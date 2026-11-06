@@ -335,6 +335,15 @@ impl<'a> ArtifactReads<'a> {
                 // provenance yet. Retain its frozen read/use ceiling even on
                 // this receipt-guarded path, using the same IAM transaction.
                 if let Some(origin) = attune_common::repositories::delegated_execution::DelegatedExecutionRepository::output_origin(held.connection(), execution.id).await? {
+                    crate::routes::executions::authorize_execution_projection_on(
+                        state,
+                        user,
+                        &execution,
+                        attune_common::rbac::Action::Decrypt,
+                        &snapshot,
+                        &mut reads.source_records.visibility,
+                        held.connection(),
+                    ).await?;
                     let attune_common::secret_provenance::SecretOrigin::Local {source_kind, source_ref} = origin else {
                         return Err(denied());
                     };

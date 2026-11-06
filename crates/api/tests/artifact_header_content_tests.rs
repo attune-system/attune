@@ -846,6 +846,43 @@ async fn running_delegated_logs_enforce_frozen_use_ceiling_before_result_materia
             json!({"body":"early-approved-operation-assertion"})
         );
     }
+    // Opaque API-capable output requires execution decrypt even before any
+    // result or runtime Key origin has been materialized.
+    let read_only = IdentityRepository::create(
+        &ctx.pool,
+        CreateIdentityInput {
+            login: "live-log-read-only".into(),
+            display_name: None,
+            attributes: json!({}),
+            password_hash: None,
+        },
+    )
+    .await?;
+    let read_set = PermissionSetRepository::create(&ctx.pool, CreatePermissionSetInput {
+        r#ref: "fixture.live_read_only".into(), pack: None, pack_ref: None, label: None, description: None,
+        grants: json!([
+            {"resource":"artifacts","actions":["read"],"constraints":{"refs":["fixture.log"]}},
+            {"resource":"executions","actions":["read"]},
+            {"resource":"keys","actions":["use"],"constraints":{"owner_types":["system"],"refs":["system.live_signer"]}}
+        ]),
+    }).await?;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: read_only.id,
+            permset: read_set.id,
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(read_only.id).await;
+    let read_token = generate_access_token(read_only.id, &read_only.login, &ctx.state.jwt_config)?;
+    for path in &paths {
+        assert_eq!(
+            ctx.get(path, Some(&read_token)).await?.status(),
+            StatusCode::NOT_FOUND,
+            "approved-operation coverage alone cannot replace execution decrypt for opaque logs"
+        );
+    }
     ctx.cleanup().await?;
     Ok(())
 }

@@ -225,13 +225,17 @@ def main():
             return response.json().get('data') if response.content else None
 
         keys = []
+        result['system_keys']=[]
         for suffix, value in [('selected', secret), ('unrelated', secrets.token_hex(24))]:
             local = run.replace('-', '_') + '_' + suffix
             key = api('POST', '/keys', json={'local_ref': local, 'owner_type': 'system', 'name': local, 'value': value, 'encrypted': True})
             assert key['owner_type'] == 'system' and key['encrypted']
             keys.append(key['ref'])
+            result['system_keys'].append({'role':suffix,'ref':key['ref'],'owner_type':key['owner_type'],'encrypted':key['encrypted']})
         signer_local=run.replace('-','_')+'_signer'
         signer=api('POST','/keys',json={'local_ref':signer_local,'owner_type':'system','name':signer_local,'encrypted':True,'value':{'private_key_pem':(ROOT/'crates/common/tests/fixtures/jwt_signing_test_private.pem').read_text(),'profiles':{'acceptance':{'issuer':'approved-client','audience':'https://auth.example.test','subjects':['approved@example.test'],'pack_refs':[run.replace('-','_')],'max_ttl_seconds':120}}}})
+        assert signer['owner_type']=='system' and signer['encrypted']
+        result['system_keys'].append({'role':'signer','ref':signer['ref'],'owner_type':signer['owner_type'],'encrypted':signer['encrypted']})
         pack = evidence / 'pack'
         for directory in ['actions', 'runtimes', 'permission_sets', 'queues', 'triggers']:
             (pack / directory).mkdir(parents=True, exist_ok=True)
@@ -324,6 +328,9 @@ print(json.dumps({'assertion':result['assertion'],'raw_denied':True,'profile_den
         assert psql(f"SELECT executor FROM execution WHERE id={positive['id']}")==str(caller_identity['id'])
         assert secret not in json.dumps(positive)
         assert psql(f"SELECT mode FROM execution_authority_selection WHERE execution={positive['id']}") == 'delegated'
+        assert psql(f"SELECT NOT (executable_snapshot->'executable'->'action'->>'is_adhoc')::boolean FROM execution WHERE id={positive['id']}")=='t'
+        result['delegated_selection']={'execution':positive['id'],'requester':caller_identity['id'],'action_ref':action_ref,'is_adhoc':False,'mode':'delegated','permission_set_refs':positive['permission_set_refs']}
+
         assert int(psql(f"SELECT count(*) FROM runtime_authority_admission WHERE owner_kind='execution' AND owner_id={positive['id']}")) == 0
         assert int(psql(f"SELECT count(*) FROM delegated_execution_key_origin WHERE execution={positive['id']}")) == 1
         assert psql(f"SELECT origin->>'key_ref' FROM delegated_execution_key_origin WHERE execution={positive['id']}")==keys[0]
