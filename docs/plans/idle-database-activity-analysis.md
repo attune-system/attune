@@ -450,9 +450,27 @@ terms; the report retains raw totals and statement-counter overhead separately.
 The result supports the implemented idle-work cleanup without turning the
 remaining low-cost pollers into a performance priority by count alone.
 
-The measured runtime remains `0c37e1dd`; later documentation-only edits do not
+The measured runtime remains `0c37e1dd`; later documentation and regression-test edits do not
 change its runtime, schema, dependency or macro-query inputs. All fourteen CI
 checks pass on that runtime commit. The final PR head must independently satisfy
 required CI before merge; the PR carries the current validation handoff. The
 three matched baseline inquiry failures, documented deferred coverage and the
 existing musl linker warning remain disclosed limitations, not passing evidence.
+
+### Final-head CI retention regression test
+
+CI on `9e8aa8e9` exposed a pre-existing assumption in
+`over_budget_first_deletion_does_not_hide_the_257th_candidate`: reaching candidate
+257 was treated as proof that all earlier cheap candidates had committed. An
+earlier singleton can also time out, advance the frozen cursor, and require the
+next pass. The test stopped with 255 claims instead of the expected 256.
+
+The regression fixture now injects that transient timeout explicitly using a
+rollback-independent sequence and waits for all 256 cheap claims under a bounded
+deadline. It also acknowledges an empty frozen-pass tail before checking another
+slow-head deferral. The deletion fixture uses deployment's 250 ms statement budget with a
+1.5-second injected delay. Audit and cancellation tests stay unchanged.
+Unknown commits still fail the test. Exact-once claims, the untouched slow head,
+failure-age preservation, and eventual clean-pass reset remain required. This is
+a test correction; retention/runtime code and the measured images are unchanged.
+The benchmark report retains the validation results and reproduction evidence.
