@@ -16,6 +16,58 @@ use crate::{
 };
 use sqlx::PgConnection;
 
+/// Observe delegated bytes and origins under the retained selection and fresh
+/// owner rights, without rendering or manufacturing recorded acceptance.
+pub(crate) async fn prepare_delegated_observation(
+    conn: &mut PgConnection,
+    source: &Execution,
+    schema: &ActionSchemaBinding,
+    key: &str,
+) -> Result<(Vec<StoredSecretValue>, Vec<ReceiptContext>)> {
+    super::delegated_execution::DelegatedExecutionRepository::validate(conn, source.id).await?;
+    let actual = ExecutionRepository::find_by_id(&mut *conn, source.id)
+        .await?
+        .ok_or_else(denied)?;
+    same_execution(source, &actual)?;
+    if SchemaContractRepository::find(conn, BindingOwner::Execution, source.id)
+        .await?
+        .as_ref()
+        != Some(schema)
+    {
+        return Err(denied());
+    }
+    let fields =
+        Secrets::find_stored_by_entity(&mut *conn, ENTITY_EXECUTION_CONFIG, source.id).await?;
+    let (ordinary, receipts) = super::immutable_input_origin::prepare_input_receipts(
+        conn,
+        ENTITY_EXECUTION_CONFIG,
+        source.id,
+        &fields,
+        key,
+    )
+    .await?;
+    if !ordinary.is_empty() {
+        crate::key_access::authorize_execution_parameter_key_origins_with_conn(
+            conn,
+            source.id,
+            source.executor,
+            &ordinary,
+        )
+        .await?;
+    }
+    super::immutable_input_origin::bind_input_receipt_buffers(
+        conn,
+        ENTITY_EXECUTION_CONFIG,
+        source.id,
+        &fields,
+    )
+    .await?;
+    for receipt in &receipts {
+        receipt.ensure_fresh_on(conn).await?;
+    }
+    Ok((fields, receipts))
+}
+
 /// Observe an already accepted source, including a legitimate terminal producer.
 /// Every field must already be an authenticated first-delivery receipt. This
 /// does not deliver inputs to it or authorize ordinary origins through current IAM.

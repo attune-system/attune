@@ -9,40 +9,7 @@ use attune_common::{
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Supplied by coordinated service startup, not pack metadata or environment.
-/// Default is deliberately not ready. Do not enable individual consumers by
-/// treating a denied operation as a reason to issue an older broad credential.
-#[derive(Clone, Copy, Default)]
-pub struct RecordedConsumerReadiness {
-    pub execution_admission: bool,
-    pub api_consumers: bool,
-    pub artifact_disclosure: bool,
-    pub runtime_read_provenance: bool,
-    pub notifier_delivery: bool,
-    pub worker_completion: bool,
-    pub native_executor_consumers: bool,
-    pub candidate_isolation: bool,
-}
-
-impl RecordedConsumerReadiness {
-    pub fn require_ready(self) -> Result<()> {
-        if self.execution_admission
-            && self.api_consumers
-            && self.artifact_disclosure
-            && self.runtime_read_provenance
-            && self.notifier_delivery
-            && self.worker_completion
-            && self.native_executor_consumers
-            && self.candidate_isolation
-        {
-            Ok(())
-        } else {
-            Err(Error::PermissionDenied(
-                "Recorded execution credentials require coordinated admission, consumers and completion readiness".into(),
-            ))
-        }
-    }
-}
+pub use attune_common::execution_authority::RecordedConsumerReadiness;
 
 /// The attempt is generated once by the worker for this launch. Retries of this
 /// preparation reuse it; another execution must never reuse its credential.

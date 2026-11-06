@@ -249,6 +249,38 @@ Verify snapshot hashes against the worktree, retain run evidence, and remove onl
 that snapshot and its owned test resources. Do not change Docker preferences
 automatically. A startup mount failure is not a test failure or a passing run.
 
+## Delegated execution authority acceptance
+
+Build production service binaries, then run the owned system-Key scenario:
+
+```bash
+cargo build -p attune-api -p attune-executor -p attune-worker \
+  --bin attune-api --bin attune-executor --bin attune-worker
+python3 scripts/test-execution-authority.py \
+  --output /tmp/attune-authority-acceptance-unique
+```
+
+The output directory must not exist. Docker, Python `requests` and PyYAML are
+required. The runner owns PostgreSQL 18, RabbitMQ, random host ports, filesystem
+roots and production API/executor/worker processes, and awaits their teardown.
+It records source/binary hashes and the check inventory in the output directory.
+Service processes use `RUST_MIN_STACK=67108864`, matching CI and the Docker Rust
+test runner. The result records that configuration. `--runtime-stack-bytes 0`
+exercises the unconfigured host default as a separate diagnostic; a passing
+configured run does not certify the smaller default debug stack.
+
+The action reads an encrypted **system-owned** Key through a pack-defined,
+explicitly selected narrow grant covered by the requester. Negative cases cover
+an unrelated system Key, missing selection, read without decrypt, use without
+plaintext, execute-only callers, terminal credentials and incompatible workers.
+An approved use-only signing case remains separate from raw read/decrypt.
+Assertions include encrypted logs/results and disclosure denials, workflow retry,
+ad hoc execution, attributed queue dispatch, rejection of recorded-only queue
+sponsorship, and tokenless stdin/completion. Recorded readiness stays disabled.
+The focused `execution_admission_tests` filter `authority_` additionally exercises
+persisted selection, missing/revoked admission, stale attempts and child ceilings.
+These scoped tests do not replace the broader authorization/service CI gate.
+
 ## Concurrency policy
 
 - Default database/service integration concurrency is **4**. The Make, Docker, benchmark, and CI entry points reject lower values.

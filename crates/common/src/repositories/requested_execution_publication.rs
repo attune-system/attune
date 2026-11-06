@@ -34,7 +34,7 @@ enum Continuation {
     Standalone {
         schema: ActionSchemaBinding,
         fields: Vec<StoredSecretValue>,
-        fence: ApprovalEffectFence,
+        fence: Option<ApprovalEffectFence>,
         receipts: Vec<ReceiptContext>,
     },
     Workflow(PreparedRetryPublication),
@@ -64,7 +64,49 @@ impl RequestedExecutionPublicationRepository {
         if actual.worker.is_some() {
             return Err(denied());
         }
-        let continuation = if let Some(task) = &actual.workflow_task {
+        let selection =
+            super::delegated_execution::DelegatedExecutionRepository::find(conn, actual.id).await?;
+        let continuation = if selection.mode == "delegated" {
+            super::delegated_execution::DelegatedExecutionRepository::validate(conn, actual.id)
+                .await?;
+            let schema = Schemas::find(conn, BindingOwner::Execution, actual.id)
+                .await?
+                .ok_or_else(denied)?;
+            schema.validate()?;
+            let fields =
+                Secrets::find_stored_by_entity(&mut *conn, ENTITY_EXECUTION_CONFIG, actual.id)
+                    .await?;
+            let (ordinary, receipts) = super::immutable_input_origin::prepare_input_receipts(
+                conn,
+                ENTITY_EXECUTION_CONFIG,
+                actual.id,
+                &fields,
+                key,
+            )
+            .await?;
+            if !ordinary.is_empty() {
+                crate::key_access::authorize_execution_parameter_key_origins_with_conn(
+                    conn,
+                    actual.id,
+                    actual.executor,
+                    &ordinary,
+                )
+                .await?;
+            }
+            super::immutable_input_origin::bind_input_receipt_buffers(
+                conn,
+                ENTITY_EXECUTION_CONFIG,
+                actual.id,
+                &fields,
+            )
+            .await?;
+            Continuation::Standalone {
+                schema,
+                fields,
+                receipts,
+                fence: None,
+            }
+        } else if let Some(task) = &actual.workflow_task {
             let prepared = if actual.retry_count > 0
                 || task.retry_count > 0
                 || actual.original_execution.is_some()
@@ -121,7 +163,7 @@ impl RequestedExecutionPublicationRepository {
             Continuation::Standalone {
                 schema,
                 fields,
-                fence,
+                fence: Some(fence),
                 receipts,
             }
         };
@@ -148,6 +190,35 @@ impl PreparedRequestedPublication {
             Continuation::Standalone { schema, fields, .. } => {
                 // Owner SHARE fences were prepared already. Never wait while
                 // upgrading behind another source holder or a parent canceller.
+                if let Some(task) = &self.execution.workflow_task {
+                    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+                        .bind(task.workflow_execution)
+                        .fetch_one(&mut *conn)
+                        .await?;
+                    if !acquired {
+                        return Err(denied());
+                    }
+                    let workflow =
+                        super::workflow::WorkflowExecutionRepository::find_by_id_for_update(
+                            &mut *conn,
+                            task.workflow_execution,
+                        )
+                        .await?
+                        .ok_or_else(denied)?;
+                    if workflow.paused
+                        || self.execution.parent != Some(workflow.execution)
+                        || !matches!(
+                            workflow.status,
+                            ExecutionStatus::Requested
+                                | ExecutionStatus::Scheduling
+                                | ExecutionStatus::Scheduled
+                                | ExecutionStatus::Running
+                        )
+                        || !workflow.current_tasks.contains(&task.task_name)
+                    {
+                        return Err(denied());
+                    }
+                }
                 if let Some(parent) = self.execution.parent {
                     let status: Option<ExecutionStatus> = sqlx::query_scalar(
                         "SELECT status FROM execution WHERE id=$1 FOR SHARE NOWAIT",
@@ -207,7 +278,15 @@ impl PreparedRequestedPublication {
             Continuation::Standalone {
                 fence, receipts, ..
             } => {
-                fence.ensure_fresh_on(conn).await?;
+                if let Some(fence) = fence {
+                    fence.ensure_fresh_on(conn).await?;
+                } else {
+                    super::delegated_execution::DelegatedExecutionRepository::validate(
+                        conn,
+                        self.execution.id,
+                    )
+                    .await?;
+                }
                 for receipt in receipts {
                     receipt.ensure_fresh_on(conn).await?;
                 }

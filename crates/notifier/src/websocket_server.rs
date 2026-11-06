@@ -166,6 +166,7 @@ struct AppState {
 }
 
 struct VerifiedWsToken {
+    delegated_claims: Option<attune_common::auth::Claims>,
     recorded: Option<RecordedConnection>,
     identity_id: i64,
     token_type: TokenType,
@@ -180,6 +181,7 @@ struct VerifiedWsToken {
 /// decisions can be memoized once per distinct snapshot per notification.
 #[derive(Clone)]
 pub(crate) struct WebSocketAuthContext {
+    pub(crate) delegated_claims: Option<attune_common::auth::Claims>,
     pub(crate) recorded: Option<RecordedConnection>,
     pub(crate) identity_id: i64,
     pub(crate) token_type: TokenType,
@@ -204,6 +206,9 @@ impl WebSocketAuthContext {
         use std::hash::{Hash, Hasher};
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        if let Some(claims) = &self.delegated_claims {
+            serde_json::to_string(claims).ok().hash(&mut hasher);
+        }
         self.identity_id.hash(&mut hasher);
         self.token_exp.hash(&mut hasher);
         if let Some(recorded) = &self.recorded {
@@ -251,6 +256,7 @@ impl WebSocketAuthContext {
         grants: Vec<Grant>,
     ) -> Self {
         Self {
+            delegated_claims: None,
             recorded: None,
             identity_id,
             token_type,
@@ -363,6 +369,8 @@ fn verify_ws_token(
     };
 
     Ok(VerifiedWsToken {
+        delegated_claims: (claims.token_type == TokenType::Execution && recorded.is_none())
+            .then(|| claims.clone()),
         recorded,
         identity_id,
         token_type: claims.token_type,
@@ -1206,6 +1214,19 @@ async fn websocket_handler(
             }
         }
     };
+    if let Some(claims) = &verified_token.delegated_claims {
+        let live=match state.db_pool.acquire().await {
+            Ok(mut conn)=>attune_common::repositories::delegated_execution::DelegatedExecutionRepository::validate_claims(&mut conn,claims).await.is_ok(),
+            Err(_)=>false,
+        };
+        if !live {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error":"delegated_authority_unavailable"})),
+            )
+                .into_response();
+        }
+    }
     let effective_authz = if let Some(recorded) = &verified_token.recorded {
         if !recorded.is_live(&state.db_pool).await {
             return (
@@ -1245,6 +1266,7 @@ async fn websocket_handler(
     };
 
     let auth = WebSocketAuthContext {
+        delegated_claims: verified_token.delegated_claims,
         recorded: verified_token.recorded,
         identity_id: verified_token.identity_id,
         token_type: verified_token.token_type,
@@ -1480,6 +1502,15 @@ async fn send_checked_frame(
             })))
             .await;
         return false;
+    }
+    if let Some(claims) = &auth.delegated_claims {
+        let live=match pool.acquire().await {
+            Ok(mut conn)=>attune_common::repositories::delegated_execution::DelegatedExecutionRepository::validate_claims(&mut conn,claims).await.is_ok(),
+            Err(_)=>false,
+        };
+        if !live {
+            return false;
+        }
     }
     if let Some(recorded) = &auth.recorded {
         let fence = match &message {
@@ -2529,6 +2560,7 @@ mod tests {
         let manager = SubscriberManager::new();
 
         let sensor_auth = Arc::new(WebSocketAuthContext {
+            delegated_claims: None,
             recorded: None,
             identity_id: 99,
             token_type: TokenType::Sensor,

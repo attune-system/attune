@@ -410,6 +410,23 @@ impl ArtifactFileTransport for VolumeTransport {
             .await
     }
 
+    async fn seal_log_stream_with_manifest(
+        &self,
+        version: i64,
+        truncated: bool,
+        manifest: &str,
+    ) -> Result<()> {
+        self.completion_api
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Configuration(
+                    "encrypted log streams require an API completion client".into(),
+                )
+            })?
+            .seal_log_stream_with_manifest(version, truncated, manifest)
+            .await
+    }
+
     async fn delete_file(&self, file_path: &str) -> Result<()> {
         let path = self.resolve(file_path).await?;
         match fs::symlink_metadata(&path).await {

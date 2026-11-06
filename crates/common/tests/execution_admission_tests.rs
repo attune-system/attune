@@ -3312,3 +3312,386 @@ async fn initial_input_projection_is_once_only_same_transaction_and_digest_only_
     later.rollback().await.unwrap();
     db.cleanup().await.unwrap();
 }
+
+/// A missing admission must not select human IAM, even for tokenless work.
+#[tokio::test]
+async fn authority_consistency_rejects_missing_managed_admission_with_or_without_refs() {
+    let (db, snapshot, policy, human) = fixture().await;
+    let mut tx = db.begin().await.unwrap();
+    for refs in [vec![], vec!["standard".to_string()]] {
+        let execution = ExecutionRepository::create_pinned(
+            &mut *tx,
+            CreateExecutionInput {
+                action: Some(snapshot.executable.action.id),
+                action_ref: snapshot.executable.action.r#ref.clone(),
+                executor: Some(human),
+                permission_set_refs: refs,
+                ..Default::default()
+            },
+            &snapshot,
+        )
+        .await
+        .unwrap();
+        assert!(Admission::existing_authority(&mut tx, execution.id)
+            .await
+            .is_err());
+        assert!(
+            Admission::input_authority(&mut tx, execution.id, Some(human))
+                .await
+                .is_err()
+        );
+    }
+    let refs = vec![format!("{}.effects", policy.owner.pack_ref)];
+    let admission = Admission::select(
+        &mut tx,
+        policy.owner.pack_id,
+        policy.invocations[0].binding.clone(),
+        &snapshot,
+        &refs,
+        RequestAttribution::Human {
+            actor: HumanAttribution {
+                identity_id: human,
+                login: "requester".into(),
+            },
+        },
+        attune_common::repositories::runtime_target::RuntimeTarget::Component(
+            attune_common::repositories::runtime_target::ComponentTarget::Action,
+            snapshot.executable.action.id,
+        ),
+    )
+    .await
+    .unwrap();
+    let execution = ExecutionRepository::create_pinned(
+        &mut *tx,
+        CreateExecutionInput {
+            action: Some(snapshot.executable.action.id),
+            action_ref: snapshot.executable.action.r#ref.clone(),
+            executor: Some(human),
+            permission_set_refs: refs,
+            ..Default::default()
+        },
+        &snapshot,
+    )
+    .await
+    .unwrap();
+    let record = admission
+        .attach(&mut tx, RuntimeOwner::Execution(execution.id))
+        .await
+        .unwrap();
+    assert_eq!(Admission::existing_authority(&mut tx, execution.id).await.unwrap(),
+        attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Recorded);
+    Authority::revoke_admission(&mut tx, record.id)
+        .await
+        .unwrap();
+    assert!(Admission::existing_authority(&mut tx, execution.id)
+        .await
+        .is_err());
+    tx.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+async fn delegated_fixture_execution(
+    conn: &mut sqlx::PgConnection,
+    snapshot: &ExecutionExecutableSnapshot,
+    owner: i64,
+    refs: Vec<String>,
+    parent: Option<i64>,
+) -> attune_common::models::Execution {
+    use attune_common::repositories::schema_contract::{BindingOwner, SchemaContractRepository};
+    let execution = ExecutionRepository::create_pinned(
+        &mut *conn,
+        CreateExecutionInput {
+            action: Some(snapshot.executable.action.id),
+            action_ref: snapshot.executable.action.r#ref.clone(),
+            executor: Some(owner),
+            permission_set_refs: refs,
+            parent,
+            ..Default::default()
+        },
+        snapshot,
+    )
+    .await
+    .unwrap();
+    let binding = SchemaContractRepository::materialize_action(conn, snapshot)
+        .await
+        .unwrap();
+    SchemaContractRepository::attach(conn, BindingOwner::Execution, execution.id, &binding)
+        .await
+        .unwrap();
+    execution
+}
+
+#[tokio::test]
+async fn delegated_authority_is_explicit_immutable_and_attempt_fenced() {
+    attune_common::auth::crypto_provider::install();
+    use attune_common::{
+        auth::jwt::{generate_delegated_execution_token, validate_token, JwtConfig},
+        models::{OwnerType, WorkerType},
+        repositories::{
+            delegated_execution::DelegatedExecutionRepository as Delegated,
+            execution::UpdateExecutionInput,
+            runtime::{CreateWorkerInput, WorkerRepository},
+        },
+    };
+    let (db, snapshot, _, human) = fixture().await;
+    let mut tx = db.begin().await.unwrap();
+    let execution =
+        delegated_fixture_execution(&mut tx, &snapshot, human, vec!["standard".into()], None).await;
+    assert!(Admission::existing_authority(&mut tx, execution.id)
+        .await
+        .is_err());
+    Delegated::select(&mut tx, execution.id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        Delegated::validate(&mut tx, execution.id)
+            .await
+            .unwrap()
+            .mode,
+        "delegated"
+    );
+    let worker = WorkerRepository::create(
+        &mut *tx,
+        CreateWorkerInput {
+            name: "authority-test".into(),
+            worker_type: WorkerType::Local,
+            runtime: None,
+            host: None,
+            port: None,
+            status: Some(attune_common::models::WorkerStatus::Active),
+            capabilities: None,
+            meta: None,
+        },
+    )
+    .await
+    .unwrap();
+    ExecutionRepository::update(
+        &mut *tx,
+        execution.id,
+        UpdateExecutionInput {
+            worker: Some(worker.id),
+            status: Some(ExecutionStatus::Scheduled),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let attempt = Delegated::start(&mut tx, execution.id, worker.id)
+        .await
+        .unwrap();
+    assert!(Delegated::start(&mut tx, execution.id, worker.id)
+        .await
+        .is_err());
+    ExecutionRepository::update(
+        &mut *tx,
+        execution.id,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Running),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    Delegated::require_completion(&mut tx, execution.id, worker.id)
+        .await
+        .unwrap();
+    assert!(
+        Delegated::require_completion(&mut tx, execution.id, worker.id + 1)
+            .await
+            .is_err()
+    );
+    let jwt = JwtConfig {
+        secret: "authority-test-only".into(),
+        access_token_expiration: 60,
+        refresh_token_expiration: 60,
+    };
+    let token = generate_delegated_execution_token(
+        human,
+        execution.id,
+        &execution.action_ref,
+        &jwt,
+        60,
+        &["standard".into()],
+        std::slice::from_ref(&execution.action_ref),
+        attempt,
+    )
+    .unwrap();
+    let claims = validate_token(&token, &jwt).unwrap();
+    assert!(Delegated::validate_claims(&mut tx, &claims)
+        .await
+        .unwrap()
+        .is_some());
+    Delegated::retain_claims(&mut tx, &claims).await.unwrap();
+    let mut stale = claims.clone();
+    stale.metadata.as_mut().unwrap()["delegated_attempt"] = json!(uuid::Uuid::new_v4());
+    assert!(Delegated::validate_claims(&mut tx, &stale).await.is_err());
+    let origin = attune_common::secret_provenance::KeyOrigin {
+        key_id: 999,
+        key_ref: "system.authority_fixture".into(),
+        owner_type: OwnerType::System,
+        owner_identity: None,
+        owner_ref: None,
+        encrypted: true,
+    };
+    Delegated::record_key(&mut tx, &claims, &origin)
+        .await
+        .unwrap();
+    let origins=attune_common::repositories::execution_key_read::ExecutionKeyReadRepository::origins_for_executions(&mut *tx,&[execution.id]).await.unwrap();
+    assert_eq!(origins[&execution.id], vec![origin]);
+    Delegated::close(&mut tx, execution.id).await.unwrap();
+    assert!(Delegated::retain_claims(&mut tx, &claims).await.is_err());
+
+    assert!(Delegated::validate_claims(&mut tx, &claims).await.is_err());
+    assert!(
+        Delegated::require_completion(&mut tx, execution.id, worker.id)
+            .await
+            .is_err()
+    );
+    tx.commit().await.unwrap();
+    let mut tx = db.begin().await.unwrap();
+    assert!(Delegated::select(&mut tx, execution.id, None)
+        .await
+        .is_err());
+    tx.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn delegated_authority_checks_grants_and_child_ceiling() {
+    use attune_common::repositories::delegated_execution::DelegatedExecutionRepository as Delegated;
+    let (db, snapshot, policy, human) = fixture().await;
+    let mut tx = db.begin().await.unwrap();
+    // Deployment admits this set to the pack, never to the requesting human.
+    let uncovered = delegated_fixture_execution(
+        &mut tx,
+        &snapshot,
+        human,
+        vec![format!("{}.effects", policy.owner.pack_ref)],
+        None,
+    )
+    .await;
+    assert!(Delegated::select(&mut tx, uncovered.id, None)
+        .await
+        .is_err());
+    let parent = delegated_fixture_execution(&mut tx, &snapshot, human, vec![], None).await;
+    Delegated::select(&mut tx, parent.id, None).await.unwrap();
+    let child = delegated_fixture_execution(
+        &mut tx,
+        &snapshot,
+        human,
+        vec!["standard".into()],
+        Some(parent.id),
+    )
+    .await;
+    assert!(Delegated::select(&mut tx, child.id, Some(parent.id))
+        .await
+        .is_err());
+    let tokenless =
+        delegated_fixture_execution(&mut tx, &snapshot, human, vec![], Some(parent.id)).await;
+    Delegated::select(&mut tx, tokenless.id, Some(parent.id))
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn enforcement_authority_tombstone_does_not_fall_back() {
+    use attune_common::{
+        models::{EnforcementCondition, EnforcementStatus},
+        repositories::event::{CreateEnforcementInput, EnforcementRepository},
+    };
+    let (db, _, _, _) = fixture().await;
+    let mut tx = db.begin().await.unwrap();
+    let enforcement = EnforcementRepository::create(
+        &mut *tx,
+        CreateEnforcementInput {
+            rule: None,
+            rule_ref: "fixture.rule".into(),
+            trigger_ref: "fixture.trigger".into(),
+            config: None,
+            event: None,
+            status: EnforcementStatus::Created,
+            payload: json!({}),
+            condition: EnforcementCondition::All,
+            conditions: json!([]),
+        },
+    )
+    .await
+    .unwrap();
+    // Inject the retained marker of an independently missing admission.
+    sqlx::query("INSERT INTO enforcement_recorded_authority(enforcement,admission) VALUES($1,$2)")
+        .bind(enforcement.id)
+        .bind(999i64)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    assert!(Admission::enforcement_is_recorded(&mut tx, enforcement.id)
+        .await
+        .unwrap());
+    assert!(
+        Admission::require(&mut tx, RuntimeOwner::Enforcement(enforcement.id))
+            .await
+            .is_err()
+    );
+    tx.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn delegated_authority_retains_use_only_output_provenance() {
+    use attune_common::{
+        delegation::DelegationAuthority,
+        repositories::delegated_execution::DelegatedExecutionRepository as Delegated,
+        secret_provenance::SecretOrigin,
+    };
+    let (db, snapshot, _, human) = fixture().await;
+    let use_grants = json!([{"resource":"keys","actions":["use"],"constraints":{"refs":["system.authority_signer"],"owner_types":["system"]}}]);
+    assign_input_grants(&db, human, "output_use", use_grants.clone()).await;
+    let mut tx = db.begin().await.unwrap();
+    let execution = delegated_fixture_execution(
+        &mut tx,
+        &snapshot,
+        human,
+        vec!["fixture.output_use".into()],
+        None,
+    )
+    .await;
+    Delegated::select(&mut tx, execution.id, None)
+        .await
+        .unwrap();
+    let Some(SecretOrigin::Local { source_ref, .. }) =
+        Delegated::output_origin(&mut tx, execution.id)
+            .await
+            .unwrap()
+    else {
+        panic!("API-capable output must retain its disclosure authority")
+    };
+    for grants in [
+        json!([]),
+        json!([{"resource":"keys","actions":["read","decrypt"],"constraints":{"refs":["system.authority_signer"],"owner_types":["system"]}}]),
+    ] {
+        let viewer = DelegationAuthority::new(
+            human,
+            Default::default(),
+            serde_json::from_value(grants).unwrap(),
+        );
+        assert!(
+            !Delegated::output_allowed(&mut tx, source_ref.as_deref(), &viewer)
+                .await
+                .unwrap()
+        );
+    }
+    let viewer = DelegationAuthority::new(
+        human,
+        Default::default(),
+        serde_json::from_value(use_grants).unwrap(),
+    );
+    assert!(
+        Delegated::output_allowed(&mut tx, source_ref.as_deref(), &viewer)
+            .await
+            .unwrap()
+    );
+    tx.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}

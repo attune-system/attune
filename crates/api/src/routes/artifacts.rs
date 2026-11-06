@@ -276,13 +276,13 @@ pub async fn get_artifact(
     Path(id): Path<i64>,
 ) -> ApiResult<impl IntoResponse> {
     if crate::recorded_consumers::is_recorded(&user)? {
-        let artifact = crate::recorded_reads::artifact(
+        let artifact = Box::pin(crate::recorded_reads::artifact(
             &state.db,
             &user,
             id,
             None,
             state.config.security.encryption_key.as_deref(),
-        )
+        ))
         .await
         .map_err(|error| {
             crate::artifact_reads::mask_detail_denial(
@@ -359,13 +359,13 @@ pub async fn get_artifact_by_ref(
         .ok_or_else(|| ApiError::NotFound(format!("Artifact '{}' not found", artifact_ref)))?;
 
     if crate::recorded_consumers::is_recorded(&user)? {
-        let artifact = crate::recorded_reads::artifact(
+        let artifact = Box::pin(crate::recorded_reads::artifact(
             &state.db,
             &user,
             header.id,
             Some(&artifact_ref),
             state.config.security.encryption_key.as_deref(),
-        )
+        ))
         .await
         .map_err(|error| {
             crate::artifact_reads::mask_detail_denial(
@@ -3488,7 +3488,12 @@ async fn authorize_artifact_action(
 ) -> Result<(), ApiError> {
     if crate::recorded_consumers::is_recorded(user)? {
         if action == Action::Read {
-            return crate::recorded_consumers::artifact_read(&state.db, user, artifact.id).await;
+            return Box::pin(crate::recorded_consumers::artifact_read(
+                &state.db,
+                user,
+                artifact.id,
+            ))
+            .await;
         }
         return Err(ApiError::Forbidden(
             "Recorded artifact writes require their effect transaction".into(),
@@ -3520,7 +3525,10 @@ async fn authorize_artifact_action(
     };
 
     if action == Action::Read {
-        return crate::artifact_reads::ArtifactReads::authorize_detail(state, user, artifact).await;
+        return Box::pin(crate::artifact_reads::ArtifactReads::authorize_detail(
+            state, user, artifact,
+        ))
+        .await;
     }
 
     let ctx = artifact_authorization_context(identity_id, artifact);

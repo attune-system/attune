@@ -696,6 +696,40 @@ pub fn generate_execution_token_with_permission_sets_and_standard_access(
     .map_err(|e| JwtError::EncodeError(e.to_string()))
 }
 
+/// Mint a delegated credential bound to the server-persisted worker attempt.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_delegated_execution_token(
+    identity: i64,
+    execution: i64,
+    action: &str,
+    config: &JwtConfig,
+    ttl: i64,
+    refs: &[String],
+    standard_actions: &[String],
+    attempt: uuid::Uuid,
+) -> Result<String, JwtError> {
+    let token = generate_execution_token_with_permission_sets_and_standard_access(
+        identity,
+        execution,
+        action,
+        config,
+        Some(ttl),
+        refs,
+        standard_actions,
+    )?;
+    let mut claims = validate_token(&token, config)?;
+    claims
+        .metadata
+        .as_mut()
+        .expect("generated execution metadata")["delegated_attempt"] = serde_json::json!(attempt);
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(config.secret.as_bytes()),
+    )
+    .map_err(|e| JwtError::EncodeError(e.to_string()))
+}
+
 /// Mint only from an already persisted runtime admission and current attempt.
 /// The signing caller must use the record's selected refs, not human IAM refs.
 pub fn generate_admitted_execution_token(

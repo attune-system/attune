@@ -286,6 +286,11 @@ impl WorkerRegistration {
             self.capabilities.insert(key, value);
         }
 
+        self.capabilities.insert(
+            attune_common::execution_authority::DELEGATED_EXECUTION_CAPABILITY.into(),
+            json!(true),
+        );
+
         // Native execution has no interpreter dependency and is always registered
         // by WorkerService, including when an interpreter allow-list is configured.
         let runtimes = self

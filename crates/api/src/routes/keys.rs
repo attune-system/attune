@@ -624,6 +624,15 @@ pub async fn get_key(
         }
     }
 
+    if can_decrypt && user.0.claims.token_type == TokenType::Execution && recorded.is_none() {
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::record_key(
+            &mut transaction,
+            &user.0.claims,
+            &attune_common::key_access::key_origin(&key),
+        )
+        .await?;
+    }
+
     if can_decrypt && user.0.claims.token_type == TokenType::Sensor {
         use attune_common::repositories::{
             sensor_schema::SensorSchemaRepository, sensor_workload::SensorWorkloadRepository,

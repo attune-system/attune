@@ -174,6 +174,50 @@ rollout. Catalog revision remains 2; the editor's component grants are unchanged
 
 ## Execution authority
 
+Execution authority is persisted in `execution_authority_selection`, independently
+of managed/ad hoc ownership. Ordinary API requests select human delegation in the
+creation transaction after checking the active attributable owner and coverage of
+selected named sets. Executable and schema snapshots remain immutable. Tokens
+bind the assigned worker's persisted attempt; empty selections omit the API token
+but retain input, log and completion protections. Selected grant-definition edits
+invalidate a running delegated credential rather than leaving stale consumer
+snapshots effective. API grant refreshes revalidate the source attempt, and
+bounded disclosure receipts retain it through commit. Streaming execution
+transports and notifier frames recheck it after connection authentication.
+
+Recorded runtime authority remains disabled until coordinated readiness is
+established. Recorded origins, managed rule sponsorship and managed queue
+sponsorship remain separate and fail closed before dispatch. Missing or revoked
+admission never enables human delegation. The migration marks historical rows as
+recorded-required: it does not retrospectively authorize delegation or rewrite
+recorded approvals. Fresh ordinary API-created ad hoc and managed executions use
+the same explicit delegation path.
+
+Successful delegated plaintext Key reads record immutable owner-qualified origins
+under the execution and worker attempt before returning bytes. Completion closes
+the attempt before collecting those origins. API-capable delegated processes use
+encrypted log frames and suppress stdout/stderr mirroring from the outset. Their
+opaque result fields are encrypted and retain both exact Key origins and a
+conservative frozen read/approved-operation grant ceiling. Plaintext result files and raw process
+results are not copied to ordinary artifact/service paths. Disclosure and input
+propagation must cover that ceiling and every actual Key origin. Retries and child
+creation retain the selected mode and cannot exceed their source's named grants
+or acquire `standard` when the source did not select it.
+
+Worker startup advertises `delegated_execution_authority_v1` only for the protected
+input/token/log/completion implementation. Dispatch requires that capability;
+incompatible workers fail with a readiness diagnostic before assignment. Apply
+the migration and deploy the matching API, executor, worker and notifier together.
+Older service binaries do not implement this authority contract.
+
+A system-owned encrypted Key remains outside `standard`. A selected external
+permission set must name its actual `system.<local_ref>` and system owner scope.
+Raw plaintext retrieval requires both `keys:read` and `keys:decrypt`. `keys:use`
+authorizes only supported approved operations, such as profile-constrained JWT
+signing, and never authorizes private-key or plaintext disclosure. The delegated
+requester must cover these selected grants; independent requester IAM still
+requires the disabled recorded-authority rollout.
+
 Execution API access remains opt-in through `permission_set_refs`.
 Named refs resolve to active permission sets, and their grants must remain covered by the current active executor identity.
 The API and notifier enforce this bound independently.

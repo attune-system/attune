@@ -4,7 +4,7 @@
 //! finds matching rules for the event's trigger, evaluates conditions, and
 //! creates enforcement records for rules that match.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use sqlx::{PgConnection, PgPool};
 use std::sync::Arc;
 use std::time::Instant;
@@ -408,17 +408,15 @@ impl EventProcessor {
         // Select code and contracts before defaults, rendering, or secret
         // persistence. Execution handoff inherits this choice rather than
         // resolving external revisions a second time.
+        if !rule.is_adhoc {
+            attune_common::execution_authority::RecordedConsumerReadiness::default()
+                .require_ready()?;
+        }
         let snapshot = if !rule.is_adhoc {
             attune_common::repositories::execution_admission::ExecutionAdmissionRepository::resolve_current_snapshot(
                 &mut tx, input_snapshot.as_ref().ok_or_else(|| anyhow::anyhow!("Rule input authority unavailable"))?.pack_id,
                 attune_common::repositories::runtime_target::RuntimeTarget::Component(attune_common::repositories::runtime_target::ComponentTarget::Rule, rule.id),
                 &attune_common::runtime_authority::InvocationBinding::Rule { rule_ref: rule.r#ref.clone(), action_ref: action.r#ref.clone() },
-            ).await?
-        } else if !action.is_adhoc {
-            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::resolve_current_snapshot(
-                &mut tx, action.pack,
-                attune_common::repositories::runtime_target::RuntimeTarget::Component(attune_common::repositories::runtime_target::ComponentTarget::Action, action.id),
-                &attune_common::runtime_authority::InvocationBinding::Action { action_ref: action.r#ref.clone() },
             ).await?
         } else {
             attune_common::repositories::executable_snapshot::ExecutableSnapshotRepository::resolve_for_action(
@@ -426,6 +424,27 @@ impl EventProcessor {
         ).await?
         };
         let action = &snapshot.executable.action;
+        if rule.is_adhoc {
+            let target =
+                attune_common::repositories::runtime_target::RuntimeTargetRepository::resolve(
+                    &mut tx,
+                    attune_common::repositories::runtime_target::RuntimeTarget::Component(
+                        attune_common::repositories::runtime_target::ComponentTarget::Action,
+                        action.id,
+                    ),
+                    identity_id,
+                )
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Rule action unavailable"))?;
+            if !input_authority.allows(
+                attune_common::rbac::Resource::Actions,
+                attune_common::rbac::Action::Execute,
+                target.context().clone(),
+            ) {
+                return Err(anyhow::anyhow!("Rule owner cannot execute target action"));
+            }
+        }
+
         let refs = rule
             .permission_set_refs
             .as_deref()
@@ -462,45 +481,7 @@ impl EventProcessor {
             input_authority
                 .require_refs_for_share(&mut tx, refs)
                 .await?;
-            if action.is_adhoc {
-                None
-            } else {
-                use attune_common::{
-                    rbac::{Action as PermissionAction, Resource},
-                    repositories::{
-                        execution_admission::ExecutionAdmissionRepository,
-                        runtime_target::{ComponentTarget, RuntimeTarget, RuntimeTargetRepository},
-                    },
-                    runtime_authority::{InvocationBinding, RequestAttribution},
-                };
-                let source = RuntimeTarget::Component(ComponentTarget::Action, action.id);
-                let target = RuntimeTargetRepository::resolve(&mut tx, source, identity_id)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("Rule target action is unavailable"))?;
-                if !input_authority.allows(
-                    Resource::Actions,
-                    PermissionAction::Execute,
-                    target.context().clone(),
-                ) {
-                    bail!("Rule owner cannot execute the target action");
-                }
-                Some(
-                    ExecutionAdmissionRepository::select(
-                        &mut tx,
-                        action.pack,
-                        InvocationBinding::Action {
-                            action_ref: action.r#ref.clone(),
-                        },
-                        &snapshot,
-                        refs,
-                        RequestAttribution::Rule {
-                            rule_ref: rule.r#ref.clone(),
-                        },
-                        source,
-                    )
-                    .await?,
-                )
-            }
+            None
         };
         let binding = if admission.is_some() {
             attune_common::repositories::schema_contract::SchemaContractRepository::materialize_action_pair(&mut tx, &snapshot).await?

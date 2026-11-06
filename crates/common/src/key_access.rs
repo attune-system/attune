@@ -413,7 +413,20 @@ fn check_parameter_origins<'a>(
                     .await?;
                     visited.remove(&(entity_type, entity_id, path));
                 }
-                SecretOrigin::Local { source_kind, .. } => {
+                SecretOrigin::Local {
+                    source_kind,
+                    source_ref,
+                } => {
+                    if source_kind == "delegated_execution_output" {
+                        if authorities.is_empty() {
+                            return Err(denied());
+                        }
+                        for authority in authorities {
+                            if !crate::repositories::delegated_execution::DelegatedExecutionRepository::output_allowed(connection,source_ref.as_deref(),authority).await? {return Err(denied());}
+                        }
+                        continue;
+                    }
+
                     if !matches!(
                         source_kind.as_str(),
                         "parameter_schema" | "pack_config" | "queue_item" | "trigger_schema"

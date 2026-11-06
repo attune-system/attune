@@ -1,7 +1,7 @@
 mod helpers;
 
 use attune_common::{
-    auth::jwt::{generate_execution_token_with_permission_sets, validate_token, JwtConfig},
+    auth::jwt::{generate_delegated_execution_token, validate_token, JwtConfig},
     models::{
         ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType, RetentionPolicyType,
     },
@@ -1229,14 +1229,7 @@ async fn named_execution_token_authority_is_bounded_by_current_active_executor()
     ])).await?;
     signing_key(&ctx).await?;
     let id = execution(&ctx, "sales", json!({})).await?;
-    let mut token = generate_execution_token_with_permission_sets(
-        identity,
-        id,
-        "sales.login",
-        &config,
-        Some(60),
-        &["fixture.key_read".into()],
-    )?;
+    let mut token = delegated_key_token(&ctx, id, &["fixture.key_read".into()]).await?;
     let response = ctx
         .get("/api/v1/keys/system.salesforce_signer", Some(&token))
         .await?;
@@ -1253,18 +1246,11 @@ async fn named_execution_token_authority_is_bounded_by_current_active_executor()
         },
     )
     .await?;
-    token = generate_execution_token_with_permission_sets(
-        identity,
-        id,
-        "sales.login",
-        &config,
-        Some(60),
-        &["fixture.escalated".into()],
-    )?;
+    token = delegated_key_token(&ctx, id, &["fixture.escalated".into()]).await?;
     let response = ctx
         .get("/api/v1/keys/system.salesforce_signer", Some(&token))
         .await?;
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     IdentityRepository::update(
         &ctx.pool,
         identity,
@@ -1274,20 +1260,104 @@ async fn named_execution_token_authority_is_bounded_by_current_active_executor()
         },
     )
     .await?;
-    token = generate_execution_token_with_permission_sets(
-        identity,
-        id,
-        "sales.login",
-        &config,
-        Some(60),
-        &["fixture.key_read".into()],
-    )?;
+    token = delegated_key_token(&ctx, id, &["fixture.key_read".into()]).await?;
     let response = ctx
         .get("/api/v1/keys/system.salesforce_signer", Some(&token))
         .await?;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    IdentityRepository::update(
+        &ctx.pool,
+        identity,
+        UpdateIdentityInput {
+            frozen: Some(false),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let user = attune_api::auth::middleware::AuthenticatedUser {
+        claims: validate_token(&token, &config)?,
+    };
+    let authz = ctx.state.authorization_service();
+    assert!(authz.effective_grants(&user).await.is_ok());
+    let mut tx = ctx.pool.begin().await?;
+    attune_common::repositories::delegated_execution::DelegatedExecutionRepository::close(
+        &mut tx, id,
+    )
+    .await?;
+    tx.commit().await?;
+    assert!(
+        authz.effective_grants(&user).await.is_err(),
+        "grant refresh must reject a closed attempt without relying on HTTP middleware"
+    );
     ctx.cleanup().await?;
     Ok(())
+}
+
+/// Consumer fixtures retain a real API-admitted selection and one worker claim.
+/// The production startup/process acceptance lives in test-execution-authority.py.
+async fn delegated_key_token(ctx: &TestContext, id: i64, refs: &[String]) -> Result<String> {
+    use attune_common::{
+        models::{ExecutionStatus, WorkerStatus, WorkerType},
+        repositories::{
+            delegated_execution::DelegatedExecutionRepository as Delegated,
+            execution::{ExecutionRepository, UpdateExecutionInput},
+            runtime::{CreateWorkerInput, WorkerRepository},
+        },
+    };
+    let mut tx = ctx.pool.begin().await?;
+    let execution = ExecutionRepository::find_by_id(&mut *tx, id)
+        .await?
+        .unwrap();
+    let attempt = if execution.status == ExecutionStatus::Running {
+        Delegated::current_attempt(&mut tx, id).await?
+    } else {
+        let worker = WorkerRepository::create(
+            &mut *tx,
+            CreateWorkerInput {
+                name: format!("key-authority-{}", uuid::Uuid::new_v4()),
+                worker_type: WorkerType::Local,
+                runtime: None,
+                host: None,
+                port: None,
+                status: Some(WorkerStatus::Active),
+                capabilities: None,
+                meta: None,
+            },
+        )
+        .await?;
+        ExecutionRepository::update(
+            &mut *tx,
+            id,
+            UpdateExecutionInput {
+                worker: Some(worker.id),
+                status: Some(ExecutionStatus::Scheduled),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let attempt = Delegated::start(&mut tx, id, worker.id).await?;
+        ExecutionRepository::update(
+            &mut *tx,
+            id,
+            UpdateExecutionInput {
+                status: Some(ExecutionStatus::Running),
+                ..Default::default()
+            },
+        )
+        .await?;
+        attempt
+    };
+    tx.commit().await?;
+    Ok(generate_delegated_execution_token(
+        execution.executor.unwrap(),
+        id,
+        &execution.action_ref,
+        &jwt_config(ctx),
+        60,
+        refs,
+        std::slice::from_ref(&execution.action_ref),
+        attempt,
+    )?)
 }
 
 async fn execution(ctx: &TestContext, pack_ref: &str, parameters: Value) -> Result<i64> {
@@ -1385,6 +1455,12 @@ async fn execution_with_original_secret_fields(
     .await?;
     SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, execution.id, &binding)
         .await?;
+    attune_common::repositories::delegated_execution::DelegatedExecutionRepository::select(
+        &mut tx,
+        execution.id,
+        None,
+    )
+    .await?;
     let initialized = ExecutionRepository::initialize_config_with_conn(
         &mut tx,
         execution.id,
@@ -1441,7 +1517,7 @@ async fn read_only_users_can_use_approved_signer_but_cannot_retrieve_private_mat
         .sub
         .parse::<i64>()?;
     grant(&ctx,identity,"fixture.key_read",json!([
-        {"resource":"keys","actions":["read"],"constraints":{"owner_types":["system"],"refs":["system.salesforce_signer"]}},
+        {"resource":"keys","actions":["read","use"],"constraints":{"owner_types":["system"],"refs":["system.salesforce_signer"]}},
         {"resource":"actions","actions":["read","execute"]},
         {"resource":"executions","actions":["read","decrypt"]}
     ])).await?;
@@ -1457,14 +1533,7 @@ async fn read_only_users_can_use_approved_signer_but_cannot_retrieve_private_mat
         ("support", "support@example.com"),
     ] {
         let id = execution(&ctx, pack_ref, json!({})).await?;
-        let token = generate_execution_token_with_permission_sets(
-            identity,
-            id,
-            &format!("{pack_ref}.login"),
-            &config,
-            Some(60),
-            &["fixture.key_read".into()],
-        )?;
+        let token = delegated_key_token(&ctx, id, &["fixture.key_read".into()]).await?;
         let response = ctx
             .post(
                 "/api/v1/keys/system.salesforce_signer/sign-jwt",

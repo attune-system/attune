@@ -392,15 +392,11 @@ impl EnforcementProcessor {
                     .clone()
                     .unwrap_or(action_default_permission_set_refs)
             });
-        let retained =
-            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
-                &mut tx,
-                attune_common::repositories::runtime_authority::RuntimeOwner::Enforcement(
-                    enforcement.id,
-                ),
-            )
-            .await?
-            .is_some();
+        let retained=attune_common::repositories::execution_admission::ExecutionAdmissionRepository::enforcement_is_recorded(&mut tx,enforcement.id).await?;
+        if !rule.is_adhoc || retained {
+            attune_common::execution_authority::RecordedConsumerReadiness::default()
+                .require_ready()?;
+        }
         let admission = if !rule.is_adhoc || retained {
             Some(attune_common::repositories::execution_admission::ExecutionAdmissionRepository::inherit(
                 &mut tx, attune_common::repositories::runtime_authority::RuntimeOwner::Enforcement(enforcement.id), &snapshot,
@@ -492,6 +488,9 @@ impl EnforcementProcessor {
             ).await?;
             if !inherited {
                 bail!("Enforcement is missing its immutable schema binding");
+            }
+            if admission.is_none() {
+                attune_common::repositories::delegated_execution::DelegatedExecutionRepository::select(&mut tx,execution.id,None).await?;
             }
             ExecutionSecretValueRepository::copy_entity(
                 &mut *tx,

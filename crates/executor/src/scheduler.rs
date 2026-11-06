@@ -1175,8 +1175,10 @@ impl ExecutionScheduler {
                     let metadata_caches = metadata_caches.clone();
                     let workflow_log_transport = workflow_log_transport.clone();
 
-                    async move {
-                        if let Err(e) = Self::process_execution_requested(
+                    // Keep native workflow scheduling state off the consumer's
+                    // stack, including when the broker has not delivered work.
+                    Box::pin(async move {
+                        if let Err(e) = Box::pin(Self::process_execution_requested(
                             &pool,
                             &publisher,
                             &policy_enforcer,
@@ -1188,7 +1190,7 @@ impl ExecutionScheduler {
                             workflow_log_flush_interval_ms,
                             &metadata_caches,
                             &envelope,
-                        )
+                        ))
                         .await
                         {
                             error!("Error scheduling execution: {}", e);
@@ -1199,7 +1201,7 @@ impl ExecutionScheduler {
                             return Err(format!("Failed to schedule execution: {}", e).into());
                         }
                         Ok(())
-                    }
+                    })
                 },
             )
             .await?;
@@ -1281,14 +1283,14 @@ impl ExecutionScheduler {
                     workflow_log_segment_max_bytes,
                     workflow_log_flush_interval_ms,
                 };
-                return Self::process_claimed_execution(
+                return Box::pin(Self::process_claimed_execution(
                     pool,
                     publisher,
                     policy_enforcer,
                     &request_context,
                     execution,
                     metadata_caches,
-                )
+                ))
                 .await;
             }
 
@@ -1334,14 +1336,14 @@ impl ExecutionScheduler {
                 }
             };
 
-        Self::process_claimed_execution(
+        Box::pin(Self::process_claimed_execution(
             pool,
             publisher,
             policy_enforcer,
             &request_context,
             execution,
             metadata_caches,
-        )
+        ))
         .await
     }
 
@@ -1358,22 +1360,14 @@ impl ExecutionScheduler {
         // Fetch action to determine runtime requirements
         let action = Self::get_action_for_execution(pool, metadata_caches, &execution).await?;
         let mut tx = pool.begin().await?;
-        let recorded =
-            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
-                &mut tx,
-                attune_common::repositories::runtime_authority::RuntimeOwner::Execution(
-                    execution.id,
-                ),
-            )
-            .await?
-            .is_some();
-        if recorded || !action.is_adhoc {
-            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::require(
-                &mut tx, attune_common::repositories::runtime_authority::RuntimeOwner::Execution(execution.id),
-            ).await?;
+        let authority = attune_common::repositories::execution_runtime_admission::ExecutionAdmissionRepository::existing_authority(&mut tx,execution.id).await?;
+        let recorded = authority == attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Recorded;
+        if recorded {
+            attune_common::execution_authority::RecordedConsumerReadiness::default()
+                .require_ready()?;
         }
         tx.commit().await?;
-        if !recorded && action.is_adhoc && (!action.enabled || action.retired_at.is_some()) {
+        if !recorded && (!action.enabled || action.retired_at.is_some()) {
             Self::fail_unschedulable_execution(
                 pool,
                 publisher,
@@ -1504,7 +1498,7 @@ impl ExecutionScheduler {
         // A workflow holds a shared slot only when its own action participates.
         // Child actions use their normal, independent scheduling admissions.
         if action.workflow_def.is_some() {
-            let result = Self::process_workflow_execution(
+            let result = Box::pin(Self::process_workflow_execution(
                 pool,
                 publisher,
                 request_context.round_robin_counter,
@@ -1516,7 +1510,7 @@ impl ExecutionScheduler {
                 &execution,
                 &action,
                 metadata_caches,
-            )
+            ))
             .await;
             if result.is_err() {
                 Self::revert_scheduling_claim(pool, execution_id).await?;
@@ -1527,12 +1521,12 @@ impl ExecutionScheduler {
         // Regular action: select appropriate worker only after policy
         // readiness is confirmed, so queued executions don't reserve stale
         // workers while they wait.
-        let worker = match Self::select_worker_for_action_execution(
+        let worker = match Box::pin(Self::select_worker_for_action_execution(
             pool,
             &action,
             Some(&execution),
             request_context.round_robin_counter,
-        )
+        ))
         .await
         {
             Ok(worker) => worker,
@@ -1701,14 +1695,14 @@ impl ExecutionScheduler {
                         "Recovered stale scheduling claim for execution {} after failed initial claim",
                         execution_id
                     );
-                    return Self::process_claimed_execution(
+                    return Box::pin(Self::process_claimed_execution(
                         pool,
                         publisher,
                         policy_enforcer,
                         request_context,
                         execution,
                         metadata_caches,
-                    )
+                    ))
                     .await;
                 }
 
@@ -2541,6 +2535,7 @@ impl ExecutionScheduler {
         task_node: &crate::workflow::graph::TaskNode,
         binding: &attune_common::repositories::schema_contract::ActionSchemaBinding,
         wf_ctx: &WorkflowContext,
+        deferred_defaults: bool,
     ) -> Result<RenderedWorkflowTaskInput> {
         let rendered =
             if task_node.input.is_object() && !task_node.input.as_object().unwrap().is_empty() {
@@ -2586,10 +2581,6 @@ impl ExecutionScheduler {
             .collect::<Vec<_>>();
         let contract = attune_common::value_schema::CompiledContract::new(&binding.input)?;
         let supplied = rendered_value.clone();
-        let deferred_defaults = parent_execution
-            .executable_snapshot
-            .as_ref()
-            .is_some_and(|snapshot| !snapshot.executable.action.is_adhoc);
         let rendered_value = if deferred_defaults {
             rendered_value
         } else {
@@ -2955,7 +2946,19 @@ impl ExecutionScheduler {
         let context =
             Self::bind_workflow_task_keys(&mut *conn, parent, task, context, encryption_key)
                 .await?;
-        let rendered = Self::render_workflow_task_input(parent, &config, task, &binding, &context)?;
+        let rendered = Self::render_workflow_task_input(
+            parent,
+            &config,
+            task,
+            &binding,
+            &context,
+            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
+                &mut *conn,
+                attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent.id),
+            )
+            .await?
+            .is_some(),
+        )?;
         Ok((binding, rendered))
     }
 
@@ -3561,16 +3564,13 @@ impl ExecutionScheduler {
         {
             return attune_common::repositories::execution_admission::ExecutionAdmissionRepository::resolve_workflow_snapshot(&mut connection, parent.id, task, action_ref).await.map_err(Into::into);
         }
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::validate(
+            &mut connection,
+            parent.id,
+        )
+        .await?;
         drop(connection);
-        if parent
-            .executable_snapshot
-            .as_ref()
-            .is_some_and(|snapshot| !snapshot.executable.action.is_adhoc)
-        {
-            return Err(anyhow::anyhow!(
-                "Managed workflow snapshot requires its retained admission"
-            ));
-        }
+
         if let Some(binding) = attune_common::repositories::schema_contract::SchemaContractRepository::find_with_executor(
             pool, attune_common::repositories::schema_contract::BindingOwner::Execution, parent.id,
         ).await? {
@@ -3604,15 +3604,11 @@ impl ExecutionScheduler {
         {
             return attune_common::repositories::execution_admission::ExecutionAdmissionRepository::resolve_workflow_snapshot(conn, parent.id, task, action_ref).await.map_err(Into::into);
         }
-        if parent
-            .executable_snapshot
-            .as_ref()
-            .is_some_and(|snapshot| !snapshot.executable.action.is_adhoc)
-        {
-            return Err(anyhow::anyhow!(
-                "Managed workflow snapshot requires its retained admission"
-            ));
-        }
+
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::validate(
+            conn, parent.id,
+        )
+        .await?;
         if let Some(binding) = attune_common::repositories::schema_contract::SchemaContractRepository::find_with_executor(
             &mut *conn, attune_common::repositories::schema_contract::BindingOwner::Execution, parent.id,
         ).await? {
@@ -4014,9 +4010,7 @@ impl ExecutionScheduler {
         }
 
         let mut publication = pool.begin().await?;
-        let prepared_publication =
-            RetryInputs::prepare_publication(&mut publication, &retry_execution, execution.id, key)
-                .await?;
+        let prepared_publication = attune_common::repositories::requested_execution_publication::RequestedExecutionPublicationRepository::prepare(&mut publication,&retry_execution,key).await?.ok_or_else(||anyhow::anyhow!("Retry publication is no longer eligible"))?;
         prepared_publication.lock_target(&mut publication).await?;
         let payload = ExecutionRequestedPayload {
             execution_id: retry_execution.id,
@@ -4823,7 +4817,8 @@ impl ExecutionScheduler {
                 task_node,
                 &child_binding,
                 &task_context,
-            )?)
+attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(&mut *conn,attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent_execution.id)).await?.is_some(),
+)?)
         };
         let task_config = rendered_input.as_ref().and_then(|rendered| {
             if rendered.value.is_object() && !rendered.value.as_object().unwrap().is_empty() {
@@ -5241,11 +5236,7 @@ impl ExecutionScheduler {
                     )
                 },
             )?;
-        let recorded = parent_execution
-            .executable_snapshot
-            .as_ref()
-            .is_some_and(|snapshot| !snapshot.executable.action.is_adhoc)
-            || attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(conn, attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent_execution.id)).await.map_err(CacheIterationInitializationError::infrastructure)?.is_some();
+        let recorded=attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(conn,parent_execution.id).await.map_err(CacheIterationInitializationError::infrastructure)?;
         if !recorded
             && !named_cache_permission_refs_are_delegated(
                 &permission_set_refs,
@@ -5610,7 +5601,8 @@ impl ExecutionScheduler {
                 task_node,
                 &child_binding,
                 &item_ctx,
-            )?;
+attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(&mut *conn,attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent_execution.id)).await?.is_some(),
+)?;
             let task_config = if rendered_input.value.is_object()
                 && !rendered_input
                     .value
@@ -5909,7 +5901,8 @@ impl ExecutionScheduler {
                 task_node,
                 &child_binding,
                 &item_ctx,
-            )?;
+attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(&mut *pool.acquire().await?,attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent_execution.id)).await?.is_some(),
+)?;
 
             // Store as flat parameters (consistent with manual and rule-triggered
             // executions) — no {"parameters": ...} wrapper.
@@ -6206,7 +6199,8 @@ impl ExecutionScheduler {
                 task_node,
                 &child_binding,
                 &item_ctx,
-            )?;
+attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(&mut *conn,attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent_execution.id)).await?.is_some(),
+)?;
 
             let task_config: Option<JsonValue> = if rendered_input.value.is_object()
                 && !rendered_input.value.as_object().unwrap().is_empty()
@@ -9862,7 +9856,39 @@ impl ExecutionScheduler {
         };
 
         // Find available action workers (role = 'action')
-        let workers = WorkerRepository::find_action_workers(pool).await?;
+        let require_delegated = if let Some(execution) = execution {
+            attune_common::repositories::delegated_execution::DelegatedExecutionRepository::find(
+                &mut *pool.acquire().await?,
+                execution.id,
+            )
+            .await?
+            .mode
+                == "delegated"
+        } else {
+            false
+        };
+        let workers: Vec<_> = WorkerRepository::find_action_workers(pool)
+            .await?
+            .into_iter()
+            .filter(|worker| {
+                !require_delegated
+                    || worker
+                        .capabilities
+                        .as_ref()
+                        .and_then(|caps| {
+                            caps.get(
+                                attune_common::execution_authority::DELEGATED_EXECUTION_CAPABILITY,
+                            )
+                        })
+                        .and_then(JsonValue::as_bool)
+                        == Some(true)
+            })
+            .collect();
+        if require_delegated && workers.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No compatible workers found with delegated execution authority v1 completion readiness"
+            ));
+        }
 
         if workers.is_empty() {
             return Err(anyhow::anyhow!("No action workers available"));
@@ -11536,7 +11562,8 @@ tasks:
                     task,
                     &binding,
                     &fixture.context,
-                )?;
+true,
+)?;
                 let expected = if explicit_null { JsonValue::Null } else { serde_json::json!({}) };
                 anyhow::ensure!(rendered.supplied == expected, "renderer must preserve absence versus explicit null");
                 anyhow::ensure!(rendered.value == expected, "managed rendering must defer schema acceptance");

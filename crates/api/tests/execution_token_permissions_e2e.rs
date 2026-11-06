@@ -5,7 +5,7 @@
 
 use attune_common::{
     auth::jwt::{
-        generate_execution_token_with_permission_sets,
+        generate_delegated_execution_token,
         generate_execution_token_with_permission_sets_and_standard_access, JwtConfig,
         STANDARD_EXECUTION_ACCESS_REF,
     },
@@ -356,31 +356,17 @@ async fn create_parent_execution(
     action: &Action,
     identity: &Identity,
 ) -> TResult<Execution> {
-    Ok(ExecutionRepository::create(
+    let pack = PackRepository::find_by_id(pool, action.pack)
+        .await?
+        .unwrap();
+    Box::pin(helpers::activate_test_pack_release(pool, &pack)).await?;
+    Box::pin(create_pinned_ad_hoc_parent(
         pool,
-        CreateExecutionInput {
-            action: Some(action.id),
-            action_ref: action.r#ref.clone(),
-            config: None,
-            env_vars: None,
-            parent: None,
-            enforcement: None,
-            executor: Some(identity.id),
-            permission_set_refs: Vec::new(),
-            artifact_retention_policy: None,
-            artifact_retention_limit: None,
-            worker_selector: None,
-            worker_tolerations: None,
-            worker_affinity: None,
-            worker: None,
-            status: ExecutionStatus::Running,
-            trace_tag: None,
-            result: None,
-            workflow_task: None,
-            timeout_seconds: None,
-        },
-    )
-    .await?)
+        action,
+        identity,
+        &action.default_execution_permission_set_refs,
+    ))
+    .await
 }
 
 async fn create_pinned_ad_hoc_parent(
@@ -393,10 +379,12 @@ async fn create_pinned_ad_hoc_parent(
         executable_snapshot::ExecutableSnapshotRepository,
         schema_contract::{BindingOwner, SchemaContractRepository},
     };
-    assert!(action.is_adhoc, "human-owned token fixture must be ad hoc");
     let mut tx = pool.begin().await?;
     let snapshot = ExecutableSnapshotRepository::resolve_for_action(&mut *tx, action.id).await?;
-    let binding = SchemaContractRepository::materialize_action(&mut tx, &snapshot).await?;
+    let binding = Box::pin(SchemaContractRepository::materialize_action(
+        &mut tx, &snapshot,
+    ))
+    .await?;
     let execution = ExecutionRepository::create_pinned(
         &mut *tx,
         CreateExecutionInput {
@@ -404,7 +392,7 @@ async fn create_pinned_ad_hoc_parent(
             action_ref: action.r#ref.clone(),
             executor: Some(identity.id),
             permission_set_refs: refs.to_vec(),
-            status: ExecutionStatus::Running,
+            status: ExecutionStatus::Requested,
             ..Default::default()
         },
         &snapshot,
@@ -412,43 +400,104 @@ async fn create_pinned_ad_hoc_parent(
     .await?;
     SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, execution.id, &binding)
         .await?;
+    Box::pin(
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::select(
+            &mut tx,
+            execution.id,
+            None,
+        ),
+    )
+    .await?;
+    Box::pin(start_delegated_fixture(&mut tx, execution.id)).await?;
     tx.commit().await?;
-    Ok(execution)
+    Ok(ExecutionRepository::find_by_id(pool, execution.id)
+        .await?
+        .unwrap())
 }
 
-fn execution_token(
+async fn start_delegated_fixture(conn: &mut sqlx::PgConnection, execution: i64) -> TResult<()> {
+    use attune_common::repositories::{
+        execution::UpdateExecutionInput,
+        runtime::{CreateWorkerInput, WorkerRepository},
+    };
+    let worker = WorkerRepository::create(
+        &mut *conn,
+        CreateWorkerInput {
+            name: format!("authority-consumer-{}", uuid::Uuid::new_v4()),
+            worker_type: WorkerType::Local,
+            runtime: None,
+            host: None,
+            port: None,
+            status: Some(WorkerStatus::Active),
+            capabilities: None,
+            meta: None,
+        },
+    )
+    .await?;
+    ExecutionRepository::update(
+        &mut *conn,
+        execution,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Scheduled),
+            worker: Some(worker.id),
+            ..Default::default()
+        },
+    )
+    .await?;
+    attune_common::repositories::delegated_execution::DelegatedExecutionRepository::start(
+        conn, execution, worker.id,
+    )
+    .await?;
+    ExecutionRepository::update(
+        &mut *conn,
+        execution,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Running),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn execution_token(
+    pool: &PgPool,
     identity: &Identity,
     parent_execution: &Execution,
     action: &Action,
     refs: &[String],
 ) -> TResult<String> {
-    Ok(generate_execution_token_with_permission_sets(
+    let attempt=attune_common::repositories::delegated_execution::DelegatedExecutionRepository::current_attempt(&mut *pool.acquire().await?,parent_execution.id).await?;
+    Ok(generate_delegated_execution_token(
         identity.id,
         parent_execution.id,
         &action.r#ref,
         &jwt_config(),
-        Some(600),
+        600,
         refs,
+        std::slice::from_ref(&action.r#ref),
+        attempt,
     )?)
 }
 
-fn standard_execution_token(
+async fn standard_execution_token(
+    pool: &PgPool,
     identity: &Identity,
     execution: &Execution,
     action_ref: &str,
     standard_action_refs: &[String],
 ) -> TResult<String> {
-    Ok(
-        generate_execution_token_with_permission_sets_and_standard_access(
-            identity.id,
-            execution.id,
-            action_ref,
-            &jwt_config(),
-            Some(600),
-            &[STANDARD_EXECUTION_ACCESS_REF.to_string()],
-            standard_action_refs,
-        )?,
-    )
+    let attempt=attune_common::repositories::delegated_execution::DelegatedExecutionRepository::current_attempt(&mut *pool.acquire().await?,execution.id).await?;
+    Ok(generate_delegated_execution_token(
+        identity.id,
+        execution.id,
+        action_ref,
+        &jwt_config(),
+        600,
+        &[STANDARD_EXECUTION_ACCESS_REF.to_string()],
+        standard_action_refs,
+        attempt,
+    )?)
 }
 
 fn execute_body(action: &Action, permission_set_refs: Option<Vec<String>>) -> Value {
@@ -490,7 +539,8 @@ async fn pack_updates_require_execution_token_configure_permission() -> TResult<
     .await?;
     assign_permission_set(&ctx.pool, &identity, &configure).await?;
 
-    let denied_token = execution_token(&identity, &parent_execution, &action, &[])?;
+    let denied_token =
+        execution_token(&ctx.pool, &identity, &parent_execution, &action, &[]).await?;
     let denied = ctx
         .put(
             &format!("/api/v1/packs/{target_pack_ref}"),
@@ -506,12 +556,21 @@ async fn pack_updates_require_execution_token_configure_permission() -> TResult<
     assert_eq!(unchanged.config, json!({}));
     assert_eq!(unchanged.label, "Original label");
 
-    let authorized_token = execution_token(
+    let authorized_parent = create_pinned_ad_hoc_parent(
+        &ctx.pool,
+        &action,
         &identity,
-        &parent_execution,
+        std::slice::from_ref(&configure_ref),
+    )
+    .await?;
+    let authorized_token = execution_token(
+        &ctx.pool,
+        &identity,
+        &authorized_parent,
         &action,
         std::slice::from_ref(&configure_ref),
-    )?;
+    )
+    .await?;
     let authorized = ctx
         .put(
             &format!("/api/v1/packs/{target_pack_ref}"),
@@ -603,7 +662,8 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
     let missing_token = ctx.get("/api/v1/runtimes", None).await?;
     assert_eq!(missing_token.status(), StatusCode::UNAUTHORIZED);
 
-    let empty_token = execution_token(&identity, &parent_execution, &action, &[])?;
+    let empty_token =
+        execution_token(&ctx.pool, &identity, &parent_execution, &action, &[]).await?;
     let empty_read = ctx.get("/api/v1/runtimes", Some(&empty_token)).await?;
     assert_eq!(empty_read.status(), StatusCode::FORBIDDEN);
 
@@ -623,7 +683,14 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
     ];
     let read_only_parent =
         create_pinned_ad_hoc_parent(&ctx.pool, &action, &identity, &read_only_refs).await?;
-    let read_only_token = execution_token(&identity, &read_only_parent, &action, &read_only_refs)?;
+    let read_only_token = execution_token(
+        &ctx.pool,
+        &identity,
+        &read_only_parent,
+        &action,
+        &read_only_refs,
+    )
+    .await?;
 
     let runtime_read = ctx.get("/api/v1/runtimes", Some(&read_only_token)).await?;
     assert_eq!(runtime_read.status(), StatusCode::OK);
@@ -657,11 +724,23 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
     let execute_only_refs = vec![action_execute_ref.clone()];
     let execute_only_parent =
         create_pinned_ad_hoc_parent(&ctx.pool, &action, &identity, &execute_only_refs).await?;
-    let execute_only_token =
-        execution_token(&identity, &execute_only_parent, &action, &execute_only_refs)?;
+    let execute_only_token = execution_token(
+        &ctx.pool,
+        &identity,
+        &execute_only_parent,
+        &action,
+        &execute_only_refs,
+    )
+    .await?;
 
-    let unbound_selection =
-        execution_token(&identity, &parent_execution, &action, &execute_only_refs)?;
+    let unbound_selection = execution_token(
+        &ctx.pool,
+        &identity,
+        &parent_execution,
+        &action,
+        &execute_only_refs,
+    )
+    .await?;
     let mismatched = ctx
         .post(
             "/api/v1/executions/execute",
@@ -749,7 +828,14 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
     let combined_refs = vec![action_execute_ref.clone(), runtime_read_ref.clone()];
     let combined_parent =
         create_pinned_ad_hoc_parent(&ctx.pool, &action, &identity, &combined_refs).await?;
-    let combined_token = execution_token(&identity, &combined_parent, &action, &combined_refs)?;
+    let combined_token = execution_token(
+        &ctx.pool,
+        &identity,
+        &combined_parent,
+        &action,
+        &combined_refs,
+    )
+    .await?;
 
     let combined_runtime_read = ctx.get("/api/v1/runtimes", Some(&combined_token)).await?;
     assert_eq!(combined_runtime_read.status(), StatusCode::OK);
@@ -841,11 +927,13 @@ async fn standard_execution_access_covers_action_and_pack_scoped_resources() -> 
 
     let execution = create_parent_execution(&ctx.pool, &action, &identity).await?;
     let token = standard_execution_token(
+        &ctx.pool,
         &identity,
         &execution,
         &action.r#ref,
         std::slice::from_ref(&action.r#ref),
-    )?;
+    )
+    .await?;
 
     assert_eq!(
         ctx.get(&format!("/api/v1/keys/{}", pack_key_ref), Some(&token))
@@ -968,14 +1056,82 @@ async fn workflow_task_standard_access_includes_workflow_action_scope() -> TResu
     create_artifact_for_action(&ctx.pool, &sql_action, &sql_artifact_ref).await?;
     create_artifact_for_pack(&ctx.pool, &unrelated_pack, &unrelated_artifact_ref).await?;
 
+    WorkflowDefinitionRepository::update(&ctx.pool,workflow_action.workflow_def.unwrap(),
+        attune_common::repositories::workflow::UpdateWorkflowDefinitionInput {
+            definition:Some(json!({"version":"1.0","tasks":[{"name":"query","action":sql_action.r#ref,"next":[]}]})),
+            ..Default::default()
+        }).await?;
+    helpers::activate_test_pack_release(&ctx.pool, &sql_pack).await?;
     let workflow_execution =
         create_parent_execution(&ctx.pool, &workflow_action, &identity).await?;
+    let mut tx = ctx.pool.begin().await?;
+    use attune_common::repositories::{
+        executable_snapshot::ExecutableSnapshotRepository,
+        schema_contract::{BindingOwner, SchemaContractRepository},
+        workflow::{CreateWorkflowExecutionInput, WorkflowExecutionRepository},
+    };
+    let wf = WorkflowExecutionRepository::create(
+        &mut *tx,
+        CreateWorkflowExecutionInput {
+            execution: workflow_execution.id,
+            workflow_def: workflow_action.workflow_def.unwrap(),
+            task_graph: json!({}),
+            variables: json!({}),
+            status: ExecutionStatus::Running,
+        },
+    )
+    .await?;
+    let snapshot =
+        ExecutableSnapshotRepository::resolve_for_action(&mut *tx, sql_action.id).await?;
+    let binding = Box::pin(SchemaContractRepository::materialize_action(
+        &mut tx, &snapshot,
+    ))
+    .await?;
+    let child = ExecutionRepository::create_pinned(
+        &mut *tx,
+        CreateExecutionInput {
+            action: Some(sql_action.id),
+            action_ref: sql_action.r#ref.clone(),
+            executor: Some(identity.id),
+            parent: Some(workflow_execution.id),
+            permission_set_refs: vec![STANDARD_EXECUTION_ACCESS_REF.into()],
+            workflow_task: Some(WorkflowTaskMetadata {
+                workflow_execution: wf.id,
+                task_name: "query".into(),
+                triggered_by: None,
+                task_index: None,
+                task_batch: None,
+                retry_count: 0,
+                max_retries: 0,
+                next_retry_at: None,
+                timeout_seconds: None,
+                timed_out: false,
+                duration_ms: None,
+                started_at: None,
+                completed_at: None,
+            }),
+            ..Default::default()
+        },
+        &snapshot,
+    )
+    .await?;
+    SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, child.id, &binding).await?;
+    attune_common::repositories::delegated_execution::DelegatedExecutionRepository::select(
+        &mut tx,
+        child.id,
+        Some(workflow_execution.id),
+    )
+    .await?;
+    start_delegated_fixture(&mut tx, child.id).await?;
+    tx.commit().await?;
     let token = standard_execution_token(
+        &ctx.pool,
         &identity,
-        &workflow_execution,
+        &child,
         &sql_action.r#ref,
         &[sql_action.r#ref.clone(), workflow_action.r#ref.clone()],
-    )?;
+    )
+    .await?;
 
     for key_ref in [
         &workflow_pack_key_ref,

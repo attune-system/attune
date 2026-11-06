@@ -2067,11 +2067,17 @@ async fn seal_log_stream(
     // Shared append uses source -> artifact advisory -> version -> stream ->
     // flock. Sealing must acquire the same locks before taking its file snapshot.
     let trace = SharedGraphTransactionTrace::new("api.log_stream_seal");
-    let operation = async {
+    let operation = Box::pin(async {
         let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
         trace.begun();
         trace.stage("version_authorization");
-        let effect = authorize_version_mutation(&state, &mut transaction, &user, &version).await?;
+        let effect = Box::pin(authorize_version_mutation(
+            &state,
+            &mut transaction,
+            &user,
+            &version,
+        ))
+        .await?;
         trace.stage("version_and_stream_locks");
         let version =
             ArtifactVersionRepository::find_by_id_for_update(&mut transaction, artifact_version)
@@ -2087,7 +2093,7 @@ async fn seal_log_stream(
             .await
             .map_err(map_repository_error)?;
         trace.stage("encrypted_seal_proof");
-        let proof = encrypted_log_seal_proof(
+        let proof = Box::pin(encrypted_log_seal_proof(
             &mut transaction,
             &state,
             &user,
@@ -2095,7 +2101,7 @@ async fn seal_log_stream(
             &stream,
             &headers,
             &effect,
-        )
+        ))
         .await?;
         let mut verifier = proof.as_ref().map(|proof| {
             attune_common::runtime_log_completion::FrameVerifier::new(
@@ -2105,13 +2111,10 @@ async fn seal_log_stream(
                     .encryption_key
                     .as_deref()
                     .expect("validated encryption key"),
-                proof.context.execution,
+                proof.execution,
                 version.id,
-                proof
-                    .permit
-                    .max_plaintext_bytes
-                    .expect("validated plaintext cap") as u64,
-                proof.permit.max_bytes as u64,
+                proof.plaintext_cap,
+                proof.ciphertext_cap,
             )
         });
         trace.stage("shared_file_snapshot");
@@ -2137,7 +2140,9 @@ async fn seal_log_stream(
                     .inspect_log_file(file_path, Some(permit.max_bytes as u64))
                     .await
             } else {
-                transport.inspect_log_file(file_path, None).await
+                transport
+                    .inspect_log_file(file_path, proof.as_ref().map(|proof| proof.ciphertext_cap))
+                    .await
             };
             Some(snapshot.map_err(map_transport_error)?)
         } else {
@@ -2275,8 +2280,11 @@ async fn seal_log_stream(
                 .ensure_fresh_on(&mut transaction)
                 .await
                 .map_err(map_api_error)?;
-            attune_common::repositories::runtime_log_completion::RuntimeLogCompletionRepository::record(
-            &mut transaction,&proof.context,&proof.permit,&proof.manifest,&proof.authenticated,query.truncated).await.map_err(map_transport_error)?;
+            if let Some((context, permit)) = &proof.recorded {
+                attune_common::repositories::runtime_log_completion::RuntimeLogCompletionRepository::record(
+                &mut transaction,context,permit,&proof.manifest,&proof.authenticated,query.truncated).await.map_err(map_transport_error)?;
+            }
+
             ArtifactVersionRepository::set_encrypted_log_manifest(
                 &mut transaction,
                 version.id,
@@ -2352,8 +2360,7 @@ async fn seal_log_stream(
             ));
         }
         trace.stage("final_freshness_and_publication");
-        effect
-            .ensure_fresh_on(&mut transaction)
+        Box::pin(effect.ensure_fresh_on(&mut transaction))
             .await
             .map_err(map_api_error)?;
         if let Some((snapshot, _, _)) = &shared_snapshot {
@@ -2401,8 +2408,7 @@ async fn seal_log_stream(
                 "Log artifact could not be marked ready".to_string(),
             ));
         }
-        effect
-            .ensure_fresh_on(&mut transaction)
+        Box::pin(effect.ensure_fresh_on(&mut transaction))
             .await
             .map_err(map_api_error)?;
         trace.stage("commit");
@@ -2423,7 +2429,7 @@ async fn seal_log_stream(
             "Sealed runtime log stream"
         );
         Ok(StatusCode::OK)
-    };
+    });
     let result = trace.observe(operation).await;
     trace.operation_result(match &result {
         Ok(_) => "success",
@@ -2442,8 +2448,13 @@ fn log_stream_seal_is_complete(
 }
 
 struct EncryptedLogSeal {
-    context: attune_common::repositories::worker_delivery::DeliveryContext,
-    permit: attune_common::repositories::worker_delivery::DeliveryPermit,
+    recorded: Option<(
+        attune_common::repositories::worker_delivery::DeliveryContext,
+        attune_common::repositories::worker_delivery::DeliveryPermit,
+    )>,
+    execution: i64,
+    plaintext_cap: u64,
+    ciphertext_cap: u64,
     manifest: attune_common::runtime_log_completion::FinalLogManifest,
     authenticated: String,
 }
@@ -2489,6 +2500,63 @@ async fn encrypted_log_seal_proof(
     if encoding != Some(attune_common::runtime_read_log::ENCODING) {
         return Err(denied());
     }
+    if permit.is_none() && user.claims.token_type == TokenType::Worker {
+        let execution = version.execution.ok_or_else(denied)?;
+        let worker = pack_candidate_worker_id(user)?;
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::require_completion(tx,execution,worker).await.map_err(map_transport_error)?;
+        let authenticated = headers
+            .get("x-attune-log-final-manifest")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(denied)?
+            .to_owned();
+        let key = state
+            .config
+            .security
+            .encryption_key
+            .as_deref()
+            .ok_or_else(denied)?;
+        let manifest =
+            attune_common::runtime_log_completion::FinalLogManifest::open(key, &authenticated)
+                .map_err(map_transport_error)?;
+        let stream_name = version
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("stream"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(denied)?;
+        let plaintext_cap = match stream_name {
+            "stdout" => state
+                .config
+                .worker
+                .as_ref()
+                .map(|w| w.max_stdout_bytes)
+                .unwrap_or(10 * 1024 * 1024) as u64,
+            "stderr" => state
+                .config
+                .worker
+                .as_ref()
+                .map(|w| w.max_stderr_bytes)
+                .unwrap_or(10 * 1024 * 1024) as u64,
+            _ => return Err(denied()),
+        };
+        let ciphertext_cap = attune_common::runtime_read_log::maximum_encoded_bytes(plaintext_cap)
+            .map_err(map_transport_error)?;
+        if manifest.execution != execution
+            || manifest.version != version.id
+            || manifest.plaintext_bytes > plaintext_cap
+            || manifest.ciphertext_bytes > ciphertext_cap
+        {
+            return Err(denied());
+        }
+        return Ok(Some(EncryptedLogSeal {
+            recorded: None,
+            execution,
+            plaintext_cap,
+            ciphertext_cap,
+            manifest,
+            authenticated,
+        }));
+    }
     let credential = attune_common::worker_delivery::credential(&user.claims)
         .map_err(map_transport_error)?
         .ok_or_else(denied)?;
@@ -2530,8 +2598,10 @@ async fn encrypted_log_seal_proof(
         return Err(denied());
     }
     Ok(Some(EncryptedLogSeal {
-        context,
-        permit,
+        execution: context.execution,
+        plaintext_cap: permit.max_plaintext_bytes.ok_or_else(denied)? as u64,
+        ciphertext_cap: permit.max_bytes as u64,
+        recorded: Some((context, permit)),
         manifest,
         authenticated,
     }))
@@ -4564,8 +4634,7 @@ async fn authorize_version_mutation(
             "Recorded file version execution mismatch".into(),
         ));
     }
-    let process = user
-        .validate_recorded_runtime_authority(tx)
+    let process = Box::pin(user.validate_recorded_runtime_authority(tx))
         .await
         .map_err(map_transport_error)?;
     let process_delivery = if let Some(authority) = &process {
@@ -4614,19 +4683,34 @@ async fn authorize_version_mutation(
         );
     } else if user.claims.token_type == TokenType::Worker {
         if let Some(execution) = version.execution {
-            if attune_common::repositories::runtime_authority::RuntimeAuthorityRepository::execution_admission(tx, execution)
-                .await.map_err(map_transport_error)?.is_some() {
-                return Err((StatusCode::FORBIDDEN, "Recorded file delivery requires a purpose-specific worker permit".into()));
+            let native = user.claims.sub == "0"
+                && user
+                    .claims
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("worker_id"))
+                    .and_then(|v| v.as_str())
+                    == Some("executor")
+                && version
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.get("kind"))
+                    .and_then(|v| v.as_str())
+                    == Some("workflow_log");
+            if native {
+                attune_common::repositories::delegated_execution::DelegatedExecutionRepository::require_native_log(tx,execution).await.map_err(map_transport_error)?;
+            } else {
+                attune_common::repositories::delegated_execution::DelegatedExecutionRepository::require_completion(tx,execution,pack_candidate_worker_id(user)?).await.map_err(map_transport_error)?;
             }
         }
     }
     let file_origin_budget = if process.is_some() || worker.is_some() {
-        crate::file_origins::prepare_existing(
+        Box::pin(crate::file_origins::prepare_existing(
             tx,
             process.as_ref(),
             version.id,
             state.config.security.encryption_key.as_deref(),
-        )
+        ))
         .await
         .map_err(map_api_error)?
     } else {
@@ -4639,12 +4723,12 @@ async fn authorize_version_mutation(
         worker,
         file_origin_budget,
     };
-    crate::recorded_files::authorize_publication(
+    Box::pin(crate::recorded_files::authorize_publication(
         tx,
         proof.process.as_ref(),
         version.id,
         version.artifact,
-    )
+    ))
     .await
     .map_err(map_api_error)?;
     // Even legacy writers acquire the advisory lock before version/stream rows.
@@ -4661,10 +4745,12 @@ async fn authorize_version_mutation(
         attune_common::repositories::worker_delivery::WorkerDeliveryRepository::require_owner_binding(
             tx, credential.permit, version.id).await.map_err(map_transport_error)?;
     }
-    crate::file_origins::require(tx, &proof, version.id)
+    Box::pin(crate::file_origins::require(tx, &proof, version.id))
         .await
         .map_err(map_api_error)?;
-    proof.ensure_fresh_on(tx).await.map_err(map_api_error)?;
+    Box::pin(proof.ensure_fresh_on(tx))
+        .await
+        .map_err(map_api_error)?;
     Ok(proof)
 }
 

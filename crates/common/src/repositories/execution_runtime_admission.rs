@@ -64,7 +64,69 @@ impl ExecutionAdmission {
 
 pub use super::execution_admission::ExecutionAdmissionRepository;
 
+/// The persisted authority decision is independent of executable ownership.
+/// Neither a missing admission nor an ad hoc snapshot authorizes delegation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExistingExecutionAuthority {
+    Recorded,
+    Delegated,
+}
+
+impl ExistingExecutionAuthority {
+    fn from_persisted(mode: &str) -> Result<Self> {
+        match mode {
+            "recorded" => Ok(Self::Recorded),
+            "delegated" => Ok(Self::Delegated),
+            _ => Err(Error::PermissionDenied(
+                "Execution authority selection is unavailable or invalid".into(),
+            )),
+        }
+    }
+}
+
 impl ExecutionAdmissionRepository {
+    /// Check persisted authority even for tokenless executions. Executable
+    /// ownership alone cannot grant delegated access. Existing recorded rows
+    /// always retain their authority, including revoked admissions.
+    pub async fn existing_authority(
+        connection: &mut PgConnection,
+        execution: Id,
+    ) -> Result<ExistingExecutionAuthority> {
+        let selection =
+            super::delegated_execution::DelegatedExecutionRepository::find(connection, execution)
+                .await?;
+        let selected_mode = ExistingExecutionAuthority::from_persisted(&selection.mode)?;
+        let authority = if selected_mode == ExistingExecutionAuthority::Recorded {
+            // Keep the full recorded/delegated validation state out of every
+            // enclosing native scheduler future's stack frame.
+            Box::pin(Self::require(
+                connection,
+                RuntimeOwner::Execution(execution),
+            ))
+            .await?;
+            ExistingExecutionAuthority::Recorded
+        } else {
+            Box::pin(
+                super::delegated_execution::DelegatedExecutionRepository::validate(
+                    connection, execution,
+                ),
+            )
+            .await?;
+            ExistingExecutionAuthority::Delegated
+        };
+        Ok(authority)
+    }
+
+    pub async fn is_recorded(connection: &mut PgConnection, execution: Id) -> Result<bool> {
+        Ok(Self::existing_authority(connection, execution).await?
+            == ExistingExecutionAuthority::Recorded)
+    }
+    pub async fn enforcement_is_recorded(
+        connection: &mut PgConnection,
+        enforcement: Id,
+    ) -> Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM enforcement_recorded_authority WHERE enforcement=$1) OR EXISTS(SELECT 1 FROM runtime_authority_admission WHERE owner_kind='enforcement' AND owner_id=$1)").bind(enforcement).fetch_one(connection).await?)
+    }
     /// A recorded task's contract is keyed by its exact policy-resolved metadata,
     /// never a ref-only parent cache or current static-child discovery.
     pub async fn workflow_schema(
@@ -72,10 +134,7 @@ impl ExecutionAdmissionRepository {
         parent: Id,
         snapshot: &ExecutionExecutableSnapshot,
     ) -> Result<super::schema_contract::ActionSchemaBinding> {
-        if Self::find(connection, RuntimeOwner::Execution(parent))
-            .await?
-            .is_some()
-        {
+        if Self::is_recorded(connection, parent).await? {
             Self::require(connection, RuntimeOwner::Execution(parent)).await?;
             super::schema_contract::SchemaContractRepository::materialize_action_pair(
                 connection, snapshot,
@@ -259,8 +318,8 @@ impl ExecutionAdmissionRepository {
         Ok(())
     }
 
-    /// Legacy ad-hoc delegation is a separate source. Fence its real row through
-    /// child creation; an unbound token cannot impersonate a recorded owner.
+    /// Delegated origins retain their real source through child creation.
+    /// An unbound credential cannot impersonate a recorded owner.
     pub async fn validate_legacy_origin(
         connection: &mut PgConnection,
         execution: Id,
@@ -269,25 +328,27 @@ impl ExecutionAdmissionRepository {
         refs: &[String],
     ) -> Result<()> {
         super::schema_type::SchemaTypeRepository::lock_selection(&mut *connection).await?;
-        type ExecutionSelectionRow = (String, Option<Id>, String, Vec<String>, bool);
+        type ExecutionSelectionRow = (String, Option<Id>, String, Vec<String>);
         let row: Option<ExecutionSelectionRow> = sqlx::query_as(
-            "SELECT status::text,executor,action_ref,permission_set_refs,COALESCE((executable_snapshot->'executable'->'action'->>'is_adhoc')::boolean,FALSE) FROM execution WHERE id = $1 FOR SHARE",
+            "SELECT status::text,executor,action_ref,permission_set_refs FROM execution WHERE id = $1 FOR SHARE",
         ).bind(execution).fetch_optional(&mut *connection).await?;
-        let Some((status, owner, action_ref, selected, adhoc)) = row else {
+        let Some((status, owner, action_ref, selected)) = row else {
             return Err(Error::PermissionDenied(
                 "Originating execution is unavailable".into(),
             ));
         };
-        if !adhoc
+        let delegated = super::delegated_execution::DelegatedExecutionRepository::validate(
+            connection, execution,
+        )
+        .await?;
+        if delegated.mode != "delegated"
             || status != "running"
             || owner != Some(identity)
             || action_ref != action
             || refs.is_empty()
             || selected.iter().collect::<std::collections::BTreeSet<_>>()
                 != refs.iter().collect::<std::collections::BTreeSet<_>>()
-            || Self::find(connection, RuntimeOwner::Execution(execution))
-                .await?
-                .is_some()
+            || Self::is_recorded(connection, execution).await?
         {
             return Err(Error::PermissionDenied(
                 "Originating legacy credential does not match its active ad-hoc execution".into(),
@@ -396,10 +457,7 @@ impl ExecutionAdmissionRepository {
         execution: Id,
         identity: Option<Id>,
     ) -> Result<Vec<crate::delegation::DelegationAuthority>> {
-        if Self::find(connection, RuntimeOwner::Execution(execution))
-            .await?
-            .is_some()
-        {
+        if Self::is_recorded(connection, execution).await? {
             let (_, fence) =
                 Self::require_with_fence(connection, RuntimeOwner::Execution(execution)).await?;
             Self::require_input_liveness(connection, execution).await?;
@@ -434,6 +492,7 @@ impl ExecutionAdmissionRepository {
         if queue.is_adhoc {
             return Ok(());
         }
+        crate::execution_authority::RecordedConsumerReadiness::default().require_ready()?;
         if item.queue != queue.id
             || item.queue_ref != queue.r#ref
             || item.pack_release != Some(snapshot.release.id)
@@ -721,9 +780,8 @@ impl ExecutionAdmissionRepository {
         execution: Id,
         identity: Option<Id>,
     ) -> Result<Option<crate::delegation::DelegationAuthority>> {
-        if Self::find(connection, RuntimeOwner::Execution(execution))
-            .await?
-            .is_some()
+        if Self::existing_authority(connection, execution).await?
+            == ExistingExecutionAuthority::Recorded
         {
             let (_, fence) =
                 Self::require_with_fence(connection, RuntimeOwner::Execution(execution)).await?;
@@ -731,18 +789,6 @@ impl ExecutionAdmissionRepository {
             let authority = Self::load_recorded_input_authority(connection, execution).await?;
             fence.ensure_fresh_on(connection).await?;
             return Ok(authority);
-        }
-        let row = super::execution::ExecutionRepository::find_by_id(&mut *connection, execution)
-            .await?
-            .ok_or_else(|| Error::PermissionDenied("Input execution is unavailable".into()))?;
-        if row
-            .executable_snapshot
-            .as_ref()
-            .is_some_and(|snapshot| !snapshot.executable.action.is_adhoc)
-        {
-            return Err(Error::PermissionDenied(
-                "Managed execution input admission is unavailable".into(),
-            ));
         }
         super::rule_authority::RuleAuthorityRepository::execution_input_authority(
             connection, execution, identity,
@@ -791,10 +837,7 @@ impl ExecutionAdmissionRepository {
     ) -> Result<super::execution::WorkflowTaskExecutionCreateOrGetResult> {
         let parent = input.parent;
         let source_closure = if let Some(parent) = parent {
-            if Self::find(connection, RuntimeOwner::Execution(parent))
-                .await?
-                .is_some()
-            {
+            if Self::is_recorded(connection, parent).await? {
                 Some(
                     super::native_input_origin::NativeInputOriginRepository::capture(
                         connection,
@@ -919,21 +962,17 @@ impl ExecutionAdmissionRepository {
             None
         } else {
             let retained = if let Some(parent) = parent {
-                Self::find(connection, RuntimeOwner::Execution(parent))
-                    .await?
-                    .is_some()
+                Self::is_recorded(connection, parent).await?
             } else {
                 false
             };
-            let managed_parent = if let Some(parent) = parent {
-                super::execution::ExecutionRepository::find_by_id(&mut *connection, parent)
-                    .await?
-                    .and_then(|execution| execution.executable_snapshot)
-                    .is_some_and(|snapshot| !snapshot.executable.action.is_adhoc)
-            } else {
-                false
-            };
-            if retained || managed_parent || !snapshot.executable.action.is_adhoc {
+            let recorded_parent = Self::existing_authority(
+                connection,
+                parent.ok_or_else(|| Error::validation("Workflow child requires parent"))?,
+            )
+            .await?
+                == ExistingExecutionAuthority::Recorded;
+            if retained || recorded_parent {
                 Some(
                     Self::workflow_child_prepared(
                         connection,
@@ -964,6 +1003,28 @@ impl ExecutionAdmissionRepository {
             )
             .await?;
         if result.created && !terminal {
+            if admission.is_none() {
+                let binding =
+                    super::schema_contract::SchemaContractRepository::workflow_child_binding(
+                        connection,
+                        parent.unwrap(),
+                        snapshot,
+                    )
+                    .await?;
+                super::schema_contract::SchemaContractRepository::attach(
+                    connection,
+                    super::schema_contract::BindingOwner::Execution,
+                    result.execution.id,
+                    &binding,
+                )
+                .await?;
+                super::delegated_execution::DelegatedExecutionRepository::select(
+                    connection,
+                    result.execution.id,
+                    parent,
+                )
+                .await?;
+            }
             if let Some(admission) = admission {
                 admission
                     .attach(connection, RuntimeOwner::Execution(result.execution.id))
@@ -1347,5 +1408,27 @@ mod tests {
         assert!(!ExecutionAdmissionRepository::workflow_task_matches(
             &ambiguous, "/tasks/0", "first"
         ));
+    }
+}
+
+#[cfg(test)]
+mod authority_consistency_tests {
+    use super::ExistingExecutionAuthority;
+    #[test]
+    fn recorded_admission_never_downgrades_based_on_action_ownership() {
+        assert_eq!(
+            ExistingExecutionAuthority::from_persisted("recorded").unwrap(),
+            ExistingExecutionAuthority::Recorded
+        );
+    }
+    #[test]
+    fn missing_managed_admission_is_not_delegation() {
+        for absent_or_ownership in ["", "missing", "adhoc", "managed"] {
+            assert!(ExistingExecutionAuthority::from_persisted(absent_or_ownership).is_err());
+        }
+        assert_eq!(
+            ExistingExecutionAuthority::from_persisted("delegated").unwrap(),
+            ExistingExecutionAuthority::Delegated
+        );
     }
 }
