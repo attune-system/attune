@@ -1,10 +1,15 @@
 # Idle database activity: source analysis and implementation opportunities
 
-Date: 2026-11-05. Status: analysis complete; proposals below are not implemented.
+Date: 2026-11-05. Status: queue/retention, workflow-log wakeups and safe
+leader-session reuse are implemented and locally validated. The completed
+normal-cadence campaign is linked below; current merge readiness is reported in
+[PR #26](https://github.com/attune-system/attune/pull/26). Inquiry scheduling and
+physical-cleanup connection reuse remain separate follow-ups.
 Code inspected: `2ad41436`. Evidence: the six accepted primary matrices in the
 [measurement report](../testing/benchmarks/database-activity-2026-11-05/README.md),
-plus a fresh examination of retained idle-window service logs. No services were
-started and no production settings were changed for this analysis.
+plus a fresh examination of retained idle-window service logs. That original
+source-only analysis started no services or production changes. Implementation
+and owned-infrastructure validation records follow below.
 
 ## Important correction to the earlier idle interpretation
 
@@ -202,3 +207,270 @@ Validation: read-only source/log analysis; all six primary logs confirm the
 retention override. Documentation links and diff whitespace checks pass. No
 runtime change was made, so application suites were not rerun. The earlier
 capture-completeness failure and required CI remain separate merge-readiness gaps.
+
+
+## Initial implementation slice
+
+Started from merged main `4846e607` on `perf/idle-database-activity`.
+The first slice implements items 2–4 without changing polling intervals:
+
+- `latest_terminal_for_queue` is read only for concurrency-one queues with a
+  positive inter-execution delay. Existing delay calculation and capacity checks
+  are unchanged for that case.
+- Each existing bounded enabled-queue page gets one repository `EXISTS` readiness
+  snapshot for queued/retry items. Empty queues skip tunable resolution, capacity/
+  history reads and protected lease preparation. The hint takes no row locks and
+  conveys no authority. If every queue has work, it is an additional bounded
+  indexed read per poll; active-load overhead needs separate measurement. The original transaction rechecks and leases ready
+  candidates. Recovery runs before the hint, independently. A newly ready item
+  missed by the snapshot is considered on the next unchanged five-second poll.
+- Retention target seeds use one typed `unnest` insert rather than 16 inserts.
+  The singleton insert remains separate: initialization issues two statements
+  instead of 17, and ordinary load issues four instead of 19. `ON CONFLICT DO
+  NOTHING`, current persisted values, keep-forever NULLs, missing-target repair,
+  and normal settings reload behavior remain intact.
+
+Queue coverage exercises all item states, selected-queue isolation, empty input
+and a leased item returning to retry. Retention coverage includes concurrent
+repair of a missing target while preserving operator values. These repository
+checks complement existing lease/coalescing/admission and dispatcher delay tests.
+
+These are source-level work reductions; no new whole-stack speedup or normal-
+cadence idle savings are claimed by this checkpoint. Outbox wakeup changes need
+notification/reconnect/deadline coverage and are not bundled into this slice.
+
+
+### Validation handoff for this slice
+
+Status: **work in progress** for merge readiness and the remaining idle plan.
+
+Validation runs use stock PostgreSQL 18 on owned disposable infrastructure,
+unique `ATTUNE_TEST_RUN_ID` values, and four test threads. Tested source is
+`4846e607` plus the retained `.scratch/idle-implementation/runtime.diff`:
+
+- `cargo test -p attune-common --test work_queue_repository_tests -- --nocapture --test-threads=4`: 11 passed, zero failed/ignored.
+- `cargo test -p attune-common --lib repositories::retention:: -- --nocapture --test-threads=4`: 15 passed, zero failed/ignored; 1,254 outside the filter.
+- `cargo test -p attune-executor --lib queue_dispatcher::tests:: -- --nocapture --test-threads=4`: 18 passed, zero failed/ignored; 299 outside the filter.
+
+Clippy for common/executor with `--all-targets --no-deps -- -D warnings`,
+`cargo fmt --all -- --check`, and `git diff --check` pass. Full commands,
+run identities and logs remain under `.scratch/idle-implementation/`.
+The exploratory full-suite statement-counter snapshot evicted entries and is
+retained only as diagnostic data, not used as a savings measurement. Normal-cadence full-stack measurements, active
+load comparisons, end-to-end queue dispatch/recovery checks and required CI are
+not completed by these scoped tests. No schema, migration or public API contract
+changes are introduced. Outbox delivery timing, retention cadence and connection
+ownership/disposal are unchanged by this slice.
+
+
+## Workflow-log wakeup slice
+
+The next slice implements item 1 with commit-time empty NOTIFY hints and a
+same-statement claimed/pending/empty result. Only genuinely empty outboxes with
+a healthy listener use the new 4–5 second fallback. Pending heads and listener
+outages retain 100 ms polling; existing error backoff stays one second.
+
+A dedicated one-connection listener pool avoids consuming work-pool capacity.
+Connect attempts run inside the dispatcher future, so shutdown/cancellation can
+close their owned sockets without a detached background listener. Every
+registration/reconnection causes a durable scan; newly committed head changes
+wake normal delivery. Atomic claims, FIFO promotion and all effect fences remain
+in their existing paths. The [runtime log section](../workflows/workflow-execution-engine.md#durable-workflow-activity-logs)
+documents timing and rollout.
+
+Validation includes the existing delivery/retention/replica/shutdown cases plus
+commit/rollback visibility, insert-before-wait, explicit requeue, lost-listener
+recovery, future retry/lease eligibility without a later hint, bounded empty
+fallback, stalled connection setup and dedicated-socket cancellation. A
+statement-level counter in an exclusively owned test database measures empty
+claim attempts for two running dispatchers over ten seconds before checking
+append/seal FIFO delivery. It does not require a metrics extension or claim a
+whole-system speedup.
+
+### Workflow-log validation record
+
+The final delivery suite passes **29 cases**, zero failures/ignores, using
+`cargo test -p attune-executor --lib workflow::log::tests:: -- --nocapture --test-threads=4`.
+This includes 21 existing cases and eight wakeup/lifecycle cases. The final
+source starts from `032ad109` plus the retained
+`.scratch/outbox-wakeup/runtime.diff`; no runtime edits follow that capture.
+
+The two-dispatcher probe observed **six claim statements in 10,007 ms** after
+listener registration, then delivered eight appends and a seal exactly once in
+FIFO order. This short window can include initial post-subscription scans. It is
+an isolated component budget check with an owned statement-trigger counter,
+not a matched whole-stack performance comparison. The counter adds its own
+fixture-only write per claim; no CPU, WAL or throughput savings are inferred.
+Pending-head polling and reconnect fallback remain separate from this genuinely
+empty interval.
+
+Fresh stock PostgreSQL 18 migrations and workspace SQLx preparation pass. SQLx
+reports no macro queries found and produces no metadata changes; the dynamic
+claim SQL is covered by the repository-backed delivery cases. Validation logs,
+commands, run identities and probe output remain under `.scratch/outbox-wakeup/`.
+Clippy for common/executor all targets with warnings denied, workspace
+formatting, explicit formatting of the included wakeup tests, and diff checks
+pass on the final source. The earlier internal dead-code warning was fixed by
+making the single-step bool adapter test-only; runtime dispatch uses the typed
+claim outcome. Fresh migration bytes are applied without rewriting any recorded
+checksum. Owned listener sessions, the PostgreSQL container and its volume are
+checked absent before completing teardown.
+
+Status remains **work in progress** for merge readiness. Full-stack E2E, real
+object storage, sustained-backlog/large-replica load, normal-cadence idle baselines
+and required CI remain outstanding. The earlier shared-file capture-completeness
+observation is not addressed by this notification slice. No API schema/client
+change or retention scheduling change is included.
+
+
+## Leader-session reuse and normal-cadence measurement work
+
+The leader connection now has a narrow RAII owner. A failed lock attempt may
+return the connection to the pool; a successful acquisition may return it only
+after PostgreSQL reports a successful advisory unlock. SQL errors, a false
+unlock result, panic, and cancellation discard the socket. No session access is
+exposed to maintenance jobs, and no transaction or session setting is changed
+on this connection. SQLx readiness/health checking and pool return are awaited.
+Physical-cleanup and probe connections keep their existing disposal fences:
+there is no established clean-completion contract for reusing those sockets.
+
+Tests cover same-backend reuse, a competing leader, drop, task cancellation,
+a terminated backend, and an unacknowledged unlock. These changes are a work in
+progress until those tests and the affected supervisor lifecycle tests pass.
+They do not change maintenance due times or ownership.
+
+The full-stack runner accepts `ATTUNE_E2E_RETENTION_PROFILE=default` to leave
+persisted deployment settings intact; the default remains `accelerated` for
+cache correctness coverage. The performance collector records actual retention
+configuration and maintenance schedules, accepts explicit settling/idle windows,
+and recognizes both the old capacity-query family and the new queue readiness
+query. This permits equivalent baseline/treatment observations without asserting
+that obsolete work must remain present. All execution/output checks remain.
+
+Inquiry timeout, wait, and callback ownership is deliberately unchanged in this
+slice. A replacement needs API-only availability, notification-loss recovery,
+MQ wakeup handling, callback retry deadlines, and lease recovery coverage.
+Adding a listener to each existing owner also adds persistent backends; a lower
+statement count alone cannot establish a net resource improvement. Use the
+normal-cadence measurements to decide whether that larger change is warranted.
+
+
+A further listener review found that repeatedly consuming the full bounded hint
+batch could leave a slow replica behind global notification traffic. Reaching
+the drain budget now discards the listener, preserving durable work scans and
+resubscribing on the next idle wait. A real PostgreSQL burst case buffers more
+than the drain budget, checks backend closure, delivers work with the listener
+absent, and verifies fresh subscription. This follow-up requires rerunning the
+workflow-log suite and building new treatment images before measurement.
+
+
+## Combined validation and baseline gaps
+
+Status: **work in progress** while normal-cadence comparisons and required CI
+complete. The measured runtime is frozen at `0c37e1dd`. The later listener-budget
+fix changes only wakeup draining, its regression test, and documentation;
+supervisor, queue, and retention inputs from `ca5fa445` are unchanged.
+
+The combined local pass has **157 passing tests**, zero failed/ignored in those
+selected Rust suites:
+
+- Supervisor: 58, including five leader reuse/contention/drop/cancellation/error cases.
+- Work-queue repository: 11; retention repository: 15.
+- Queue dispatcher: 18; workflow-log delivery/lifecycle: 30, including the new burst case.
+- API queue/RBAC: 25, including both queue-permission cases from the earlier CI regression.
+
+`cargo check --workspace --all-targets` and common/executor/supervisor Clippy with
+all targets and `-D warnings` pass. Workspace formatting, explicit formatting of
+the included wakeup tests, script syntax, bootstrap tests and isolation guards
+pass. Fresh stock PostgreSQL 18.6 migrations pass. Workspace SQLx preparation
+from `59c152b9` is reused: migration bytes and macro-query inputs are unchanged,
+and that run found no macro queries or metadata changes. The local native test
+container and volume are independently checked absent after all sessions close.
+Commands, identities, differences and result provenance are retained under
+`.scratch/idle-readiness/`.
+
+The supplemental default-budget E2E selection is **32 passed / 3 failed** on
+both treatment `0c37e1dd` and baseline images `747832c9`, whose runtime/build
+source files match merged main `4846e607`. The same three cases fail:
+
+- `test_inquiry_response_releases_guarded_workflow_task`
+- `test_inquiry_rejects_invalid_response_before_releasing_task`
+- `test_inquiry_list_filters_by_creator_execution`
+
+All three creator actions stop before inquiry creation with the identical error:
+`Recorded execution credentials require coordinated admission, consumers and completion readiness`.
+The worker credential/admission code and inquiry fixture are unchanged by this
+branch. The recorded-consumer readiness guard remains off, as documented in
+[supported deployment scope](../testing/supported-deployment-scope.md).
+No guard, assertion, or test status is changed to make these cases pass. They are
+actual baseline failures and a coverage gap, not additional deferred-test
+exceptions or proof of inquiry E2E support. Both fresh E2E stacks have verified
+container, network, and volume teardown. Their matching results and preparation
+errors are retained in `.scratch/idle-readiness/known-baseline-inquiry.json`.
+
+The musl image build repeats the archived baseline linker warning
+`ignoring deprecated linker optimization setting '1'`. Cargo/linker flags and
+Dockerfiles are unchanged; this is not a new compiler warning. Baseline and
+current log evidence is retained in `baseline-linker-warning.json`. Native
+workspace checking and Clippy remain warning-free.
+
+The normal-cadence campaign uses separately owned stacks, identical collector
+bytes, runtime/infrastructure image checks, actual persisted settings and
+maintenance deadlines, six-minute idle windows, complete output assertions and
+a separate default-budget correctness run. It must finish before claiming new
+whole-stack idle or latency results. Pending CI still prevents a merge-ready
+status. The earlier instrumented shared-file capture-budget stress limit is not
+resolved by these tests; neither full deployment certification nor many-replica,
+busy-queue, S3, CPU or saturated-capacity performance is claimed.
+
+
+## Completed normal-cadence campaign
+
+The [retained report and interactive comparison](../testing/benchmarks/idle-database-activity-2026-11-05/README.md)
+contain six fresh-stack matrices, 7,200 measured executions, identical collector
+bytes and dependency/base-image checks, three paired six-minute idle comparisons,
+actual persisted settings and maintenance deadlines, complete output/counter
+assertions, reader checks, and verified teardown. The extra shared-file pair
+reverses the initial run order and retains both trials separately.
+
+Idle top-level SQL falls consistently by about 67%, from 3,377–3,398/minute to
+1,108–1,111/minute. The repeated pair confirms the same reduction. Outbox claims
+fall from roughly 1,170 to 26/minute; per-empty-queue capacity and latest-terminal
+queries disappear, replaced by 24 readiness snapshots/minute. Target seeding
+falls from 16 calls/minute to one. Connection setup statements also decline,
+with their proxy/census limitation retained. Inquiry/wait/callback rates remain
+unchanged, and each executor may hold one additional listener backend.
+
+The active-workload result is modestly lower SQL/job and inconclusive latency.
+Initial shared-file median paired p50/p95 changes are +0.9%/+8.3%; the reversed
+repeat has −3.4%/−6.0%. API/object segments have −0.1%/+3.4%. The initial tail
+direction does not repeat. No general execution-latency, CPU, capacity or WAL
+improvement is established. Aggregate idle DB execution time is small in absolute
+terms; the report retains raw totals and statement-counter overhead separately.
+The result supports the implemented idle-work cleanup without turning the
+remaining low-cost pollers into a performance priority by count alone.
+
+The measured runtime remains `0c37e1dd`; later documentation and regression-test edits do not
+change its runtime, schema, dependency or macro-query inputs. All fourteen CI
+checks pass on that runtime commit. The final PR head must independently satisfy
+required CI before merge; the PR carries the current validation handoff. The
+three matched baseline inquiry failures, documented deferred coverage and the
+existing musl linker warning remain disclosed limitations, not passing evidence.
+
+### Final-head CI retention regression test
+
+CI on `9e8aa8e9` exposed a pre-existing assumption in
+`over_budget_first_deletion_does_not_hide_the_257th_candidate`: reaching candidate
+257 was treated as proof that all earlier cheap candidates had committed. An
+earlier singleton can also time out, advance the frozen cursor, and require the
+next pass. The test stopped with 255 claims instead of the expected 256.
+
+The regression fixture now injects that transient timeout explicitly using a
+rollback-independent sequence and waits for all 256 cheap claims under a bounded
+deadline. It also acknowledges an empty frozen-pass tail before checking another
+slow-head deferral. The deletion fixture uses deployment's 250 ms statement budget with a
+1.5-second injected delay. Audit and cancellation tests stay unchanged.
+Unknown commits still fail the test. Exact-once claims, the untouched slow head,
+failure-age preservation, and eventual clean-pass reset remain required. This is
+a test correction; retention/runtime code and the measured images are unchanged.
+The benchmark report retains the validation results and reproduction evidence.

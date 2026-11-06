@@ -250,21 +250,44 @@ def test_worker_lifecycle_profile(client, tmp_path):
             assert response.status_code == 201, response.text
             idle_queues.append(response.json()["data"]["id"])
         report["enabled_empty_queue_ids"] = idle_queues
+        response = client.session.get(f"{client.base_url}/api/v1/retention-config", timeout=30)
+        response.raise_for_status()
+        report["runtime_retention_config"] = response.json()["data"]
+        report["maintenance_schedule_before_idle"] = [
+            {"job": job, "next_due": due.isoformat(), "last_success": success.isoformat() if success else None,
+             "deferred_since": deferred.isoformat() if deferred else None}
+            for job, due, success, deferred in observer.execute(
+                "SELECT job,next_due,last_success,deferred_since FROM native_maintenance_schedule ORDER BY job")]
+        settle_seconds = int(os.getenv("ATTUNE_WORKER_BENCHMARK_SETTLE_SECONDS", "60"))
+        idle_seconds = int(os.getenv("ATTUNE_WORKER_BENCHMARK_IDLE_SECONDS", "60"))
+        assert 0 <= settle_seconds <= 3600 and 1 <= idle_seconds <= 3600
+        report["settle_seconds"] = settle_seconds
+        report["requested_idle_seconds"] = idle_seconds
         # Fixed-duration observation, not readiness synchronization. Both revisions
         # use the same settling and measurement intervals with identical replicas.
-        time.sleep(60)
+        time.sleep(settle_seconds)
         idle_epoch = _stats_epoch(observer)
         idle_before = _statements(observer)
         idle_start_wall = time.time()
         idle_start = time.monotonic()
-        time.sleep(60)
+        time.sleep(idle_seconds)
         idle_after = _statements(observer)
         assert _stats_epoch(observer) == idle_epoch, "idle counters reset or evicted"
         idle = _statement_deltas(idle_before, idle_after)
         report["idle"] = {"start_wall_time": idle_start_wall, "end_wall_time": time.time(), "seconds": time.monotonic()-idle_start,
                           **_statement_totals(idle), "statement_deltas": idle}
-        assert any("SELECT COUNT(*) FROM work_queue_dispatch" in " ".join(query.split())
-                   for query in idle), "idle queues did not exercise capacity observation"
+        capacity = sum(value["calls"] for query, value in idle.items()
+                       if "SELECT COUNT(*) FROM work_queue_dispatch" in " ".join(query.split()))
+        readiness = sum(value["calls"] for query, value in idle.items()
+                        if "SELECT candidate.queue FROM unnest" in " ".join(query.split()))
+        assert capacity or readiness, "idle queues did not exercise queue observation"
+        report["idle"]["queue_capacity_calls"] = capacity
+        report["idle"]["queue_readiness_calls"] = readiness
+        report["maintenance_schedule_after_idle"] = [
+            {"job": job, "next_due": due.isoformat(), "last_success": success.isoformat() if success else None,
+             "deferred_since": deferred.isoformat() if deferred else None}
+            for job, due, success, deferred in observer.execute(
+                "SELECT job,next_due,last_success,deferred_since FROM native_maintenance_schedule ORDER BY job")]
         report["sql_timing_note"] = "Top-level and nested times overlap; summed sql_exec_ms is legacy inclusive work, not independent elapsed time."
         with CompletionObserver(listener) as completion:
             for name, reference, parameters, status, stdout, stderr in scenarios:

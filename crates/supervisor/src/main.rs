@@ -3,6 +3,7 @@
 //! Owns platform maintenance loops such as runtime database retention.
 
 mod cache_retention;
+mod leader_session;
 mod native_maintenance;
 mod object_retention;
 mod storage_migration;
@@ -261,18 +262,16 @@ impl SupervisorService {
         }
         let interval = native_maintenance::poll_interval(&retention);
 
-        let mut conn = self.inner.pool.acquire().await?;
-
-        if !RetentionRepository::try_advisory_lock(&mut conn, retention.advisory_lock_key).await? {
+        let Some(leader) =
+            leader_session::LeaderSession::acquire(&self.inner.pool, retention.advisory_lock_key)
+                .await?
+        else {
             info!(
                 advisory_lock_key = retention.advisory_lock_key,
                 "Another supervisor owns the retention lock; skipping cycle"
             );
             return Ok(interval);
-        }
-        // Session locks survive transaction rollback. A cancelled/panicking
-        // leader must never return its locked connection to the pool.
-        conn.close_on_drop();
+        };
 
         let cycle_result = async {
             let cycle_reason = self.ensure_supervisor_run(cycle_reason).await?;
@@ -458,17 +457,8 @@ impl SupervisorService {
         }
         .await;
 
-        if let Err(err) =
-            RetentionRepository::advisory_unlock(&mut conn, retention.advisory_lock_key).await
-        {
-            warn!(
-                advisory_lock_key = retention.advisory_lock_key,
-                error = %err,
-                "Failed to release retention advisory lock"
-            );
-        }
-        if let Err(error) = conn.close().await {
-            warn!(error = %error, "Failed to close supervisor leader session");
+        if let Err(error) = leader.release().await {
+            warn!(%error, "Failed to acknowledge supervisor advisory unlock; leader socket discarded");
         }
 
         cycle_result?;

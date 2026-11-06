@@ -1,0 +1,1346 @@
+[
+  {
+    "kind": "baseline",
+    "backend": "volume",
+    "trial": 1,
+    "revision": "747832c97e09cbc122f72af1304e66375e3dde0e",
+    "runtime_source_equivalent_to": "4846e6073c72325afd9583a550cc772dcd342057",
+    "project": "attune-idle-ready-base-volume-40d6cb1b",
+    "collector_sha256": "5d440cba38f43a331a698811e8f4af5a7f864cbc10b8023aae9a56f8ce0ef358",
+    "capture_budget_ms": 10000,
+    "cleanup_verified": true,
+    "stream_discovery_exit_code": 0,
+    "observer_image": "sha256:9bc8e4da26d9939d0cb9c4e6f719a0eab4a5662336105d79358b7ec94fd22524",
+    "python_dependencies": {
+      "pytest": "9.2.0",
+      "psycopg": "3.3.8",
+      "requests": "2.34.2",
+      "pyyaml": "6.0.3"
+    },
+    "infrastructure_images": {
+      "worker-shell": "sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587",
+      "worker-python": "sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f",
+      "worker-node": "sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392",
+      "worker-full": "sha256:05e6ff96f79bb39c3c46e5bddca425c82f0887ae4c91288f1c80895fac9227a9",
+      "sensor": "sha256:05e6ff96f79bb39c3c46e5bddca425c82f0887ae4c91288f1c80895fac9227a9",
+      "postgres": "sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873",
+      "rabbitmq": "sha256:3ef7f7e89fed709a78f79b8b5f4e30e1312a1d4089da752e23595566d9d61a95",
+      "init-pack-binaries": "sha256:5af00c1720ed48e7b6d5b615a0650c4fd17364569de3a7cf5a94cb6e81f95b83"
+    },
+    "runtime_images": {
+      "api": "sha256:97341ff83e7a9b6bc5ada440da64e36a752c462e46e7ac14485d9e60a8ddbfab",
+      "executor": "sha256:87ba73c1cc3370c703d9c35963bf8d17816c26b1c80cbce392049a335a2da4b7",
+      "executor-2": "sha256:fb7dbc485d108d95c18746470019051a4dc0d440cd4dbba16550b05dacf3c5e2",
+      "notifier": "sha256:23d5fcb2342f58995c0def97d1d9bd499ca4af0a130827b2c62cffe968f54284",
+      "supervisor": "sha256:7c6e9d174e2789531af098c2948255f22cad58a2376711eabbca831c0ae043c1",
+      "init-agent": "sha256:27fbfe53e14315b719f0b56d16aa0e1701bca2fd0ca13d21901133f930297973",
+      "pack-release-upgrade": "sha256:802e8bde87b111df97c957fa3b7e490cbb529c9385a491417a2d0ffbaa6ca467"
+    },
+    "verified_agent_sha256": "265d7f0f301abd9bdaafb604a3bb7de25f928b9b5748093b00efc0a13fb32104",
+    "idle": {
+      "end_wall_time": 1793910692.8077214,
+      "nested_exec_ms": 0,
+      "nested_statement_calls": 0,
+      "observer_statement_calls": 1,
+      "queue_capacity_calls": 1296,
+      "queue_readiness_calls": 0,
+      "seconds": 360.05112135701347,
+      "sql_exec_ms": 881.8386550000024,
+      "start_wall_time": 1793910332.7556894,
+      "statement_calls": 20392,
+      "top_level_exec_ms": 881.8386550000024,
+      "top_level_statement_calls": 20392,
+      "top_level_wal_bytes": 513194,
+      "top_level_counter_query_exec_ms": 25.389374999999998,
+      "top_level_exec_ms_excluding_counter_queries": 856.4492800000024,
+      "top_level_statement_calls_per_minute": 3398.18411171341,
+      "top_level_exec_ms_per_minute": 146.95224139445523,
+      "top_level_wal_bytes_per_minute": 85520.18914410807,
+      "top_level_counter_query_exec_ms_per_minute": 4.230961687491843,
+      "top_level_exec_ms_excluding_counter_queries_per_minute": 142.7212797069634
+    },
+    "runtime_retention_config": {
+      "advisory_lock_key": 7821001,
+      "batch_size": 1000,
+      "cache_retention": {
+        "alert_cooldown_seconds": 3600,
+        "alert_limit_per_cycle": 25,
+        "ddl_creation_statement_timeout_milliseconds": 5000,
+        "ddl_lock_timeout_milliseconds": 250,
+        "ddl_statement_timeout_milliseconds": 1000,
+        "dry_run": false,
+        "enabled": true,
+        "freshness_alert_grace_seconds": 900,
+        "freshness_alerts_enabled": true,
+        "max_cleanup_cycle_milliseconds": 30000,
+        "max_generations_per_cycle": 50,
+        "max_namespaces_per_cycle": 50,
+        "min_traversal_window_seconds": 3600,
+        "staging_expiry_seconds": 86400,
+        "staging_failure_alert_threshold": 3,
+        "statistics_interval_seconds": 300,
+        "statistics_statement_timeout_milliseconds": 5000
+      },
+      "check_interval_seconds": 3600,
+      "dry_run": false,
+      "enabled": true,
+      "max_batches_per_target": 100,
+      "native_maintenance": {
+        "default_repair_row_limit": 1000,
+        "enabled": true,
+        "lock_timeout_milliseconds": 250,
+        "max_partition_cycle_milliseconds": 5000,
+        "max_partition_operations_per_cycle": 32,
+        "max_summary_buckets_per_cycle": 128,
+        "max_summary_cycle_milliseconds": 5000,
+        "max_summary_invalidations_per_bucket": 10000,
+        "operation_timeout_milliseconds": 1000,
+        "partition_interval_seconds": 3600,
+        "partition_lookahead_days": 7,
+        "summary_bootstrap_hours": 24,
+        "summary_interval_seconds": 300
+      },
+      "targets": {
+        "audit_events": {
+          "max_age_seconds": 7776000
+        },
+        "enforcements": {
+          "max_age_seconds": 2592000
+        },
+        "events": {
+          "max_age_seconds": 2592000
+        },
+        "execution_admission": {
+          "max_age_seconds": 2592000
+        },
+        "execution_history": {
+          "max_age_seconds": 2592000
+        },
+        "executions": {
+          "max_age_seconds": 2592000
+        },
+        "inquiries": {
+          "max_age_seconds": 2592000
+        },
+        "notifications": {
+          "max_age_seconds": 2592000
+        },
+        "pack_test_executions": {
+          "max_age_seconds": 2592000
+        },
+        "sensor_process_history": {
+          "max_age_seconds": 2592000
+        },
+        "sensor_processes": {
+          "max_age_seconds": 2592000
+        },
+        "webhook_event_logs": {
+          "max_age_seconds": 2592000
+        },
+        "work_queue_dispatches": {
+          "max_age_seconds": 2592000
+        },
+        "work_queue_items": {
+          "max_age_seconds": 2592000
+        },
+        "worker_history": {
+          "max_age_seconds": 2592000
+        },
+        "workers": {
+          "max_age_seconds": 2592000
+        }
+      }
+    },
+    "maintenance_schedule_before_idle": [
+      {
+        "deferred_since": "2026-11-05T20:22:38.766792+00:00",
+        "job": "object_retention",
+        "last_success": null,
+        "next_due": "2026-11-05T20:24:52.757394+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "partition",
+        "last_success": "2026-11-05T20:22:37.249277+00:00",
+        "next_due": "2026-11-05T21:22:37.249277+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "retention",
+        "last_success": "2026-11-05T20:22:37.734323+00:00",
+        "next_due": "2026-11-05T21:22:37.734323+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "summary",
+        "last_success": "2026-11-05T20:22:39.247319+00:00",
+        "next_due": "2026-11-05T20:27:39.247319+00:00"
+      }
+    ],
+    "maintenance_schedule_after_idle": [
+      {
+        "deferred_since": null,
+        "job": "object_retention",
+        "last_success": "2026-11-05T20:24:55.753502+00:00",
+        "next_due": "2026-11-05T21:22:37.753502+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "partition",
+        "last_success": "2026-11-05T20:22:37.249277+00:00",
+        "next_due": "2026-11-05T21:22:37.249277+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "retention",
+        "last_success": "2026-11-05T20:22:37.734323+00:00",
+        "next_due": "2026-11-05T21:22:37.734323+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "summary",
+        "last_success": "2026-11-05T20:27:56.326975+00:00",
+        "next_due": "2026-11-05T20:32:56.326975+00:00"
+      }
+    ],
+    "postgres_settings": {
+      "fsync": "on",
+      "max_connections": "100",
+      "pg_stat_statements.max": "50000",
+      "pg_stat_statements.track": "all",
+      "server_version": "18.6",
+      "shared_buffers": "16384",
+      "synchronous_commit": "on"
+    },
+    "host": {
+      "logical_cpus": 8,
+      "kernel": "7.3.1-1-cachyos"
+    },
+    "docker": {
+      "NCPU": 8,
+      "MemTotal": 16765710336,
+      "Architecture": "x86_64",
+      "ServerVersion": "29.9.2"
+    }
+  },
+  {
+    "kind": "current",
+    "backend": "volume",
+    "trial": 1,
+    "revision": "0c37e1dd8792de0ec93bf7ed397e674a2cb4def8",
+    "runtime_source_equivalent_to": null,
+    "project": "attune-idle-ready-current-volume-706e6dae",
+    "collector_sha256": "5d440cba38f43a331a698811e8f4af5a7f864cbc10b8023aae9a56f8ce0ef358",
+    "capture_budget_ms": 10000,
+    "cleanup_verified": true,
+    "stream_discovery_exit_code": 0,
+    "observer_image": "sha256:9bc8e4da26d9939d0cb9c4e6f719a0eab4a5662336105d79358b7ec94fd22524",
+    "python_dependencies": {
+      "pytest": "9.2.0",
+      "psycopg": "3.3.8",
+      "requests": "2.34.2",
+      "pyyaml": "6.0.3"
+    },
+    "infrastructure_images": {
+      "worker-shell": "sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587",
+      "worker-python": "sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f",
+      "worker-node": "sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392",
+      "worker-full": "sha256:05e6ff96f79bb39c3c46e5bddca425c82f0887ae4c91288f1c80895fac9227a9",
+      "sensor": "sha256:05e6ff96f79bb39c3c46e5bddca425c82f0887ae4c91288f1c80895fac9227a9",
+      "postgres": "sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873",
+      "rabbitmq": "sha256:3ef7f7e89fed709a78f79b8b5f4e30e1312a1d4089da752e23595566d9d61a95",
+      "init-pack-binaries": "sha256:5af00c1720ed48e7b6d5b615a0650c4fd17364569de3a7cf5a94cb6e81f95b83"
+    },
+    "runtime_images": {
+      "api": "sha256:2069f1e9a3dd20a881275a4296eefe77c34f63c30f1ba419464115fba55efa79",
+      "executor": "sha256:eab0bc28091db0591b015d83442e20d252311cdc08ad7af774aeac3b1010baca",
+      "executor-2": "sha256:67c3cafc269347f8802520be85f989c7b39648cbd7dd0db79cb9a275fe6a62fe",
+      "notifier": "sha256:8b395bf47539eb0d8177fdb2a8dcc241d5e61ec923573291677cbeeaf6d580a0",
+      "supervisor": "sha256:2f64f8fa1127bc4b9275e9377ffe3827e77ad49d87ff488a772e108056a708c9",
+      "init-agent": "sha256:5bd49d8c0882fc9e5878a330d05c19974aaa3716ad6b4653694ecf7f9938f6d2",
+      "pack-release-upgrade": "sha256:2a59d7d9aecc416c710d2b86e67d0a79ba19d418d4f06096d31a976271118388"
+    },
+    "verified_agent_sha256": "265d7f0f301abd9bdaafb604a3bb7de25f928b9b5748093b00efc0a13fb32104",
+    "idle": {
+      "end_wall_time": 1793917369.9301934,
+      "nested_exec_ms": 0,
+      "nested_statement_calls": 0,
+      "observer_statement_calls": 1,
+      "queue_capacity_calls": 144,
+      "queue_readiness_calls": 144,
+      "seconds": 360.0642093350034,
+      "sql_exec_ms": 713.2914580000001,
+      "start_wall_time": 1793917009.8654883,
+      "statement_calls": 6670,
+      "top_level_exec_ms": 713.2914580000001,
+      "top_level_statement_calls": 6670,
+      "top_level_wal_bytes": 511213,
+      "top_level_counter_query_exec_ms": 42.070530000000005,
+      "top_level_exec_ms_excluding_counter_queries": 671.2209280000002,
+      "top_level_statement_calls_per_minute": 1111.4684259763633,
+      "top_level_exec_ms_per_minute": 118.86070975796784,
+      "top_level_wal_bytes_per_minute": 85186.97278090773,
+      "top_level_counter_query_exec_ms_per_minute": 7.010504611557928,
+      "top_level_exec_ms_excluding_counter_queries_per_minute": 111.8502051464099
+    },
+    "runtime_retention_config": {
+      "advisory_lock_key": 7821001,
+      "batch_size": 1000,
+      "cache_retention": {
+        "alert_cooldown_seconds": 3600,
+        "alert_limit_per_cycle": 25,
+        "ddl_creation_statement_timeout_milliseconds": 5000,
+        "ddl_lock_timeout_milliseconds": 250,
+        "ddl_statement_timeout_milliseconds": 1000,
+        "dry_run": false,
+        "enabled": true,
+        "freshness_alert_grace_seconds": 900,
+        "freshness_alerts_enabled": true,
+        "max_cleanup_cycle_milliseconds": 30000,
+        "max_generations_per_cycle": 50,
+        "max_namespaces_per_cycle": 50,
+        "min_traversal_window_seconds": 3600,
+        "staging_expiry_seconds": 86400,
+        "staging_failure_alert_threshold": 3,
+        "statistics_interval_seconds": 300,
+        "statistics_statement_timeout_milliseconds": 5000
+      },
+      "check_interval_seconds": 3600,
+      "dry_run": false,
+      "enabled": true,
+      "max_batches_per_target": 100,
+      "native_maintenance": {
+        "default_repair_row_limit": 1000,
+        "enabled": true,
+        "lock_timeout_milliseconds": 250,
+        "max_partition_cycle_milliseconds": 5000,
+        "max_partition_operations_per_cycle": 32,
+        "max_summary_buckets_per_cycle": 128,
+        "max_summary_cycle_milliseconds": 5000,
+        "max_summary_invalidations_per_bucket": 10000,
+        "operation_timeout_milliseconds": 1000,
+        "partition_interval_seconds": 3600,
+        "partition_lookahead_days": 7,
+        "summary_bootstrap_hours": 24,
+        "summary_interval_seconds": 300
+      },
+      "targets": {
+        "audit_events": {
+          "max_age_seconds": 7776000
+        },
+        "enforcements": {
+          "max_age_seconds": 2592000
+        },
+        "events": {
+          "max_age_seconds": 2592000
+        },
+        "execution_admission": {
+          "max_age_seconds": 2592000
+        },
+        "execution_history": {
+          "max_age_seconds": 2592000
+        },
+        "executions": {
+          "max_age_seconds": 2592000
+        },
+        "inquiries": {
+          "max_age_seconds": 2592000
+        },
+        "notifications": {
+          "max_age_seconds": 2592000
+        },
+        "pack_test_executions": {
+          "max_age_seconds": 2592000
+        },
+        "sensor_process_history": {
+          "max_age_seconds": 2592000
+        },
+        "sensor_processes": {
+          "max_age_seconds": 2592000
+        },
+        "webhook_event_logs": {
+          "max_age_seconds": 2592000
+        },
+        "work_queue_dispatches": {
+          "max_age_seconds": 2592000
+        },
+        "work_queue_items": {
+          "max_age_seconds": 2592000
+        },
+        "worker_history": {
+          "max_age_seconds": 2592000
+        },
+        "workers": {
+          "max_age_seconds": 2592000
+        }
+      }
+    },
+    "maintenance_schedule_before_idle": [
+      {
+        "deferred_since": null,
+        "job": "object_retention",
+        "last_success": "2026-11-05T22:14:03.666921+00:00",
+        "next_due": "2026-11-05T23:14:02.666921+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "partition",
+        "last_success": "2026-11-05T22:14:02.098303+00:00",
+        "next_due": "2026-11-05T23:14:02.098303+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "retention",
+        "last_success": "2026-11-05T22:14:02.648333+00:00",
+        "next_due": "2026-11-05T23:14:02.648333+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "summary",
+        "last_success": "2026-11-05T22:14:04.086364+00:00",
+        "next_due": "2026-11-05T22:19:04.086364+00:00"
+      }
+    ],
+    "maintenance_schedule_after_idle": [
+      {
+        "deferred_since": null,
+        "job": "object_retention",
+        "last_success": "2026-11-05T22:14:03.666921+00:00",
+        "next_due": "2026-11-05T23:14:02.666921+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "partition",
+        "last_success": "2026-11-05T22:14:02.098303+00:00",
+        "next_due": "2026-11-05T23:14:02.098303+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "retention",
+        "last_success": "2026-11-05T22:14:02.648333+00:00",
+        "next_due": "2026-11-05T23:14:02.648333+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "summary",
+        "last_success": "2026-11-05T22:19:04.898316+00:00",
+        "next_due": "2026-11-05T22:24:04.898316+00:00"
+      }
+    ],
+    "postgres_settings": {
+      "fsync": "on",
+      "max_connections": "100",
+      "pg_stat_statements.max": "50000",
+      "pg_stat_statements.track": "all",
+      "server_version": "18.6",
+      "shared_buffers": "16384",
+      "synchronous_commit": "on"
+    },
+    "host": {
+      "logical_cpus": 8,
+      "kernel": "7.3.1-1-cachyos"
+    },
+    "docker": {
+      "NCPU": 8,
+      "MemTotal": 16765710336,
+      "Architecture": "x86_64",
+      "ServerVersion": "29.9.2"
+    }
+  },
+  {
+    "kind": "baseline",
+    "backend": "api",
+    "trial": 1,
+    "revision": "747832c97e09cbc122f72af1304e66375e3dde0e",
+    "runtime_source_equivalent_to": "4846e6073c72325afd9583a550cc772dcd342057",
+    "project": "attune-idle-ready-baseline-api-696f2eb5",
+    "collector_sha256": "5d440cba38f43a331a698811e8f4af5a7f864cbc10b8023aae9a56f8ce0ef358",
+    "capture_budget_ms": 10000,
+    "cleanup_verified": true,
+    "stream_discovery_exit_code": 0,
+    "observer_image": "sha256:9bc8e4da26d9939d0cb9c4e6f719a0eab4a5662336105d79358b7ec94fd22524",
+    "python_dependencies": {
+      "pytest": "9.2.0",
+      "psycopg": "3.3.8",
+      "requests": "2.34.2",
+      "pyyaml": "6.0.3"
+    },
+    "infrastructure_images": {
+      "worker-shell": "sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587",
+      "worker-python": "sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f",
+      "worker-node": "sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392",
+      "worker-full": "sha256:05e6ff96f79bb39c3c46e5bddca425c82f0887ae4c91288f1c80895fac9227a9",
+      "sensor": "sha256:05e6ff96f79bb39c3c46e5bddca425c82f0887ae4c91288f1c80895fac9227a9",
+      "postgres": "sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873",
+      "rabbitmq": "sha256:3ef7f7e89fed709a78f79b8b5f4e30e1312a1d4089da752e23595566d9d61a95",
+      "init-pack-binaries": "sha256:5af00c1720ed48e7b6d5b615a0650c4fd17364569de3a7cf5a94cb6e81f95b83"
+    },
+    "runtime_images": {
+      "api": "sha256:97341ff83e7a9b6bc5ada440da64e36a752c462e46e7ac14485d9e60a8ddbfab",
+      "executor": "sha256:87ba73c1cc3370c703d9c35963bf8d17816c26b1c80cbce392049a335a2da4b7",
+      "executor-2": "sha256:fb7dbc485d108d95c18746470019051a4dc0d440cd4dbba16550b05dacf3c5e2",
+      "notifier": "sha256:23d5fcb2342f58995c0def97d1d9bd499ca4af0a130827b2c62cffe968f54284",
+      "supervisor": "sha256:7c6e9d174e2789531af098c2948255f22cad58a2376711eabbca831c0ae043c1",
+      "init-agent": "sha256:27fbfe53e14315b719f0b56d16aa0e1701bca2fd0ca13d21901133f930297973",
+      "pack-release-upgrade": "sha256:802e8bde87b111df97c957fa3b7e490cbb529c9385a491417a2d0ffbaa6ca467"
+    },
+    "verified_agent_sha256": "265d7f0f301abd9bdaafb604a3bb7de25f928b9b5748093b00efc0a13fb32104",
+    "idle": {
+      "end_wall_time": 1793918560.896864,
+      "nested_exec_ms": 0,
+      "nested_statement_calls": 0,
+      "observer_statement_calls": 1,
+      "queue_capacity_calls": 1278,
+      "queue_readiness_calls": 0,
+      "seconds": 360.06629193900153,
+      "sql_exec_ms": 1471.957243999998,
+      "start_wall_time": 1793918200.829883,
+      "statement_calls": 20268,
+      "top_level_exec_ms": 1471.957243999998,
+      "top_level_statement_calls": 20268,
+      "top_level_wal_bytes": 511786,
+      "top_level_counter_query_exec_ms": 34.756447,
+      "top_level_exec_ms_excluding_counter_queries": 1437.200796999998,
+      "top_level_statement_calls_per_minute": 3377.378075162934,
+      "top_level_exec_ms_per_minute": 245.2810402340068,
+      "top_level_wal_bytes_per_minute": 85281.96248151457,
+      "top_level_counter_query_exec_ms_per_minute": 5.791674662934801,
+      "top_level_exec_ms_excluding_counter_queries_per_minute": 239.489365571072
+    },
+    "runtime_retention_config": {
+      "advisory_lock_key": 7821001,
+      "batch_size": 1000,
+      "cache_retention": {
+        "alert_cooldown_seconds": 3600,
+        "alert_limit_per_cycle": 25,
+        "ddl_creation_statement_timeout_milliseconds": 5000,
+        "ddl_lock_timeout_milliseconds": 250,
+        "ddl_statement_timeout_milliseconds": 1000,
+        "dry_run": false,
+        "enabled": true,
+        "freshness_alert_grace_seconds": 900,
+        "freshness_alerts_enabled": true,
+        "max_cleanup_cycle_milliseconds": 30000,
+        "max_generations_per_cycle": 50,
+        "max_namespaces_per_cycle": 50,
+        "min_traversal_window_seconds": 3600,
+        "staging_expiry_seconds": 86400,
+        "staging_failure_alert_threshold": 3,
+        "statistics_interval_seconds": 300,
+        "statistics_statement_timeout_milliseconds": 5000
+      },
+      "check_interval_seconds": 3600,
+      "dry_run": false,
+      "enabled": true,
+      "max_batches_per_target": 100,
+      "native_maintenance": {
+        "default_repair_row_limit": 1000,
+        "enabled": true,
+        "lock_timeout_milliseconds": 250,
+        "max_partition_cycle_milliseconds": 5000,
+        "max_partition_operations_per_cycle": 32,
+        "max_summary_buckets_per_cycle": 128,
+        "max_summary_cycle_milliseconds": 5000,
+        "max_summary_invalidations_per_bucket": 10000,
+        "operation_timeout_milliseconds": 1000,
+        "partition_interval_seconds": 3600,
+        "partition_lookahead_days": 7,
+        "summary_bootstrap_hours": 24,
+        "summary_interval_seconds": 300
+      },
+      "targets": {
+        "audit_events": {
+          "max_age_seconds": 7776000
+        },
+        "enforcements": {
+          "max_age_seconds": 2592000
+        },
+        "events": {
+          "max_age_seconds": 2592000
+        },
+        "execution_admission": {
+          "max_age_seconds": 2592000
+        },
+        "execution_history": {
+          "max_age_seconds": 2592000
+        },
+        "executions": {
+          "max_age_seconds": 2592000
+        },
+        "inquiries": {
+          "max_age_seconds": 2592000
+        },
+        "notifications": {
+          "max_age_seconds": 2592000
+        },
+        "pack_test_executions": {
+          "max_age_seconds": 2592000
+        },
+        "sensor_process_history": {
+          "max_age_seconds": 2592000
+        },
+        "sensor_processes": {
+          "max_age_seconds": 2592000
+        },
+        "webhook_event_logs": {
+          "max_age_seconds": 2592000
+        },
+        "work_queue_dispatches": {
+          "max_age_seconds": 2592000
+        },
+        "work_queue_items": {
+          "max_age_seconds": 2592000
+        },
+        "worker_history": {
+          "max_age_seconds": 2592000
+        },
+        "workers": {
+          "max_age_seconds": 2592000
+        }
+      }
+    },
+    "maintenance_schedule_before_idle": [
+      {
+        "deferred_since": null,
+        "job": "object_retention",
+        "last_success": "2026-11-05T22:33:56.169525+00:00",
+        "next_due": "2026-11-05T23:33:55.169525+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "partition",
+        "last_success": "2026-11-05T22:33:54.857328+00:00",
+        "next_due": "2026-11-05T23:33:54.857328+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "retention",
+        "last_success": "2026-11-05T22:33:55.401768+00:00",
+        "next_due": "2026-11-05T23:33:55.401768+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "summary",
+        "last_success": "2026-11-05T22:33:56.587675+00:00",
+        "next_due": "2026-11-05T22:38:56.587675+00:00"
+      }
+    ],
+    "maintenance_schedule_after_idle": [
+      {
+        "deferred_since": null,
+        "job": "object_retention",
+        "last_success": "2026-11-05T22:33:56.169525+00:00",
+        "next_due": "2026-11-05T23:33:55.169525+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "partition",
+        "last_success": "2026-11-05T22:33:54.857328+00:00",
+        "next_due": "2026-11-05T23:33:54.857328+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "retention",
+        "last_success": "2026-11-05T22:33:55.401768+00:00",
+        "next_due": "2026-11-05T23:33:55.401768+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "summary",
+        "last_success": "2026-11-05T22:38:57.519851+00:00",
+        "next_due": "2026-11-05T22:43:57.519851+00:00"
+      }
+    ],
+    "postgres_settings": {
+      "fsync": "on",
+      "max_connections": "100",
+      "pg_stat_statements.max": "50000",
+      "pg_stat_statements.track": "all",
+      "server_version": "18.6",
+      "shared_buffers": "16384",
+      "synchronous_commit": "on"
+    },
+    "host": {
+      "logical_cpus": 8,
+      "kernel": "7.3.1-1-cachyos"
+    },
+    "docker": {
+      "NCPU": 8,
+      "MemTotal": 16765710336,
+      "Architecture": "x86_64",
+      "ServerVersion": "29.9.2"
+    }
+  },
+  {
+    "kind": "current",
+    "backend": "api",
+    "trial": 1,
+    "revision": "0c37e1dd8792de0ec93bf7ed397e674a2cb4def8",
+    "runtime_source_equivalent_to": null,
+    "project": "attune-idle-ready-current-api-0c750f7e",
+    "collector_sha256": "5d440cba38f43a331a698811e8f4af5a7f864cbc10b8023aae9a56f8ce0ef358",
+    "capture_budget_ms": 10000,
+    "cleanup_verified": true,
+    "stream_discovery_exit_code": 0,
+    "observer_image": "sha256:9bc8e4da26d9939d0cb9c4e6f719a0eab4a5662336105d79358b7ec94fd22524",
+    "python_dependencies": {
+      "pytest": "9.2.0",
+      "psycopg": "3.3.8",
+      "requests": "2.34.2",
+      "pyyaml": "6.0.3"
+    },
+    "infrastructure_images": {
+      "worker-shell": "sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587",
+      "worker-python": "sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f",
+      "worker-node": "sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392",
+      "worker-full": "sha256:05e6ff96f79bb39c3c46e5bddca425c82f0887ae4c91288f1c80895fac9227a9",
+      "sensor": "sha256:05e6ff96f79bb39c3c46e5bddca425c82f0887ae4c91288f1c80895fac9227a9",
+      "postgres": "sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873",
+      "rabbitmq": "sha256:3ef7f7e89fed709a78f79b8b5f4e30e1312a1d4089da752e23595566d9d61a95",
+      "init-pack-binaries": "sha256:5af00c1720ed48e7b6d5b615a0650c4fd17364569de3a7cf5a94cb6e81f95b83"
+    },
+    "runtime_images": {
+      "api": "sha256:2069f1e9a3dd20a881275a4296eefe77c34f63c30f1ba419464115fba55efa79",
+      "executor": "sha256:eab0bc28091db0591b015d83442e20d252311cdc08ad7af774aeac3b1010baca",
+      "executor-2": "sha256:67c3cafc269347f8802520be85f989c7b39648cbd7dd0db79cb9a275fe6a62fe",
+      "notifier": "sha256:8b395bf47539eb0d8177fdb2a8dcc241d5e61ec923573291677cbeeaf6d580a0",
+      "supervisor": "sha256:2f64f8fa1127bc4b9275e9377ffe3827e77ad49d87ff488a772e108056a708c9",
+      "init-agent": "sha256:5bd49d8c0882fc9e5878a330d05c19974aaa3716ad6b4653694ecf7f9938f6d2",
+      "pack-release-upgrade": "sha256:2a59d7d9aecc416c710d2b86e67d0a79ba19d418d4f06096d31a976271118388"
+    },
+    "verified_agent_sha256": "265d7f0f301abd9bdaafb604a3bb7de25f928b9b5748093b00efc0a13fb32104",
+    "idle": {
+      "end_wall_time": 1793919573.9480417,
+      "nested_exec_ms": 0,
+      "nested_statement_calls": 0,
+      "observer_statement_calls": 1,
+      "queue_capacity_calls": 144,
+      "queue_readiness_calls": 144,
+      "seconds": 360.0552333180094,
+      "sql_exec_ms": 789.1602609999998,
+      "start_wall_time": 1793919213.8913546,
+      "statement_calls": 6649,
+      "top_level_exec_ms": 789.1602609999998,
+      "top_level_statement_calls": 6649,
+      "top_level_wal_bytes": 521953,
+      "top_level_counter_query_exec_ms": 48.894669,
+      "top_level_exec_ms_excluding_counter_queries": 740.2655919999997,
+      "top_level_statement_calls_per_minute": 1107.9966712986134,
+      "top_level_exec_ms_per_minute": 131.50653366057222,
+      "top_level_wal_bytes_per_minute": 86978.8218640886,
+      "top_level_counter_query_exec_ms_per_minute": 8.147861407166115,
+      "top_level_exec_ms_excluding_counter_queries_per_minute": 123.3586722534061
+    },
+    "runtime_retention_config": {
+      "advisory_lock_key": 7821001,
+      "batch_size": 1000,
+      "cache_retention": {
+        "alert_cooldown_seconds": 3600,
+        "alert_limit_per_cycle": 25,
+        "ddl_creation_statement_timeout_milliseconds": 5000,
+        "ddl_lock_timeout_milliseconds": 250,
+        "ddl_statement_timeout_milliseconds": 1000,
+        "dry_run": false,
+        "enabled": true,
+        "freshness_alert_grace_seconds": 900,
+        "freshness_alerts_enabled": true,
+        "max_cleanup_cycle_milliseconds": 30000,
+        "max_generations_per_cycle": 50,
+        "max_namespaces_per_cycle": 50,
+        "min_traversal_window_seconds": 3600,
+        "staging_expiry_seconds": 86400,
+        "staging_failure_alert_threshold": 3,
+        "statistics_interval_seconds": 300,
+        "statistics_statement_timeout_milliseconds": 5000
+      },
+      "check_interval_seconds": 3600,
+      "dry_run": false,
+      "enabled": true,
+      "max_batches_per_target": 100,
+      "native_maintenance": {
+        "default_repair_row_limit": 1000,
+        "enabled": true,
+        "lock_timeout_milliseconds": 250,
+        "max_partition_cycle_milliseconds": 5000,
+        "max_partition_operations_per_cycle": 32,
+        "max_summary_buckets_per_cycle": 128,
+        "max_summary_cycle_milliseconds": 5000,
+        "max_summary_invalidations_per_bucket": 10000,
+        "operation_timeout_milliseconds": 1000,
+        "partition_interval_seconds": 3600,
+        "partition_lookahead_days": 7,
+        "summary_bootstrap_hours": 24,
+        "summary_interval_seconds": 300
+      },
+      "targets": {
+        "audit_events": {
+          "max_age_seconds": 7776000
+        },
+        "enforcements": {
+          "max_age_seconds": 2592000
+        },
+        "events": {
+          "max_age_seconds": 2592000
+        },
+        "execution_admission": {
+          "max_age_seconds": 2592000
+        },
+        "execution_history": {
+          "max_age_seconds": 2592000
+        },
+        "executions": {
+          "max_age_seconds": 2592000
+        },
+        "inquiries": {
+          "max_age_seconds": 2592000
+        },
+        "notifications": {
+          "max_age_seconds": 2592000
+        },
+        "pack_test_executions": {
+          "max_age_seconds": 2592000
+        },
+        "sensor_process_history": {
+          "max_age_seconds": 2592000
+        },
+        "sensor_processes": {
+          "max_age_seconds": 2592000
+        },
+        "webhook_event_logs": {
+          "max_age_seconds": 2592000
+        },
+        "work_queue_dispatches": {
+          "max_age_seconds": 2592000
+        },
+        "work_queue_items": {
+          "max_age_seconds": 2592000
+        },
+        "worker_history": {
+          "max_age_seconds": 2592000
+        },
+        "workers": {
+          "max_age_seconds": 2592000
+        }
+      }
+    },
+    "maintenance_schedule_before_idle": [
+      {
+        "deferred_since": null,
+        "job": "object_retention",
+        "last_success": "2026-11-05T22:51:10.006568+00:00",
+        "next_due": "2026-11-05T23:50:37.006568+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "partition",
+        "last_success": "2026-11-05T22:50:36.817087+00:00",
+        "next_due": "2026-11-05T23:50:36.817087+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "retention",
+        "last_success": "2026-11-05T22:50:37.327670+00:00",
+        "next_due": "2026-11-05T23:50:37.327670+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "summary",
+        "last_success": "2026-11-05T22:50:38.622756+00:00",
+        "next_due": "2026-11-05T22:55:38.622756+00:00"
+      }
+    ],
+    "maintenance_schedule_after_idle": [
+      {
+        "deferred_since": null,
+        "job": "object_retention",
+        "last_success": "2026-11-05T22:51:10.006568+00:00",
+        "next_due": "2026-11-05T23:50:37.006568+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "partition",
+        "last_success": "2026-11-05T22:50:36.817087+00:00",
+        "next_due": "2026-11-05T23:50:36.817087+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "retention",
+        "last_success": "2026-11-05T22:50:37.327670+00:00",
+        "next_due": "2026-11-05T23:50:37.327670+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "summary",
+        "last_success": "2026-11-05T22:56:10.951800+00:00",
+        "next_due": "2026-11-05T23:01:10.951800+00:00"
+      }
+    ],
+    "postgres_settings": {
+      "fsync": "on",
+      "max_connections": "100",
+      "pg_stat_statements.max": "50000",
+      "pg_stat_statements.track": "all",
+      "server_version": "18.6",
+      "shared_buffers": "16384",
+      "synchronous_commit": "on"
+    },
+    "host": {
+      "logical_cpus": 8,
+      "kernel": "7.3.1-1-cachyos"
+    },
+    "docker": {
+      "NCPU": 8,
+      "MemTotal": 16765710336,
+      "Architecture": "x86_64",
+      "ServerVersion": "29.9.2"
+    }
+  },
+  {
+    "kind": "current",
+    "backend": "volume",
+    "trial": 2,
+    "revision": "0c37e1dd8792de0ec93bf7ed397e674a2cb4def8",
+    "runtime_source_equivalent_to": null,
+    "project": "attune-idle-ready-repeat-current-vol-cf3658d9",
+    "collector_sha256": "5d440cba38f43a331a698811e8f4af5a7f864cbc10b8023aae9a56f8ce0ef358",
+    "capture_budget_ms": 10000,
+    "cleanup_verified": true,
+    "stream_discovery_exit_code": 0,
+    "observer_image": "sha256:9bc8e4da26d9939d0cb9c4e6f719a0eab4a5662336105d79358b7ec94fd22524",
+    "python_dependencies": {
+      "pytest": "9.2.0",
+      "psycopg": "3.3.8",
+      "requests": "2.34.2",
+      "pyyaml": "6.0.3"
+    },
+    "infrastructure_images": {
+      "worker-shell": "sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587",
+      "worker-python": "sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f",
+      "worker-node": "sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392",
+      "worker-full": "sha256:05e6ff96f79bb39c3c46e5bddca425c82f0887ae4c91288f1c80895fac9227a9",
+      "sensor": "sha256:05e6ff96f79bb39c3c46e5bddca425c82f0887ae4c91288f1c80895fac9227a9",
+      "postgres": "sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873",
+      "rabbitmq": "sha256:3ef7f7e89fed709a78f79b8b5f4e30e1312a1d4089da752e23595566d9d61a95",
+      "init-pack-binaries": "sha256:5af00c1720ed48e7b6d5b615a0650c4fd17364569de3a7cf5a94cb6e81f95b83"
+    },
+    "runtime_images": {
+      "api": "sha256:2069f1e9a3dd20a881275a4296eefe77c34f63c30f1ba419464115fba55efa79",
+      "executor": "sha256:eab0bc28091db0591b015d83442e20d252311cdc08ad7af774aeac3b1010baca",
+      "executor-2": "sha256:67c3cafc269347f8802520be85f989c7b39648cbd7dd0db79cb9a275fe6a62fe",
+      "notifier": "sha256:8b395bf47539eb0d8177fdb2a8dcc241d5e61ec923573291677cbeeaf6d580a0",
+      "supervisor": "sha256:2f64f8fa1127bc4b9275e9377ffe3827e77ad49d87ff488a772e108056a708c9",
+      "init-agent": "sha256:5bd49d8c0882fc9e5878a330d05c19974aaa3716ad6b4653694ecf7f9938f6d2",
+      "pack-release-upgrade": "sha256:2a59d7d9aecc416c710d2b86e67d0a79ba19d418d4f06096d31a976271118388"
+    },
+    "verified_agent_sha256": "265d7f0f301abd9bdaafb604a3bb7de25f928b9b5748093b00efc0a13fb32104",
+    "idle": {
+      "end_wall_time": 1793920680.4930615,
+      "nested_exec_ms": 0,
+      "nested_statement_calls": 0,
+      "observer_statement_calls": 1,
+      "queue_capacity_calls": 144,
+      "queue_readiness_calls": 144,
+      "seconds": 360.0553443210083,
+      "sql_exec_ms": 705.0585629999997,
+      "start_wall_time": 1793920320.4370315,
+      "statement_calls": 6659,
+      "top_level_exec_ms": 705.0585629999997,
+      "top_level_statement_calls": 6659,
+      "top_level_wal_bytes": 551410,
+      "top_level_counter_query_exec_ms": 21.236376,
+      "top_level_exec_ms_excluding_counter_queries": 683.8221869999998,
+      "top_level_statement_calls_per_minute": 1109.662740191933,
+      "top_level_exec_ms_per_minute": 117.49169800486052,
+      "top_level_wal_bytes_per_minute": 91887.54040685295,
+      "top_level_counter_query_exec_ms_per_minute": 3.5388519573368673,
+      "top_level_exec_ms_excluding_counter_queries_per_minute": 113.95284604752366
+    },
+    "runtime_retention_config": {
+      "advisory_lock_key": 7821001,
+      "batch_size": 1000,
+      "cache_retention": {
+        "alert_cooldown_seconds": 3600,
+        "alert_limit_per_cycle": 25,
+        "ddl_creation_statement_timeout_milliseconds": 5000,
+        "ddl_lock_timeout_milliseconds": 250,
+        "ddl_statement_timeout_milliseconds": 1000,
+        "dry_run": false,
+        "enabled": true,
+        "freshness_alert_grace_seconds": 900,
+        "freshness_alerts_enabled": true,
+        "max_cleanup_cycle_milliseconds": 30000,
+        "max_generations_per_cycle": 50,
+        "max_namespaces_per_cycle": 50,
+        "min_traversal_window_seconds": 3600,
+        "staging_expiry_seconds": 86400,
+        "staging_failure_alert_threshold": 3,
+        "statistics_interval_seconds": 300,
+        "statistics_statement_timeout_milliseconds": 5000
+      },
+      "check_interval_seconds": 3600,
+      "dry_run": false,
+      "enabled": true,
+      "max_batches_per_target": 100,
+      "native_maintenance": {
+        "default_repair_row_limit": 1000,
+        "enabled": true,
+        "lock_timeout_milliseconds": 250,
+        "max_partition_cycle_milliseconds": 5000,
+        "max_partition_operations_per_cycle": 32,
+        "max_summary_buckets_per_cycle": 128,
+        "max_summary_cycle_milliseconds": 5000,
+        "max_summary_invalidations_per_bucket": 10000,
+        "operation_timeout_milliseconds": 1000,
+        "partition_interval_seconds": 3600,
+        "partition_lookahead_days": 7,
+        "summary_bootstrap_hours": 24,
+        "summary_interval_seconds": 300
+      },
+      "targets": {
+        "audit_events": {
+          "max_age_seconds": 7776000
+        },
+        "enforcements": {
+          "max_age_seconds": 2592000
+        },
+        "events": {
+          "max_age_seconds": 2592000
+        },
+        "execution_admission": {
+          "max_age_seconds": 2592000
+        },
+        "execution_history": {
+          "max_age_seconds": 2592000
+        },
+        "executions": {
+          "max_age_seconds": 2592000
+        },
+        "inquiries": {
+          "max_age_seconds": 2592000
+        },
+        "notifications": {
+          "max_age_seconds": 2592000
+        },
+        "pack_test_executions": {
+          "max_age_seconds": 2592000
+        },
+        "sensor_process_history": {
+          "max_age_seconds": 2592000
+        },
+        "sensor_processes": {
+          "max_age_seconds": 2592000
+        },
+        "webhook_event_logs": {
+          "max_age_seconds": 2592000
+        },
+        "work_queue_dispatches": {
+          "max_age_seconds": 2592000
+        },
+        "work_queue_items": {
+          "max_age_seconds": 2592000
+        },
+        "worker_history": {
+          "max_age_seconds": 2592000
+        },
+        "workers": {
+          "max_age_seconds": 2592000
+        }
+      }
+    },
+    "maintenance_schedule_before_idle": [
+      {
+        "deferred_since": null,
+        "job": "object_retention",
+        "last_success": "2026-11-05T23:08:59.375545+00:00",
+        "next_due": "2026-11-06T00:08:58.375545+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "partition",
+        "last_success": "2026-11-05T23:08:58.074479+00:00",
+        "next_due": "2026-11-06T00:08:58.074479+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "retention",
+        "last_success": "2026-11-05T23:08:58.593616+00:00",
+        "next_due": "2026-11-06T00:08:58.593616+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "summary",
+        "last_success": "2026-11-05T23:08:59.800566+00:00",
+        "next_due": "2026-11-05T23:13:59.800566+00:00"
+      }
+    ],
+    "maintenance_schedule_after_idle": [
+      {
+        "deferred_since": null,
+        "job": "object_retention",
+        "last_success": "2026-11-05T23:08:59.375545+00:00",
+        "next_due": "2026-11-06T00:08:58.375545+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "partition",
+        "last_success": "2026-11-05T23:08:58.074479+00:00",
+        "next_due": "2026-11-06T00:08:58.074479+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "retention",
+        "last_success": "2026-11-05T23:08:58.593616+00:00",
+        "next_due": "2026-11-06T00:08:58.593616+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "summary",
+        "last_success": "2026-11-05T23:14:00.519914+00:00",
+        "next_due": "2026-11-05T23:19:00.519914+00:00"
+      }
+    ],
+    "postgres_settings": {
+      "fsync": "on",
+      "max_connections": "100",
+      "pg_stat_statements.max": "50000",
+      "pg_stat_statements.track": "all",
+      "server_version": "18.6",
+      "shared_buffers": "16384",
+      "synchronous_commit": "on"
+    },
+    "host": {
+      "logical_cpus": 8,
+      "kernel": "7.3.1-1-cachyos"
+    },
+    "docker": {
+      "NCPU": 8,
+      "MemTotal": 16765710336,
+      "Architecture": "x86_64",
+      "ServerVersion": "29.9.2"
+    }
+  },
+  {
+    "kind": "baseline",
+    "backend": "volume",
+    "trial": 2,
+    "revision": "747832c97e09cbc122f72af1304e66375e3dde0e",
+    "runtime_source_equivalent_to": "4846e6073c72325afd9583a550cc772dcd342057",
+    "project": "attune-idle-ready-repeat-base-vol-4761def1",
+    "collector_sha256": "5d440cba38f43a331a698811e8f4af5a7f864cbc10b8023aae9a56f8ce0ef358",
+    "capture_budget_ms": 10000,
+    "cleanup_verified": true,
+    "stream_discovery_exit_code": 0,
+    "observer_image": "sha256:9bc8e4da26d9939d0cb9c4e6f719a0eab4a5662336105d79358b7ec94fd22524",
+    "python_dependencies": {
+      "pytest": "9.2.0",
+      "psycopg": "3.3.8",
+      "requests": "2.34.2",
+      "pyyaml": "6.0.3"
+    },
+    "infrastructure_images": {
+      "worker-shell": "sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587",
+      "worker-python": "sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f",
+      "worker-node": "sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392",
+      "worker-full": "sha256:05e6ff96f79bb39c3c46e5bddca425c82f0887ae4c91288f1c80895fac9227a9",
+      "sensor": "sha256:05e6ff96f79bb39c3c46e5bddca425c82f0887ae4c91288f1c80895fac9227a9",
+      "postgres": "sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873",
+      "rabbitmq": "sha256:3ef7f7e89fed709a78f79b8b5f4e30e1312a1d4089da752e23595566d9d61a95",
+      "init-pack-binaries": "sha256:5af00c1720ed48e7b6d5b615a0650c4fd17364569de3a7cf5a94cb6e81f95b83"
+    },
+    "runtime_images": {
+      "api": "sha256:97341ff83e7a9b6bc5ada440da64e36a752c462e46e7ac14485d9e60a8ddbfab",
+      "executor": "sha256:87ba73c1cc3370c703d9c35963bf8d17816c26b1c80cbce392049a335a2da4b7",
+      "executor-2": "sha256:fb7dbc485d108d95c18746470019051a4dc0d440cd4dbba16550b05dacf3c5e2",
+      "notifier": "sha256:23d5fcb2342f58995c0def97d1d9bd499ca4af0a130827b2c62cffe968f54284",
+      "supervisor": "sha256:7c6e9d174e2789531af098c2948255f22cad58a2376711eabbca831c0ae043c1",
+      "init-agent": "sha256:27fbfe53e14315b719f0b56d16aa0e1701bca2fd0ca13d21901133f930297973",
+      "pack-release-upgrade": "sha256:802e8bde87b111df97c957fa3b7e490cbb529c9385a491417a2d0ffbaa6ca467"
+    },
+    "verified_agent_sha256": "265d7f0f301abd9bdaafb604a3bb7de25f928b9b5748093b00efc0a13fb32104",
+    "idle": {
+      "end_wall_time": 1793921857.381502,
+      "nested_exec_ms": 0,
+      "nested_statement_calls": 0,
+      "observer_statement_calls": 1,
+      "queue_capacity_calls": 1287,
+      "queue_readiness_calls": 0,
+      "seconds": 360.04715109699464,
+      "sql_exec_ms": 1551.0330359999962,
+      "start_wall_time": 1793921497.3344967,
+      "statement_calls": 20305,
+      "top_level_exec_ms": 1551.0330359999962,
+      "top_level_statement_calls": 20305,
+      "top_level_wal_bytes": 546084,
+      "top_level_counter_query_exec_ms": 35.680989000000004,
+      "top_level_exec_ms_excluding_counter_queries": 1515.3520469999962,
+      "top_level_statement_calls_per_minute": 3383.7234825718615,
+      "top_level_exec_ms_per_minute": 258.4716526056594,
+      "top_level_wal_bytes_per_minute": 91002.08097792526,
+      "top_level_counter_query_exec_ms_per_minute": 5.946052714143724,
+      "top_level_exec_ms_excluding_counter_queries_per_minute": 252.52559989151572
+    },
+    "runtime_retention_config": {
+      "advisory_lock_key": 7821001,
+      "batch_size": 1000,
+      "cache_retention": {
+        "alert_cooldown_seconds": 3600,
+        "alert_limit_per_cycle": 25,
+        "ddl_creation_statement_timeout_milliseconds": 5000,
+        "ddl_lock_timeout_milliseconds": 250,
+        "ddl_statement_timeout_milliseconds": 1000,
+        "dry_run": false,
+        "enabled": true,
+        "freshness_alert_grace_seconds": 900,
+        "freshness_alerts_enabled": true,
+        "max_cleanup_cycle_milliseconds": 30000,
+        "max_generations_per_cycle": 50,
+        "max_namespaces_per_cycle": 50,
+        "min_traversal_window_seconds": 3600,
+        "staging_expiry_seconds": 86400,
+        "staging_failure_alert_threshold": 3,
+        "statistics_interval_seconds": 300,
+        "statistics_statement_timeout_milliseconds": 5000
+      },
+      "check_interval_seconds": 3600,
+      "dry_run": false,
+      "enabled": true,
+      "max_batches_per_target": 100,
+      "native_maintenance": {
+        "default_repair_row_limit": 1000,
+        "enabled": true,
+        "lock_timeout_milliseconds": 250,
+        "max_partition_cycle_milliseconds": 5000,
+        "max_partition_operations_per_cycle": 32,
+        "max_summary_buckets_per_cycle": 128,
+        "max_summary_cycle_milliseconds": 5000,
+        "max_summary_invalidations_per_bucket": 10000,
+        "operation_timeout_milliseconds": 1000,
+        "partition_interval_seconds": 3600,
+        "partition_lookahead_days": 7,
+        "summary_bootstrap_hours": 24,
+        "summary_interval_seconds": 300
+      },
+      "targets": {
+        "audit_events": {
+          "max_age_seconds": 7776000
+        },
+        "enforcements": {
+          "max_age_seconds": 2592000
+        },
+        "events": {
+          "max_age_seconds": 2592000
+        },
+        "execution_admission": {
+          "max_age_seconds": 2592000
+        },
+        "execution_history": {
+          "max_age_seconds": 2592000
+        },
+        "executions": {
+          "max_age_seconds": 2592000
+        },
+        "inquiries": {
+          "max_age_seconds": 2592000
+        },
+        "notifications": {
+          "max_age_seconds": 2592000
+        },
+        "pack_test_executions": {
+          "max_age_seconds": 2592000
+        },
+        "sensor_process_history": {
+          "max_age_seconds": 2592000
+        },
+        "sensor_processes": {
+          "max_age_seconds": 2592000
+        },
+        "webhook_event_logs": {
+          "max_age_seconds": 2592000
+        },
+        "work_queue_dispatches": {
+          "max_age_seconds": 2592000
+        },
+        "work_queue_items": {
+          "max_age_seconds": 2592000
+        },
+        "worker_history": {
+          "max_age_seconds": 2592000
+        },
+        "workers": {
+          "max_age_seconds": 2592000
+        }
+      }
+    },
+    "maintenance_schedule_before_idle": [
+      {
+        "deferred_since": null,
+        "job": "object_retention",
+        "last_success": "2026-11-05T23:28:31.664682+00:00",
+        "next_due": "2026-11-06T00:28:30.664682+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "partition",
+        "last_success": "2026-11-05T23:28:30.132299+00:00",
+        "next_due": "2026-11-06T00:28:30.132299+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "retention",
+        "last_success": "2026-11-05T23:28:30.628937+00:00",
+        "next_due": "2026-11-06T00:28:30.628937+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "summary",
+        "last_success": "2026-11-05T23:28:32.143057+00:00",
+        "next_due": "2026-11-05T23:33:32.143057+00:00"
+      }
+    ],
+    "maintenance_schedule_after_idle": [
+      {
+        "deferred_since": null,
+        "job": "object_retention",
+        "last_success": "2026-11-05T23:28:31.664682+00:00",
+        "next_due": "2026-11-06T00:28:30.664682+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "partition",
+        "last_success": "2026-11-05T23:28:30.132299+00:00",
+        "next_due": "2026-11-06T00:28:30.132299+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "retention",
+        "last_success": "2026-11-05T23:28:30.628937+00:00",
+        "next_due": "2026-11-06T00:28:30.628937+00:00"
+      },
+      {
+        "deferred_since": null,
+        "job": "summary",
+        "last_success": "2026-11-05T23:33:33.051714+00:00",
+        "next_due": "2026-11-05T23:38:33.051714+00:00"
+      }
+    ],
+    "postgres_settings": {
+      "fsync": "on",
+      "max_connections": "100",
+      "pg_stat_statements.max": "50000",
+      "pg_stat_statements.track": "all",
+      "server_version": "18.6",
+      "shared_buffers": "16384",
+      "synchronous_commit": "on"
+    },
+    "host": {
+      "logical_cpus": 8,
+      "kernel": "7.3.1-1-cachyos"
+    },
+    "docker": {
+      "NCPU": 8,
+      "MemTotal": 16765710336,
+      "Architecture": "x86_64",
+      "ServerVersion": "29.9.2"
+    }
+  }
+]

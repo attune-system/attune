@@ -1,0 +1,20 @@
+{
+  "final_runtime_revision": "0c37e1dd8792de0ec93bf7ed397e674a2cb4def8",
+  "initial_validation_revision": "ca5fa44567e475892d89bbf981a7085a7695ac51",
+  "intervening_changed_paths": [
+    "crates/executor/src/workflow/log/wakeup.rs",
+    "crates/executor/src/workflow/log/wakeup_tests.rs",
+    "docs/plans/idle-database-activity-analysis.md",
+    "docs/workflows/workflow-execution-engine.md"
+  ],
+  "reused_checks": [
+    "supervisor: 58 passed",
+    "queue repository: 11 passed",
+    "retention: 15 passed",
+    "queue dispatcher: 18 passed"
+  ],
+  "reuse_rationale": "Later source edits affect only workflow hint draining and its new regression case; shared repository/queue/supervisor inputs stay unchanged. The final workflow suite (30), API suites (25), workspace/all-target check and Clippy run after those edits.",
+  "fresh_postgresql_version": "18.6",
+  "sqlx_prepare_revision": "59c152b9",
+  "sqlx_reuse_rationale": "Migration bytes and macro-query inputs are unchanged; preparation found no macro queries. Later SQL is dynamic/builtin and covered by PostgreSQL-backed tests."
+}

@@ -1,7 +1,7 @@
 //! Work queue dispatcher - polls business queues and creates executions.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
@@ -133,7 +133,19 @@ impl WorkQueueDispatcher {
         )
         .await?;
 
+        // This snapshot is only an optimization hint. Recovery above remains
+        // independent; prepare_next_dispatch still locks and rechecks every item.
+        // A concurrent enqueue missed here is seen by the next ordinary poll.
+        let queue_ids: Vec<_> = queues.rows.iter().map(|queue| queue.id).collect();
+        let ready: HashSet<_> =
+            WorkQueueItemRepository::queues_with_ready_items(&self.pool, &queue_ids)
+                .await?
+                .into_iter()
+                .collect();
         for queue in queues.rows {
+            if !ready.contains(&queue.id) {
+                continue;
+            }
             if let Err(error) = self.dispatch_ready_batches_for_queue(&queue).await {
                 error!(
                     "Failed to dispatch queued work for queue '{}' ({}): {error:#}",
@@ -320,20 +332,22 @@ impl WorkQueueDispatcher {
             return Ok(());
         }
 
-        if let Some(delay_until) = Self::sequential_delay_until(
-            WorkQueueDispatchRepository::latest_terminal_for_queue(&self.pool, queue.id)
-                .await?
-                .as_ref(),
-            context.concurrency,
-            context.inter_execution_delay_seconds,
-        ) {
-            let now = Utc::now();
-            if delay_until > now {
-                debug!(
-                    "Queue '{}' is waiting for sequential inter-execution delay until {}",
-                    queue.r#ref, delay_until
-                );
-                return Ok(());
+        if context.concurrency == 1 && context.inter_execution_delay_seconds > 0 {
+            if let Some(delay_until) = Self::sequential_delay_until(
+                WorkQueueDispatchRepository::latest_terminal_for_queue(&self.pool, queue.id)
+                    .await?
+                    .as_ref(),
+                context.concurrency,
+                context.inter_execution_delay_seconds,
+            ) {
+                let now = Utc::now();
+                if delay_until > now {
+                    debug!(
+                        "Queue '{}' is waiting for sequential inter-execution delay until {}",
+                        queue.r#ref, delay_until
+                    );
+                    return Ok(());
+                }
             }
         }
 

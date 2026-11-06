@@ -440,6 +440,18 @@ async fn batch_budget_and_unlimited_targets_round_trip_through_persistence() {
         RetentionRepository::load_config(db.pool()).await.unwrap(),
         updated
     );
+    // Missing targets are still repaired; concurrent initialization must not
+    // overwrite the operator's keep-forever value or their other settings.
+    sqlx::query("DELETE FROM runtime_retention_target_config WHERE target = 'notifications'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let (first, second) = tokio::join!(
+        RetentionRepository::load_config(db.pool()),
+        RetentionRepository::load_config(db.pool()),
+    );
+    assert_eq!(first.unwrap(), updated);
+    assert_eq!(second.unwrap(), updated);
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*)::BIGINT FROM runtime_retention_target_config"

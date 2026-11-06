@@ -1,0 +1,625 @@
+{
+  "failed_ci_head": "9e8aa8e96111e20eb6ba614e4e8622c22c24c468",
+  "failed_job": "https://github.com/attune-system/attune/actions/runs/42132807332/job/127613419690",
+  "ci_assertion": {
+    "actual": 255,
+    "expected": 256
+  },
+  "runtime_unchanged": true,
+  "final_test_source_sha256": "5561be9be432c0e6016f09896864afa0e732b498a0a7db4934ed5ef94f7de8fa",
+  "final_result": {
+    "retention_tests_passed": 24,
+    "retention_tests_failed": 0,
+    "threads": 4,
+    "focused_deletion_consecutive_passes": 3,
+    "clippy_warnings_denied": "passed",
+    "fmt_and_diff_checks": "passed",
+    "storage": "owned Docker volume using tmpfs, 3GiB limit",
+    "fsync": "on",
+    "synchronous_commit": "on"
+  },
+  "limitations": [
+    "Disk-backed local full-suite attempts failed as recorded; no failures are counted as passing.",
+    "Memory-backed validation does not certify physical storage durability or remove final required CI gate.",
+    "All failed development iterations and temporary audit-fixture adjustments are retained; final audit tests remain unchanged."
+  ],
+  "development_checkpoints": [
+    {
+      "checkpoint": "fairness",
+      "interpretation": "Original stop condition reproduces exact 255/256 failure with explicit transient timeout; first correction then finds empty-tail transition.",
+      "commands": [
+        {
+          "name": "setup",
+          "command": [
+            "make",
+            "db-test-setup",
+            "TEST_DB_ADMIN_URL=postgresql://postgres@127.0.0.1:35629/postgres",
+            "TEST_DB_URL=postgresql://postgres@127.0.0.1:35629/attune_test"
+          ],
+          "exit_code": 0,
+          "expected": 0,
+          "seconds": 7.682297036983073,
+          "run_id": "fair-d11678783695"
+        },
+        {
+          "name": "old-stop-regression",
+          "command": [
+            "cargo",
+            "test",
+            "-p",
+            "attune-common",
+            "--test",
+            "file_evidence_retention_tests",
+            "over_budget_first_deletion_does_not_hide_the_257th_candidate",
+            "--",
+            "--nocapture",
+            "--test-threads=4"
+          ],
+          "exit_code": 101,
+          "expected": 101,
+          "seconds": 276.0225749480305,
+          "run_id": "fair-65cfecd479ee"
+        },
+        {
+          "name": "fairness-1",
+          "command": [
+            "cargo",
+            "test",
+            "-p",
+            "attune-common",
+            "--test",
+            "file_evidence_retention_tests",
+            "over_budget_first_deletion_does_not_hide_the_257th_candidate",
+            "--",
+            "--nocapture",
+            "--test-threads=4"
+          ],
+          "exit_code": 101,
+          "expected": 0,
+          "seconds": 61.33180101501057,
+          "run_id": "fair-446f3cac407f"
+        }
+      ],
+      "database": {
+        "image_id": "sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873",
+        "image_digests": [
+          "postgres@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873"
+        ],
+        "server_version": "PostgreSQL 18.6 on x86_64-pc-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",
+        "port": "127.0.0.1:35629",
+        "settings": [
+          "TimeZone=UTC",
+          "default_transaction_isolation=read committed",
+          "fsync=on",
+          "max_connections=100",
+          "shared_buffers=16384",
+          "synchronous_commit=on"
+        ],
+        "cleanup_errors": []
+      },
+      "logs": [
+        {
+          "name": "fairness-1.log",
+          "sha256": "5c32c786d1bfa40918aa3475660c985c2e5afc283783cb81d1b08fbf0190dcc7"
+        },
+        {
+          "name": "old-stop-regression.log",
+          "sha256": "4e4ac2963fa3378a68caab1f032449a775381d705773f1b129c4866715d02b01"
+        },
+        {
+          "name": "setup.log",
+          "sha256": "e63f60180172ef0000631fc33ea4c23081c4e279e17cbbce25799ff60c76c6f4"
+        }
+      ]
+    },
+    {
+      "checkpoint": "fairness-final",
+      "interpretation": "Empty-tail correction passes twice, third exposes 50ms bookkeeping commit deadline. Superseded fixture.",
+      "commands": [
+        {
+          "name": "setup",
+          "command": [
+            "make",
+            "db-test-setup",
+            "TEST_DB_ADMIN_URL=postgresql://postgres@127.0.0.1:41795/postgres",
+            "TEST_DB_URL=postgresql://postgres@127.0.0.1:41795/attune_test"
+          ],
+          "exit_code": 0,
+          "expected": 0,
+          "seconds": 8.23472273099469,
+          "run_id": "fair-00fb3f81bcaa"
+        },
+        {
+          "name": "fairness-1",
+          "command": [
+            "cargo",
+            "test",
+            "-p",
+            "attune-common",
+            "--test",
+            "file_evidence_retention_tests",
+            "over_budget_first_deletion_does_not_hide_the_257th_candidate",
+            "--",
+            "--nocapture",
+            "--test-threads=4"
+          ],
+          "exit_code": 0,
+          "expected": 0,
+          "seconds": 55.04812871804461,
+          "run_id": "fair-4d199a5614d8"
+        },
+        {
+          "name": "fairness-2",
+          "command": [
+            "cargo",
+            "test",
+            "-p",
+            "attune-common",
+            "--test",
+            "file_evidence_retention_tests",
+            "over_budget_first_deletion_does_not_hide_the_257th_candidate",
+            "--",
+            "--nocapture",
+            "--test-threads=4"
+          ],
+          "exit_code": 0,
+          "expected": 0,
+          "seconds": 41.315226806967985,
+          "run_id": "fair-63f45503d86b"
+        },
+        {
+          "name": "fairness-3",
+          "command": [
+            "cargo",
+            "test",
+            "-p",
+            "attune-common",
+            "--test",
+            "file_evidence_retention_tests",
+            "over_budget_first_deletion_does_not_hide_the_257th_candidate",
+            "--",
+            "--nocapture",
+            "--test-threads=4"
+          ],
+          "exit_code": 101,
+          "expected": 0,
+          "seconds": 46.1426701680175,
+          "run_id": "fair-3e9a5dacb4fb"
+        }
+      ],
+      "database": {
+        "image_id": "sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873",
+        "image_digests": [
+          "postgres@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873"
+        ],
+        "server_version": "PostgreSQL 18.6 on x86_64-pc-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",
+        "port": "127.0.0.1:41795",
+        "settings": [
+          "TimeZone=UTC",
+          "default_transaction_isolation=read committed",
+          "fsync=on",
+          "max_connections=100",
+          "shared_buffers=16384",
+          "synchronous_commit=on"
+        ],
+        "cleanup_errors": []
+      },
+      "logs": [
+        {
+          "name": "fairness-1.log",
+          "sha256": "230f461118dd710a2c2533ebc3b48ca1c525cb38db5409854cc3078f34c5011d"
+        },
+        {
+          "name": "fairness-2.log",
+          "sha256": "d858ed3e36628b93d77b548d70706b7a576ef5d0af976bb3af2865b543ca4a48"
+        },
+        {
+          "name": "fairness-3.log",
+          "sha256": "86aa84b8a020679cf0c3d4c3eeedf5f42e6f1c75155fb0e9d19a1c14819ddcac"
+        },
+        {
+          "name": "setup.log",
+          "sha256": "9161968a4cb42741e5bd37e75f9d1f2cf17c0b80c9641860c0ad0ae05437bb80"
+        }
+      ]
+    },
+    {
+      "checkpoint": "fairness-validated",
+      "interpretation": "Final deletion fixture passes three focused runs; concurrent suite exposes existing audit deadline failure. Audit fixture unchanged at this checkpoint.",
+      "commands": [
+        {
+          "name": "setup",
+          "command": [
+            "make",
+            "db-test-setup",
+            "TEST_DB_ADMIN_URL=postgresql://postgres@127.0.0.1:40655/postgres",
+            "TEST_DB_URL=postgresql://postgres@127.0.0.1:40655/attune_test"
+          ],
+          "exit_code": 0,
+          "expected": 0,
+          "seconds": 8.28468351700576,
+          "run_id": "fair-03cffdb53d9e"
+        },
+        {
+          "name": "fairness-1",
+          "command": [
+            "cargo",
+            "test",
+            "-p",
+            "attune-common",
+            "--test",
+            "file_evidence_retention_tests",
+            "over_budget_first_deletion_does_not_hide_the_257th_candidate",
+            "--",
+            "--nocapture",
+            "--test-threads=4"
+          ],
+          "exit_code": 0,
+          "expected": 0,
+          "seconds": 54.993016468011774,
+          "run_id": "fair-554437b46ce4"
+        },
+        {
+          "name": "fairness-2",
+          "command": [
+            "cargo",
+            "test",
+            "-p",
+            "attune-common",
+            "--test",
+            "file_evidence_retention_tests",
+            "over_budget_first_deletion_does_not_hide_the_257th_candidate",
+            "--",
+            "--nocapture",
+            "--test-threads=4"
+          ],
+          "exit_code": 0,
+          "expected": 0,
+          "seconds": 41.814569739974104,
+          "run_id": "fair-12919b860b75"
+        },
+        {
+          "name": "fairness-3",
+          "command": [
+            "cargo",
+            "test",
+            "-p",
+            "attune-common",
+            "--test",
+            "file_evidence_retention_tests",
+            "over_budget_first_deletion_does_not_hide_the_257th_candidate",
+            "--",
+            "--nocapture",
+            "--test-threads=4"
+          ],
+          "exit_code": 0,
+          "expected": 0,
+          "seconds": 46.18715449498268,
+          "run_id": "fair-fd0196eeee43"
+        },
+        {
+          "name": "retention-suite",
+          "command": [
+            "cargo",
+            "test",
+            "-p",
+            "attune-common",
+            "--test",
+            "file_evidence_retention_tests",
+            "--",
+            "--nocapture",
+            "--test-threads=4"
+          ],
+          "exit_code": 101,
+          "expected": 0,
+          "seconds": 85.93387616495602,
+          "run_id": "fair-f33c349d2461"
+        }
+      ],
+      "database": {
+        "image_id": "sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873",
+        "image_digests": [
+          "postgres@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873"
+        ],
+        "server_version": "PostgreSQL 18.6 on x86_64-pc-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",
+        "port": "127.0.0.1:40655",
+        "settings": [
+          "TimeZone=UTC",
+          "default_transaction_isolation=read committed",
+          "fsync=on",
+          "max_connections=100",
+          "shared_buffers=16384",
+          "synchronous_commit=on"
+        ],
+        "cleanup_errors": []
+      },
+      "logs": [
+        {
+          "name": "fairness-1.log",
+          "sha256": "363f6f915bef0c379473bd842630799275f46593b9b9d604aad4b64cda820967"
+        },
+        {
+          "name": "fairness-2.log",
+          "sha256": "1d26a49d76d600504747dcd15e5dfa05e46bfaa77fa167d0794e62c07faaeb9f"
+        },
+        {
+          "name": "fairness-3.log",
+          "sha256": "e0a96a4fcc8537936329f41beed40b7538d794b845666e3f6355ef557f7f7156"
+        },
+        {
+          "name": "retention-suite.log",
+          "sha256": "49f35a3e2cd1f0424889192fb8d977c4ba799a7a31df6386d1d6c42363126481"
+        },
+        {
+          "name": "setup.log",
+          "sha256": "2a12f2f1adfe4a17b96ef53a14c5f80c15201676c127a9380c9fccde85518977"
+        }
+      ]
+    },
+    {
+      "checkpoint": "fairness-complete",
+      "interpretation": "Trial audit budget adjustment does not fix concurrent disk-backed acknowledgement failures; adjustment reverted.",
+      "commands": [
+        {
+          "name": "setup",
+          "command": [
+            "make",
+            "db-test-setup",
+            "TEST_DB_ADMIN_URL=postgresql://postgres@127.0.0.1:35827/postgres",
+            "TEST_DB_URL=postgresql://postgres@127.0.0.1:35827/attune_test"
+          ],
+          "exit_code": 0,
+          "expected": 0,
+          "seconds": 7.982474819000345,
+          "run_id": "fair-9cfdc93cc184"
+        },
+        {
+          "name": "retention-suite",
+          "command": [
+            "cargo",
+            "test",
+            "-p",
+            "attune-common",
+            "--test",
+            "file_evidence_retention_tests",
+            "--",
+            "--nocapture",
+            "--test-threads=4"
+          ],
+          "exit_code": 101,
+          "expected": 0,
+          "seconds": 87.55534860998159,
+          "run_id": "fair-fbb0c7fd75aa"
+        }
+      ],
+      "database": {
+        "image_id": "sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873",
+        "image_digests": [
+          "postgres@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873"
+        ],
+        "server_version": "PostgreSQL 18.6 on x86_64-pc-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",
+        "port": "127.0.0.1:35827",
+        "settings": [
+          "TimeZone=UTC",
+          "default_transaction_isolation=read committed",
+          "fsync=on",
+          "max_connections=100",
+          "shared_buffers=16384",
+          "synchronous_commit=on"
+        ],
+        "cleanup_errors": []
+      },
+      "logs": [
+        {
+          "name": "retention-suite.log",
+          "sha256": "d1c0d9480dce1f263c002533aab149d4174b9550b2b2bdaf29ddf18239c01f91"
+        },
+        {
+          "name": "setup.log",
+          "sha256": "7b09afdf19c7efa4ba22823e0c8408fa0b85fe2ce3442f014746f26bc83281bc"
+        }
+      ]
+    },
+    {
+      "checkpoint": "fairness-container",
+      "interpretation": "Co-located binary still exposes audit deadline failures; host transport alone does not explain them. Deletion test passes. Trial audit adjustment later reverted.",
+      "commands": [
+        {
+          "name": "setup",
+          "command": [
+            "make",
+            "db-test-setup",
+            "TEST_DB_ADMIN_URL=postgresql://postgres@127.0.0.1:43785/postgres",
+            "TEST_DB_URL=postgresql://postgres@127.0.0.1:43785/attune_test"
+          ],
+          "exit_code": 0,
+          "expected": 0,
+          "seconds": 8.335043611994479,
+          "run_id": "fair-2e015973ad6e"
+        },
+        {
+          "name": "compile",
+          "command": [
+            "cargo",
+            "test",
+            "-p",
+            "attune-common",
+            "--test",
+            "file_evidence_retention_tests",
+            "--no-run"
+          ],
+          "exit_code": 0,
+          "expected": 0,
+          "seconds": 15.157429245999083,
+          "run_id": "fair-2fcde6bfe43d"
+        },
+        {
+          "name": "retention-suite",
+          "command": [
+            "docker",
+            "exec",
+            "-e",
+            "ATTUNE__DATABASE__URL=postgresql://postgres@127.0.0.1/attune_test",
+            "-e",
+            "ATTUNE_TEST_RUN_ID=container-c0cac391",
+            "attune-native-fair-c4ab99662a-18-alpine",
+            "/tmp/attune-test-libs/ld-linux-x86-64.so.2",
+            "--library-path",
+            "/tmp/attune-test-libs",
+            "/tmp/attune-retention-tests",
+            "--nocapture",
+            "--test-threads=4"
+          ],
+          "exit_code": 101,
+          "expected": 0,
+          "seconds": 93.26685690099839,
+          "run_id": "fair-7d0f9237770f"
+        }
+      ],
+      "database": {
+        "image_id": "sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873",
+        "image_digests": [
+          "postgres@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873"
+        ],
+        "server_version": "PostgreSQL 18.6 on x86_64-pc-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",
+        "port": "127.0.0.1:43785",
+        "settings": [
+          "TimeZone=UTC",
+          "default_transaction_isolation=read committed",
+          "fsync=on",
+          "max_connections=100",
+          "shared_buffers=16384",
+          "synchronous_commit=on"
+        ],
+        "cleanup_errors": []
+      },
+      "logs": [
+        {
+          "name": "compile.log",
+          "sha256": "d2b003153195c0d320fc8062e4ed078c26e3ac4f0555c44f3bc2f42e9d14489c"
+        },
+        {
+          "name": "retention-suite.log",
+          "sha256": "22bca882f94a4832354b86555606d829f1d48c6c3246ec3de5dfc2045a6c4040"
+        },
+        {
+          "name": "setup.log",
+          "sha256": "913bab083ac8542638052c124ee86b8b1c284c46ed3a21632b16b1a6c07d002b"
+        }
+      ]
+    },
+    {
+      "checkpoint": "fairness-memory",
+      "interpretation": "Final source; all 24 tests pass at four threads on owned tmpfs database storage, fsync and synchronous_commit enabled; Clippy passes.",
+      "commands": [
+        {
+          "name": "setup",
+          "command": [
+            "make",
+            "db-test-setup",
+            "TEST_DB_ADMIN_URL=postgresql://postgres@127.0.0.1:44123/postgres",
+            "TEST_DB_URL=postgresql://postgres@127.0.0.1:44123/attune_test"
+          ],
+          "exit_code": 0,
+          "expected": 0,
+          "seconds": 2.6690698489546776,
+          "run_id": "fair-db4049bbd251"
+        },
+        {
+          "name": "compile",
+          "command": [
+            "cargo",
+            "test",
+            "-p",
+            "attune-common",
+            "--test",
+            "file_evidence_retention_tests",
+            "--no-run"
+          ],
+          "exit_code": 0,
+          "expected": 0,
+          "seconds": 15.901311384048313,
+          "run_id": "fair-439a828780f8"
+        },
+        {
+          "name": "retention-suite",
+          "command": [
+            "docker",
+            "exec",
+            "-e",
+            "ATTUNE__DATABASE__URL=postgresql://postgres@127.0.0.1/attune_test",
+            "-e",
+            "ATTUNE_TEST_RUN_ID=container-93df7771",
+            "attune-native-fair-7700fa0fd5-18-alpine",
+            "/tmp/attune-test-libs/ld-linux-x86-64.so.2",
+            "--library-path",
+            "/tmp/attune-test-libs",
+            "/tmp/attune-retention-tests",
+            "--nocapture",
+            "--test-threads=4"
+          ],
+          "exit_code": 0,
+          "expected": 0,
+          "seconds": 13.591456455993466,
+          "run_id": "fair-3d6e44684670"
+        },
+        {
+          "name": "clippy",
+          "command": [
+            "cargo",
+            "clippy",
+            "-p",
+            "attune-common",
+            "--test",
+            "file_evidence_retention_tests",
+            "--no-deps",
+            "--",
+            "-D",
+            "warnings"
+          ],
+          "exit_code": 0,
+          "expected": 0,
+          "seconds": 72.73675482399995,
+          "run_id": "fair-d0885e55e4f1"
+        }
+      ],
+      "database": {
+        "image_id": "sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873",
+        "image_digests": [
+          "postgres@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873"
+        ],
+        "server_version": "PostgreSQL 18.6 on x86_64-pc-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",
+        "port": "127.0.0.1:44123",
+        "settings": [
+          "TimeZone=UTC",
+          "default_transaction_isolation=read committed",
+          "fsync=on",
+          "max_connections=100",
+          "shared_buffers=16384",
+          "synchronous_commit=on"
+        ],
+        "passed": true,
+        "sessions_before_container_removal": 0,
+        "cleanup_errors": []
+      },
+      "logs": [
+        {
+          "name": "clippy.log",
+          "sha256": "6057282fa90189af4995c771c2c6ee7f6bd6dd90c199e067a9ef86f7fc4706fb"
+        },
+        {
+          "name": "compile.log",
+          "sha256": "ecdc987cb7fff0f44580e6e022d7ac24564e7b68b548ec59e1cc9e0411d8fba4"
+        },
+        {
+          "name": "retention-suite.log",
+          "sha256": "9129e3401dfa2878f7bdf724498a900f1707d342233f06017517ffc7a0b1c124"
+        },
+        {
+          "name": "setup.log",
+          "sha256": "3ba6da24a60e3aa32ad2492d021be01a1ba9f2dba12ea5104ea166d41fc9bbcb"
+        }
+      ]
+    }
+  ]
+}

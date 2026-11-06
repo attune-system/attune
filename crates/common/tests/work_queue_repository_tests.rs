@@ -1200,3 +1200,84 @@ async fn work_queue_dispatch_repository_tracks_active_and_terminal_dispatches() 
         .expect("list active after completion");
     assert!(!active_after.iter().any(|row| row.id == dispatch.id));
 }
+
+#[tokio::test]
+async fn readiness_hints_only_include_selected_queues_with_dispatchable_statuses() {
+    let (db, empty) = create_queue_fixture().await;
+    let mut selected = vec![empty.id];
+    let mut expected = Vec::new();
+    for status in [
+        WorkQueueItemStatus::Queued,
+        WorkQueueItemStatus::Retry,
+        WorkQueueItemStatus::Leased,
+        WorkQueueItemStatus::Completed,
+        WorkQueueItemStatus::Failed,
+        WorkQueueItemStatus::Skipped,
+        WorkQueueItemStatus::Cancelled,
+    ] {
+        let queue = create_queue(&db).await;
+        selected.push(queue.id);
+        if matches!(
+            status,
+            WorkQueueItemStatus::Queued | WorkQueueItemStatus::Retry
+        ) {
+            expected.push(queue.id);
+        }
+        WorkQueueItemRepository::create(
+            &db,
+            CreateWorkQueueItemInput {
+                queue: queue.id,
+                queue_ref: queue.r#ref.clone(),
+                item_key: None,
+                priority: 0,
+                status,
+                payload: json!({"order_id": 1}),
+                metadata: json!({}),
+                trace_tag: None,
+                enqueue_source: "api".into(),
+                requested_by_identity: None,
+                requested_by_execution: None,
+                requested_by_enforcement: None,
+                leased_execution: None,
+                lease_token: (status == WorkQueueItemStatus::Leased).then(Uuid::new_v4),
+                lease_expires_at: (status == WorkQueueItemStatus::Leased)
+                    .then(|| Utc::now() + Duration::minutes(5)),
+                attempt_count: 0,
+                last_error: None,
+                ack_summary: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let mut ready = WorkQueueItemRepository::queues_with_ready_items(&db, &selected)
+        .await
+        .unwrap();
+    ready.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(ready, expected);
+    assert!(
+        WorkQueueItemRepository::queues_with_ready_items(&db, &[empty.id])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(WorkQueueItemRepository::queues_with_ready_items(&db, &[])
+        .await
+        .unwrap()
+        .is_empty());
+
+    // This is not a remembered empty result: the next snapshot sees new work.
+    sqlx::query("UPDATE work_queue_item SET status = 'retry', lease_token = NULL, lease_expires_at = NULL WHERE queue = $1")
+        .bind(selected[3])
+        .execute(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        WorkQueueItemRepository::queues_with_ready_items(&db, &[selected[3]])
+            .await
+            .unwrap(),
+        vec![selected[3]]
+    );
+    db.cleanup().await.unwrap();
+}

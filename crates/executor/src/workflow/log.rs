@@ -15,7 +15,7 @@ use attune_common::repositories::artifact::{
 use attune_common::repositories::log_stream::LogStreamRepository;
 use attune_common::repositories::workflow::WorkflowExecutionRepository;
 use attune_common::repositories::workflow_log_outbox::{
-    DeliveryRebase, WorkflowLogOutboxRepository,
+    DeliveryRebase, WorkflowLogClaim, WorkflowLogOutboxRepository,
 };
 use chrono::{SecondsFormat, Utc};
 use sha2::{Digest, Sha256};
@@ -26,7 +26,15 @@ use uuid::Uuid;
 const LOG_CONTENT_TYPE: &str = "text/plain";
 const WORKFLOW_LOG_RETENTION: i32 = 50;
 const CLAIM_LEASE: Duration = Duration::from_secs(120);
-const IDLE_DELAY: Duration = Duration::from_millis(100);
+mod wakeup;
+use wakeup::OutboxWakeups;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchOutcome {
+    Progress,
+    Pending,
+    Empty,
+}
 
 enum AppendReconciliation {
     Ready,
@@ -148,21 +156,35 @@ impl WorkflowLogDispatcher {
     }
 
     pub async fn start(self, mut shutdown: tokio::sync::broadcast::Receiver<()>) -> Result<()> {
+        let mut wakeups = OutboxWakeups::new(&self.pool, self.owner);
+        let result = self.run(&mut shutdown, &mut wakeups).await;
+        wakeups.close().await;
+        result
+    }
+
+    async fn run(
+        &self,
+        shutdown: &mut tokio::sync::broadcast::Receiver<()>,
+        wakeups: &mut OutboxWakeups,
+    ) -> Result<()> {
         loop {
             match shutdown.try_recv() {
                 Ok(()) | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => return Ok(()),
                 Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => return Ok(()),
             }
-            match self.dispatch_once().await {
-                Ok(true) => {}
-                Ok(false) => {
-                    tokio::select! {
-                        _ = shutdown.recv() => return Ok(()),
-                        _ = tokio::time::sleep(IDLE_DELAY) => {}
+            match self.dispatch_next().await {
+                Ok(DispatchOutcome::Progress) => wakeups.drain_ready(),
+                Ok(outcome) => {
+                    if !wakeups
+                        .wait(outcome == DispatchOutcome::Pending, shutdown)
+                        .await
+                    {
+                        return Ok(());
                     }
                 }
                 Err(dispatch_error) => {
+                    wakeups.disconnect();
                     warn!(error = %dispatch_error, "Workflow log dispatcher cycle failed");
                     tokio::select! {
                         _ = shutdown.recv() => return Ok(()),
@@ -173,11 +195,22 @@ impl WorkflowLogDispatcher {
         }
     }
 
-    pub async fn dispatch_once(&self) -> Result<bool> {
-        let Some(record) =
-            WorkflowLogOutboxRepository::claim_next(&self.pool, self.owner, CLAIM_LEASE).await?
-        else {
-            return Ok(false);
+    #[cfg(test)]
+    async fn dispatch_once(&self) -> Result<bool> {
+        Ok(self.dispatch_next().await? == DispatchOutcome::Progress)
+    }
+
+    async fn dispatch_next(&self) -> Result<DispatchOutcome> {
+        let record = match WorkflowLogOutboxRepository::claim_next_with_state(
+            &self.pool,
+            self.owner,
+            CLAIM_LEASE,
+        )
+        .await?
+        {
+            WorkflowLogClaim::Claimed(record) => record,
+            WorkflowLogClaim::Pending => return Ok(DispatchOutcome::Pending),
+            WorkflowLogClaim::Empty => return Ok(DispatchOutcome::Empty),
         };
 
         let mut append_attempt = None;
@@ -276,7 +309,7 @@ impl WorkflowLogDispatcher {
                                 record.claimed_by,
                             )
                             .await?;
-                            return Ok(true);
+                            return Ok(DispatchOutcome::Progress);
                         }
                         AppendReconciliation::Rebased => {
                             WorkflowLogOutboxRepository::release_after_failure(
@@ -287,11 +320,11 @@ impl WorkflowLogDispatcher {
                                 "append:sequence_rebased",
                             )
                             .await?;
-                            return Ok(true);
+                            return Ok(DispatchOutcome::Progress);
                         }
                         AppendReconciliation::Permanent(code) => {
                             self.mark_permanent(&record, code).await?;
-                            return Ok(true);
+                            return Ok(DispatchOutcome::Progress);
                         }
                         AppendReconciliation::Ready => {}
                     }
@@ -304,7 +337,7 @@ impl WorkflowLogDispatcher {
                 {
                     self.mark_permanent(&record, "append:unresolved_sequence_conflict")
                         .await?;
-                    return Ok(true);
+                    return Ok(DispatchOutcome::Progress);
                 }
                 if delivery_failure_is_retryable(&delivery_error) {
                     let retry_at = Utc::now()
@@ -337,7 +370,7 @@ impl WorkflowLogDispatcher {
                 }
             }
         }
-        Ok(true)
+        Ok(DispatchOutcome::Progress)
     }
 
     async fn reconcile_append(
@@ -1643,4 +1676,5 @@ mod tests {
         assert_eq!(heads, vec![(1, true)]);
         database.cleanup().await.unwrap();
     }
+    include!("log/wakeup_tests.rs");
 }

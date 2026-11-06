@@ -194,6 +194,17 @@ bash scripts/benchmark-rust-integration-tests.sh \
   /tmp/attune-rust-integration-benchmark.tsv
 ```
 
+The full-stack runner defaults to accelerated cache-retention settings, including
+a two-second retention interval. For isolated performance measurements, set
+`ATTUNE_E2E_RETENTION_PROFILE=default` to retain deployment settings. Do not use
+that profile as a substitute for cache lifecycle correctness coverage. The worker
+lifecycle collector records actual persisted settings and maintenance deadlines;
+`ATTUNE_WORKER_BENCHMARK_IDLE_SECONDS` and
+`ATTUNE_WORKER_BENCHMARK_SETTLE_SECONDS` select observation/settling windows
+(default 60 seconds each). Use identical settings, windows, replicas, output
+checks and capture budgets for a baseline/treatment comparison. An accelerated
+idle rate is not a normal-deployment idle rate.
+
 The Rust image uses a small runtime stage and stores stripped test executables, not the Rust toolchain or Cargo's incremental directory. Its `inventory.tsv` is the exact runnable-test fingerprint. A normal runtime invocation executes those binaries directly and does not compile. Changes limited to the entrypoint or other runtime Docker fixtures do not invalidate the workspace compile layer.
 
 The full-stack runner starts the API and test identity before core-pack

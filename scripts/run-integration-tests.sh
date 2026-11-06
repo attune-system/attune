@@ -56,6 +56,14 @@ if ! validate_identifier "$COMPOSE_PROJECT_NAME"; then
   echo "ERROR: ATTUNE_E2E_PROJECT_NAME is not a safe Compose project name." >&2
   exit 2
 fi
+# Keep accelerated cache E2E coverage as the default. Performance runs can
+# explicitly retain deployment settings; always record the actual DB settings.
+RETENTION_PROFILE="${ATTUNE_E2E_RETENTION_PROFILE:-accelerated}"
+case "$RETENTION_PROFILE" in
+  accelerated|default) ;;
+  *) echo "ERROR: ATTUNE_E2E_RETENTION_PROFILE must be accelerated or default." >&2; exit 2 ;;
+esac
+
 DO_BUILD=true
 DO_TEARDOWN=true
 DO_STARTUP=true
@@ -98,6 +106,7 @@ while [[ $# -gt 0 ]]; do
       echo "Environment:"
       echo "  ATTUNE_E2E_RUN_ID         Optional unique run identity"
       echo "  ATTUNE_E2E_PROJECT_NAME  Optional Compose project for a pre-started stack"
+      echo "  ATTUNE_E2E_RETENTION_PROFILE  accelerated (default) or default deployment settings"
       echo "  ATTUNE_DOCKER_CONFIG_PATH  Config mounted into owned stacks"
       echo "                            Default: docker/distributable/config.docker.yaml"
       echo "  -k <EXPR>         Pytest filter expression"
@@ -385,11 +394,15 @@ if [[ "$DO_STARTUP" == true ]]; then
   # public API before starting the supervisor. This keeps production defaults
   # intact while allowing cursor-expiry and bounded-cleanup scenarios to poll
   # deterministically instead of sleeping for the production retention window.
-  log_info "Configuring E2E cache retention..."
-  compose run --rm --no-deps --entrypoint python3 \
-    -e PYTHONPATH=/app/tests:/app \
-    e2e-tests \
-    /app/tests/e2e/configure_cache_retention.py
+  if [[ "$RETENTION_PROFILE" == accelerated ]]; then
+    log_info "Configuring accelerated E2E cache retention..."
+    compose run --rm --no-deps --entrypoint python3 \
+      -e PYTHONPATH=/app/tests:/app \
+      e2e-tests \
+      /app/tests/e2e/configure_cache_retention.py
+  else
+    log_info "Keeping deployment retention settings (default profile)..."
+  fi
   compose up -d --no-deps supervisor
 
   # Synchronize on persisted worker admission instead of guessing startup time.
