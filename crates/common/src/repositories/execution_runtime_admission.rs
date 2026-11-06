@@ -77,6 +77,9 @@ impl ExistingExecutionAuthority {
         match mode {
             "recorded" => Ok(Self::Recorded),
             "delegated" => Ok(Self::Delegated),
+            "unavailable" => Err(Error::PermissionDenied(
+                "Execution predates explicit authority selection; create a new authorized execution".into(),
+            )),
             _ => Err(Error::PermissionDenied(
                 "Execution authority selection is unavailable or invalid".into(),
             )),
@@ -92,10 +95,7 @@ impl ExecutionAdmissionRepository {
         connection: &mut PgConnection,
         execution: Id,
     ) -> Result<ExistingExecutionAuthority> {
-        let selection =
-            super::delegated_execution::DelegatedExecutionRepository::find(connection, execution)
-                .await?;
-        let selected_mode = ExistingExecutionAuthority::from_persisted(&selection.mode)?;
+        let selected_mode = Self::selected_authority(connection, execution).await?;
         let authority = if selected_mode == ExistingExecutionAuthority::Recorded {
             // Keep the full recorded/delegated validation state out of every
             // enclosing native scheduler future's stack frame.
@@ -117,8 +117,33 @@ impl ExecutionAdmissionRepository {
         Ok(authority)
     }
 
+    /// Classification is not authorization. A recorded tombstone stays recorded
+    /// after loss or revocation; consumers must then require its retained proof.
+    /// This permits stale/terminal event handlers to stop without borrowing IAM.
+    pub async fn selected_authority(
+        connection: &mut PgConnection,
+        execution: Id,
+    ) -> Result<ExistingExecutionAuthority> {
+        let selection =
+            super::delegated_execution::DelegatedExecutionRepository::find(connection, execution)
+                .await?;
+        let selected_mode = ExistingExecutionAuthority::from_persisted(&selection.mode)?;
+        if selected_mode == ExistingExecutionAuthority::Delegated
+            && (!selection.explicit
+                || selection.admission.is_some()
+                || Self::find(connection, RuntimeOwner::Execution(execution))
+                    .await?
+                    .is_some())
+        {
+            return Err(Error::PermissionDenied(
+                "Conflicting execution authority selection".into(),
+            ));
+        }
+        Ok(selected_mode)
+    }
+
     pub async fn is_recorded(connection: &mut PgConnection, execution: Id) -> Result<bool> {
-        Ok(Self::existing_authority(connection, execution).await?
+        Ok(Self::selected_authority(connection, execution).await?
             == ExistingExecutionAuthority::Recorded)
     }
     pub async fn enforcement_is_recorded(
@@ -1231,7 +1256,23 @@ impl ExecutionAdmissionRepository {
         RuntimeAdmissionRecord,
         super::runtime_authority::ApprovalEffectFence,
     )> {
-        RuntimeAuthorityRepository::require_existing_admission(connection, owner).await
+        let retained =
+            RuntimeAuthorityRepository::require_existing_admission(connection, owner).await?;
+        if let RuntimeOwner::Execution(execution) = owner {
+            let selection = super::delegated_execution::DelegatedExecutionRepository::find(
+                connection, execution,
+            )
+            .await?;
+            if selection.mode != "recorded"
+                || selection.explicit
+                || selection.admission != Some(retained.0.id)
+            {
+                return Err(Error::PermissionDenied(
+                    "Recorded execution binding differs from retained authority selection".into(),
+                ));
+            }
+        }
+        Ok(retained)
     }
 
     /// Native effects under the executing action's nonempty selection use its

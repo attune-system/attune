@@ -288,7 +288,7 @@ impl WorkerRegistration {
 
         self.capabilities.insert(
             attune_common::execution_authority::DELEGATED_EXECUTION_CAPABILITY.into(),
-            json!(true),
+            json!(config.security.encryption_key.is_some()),
         );
 
         // Native execution has no interpreter dependency and is always registered

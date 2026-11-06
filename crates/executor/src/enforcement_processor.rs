@@ -352,6 +352,16 @@ impl EnforcementProcessor {
                 enforcement.id,
             )
             .await?;
+        let retained = attune_common::repositories::execution_admission::ExecutionAdmissionRepository::enforcement_is_recorded(&mut tx, enforcement.id).await?;
+        if !rule.is_adhoc || retained {
+            attune_common::execution_authority::RecordedConsumerReadiness::default()
+                .require_ready()?;
+        }
+        let delegated = if rule.is_adhoc && !retained {
+            Some(attune_common::repositories::delegated_execution::DelegatedExecutionRepository::enforcement_selection(&mut tx, enforcement).await?)
+        } else {
+            None
+        };
         let executor_identity = match &input_snapshot {
             Some(snapshot) => {
                 snapshot.input_authority(&mut tx).await?;
@@ -361,9 +371,14 @@ impl EnforcementProcessor {
                 if !rule.is_adhoc {
                     bail!("Deployed enforcement input authority is unavailable");
                 }
-                rule.owner_identity.ok_or_else(|| {
-                    anyhow::anyhow!("Rule execution requires an explicit owner identity")
-                })?
+                delegated
+                    .as_ref()
+                    .map(|selection| selection.0)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Enforcement requires its match-time delegated authority selection"
+                        )
+                    })?
             }
         };
         let snapshot: attune_common::models::ExecutionExecutableSnapshot =
@@ -380,23 +395,11 @@ impl EnforcementProcessor {
 
         let action_ref = &snapshot.executable.action.r#ref;
         let action = Some(snapshot.executable.action.clone());
-        let action_default_permission_set_refs = action
-            .as_ref()
-            .map(|action| action.default_execution_permission_set_refs.clone())
-            .unwrap_or_default();
         let mut permission_set_refs = input_snapshot
             .as_ref()
             .map(|snapshot| snapshot.execution_permission_set_refs.clone())
-            .unwrap_or_else(|| {
-                rule.permission_set_refs
-                    .clone()
-                    .unwrap_or(action_default_permission_set_refs)
-            });
-        let retained=attune_common::repositories::execution_admission::ExecutionAdmissionRepository::enforcement_is_recorded(&mut tx,enforcement.id).await?;
-        if !rule.is_adhoc || retained {
-            attune_common::execution_authority::RecordedConsumerReadiness::default()
-                .require_ready()?;
-        }
+            .or_else(|| delegated.as_ref().map(|selection| selection.1.clone()))
+            .ok_or_else(|| anyhow::anyhow!("Enforcement permission selection unavailable"))?;
         let admission = if !rule.is_adhoc || retained {
             Some(attune_common::repositories::execution_admission::ExecutionAdmissionRepository::inherit(
                 &mut tx, attune_common::repositories::runtime_authority::RuntimeOwner::Enforcement(enforcement.id), &snapshot,

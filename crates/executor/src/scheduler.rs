@@ -1813,14 +1813,8 @@ impl ExecutionScheduler {
         )
         .await?;
         let recorded_initialization =
-            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
-                &mut initialization,
-                attune_common::repositories::runtime_authority::RuntimeOwner::Execution(
-                    execution.id,
-                ),
-            )
-            .await?
-            .is_some();
+            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut initialization, execution.id,)
+            .await?;
         let initialization_closure = if recorded_initialization {
             Some(attune_common::repositories::native_input_origin::NativeInputOriginRepository::capture_with_key(&mut initialization,execution.id,&[],encryption_key).await?)
         } else {
@@ -2635,6 +2629,7 @@ impl ExecutionScheduler {
         supplied: &JsonValue,
         secret_inputs: Vec<SecretValueInput>,
     ) -> Result<PreparedExecutionInputs> {
+        attune_common::repositories::execution_admission::ExecutionAdmissionRepository::existing_authority(conn, child_execution_id).await?;
         let recorded =
             attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
                 conn,
@@ -2743,12 +2738,8 @@ impl ExecutionScheduler {
             entity_type,
             ENTITY_EXECUTION_CONFIG | ENTITY_EXECUTION_RESULT
         ) {
-            if attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
-                &mut transaction,
-                attune_common::repositories::runtime_authority::RuntimeOwner::Execution(consumer),
-            )
+            if attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut transaction, consumer)
             .await?
-            .is_some()
             {
                 // The root config is already prepared by capture_with_key. Its
                 // external sources must remain strict descendants, never the root.
@@ -2832,12 +2823,8 @@ impl ExecutionScheduler {
         variables: &JsonValue,
     ) -> Result<(JsonValue, Vec<(JsonPointer, SecretSource)>)> {
         let prepared =
-            if attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
-                conn,
-                attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent.id),
-            )
+            if attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(conn, parent.id)
             .await?
-            .is_some()
             {
                 Some(attune_common::repositories::native_input_origin::NativeInputOriginRepository::capture_with_key(
                 conn, parent.id, &[], encryption_key,
@@ -2904,12 +2891,8 @@ impl ExecutionScheduler {
         context: &WorkflowContext,
         encryption_key: Option<&str>,
     ) -> Result<Option<attune_common::repositories::native_input_origin::NativeInputClosure>> {
-        if attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
-            conn,
-            attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent),
-        )
+        if !attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(conn, parent)
         .await?
-        .is_none()
         {
             return Ok(None);
         }
@@ -2952,12 +2935,8 @@ impl ExecutionScheduler {
             task,
             &binding,
             &context,
-            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
-                &mut *conn,
-                attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent.id),
-            )
-            .await?
-            .is_some(),
+            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut *conn, parent.id)
+            .await?,
         )?;
         Ok((binding, rendered))
     }
@@ -2977,12 +2956,9 @@ impl ExecutionScheduler {
         use attune_common::repositories::{
             declared_input::DeclaredInputRepository,
             declared_input_materialization::DeclaredInputMaterializationRepository,
-            execution_admission::ExecutionAdmissionRepository, runtime_authority::RuntimeOwner,
+            execution_admission::ExecutionAdmissionRepository,
         };
-        if ExecutionAdmissionRepository::find(conn, RuntimeOwner::Execution(parent.id))
-            .await?
-            .is_some()
-        {
+        if ExecutionAdmissionRepository::is_recorded(conn, parent.id).await? {
             let native_closure = attune_common::repositories::native_input_origin::NativeInputOriginRepository::capture_workflow(conn, parent.id).await?;
             context.bind_native_input_closure(&native_closure);
             let action_ref = workflow_action_ref(
@@ -3285,7 +3261,9 @@ impl ExecutionScheduler {
                         CacheIterationInitializationFailure::OwnerResolution,
                     ));
                 }
-                let recorded = attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(conn, attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent_execution.id)).await.map_err(CacheIterationInitializationError::infrastructure)?;
+                let recorded = if attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(conn, parent_execution.id).await.map_err(CacheIterationInitializationError::infrastructure)? {
+                    Some(attune_common::repositories::execution_admission::ExecutionAdmissionRepository::require(conn, attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent_execution.id)).await.map_err(CacheIterationInitializationError::infrastructure)?)
+                } else { None };
                 let identity_id = recorded
                     .map(|record| record.authority.owner.sponsor_identity_id)
                     .or(parent_execution.executor)
@@ -3555,12 +3533,8 @@ impl ExecutionScheduler {
         task: &str,
     ) -> Result<ExecutionExecutableSnapshot> {
         let mut connection = pool.acquire().await?;
-        if attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
-            &mut connection,
-            attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent.id),
-        )
+        if attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut connection, parent.id)
         .await?
-        .is_some()
         {
             return attune_common::repositories::execution_admission::ExecutionAdmissionRepository::resolve_workflow_snapshot(&mut connection, parent.id, task, action_ref).await.map_err(Into::into);
         }
@@ -3595,12 +3569,8 @@ impl ExecutionScheduler {
         action_ref: &str,
         task: &str,
     ) -> Result<ExecutionExecutableSnapshot> {
-        if attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
-            conn,
-            attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent.id),
-        )
+        if attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(conn, parent.id)
         .await?
-        .is_some()
         {
             return attune_common::repositories::execution_admission::ExecutionAdmissionRepository::resolve_workflow_snapshot(conn, parent.id, task, action_ref).await.map_err(Into::into);
         }
@@ -4817,7 +4787,7 @@ impl ExecutionScheduler {
                 task_node,
                 &child_binding,
                 &task_context,
-attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(&mut *conn,attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent_execution.id)).await?.is_some(),
+attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut *conn, parent_execution.id).await?,
 )?)
         };
         let task_config = rendered_input.as_ref().and_then(|rendered| {
@@ -5601,7 +5571,7 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
                 task_node,
                 &child_binding,
                 &item_ctx,
-attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(&mut *conn,attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent_execution.id)).await?.is_some(),
+attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut *conn, parent_execution.id).await?,
 )?;
             let task_config = if rendered_input.value.is_object()
                 && !rendered_input
@@ -5901,7 +5871,7 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
                 task_node,
                 &child_binding,
                 &item_ctx,
-attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(&mut *pool.acquire().await?,attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent_execution.id)).await?.is_some(),
+attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut *pool.acquire().await?, parent_execution.id).await?,
 )?;
 
             // Store as flat parameters (consistent with manual and rule-triggered
@@ -6199,7 +6169,7 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
                 task_node,
                 &child_binding,
                 &item_ctx,
-attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(&mut *conn,attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent_execution.id)).await?.is_some(),
+attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut *conn, parent_execution.id).await?,
 )?;
 
             let task_config: Option<JsonValue> = if rendered_input.value.is_object()
@@ -7287,13 +7257,10 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
             native_wait_materialization::{
                 InitialWaitApply, NativeInitialWaitMaterializationRepository as Initial,
             },
-            runtime_authority::RuntimeOwner,
         };
         let native = {
             let mut conn = pool.acquire().await?;
-            Admissions::find(&mut conn, RuntimeOwner::Execution(parent.id))
-                .await?
-                .is_some()
+            Admissions::is_recorded(&mut conn, parent.id).await?
         };
         if !native {
             return Ok(false);
@@ -7438,8 +7405,7 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
             attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut conn).await?;
             let actual = ExecutionRepository::find_by_id(&mut *conn, parent.id).await?
                 .ok_or_else(|| anyhow::anyhow!("Native cache parent disappeared"))?;
-            if attune_common::repositories::execution_runtime_admission::ExecutionAdmissionRepository::find(
-                &mut conn, attune_common::repositories::runtime_authority::RuntimeOwner::Execution(actual.id)).await?.is_none() {
+            if !attune_common::repositories::execution_runtime_admission::ExecutionAdmissionRepository::is_recorded(&mut conn, actual.id).await? {
                 sqlx::query("ROLLBACK").execute(&mut *conn).await?;
                 return Ok::<_, anyhow::Error>(false);
             }
@@ -7553,7 +7519,12 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
                 &mut conn,
             )
             .await?;
-            prepared = NativeWaitCheckpoint::prepare(&mut conn, wait, encryption_key).await?;
+            prepared = Box::pin(NativeWaitCheckpoint::prepare(
+                &mut conn,
+                wait,
+                encryption_key,
+            ))
+            .await?;
             let Some(plan) = prepared.as_mut() else {
                 sqlx::query("ROLLBACK").execute(&mut *conn).await?;
                 return Ok::<_, anyhow::Error>(false);
@@ -11486,11 +11457,11 @@ tasks:
             .await
             .expect("load terminal wait")
             .expect("terminal wait exists");
-            let prepared = NativeWaitCheckpoint::prepare(
+            let prepared = Box::pin(NativeWaitCheckpoint::prepare(
                 &mut transaction,
                 &wait,
                 Some(INQUIRY_SCHEDULER_INPUT_KEY),
-            )
+            ))
             .await
             .expect("prepare terminal wait before workflow locks");
             let outcome = ExecutionScheduler::advance_resolved_task_wait_with_conn(
@@ -11756,6 +11727,37 @@ true,
         )
         .await
         .expect("grant legitimate owner authority");
+        // Expanding the owner's IAM does not expand an already admitted source.
+        let mut unchanged = pool.begin().await.unwrap();
+        CacheEntryRepository::protect_transaction(
+            &mut unchanged,
+            CacheTransactionMode::PinMutation,
+        )
+        .await
+        .unwrap();
+        assert!(ExecutionScheduler::dispatch_workflow_task_with_conn(
+            &mut unchanged,
+            &AtomicUsize::new(0),
+            &parent,
+            &fixture.workflow_execution_id,
+            fixture.graph.get_task("permitted_single").unwrap(),
+            &context,
+            None,
+            None,
+            &mut WorkflowPublications::default(),
+            &mut Vec::new(),
+        )
+        .await
+        .is_err());
+        unchanged.rollback().await.unwrap();
+        fixture.cleanup().await.unwrap();
+        // A new invocation explicitly selects and covers the named ceiling.
+        let fixture = AdhocWorkflowDelegationFixture::create_with_selection(true)
+            .await
+            .unwrap();
+        let pool = fixture.database.pool();
+        let parent = fixture.parent.clone();
+        let context = fixture.context.clone();
         let task = fixture
             .graph
             .get_task("permitted_single")
@@ -12049,11 +12051,11 @@ true,
         .await
         .expect("load timed-out wait")
         .expect("timed-out wait exists");
-        let prepared = NativeWaitCheckpoint::prepare(
+        let prepared = Box::pin(NativeWaitCheckpoint::prepare(
             &mut transaction,
             &wait,
             Some(INQUIRY_SCHEDULER_INPUT_KEY),
-        )
+        ))
         .await
         .expect("prepare timeout before workflow locks");
         let outcome = ExecutionScheduler::advance_resolved_task_wait_with_conn(
@@ -12440,11 +12442,11 @@ true,
         attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
             .await
             .expect("lock schema selection");
-        let mut first = NativeWaitCheckpoint::prepare(
+        let mut first = Box::pin(NativeWaitCheckpoint::prepare(
             &mut tx,
             &original_wait,
             Some(INQUIRY_SCHEDULER_INPUT_KEY),
-        )
+        ))
         .await
         .expect("prepare genuine wait progress")
         .expect("native progress plan");
@@ -12507,11 +12509,14 @@ true,
         attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
             .await
             .expect("lock replay schema selection");
-        let mut replay =
-            NativeWaitCheckpoint::prepare(&mut tx, &saved_wait, Some(INQUIRY_SCHEDULER_INPUT_KEY))
-                .await
-                .expect("authenticate committed progress")
-                .expect("native replay plan");
+        let mut replay = Box::pin(NativeWaitCheckpoint::prepare(
+            &mut tx,
+            &saved_wait,
+            Some(INQUIRY_SCHEDULER_INPUT_KEY),
+        ))
+        .await
+        .expect("authenticate committed progress")
+        .expect("native replay plan");
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(fixture.workflow_execution_id)
             .execute(&mut *tx)
@@ -12597,11 +12602,11 @@ true,
             .await
             .expect("lock terminal-root schema selection");
         let earlier_wait = fixture.wait("queue_skipped_guarded").await;
-        let mut terminal_replay = NativeWaitCheckpoint::prepare(
+        let mut terminal_replay = Box::pin(NativeWaitCheckpoint::prepare(
             &mut tx,
             &earlier_wait,
             Some(INQUIRY_SCHEDULER_INPUT_KEY),
-        )
+        ))
         .await
         .expect("authenticate final root and earlier own release")
         .expect("earlier progress acknowledgement");

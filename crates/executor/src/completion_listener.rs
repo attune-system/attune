@@ -148,7 +148,7 @@ impl CompletionListener {
                     let workflow_log_transport = workflow_log_transport.clone();
 
                     async move {
-                        if let Err(e) = Self::process_execution_completed(
+                        if let Err(e) = Box::pin(Self::process_execution_completed(
                             &pool,
                             &publisher,
                             &queue_manager,
@@ -160,7 +160,7 @@ impl CompletionListener {
                             encryption_key.as_deref(),
                             &metadata_caches,
                             &envelope,
-                        )
+                        ))
                         .await
                         {
                             error!("Error processing execution completion: {}", e);
@@ -229,12 +229,12 @@ impl CompletionListener {
                 execution_id, exec.status
             );
 
-            ExecutionScheduler::release_target_waits(
+            Box::pin(ExecutionScheduler::release_target_waits(
                 pool,
                 publisher,
                 WorkflowTaskWaitTarget::Execution(exec.id),
                 encryption_key,
-            )
+            ))
             .await?;
 
             // Check if this execution is a workflow child task and advance the
@@ -531,12 +531,12 @@ impl CompletionListener {
         tx.commit().await?;
 
         for item in &leased_items {
-            if let Err(error) = ExecutionScheduler::release_target_waits(
+            if let Err(error) = Box::pin(ExecutionScheduler::release_target_waits(
                 pool,
                 publisher,
                 WorkflowTaskWaitTarget::WorkQueueItem(item.id),
                 encryption_key,
-            )
+            ))
             .await
             {
                 warn!(

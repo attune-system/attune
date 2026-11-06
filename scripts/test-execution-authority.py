@@ -74,7 +74,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--bin-dir', type=Path, default=ROOT / 'target/debug')
-    parser.add_argument('--runtime-stack-bytes',type=int,default=67108864,help='Match the CI/Docker Rust stack; zero exercises the unconfigured host default')
+    parser.add_argument('--runtime-stack-bytes',type=int,default=0,help='Default: leave RUST_MIN_STACK unset; a positive value is an explicitly recorded diagnostic override')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False, mode=0o700)
     evidence = args.output.resolve()
@@ -88,7 +88,8 @@ def main():
     for binary in ['attune-api','attune-executor','attune-worker']:
         with (args.bin_dir / binary).open('rb') as file:
             result['binaries'][binary]=hashlib.file_digest(file,'sha256').hexdigest()
-    changed=subprocess.check_output(['git','ls-files','-m','--others','--exclude-standard'],cwd=ROOT,text=True).splitlines()
+    changed=sorted(set(subprocess.check_output(['git','diff','--name-only','origin/main'],cwd=ROOT,text=True).splitlines()+subprocess.check_output(['git','ls-files','--others','--exclude-standard'],cwd=ROOT,text=True).splitlines()))
+    (evidence/'tested.patch').write_bytes(subprocess.check_output(['git','diff','HEAD'],cwd=ROOT))
     (evidence/'tested-source.sha256').write_text(''.join(hashlib.sha256((ROOT/path).read_bytes()).hexdigest()+'  '+path+'\n' for path in sorted(changed) if (ROOT/path).is_file()))
 
     def command(argv, **kwargs):
@@ -97,9 +98,11 @@ def main():
 
     def docker_container(kind, image, ports, extra):
         name = run + '-' + kind
+        # Register ownership before invoking Docker: a client timeout may still
+        # have created the container on the daemon.
+        containers.append(name)
         command(['docker', 'run', '-d', '--name', name, '--label', 'attune.authority.run=' + run,
                  *sum((['-p', '127.0.0.1::' + str(port)] for port in ports), []), *extra, image], stdout=subprocess.DEVNULL)
-        containers.append(name)
         return name
 
     def port(name, value):
@@ -120,6 +123,7 @@ def main():
         processes.append(proc)
 
     try:
+        wait_for(lambda: subprocess.run(['docker', 'info', '--format', '{{.ServerVersion}}'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10).returncode == 0, 180, 'Docker daemon')
         pg = docker_container('pg', 'postgres:18-alpine', [5432], ['-e', 'POSTGRES_HOST_AUTH_METHOD=trust', '-e', 'POSTGRES_USER=attune', '-e', 'POSTGRES_DB=attune', '--tmpfs', '/var/lib/postgresql'])
         broker = docker_container('mq', 'rabbitmq:4.3.6-management-alpine', [5672], ['-e', 'RABBITMQ_DEFAULT_USER=attune', '-e', 'RABBITMQ_DEFAULT_PASS=attune', '-e', 'RABBITMQ_DEFAULT_VHOST=' + run])
         wait_for(lambda: subprocess.run(['docker', 'exec', pg, 'pg_isready', '-h', '127.0.0.1', '-U', 'attune'], stdout=subprocess.DEVNULL, timeout=10).returncode == 0, 90, 'PostgreSQL')
@@ -176,7 +180,7 @@ def main():
         signer_local=run.replace('-','_')+'_signer'
         signer=api('POST','/keys',json={'local_ref':signer_local,'owner_type':'system','name':signer_local,'encrypted':True,'value':{'private_key_pem':(ROOT/'crates/common/tests/fixtures/jwt_signing_test_private.pem').read_text(),'profiles':{'acceptance':{'issuer':'approved-client','audience':'https://auth.example.test','subjects':['approved@example.test'],'pack_refs':[run.replace('-','_')],'max_ttl_seconds':120}}}})
         pack = evidence / 'pack'
-        for directory in ['actions', 'runtimes', 'permission_sets', 'queues']:
+        for directory in ['actions', 'runtimes', 'permission_sets', 'queues', 'triggers']:
             (pack / directory).mkdir(parents=True, exist_ok=True)
         pack_ref = run.replace('-', '_')
         action_ref = pack_ref + '.read_system'
@@ -223,6 +227,12 @@ print(json.dumps({'assertion':result['assertion'],'raw_denied':True,'profile_den
 """)
         (pack/'permission_sets/sign_system.yaml').write_text(yaml.safe_dump({'ref':signer_ref,'scope':'external','grants':[{'resource':'keys','actions':['use'],'constraints':{'refs':[signer['ref']],'owner_types':['system']}}]}))
         (pack / 'permission_sets/invoke.yaml').write_text(yaml.safe_dump({'ref': pack_ref + '.invoke', 'grants': [{'resource': 'actions', 'actions': ['execute'], 'constraints': {'refs': [action_ref,signer_ref]}}, {'resource': 'executions', 'actions': ['read', 'decrypt'], 'constraints': {'refs': [action_ref,signer_ref]}}, {'resource':'artifacts','actions':['read']}]}))
+        event_ref=pack_ref+'.authority_event'
+        emitter_ref=pack_ref+'.emit_event'
+        (pack/'triggers/authority_event.yaml').write_text(yaml.safe_dump({'ref':event_ref,'label':'Authority acceptance event','out_schema':{'marker':{'type':'string'}}}))
+        (pack/'actions/emit_event.yaml').write_text(yaml.safe_dump({'ref':emitter_ref,'label':'Delegated event emitter','runner_type':pack_ref+'.python','entry_point':'emit_event.py','parameter_format':'json','output_format':'json','parameters':{'trigger':{'type':'string','required':True},'marker':{'type':'string','required':True}}}))
+        (pack/'permission_sets/emit_event.yaml').write_text(yaml.safe_dump({'ref':emitter_ref,'scope':'external','grants':[{'resource':'events','actions':['create'],'constraints':{'refs':[event_ref]}}]}))
+        (pack/'actions/emit_event.py').write_text("import json,os,sys,urllib.request\np=json.load(sys.stdin)\nr=urllib.request.Request(os.environ['ATTUNE_API_URL']+'/api/v1/events',data=json.dumps({'trigger_ref':p['trigger'],'payload':{'marker':p['marker']}}).encode(),headers={'Authorization':'Bearer '+os.environ['ATTUNE_API_TOKEN'],'Content-Type':'application/json'},method='POST')\nwith urllib.request.urlopen(r,timeout=15) as response: event=json.load(response)['data']\nprint(json.dumps({'event_id':event['id']}))\n")
         archive = io.BytesIO()
         with tarfile.open(fileobj=archive, mode='w:gz') as tar:
             tar.add(pack, arcname=pack_ref)
@@ -269,6 +279,8 @@ print(json.dumps({'assertion':result['assertion'],'raw_denied':True,'profile_den
         positive_logs=json.loads(psql(f"SELECT json_agg(json_build_object('artifact',artifact,'version',version,'encoding',meta->>'log_encoding')) FROM artifact_version WHERE execution={positive['id']}"))
         assert len(positive_logs)==2 and all(log['encoding']=='attune_encrypted_log_v1' for log in positive_logs)
         log_paths=[f"/api/v1/artifacts/{log['artifact']}/versions/{log['version']}/download" for log in positive_logs]
+        log_paths += [f"/api/v1/artifacts/{log['artifact']}/download" for log in positive_logs]
+        result['protected_log_paths']=log_paths
         for path in log_paths:
             revealed=admin.get(base+path,timeout=15)
             assert revealed.status_code==200 and secret in revealed.text, 'authorized protected log download failed'
@@ -301,6 +313,16 @@ print(json.dumps({'assertion':result['assertion'],'raw_denied':True,'profile_den
         assert adhoc['is_adhoc'] is True
         execute(['standard',pack_ref+'.read_system'],True,reference=adhoc_ref)
         result['checks'] += ['ordinary API-created ad hoc execution remains supported']
+        rule_ref=pack_ref+'.delegated_rule'
+        rule=api('POST','/rules',json={'ref':rule_ref,'pack_ref':pack_ref,'label':'Delegated rule selection','trigger_ref':event_ref,'action_ref':action_ref,'permission_set_refs':['standard',pack_ref+'.read_system'],'action_params':{'key':keys[0],'other':keys[1],'plaintext':True}})
+        assert rule['is_adhoc'] is True
+        execute([emitter_ref],False,reference=emitter_ref,parameters={'trigger':event_ref,'marker':run})
+        rule_execution=wait_for(lambda: psql("SELECT x.id FROM execution x JOIN enforcement e ON e.id=x.enforcement WHERE e.rule_ref='"+rule_ref+"' AND x.status='completed' LIMIT 1"),60,'delegated rule execution')
+        rule_result=api('GET',f'/executions/{rule_execution}?include_secret_values=true')
+        assert rule_result['result']['data']['value']==secret
+        assert psql("SELECT count(*) FROM delegated_enforcement_selection s JOIN enforcement e ON e.id=s.enforcement WHERE e.rule_ref='"+rule_ref+"'")=='1'
+        result['checks'] += ['delegated event-to-rule-to-worker execution retains match-time selection and protected system-Key results']
+
 
         # Ordinary queues use their attributed selected refs; managed sponsorship
         # remains unavailable, even for tokenless executions.

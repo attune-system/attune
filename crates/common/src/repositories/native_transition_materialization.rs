@@ -23,7 +23,7 @@ use super::{
         check_bounds, collect_leaves, contains_template, escape, expression_functions,
         expression_names, public_leaves, reserved,
     },
-    runtime_authority::{ApprovalEffectFence, RuntimeAuthorityRepository, RuntimeOwner},
+    runtime_authority::{ApprovalEffectFence, RuntimeAuthorityRepository},
     workflow::WorkflowExecutionRepository,
     FindById, Update,
 };
@@ -804,10 +804,7 @@ impl NativeTransitionMaterializationRepository {
         let parent = ExecutionRepository::find_by_id(&mut *conn, execution)
             .await?
             .ok_or_else(changed)?;
-        if ExecutionAdmissionRepository::find(conn, RuntimeOwner::Execution(execution))
-            .await?
-            .is_none()
-        {
+        if !ExecutionAdmissionRepository::is_recorded(conn, execution).await? {
             return Ok(None);
         }
         let snapshot = parent.executable_snapshot.as_ref().ok_or_else(changed)?;
@@ -983,10 +980,7 @@ impl NativeTransitionMaterializationRepository {
         ) {
             return Ok(None);
         }
-        if ExecutionAdmissionRepository::find(conn, RuntimeOwner::Execution(parent.id))
-            .await?
-            .is_none()
-        {
+        if !ExecutionAdmissionRepository::is_recorded(conn, parent.id).await? {
             return Ok(None);
         }
         let snapshot = parent.executable_snapshot.as_ref().ok_or_else(changed)?;

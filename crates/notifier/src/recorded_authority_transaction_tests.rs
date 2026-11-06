@@ -26,7 +26,7 @@ use attune_common::{
 };
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 const DEADLINE: Duration = Duration::from_secs(15);
 const APPLICATION_NAME: &str = "notifier-authority-validation-test";
@@ -774,5 +774,225 @@ async fn shutdown_drains_an_active_validation_with_identity_still_blocked() -> R
     }
     .await;
     fixture.cleanup().await?;
+    result
+}
+
+/// Exercise the production socket router, including the final frame fence.
+#[tokio::test]
+async fn delegated_socket_rejects_stale_terminal_and_closed_attempts() -> Result<()> {
+    use crate::{subscriber_manager::SubscriberManager, websocket_server::WebSocketServer};
+    use attune_common::{
+        auth::jwt::{generate_delegated_execution_token, JwtConfig},
+        repositories::{
+            delegated_execution::DelegatedExecutionRepository as Delegated,
+            execution::UpdateExecutionInput,
+            runtime::{CreateWorkerInput, WorkerRepository},
+            schema_contract::{BindingOwner, SchemaContractRepository},
+            Update,
+        },
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+    use tokio_util::sync::CancellationToken;
+
+    async fn connect(address: std::net::SocketAddr, token: &str) -> Result<(TcpStream, u16)> {
+        let mut socket = TcpStream::connect(address).await?;
+        let request = format!("GET /ws HTTP/1.1\r\nHost: {address}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: attune.v1, attune.jwt.{token}\r\n\r\n");
+        socket.write_all(request.as_bytes()).await?;
+        let mut headers = Vec::new();
+        tokio::time::timeout(DEADLINE, async {
+            while !headers.ends_with(b"\r\n\r\n") {
+                ensure!(headers.len() < 16384, "oversized socket handshake");
+                headers.push(socket.read_u8().await?);
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        let status = std::str::from_utf8(&headers)?
+            .split_whitespace()
+            .nth(1)
+            .context("socket status missing")?
+            .parse()?;
+        Ok((socket, status))
+    }
+    async fn read_frame(socket: &mut TcpStream) -> Result<(u8, Vec<u8>)> {
+        tokio::time::timeout(DEADLINE, async {
+            let opcode = socket.read_u8().await? & 15;
+            let length = socket.read_u8().await? & 127;
+            let length = if length == 126 {
+                socket.read_u16().await? as usize
+            } else {
+                length as usize
+            };
+            ensure!(length < 8192, "oversized socket frame");
+            let mut bytes = vec![0; length];
+            socket.read_exact(&mut bytes).await?;
+            Ok((opcode, bytes))
+        })
+        .await?
+    }
+
+    let fixture = Fixture::new().await?;
+    let mut config = Config::load_from_file(&format!(
+        "{}/../../config.test.yaml",
+        env!("CARGO_MANIFEST_DIR")
+    ))?;
+    let jwt = JwtConfig {
+        secret: "delegated-notifier-socket-test".into(),
+        access_token_expiration: 600,
+        refresh_token_expiration: 600,
+    };
+    config.security.jwt_secret = Some(jwt.secret.clone());
+    let shutdown = CancellationToken::new();
+    let (notifications, _) = tokio::sync::broadcast::channel(8);
+    let server = WebSocketServer::new(
+        config,
+        notifications,
+        Arc::new(SubscriberManager::new()),
+        shutdown.clone(),
+        fixture.db.pool().clone(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let stop = shutdown.clone();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, server.router())
+            .with_graceful_shutdown(stop.cancelled_owned())
+            .await
+    });
+    let result: Result<()> = async {
+        let original = ExecutionRepository::find_by_id(
+            fixture.db.pool(),
+            fixture.recorded.binding.execution_id,
+        )
+        .await?
+        .context("source missing")?;
+        let snapshot = original.executable_snapshot.context("snapshot missing")?;
+        let mut tx = fixture.db.begin().await?;
+        let binding = SchemaContractRepository::materialize_action(&mut tx, &snapshot).await?;
+        let execution = ExecutionRepository::create_pinned(
+            &mut *tx,
+            CreateExecutionInput {
+                action: original.action,
+                action_ref: original.action_ref.clone(),
+                executor: original.executor,
+                permission_set_refs: vec!["standard".into()],
+                ..Default::default()
+            },
+            &snapshot,
+        )
+        .await?;
+        SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, execution.id, &binding)
+            .await?;
+        Delegated::select(&mut tx, execution.id, None).await?;
+        let worker = WorkerRepository::create(
+            &mut *tx,
+            CreateWorkerInput {
+                name: "delegated-notifier-test".into(),
+                worker_type: attune_common::models::WorkerType::Local,
+                runtime: None,
+                host: None,
+                port: None,
+                status: Some(attune_common::models::WorkerStatus::Active),
+                capabilities: None,
+                meta: None,
+            },
+        )
+        .await?;
+        ExecutionRepository::update(
+            &mut *tx,
+            execution.id,
+            UpdateExecutionInput {
+                status: Some(ExecutionStatus::Scheduled),
+                worker: Some(worker.id),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let attempt = Delegated::start(&mut tx, execution.id, worker.id).await?;
+        ExecutionRepository::transition_worker(
+            &mut *tx,
+            execution.id,
+            Some(worker.id),
+            ExecutionStatus::Running,
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        let token = |attempt| {
+            generate_delegated_execution_token(
+                original.executor.unwrap(),
+                execution.id,
+                &execution.action_ref,
+                &jwt,
+                600,
+                &["standard".into()],
+                std::slice::from_ref(&execution.action_ref),
+                attempt,
+            )
+        };
+        let valid = token(attempt)?;
+        let (_, status) = connect(address, &token(uuid::Uuid::new_v4())?).await?;
+        ensure!(status == 401, "stale socket attempt accepted: {status}");
+        let (mut socket, status) = connect(address, &valid).await?;
+        ensure!(status == 101, "live delegated socket rejected: {status}");
+        let (opcode, welcome) = read_frame(&mut socket).await?;
+        ensure!(
+            opcode == 1
+                && serde_json::from_slice::<serde_json::Value>(&welcome)?["type"] == "welcome",
+            "welcome frame missing"
+        );
+        let message = br#"{"type":"subscribe","filter":"unknown"}"#;
+        let mut frame = vec![0x81, 0x80 | message.len() as u8, 1, 2, 3, 4];
+        frame.extend(
+            message
+                .iter()
+                .enumerate()
+                .map(|(i, byte)| byte ^ [1, 2, 3, 4][i % 4]),
+        );
+        socket.write_all(&frame).await?;
+        let (opcode, error) = read_frame(&mut socket).await?;
+        ensure!(
+            opcode == 1 && serde_json::from_slice::<serde_json::Value>(&error)?["type"] == "error",
+            "live subscription error frame missing"
+        );
+        let mut tx = fixture.db.begin().await?;
+        Delegated::close(&mut tx, execution.id).await?;
+        tx.commit().await?;
+        // The same request emits no data after closure, even when its control
+        // reply was queued before actual socket readiness.
+        socket.write_all(&frame).await?;
+        match read_frame(&mut socket).await {
+            Ok((opcode, _)) => ensure!(opcode == 8, "closed attempt emitted a data frame"),
+            Err(error) => ensure!(
+                error.downcast_ref::<std::io::Error>().is_some(),
+                "socket failed to close: {error}"
+            ),
+        }
+        let (_, status) = connect(address, &valid).await?;
+        ensure!(status == 401, "closed socket attempt accepted: {status}");
+        ExecutionRepository::transition_worker(
+            fixture.db.pool(),
+            execution.id,
+            Some(worker.id),
+            ExecutionStatus::Completed,
+            None,
+        )
+        .await?;
+        let (_, status) = connect(address, &valid).await?;
+        ensure!(
+            status == 401,
+            "terminal socket credential accepted: {status}"
+        );
+        Ok(())
+    }
+    .await;
+    shutdown.cancel();
+    let stopped = tokio::time::timeout(DEADLINE, task).await;
+    let cleaned = fixture.cleanup().await;
+    stopped???;
+    cleaned?;
     result
 }

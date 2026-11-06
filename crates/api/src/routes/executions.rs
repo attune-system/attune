@@ -294,12 +294,8 @@ pub async fn create_execution(
             .clone()
             .unwrap_or_else(|| action.default_execution_permission_set_refs.clone());
         let recorded_parent = if let Some(parent) = parent_from_token {
-            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
-                &mut tx,
-                attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent),
-            )
+            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut tx, parent)
             .await?
-            .is_some()
         } else {
             false
         };

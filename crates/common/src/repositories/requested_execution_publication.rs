@@ -66,7 +66,7 @@ impl RequestedExecutionPublicationRepository {
         }
         let selection =
             super::delegated_execution::DelegatedExecutionRepository::find(conn, actual.id).await?;
-        let continuation = if selection.mode == "delegated" {
+        let continuation = if selection.mode == "delegated" && actual.workflow_task.is_none() {
             super::delegated_execution::DelegatedExecutionRepository::validate(conn, actual.id)
                 .await?;
             let schema = Schemas::find(conn, BindingOwner::Execution, actual.id)

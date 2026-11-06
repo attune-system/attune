@@ -56,6 +56,12 @@ impl DelegatedExecutionRepository {
             {
                 return Err(denied());
             }
+            if row.original_execution.is_none()
+                && row.parent == Some(source)
+                && source_row.status != crate::models::ExecutionStatus::Running
+            {
+                return Err(denied());
+            }
             if row.original_execution.is_some()
                 && (row.permission_set_refs != parent.selected_refs
                     || serde_json::to_value(&row.executable_snapshot)?
@@ -153,7 +159,7 @@ impl DelegatedExecutionRepository {
                 });
             }
         }
-        let changed = sqlx::query("UPDATE execution_authority_selection s SET mode='delegated',explicit=TRUE,owner=$2,selected_refs=$3,executable_snapshot=$4,schema_digest=$5,grant_digest=$6,output_grants=$7 WHERE execution=$1 AND selection_transaction=pg_current_xact_id() AND admission IS NULL AND NOT EXISTS(SELECT 1 FROM runtime_authority_admission WHERE owner_kind='execution' AND owner_id=$1) AND EXISTS(SELECT 1 FROM execution WHERE id=$1 AND initial_input_transaction=pg_current_xact_id() AND worker IS NULL AND started_at IS NULL)")
+        let changed = sqlx::query("UPDATE execution_authority_selection s SET mode='delegated',explicit=TRUE,owner=$2,selected_refs=$3,executable_snapshot=$4,schema_digest=$5,grant_digest=$6,output_grants=$7 WHERE execution=$1 AND NOT s.explicit AND selection_transaction=pg_current_xact_id() AND admission IS NULL AND NOT EXISTS(SELECT 1 FROM runtime_authority_admission WHERE owner_kind='execution' AND owner_id=$1) AND EXISTS(SELECT 1 FROM execution WHERE id=$1 AND initial_input_transaction=pg_current_xact_id() AND worker IS NULL AND started_at IS NULL)")
             .bind(execution).bind(owner).bind(&row.permission_set_refs).bind(sqlx::types::Json(row.executable_snapshot.as_ref().ok_or_else(denied)?)).bind(hash).bind(grant_digest).bind(serde_json::to_value(output_grants)?).execute(&mut *conn).await?;
         if changed.rows_affected() != 1 {
             return Err(denied());
@@ -298,6 +304,74 @@ impl DelegatedExecutionRepository {
         }
         Ok(())
     }
+    /// Persist the human rule's match-time choice; dispatch never selects from
+    /// mutable rule ownership, defaults or permission refs again.
+    pub async fn accept_enforcement(
+        conn: &mut PgConnection,
+        enforcement: &crate::models::Enforcement,
+        owner: Id,
+        refs: &[String],
+    ) -> Result<()> {
+        let authority = DelegationAuthority::load_for_share(conn, owner).await?;
+        authority.require_refs_for_share(conn, refs).await?;
+        let snapshot = enforcement
+            .executable_snapshot
+            .as_ref()
+            .ok_or_else(denied)?;
+        let binding = super::schema_contract::SchemaContractRepository::find(
+            conn,
+            super::schema_contract::BindingOwner::Enforcement,
+            enforcement.id,
+        )
+        .await?
+        .ok_or_else(denied)?;
+        let schema_digest = digest(&serde_json::to_value(binding)?).map_err(|_| denied())?;
+        let grant_digest = digest(&serde_json::to_value(
+            Self::selected_grants(conn, refs).await?,
+        )?)
+        .map_err(|_| denied())?;
+        let changed = sqlx::query("INSERT INTO delegated_enforcement_selection(enforcement,owner,selected_refs,grant_digest,executable_snapshot,schema_digest) SELECT id,$2,$3,$4,$5,$6 FROM enforcement WHERE id=$1 AND status='created' AND executable_snapshot=$5 AND NOT EXISTS(SELECT 1 FROM enforcement_recorded_authority WHERE enforcement=$1) AND NOT EXISTS(SELECT 1 FROM runtime_authority_admission WHERE owner_kind='enforcement' AND owner_id=$1)")
+            .bind(enforcement.id).bind(owner).bind(refs).bind(grant_digest).bind(snapshot).bind(schema_digest).execute(conn).await?;
+        if changed.rows_affected() != 1 {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
+    pub async fn enforcement_selection(
+        conn: &mut PgConnection,
+        enforcement: &crate::models::Enforcement,
+    ) -> Result<(Id, Vec<String>)> {
+        if super::execution_runtime_admission::ExecutionAdmissionRepository::enforcement_is_recorded(conn, enforcement.id).await? {
+            return Err(denied());
+        }
+        let (owner, refs, grant_digest, snapshot, schema_digest): (Id, Vec<String>, String, serde_json::Value, String) =
+            sqlx::query_as("SELECT owner,selected_refs,grant_digest,executable_snapshot,schema_digest FROM delegated_enforcement_selection WHERE enforcement=$1 FOR SHARE")
+                .bind(enforcement.id).fetch_optional(&mut *conn).await?.ok_or_else(denied)?;
+        let binding = super::schema_contract::SchemaContractRepository::find(
+            conn,
+            super::schema_contract::BindingOwner::Enforcement,
+            enforcement.id,
+        )
+        .await?
+        .ok_or_else(denied)?;
+        if enforcement.executable_snapshot.as_ref() != Some(&snapshot)
+            || digest(&serde_json::to_value(binding)?).map_err(|_| denied())? != schema_digest
+            || digest(&serde_json::to_value(
+                Self::selected_grants(conn, &refs).await?,
+            )?)
+            .map_err(|_| denied())?
+                != grant_digest
+        {
+            return Err(denied());
+        }
+        DelegationAuthority::load_for_share(conn, owner)
+            .await?
+            .require_refs_for_share(conn, &refs)
+            .await?;
+        Ok((owner, refs))
+    }
+
     pub async fn accept_queue_item(
         conn: &mut PgConnection,
         queue: &crate::models::WorkQueue,

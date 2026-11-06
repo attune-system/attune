@@ -1214,18 +1214,12 @@ async fn websocket_handler(
             }
         }
     };
-    if let Some(claims) = &verified_token.delegated_claims {
-        let live=match state.db_pool.acquire().await {
-            Ok(mut conn)=>attune_common::repositories::delegated_execution::DelegatedExecutionRepository::validate_claims(&mut conn,claims).await.is_ok(),
-            Err(_)=>false,
-        };
-        if !live {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error":"delegated_authority_unavailable"})),
-            )
-                .into_response();
-        }
+    if !delegated_source_is_live(&state.db_pool, &verified_token.delegated_claims).await {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error":"delegated_authority_unavailable"})),
+        )
+            .into_response();
     }
     let effective_authz = if let Some(recorded) = &verified_token.recorded {
         if !recorded.is_live(&state.db_pool).await {
@@ -1408,6 +1402,7 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, auth: WebSock
             _ = exp_interval.tick() => {
                 let now = chrono::Utc::now().timestamp();
                 if is_token_expired(auth.token_exp, now)
+                    || !delegated_source_is_live(&state.db_pool, &auth.delegated_claims).await
                     || match &auth.recorded {
                         Some(recorded) => !recorded.is_live(&state.db_pool).await,
                         None => false,
@@ -1463,6 +1458,19 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, auth: WebSock
     info!("WebSocket connection closed: {}", client_id);
 }
 
+async fn delegated_source_is_live(
+    pool: &PgPool,
+    claims: &Option<attune_common::auth::Claims>,
+) -> bool {
+    let Some(claims) = claims else {
+        return true;
+    };
+    match pool.acquire().await {
+        Ok(mut connection) => attune_common::repositories::delegated_execution::DelegatedExecutionRepository::validate_claims(&mut connection, claims).await.is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// Check after dequeue AND actual socket readiness, not before a blocked writer.
 async fn send_checked_frame(
     socket: &mut WebSocket,
@@ -1503,14 +1511,8 @@ async fn send_checked_frame(
             .await;
         return false;
     }
-    if let Some(claims) = &auth.delegated_claims {
-        let live=match pool.acquire().await {
-            Ok(mut conn)=>attune_common::repositories::delegated_execution::DelegatedExecutionRepository::validate_claims(&mut conn,claims).await.is_ok(),
-            Err(_)=>false,
-        };
-        if !live {
-            return false;
-        }
+    if !delegated_source_is_live(pool, &auth.delegated_claims).await {
+        return false;
     }
     if let Some(recorded) = &auth.recorded {
         let fence = match &message {

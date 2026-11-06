@@ -257,17 +257,19 @@ Build production service binaries, then run the owned system-Key scenario:
 cargo build -p attune-api -p attune-executor -p attune-worker \
   --bin attune-api --bin attune-executor --bin attune-worker
 python3 scripts/test-execution-authority.py \
-  --output /tmp/attune-authority-acceptance-unique
+  --output .scratch/attune-authority-acceptance-unique
 ```
 
 The output directory must not exist. Docker, Python `requests` and PyYAML are
 required. The runner owns PostgreSQL 18, RabbitMQ, random host ports, filesystem
 roots and production API/executor/worker processes, and awaits their teardown.
 It records source/binary hashes and the check inventory in the output directory.
-Service processes use `RUST_MIN_STACK=67108864`, matching CI and the Docker Rust
-test runner. The result records that configuration. `--runtime-stack-bytes 0`
-exercises the unconfigured host default as a separate diagnostic; a passing
-configured run does not certify the smaller default debug stack.
+By default the runner leaves `RUST_MIN_STACK` unset, exercising the service
+runtime defaults. `--runtime-stack-bytes` is an explicit diagnostic override,
+recorded in the result; a configured run alone does not certify the defaults.
+Repeat with release binaries using `cargo build --release` and
+`--bin-dir target/release` to cover the production build profile. Keep binary
+snapshots and other large artifacts under `.scratch/`, outside `/tmp` tmpfs.
 
 The action reads an encrypted **system-owned** Key through a pack-defined,
 explicitly selected narrow grant covered by the requester. Negative cases cover
@@ -278,7 +280,9 @@ Assertions include encrypted logs/results and disclosure denials, workflow retry
 ad hoc execution, attributed queue dispatch, rejection of recorded-only queue
 sponsorship, and tokenless stdin/completion. Recorded readiness stays disabled.
 The focused `execution_admission_tests` filter `authority_` additionally exercises
-persisted selection, missing/revoked admission, stale attempts and child ceilings.
+persisted selection, missing/revoked admission, stale attempts, child ceilings,
+disclosure/closure fencing and the coordinated populated-database cutover described
+in [PostgreSQL deployment](../deployment/postgresql-only.md#execution-authority-cutover).
 These scoped tests do not replace the broader authorization/service CI gate.
 
 ## Concurrency policy

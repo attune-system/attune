@@ -188,10 +188,13 @@ transports and notifier frames recheck it after connection authentication.
 Recorded runtime authority remains disabled until coordinated readiness is
 established. Recorded origins, managed rule sponsorship and managed queue
 sponsorship remain separate and fail closed before dispatch. Missing or revoked
-admission never enables human delegation. The migration marks historical rows as
-recorded-required: it does not retrospectively authorize delegation or rewrite
-recorded approvals. Fresh ordinary API-created ad hoc and managed executions use
-the same explicit delegation path.
+admission never enables human delegation. The coordinated migration requires old
+unrecorded active work to drain first, retains recorded bindings, and marks
+historical rows without proof unavailable for new execution authority. It does
+not retrospectively authorize delegation or rewrite recorded approvals. See
+[the cutover procedure](../deployment/postgresql-only.md#execution-authority-cutover).
+Fresh ordinary API-created ad hoc and managed executions use the same explicit
+delegation path.
 
 Successful delegated plaintext Key reads record immutable owner-qualified origins
 under the execution and worker attempt before returning bytes. Completion closes
@@ -200,12 +203,19 @@ encrypted log frames and suppress stdout/stderr mirroring from the outset. Their
 opaque result fields are encrypted and retain both exact Key origins and a
 conservative frozen read/approved-operation grant ceiling. Plaintext result files and raw process
 results are not copied to ordinary artifact/service paths. Disclosure and input
-propagation must cover that ceiling and every actual Key origin. Retries and child
+propagation must cover that ceiling and every actual Key origin. API-capable log
+bodies require explicit execution read/decrypt rights even for nonsensitive
+schemas; `standard` alone does not grant execution decryption. Its scoped
+Key/artifact/cache grants stay unchanged. Retries and child
 creation retain the selected mode and cannot exceed their source's named grants
-or acquire `standard` when the source did not select it.
+or acquire `standard` when the source did not select it. Ad hoc rule matches pin
+the original active owner, selected refs, grant digest, executable and schema;
+later rule edits cannot reselect that pending enforcement's authority. Queue
+contributors likewise retain their accepted owner and selection.
 
 Worker startup advertises `delegated_execution_authority_v1` only for the protected
-input/token/log/completion implementation. Dispatch requires that capability;
+input/token/log/completion implementation with output encryption configured.
+Dispatch requires that capability;
 incompatible workers fail with a readiness diagnostic before assignment. Apply
 the migration and deploy the matching API, executor, worker and notifier together.
 Older service binaries do not implement this authority contract.

@@ -135,10 +135,11 @@ impl<'a> ArtifactReads<'a> {
     ) -> ApiResult<crate::receipt_disclosure::SharedHumanReceiptGuard> {
         let executions =
             ArtifactRepository::linked_execution_ids_bounded(&state.db, artifact.id, 257).await?;
-        let guard =
-            crate::receipt_disclosure::HumanReceiptGuard::for_executions(state, user, &executions)
-                .await?
-                .shared();
+        let guard = Box::pin(
+            crate::receipt_disclosure::HumanReceiptGuard::for_executions(state, user, &executions),
+        )
+        .await?
+        .shared();
         Self::authorize_detail_with_prepared_receipts(state, user, artifact, guard).await
     }
 
@@ -263,11 +264,12 @@ impl<'a> ArtifactReads<'a> {
             }
         };
         let executions = selected.execution.into_iter().collect::<Vec<_>>();
-        let mut guard =
-            crate::receipt_disclosure::HumanReceiptGuard::for_executions(state, user, &executions)
-                .await?;
+        let mut guard = Box::pin(
+            crate::receipt_disclosure::HumanReceiptGuard::for_executions(state, user, &executions),
+        )
+        .await?;
         if sensor_ref.is_some() {
-            guard.prepare_sensor_logs(state, &[selected.id]).await?;
+            Box::pin(guard.prepare_sensor_logs(state, &[selected.id])).await?;
         }
         let guard = guard.shared();
         let snapshot = guard.lock().await.iam_snapshot().ok_or_else(denied)?;
@@ -657,14 +659,14 @@ impl<'a> ArtifactReads<'a> {
                                 "Runtime log secret disclosure requires identity access".into(),
                             )
                         })?;
-                        let result = authorize_runtime_log_cached(
+                        let result = Box::pin(authorize_runtime_log_cached(
                             self.state,
                             self.user,
                             execution,
                             secrets,
                             snapshot,
                             &mut self.source_records,
-                        )
+                        ))
                         .await;
                         match result {
                             Ok(()) => true,

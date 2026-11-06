@@ -1454,6 +1454,7 @@ impl WorkQueueDispatcher {
         // retained delivery proofs, never reseal with current grants or rewrite
         // the config with a cached pre-seal ciphertext/provenance buffer.
         let mut source = self.pool.begin().await?;
+        attune_common::repositories::execution_admission::ExecutionAdmissionRepository::existing_authority(&mut source, dispatch.execution_id).await?;
         let record =
             attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
                 &mut source,

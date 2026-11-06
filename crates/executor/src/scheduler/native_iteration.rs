@@ -24,9 +24,7 @@ impl ExecutionScheduler {
         let actual = ExecutionRepository::find_by_id(&mut *tx, parent.id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Ordinary iteration parent disappeared"))?;
-        if attune_common::repositories::execution_runtime_admission::ExecutionAdmissionRepository::find(
-            &mut tx, attune_common::repositories::runtime_authority::RuntimeOwner::Execution(actual.id),
-        ).await?.is_none() {
+        if !attune_common::repositories::execution_runtime_admission::ExecutionAdmissionRepository::is_recorded(&mut tx, actual.id).await? {
             tx.rollback().await?;
             return Ok(false);
         }
@@ -281,8 +279,7 @@ impl ExecutionScheduler {
         .await?
         .ok_or_else(|| anyhow::anyhow!("Ordinary predecessor parent disappeared"))?;
         if parent.status!=ExecutionStatus::Running
-            || attune_common::repositories::execution_runtime_admission::ExecutionAdmissionRepository::find(
-                &mut tx,attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent.id)).await?.is_none() {
+            || !attune_common::repositories::execution_runtime_admission::ExecutionAdmissionRepository::is_recorded(&mut tx, parent.id).await? {
             tx.rollback().await?;
             return Ok(false);
         }

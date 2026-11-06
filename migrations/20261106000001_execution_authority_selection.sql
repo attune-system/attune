@@ -1,8 +1,31 @@
+-- Upgrade is a coordinated authority cutover, not authority reconstruction.
+-- Old rows did not persist a delegated decision or attempt nonce. Drain them
+-- with the old binaries before upgrading; abort atomically rather than interrupt
+-- running actions or reinterpret missing/revoked recorded evidence as delegation.
+LOCK TABLE execution, enforcement, work_queue_item IN SHARE ROW EXCLUSIVE MODE;
+DO $$
+BEGIN
+    IF EXISTS(SELECT 1 FROM execution e
+              WHERE e.status IN ('requested','scheduling','scheduled','running','canceling')
+                AND NOT EXISTS(SELECT 1 FROM runtime_authority_admission a
+                               WHERE a.owner_kind='execution' AND a.owner_id=e.id))
+       OR EXISTS(SELECT 1 FROM enforcement e WHERE e.status='created'
+                 AND NOT EXISTS(SELECT 1 FROM runtime_authority_admission a
+                                WHERE a.owner_kind='enforcement' AND a.owner_id=e.id))
+       OR EXISTS(SELECT 1 FROM work_queue_item q WHERE q.status IN ('queued','leased','retry')
+                 AND NOT EXISTS(SELECT 1 FROM runtime_authority_admission a
+                                WHERE a.owner_kind='queue_item' AND a.owner_id=q.id))
+    THEN
+        RAISE EXCEPTION 'Authority cutover requires draining unrecorded executions, enforcements and queue items with the previous binaries; no rows have been converted';
+    END IF;
+END;
+$$;
+
 -- Server-owned execution authority, separate from executable ownership. Recorded
 -- tombstones intentionally survive admission removal; no absence grants access.
 CREATE TABLE execution_authority_selection (
     execution BIGINT PRIMARY KEY REFERENCES execution(id) ON DELETE CASCADE,
-    mode TEXT NOT NULL CHECK (mode IN ('recorded','delegated')),
+    mode TEXT NOT NULL CHECK (mode IN ('recorded','delegated','unavailable')),
     explicit BOOLEAN NOT NULL DEFAULT FALSE,
     owner BIGINT,
     selected_refs TEXT[] NOT NULL,
@@ -16,7 +39,7 @@ CREATE TABLE execution_authority_selection (
     CHECK (NOT explicit OR (owner IS NOT NULL AND executable_snapshot IS NOT NULL AND schema_digest IS NOT NULL AND grant_digest IS NOT NULL AND output_grants IS NOT NULL))
 );
 INSERT INTO execution_authority_selection(execution,mode,owner,selected_refs,executable_snapshot,admission)
-SELECT e.id, 'recorded',
+SELECT e.id, CASE WHEN a.id IS NULL THEN 'unavailable' ELSE 'recorded' END,
        e.executor,e.permission_set_refs,e.executable_snapshot,a.id
 FROM execution e LEFT JOIN runtime_authority_admission a ON a.owner_kind='execution' AND a.owner_id=e.id;
 
@@ -37,6 +60,7 @@ BEGIN
        OR NEW.selection_transaction IS DISTINCT FROM OLD.selection_transaction
        OR NEW.execution IS DISTINCT FROM OLD.execution
        OR OLD.admission IS NOT NULL
+       OR OLD.explicit
        OR EXISTS(SELECT 1 FROM runtime_authority_admission WHERE owner_kind='execution' AND owner_id=OLD.execution)
     THEN RAISE EXCEPTION 'Execution authority selection is immutable'; END IF;
     RETURN NEW;
@@ -56,6 +80,18 @@ SELECT e.id,a.id FROM enforcement e LEFT JOIN runtime_authority_admission a ON a
 CREATE TRIGGER enforcement_recorded_authority_immutable BEFORE UPDATE ON enforcement_recorded_authority
 FOR EACH ROW EXECUTE FUNCTION guard_execution_runtime_read_origin();
 
+-- Match-time human rule selection survives rule edits before dispatch.
+CREATE TABLE delegated_enforcement_selection (
+    enforcement BIGINT PRIMARY KEY REFERENCES enforcement(id) ON DELETE CASCADE,
+    owner BIGINT NOT NULL,
+    selected_refs TEXT[] NOT NULL,
+    grant_digest TEXT NOT NULL,
+    executable_snapshot JSONB NOT NULL,
+    schema_digest TEXT NOT NULL
+);
+CREATE TRIGGER delegated_enforcement_selection_immutable BEFORE UPDATE ON delegated_enforcement_selection
+FOR EACH ROW EXECUTE FUNCTION guard_execution_runtime_read_origin();
+
 CREATE FUNCTION retain_recorded_execution_authority() RETURNS TRIGGER AS $$
 BEGIN
     IF NEW.owner_kind='execution' THEN
@@ -70,6 +106,8 @@ BEGIN
         INSERT INTO execution_authority_selection(execution,mode,owner,selected_refs,executable_snapshot,admission)
         SELECT id,'recorded',executor,permission_set_refs,executable_snapshot,NEW.id FROM execution WHERE id=NEW.owner_id;
     ELSIF NEW.owner_kind='enforcement' THEN
+        IF EXISTS(SELECT 1 FROM delegated_enforcement_selection WHERE enforcement=NEW.owner_id)
+        THEN RAISE EXCEPTION 'Delegated enforcement cannot acquire recorded authority'; END IF;
         IF EXISTS(SELECT 1 FROM enforcement_recorded_authority WHERE enforcement=NEW.owner_id AND admission IS DISTINCT FROM NEW.id)
         THEN RAISE EXCEPTION 'Existing recorded enforcement authority cannot be replaced'; END IF;
         INSERT INTO enforcement_recorded_authority(enforcement,admission) VALUES(NEW.owner_id,NEW.id) ON CONFLICT DO NOTHING;

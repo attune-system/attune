@@ -1,4 +1,6 @@
 //! Metadata visibility must never become a permit for protected content.
+#[path = "helpers/delegated.rs"]
+mod delegated;
 mod helpers;
 // This action-only suite shares the admitted pack fixture with the sensor suite;
 // its retained-generation helper is intentionally unused in this executable.
@@ -105,11 +107,15 @@ async fn artifact(
 }
 
 async fn execution(ctx: &TestContext, action_ref: &str) -> Result<i64> {
+    execution_with_refs(ctx, action_ref, &[]).await
+}
+
+async fn execution_with_refs(ctx: &TestContext, action_ref: &str, refs: &[String]) -> Result<i64> {
     let response = ctx
         .post(
             "/api/v1/executions/execute",
             json!({
-                "action_ref":action_ref, "parameters":{}, "permission_set_refs":[]
+                "action_ref":action_ref, "parameters":{}, "permission_set_refs":refs
             }),
             ctx.token(),
         )
@@ -360,14 +366,42 @@ async fn ordinary_artifact_content_preserves_nonrecorded_execution_credentials()
     )
     .await?;
     let selected = version(&ctx, id, None, "ordinary body").await?;
-    let token = attune_common::auth::jwt::generate_execution_token_with_permission_sets(
+    let action_ref = managed_fixture::action_pack(&ctx).await?;
+    let execution = execution_with_refs(&ctx, &action_ref, &["fixture.headers".into()]).await?;
+    let mut tx = ctx.pool.begin().await?;
+    let attempt = delegated::start(&mut tx, execution).await?;
+    tx.commit().await?;
+    let token = attune_common::auth::jwt::generate_delegated_execution_token(
         ctx.user.as_ref().ok_or("fixture identity missing")?.id,
-        1234,
-        "artifact_perf.run",
+        execution,
+        &action_ref,
         &ctx.state.jwt_config,
-        Some(300),
+        300,
         &["fixture.headers".into()],
+        &[],
+        attempt,
     )?;
+    // Bound the handler's stored branch state independently of Tokio test
+    // stack settings; the production acceptance also exercises actual polling.
+    let user = attune_api::auth::middleware::AuthenticatedUser {
+        claims: attune_common::auth::jwt::validate_token(&token, &ctx.state.jwt_config)?,
+    };
+    let numbered = attune_api::routes::artifacts::download_version(
+        attune_api::auth::middleware::RequireAuth(user.clone()),
+        axum::extract::State(ctx.state.clone()), axum::extract::Path((id, 1)),
+        axum::extract::Query(Default::default()), axum::http::HeaderMap::new(),
+    );
+    assert!(std::mem::size_of_val(&numbered) <= 128 * 1024,
+        "numbered download future uses {} bytes", std::mem::size_of_val(&numbered));
+    drop(numbered);
+    let latest = attune_api::routes::artifacts::download_latest(
+        attune_api::auth::middleware::RequireAuth(user),
+        axum::extract::State(ctx.state.clone()), axum::extract::Path(id),
+        axum::extract::Query(Default::default()), axum::http::HeaderMap::new(),
+    );
+    assert!(std::mem::size_of_val(&latest) <= 128 * 1024,
+        "latest download future uses {} bytes", std::mem::size_of_val(&latest));
+    drop(latest);
     for suffix in [
         "versions/1",
         "versions/latest",
@@ -392,7 +426,7 @@ async fn nonsensitive_runtime_log_preserves_legacy_execution_reads_through_chunk
         .await?;
     grant_artifacts(&ctx).await?;
     let action_ref = managed_fixture::action_pack(&ctx).await?;
-    let producer = execution(&ctx, &action_ref).await?;
+    let producer = execution_with_refs(&ctx, &action_ref, &["fixture.headers".into()]).await?;
     let id = artifact(
         &ctx,
         "fixture.log",
@@ -418,13 +452,18 @@ async fn nonsensitive_runtime_log_preserves_legacy_execution_reads_through_chunk
         },
     )
     .await?;
-    let token = attune_common::auth::jwt::generate_execution_token_with_permission_sets(
+    let mut tx = ctx.pool.begin().await?;
+    let attempt = delegated::start(&mut tx, producer).await?;
+    tx.commit().await?;
+    let token = attune_common::auth::jwt::generate_delegated_execution_token(
         ctx.user.as_ref().ok_or("fixture identity missing")?.id,
         producer,
         &action_ref,
         &ctx.state.jwt_config,
-        Some(300),
+        300,
         &["fixture.headers".into()],
+        &[],
+        attempt,
     )?;
     for suffix in [
         "versions/1",

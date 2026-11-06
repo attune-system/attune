@@ -1922,14 +1922,8 @@ impl ActionExecutor {
         };
         let mut conn = self.pool.acquire().await?;
         let recorded =
-            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
-                &mut conn,
-                attune_common::repositories::runtime_authority::RuntimeOwner::Execution(
-                    execution_id,
-                ),
-            )
-            .await?
-            .is_some();
+            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut conn, execution_id,)
+            .await?;
         drop(conn);
         let artifact_ref = if recorded {
             crate::completion::log_reference(&execution, stream.as_str())?
@@ -1993,8 +1987,17 @@ impl ActionExecutor {
             };
 
             let mut conn = self.pool.acquire().await?;
-            let recorded = attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
-                &mut conn, attune_common::repositories::runtime_authority::RuntimeOwner::Execution(execution_id)).await?.is_some();
+            // Ordinary file metadata outlives execution retention. This path
+            // grants no runtime or disclosure authority; an absent owner only
+            // permits finalizing the already allocated storage metadata.
+            let recorded = if ExecutionRepository::find_by_id(&mut *conn, execution_id)
+                .await?
+                .is_some()
+            {
+                attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut conn, execution_id).await?
+            } else {
+                false
+            };
             drop(conn);
             let transport = if recorded {
                 crate::completion::CompletionTransport::for_version(

@@ -411,6 +411,10 @@ impl EventProcessor {
         if !rule.is_adhoc {
             attune_common::execution_authority::RecordedConsumerReadiness::default()
                 .require_ready()?;
+        } else if encryption_key.is_none() {
+            return Err(anyhow::anyhow!(
+                "Delegated rule execution output encryption is unavailable"
+            ));
         }
         let snapshot = if !rule.is_adhoc {
             attune_common::repositories::execution_admission::ExecutionAdmissionRepository::resolve_current_snapshot(
@@ -574,6 +578,9 @@ impl EventProcessor {
                 &binding,
             )
             .await?;
+            if admission.is_none() {
+                attune_common::repositories::delegated_execution::DelegatedExecutionRepository::accept_enforcement(&mut tx, &enforcement, identity_id, refs).await?;
+            }
         }
         if enforcement_result.created && !prepared_secrets.is_empty() {
             ExecutionSecretValueRepository::upsert_many_with_conn(

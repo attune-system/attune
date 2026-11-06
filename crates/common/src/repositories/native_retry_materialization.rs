@@ -70,6 +70,10 @@ impl NativeRetryMaterializationRepository {
         {
             return Err(denied());
         }
+        if is_delegated(conn, child).await? {
+            return prepare_delegated_publication(conn, child, PublicationSource::InitialTask, key)
+                .await;
+        }
         let admission =
             ExecutionAdmissionRepository::require(conn, RuntimeOwner::Execution(child.id)).await?;
         let (_, binding) = ExecutionAdmissionRepository::workflow_invocation(
@@ -182,7 +186,6 @@ impl NativeRetryMaterializationRepository {
         same_execution(expected, &actual)?;
         let snapshot = actual.executable_snapshot.as_ref().ok_or_else(denied)?;
         let admission = if ExecutionAdmissionRepository::is_recorded(conn, actual.id).await? {
-            crate::execution_authority::RecordedConsumerReadiness::default().require_ready()?;
             Some(
                 ExecutionAdmissionRepository::inherit(
                     conn,
@@ -229,8 +232,13 @@ impl NativeRetryMaterializationRepository {
     ) -> Result<PreparedRetryPublication> {
         let task = retry.workflow_task.as_ref().ok_or_else(denied)?;
         if is_delegated(conn, retry).await? {
-            return prepare_delegated_publication(conn, retry, PublicationSource::Retry(source))
-                .await;
+            return prepare_delegated_publication(
+                conn,
+                retry,
+                PublicationSource::Retry(source),
+                key,
+            )
+            .await;
         }
         let admission =
             ExecutionAdmissionRepository::require(conn, RuntimeOwner::Execution(retry.id)).await?;
@@ -277,6 +285,9 @@ impl PreparedNativeRetry {
                 self.source.id,
             )
             .await?;
+            if delegated_fields(conn, &self.source).await? != self.fields {
+                return Err(denied());
+            }
         }
         for receipt in &self.receipts {
             receipt.ensure_fresh_on(conn).await?;
@@ -605,6 +616,7 @@ async fn prepare_delegated_publication(
     conn: &mut PgConnection,
     retry: &Execution,
     source: PublicationSource,
+    key: &str,
 ) -> Result<PreparedRetryPublication> {
     if retry.status != ExecutionStatus::Requested || retry.worker.is_some() {
         return Err(denied());
@@ -615,7 +627,9 @@ async fn prepare_delegated_publication(
         .await?
         .ok_or_else(denied)?;
     schema.validate()?;
-    let fields = delegated_fields(conn, retry).await?;
+    let (fields, receipts) =
+        super::accepted_execution_source::prepare_delegated_observation(conn, retry, &schema, key)
+            .await?;
     if let PublicationSource::Retry(id) = source {
         let original = ExecutionRepository::find_by_id(&mut *conn, id)
             .await?
@@ -655,7 +669,7 @@ async fn prepare_delegated_publication(
         workflow: task.workflow_execution,
         source,
         fence: None,
-        receipts: Vec::new(),
+        receipts,
         schema,
         fields,
         cache: None,

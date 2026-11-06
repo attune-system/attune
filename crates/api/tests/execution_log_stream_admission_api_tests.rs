@@ -1,3 +1,5 @@
+#[path = "helpers/delegated.rs"]
+mod delegated;
 mod helpers;
 
 use std::time::Duration;
@@ -118,9 +120,12 @@ async fn stream_fixture_kind(ctx: &TestContext, sensitive: bool) -> Result<(i64,
     Ok((execution.id, token))
 }
 
+#[derive(Clone, Copy)]
 enum LogAccess {
     Disabled,
+    ReadOnly,
     Named,
+    StandardOnly,
     Standard,
 }
 
@@ -129,10 +134,7 @@ async fn bound_legacy_stream_fixture(
     access: LogAccess,
 ) -> Result<(i64, String)> {
     use attune_common::{
-        auth::jwt::{
-            generate_execution_token_with_permission_sets_and_standard_access,
-            STANDARD_EXECUTION_ACCESS_REF,
-        },
+        auth::jwt::{generate_delegated_execution_token, STANDARD_EXECUTION_ACCESS_REF},
         repositories::{
             action::{ActionRepository, CreateActionInput},
             executable_snapshot::ExecutableSnapshotRepository,
@@ -184,8 +186,9 @@ async fn bound_legacy_stream_fixture(
     let reference = format!("fixture.log_optin_{}", uuid::Uuid::new_v4().simple());
     let selected = match access {
         LogAccess::Disabled => Vec::new(),
-        LogAccess::Named => vec![reference.clone()],
-        LogAccess::Standard => vec![STANDARD_EXECUTION_ACCESS_REF.to_owned()],
+        LogAccess::ReadOnly | LogAccess::Named => vec![reference.clone()],
+        LogAccess::StandardOnly => vec![STANDARD_EXECUTION_ACCESS_REF.to_owned()],
+        LogAccess::Standard => vec![STANDARD_EXECUTION_ACCESS_REF.to_owned(), reference.clone()],
     };
     let mut tx = ctx.pool.begin().await?;
     let snapshot = ExecutableSnapshotRepository::resolve_for_action(&mut *tx, action.id).await?;
@@ -197,7 +200,7 @@ async fn bound_legacy_stream_fixture(
             action_ref: action.r#ref.clone(),
             executor: Some(identity.id),
             permission_set_refs: selected.clone(),
-            status: ExecutionStatus::Running,
+            status: ExecutionStatus::Requested,
             ..Default::default()
         },
         &snapshot,
@@ -214,7 +217,7 @@ async fn bound_legacy_stream_fixture(
             pack_ref: None,
             label: None,
             description: None,
-            grants: serde_json::json!([{"resource":"executions","actions":["read"],
+            grants: serde_json::json!([{"resource":"executions","actions": if matches!(access, LogAccess::ReadOnly) { vec!["read"] } else { vec!["read","decrypt"] },
             "constraints":{"ids":[execution.id]}}]),
         },
     )
@@ -227,16 +230,24 @@ async fn bound_legacy_stream_fixture(
         },
     )
     .await?;
+    attune_common::repositories::delegated_execution::DelegatedExecutionRepository::select(
+        &mut tx,
+        execution.id,
+        None,
+    )
+    .await?;
+    let attempt = delegated::start(&mut tx, execution.id).await?;
     tx.commit().await?;
     attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(identity.id).await;
-    let token = generate_execution_token_with_permission_sets_and_standard_access(
+    let token = generate_delegated_execution_token(
         identity.id,
         execution.id,
         &action.r#ref,
         &ctx.state.jwt_config,
-        Some(300),
+        300,
         &selected,
         std::slice::from_ref(&action.r#ref),
+        attempt,
     )?;
     Ok((execution.id, token))
 }
@@ -263,6 +274,31 @@ async fn empty_ref_execution_token_cannot_stream_validly_bound_own_logs() -> Res
         drop(response.into_response());
     }
     wait_for_no_leases(&ctx).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_only_and_standard_only_tokens_cannot_decrypt_api_capable_logs() -> Result<()> {
+    let ctx = TestContext::new_with_stream_limits(2, 2)
+        .await?
+        .with_auth()
+        .await?;
+    for access in [LogAccess::ReadOnly, LogAccess::StandardOnly] {
+        let (id, token) = bound_legacy_stream_fixture(&ctx, access).await?;
+        let response = ctx
+            .get(
+                &format!("/api/v1/executions/{id}/logs/stdout/stream"),
+                Some(&token),
+            )
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "API-capable logs retain explicit execution read/decrypt and output-origin checks"
+        );
+    }
+    wait_for_no_leases(&ctx).await?;
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -321,7 +357,7 @@ async fn opted_in_execution_log_token_is_narrow_and_requires_active_owner() -> R
 }
 
 #[tokio::test]
-async fn standard_execution_log_access_remains_scoped_to_own_execution() -> Result<()> {
+async fn standard_and_explicit_log_decrypt_access_remain_scoped_to_own_execution() -> Result<()> {
     let ctx = TestContext::new_with_stream_limits(2, 2)
         .await?
         .with_auth()

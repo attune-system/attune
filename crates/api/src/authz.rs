@@ -628,6 +628,10 @@ impl AuthorizationService {
         user: &AuthenticatedUser,
         permission_set_refs: &[String],
     ) -> Result<bool, ApiError> {
+        if user.claims.token_type == TokenType::Execution {
+            attune_common::repositories::delegated_execution::DelegatedExecutionRepository::validate_claims(conn, &user.claims)
+                .await.map_err(|_| ApiError::Unauthorized("Delegated execution authority is unavailable".into()))?;
+        }
         let permission_set_refs = named_execution_permission_set_refs(permission_set_refs);
         if permission_set_refs.is_empty() {
             return Ok(true);

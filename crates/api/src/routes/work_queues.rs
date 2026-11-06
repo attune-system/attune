@@ -1955,6 +1955,11 @@ async fn enqueue_queue_item_in_transaction(
             "Dispatch action is unavailable for new queue admission".into(),
         ));
     }
+    if queue.is_adhoc && state.config.security.encryption_key.is_none() {
+        return Err(ApiError::NotImplemented(
+            "Delegated queue execution output encryption is unavailable".into(),
+        ));
+    }
     let item = WorkQueueItemRepository::create_bound_pinned(
         &mut *connection,
         CreateWorkQueueItemInput {

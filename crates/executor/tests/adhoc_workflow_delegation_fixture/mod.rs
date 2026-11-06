@@ -14,6 +14,10 @@ struct AdhocWorkflowDelegationFixture {
 
 impl AdhocWorkflowDelegationFixture {
     async fn create() -> Result<Self> {
+        Self::create_with_selection(false).await
+    }
+
+    async fn create_with_selection(named: bool) -> Result<Self> {
         use attune_common::{
             repositories::{
                 executable_snapshot::ExecutableSnapshotRepository,
@@ -268,7 +272,16 @@ tasks:
         contract.validate(&values)?;
         // The owning fixture declares no sensitive schema fields or Key/Pack
         // templates. Supplied refs remain literal JSON, not server declarations.
-        let selected_refs = vec!["standard".into()];
+        let mut selected_refs = vec!["standard".into()];
+        if named {
+            attune_common::repositories::identity::PermissionAssignmentRepository::create(
+                &mut *acceptance,
+                attune_common::repositories::identity::CreatePermissionAssignmentInput {
+                    identity: identity.id, permset: set.id,
+                },
+            ).await?;
+            selected_refs.push(ADHOC_WORKFLOW_PERMISSION_REF.into());
+        }
         attune_common::delegation::require_execution_refs_for_share(
             &mut acceptance,
             Some(identity.id),
@@ -296,6 +309,7 @@ tasks:
             &binding,
         )
         .await?;
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::select(&mut acceptance, provisional.id, None).await?;
         ExecutionRepository::initialize_config_with_conn(
             &mut acceptance,
             provisional.id,

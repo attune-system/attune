@@ -11,7 +11,6 @@ use attune_common::{
         execution::ExecutionRepository,
         execution_admission::ExecutionAdmissionRepository,
         log_stream::LogStreamRepository,
-        runtime_authority::RuntimeOwner,
         worker_delivery::{
             DeliveryContext, DeliveryOperation, DeliveryPermit, WorkerDeliveryRepository,
         },
