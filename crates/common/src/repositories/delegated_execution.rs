@@ -131,19 +131,22 @@ impl DelegatedExecutionRepository {
                     );
                 }
             }
+            actions.sort();
+            actions.dedup();
+            let mut packs = actions
+                .iter()
+                .filter_map(|a| a.split_once('.').map(|(p, _)| p.to_owned()))
+                .collect::<Vec<_>>();
+            packs.sort();
+            packs.dedup();
             let mut owners = actions.clone();
-            owners.extend(
-                actions
-                    .iter()
-                    .filter_map(|a| a.rsplit_once('.').map(|(p, _)| p.to_owned())),
-            );
+            owners.extend(packs.iter().cloned());
             owners.sort();
             owners.dedup();
             use crate::rbac::{Action, Grant, GrantConstraints, Resource};
             for (resource, actions) in [
                 (Resource::Keys, vec![Action::Read, Action::Decrypt]),
                 (Resource::Artifacts, vec![Action::Read]),
-                (Resource::Caches, vec![Action::Read]),
             ] {
                 output_grants.push(Grant {
                     resource,
@@ -157,6 +160,25 @@ impl DelegatedExecutionRepository {
                         ..Default::default()
                     }),
                 });
+            }
+            // Standard cache access keeps pack/action selectors separate.
+            // A combined owner-type/ref cross product would demand rights that
+            // the API's scoped standard grants intentionally do not provide.
+            for (owner_type, owner_refs) in [
+                (crate::models::OwnerType::Pack, packs),
+                (crate::models::OwnerType::Action, actions),
+            ] {
+                if !owner_refs.is_empty() {
+                    output_grants.push(Grant {
+                        resource: Resource::Caches,
+                        actions: vec![Action::Read],
+                        constraints: Some(GrantConstraints {
+                            owner_types: Some(vec![owner_type]),
+                            owner_refs: Some(owner_refs),
+                            ..Default::default()
+                        }),
+                    });
+                }
             }
         }
         let changed = sqlx::query("UPDATE execution_authority_selection s SET mode='delegated',explicit=TRUE,owner=$2,selected_refs=$3,executable_snapshot=$4,schema_digest=$5,grant_digest=$6,output_grants=$7 WHERE execution=$1 AND NOT s.explicit AND selection_transaction=pg_current_xact_id() AND admission IS NULL AND NOT EXISTS(SELECT 1 FROM runtime_authority_admission WHERE owner_kind='execution' AND owner_id=$1) AND EXISTS(SELECT 1 FROM execution WHERE id=$1 AND initial_input_transaction=pg_current_xact_id() AND worker IS NULL AND started_at IS NULL)")

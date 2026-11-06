@@ -329,6 +329,20 @@ print(json.dumps({'assertion':result['assertion'],'raw_denied':True,'profile_den
         assert data['value'] == secret and data['unrelated_denied']
         stale = requests.get(base + '/api/v1/keys/' + keys[0], headers={'Authorization': 'Bearer ' + data['credential']}, timeout=10)
         assert stale.status_code == 401, 'terminal credential accepted'
+        # Reproduce the legitimate closure-to-terminal status lag using the
+        # already completed owned fixture. The real process credential must
+        # stay invalid while the attempt is closed and its row says running.
+        assert psql(f"SELECT closed FROM delegated_execution_attempt WHERE execution={positive['id']}")=='t'
+        psql(f"UPDATE execution SET status='running' WHERE id={positive['id']}")
+        try:
+            assert psql(f"SELECT status FROM execution WHERE id={positive['id']}")=='running'
+            closed=requests.get(base+'/api/v1/keys/'+keys[0],headers={'Authorization':'Bearer '+data['credential']},timeout=10)
+            assert closed.status_code==401, 'closed attempt credential accepted while source row remains running'
+        finally:
+            psql(f"UPDATE execution SET status='completed' WHERE id={positive['id']}")
+        result['checks'] += ['closed attempt credential denied while source execution still says running']
+        result['credential_fencing']={'execution':positive['id'],'terminal_status':stale.status_code,'closed_running_status':closed.status_code}
+
         result['checks'] += ['narrow requester managed system-Key read+decrypt through API/broker/production worker/process', 'unrelated system Key denied', 'terminal credential denied', 'runtime origin retained', 'default result redacted']
         for refs in [['standard'], ['standard', pack_ref + '.use_system'], ['standard', pack_ref + '.read_metadata']]:
             execute(refs, False)

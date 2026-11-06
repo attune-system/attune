@@ -271,10 +271,19 @@ Repeat with release binaries using `cargo build --release` and
 `--bin-dir target/release` to cover the production build profile. Keep binary
 snapshots and other large artifacts under `.scratch/`, outside `/tmp` tmpfs.
 
+For a container runtime check, supply Linux static release binaries with
+`--bin-dir <directory> --service-image python:3.12-bookworm`. The runner pins
+and records the image ID, mounts only its owned evidence directory and supplied
+binaries, and starts the services on an owned Docker network. To exercise the
+production injected agent, place a symlink named `attune-worker` to the built
+`attune-agent` in that directory; the resolved binary path and hash are recorded.
+The image must not override `RUST_MIN_STACK` for a default-stack run.
+
 The action reads an encrypted **system-owned** Key through a pack-defined,
 explicitly selected narrow grant covered by the requester. Negative cases cover
 an unrelated system Key, missing selection, read without decrypt, use without
-plaintext, execute-only callers, terminal credentials and incompatible workers.
+plaintext, execute-only callers, terminal credentials, closed attempts during
+status lag and incompatible workers.
 An approved use-only signing case remains separate from raw read/decrypt.
 Assertions include encrypted logs/results and disclosure denials, workflow retry,
 ad hoc execution, attributed queue dispatch, rejection of recorded-only queue

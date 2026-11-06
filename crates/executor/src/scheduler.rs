@@ -2741,9 +2741,9 @@ impl ExecutionScheduler {
         ))
     }
 
-    /// Transaction callers always use their actual connection. Keeping this
-    /// future concrete avoids higher-ranked Acquire requirements propagating
-    /// through the scheduler's Send MQ/spawn futures.
+    /// Transaction callers use a concrete PgConnection to avoid higher-ranked
+    /// Acquire requirements in Send MQ/spawn futures. The returned future is
+    /// heap-owned to bound the orchestration poll frames.
     fn restore_secret_entity<'a>(
         connection: &'a mut PgConnection,
         encryption_key: Option<&'a str>,
