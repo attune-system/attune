@@ -94,6 +94,8 @@ use crate::workflow::task_wait::{
     execution_resolution, work_queue_item_resolution, TargetResolution,
 };
 
+type RestoredWorkflowVariables = (JsonValue, Vec<(JsonPointer, SecretSource)>);
+
 #[derive(Debug, Clone)]
 struct EffectiveWorkerPlacement {
     constraints: Vec<WorkerPlacement>,
@@ -2844,7 +2846,7 @@ impl ExecutionScheduler {
         encryption_key: Option<&'a str>,
         parent: &'a Execution,
         variables: &'a JsonValue,
-    ) -> futures::future::BoxFuture<'a, Result<(JsonValue, Vec<(JsonPointer, SecretSource)>)>> {
+    ) -> futures::future::BoxFuture<'a, Result<RestoredWorkflowVariables>> {
         Box::pin(async move {
             let prepared =
             if attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(conn, parent.id)
