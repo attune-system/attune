@@ -100,6 +100,8 @@ const LOG_STREAM_READ_CHUNK_SIZE: usize = 1024 * 1024;
         (status = 201, description = "Execution created and queued", body = ExecutionResponse),
         (status = 404, description = "Action not found"),
         (status = 400, description = "Invalid request"),
+        (status = 403, description = "Caller cannot execute or cover the selected grants"),
+        (status = 501, description = "Execution sponsorship or protected output services are not ready"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -2068,6 +2070,7 @@ pub async fn cancel_execution(
         (status = 200, description = "Execution request republished", body = inline(ApiResponse<ExecutionRescheduleResponse>)),
         (status = 404, description = "Execution not found"),
         (status = 409, description = "Execution is not eligible for reschedule"),
+        (status = 501, description = "Recorded execution scheduling requires coordinated runtime readiness"),
     ),
     security(("bearer_auth" = []))
 )]

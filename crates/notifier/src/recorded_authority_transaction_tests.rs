@@ -780,6 +780,7 @@ async fn shutdown_drains_an_active_validation_with_identity_still_blocked() -> R
 /// Exercise the production socket router, including the final frame fence.
 #[tokio::test]
 async fn delegated_socket_rejects_stale_terminal_and_closed_attempts() -> Result<()> {
+    attune_common::auth::install_crypto_provider();
     use crate::{subscriber_manager::SubscriberManager, websocket_server::WebSocketServer};
     use attune_common::{
         auth::jwt::{generate_delegated_execution_token, JwtConfig},

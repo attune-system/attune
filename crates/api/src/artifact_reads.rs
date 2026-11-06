@@ -331,6 +331,23 @@ impl<'a> ArtifactReads<'a> {
                     held.connection(),
                 )
                 .await?;
+                // The process may not have read a Key or materialized result
+                // provenance yet. Retain its frozen read/use ceiling even on
+                // this receipt-guarded path, using the same IAM transaction.
+                if let Some(origin) = attune_common::repositories::delegated_execution::DelegatedExecutionRepository::output_origin(held.connection(), execution.id).await? {
+                    let attune_common::secret_provenance::SecretOrigin::Local {source_kind, source_ref} = origin else {
+                        return Err(denied());
+                    };
+                    if source_kind != "delegated_execution_output" {
+                        return Err(denied());
+                    }
+                    let viewer = attune_common::delegation::DelegationAuthority::new(
+                        snapshot.identity_id, snapshot.identity_attributes.clone(), snapshot.grants.clone(),
+                    );
+                    if !attune_common::repositories::delegated_execution::DelegatedExecutionRepository::output_allowed(held.connection(), source_ref.as_deref(), &viewer).await? {
+                        return Err(denied());
+                    }
+                }
                 execution
             };
             reads.load_execution_disclosure(&executions).await?;

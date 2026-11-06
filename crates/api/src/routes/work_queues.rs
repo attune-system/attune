@@ -893,7 +893,8 @@ pub async fn get_queue_item(
         (status = 400, description = "Validation error"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Queue not found"),
-        (status = 409, description = "Pending item conflict")
+        (status = 409, description = "Pending item conflict"),
+        (status = 501, description = "Queue sponsorship or protected delegated output is not ready"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -958,7 +959,8 @@ pub async fn enqueue_queue_item(
         (status = 400, description = "Validation error or configured bulk enqueue limit exceeded"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Queue not found"),
-        (status = 409, description = "Queue is not accepting items or pending item conflict")
+        (status = 409, description = "Queue is not accepting items or pending item conflict"),
+        (status = 501, description = "Queue sponsorship or protected delegated output is not ready"),
     ),
     security(("bearer_auth" = []))
 )]

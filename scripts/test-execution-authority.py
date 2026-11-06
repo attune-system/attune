@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Owned API/broker/production-worker acceptance for delegated system Key reads.
 
-Requires built debug API/executor/worker binaries, Docker, PyYAML and requests.
+Requires built API/executor/worker binaries, Docker, OpenSSL, PyYAML and requests.
 No recorded readiness flags, direct token minting, or deployment exemptions.
 """
 import argparse
+import base64
 import io
 import hashlib
 import json
@@ -97,8 +98,19 @@ def main():
     (evidence/'tested.patch').write_bytes(subprocess.check_output(['git','diff','HEAD'],cwd=ROOT))
     (evidence/'tested-source.sha256').write_text(''.join(hashlib.sha256((ROOT/path).read_bytes()).hexdigest()+'  '+path+'\n' for path in sorted(changed) if (ROOT/path).is_file()))
 
+    # Test services take all Attune configuration from this run's explicit
+    # file/context; inherited operator settings must never select another DB.
+    result['ignored_attune_environment']=sorted(key for key in os.environ if key.startswith('ATTUNE_'))
+    def owned_environment():
+        values={key:value for key,value in os.environ.items() if not key.startswith('ATTUNE_')}
+        if args.runtime_stack_bytes:
+            values['RUST_MIN_STACK']=str(args.runtime_stack_bytes)
+        else:
+            values.pop('RUST_MIN_STACK',None)
+        return values
+
     def command(argv, **kwargs):
-        kwargs.setdefault('env', dict(os.environ, ATTUNE__ENVIRONMENT='authority_acceptance'))
+        kwargs.setdefault('env', dict(owned_environment(), ATTUNE__ENVIRONMENT='authority_acceptance'))
         return subprocess.run(argv, check=True, timeout=kwargs.pop('timeout', 60), **kwargs)
 
     def docker_container(kind, image, ports, extra):
@@ -140,7 +152,7 @@ def main():
     def start(binary, config):
         log = (evidence / (binary + '.log')).open('w')
         logs.append(log)
-        env = dict(os.environ, ATTUNE_API_URL=base, ATTUNE_WORKER_NAME=run, ATTUNE__ENVIRONMENT='authority_acceptance', RUST_LOG='info')
+        env = dict(owned_environment(), ATTUNE_API_URL=base, ATTUNE_WORKER_NAME=run, ATTUNE__ENVIRONMENT='authority_acceptance', RUST_LOG='info')
         if args.runtime_stack_bytes:
             env['RUST_MIN_STACK']=str(args.runtime_stack_bytes)
         else:
@@ -327,6 +339,10 @@ print(json.dumps({'assertion':result['assertion'],'raw_denied':True,'profile_den
             assert revealed.status_code==200 and secret in revealed.text, 'authorized protected log download failed'
         result['checks'] += ['dynamic Key stdout/stderr encrypted and authorized log downloads recover original bytes']
         assert data['value'] == secret and data['unrelated_denied']
+        payload=data['credential'].split('.')[1]
+        credential_claims=json.loads(base64.urlsafe_b64decode(payload+'='*(-len(payload)%4)))
+        assert credential_claims['exp']>time.time()+5, 'credential must remain unexpired for lifecycle denials'
+        assert credential_claims['metadata']['delegated_attempt']==psql(f"SELECT attempt::text FROM delegated_execution_attempt WHERE execution={positive['id']}")
         stale = requests.get(base + '/api/v1/keys/' + keys[0], headers={'Authorization': 'Bearer ' + data['credential']}, timeout=10)
         assert stale.status_code == 401, 'terminal credential accepted'
         # Reproduce the legitimate closure-to-terminal status lag using the
@@ -341,7 +357,7 @@ print(json.dumps({'assertion':result['assertion'],'raw_denied':True,'profile_den
         finally:
             psql(f"UPDATE execution SET status='completed' WHERE id={positive['id']}")
         result['checks'] += ['closed attempt credential denied while source execution still says running']
-        result['credential_fencing']={'execution':positive['id'],'terminal_status':stale.status_code,'closed_running_status':closed.status_code}
+        result['credential_fencing']={'execution':positive['id'],'terminal_status':stale.status_code,'closed_running_status':closed.status_code,'unexpired':True,'attempt_matches':True}
 
         result['checks'] += ['narrow requester managed system-Key read+decrypt through API/broker/production worker/process', 'unrelated system Key denied', 'terminal credential denied', 'runtime origin retained', 'default result redacted']
         for refs in [['standard'], ['standard', pack_ref + '.use_system'], ['standard', pack_ref + '.read_metadata']]:
@@ -351,6 +367,19 @@ print(json.dumps({'assertion':result['assertion'],'raw_denied':True,'profile_den
         signed_data=api('GET',f"/executions/{signed['id']}?include_secret_values=true")['result']['data']
         assert signed_data['raw_denied'] and signed_data['profile_denied'] and len(signed_data['assertion'].split('.'))==3
         assert 'private_key_pem' not in json.dumps(signed_data)
+        header,claims,signature=signed_data['assertion'].split('.')
+        decoded_header=json.loads(base64.urlsafe_b64decode(header+'='*(-len(header)%4)))
+        decoded_claims=json.loads(base64.urlsafe_b64decode(claims+'='*(-len(claims)%4)))
+        assert decoded_header['alg']=='RS256'
+        assert decoded_claims['iss']=='approved-client' and decoded_claims['aud']=='https://auth.example.test' and decoded_claims['sub']=='approved@example.test'
+        assert decoded_claims['exp']>time.time() and decoded_claims['exp']-decoded_claims['iat']==60
+        public_key=evidence/'signer-public.pem'
+        signature_file=evidence/'approved-signature.bin'
+        public_key.write_bytes(command(['openssl','pkey','-pubout','-in',str(ROOT/'crates/common/tests/fixtures/jwt_signing_test_private.pem')],capture_output=True).stdout)
+        signature_file.write_bytes(base64.urlsafe_b64decode(signature+'='*(-len(signature)%4)))
+        command(['openssl','dgst','-sha256','-verify',str(public_key),'-signature',str(signature_file)],input=(header+'.'+claims).encode(),capture_output=True)
+        result['approved_signature_verified']=True
+
         result['checks'] += ['keys:use-only approved signer succeeds without private material; unapproved subject denied']
         # Native workflow fanout and failed-attempt retry retain delegated mode.
         workflow=execute(['standard',pack_ref+'.read_system'],True,reference=flow_ref,fail_once=True)

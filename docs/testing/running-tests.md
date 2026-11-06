@@ -260,7 +260,7 @@ python3 scripts/test-execution-authority.py \
   --output .scratch/attune-authority-acceptance-unique
 ```
 
-The output directory must not exist. Docker, Python `requests` and PyYAML are
+The output directory must not exist. Docker, OpenSSL, Python `requests` and PyYAML are
 required. The runner owns PostgreSQL 18, RabbitMQ, random host ports, filesystem
 roots and production API/executor/worker processes, and awaits their teardown.
 It records source/binary hashes and the check inventory in the output directory.
