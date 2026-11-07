@@ -1,0 +1,77 @@
+{
+  "finding": "The owned E2E runner invokes configure_cache_retention.py, setting retention cadence to 2 seconds for every primary lane. This is not production-default idle.",
+  "runs": [
+    {
+      "run": "dbm-legacy-volume-10000-29cb2d88",
+      "kind": "legacy",
+      "backend": "volume",
+      "observed_retention_interval_seconds": 2,
+      "maintenance_cycle_starts": 24,
+      "idle_seconds": 60.04137164101121,
+      "top_level_calls": 9556,
+      "top_level_exec_ms": 721.1160759999998,
+      "outbox_calls": 1172,
+      "outbox_exec_ms": 60.237349999999935
+    },
+    {
+      "run": "dbm-before-volume-10000-e8726853",
+      "kind": "before",
+      "backend": "volume",
+      "observed_retention_interval_seconds": 2,
+      "maintenance_cycle_starts": 23,
+      "idle_seconds": 60.06154810999578,
+      "top_level_calls": 9284,
+      "top_level_exec_ms": 744.415655,
+      "outbox_calls": 1170,
+      "outbox_exec_ms": 62.7281669999999
+    },
+    {
+      "run": "dbm-after-volume-10000-70d69eb7",
+      "kind": "after",
+      "backend": "volume",
+      "observed_retention_interval_seconds": 2,
+      "maintenance_cycle_starts": 22,
+      "idle_seconds": 60.02979584899731,
+      "top_level_calls": 8817,
+      "top_level_exec_ms": 833.4728980000002,
+      "outbox_calls": 1170,
+      "outbox_exec_ms": 65.60105600000003
+    },
+    {
+      "run": "dbm-after-api-10000-8de4e00c",
+      "kind": "after",
+      "backend": "api",
+      "observed_retention_interval_seconds": 2,
+      "maintenance_cycle_starts": 24,
+      "idle_seconds": 60.03671109300922,
+      "top_level_calls": 9343,
+      "top_level_exec_ms": 684.4575560000002,
+      "outbox_calls": 1170,
+      "outbox_exec_ms": 64.95774300000028
+    },
+    {
+      "run": "dbm-before-api-10000-3e60d244",
+      "kind": "before",
+      "backend": "api",
+      "observed_retention_interval_seconds": 2,
+      "maintenance_cycle_starts": 23,
+      "idle_seconds": 60.05783472000621,
+      "top_level_calls": 9285,
+      "top_level_exec_ms": 818.7887999999997,
+      "outbox_calls": 1171,
+      "outbox_exec_ms": 63.324579999999685
+    },
+    {
+      "run": "dbm-legacy-api-10000-e2b6d7d2",
+      "kind": "legacy",
+      "backend": "api",
+      "observed_retention_interval_seconds": 2,
+      "maintenance_cycle_starts": 23,
+      "idle_seconds": 60.04405634599971,
+      "top_level_calls": 9538,
+      "top_level_exec_ms": 769.3557159999996,
+      "outbox_calls": 1170,
+      "outbox_exec_ms": 65.56344899999965
+    }
+  ]
+}

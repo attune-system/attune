@@ -4,6 +4,8 @@ mod c_inherited_receipt_consumers;
 mod cache_selector_composition;
 #[path = "support/file_native_retention_cases.rs"]
 mod file_native_retention_cases;
+#[path = "runtime_authority_repository_tests/input_authority_validation.rs"]
+mod input_authority_validation;
 // The reused success fixture owns this executable's single database helper module.
 use file_native_retention_cases::success_metadata_custody_cases::source::helpers;
 #[path = "runtime_authority_repository_tests/native_cache_activation.rs"]

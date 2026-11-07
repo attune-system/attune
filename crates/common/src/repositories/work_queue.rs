@@ -1,7 +1,7 @@
 //! Work queue repositories for first-class business queues.
 
 use chrono::{DateTime, Utc};
-use sqlx::{Executor, PgConnection, Postgres, QueryBuilder};
+use sqlx::{Executor, PgConnection, PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use crate::models::{
@@ -1092,6 +1092,27 @@ impl Create for WorkQueueItemRepository {
 }
 
 impl WorkQueueItemRepository {
+    /// Advisory readiness snapshot for a bounded queue poll. This takes no item
+    /// locks and grants no dispatch authority. Leasing must recheck eligibility;
+    /// concurrent enqueues/retries can be picked up by the next poll.
+    pub async fn queues_with_ready_items(pool: &PgPool, queue_ids: &[Id]) -> Result<Vec<Id>> {
+        if queue_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(sqlx::query_scalar(
+            "SELECT candidate.queue FROM unnest($1::bigint[]) AS candidate(queue)
+             WHERE EXISTS (
+                 SELECT 1 FROM work_queue_item item
+                 WHERE item.queue = candidate.queue
+                   AND item.status = ANY($2::work_queue_item_status_enum[])
+             )",
+        )
+        .bind(queue_ids)
+        .bind([WorkQueueItemStatus::Queued, WorkQueueItemStatus::Retry].as_slice())
+        .fetch_all(pool)
+        .await?)
+    }
+
     pub async fn create_bound_pinned<'e, E>(
         executor: E,
         input: CreateWorkQueueItemInput,
@@ -2322,6 +2343,28 @@ impl Delete for WorkQueueDispatchRepository {
 }
 
 impl WorkQueueDispatchRepository {
+    /// Observe active dispatches without fetching rows that the poller discards.
+    /// This is an unlocked count; the dispatcher's admission and lease recovery
+    /// protocol remains the caller's responsibility.
+    pub async fn count_active_for_queue<'e, E>(executor: E, queue: Id) -> Result<u64>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let active = vec![
+            WorkQueueDispatchStatus::Leased,
+            WorkQueueDispatchStatus::Dispatched,
+        ];
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_queue_dispatch \
+             WHERE queue = $1 AND status = ANY($2::work_queue_dispatch_status_enum[])",
+        )
+        .bind(queue)
+        .bind(active)
+        .fetch_one(executor)
+        .await?;
+        Ok(count.max(0) as u64)
+    }
+
     pub async fn list_by_executions<'e, E>(
         executor: E,
         execution_ids: &[Id],

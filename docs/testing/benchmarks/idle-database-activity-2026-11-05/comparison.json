@@ -1,0 +1,140 @@
+{
+  "volume": {
+    "database_terminal_p50_ms": {
+      "median_paired_change_percent": 0.9274910241971523,
+      "improved_profiles": 6,
+      "worst_change_percent": 18.82894899340508,
+      "best_change_percent": -12.055751134137772,
+      "baseline_profile_mean": 752.1357668338169,
+      "current_profile_mean": 768.2362359167504
+    },
+    "database_terminal_p95_ms": {
+      "median_paired_change_percent": 8.253098387550628,
+      "improved_profiles": 3,
+      "worst_change_percent": 29.00271103406318,
+      "best_change_percent": -4.125834556496921,
+      "baseline_profile_mean": 937.8897845854226,
+      "current_profile_mean": 992.3679599972578
+    },
+    "top_level_statement_calls_per_job": {
+      "median_paired_change_percent": -2.54366701788743,
+      "improved_profiles": 12,
+      "worst_change_percent": -1.4611354948322108,
+      "best_change_percent": -3.551902266128726,
+      "baseline_profile_mean": 498.8225,
+      "current_profile_mean": 485.19166666666666
+    },
+    "top_level_exec_ms_per_job": {
+      "median_paired_change_percent": -3.6481649758324854,
+      "improved_profiles": 7,
+      "worst_change_percent": 20.577663448492633,
+      "best_change_percent": -11.671803098211287,
+      "baseline_profile_mean": 276.7126018925,
+      "current_profile_mean": 276.47789818500024
+    },
+    "top_level_wal_bytes_per_job": {
+      "median_paired_change_percent": -0.25064789128037,
+      "improved_profiles": 7,
+      "worst_change_percent": 1.7262525341851687,
+      "best_change_percent": -1.6672047853758198,
+      "baseline_profile_mean": 59002.3375,
+      "current_profile_mean": 59036.54833333333
+    },
+    "idle": {
+      "top_level_statement_calls_per_minute": {
+        "baseline": 3398.18411171341,
+        "current": 1111.4684259763633,
+        "change_percent": -67.29228348325289
+      },
+      "top_level_exec_ms_per_minute": {
+        "baseline": 146.95224139445523,
+        "current": 118.86070975796784,
+        "change_percent": -19.116096066260702
+      },
+      "top_level_wal_bytes_per_minute": {
+        "baseline": 85520.18914410807,
+        "current": 85186.97278090773,
+        "change_percent": -0.3896347360023311
+      },
+      "top_level_counter_query_exec_ms_per_minute": {
+        "baseline": 4.230961687491843,
+        "current": 7.010504611557928,
+        "change_percent": 65.69529883202101
+      },
+      "top_level_exec_ms_excluding_counter_queries_per_minute": {
+        "baseline": 142.7212797069634,
+        "current": 111.8502051464099,
+        "change_percent": -21.630323539655937
+      }
+    }
+  },
+  "api": {
+    "database_terminal_p50_ms": {
+      "median_paired_change_percent": -0.09568076557692762,
+      "improved_profiles": 7,
+      "worst_change_percent": 6.650947649840933,
+      "best_change_percent": -2.0331492479248703,
+      "baseline_profile_mean": 441.9184969156049,
+      "current_profile_mean": 445.23993058586103
+    },
+    "database_terminal_p95_ms": {
+      "median_paired_change_percent": 3.3573016444551795,
+      "improved_profiles": 5,
+      "worst_change_percent": 16.23387923822861,
+      "best_change_percent": -19.464621924901948,
+      "baseline_profile_mean": 589.5206470001236,
+      "current_profile_mean": 590.4257924169846
+    },
+    "top_level_statement_calls_per_job": {
+      "median_paired_change_percent": -1.4840479575391807,
+      "improved_profiles": 12,
+      "worst_change_percent": -0.9277038750722943,
+      "best_change_percent": -7.336624727929076,
+      "baseline_profile_mean": 571.6525,
+      "current_profile_mean": 561.1908333333333
+    },
+    "top_level_exec_ms_per_job": {
+      "median_paired_change_percent": -4.241347929505407,
+      "improved_profiles": 10,
+      "worst_change_percent": 1.4157703803596267,
+      "best_change_percent": -8.37900206990614,
+      "baseline_profile_mean": 80.41085399750021,
+      "current_profile_mean": 78.44981820333342
+    },
+    "top_level_wal_bytes_per_job": {
+      "median_paired_change_percent": 0.6126046262448281,
+      "improved_profiles": 4,
+      "worst_change_percent": 21.9185077541759,
+      "best_change_percent": -13.966378706060967,
+      "baseline_profile_mean": 64988.2625,
+      "current_profile_mean": 65310.08083333333
+    },
+    "idle": {
+      "top_level_statement_calls_per_minute": {
+        "baseline": 3377.378075162934,
+        "current": 1107.9966712986134,
+        "change_percent": -67.1935848862535
+      },
+      "top_level_exec_ms_per_minute": {
+        "baseline": 245.2810402340068,
+        "current": 131.50653366057222,
+        "change_percent": -46.385365320079245
+      },
+      "top_level_wal_bytes_per_minute": {
+        "baseline": 85281.96248151457,
+        "current": 86978.8218640886,
+        "change_percent": 1.9897048956182717
+      },
+      "top_level_counter_query_exec_ms_per_minute": {
+        "baseline": 5.791674662934801,
+        "current": 8.147861407166115,
+        "change_percent": 40.682304883426745
+      },
+      "top_level_exec_ms_excluding_counter_queries_per_minute": {
+        "baseline": 239.489365571072,
+        "current": 123.3586722534061,
+        "change_percent": -48.49096035673551
+      }
+    }
+  }
+}

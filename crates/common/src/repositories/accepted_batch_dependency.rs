@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ItemProof {
-    source_admission: Id,
+    source_admission: Option<Id>,
     authority: SelectedRuntimeAuthority,
     executable: ExecutionExecutableSnapshot,
     template: Value,
@@ -66,7 +66,17 @@ impl AcceptedBatchDependencyRepository {
         // before taking item/target protection. B's creation transaction must
         // already hold the same source fence before its execution insert.
         for item in &ids {
-            type AcceptedDispatchRow = (Id, Id, Value, String, Value, String, Value, String, Value);
+            type AcceptedDispatchRow = (
+                Option<Id>,
+                Id,
+                Value,
+                String,
+                Value,
+                String,
+                Value,
+                String,
+                Value,
+            );
             let row: Option<AcceptedDispatchRow> = sqlx::query_as(
                 "SELECT a.source_admission,r.policy_revision,r.authority,r.authority_digest,a.template,a.template_digest,a.schema_binding,a.schema_digest,i.executable_snapshot FROM work_queue_item_ad_hoc_dispatch a JOIN work_queue_item_runtime_admission r ON r.item = a.item JOIN work_queue_item i ON i.id = a.item WHERE a.item = $1 AND i.queue = (a.template->>'id')::BIGINT AND i.queue_ref = a.template->>'ref'")
                 .bind(item).fetch_optional(&mut *conn).await?;
@@ -88,25 +98,30 @@ impl AcceptedBatchDependencyRepository {
                 return Err(denied());
             }
             let authority: SelectedRuntimeAuthority = serde_json::from_value(authority)?;
-            let source_record =
-                RuntimeAuthorityRepository::require_retained_admission(conn, source).await?;
-            if source_record.id >= record.id
-                || source_record.owner_kind != "execution"
-                || policy != authority.policy_id
-                || authority.attribution
-                    != (RequestAttribution::ParentExecution {
-                        execution_id: source_record.owner_id,
-                    })
-            {
+            if policy != authority.policy_id {
                 return Err(denied());
             }
-            fence = fence
-                .intersect(
+            if let Some(source) = source {
+                let source_record =
+                    RuntimeAuthorityRepository::require_retained_admission(conn, source).await?;
+                if source_record.id >= record.id
+                    || source_record.owner_kind != "execution"
+                    || authority.attribution
+                        != (RequestAttribution::ParentExecution {
+                            execution_id: source_record.owner_id,
+                        })
+                {
+                    return Err(denied());
+                }
+                fence = fence.intersect(
                     &RuntimeAuthorityRepository::retained_admission_fence(conn, source).await?,
-                )
-                .intersect(
-                    &RuntimeAuthorityRepository::selected_effect_fence(conn, &authority).await?,
                 );
+            } else if !matches!(authority.attribution, RequestAttribution::Human { .. }) {
+                return Err(denied());
+            }
+            fence = fence.intersect(
+                &RuntimeAuthorityRepository::selected_effect_fence(conn, &authority).await?,
+            );
             let contributors:Vec<(String,Value,String)> = sqlx::query_as("SELECT contributor,authority,authority_digest FROM (SELECT ''::TEXT AS contributor,authority,authority_digest FROM recorded_execution_input_authority WHERE owner_kind = 'queue_item' AND owner_id = $1 UNION ALL SELECT contributor,authority,authority_digest FROM recorded_queue_item_input WHERE item = $1) contributors ORDER BY contributor")
                 .bind(item).fetch_all(&mut *conn).await?;
             if contributors.len() > 256 {
@@ -137,7 +152,7 @@ impl AcceptedBatchDependencyRepository {
             {
                 return Err(denied());
             }
-            check_item(conn, &record, &proof, queue_ref).await?;
+            check_item(conn, &record, *item, &proof, queue_ref).await?;
             proofs.push((*item, proof));
         }
         if expected_contributors.len() > 256 {
@@ -186,8 +201,10 @@ impl AcceptedBatchDependencyRepository {
             let value = serde_json::to_value(&proof)?;
             sqlx::query("INSERT INTO runtime_accepted_batch_item(admission,item,source_admission,target_policy,proof,proof_digest) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING")
                 .bind(destination).bind(item).bind(proof.source_admission).bind(proof.authority.policy_id).bind(&value).bind(hash(&value)?).execute(&mut *conn).await?;
-            sqlx::query("INSERT INTO runtime_admission_dependency(admission,dependency,dependency_kind) VALUES ($1,$2,'accepted_item') ON CONFLICT DO NOTHING")
-                .bind(destination).bind(proof.source_admission).execute(&mut *conn).await?;
+            if let Some(source) = proof.source_admission {
+                sqlx::query("INSERT INTO runtime_admission_dependency(admission,dependency,dependency_kind) VALUES ($1,$2,'accepted_item') ON CONFLICT DO NOTHING")
+                    .bind(destination).bind(source).execute(&mut *conn).await?;
+            }
         }
         // Canonical validation requires the sealed exact manifest and every
         // independent source. It also validates idempotent capture conflicts.
@@ -225,14 +242,14 @@ impl AcceptedBatchDependencyRepository {
         if canonical_ids(&ids)? != items.keys().copied().collect::<Vec<_>>() {
             return Err(denied());
         }
-        let rows:Vec<(Id,Id,Id,Value,String)> = sqlx::query_as("SELECT item,source_admission,target_policy,proof,proof_digest FROM runtime_accepted_batch_item WHERE admission = $1 ORDER BY item")
+        let rows:Vec<(Id,Option<Id>,Id,Value,String)> = sqlx::query_as("SELECT item,source_admission,target_policy,proof,proof_digest FROM runtime_accepted_batch_item WHERE admission = $1 ORDER BY item")
             .bind(record.id).fetch_all(&mut *conn).await?;
         if rows.iter().map(|row| row.0).collect::<Vec<_>>() != ids {
             return Err(denied());
         }
         let mut selections = Vec::new();
         let mut sources = BTreeSet::new();
-        for (_, source, policy, body, expected) in rows {
+        for (item, source, policy, body, expected) in rows {
             if hash(&body)? != expected {
                 return Err(denied());
             }
@@ -240,8 +257,10 @@ impl AcceptedBatchDependencyRepository {
             if proof.source_admission != source || proof.authority.policy_id != policy {
                 return Err(denied());
             }
-            check_item(conn, record, &proof, queue_ref).await?;
-            sources.insert(source);
+            check_item(conn, record, item, &proof, queue_ref).await?;
+            if let Some(source) = source {
+                sources.insert(source);
+            }
             selections.push(proof.authority);
         }
         let edges:Vec<Id> = sqlx::query_scalar("SELECT dependency FROM runtime_admission_dependency WHERE admission = $1 AND dependency_kind = 'accepted_item' ORDER BY dependency")
@@ -256,6 +275,7 @@ impl AcceptedBatchDependencyRepository {
 async fn check_item(
     conn: &mut PgConnection,
     record: &RuntimeAdmissionRecord,
+    item: Id,
     proof: &ItemProof,
     queue_ref: &str,
 ) -> Result<()> {
@@ -263,16 +283,28 @@ async fn check_item(
     let schema: super::schema_contract::ActionSchemaBinding =
         serde_json::from_value(proof.schema.clone())?;
     schema.validate()?;
-    let source: Option<(String, Id)> =
-        sqlx::query_as("SELECT owner_kind,owner_id FROM runtime_authority_admission WHERE id = $1")
-            .bind(proof.source_admission)
-            .fetch_optional(&mut *conn)
-            .await?;
-    if source.as_ref().is_none_or(|(kind, id)| {
-        kind != "execution"
-            || proof.authority.attribution
-                != (RequestAttribution::ParentExecution { execution_id: *id })
-    }) {
+    let actor = if let Some(source_admission) = proof.source_admission {
+        let source: Option<(String, Id)> = sqlx::query_as(
+            "SELECT owner_kind,owner_id FROM runtime_authority_admission WHERE id = $1",
+        )
+        .bind(source_admission)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if source.as_ref().is_none_or(|(kind, id)| {
+            kind != "execution"
+                || proof.authority.attribution
+                    != (RequestAttribution::ParentExecution { execution_id: *id })
+        }) {
+            return Err(denied());
+        }
+        None
+    } else if let RequestAttribution::Human { actor } = &proof.authority.attribution {
+        Some(actor.clone())
+    } else {
+        return Err(denied());
+    };
+    if !matches!(&record.authority.attribution, RequestAttribution::QueueBatch { items, .. } if items.get(&item) == Some(&actor))
+    {
         return Err(denied());
     }
     if !template.is_adhoc

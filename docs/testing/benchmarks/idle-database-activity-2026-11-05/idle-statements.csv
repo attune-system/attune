@@ -1,0 +1,1422 @@
+backend,calls,kind,observer,query,rows,run,shared_blks_hit,shared_blks_read,sql_exec_ms,toplevel,trial,wal_bytes
+volume,1285,baseline,False,BEGIN /* profile:top */,0,idle-ready-base-volume-40d6cb1b,0,0,0.8828269999999985,True,1,0
+volume,1281,baseline,False,COMMIT /* profile:top */,0,idle-ready-base-volume-40d6cb1b,0,0,0.7020029999999993,True,1,0
+volume,32,baseline,False,DELETE FROM event_volume_hourly_summary WHERE bucket = $1 /* profile:top */,0,idle-ready-base-volume-40d6cb1b,64,0,0.18861399999999998,True,1,0
+volume,32,baseline,False,DELETE FROM execution_creation_hourly_summary WHERE bucket = $1 /* profile:top */,0,idle-ready-base-volume-40d6cb1b,64,0,0.218048,True,1,0
+volume,32,baseline,False,DELETE FROM execution_status_hourly_summary WHERE bucket = $1 /* profile:top */,0,idle-ready-base-volume-40d6cb1b,64,0,0.19156799999999988,True,1,0
+volume,32,baseline,False,DELETE FROM worker_status_hourly_summary WHERE bucket = $1 /* profile:top */,0,idle-ready-base-volume-40d6cb1b,64,0,0.18803700000000007,True,1,0
+volume,13,baseline,False,"INSERT INTO audit_event (category, event_type, outcome, actor_identity, actor_login, actor_token_type, actor_ip, actor_user_agent, request_id, resource_type, resource_id, resource_ref, http_method, http_path, http_status, duration_ms, details, correlation_chain) VALUES ($1, $2, $3, $4, $5, $6, $7::inet, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) /* profile:top */",13,idle-ready-base-volume-40d6cb1b,656,0,7.301574999999998,True,1,23065
+volume,6,baseline,False,"INSERT INTO native_maintenance_schedule (job, next_due)
+             SELECT unnest(ARRAY[$1 /*, ... */]::text[]), $2
+             ON CONFLICT (job) DO NOTHING /* profile:top */",0,idle-ready-base-volume-40d6cb1b,48,0,1.6146269999999998,True,1,0
+volume,6,baseline,False,"INSERT INTO runtime_retention_config (
+                id, enabled, check_interval_seconds, batch_size, max_batches_per_target, dry_run, advisory_lock_key,
+                cache_retention, native_maintenance
+             )
+             VALUES ($9, $1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (id) DO NOTHING /* profile:top */",0,idle-ready-base-volume-40d6cb1b,36,0,1.1734820000000004,True,1,0
+volume,96,baseline,False,"INSERT INTO runtime_retention_target_config (target, max_age_seconds)
+                 VALUES ($1, $2)
+                 ON CONFLICT (target) DO NOTHING /* profile:top */",0,idle-ready-base-volume-40d6cb1b,274,0,8.867252000000022,True,1,0
+volume,33,baseline,False,LOCK TABLE ONLY event IN ACCESS SHARE MODE /* profile:top */,0,idle-ready-base-volume-40d6cb1b,8,0,0.37070600000000004,True,1,0
+volume,66,baseline,False,LOCK TABLE ONLY execution_history IN ACCESS SHARE MODE /* profile:top */,0,idle-ready-base-volume-40d6cb1b,16,0,0.6031300000000002,True,1,0
+volume,33,baseline,False,LOCK TABLE ONLY worker_history IN ACCESS SHARE MODE /* profile:top */,0,idle-ready-base-volume-40d6cb1b,8,0,0.26315000000000016,True,1,0
+volume,4,baseline,False,ROLLBACK /* profile:top */,0,idle-ready-base-volume-40d6cb1b,0,0,0.003969,True,1,0
+volume,180,baseline,False,"SELECT
+    id, runtime, runtime_ref, version,
+    version_major, version_minor, version_patch,
+    execution_config, distributions,
+    is_default, available, verified_at, meta, retired_at,
+    created, updated
+ FROM runtime_version WHERE runtime = ANY($1) AND retired_at IS NULL /* profile:top */",0,idle-ready-base-volume-40d6cb1b,180,0,6.671385000000003,True,1,0
+volume,6,baseline,False,SELECT $1::regtype::oid /* profile:top */,6,idle-ready-base-volume-40d6cb1b,45,0,0.9852889999999981,True,1,0
+volume,144,baseline,False,SELECT COUNT(*) FROM work_queue WHERE retired_at IS NULL AND effective_enabled = $1 /* profile:top */,144,idle-ready-base-volume-40d6cb1b,288,0,11.708118000000002,True,1,0
+volume,1152,baseline,False,SELECT COUNT(*) FROM work_queue_dispatch WHERE queue = $1 AND status = ANY($2::work_queue_dispatch_status_enum[]) /* profile:top */,1152,idle-ready-base-volume-40d6cb1b,2304,0,46.17518000000001,True,1,0
+volume,144,baseline,False,SELECT COUNT(*) FROM work_queue_dispatch WHERE status = ANY($1) /* profile:top */,144,idle-ready-base-volume-40d6cb1b,144,0,7.914615000000005,True,1,0
+volume,4,baseline,False,"SELECT b.bucket FROM generate_series($2::timestamptz, $3::timestamptz - interval $5, interval $6) AS b(bucket)
+             WHERE NOT EXISTS (SELECT $7 FROM native_summary_hour h WHERE h.kind = $1::text::native_summary_kind AND h.bucket = b.bucket)
+             ORDER BY b.bucket DESC LIMIT $4 /* profile:top */",0,idle-ready-base-volume-40d6cb1b,13,0,0.41701399999999994,True,1,0
+volume,4,baseline,False,"SELECT b.bucket FROM generate_series($2::timestamptz, greatest($3::timestamptz, $2::timestamptz - ($4::bigint - $5) * interval $6), -interval $7) AS b(bucket)
+                 WHERE NOT EXISTS (SELECT $8 FROM native_summary_hour h WHERE h.kind = $1::text::native_summary_kind AND h.bucket = b.bucket) /* profile:top */",132,idle-ready-base-volume-40d6cb1b,4,0,0.296122,True,1,0
+volume,4,baseline,False,"SELECT bucket FROM native_summary_invalidation WHERE kind = $1::text::native_summary_kind AND bucket >= $2 AND bucket < $3
+             GROUP BY bucket ORDER BY bucket LIMIT $4 /* profile:top */",0,idle-ready-base-volume-40d6cb1b,8,0,0.107054,True,1,0
+volume,6,baseline,False,SELECT c.lease FROM pack_candidate_context c JOIN pack_install p ON p.id = c.install_id WHERE NOT c.revoked AND (c.expires_at <= clock_timestamp() OR p.status <> $2 OR p.started_at <= clock_timestamp() - INTERVAL $3) ORDER BY c.expires_at LIMIT $1 /* profile:top */,0,idle-ready-base-volume-40d6cb1b,0,0,0.299616,True,1,0
+volume,180,baseline,False,SELECT clock_timestamp() /* profile:top */,180,idle-ready-base-volume-40d6cb1b,0,0,1.1559030000000008,True,1,0
+volume,12,baseline,False,"SELECT compatibility_epoch, revision FROM platform_catalog_state WHERE singleton /* profile:top */",12,idle-ready-base-volume-40d6cb1b,24,0,0.6518180000000002,True,1,0
+volume,6,baseline,False,"SELECT enabled, check_interval_seconds, batch_size, max_batches_per_target, dry_run, advisory_lock_key,
+                    cache_retention, native_maintenance
+             FROM runtime_retention_config
+             WHERE id = $1 /* profile:top */",6,idle-ready-base-volume-40d6cb1b,12,0,0.246985,True,1,0
+volume,14,baseline,False,"SELECT enumlabel
+FROM pg_catalog.pg_enum
+WHERE enumtypid = $1
+ORDER BY enumsortorder /* profile:top */",55,idle-ready-base-volume-40d6cb1b,34,0,0.5888559999999963,True,1,0
+volume,12,baseline,False,"SELECT id, action, action_ref, pack_release, pack_release_digest, executable_snapshot, config, env_vars, parent, enforcement, executor, permission_set_refs, artifact_retention_policy, artifact_retention_limit, worker_selector, worker_tolerations, worker_affinity, worker, status, trace_tag, result, retry_count, max_retries, retry_reason, original_execution, started_at, timeout_seconds, workflow_task, created, updated FROM execution WHERE status = $1 AND updated < $2 ORDER BY updated ASC LIMIT $3 /* profile:top */",0,idle-ready-base-volume-40d6cb1b,24,0,0.358194,True,1,0
+volume,12,baseline,False,"SELECT id, action, action_ref, pack_release, pack_release_digest, executable_snapshot, config, env_vars, parent, enforcement, executor, permission_set_refs, artifact_retention_policy, artifact_retention_limit, worker_selector, worker_tolerations, worker_affinity, worker, status, trace_tag, result, retry_count, max_retries, retry_reason, original_execution, started_at, timeout_seconds, workflow_task, created, updated FROM execution WHERE status = $1 ORDER BY created DESC, id DESC /* profile:top */",0,idle-ready-base-volume-40d6cb1b,24,0,0.3287969999999999,True,1,0
+volume,180,baseline,False,"SELECT id, name, worker_type, worker_role, runtime, host, port, status, capabilities, meta, last_heartbeat, cordoned, cordon_reason, cordoned_by, cordoned_at, created, updated FROM worker WHERE id = $1 /* profile:top */",180,idle-ready-base-volume-40d6cb1b,187,0,17.637399000000002,True,1,9914
+volume,12,baseline,False,"SELECT id, name, worker_type, worker_role, runtime, host, port, status, capabilities, meta, last_heartbeat, cordoned, cordon_reason, cordoned_by, cordoned_at, created, updated FROM worker WHERE status = $1 ORDER BY name ASC /* profile:top */",60,idle-ready-base-volume-40d6cb1b,47,0,1.5764129999999996,True,1,0
+volume,180,baseline,False,"SELECT id, owner_roles, ref, label, description, version, conf_schema, config, meta, tags, runtime_deps, dependencies, is_standard, installers, worker_selector, worker_tolerations, worker_affinity, source_type, source_url, source_ref, checksum, checksum_verified, installed_at, installed_by, installation_method, storage_path, install_status, active_release, created, updated FROM pack WHERE id = ANY($1) /* profile:top */",180,idle-ready-base-volume-40d6cb1b,180,0,16.560170000000003,True,1,0
+volume,1152,baseline,False,"SELECT id, queue, queue_ref, execution, status, leased_item_count, created, updated FROM work_queue_dispatch WHERE queue = $1 AND status = ANY($2::work_queue_dispatch_status_enum[]) ORDER BY updated DESC LIMIT $3 /* profile:top */",0,idle-ready-base-volume-40d6cb1b,2304,0,48.25730899999997,True,1,0
+volume,144,baseline,False,"SELECT id, queue, queue_ref, execution, status, leased_item_count, created, updated FROM work_queue_dispatch WHERE status = ANY($1) ORDER BY created DESC LIMIT $2 OFFSET $3 /* profile:top */",0,idle-ready-base-volume-40d6cb1b,144,0,8.607990999999998,True,1,0
+volume,180,baseline,False,"SELECT id, ref, pack, pack_ref, description, name, aliases, distributions, installation, installers, execution_config, auto_detected, detection_config, retired_at, created, updated FROM runtime WHERE id = ANY($1) AND retired_at IS NULL /* profile:top */",180,idle-ready-base-volume-40d6cb1b,540,0,13.863621999999989,True,1,0
+volume,144,baseline,False,"SELECT id, ref, pack, pack_ref, is_adhoc, label, description, effective_enabled AS enabled, enabled_override, accepting_new_items, dispatch_action, dispatch_action_ref, default_priority, allow_pending_update, update_strategy, batch_mode, item_schema, action_params, trace_tag_template, permission_set_refs, config, reference_visibility, reference_allowed_pack_refs, retired_at, created, updated FROM work_queue WHERE retired_at IS NULL AND effective_enabled = $1 ORDER BY ref ASC LIMIT $2 OFFSET $3 /* profile:top */",1152,idle-ready-base-volume-40d6cb1b,288,0,19.87921099999999,True,1,0
+volume,180,baseline,False,"SELECT id, ref, pack, pack_ref, label, description, entrypoint, runtime, runtime_ref, runtime_version_constraint, effective_enabled AS enabled, enabled_override, param_schema, config, worker_selector, worker_tolerations, worker_affinity, log_retention_policy, log_retention_limit, artifact_retention_policy, artifact_retention_limit, retired_at, created, updated FROM sensor WHERE retired_at IS NULL ORDER BY ref ASC /* profile:top */",180,idle-ready-base-volume-40d6cb1b,360,0,33.347658999999986,True,1,0
+volume,12,baseline,False,"SELECT job, next_due, last_success, deferred_since FROM native_maintenance_schedule ORDER BY job /* profile:top */",48,idle-ready-base-volume-40d6cb1b,24,0,0.6234380000000002,True,1,0
+volume,1,baseline,False,"SELECT k.kind, d.notifications_at_least, d.notifications_at_least <= $1 AS count_exact,
+                  d.oldest_observed_notification, d.oldest_eligible_at
+             FROM unnest(enum_range($3::native_summary_kind)) AS k(kind)
+             CROSS JOIN LATERAL (
+                  SELECT count(*)::bigint AS notifications_at_least,
+                         min(n.created) AS oldest_observed_notification,
+                         min(GREATEST(n.created, n.bucket + interval $4)) AS oldest_eligible_at
+                  FROM (SELECT created, bucket FROM native_summary_invalidation WHERE kind = k.kind
+                        AND bucket < date_trunc($5, $2::timestamptz, $6)
+                        ORDER BY bucket, id LIMIT $1 + $7) n
+              ) d ORDER BY k.kind /* profile:top */",4,idle-ready-base-volume-40d6cb1b,26,0,0.242435,True,1,0
+volume,14,baseline,False,"SELECT oid::regtype::text, typtype, typcategory, typrelid, typelem, typbasetype FROM pg_catalog.pg_type WHERE oid = $1 /* profile:top */",14,idle-ready-base-volume-40d6cb1b,56,0,0.838625000000004,True,1,0
+volume,6,baseline,False,SELECT pg_advisory_unlock($1) /* profile:top */,6,idle-ready-base-volume-40d6cb1b,0,0,0.036907999999999996,True,1,0
+volume,1152,baseline,False,"SELECT pg_advisory_xact_lock_shared(hashtextextended(current_schema() || $1, $2)), pg_backend_pid() AS backend /* profile:top */",1152,idle-ready-base-volume-40d6cb1b,0,0,11.455464999999988,True,1,0
+volume,6,baseline,False,SELECT pg_try_advisory_lock($1) /* profile:top */,6,idle-ready-base-volume-40d6cb1b,0,0,0.06615099999999999,True,1,0
+volume,1,baseline,True,"SELECT query, toplevel, sum(calls)::bigint, sum(total_exec_time), sum(wal_bytes), sum(shared_blks_read), sum(shared_blks_hit), sum(rows) FROM pg_stat_statements WHERE dbid=(SELECT oid FROM pg_database WHERE datname=current_database()) GROUP BY query,toplevel /* profile:top */",3032,idle-ready-base-volume-40d6cb1b,9,0,25.389374999999998,True,1,0
+volume,1,baseline,False,"SELECT set_config($2,$1,$3) /* profile:top */",1,idle-ready-base-volume-40d6cb1b,0,0,0.019962000000000035,True,1,0
+volume,6,baseline,False,"SELECT set_config($3, $1, $4), set_config($5, $2, $6) /* profile:top */",6,idle-ready-base-volume-40d6cb1b,0,0,0.04904299999999995,True,1,0
+volume,6,baseline,False,"SELECT target, max_age_seconds
+             FROM runtime_retention_target_config
+             ORDER BY target ASC /* profile:top */",96,idle-ready-base-volume-40d6cb1b,12,0,0.22465300000000005,True,1,0
+volume,180,baseline,False,"SELECT trigger.sensor AS sensor_id, rule.sensor_worker_selector, rule.sensor_worker_tolerations, rule.sensor_worker_affinity FROM trigger JOIN rule ON rule.trigger = trigger.id WHERE trigger.sensor = ANY($1) AND trigger.effective_enabled AND trigger.retired_at IS NULL AND rule.effective_enabled AND rule.retired_at IS NULL /* profile:top */",0,idle-ready-base-volume-40d6cb1b,1440,0,10.720888000000022,True,1,0
+volume,720,baseline,False,"SELECT w.id, w.workflow_execution, w.task_name, w.kind, w.state, w.inquiry, w.target_execution, w.work_queue_item, w.result, w.resolved_at, w.released_at, w.created, w.updated FROM workflow_task_wait w WHERE (w.state = $1 AND ( (w.kind = $2 AND EXISTS ( SELECT $3 FROM inquiry i WHERE i.id = w.inquiry AND i.status <> $4 )) OR (w.kind = $5 AND (NOT EXISTS ( SELECT $6 FROM execution target WHERE target.id = w.target_execution ) OR EXISTS ( SELECT $7 FROM execution target WHERE target.id = w.target_execution AND target.status IN ($8 /*, ... */) ))) OR (w.kind = $9 AND (NOT EXISTS ( SELECT $10 FROM work_queue_item item WHERE item.id = w.work_queue_item ) OR EXISTS ( SELECT $11 FROM work_queue_item item WHERE item.id = w.work_queue_item AND item.status IN ($12 /*, ... */) ))) )) OR (w.state = $13 AND EXISTS ( SELECT $14 FROM execution e WHERE e.workflow_task->>$15 = w.workflow_execution::TEXT AND e.workflow_task->>$16 = w.task_name AND e.status = $17 )) OR (w.state IN ($18 /*, ... */) AND (w.result->>$19) IS DISTINCT FROM $20) ORDER BY w.id LIMIT $21 /* profile:top */",0,idle-ready-base-volume-40d6cb1b,2160,0,35.030758000000034,True,1,0
+volume,132,baseline,False,SET LOCAL lock_timeout = $1 /* profile:top */,0,idle-ready-base-volume-40d6cb1b,0,0,0.3590000000000003,True,1,0
+volume,132,baseline,False,SET LOCAL plan_cache_mode = $1 /* profile:top */,0,idle-ready-base-volume-40d6cb1b,0,0,0.22847399999999957,True,1,0
+volume,644,baseline,False,SET LOCAL statement_timeout = $1 /* profile:top */,0,idle-ready-base-volume-40d6cb1b,0,0,1.7664690000000052,True,1,0
+volume,128,baseline,False,SET LOCAL synchronous_commit = $1 /* profile:top */,0,idle-ready-base-volume-40d6cb1b,0,0,0.36483199999999993,True,1,0
+volume,132,baseline,False,SET TRANSACTION ISOLATION LEVEL REPEATABLE READ /* profile:top */,0,idle-ready-base-volume-40d6cb1b,0,0,0.6715430000000004,True,1,0
+volume,1080,baseline,False,"UPDATE inquiry SET status = $1, updated = NOW() WHERE status = $2 AND timeout_at IS NOT NULL AND timeout_at <= NOW() RETURNING id, created_by_execution, workflow_execution, workflow_task_name, action_attempt_family, purpose, prompt, response_schema, response_options, assigned_to, status, response, timeout_at, timeout_seconds, responded_by, external_actor, responded_at, created, updated /* profile:top */",0,idle-ready-base-volume-40d6cb1b,2160,0,77.89184500000009,True,1,0
+volume,24,baseline,False,"UPDATE native_maintenance_schedule SET next_due = $3
+             WHERE job = $1 AND (next_due <= $2 OR $4) /* profile:top */",1,idle-ready-base-volume-40d6cb1b,50,0,1.1708809999999998,True,1,2293
+volume,6,baseline,False,"UPDATE pack_install SET status = $1, candidate_access_token_hash = $2, error_message = $3, finished_at = NOW(), updated_at = NOW() WHERE (status IN ($4 /*, ... */) AND started_at < NOW() - make_interval(secs => $5)) OR (status = $6 AND updated_at < NOW() - make_interval(secs => $7)) RETURNING id, pack_ref, pack_version, status, trigger_reason, absent_metadata_policy, pack_id, requested_by, assigned_worker_id, candidate_access_token_hash, candidate_object_key, candidate_provider_version, candidate_archive_size, candidate_digest, test_execution_id, test_result, error_message, diagnostic_details, started_at, updated_at, finished_at /* profile:top */",0,idle-ready-base-volume-40d6cb1b,6,0,0.13442199999999999,True,1,0
+volume,6,baseline,False,UPDATE supervisor_run SET heartbeat_at = NOW() WHERE id = $1 /* profile:top */,6,idle-ready-base-volume-40d6cb1b,24,0,0.3229620000000001,True,1,2123
+volume,144,baseline,False,"UPDATE worker
+                SET last_heartbeat = $1,
+                    status = $2,
+                    updated = $1
+                WHERE id = $3 /* profile:top */",144,idle-ready-base-volume-40d6cb1b,4132,0,58.76983400000006,True,1,334501
+volume,36,baseline,False,"UPDATE worker
+                SET last_heartbeat = $1,
+                    status = $2,
+                    updated = $3
+                WHERE id = $4 /* profile:top */",36,idle-ready-base-volume-40d6cb1b,1273,0,27.282311999999983,True,1,82994
+volume,1152,baseline,False,"WITH anchor AS (
+                SELECT id,
+                       priority,
+                       historical_requester_identity,
+                       pack_release,
+                       pack_release_digest,
+                       executable_snapshot,
+                       payload #> $7::text[] AS group_value
+                FROM work_queue_item
+                WHERE queue = $1
+                  AND status = ANY($2::work_queue_item_status_enum[])
+                ORDER BY priority DESC, created ASC, id ASC
+                LIMIT $11
+                FOR UPDATE SKIP LOCKED
+            ),
+            extra_candidates_locked AS (
+                SELECT item.id,
+                       item.priority,
+                       item.created
+                FROM work_queue_item AS item
+                CROSS JOIN anchor
+                WHERE item.queue = $1
+                  AND item.status = ANY($2::work_queue_item_status_enum[])
+                  AND item.id <> anchor.id
+                  AND (NOT $10 OR item.historical_requester_identity IS NOT DISTINCT FROM anchor.historical_requester_identity)
+                  AND item.pack_release IS NOT DISTINCT FROM anchor.pack_release
+                  AND item.pack_release_digest IS NOT DISTINCT FROM anchor.pack_release_digest
+                  AND item.executable_snapshot IS NOT DISTINCT FROM anchor.executable_snapshot
+                  AND (
+                        $8 = $12
+                        OR anchor.group_value IS NULL
+                        OR anchor.group_value = $13::jsonb
+                        OR (
+                            item.payload #> $7::text[] = anchor.group_value
+                            AND ($9 OR item.priority = anchor.priority)
+                        )
+                  )
+                ORDER BY item.priority DESC, item.created ASC, item.id ASC
+                LIMIT GREATEST($3 - $14, $15)
+                FOR UPDATE SKIP LOCKED
+            ),
+            extra_candidates AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (ORDER BY priority DESC, created ASC, id ASC) AS sort_order
+                FROM extra_candidates_locked
+            ),
+            candidate AS (
+                SELECT id, $16 AS sort_order
+                FROM anchor
+                UNION ALL
+                SELECT id, sort_order
+                FROM extra_candidates
+            ),
+            updated AS (
+                UPDATE work_queue_item AS item
+                SET status = $17::work_queue_item_status_enum,
+                    leased_execution = $4,
+                    lease_token = $5,
+                    lease_expires_at = $6,
+                    attempt_count = item.attempt_count + $18,
+                    updated = NOW()
+                FROM candidate
+                WHERE item.id = candidate.id
+                RETURNING candidate.sort_order, item.id, item.queue, item.queue_ref, item.pack_release, item.pack_release_digest, item.executable_snapshot, item.item_key, item.priority, item.status, item.payload, item.schema_binding, item.metadata, item.trace_tag, item.enqueue_source, item.requested_by_identity, item.requested_by_execution, item.requested_by_enforcement, item.leased_execution, item.lease_token, item.lease_expires_at, item.attempt_count, item.last_error, item.ack_summary, item.created, item.updated
+            )
+            SELECT id, queue, queue_ref, pack_release, pack_release_digest, executable_snapshot, item_key, priority, status, payload, schema_binding, metadata, trace_tag, enqueue_source, requested_by_identity, requested_by_execution, requested_by_enforcement, leased_execution, lease_token, lease_expires_at, attempt_count, last_error, ack_summary, created, updated
+            FROM updated AS item
+            ORDER BY item.sort_order ASC /* profile:top */",0,idle-ready-base-volume-40d6cb1b,0,0,33.60551399999997,True,1,0
+volume,7047,baseline,False,"WITH candidate AS ( SELECT item.id FROM workflow_log_outbox item WHERE item.is_head AND item.delivered_at IS NULL AND item.failed_at IS NULL AND item.available_at <= clock_timestamp() AND (item.claim_expires_at IS NULL OR item.claim_expires_at <= clock_timestamp()) ORDER BY item.available_at, item.created, item.id FOR UPDATE OF item SKIP LOCKED LIMIT $3 ), claimed AS ( UPDATE workflow_log_outbox item SET claimed_by = $1, claim_expires_at = clock_timestamp() + ($2 * INTERVAL $4), attempt_count = attempt_count + $5 FROM candidate WHERE item.id = candidate.id RETURNING item.id, item.workflow_execution, item.sequence, item.kind, item.payload, item.claimed_by, item.attempt_count ) SELECT claimed.id, claimed.workflow_execution, claimed.sequence, claimed.kind, claimed.payload, workflow.execution AS parent_execution, execution.action_ref, claimed.claimed_by, claimed.attempt_count FROM claimed JOIN workflow_execution workflow ON workflow.id = claimed.workflow_execution JOIN execution ON execution.id = workflow.execution /* profile:top */",0,idle-ready-base-volume-40d6cb1b,7047,0,291.5528830000022,True,1,0
+volume,360,baseline,False,"WITH candidates AS ( SELECT id FROM inquiry_callback_delivery WHERE state = $3 AND next_attempt_at <= clock_timestamp() ORDER BY next_attempt_at, created, id LIMIT $1 FOR UPDATE SKIP LOCKED ) UPDATE inquiry_callback_delivery AS delivery SET attempt_count = attempt_count + $4, next_attempt_at = clock_timestamp() + make_interval(secs => $2::double precision), updated = NOW() FROM candidates WHERE delivery.id = candidates.id RETURNING delivery.id /* profile:top */",0,idle-ready-base-volume-40d6cb1b,360,0,19.623280000000037,True,1,0
+volume,1,baseline,False,"WITH completion AS MATERIALIZED (
+                 SELECT GREATEST($4::timestamptz, clock_timestamp()) AS at
+             )
+             UPDATE native_maintenance_schedule
+             SET next_due = completion.at + ($2::timestamptz - $4::timestamptz),
+                 last_success = CASE WHEN $3 THEN completion.at ELSE last_success END,
+                 deferred_since = CASE WHEN $3 THEN $5 ELSE COALESCE(deferred_since, completion.at) END
+             FROM completion
+              WHERE job = $1 /* profile:top */",1,idle-ready-base-volume-40d6cb1b,7,0,0.08367600000000008,True,1,82
+volume,4,baseline,False,"WITH heads AS (
+            SELECT $3::timestamptz - interval $4 AS bucket
+            UNION SELECT bucket - interval $5 FROM native_summary_hour
+                WHERE kind = $1::text::native_summary_kind AND bucket > $2 AND bucket <= $3
+         ) SELECT bucket FROM heads b WHERE bucket >= $2 AND bucket < $3
+           AND NOT EXISTS (SELECT $6 FROM native_summary_hour h WHERE h.kind = $1::text::native_summary_kind AND h.bucket = b.bucket)
+         ORDER BY bucket DESC LIMIT $7 /* profile:top */",4,idle-ready-base-volume-40d6cb1b,8,0,0.503782,True,1,0
+volume,128,baseline,False,"WITH locked AS MATERIALIZED (
+                SELECT kind FROM native_summary_state WHERE kind = $1::text::native_summary_kind FOR UPDATE
+             ), updated AS (
+                UPDATE native_summary_state s SET updated = clock_timestamp()
+                FROM locked l WHERE s.kind = l.kind RETURNING s.kind
+             ) SELECT ARRAY(
+                SELECT i.id FROM native_summary_invalidation i
+                WHERE u.kind = $1::text::native_summary_kind
+                    AND i.kind = $1::text::native_summary_kind AND i.bucket = $2
+                ORDER BY i.id LIMIT $3
+             ) FROM updated u /* profile:top */",128,idle-ready-base-volume-40d6cb1b,898,0,9.926394999999994,True,1,24970
+volume,32,baseline,False,"WITH refreshed AS (
+                INSERT INTO event_volume_hourly_summary (bucket, trigger_ref, event_count)
+             SELECT $1, trigger_ref, count(*)::bigint FROM event
+             WHERE created >= $1 AND created < $2 GROUP BY trigger_ref RETURNING $5
+             ), coverage AS (
+                INSERT INTO native_summary_hour(kind,bucket,refreshed_at)
+                SELECT $3::text::native_summary_kind,$1,clock_timestamp() WHERE (SELECT count(*) FROM refreshed) >= $6
+                ON CONFLICT(kind,bucket) DO UPDATE SET refreshed_at = excluded.refreshed_at
+                RETURNING kind
+             ), acknowledged AS (
+                DELETE FROM native_summary_invalidation
+                WHERE kind = $3::text::native_summary_kind AND bucket = $1 AND id = ANY($4::bigint[])
+                    AND EXISTS (SELECT $7 FROM coverage)
+                RETURNING id
+             ) SELECT (SELECT count(*) FROM refreshed)::bigint,
+                      (SELECT count(*) FROM acknowledged)::bigint /* profile:top */",32,idle-ready-base-volume-40d6cb1b,199,0,2.9773280000000013,True,1,6368
+volume,32,baseline,False,"WITH refreshed AS (
+                INSERT INTO execution_creation_hourly_summary (bucket, action_ref, execution_count)
+             SELECT $1, entity_ref, count(*)::bigint FROM execution_history
+             WHERE time >= $1 AND time < $2 AND operation = $5 GROUP BY entity_ref RETURNING $6
+             ), coverage AS (
+                INSERT INTO native_summary_hour(kind,bucket,refreshed_at)
+                SELECT $3::text::native_summary_kind,$1,clock_timestamp() WHERE (SELECT count(*) FROM refreshed) >= $7
+                ON CONFLICT(kind,bucket) DO UPDATE SET refreshed_at = excluded.refreshed_at
+                RETURNING kind
+             ), acknowledged AS (
+                DELETE FROM native_summary_invalidation
+                WHERE kind = $3::text::native_summary_kind AND bucket = $1 AND id = ANY($4::bigint[])
+                    AND EXISTS (SELECT $8 FROM coverage)
+                RETURNING id
+             ) SELECT (SELECT count(*) FROM refreshed)::bigint,
+                      (SELECT count(*) FROM acknowledged)::bigint /* profile:top */",32,idle-ready-base-volume-40d6cb1b,200,0,3.274978999999999,True,1,14148
+volume,32,baseline,False,"WITH refreshed AS (
+                INSERT INTO execution_status_hourly_summary (bucket, action_ref, new_status, transition_count)
+             SELECT $1, entity_ref, new_values->>$5, count(*)::bigint FROM execution_history
+             WHERE time >= $1 AND time < $2 AND $6 = ANY(changed_fields)
+             GROUP BY entity_ref, new_values->>'status' RETURNING $7
+             ), coverage AS (
+                INSERT INTO native_summary_hour(kind,bucket,refreshed_at)
+                SELECT $3::text::native_summary_kind,$1,clock_timestamp() WHERE (SELECT count(*) FROM refreshed) >= $8
+                ON CONFLICT(kind,bucket) DO UPDATE SET refreshed_at = excluded.refreshed_at
+                RETURNING kind
+             ), acknowledged AS (
+                DELETE FROM native_summary_invalidation
+                WHERE kind = $3::text::native_summary_kind AND bucket = $1 AND id = ANY($4::bigint[])
+                    AND EXISTS (SELECT $9 FROM coverage)
+                RETURNING id
+             ) SELECT (SELECT count(*) FROM refreshed)::bigint,
+                      (SELECT count(*) FROM acknowledged)::bigint /* profile:top */",32,idle-ready-base-volume-40d6cb1b,200,0,3.005349999999999,True,1,6368
+volume,32,baseline,False,"WITH refreshed AS (
+                INSERT INTO worker_status_hourly_summary (bucket, worker_name, new_status, transition_count)
+             SELECT $1, entity_ref, new_values->>$5, count(*)::bigint FROM worker_history
+             WHERE time >= $1 AND time < $2 AND $6 = ANY(changed_fields)
+             GROUP BY entity_ref, new_values->>'status' RETURNING $7
+             ), coverage AS (
+                INSERT INTO native_summary_hour(kind,bucket,refreshed_at)
+                SELECT $3::text::native_summary_kind,$1,clock_timestamp() WHERE (SELECT count(*) FROM refreshed) >= $8
+                ON CONFLICT(kind,bucket) DO UPDATE SET refreshed_at = excluded.refreshed_at
+                RETURNING kind
+             ), acknowledged AS (
+                DELETE FROM native_summary_invalidation
+                WHERE kind = $3::text::native_summary_kind AND bucket = $1 AND id = ANY($4::bigint[])
+                    AND EXISTS (SELECT $9 FROM coverage)
+                RETURNING id
+             ) SELECT (SELECT count(*) FROM refreshed)::bigint,
+                      (SELECT count(*) FROM acknowledged)::bigint /* profile:top */",32,idle-ready-base-volume-40d6cb1b,200,0,3.421485000000001,True,1,6368
+volume,133,current,False,BEGIN /* profile:top */,0,idle-ready-current-volume-706e6dae,0,0,0.07226000000000266,True,1,0
+volume,129,current,False,COMMIT /* profile:top */,0,idle-ready-current-volume-706e6dae,0,0,0.06350099999999997,True,1,0
+volume,32,current,False,DELETE FROM event_volume_hourly_summary WHERE bucket = $1 /* profile:top */,0,idle-ready-current-volume-706e6dae,64,0,0.18517399999999995,True,1,0
+volume,32,current,False,DELETE FROM execution_creation_hourly_summary WHERE bucket = $1 /* profile:top */,0,idle-ready-current-volume-706e6dae,64,0,0.189563,True,1,0
+volume,32,current,False,DELETE FROM execution_status_hourly_summary WHERE bucket = $1 /* profile:top */,0,idle-ready-current-volume-706e6dae,64,0,0.20079099999999997,True,1,0
+volume,32,current,False,DELETE FROM worker_status_hourly_summary WHERE bucket = $1 /* profile:top */,0,idle-ready-current-volume-706e6dae,64,0,0.21832600000000005,True,1,0
+volume,13,current,False,"INSERT INTO audit_event (category, event_type, outcome, actor_identity, actor_login, actor_token_type, actor_ip, actor_user_agent, request_id, resource_type, resource_id, resource_ref, http_method, http_path, http_status, duration_ms, details, correlation_chain) VALUES ($1, $2, $3, $4, $5, $6, $7::inet, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) /* profile:top */",13,idle-ready-current-volume-706e6dae,679,0,8.687256000000001,True,1,23619
+volume,6,current,False,"INSERT INTO native_maintenance_schedule (job, next_due)
+             SELECT unnest(ARRAY[$1 /*, ... */]::text[]), $2
+             ON CONFLICT (job) DO NOTHING /* profile:top */",0,idle-ready-current-volume-706e6dae,48,0,1.966549,True,1,0
+volume,6,current,False,"INSERT INTO runtime_retention_config (
+                id, enabled, check_interval_seconds, batch_size, max_batches_per_target, dry_run, advisory_lock_key,
+                cache_retention, native_maintenance
+             )
+             VALUES ($9, $1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (id) DO NOTHING /* profile:top */",0,idle-ready-current-volume-706e6dae,12,0,1.2985209999999998,True,1,0
+volume,6,current,False,"INSERT INTO runtime_retention_target_config (target, max_age_seconds)
+             SELECT target, max_age_seconds
+             FROM unnest($1::text[], $2::bigint[]) AS seed(target, max_age_seconds)
+             ON CONFLICT (target) DO NOTHING /* profile:top */",0,idle-ready-current-volume-706e6dae,193,0,4.810426,True,1,0
+volume,33,current,False,LOCK TABLE ONLY event IN ACCESS SHARE MODE /* profile:top */,0,idle-ready-current-volume-706e6dae,8,0,0.26715399999999995,True,1,0
+volume,66,current,False,LOCK TABLE ONLY execution_history IN ACCESS SHARE MODE /* profile:top */,0,idle-ready-current-volume-706e6dae,16,0,0.5862950000000001,True,1,0
+volume,33,current,False,LOCK TABLE ONLY worker_history IN ACCESS SHARE MODE /* profile:top */,0,idle-ready-current-volume-706e6dae,8,0,0.3118679999999996,True,1,0
+volume,4,current,False,ROLLBACK /* profile:top */,0,idle-ready-current-volume-706e6dae,0,0,0.002491000000000021,True,1,0
+volume,180,current,False,"SELECT
+    id, runtime, runtime_ref, version,
+    version_major, version_minor, version_patch,
+    execution_config, distributions,
+    is_default, available, verified_at, meta, retired_at,
+    created, updated
+ FROM runtime_version WHERE runtime = ANY($1) AND retired_at IS NULL /* profile:top */",0,idle-ready-current-volume-706e6dae,180,0,13.435120999999995,True,1,0
+volume,7,current,False,SELECT $1::regtype::oid /* profile:top */,7,idle-ready-current-volume-706e6dae,53,0,2.182086999999999,True,1,0
+volume,144,current,False,SELECT COUNT(*) FROM work_queue WHERE retired_at IS NULL AND effective_enabled = $1 /* profile:top */,144,idle-ready-current-volume-706e6dae,288,0,16.391711,True,1,0
+volume,144,current,False,SELECT COUNT(*) FROM work_queue_dispatch WHERE status = ANY($1) /* profile:top */,144,idle-ready-current-volume-706e6dae,144,0,9.674973000000001,True,1,0
+volume,4,current,False,"SELECT b.bucket FROM generate_series($2::timestamptz, $3::timestamptz - interval $5, interval $6) AS b(bucket)
+             WHERE NOT EXISTS (SELECT $7 FROM native_summary_hour h WHERE h.kind = $1::text::native_summary_kind AND h.bucket = b.bucket)
+             ORDER BY b.bucket DESC LIMIT $4 /* profile:top */",0,idle-ready-current-volume-706e6dae,7,0,0.367683,True,1,0
+volume,4,current,False,"SELECT b.bucket FROM generate_series($2::timestamptz, greatest($3::timestamptz, $2::timestamptz - ($4::bigint - $5) * interval $6), -interval $7) AS b(bucket)
+                 WHERE NOT EXISTS (SELECT $8 FROM native_summary_hour h WHERE h.kind = $1::text::native_summary_kind AND h.bucket = b.bucket) /* profile:top */",132,idle-ready-current-volume-706e6dae,4,0,0.166367,True,1,0
+volume,4,current,False,"SELECT bucket FROM native_summary_invalidation WHERE kind = $1::text::native_summary_kind AND bucket >= $2 AND bucket < $3
+             GROUP BY bucket ORDER BY bucket LIMIT $4 /* profile:top */",0,idle-ready-current-volume-706e6dae,8,0,0.06014100000000001,True,1,0
+volume,6,current,False,SELECT c.lease FROM pack_candidate_context c JOIN pack_install p ON p.id = c.install_id WHERE NOT c.revoked AND (c.expires_at <= clock_timestamp() OR p.status <> $2 OR p.started_at <= clock_timestamp() - INTERVAL $3) ORDER BY c.expires_at LIMIT $1 /* profile:top */,0,idle-ready-current-volume-706e6dae,0,0,0.296959,True,1,0
+volume,144,current,False,"SELECT candidate.queue FROM unnest($1::bigint[]) AS candidate(queue)
+             WHERE EXISTS (
+                 SELECT $3 FROM work_queue_item item
+                 WHERE item.queue = candidate.queue
+                   AND item.status = ANY($2::work_queue_item_status_enum[])
+             ) /* profile:top */",0,idle-ready-current-volume-706e6dae,36,0,5.477841999999997,True,1,0
+volume,180,current,False,SELECT clock_timestamp() /* profile:top */,180,idle-ready-current-volume-706e6dae,0,0,1.7223399999999984,True,1,0
+volume,12,current,False,"SELECT compatibility_epoch, revision FROM platform_catalog_state WHERE singleton /* profile:top */",12,idle-ready-current-volume-706e6dae,24,0,0.6801010000000003,True,1,0
+volume,6,current,False,"SELECT enabled, check_interval_seconds, batch_size, max_batches_per_target, dry_run, advisory_lock_key,
+                    cache_retention, native_maintenance
+             FROM runtime_retention_config
+             WHERE id = $1 /* profile:top */",6,idle-ready-current-volume-706e6dae,12,0,0.3512719999999999,True,1,0
+volume,25,current,False,"SELECT enumlabel
+FROM pg_catalog.pg_enum
+WHERE enumtypid = $1
+ORDER BY enumsortorder /* profile:top */",94,idle-ready-current-volume-706e6dae,56,0,2.1805749999999904,True,1,0
+volume,12,current,False,"SELECT id, action, action_ref, pack_release, pack_release_digest, executable_snapshot, config, env_vars, parent, enforcement, executor, permission_set_refs, artifact_retention_policy, artifact_retention_limit, worker_selector, worker_tolerations, worker_affinity, worker, status, trace_tag, result, retry_count, max_retries, retry_reason, original_execution, started_at, timeout_seconds, workflow_task, created, updated FROM execution WHERE status = $1 AND updated < $2 ORDER BY updated ASC LIMIT $3 /* profile:top */",0,idle-ready-current-volume-706e6dae,24,0,0.709486,True,1,0
+volume,12,current,False,"SELECT id, action, action_ref, pack_release, pack_release_digest, executable_snapshot, config, env_vars, parent, enforcement, executor, permission_set_refs, artifact_retention_policy, artifact_retention_limit, worker_selector, worker_tolerations, worker_affinity, worker, status, trace_tag, result, retry_count, max_retries, retry_reason, original_execution, started_at, timeout_seconds, workflow_task, created, updated FROM execution WHERE status = $1 ORDER BY created DESC, id DESC /* profile:top */",0,idle-ready-current-volume-706e6dae,36,0,1.144906,True,1,0
+volume,180,current,False,"SELECT id, name, worker_type, worker_role, runtime, host, port, status, capabilities, meta, last_heartbeat, cordoned, cordon_reason, cordoned_by, cordoned_at, created, updated FROM worker WHERE id = $1 /* profile:top */",180,idle-ready-current-volume-706e6dae,193,0,22.16481400000002,True,1,128
+volume,12,current,False,"SELECT id, name, worker_type, worker_role, runtime, host, port, status, capabilities, meta, last_heartbeat, cordoned, cordon_reason, cordoned_by, cordoned_at, created, updated FROM worker WHERE status = $1 ORDER BY name ASC /* profile:top */",60,idle-ready-current-volume-706e6dae,58,0,2.964576,True,1,0
+volume,180,current,False,"SELECT id, owner_roles, ref, label, description, version, conf_schema, config, meta, tags, runtime_deps, dependencies, is_standard, installers, worker_selector, worker_tolerations, worker_affinity, source_type, source_url, source_ref, checksum, checksum_verified, installed_at, installed_by, installation_method, storage_path, install_status, active_release, created, updated FROM pack WHERE id = ANY($1) /* profile:top */",180,idle-ready-current-volume-706e6dae,180,0,26.24831699999998,True,1,0
+volume,144,current,False,"SELECT id, queue, queue_ref, execution, status, leased_item_count, created, updated FROM work_queue_dispatch WHERE status = ANY($1) ORDER BY created DESC LIMIT $2 OFFSET $3 /* profile:top */",0,idle-ready-current-volume-706e6dae,147,0,11.917573999999991,True,1,0
+volume,180,current,False,"SELECT id, ref, pack, pack_ref, description, name, aliases, distributions, installation, installers, execution_config, auto_detected, detection_config, retired_at, created, updated FROM runtime WHERE id = ANY($1) AND retired_at IS NULL /* profile:top */",180,idle-ready-current-volume-706e6dae,540,0,24.52983100000001,True,1,0
+volume,144,current,False,"SELECT id, ref, pack, pack_ref, is_adhoc, label, description, effective_enabled AS enabled, enabled_override, accepting_new_items, dispatch_action, dispatch_action_ref, default_priority, allow_pending_update, update_strategy, batch_mode, item_schema, action_params, trace_tag_template, permission_set_refs, config, reference_visibility, reference_allowed_pack_refs, retired_at, created, updated FROM work_queue WHERE retired_at IS NULL AND effective_enabled = $1 ORDER BY ref ASC LIMIT $2 OFFSET $3 /* profile:top */",1152,idle-ready-current-volume-706e6dae,306,0,68.07592500000007,True,1,0
+volume,180,current,False,"SELECT id, ref, pack, pack_ref, label, description, entrypoint, runtime, runtime_ref, runtime_version_constraint, effective_enabled AS enabled, enabled_override, param_schema, config, worker_selector, worker_tolerations, worker_affinity, log_retention_policy, log_retention_limit, artifact_retention_policy, artifact_retention_limit, retired_at, created, updated FROM sensor WHERE retired_at IS NULL ORDER BY ref ASC /* profile:top */",180,idle-ready-current-volume-706e6dae,360,0,39.369092000000045,True,1,0
+volume,12,current,False,"SELECT job, next_due, last_success, deferred_since FROM native_maintenance_schedule ORDER BY job /* profile:top */",48,idle-ready-current-volume-706e6dae,24,0,0.9388970000000003,True,1,0
+volume,1,current,False,"SELECT k.kind, d.notifications_at_least, d.notifications_at_least <= $1 AS count_exact,
+                  d.oldest_observed_notification, d.oldest_eligible_at
+             FROM unnest(enum_range($3::native_summary_kind)) AS k(kind)
+             CROSS JOIN LATERAL (
+                  SELECT count(*)::bigint AS notifications_at_least,
+                         min(n.created) AS oldest_observed_notification,
+                         min(GREATEST(n.created, n.bucket + interval $4)) AS oldest_eligible_at
+                  FROM (SELECT created, bucket FROM native_summary_invalidation WHERE kind = k.kind
+                        AND bucket < date_trunc($5, $2::timestamptz, $6)
+                        ORDER BY bucket, id LIMIT $1 + $7) n
+              ) d ORDER BY k.kind /* profile:top */",4,idle-ready-current-volume-706e6dae,26,0,0.20855700000000005,True,1,0
+volume,2,current,False,"SELECT oid, typarray FROM pg_catalog.pg_type WHERE oid = $1::regtype::oid /* profile:top */",2,idle-ready-current-volume-706e6dae,6,0,0.039150999999999936,True,1,0
+volume,27,current,False,"SELECT oid::regtype::text, typtype, typcategory, typrelid, typelem, typbasetype FROM pg_catalog.pg_type WHERE oid = $1 /* profile:top */",27,idle-ready-current-volume-706e6dae,111,0,2.3513180000000027,True,1,0
+volume,6,current,False,SELECT pg_advisory_unlock($1) /* profile:top */,6,idle-ready-current-volume-706e6dae,0,0,0.08638600000000002,True,1,0
+volume,6,current,False,SELECT pg_try_advisory_lock($1) /* profile:top */,6,idle-ready-current-volume-706e6dae,0,0,0.06805899999999998,True,1,0
+volume,1,current,True,"SELECT query, toplevel, sum(calls)::bigint, sum(total_exec_time), sum(wal_bytes), sum(shared_blks_read), sum(shared_blks_hit), sum(rows) FROM pg_stat_statements WHERE dbid=(SELECT oid FROM pg_database WHERE datname=current_database()) GROUP BY query,toplevel /* profile:top */",3032,idle-ready-current-volume-706e6dae,9,0,42.070530000000005,True,1,0
+volume,1,current,False,"SELECT set_config($2,$1,$3) /* profile:top */",1,idle-ready-current-volume-706e6dae,0,0,0.006755999999999998,True,1,0
+volume,6,current,False,"SELECT target, max_age_seconds
+             FROM runtime_retention_target_config
+             ORDER BY target ASC /* profile:top */",96,idle-ready-current-volume-706e6dae,12,0,0.37991600000000003,True,1,0
+volume,180,current,False,"SELECT trigger.sensor AS sensor_id, rule.sensor_worker_selector, rule.sensor_worker_tolerations, rule.sensor_worker_affinity FROM trigger JOIN rule ON rule.trigger = trigger.id WHERE trigger.sensor = ANY($1) AND trigger.effective_enabled AND trigger.retired_at IS NULL AND rule.effective_enabled AND rule.retired_at IS NULL /* profile:top */",0,idle-ready-current-volume-706e6dae,1440,0,24.201437999999996,True,1,0
+volume,720,current,False,"SELECT w.id, w.workflow_execution, w.task_name, w.kind, w.state, w.inquiry, w.target_execution, w.work_queue_item, w.result, w.resolved_at, w.released_at, w.created, w.updated FROM workflow_task_wait w WHERE (w.state = $1 AND ( (w.kind = $2 AND EXISTS ( SELECT $3 FROM inquiry i WHERE i.id = w.inquiry AND i.status <> $4 )) OR (w.kind = $5 AND (NOT EXISTS ( SELECT $6 FROM execution target WHERE target.id = w.target_execution ) OR EXISTS ( SELECT $7 FROM execution target WHERE target.id = w.target_execution AND target.status IN ($8 /*, ... */) ))) OR (w.kind = $9 AND (NOT EXISTS ( SELECT $10 FROM work_queue_item item WHERE item.id = w.work_queue_item ) OR EXISTS ( SELECT $11 FROM work_queue_item item WHERE item.id = w.work_queue_item AND item.status IN ($12 /*, ... */) ))) )) OR (w.state = $13 AND EXISTS ( SELECT $14 FROM execution e WHERE e.workflow_task->>$15 = w.workflow_execution::TEXT AND e.workflow_task->>$16 = w.task_name AND e.status = $17 )) OR (w.state IN ($18 /*, ... */) AND (w.result->>$19) IS DISTINCT FROM $20) ORDER BY w.id LIMIT $21 /* profile:top */",0,idle-ready-current-volume-706e6dae,2160,0,69.93369399999993,True,1,0
+volume,132,current,False,SET LOCAL lock_timeout = $1 /* profile:top */,0,idle-ready-current-volume-706e6dae,0,0,0.3119249999999996,True,1,0
+volume,132,current,False,SET LOCAL plan_cache_mode = $1 /* profile:top */,0,idle-ready-current-volume-706e6dae,0,0,0.2125980000000003,True,1,0
+volume,644,current,False,SET LOCAL statement_timeout = $1 /* profile:top */,0,idle-ready-current-volume-706e6dae,0,0,1.5741750000000012,True,1,0
+volume,128,current,False,SET LOCAL synchronous_commit = $1 /* profile:top */,0,idle-ready-current-volume-706e6dae,0,0,0.33324799999999977,True,1,0
+volume,132,current,False,SET TRANSACTION ISOLATION LEVEL REPEATABLE READ /* profile:top */,0,idle-ready-current-volume-706e6dae,0,0,0.573693,True,1,0
+volume,1080,current,False,"UPDATE inquiry SET status = $1, updated = NOW() WHERE status = $2 AND timeout_at IS NOT NULL AND timeout_at <= NOW() RETURNING id, created_by_execution, workflow_execution, workflow_task_name, action_attempt_family, purpose, prompt, response_schema, response_options, assigned_to, status, response, timeout_at, timeout_seconds, responded_by, external_actor, responded_at, created, updated /* profile:top */",0,idle-ready-current-volume-706e6dae,2160,0,93.01954100000015,True,1,0
+volume,24,current,False,"UPDATE native_maintenance_schedule SET next_due = $3
+             WHERE job = $1 AND (next_due <= $2 OR $4) /* profile:top */",1,idle-ready-current-volume-706e6dae,50,0,1.910283,True,1,797
+volume,6,current,False,"UPDATE pack_install SET status = $1, candidate_access_token_hash = $2, error_message = $3, finished_at = NOW(), updated_at = NOW() WHERE (status IN ($4 /*, ... */) AND started_at < NOW() - make_interval(secs => $5)) OR (status = $6 AND updated_at < NOW() - make_interval(secs => $7)) RETURNING id, pack_ref, pack_version, status, trigger_reason, absent_metadata_policy, pack_id, requested_by, assigned_worker_id, candidate_access_token_hash, candidate_object_key, candidate_provider_version, candidate_archive_size, candidate_digest, test_execution_id, test_result, error_message, diagnostic_details, started_at, updated_at, finished_at /* profile:top */",0,idle-ready-current-volume-706e6dae,6,0,0.142991,True,1,0
+volume,6,current,False,UPDATE supervisor_run SET heartbeat_at = NOW() WHERE id = $1 /* profile:top */,6,idle-ready-current-volume-706e6dae,24,0,0.39484900000000006,True,1,1079
+volume,144,current,False,"UPDATE worker
+                SET last_heartbeat = $1,
+                    status = $2,
+                    updated = $1
+                WHERE id = $3 /* profile:top */",144,idle-ready-current-volume-706e6dae,4140,0,88.56447699999995,True,1,336121
+volume,36,current,False,"UPDATE worker
+                SET last_heartbeat = $1,
+                    status = $2,
+                    updated = $3
+                WHERE id = $4 /* profile:top */",36,idle-ready-current-volume-706e6dae,1344,0,47.613964999999986,True,1,91170
+volume,162,current,False,"WITH candidate AS ( SELECT item.id FROM workflow_log_outbox item WHERE item.is_head AND item.delivered_at IS NULL AND item.failed_at IS NULL AND item.available_at <= clock_timestamp() AND (item.claim_expires_at IS NULL OR item.claim_expires_at <= clock_timestamp()) ORDER BY item.available_at, item.created, item.id FOR UPDATE OF item SKIP LOCKED LIMIT $3 ), claimed AS ( UPDATE workflow_log_outbox item SET claimed_by = $1, claim_expires_at = clock_timestamp() + ($2 * INTERVAL $4), attempt_count = attempt_count + $5 FROM candidate WHERE item.id = candidate.id RETURNING item.id, item.workflow_execution, item.sequence, item.kind, item.payload, item.claimed_by, item.attempt_count ), resolved AS ( SELECT claimed.id, claimed.workflow_execution, claimed.sequence, claimed.kind, claimed.payload, workflow.execution AS parent_execution, execution.action_ref, claimed.claimed_by, claimed.attempt_count FROM claimed JOIN workflow_execution workflow ON workflow.id = claimed.workflow_execution JOIN execution ON execution.id = workflow.execution ) SELECT record.id, record.workflow_execution, record.sequence, record.kind, record.payload, record.parent_execution, record.action_ref, record.claimed_by, record.attempt_count, CASE WHEN record.id IS NOT NULL THEN $6 ELSE EXISTS( SELECT $7 FROM workflow_log_outbox pending WHERE pending.is_head AND pending.delivered_at IS NULL AND pending.failed_at IS NULL ) END AS pending FROM (VALUES ($8)) AS singleton(dummy) LEFT JOIN resolved record ON $9 /* profile:top */",162,idle-ready-current-volume-706e6dae,324,0,15.107751,True,1,0
+volume,360,current,False,"WITH candidates AS ( SELECT id FROM inquiry_callback_delivery WHERE state = $3 AND next_attempt_at <= clock_timestamp() ORDER BY next_attempt_at, created, id LIMIT $1 FOR UPDATE SKIP LOCKED ) UPDATE inquiry_callback_delivery AS delivery SET attempt_count = attempt_count + $4, next_attempt_at = clock_timestamp() + make_interval(secs => $2::double precision), updated = NOW() FROM candidates WHERE delivery.id = candidates.id RETURNING delivery.id /* profile:top */",0,idle-ready-current-volume-706e6dae,360,0,33.74229599999998,True,1,0
+volume,1,current,False,"WITH completion AS MATERIALIZED (
+                 SELECT GREATEST($4::timestamptz, clock_timestamp()) AS at
+             )
+             UPDATE native_maintenance_schedule
+             SET next_due = completion.at + ($2::timestamptz - $4::timestamptz),
+                 last_success = CASE WHEN $3 THEN completion.at ELSE last_success END,
+                 deferred_since = CASE WHEN $3 THEN $5 ELSE COALESCE(deferred_since, completion.at) END
+             FROM completion
+              WHERE job = $1 /* profile:top */",1,idle-ready-current-volume-706e6dae,4,0,0.052802000000000016,True,1,82
+volume,4,current,False,"WITH heads AS (
+            SELECT $3::timestamptz - interval $4 AS bucket
+            UNION SELECT bucket - interval $5 FROM native_summary_hour
+                WHERE kind = $1::text::native_summary_kind AND bucket > $2 AND bucket <= $3
+         ) SELECT bucket FROM heads b WHERE bucket >= $2 AND bucket < $3
+           AND NOT EXISTS (SELECT $6 FROM native_summary_hour h WHERE h.kind = $1::text::native_summary_kind AND h.bucket = b.bucket)
+         ORDER BY bucket DESC LIMIT $7 /* profile:top */",4,idle-ready-current-volume-706e6dae,8,0,0.23294700000000002,True,1,0
+volume,128,current,False,"WITH locked AS MATERIALIZED (
+                SELECT kind FROM native_summary_state WHERE kind = $1::text::native_summary_kind FOR UPDATE
+             ), updated AS (
+                UPDATE native_summary_state s SET updated = clock_timestamp()
+                FROM locked l WHERE s.kind = l.kind RETURNING s.kind
+             ) SELECT ARRAY(
+                SELECT i.id FROM native_summary_invalidation i
+                WHERE u.kind = $1::text::native_summary_kind
+                    AND i.kind = $1::text::native_summary_kind AND i.bucket = $2
+                ORDER BY i.id LIMIT $3
+             ) FROM updated u /* profile:top */",128,idle-ready-current-volume-706e6dae,898,0,9.111792999999995,True,1,24965
+volume,32,current,False,"WITH refreshed AS (
+                INSERT INTO event_volume_hourly_summary (bucket, trigger_ref, event_count)
+             SELECT $1, trigger_ref, count(*)::bigint FROM event
+             WHERE created >= $1 AND created < $2 GROUP BY trigger_ref RETURNING $5
+             ), coverage AS (
+                INSERT INTO native_summary_hour(kind,bucket,refreshed_at)
+                SELECT $3::text::native_summary_kind,$1,clock_timestamp() WHERE (SELECT count(*) FROM refreshed) >= $6
+                ON CONFLICT(kind,bucket) DO UPDATE SET refreshed_at = excluded.refreshed_at
+                RETURNING kind
+             ), acknowledged AS (
+                DELETE FROM native_summary_invalidation
+                WHERE kind = $3::text::native_summary_kind AND bucket = $1 AND id = ANY($4::bigint[])
+                    AND EXISTS (SELECT $7 FROM coverage)
+                RETURNING id
+             ) SELECT (SELECT count(*) FROM refreshed)::bigint,
+                      (SELECT count(*) FROM acknowledged)::bigint /* profile:top */",32,idle-ready-current-volume-706e6dae,194,0,2.612216,True,1,6368
+volume,32,current,False,"WITH refreshed AS (
+                INSERT INTO execution_creation_hourly_summary (bucket, action_ref, execution_count)
+             SELECT $1, entity_ref, count(*)::bigint FROM execution_history
+             WHERE time >= $1 AND time < $2 AND operation = $5 GROUP BY entity_ref RETURNING $6
+             ), coverage AS (
+                INSERT INTO native_summary_hour(kind,bucket,refreshed_at)
+                SELECT $3::text::native_summary_kind,$1,clock_timestamp() WHERE (SELECT count(*) FROM refreshed) >= $7
+                ON CONFLICT(kind,bucket) DO UPDATE SET refreshed_at = excluded.refreshed_at
+                RETURNING kind
+             ), acknowledged AS (
+                DELETE FROM native_summary_invalidation
+                WHERE kind = $3::text::native_summary_kind AND bucket = $1 AND id = ANY($4::bigint[])
+                    AND EXISTS (SELECT $8 FROM coverage)
+                RETURNING id
+             ) SELECT (SELECT count(*) FROM refreshed)::bigint,
+                      (SELECT count(*) FROM acknowledged)::bigint /* profile:top */",32,idle-ready-current-volume-706e6dae,194,0,2.5917660000000007,True,1,6368
+volume,32,current,False,"WITH refreshed AS (
+                INSERT INTO execution_status_hourly_summary (bucket, action_ref, new_status, transition_count)
+             SELECT $1, entity_ref, new_values->>$5, count(*)::bigint FROM execution_history
+             WHERE time >= $1 AND time < $2 AND $6 = ANY(changed_fields)
+             GROUP BY entity_ref, new_values->>'status' RETURNING $7
+             ), coverage AS (
+                INSERT INTO native_summary_hour(kind,bucket,refreshed_at)
+                SELECT $3::text::native_summary_kind,$1,clock_timestamp() WHERE (SELECT count(*) FROM refreshed) >= $8
+                ON CONFLICT(kind,bucket) DO UPDATE SET refreshed_at = excluded.refreshed_at
+                RETURNING kind
+             ), acknowledged AS (
+                DELETE FROM native_summary_invalidation
+                WHERE kind = $3::text::native_summary_kind AND bucket = $1 AND id = ANY($4::bigint[])
+                    AND EXISTS (SELECT $9 FROM coverage)
+                RETURNING id
+             ) SELECT (SELECT count(*) FROM refreshed)::bigint,
+                      (SELECT count(*) FROM acknowledged)::bigint /* profile:top */",32,idle-ready-current-volume-706e6dae,193,0,2.9598029999999986,True,1,6368
+volume,32,current,False,"WITH refreshed AS (
+                INSERT INTO worker_status_hourly_summary (bucket, worker_name, new_status, transition_count)
+             SELECT $1, entity_ref, new_values->>$5, count(*)::bigint FROM worker_history
+             WHERE time >= $1 AND time < $2 AND $6 = ANY(changed_fields)
+             GROUP BY entity_ref, new_values->>'status' RETURNING $7
+             ), coverage AS (
+                INSERT INTO native_summary_hour(kind,bucket,refreshed_at)
+                SELECT $3::text::native_summary_kind,$1,clock_timestamp() WHERE (SELECT count(*) FROM refreshed) >= $8
+                ON CONFLICT(kind,bucket) DO UPDATE SET refreshed_at = excluded.refreshed_at
+                RETURNING kind
+             ), acknowledged AS (
+                DELETE FROM native_summary_invalidation
+                WHERE kind = $3::text::native_summary_kind AND bucket = $1 AND id = ANY($4::bigint[])
+                    AND EXISTS (SELECT $9 FROM coverage)
+                RETURNING id
+             ) SELECT (SELECT count(*) FROM refreshed)::bigint,
+                      (SELECT count(*) FROM acknowledged)::bigint /* profile:top */",32,idle-ready-current-volume-706e6dae,200,0,2.971768999999999,True,1,14148
+api,1269,baseline,False,BEGIN /* profile:top */,0,idle-ready-baseline-api-696f2eb5,0,0,1.7185619999999995,True,1,0
+api,1265,baseline,False,COMMIT /* profile:top */,0,idle-ready-baseline-api-696f2eb5,0,0,1.5783379999999991,True,1,0
+api,32,baseline,False,DELETE FROM event_volume_hourly_summary WHERE bucket = $1 /* profile:top */,0,idle-ready-baseline-api-696f2eb5,64,0,0.1867789999999999,True,1,0
+api,32,baseline,False,DELETE FROM execution_creation_hourly_summary WHERE bucket = $1 /* profile:top */,0,idle-ready-baseline-api-696f2eb5,64,0,0.18624699999999994,True,1,0
+api,32,baseline,False,DELETE FROM execution_status_hourly_summary WHERE bucket = $1 /* profile:top */,0,idle-ready-baseline-api-696f2eb5,64,0,0.19443399999999997,True,1,0
+api,32,baseline,False,DELETE FROM worker_status_hourly_summary WHERE bucket = $1 /* profile:top */,0,idle-ready-baseline-api-696f2eb5,64,0,0.19122899999999984,True,1,0
+api,13,baseline,False,"INSERT INTO audit_event (category, event_type, outcome, actor_identity, actor_login, actor_token_type, actor_ip, actor_user_agent, request_id, resource_type, resource_id, resource_ref, http_method, http_path, http_status, duration_ms, details, correlation_chain) VALUES ($1, $2, $3, $4, $5, $6, $7::inet, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) /* profile:top */",13,idle-ready-baseline-api-696f2eb5,506,0,7.671669,True,1,24315
+api,6,baseline,False,"INSERT INTO native_maintenance_schedule (job, next_due)
+             SELECT unnest(ARRAY[$1 /*, ... */]::text[]), $2
+             ON CONFLICT (job) DO NOTHING /* profile:top */",0,idle-ready-baseline-api-696f2eb5,48,0,1.42551,True,1,0
+api,6,baseline,False,"INSERT INTO runtime_retention_config (
+                id, enabled, check_interval_seconds, batch_size, max_batches_per_target, dry_run, advisory_lock_key,
+                cache_retention, native_maintenance
+             )
+             VALUES ($9, $1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (id) DO NOTHING /* profile:top */",0,idle-ready-baseline-api-696f2eb5,22,0,1.340527,True,1,0
+api,96,baseline,False,"INSERT INTO runtime_retention_target_config (target, max_age_seconds)
+                 VALUES ($1, $2)
+                 ON CONFLICT (target) DO NOTHING /* profile:top */",0,idle-ready-baseline-api-696f2eb5,264,0,14.139420000000005,True,1,0
+api,33,baseline,False,LOCK TABLE ONLY event IN ACCESS SHARE MODE /* profile:top */,0,idle-ready-baseline-api-696f2eb5,8,0,0.43620199999999987,True,1,0
+api,66,baseline,False,LOCK TABLE ONLY execution_history IN ACCESS SHARE MODE /* profile:top */,0,idle-ready-baseline-api-696f2eb5,16,0,0.9988110000000003,True,1,0
+api,33,baseline,False,LOCK TABLE ONLY worker_history IN ACCESS SHARE MODE /* profile:top */,0,idle-ready-baseline-api-696f2eb5,8,0,0.7683589999999996,True,1,0
+api,4,baseline,False,ROLLBACK /* profile:top */,0,idle-ready-baseline-api-696f2eb5,0,0,0.009815000000000018,True,1,0
+api,180,baseline,False,"SELECT
+    id, runtime, runtime_ref, version,
+    version_major, version_minor, version_patch,
+    execution_config, distributions,
+    is_default, available, verified_at, meta, retired_at,
+    created, updated
+ FROM runtime_version WHERE runtime = ANY($1) AND retired_at IS NULL /* profile:top */",0,idle-ready-baseline-api-696f2eb5,180,0,15.159363,True,1,0
+api,10,baseline,False,SELECT $1::regtype::oid /* profile:top */,10,idle-ready-baseline-api-696f2eb5,74,0,2.4347809999999974,True,1,0
+api,142,baseline,False,SELECT COUNT(*) FROM work_queue WHERE retired_at IS NULL AND effective_enabled = $1 /* profile:top */,142,idle-ready-baseline-api-696f2eb5,284,0,20.723379000000016,True,1,0
+api,1136,baseline,False,SELECT COUNT(*) FROM work_queue_dispatch WHERE queue = $1 AND status = ANY($2::work_queue_dispatch_status_enum[]) /* profile:top */,1136,idle-ready-baseline-api-696f2eb5,2272,0,94.12186800000003,True,1,0
+api,142,baseline,False,SELECT COUNT(*) FROM work_queue_dispatch WHERE status = ANY($1) /* profile:top */,142,idle-ready-baseline-api-696f2eb5,142,0,10.553875999999997,True,1,0
+api,4,baseline,False,"SELECT b.bucket FROM generate_series($2::timestamptz, $3::timestamptz - interval $5, interval $6) AS b(bucket)
+             WHERE NOT EXISTS (SELECT $7 FROM native_summary_hour h WHERE h.kind = $1::text::native_summary_kind AND h.bucket = b.bucket)
+             ORDER BY b.bucket DESC LIMIT $4 /* profile:top */",0,idle-ready-baseline-api-696f2eb5,4,0,0.648325,True,1,0
+api,4,baseline,False,"SELECT b.bucket FROM generate_series($2::timestamptz, greatest($3::timestamptz, $2::timestamptz - ($4::bigint - $5) * interval $6), -interval $7) AS b(bucket)
+                 WHERE NOT EXISTS (SELECT $8 FROM native_summary_hour h WHERE h.kind = $1::text::native_summary_kind AND h.bucket = b.bucket) /* profile:top */",132,idle-ready-baseline-api-696f2eb5,4,0,0.839847,True,1,0
+api,4,baseline,False,"SELECT bucket FROM native_summary_invalidation WHERE kind = $1::text::native_summary_kind AND bucket >= $2 AND bucket < $3
+             GROUP BY bucket ORDER BY bucket LIMIT $4 /* profile:top */",0,idle-ready-baseline-api-696f2eb5,8,0,0.19327599999999998,True,1,0
+api,6,baseline,False,SELECT c.lease FROM pack_candidate_context c JOIN pack_install p ON p.id = c.install_id WHERE NOT c.revoked AND (c.expires_at <= clock_timestamp() OR p.status <> $2 OR p.started_at <= clock_timestamp() - INTERVAL $3) ORDER BY c.expires_at LIMIT $1 /* profile:top */,0,idle-ready-baseline-api-696f2eb5,0,0,0.336558,True,1,0
+api,180,baseline,False,SELECT clock_timestamp() /* profile:top */,180,idle-ready-baseline-api-696f2eb5,0,0,1.6561380000000008,True,1,0
+api,12,baseline,False,"SELECT compatibility_epoch, revision FROM platform_catalog_state WHERE singleton /* profile:top */",12,idle-ready-baseline-api-696f2eb5,24,0,0.6797630000000001,True,1,0
+api,6,baseline,False,"SELECT enabled, check_interval_seconds, batch_size, max_batches_per_target, dry_run, advisory_lock_key,
+                    cache_retention, native_maintenance
+             FROM runtime_retention_config
+             WHERE id = $1 /* profile:top */",6,idle-ready-baseline-api-696f2eb5,12,0,0.423057,True,1,0
+api,25,baseline,False,"SELECT enumlabel
+FROM pg_catalog.pg_enum
+WHERE enumtypid = $1
+ORDER BY enumsortorder /* profile:top */",96,idle-ready-baseline-api-696f2eb5,56,0,2.285620999999999,True,1,0
+api,12,baseline,False,"SELECT id, action, action_ref, pack_release, pack_release_digest, executable_snapshot, config, env_vars, parent, enforcement, executor, permission_set_refs, artifact_retention_policy, artifact_retention_limit, worker_selector, worker_tolerations, worker_affinity, worker, status, trace_tag, result, retry_count, max_retries, retry_reason, original_execution, started_at, timeout_seconds, workflow_task, created, updated FROM execution WHERE status = $1 AND updated < $2 ORDER BY updated ASC LIMIT $3 /* profile:top */",0,idle-ready-baseline-api-696f2eb5,24,0,0.62286,True,1,0
+api,12,baseline,False,"SELECT id, action, action_ref, pack_release, pack_release_digest, executable_snapshot, config, env_vars, parent, enforcement, executor, permission_set_refs, artifact_retention_policy, artifact_retention_limit, worker_selector, worker_tolerations, worker_affinity, worker, status, trace_tag, result, retry_count, max_retries, retry_reason, original_execution, started_at, timeout_seconds, workflow_task, created, updated FROM execution WHERE status = $1 ORDER BY created DESC, id DESC /* profile:top */",0,idle-ready-baseline-api-696f2eb5,24,0,0.892083,True,1,0
+api,180,baseline,False,"SELECT id, name, worker_type, worker_role, runtime, host, port, status, capabilities, meta, last_heartbeat, cordoned, cordon_reason, cordoned_by, cordoned_at, created, updated FROM worker WHERE id = $1 /* profile:top */",180,idle-ready-baseline-api-696f2eb5,193,0,24.90464200000001,True,1,9926
+api,12,baseline,False,"SELECT id, name, worker_type, worker_role, runtime, host, port, status, capabilities, meta, last_heartbeat, cordoned, cordon_reason, cordoned_by, cordoned_at, created, updated FROM worker WHERE status = $1 ORDER BY name ASC /* profile:top */",60,idle-ready-baseline-api-696f2eb5,74,0,3.1544069999999986,True,1,0
+api,180,baseline,False,"SELECT id, owner_roles, ref, label, description, version, conf_schema, config, meta, tags, runtime_deps, dependencies, is_standard, installers, worker_selector, worker_tolerations, worker_affinity, source_type, source_url, source_ref, checksum, checksum_verified, installed_at, installed_by, installation_method, storage_path, install_status, active_release, created, updated FROM pack WHERE id = ANY($1) /* profile:top */",180,idle-ready-baseline-api-696f2eb5,180,0,30.164606999999982,True,1,0
+api,1136,baseline,False,"SELECT id, queue, queue_ref, execution, status, leased_item_count, created, updated FROM work_queue_dispatch WHERE queue = $1 AND status = ANY($2::work_queue_dispatch_status_enum[]) ORDER BY updated DESC LIMIT $3 /* profile:top */",0,idle-ready-baseline-api-696f2eb5,2272,0,107.46631000000006,True,1,0
+api,142,baseline,False,"SELECT id, queue, queue_ref, execution, status, leased_item_count, created, updated FROM work_queue_dispatch WHERE status = ANY($1) ORDER BY created DESC LIMIT $2 OFFSET $3 /* profile:top */",0,idle-ready-baseline-api-696f2eb5,142,0,13.744599999999991,True,1,0
+api,180,baseline,False,"SELECT id, ref, pack, pack_ref, description, name, aliases, distributions, installation, installers, execution_config, auto_detected, detection_config, retired_at, created, updated FROM runtime WHERE id = ANY($1) AND retired_at IS NULL /* profile:top */",180,idle-ready-baseline-api-696f2eb5,540,0,24.940992000000005,True,1,0
+api,142,baseline,False,"SELECT id, ref, pack, pack_ref, is_adhoc, label, description, effective_enabled AS enabled, enabled_override, accepting_new_items, dispatch_action, dispatch_action_ref, default_priority, allow_pending_update, update_strategy, batch_mode, item_schema, action_params, trace_tag_template, permission_set_refs, config, reference_visibility, reference_allowed_pack_refs, retired_at, created, updated FROM work_queue WHERE retired_at IS NULL AND effective_enabled = $1 ORDER BY ref ASC LIMIT $2 OFFSET $3 /* profile:top */",1136,idle-ready-baseline-api-696f2eb5,290,0,43.33536400000002,True,1,0
+api,180,baseline,False,"SELECT id, ref, pack, pack_ref, label, description, entrypoint, runtime, runtime_ref, runtime_version_constraint, effective_enabled AS enabled, enabled_override, param_schema, config, worker_selector, worker_tolerations, worker_affinity, log_retention_policy, log_retention_limit, artifact_retention_policy, artifact_retention_limit, retired_at, created, updated FROM sensor WHERE retired_at IS NULL ORDER BY ref ASC /* profile:top */",180,idle-ready-baseline-api-696f2eb5,360,0,48.22297500000002,True,1,0
+api,12,baseline,False,"SELECT job, next_due, last_success, deferred_since FROM native_maintenance_schedule ORDER BY job /* profile:top */",48,idle-ready-baseline-api-696f2eb5,24,0,0.8039970000000001,True,1,0
+api,1,baseline,False,"SELECT k.kind, d.notifications_at_least, d.notifications_at_least <= $1 AS count_exact,
+                  d.oldest_observed_notification, d.oldest_eligible_at
+             FROM unnest(enum_range($3::native_summary_kind)) AS k(kind)
+             CROSS JOIN LATERAL (
+                  SELECT count(*)::bigint AS notifications_at_least,
+                         min(n.created) AS oldest_observed_notification,
+                         min(GREATEST(n.created, n.bucket + interval $4)) AS oldest_eligible_at
+                  FROM (SELECT created, bucket FROM native_summary_invalidation WHERE kind = k.kind
+                        AND bucket < date_trunc($5, $2::timestamptz, $6)
+                        ORDER BY bucket, id LIMIT $1 + $7) n
+              ) d ORDER BY k.kind /* profile:top */",4,idle-ready-baseline-api-696f2eb5,26,0,0.19948700000000003,True,1,0
+api,25,baseline,False,"SELECT oid::regtype::text, typtype, typcategory, typrelid, typelem, typbasetype FROM pg_catalog.pg_type WHERE oid = $1 /* profile:top */",25,idle-ready-baseline-api-696f2eb5,103,0,2.5481989999999968,True,1,0
+api,6,baseline,False,SELECT pg_advisory_unlock($1) /* profile:top */,6,idle-ready-baseline-api-696f2eb5,0,0,0.032609000000000006,True,1,0
+api,1136,baseline,False,"SELECT pg_advisory_xact_lock_shared(hashtextextended(current_schema() || $1, $2)), pg_backend_pid() AS backend /* profile:top */",1136,idle-ready-baseline-api-696f2eb5,0,0,21.725980999999965,True,1,0
+api,6,baseline,False,SELECT pg_try_advisory_lock($1) /* profile:top */,6,idle-ready-baseline-api-696f2eb5,0,0,0.07855800000000002,True,1,0
+api,1,baseline,True,"SELECT query, toplevel, sum(calls)::bigint, sum(total_exec_time), sum(wal_bytes), sum(shared_blks_read), sum(shared_blks_hit), sum(rows) FROM pg_stat_statements WHERE dbid=(SELECT oid FROM pg_database WHERE datname=current_database()) GROUP BY query,toplevel /* profile:top */",3031,idle-ready-baseline-api-696f2eb5,9,0,34.756447,True,1,0
+api,1,baseline,False,"SELECT set_config($2,$1,$3) /* profile:top */",1,idle-ready-baseline-api-696f2eb5,0,0,0.007962999999999998,True,1,0
+api,6,baseline,False,"SELECT set_config($3, $1, $4), set_config($5, $2, $6) /* profile:top */",6,idle-ready-baseline-api-696f2eb5,0,0,0.04651099999999997,True,1,0
+api,6,baseline,False,"SELECT target, max_age_seconds
+             FROM runtime_retention_target_config
+             ORDER BY target ASC /* profile:top */",96,idle-ready-baseline-api-696f2eb5,12,0,0.26336600000000004,True,1,0
+api,180,baseline,False,"SELECT trigger.sensor AS sensor_id, rule.sensor_worker_selector, rule.sensor_worker_tolerations, rule.sensor_worker_affinity FROM trigger JOIN rule ON rule.trigger = trigger.id WHERE trigger.sensor = ANY($1) AND trigger.effective_enabled AND trigger.retired_at IS NULL AND rule.effective_enabled AND rule.retired_at IS NULL /* profile:top */",0,idle-ready-baseline-api-696f2eb5,1440,0,26.703474999999997,True,1,0
+api,721,baseline,False,"SELECT w.id, w.workflow_execution, w.task_name, w.kind, w.state, w.inquiry, w.target_execution, w.work_queue_item, w.result, w.resolved_at, w.released_at, w.created, w.updated FROM workflow_task_wait w WHERE (w.state = $1 AND ( (w.kind = $2 AND EXISTS ( SELECT $3 FROM inquiry i WHERE i.id = w.inquiry AND i.status <> $4 )) OR (w.kind = $5 AND (NOT EXISTS ( SELECT $6 FROM execution target WHERE target.id = w.target_execution ) OR EXISTS ( SELECT $7 FROM execution target WHERE target.id = w.target_execution AND target.status IN ($8 /*, ... */) ))) OR (w.kind = $9 AND (NOT EXISTS ( SELECT $10 FROM work_queue_item item WHERE item.id = w.work_queue_item ) OR EXISTS ( SELECT $11 FROM work_queue_item item WHERE item.id = w.work_queue_item AND item.status IN ($12 /*, ... */) ))) )) OR (w.state = $13 AND EXISTS ( SELECT $14 FROM execution e WHERE e.workflow_task->>$15 = w.workflow_execution::TEXT AND e.workflow_task->>$16 = w.task_name AND e.status = $17 )) OR (w.state IN ($18 /*, ... */) AND (w.result->>$19) IS DISTINCT FROM $20) ORDER BY w.id LIMIT $21 /* profile:top */",0,idle-ready-baseline-api-696f2eb5,2163,0,73.68970599999989,True,1,0
+api,132,baseline,False,SET LOCAL lock_timeout = $1 /* profile:top */,0,idle-ready-baseline-api-696f2eb5,0,0,0.32445499999999977,True,1,0
+api,132,baseline,False,SET LOCAL plan_cache_mode = $1 /* profile:top */,0,idle-ready-baseline-api-696f2eb5,0,0,0.19840499999999994,True,1,0
+api,644,baseline,False,SET LOCAL statement_timeout = $1 /* profile:top */,0,idle-ready-baseline-api-696f2eb5,0,0,1.6445220000000014,True,1,0
+api,128,baseline,False,SET LOCAL synchronous_commit = $1 /* profile:top */,0,idle-ready-baseline-api-696f2eb5,0,0,0.3595870000000004,True,1,0
+api,132,baseline,False,SET TRANSACTION ISOLATION LEVEL REPEATABLE READ /* profile:top */,0,idle-ready-baseline-api-696f2eb5,0,0,0.60857,True,1,0
+api,1081,baseline,False,"UPDATE inquiry SET status = $1, updated = NOW() WHERE status = $2 AND timeout_at IS NOT NULL AND timeout_at <= NOW() RETURNING id, created_by_execution, workflow_execution, workflow_task_name, action_attempt_family, purpose, prompt, response_schema, response_options, assigned_to, status, response, timeout_at, timeout_seconds, responded_by, external_actor, responded_at, created, updated /* profile:top */",0,idle-ready-baseline-api-696f2eb5,2162,0,114.33580099999988,True,1,0
+api,24,baseline,False,"UPDATE native_maintenance_schedule SET next_due = $3
+             WHERE job = $1 AND (next_due <= $2 OR $4) /* profile:top */",1,idle-ready-baseline-api-696f2eb5,50,0,1.564778,True,1,797
+api,6,baseline,False,"UPDATE pack_install SET status = $1, candidate_access_token_hash = $2, error_message = $3, finished_at = NOW(), updated_at = NOW() WHERE (status IN ($4 /*, ... */) AND started_at < NOW() - make_interval(secs => $5)) OR (status = $6 AND updated_at < NOW() - make_interval(secs => $7)) RETURNING id, pack_ref, pack_version, status, trigger_reason, absent_metadata_policy, pack_id, requested_by, assigned_worker_id, candidate_access_token_hash, candidate_object_key, candidate_provider_version, candidate_archive_size, candidate_digest, test_execution_id, test_result, error_message, diagnostic_details, started_at, updated_at, finished_at /* profile:top */",0,idle-ready-baseline-api-696f2eb5,6,0,0.330353,True,1,0
+api,6,baseline,False,UPDATE supervisor_run SET heartbeat_at = NOW() WHERE id = $1 /* profile:top */,6,idle-ready-baseline-api-696f2eb5,24,0,0.49010600000000015,True,1,1079
+api,144,baseline,False,"UPDATE worker
+                SET last_heartbeat = $1,
+                    status = $2,
+                    updated = $1
+                WHERE id = $3 /* profile:top */",144,idle-ready-baseline-api-696f2eb5,4098,0,102.07671499999978,True,1,299425
+api,36,baseline,False,"UPDATE worker
+                SET last_heartbeat = $1,
+                    status = $2,
+                    updated = $3
+                WHERE id = $4 /* profile:top */",36,idle-ready-baseline-api-696f2eb5,1059,0,32.82553,True,1,117942
+api,1136,baseline,False,"WITH anchor AS (
+                SELECT id,
+                       priority,
+                       historical_requester_identity,
+                       pack_release,
+                       pack_release_digest,
+                       executable_snapshot,
+                       payload #> $7::text[] AS group_value
+                FROM work_queue_item
+                WHERE queue = $1
+                  AND status = ANY($2::work_queue_item_status_enum[])
+                ORDER BY priority DESC, created ASC, id ASC
+                LIMIT $11
+                FOR UPDATE SKIP LOCKED
+            ),
+            extra_candidates_locked AS (
+                SELECT item.id,
+                       item.priority,
+                       item.created
+                FROM work_queue_item AS item
+                CROSS JOIN anchor
+                WHERE item.queue = $1
+                  AND item.status = ANY($2::work_queue_item_status_enum[])
+                  AND item.id <> anchor.id
+                  AND (NOT $10 OR item.historical_requester_identity IS NOT DISTINCT FROM anchor.historical_requester_identity)
+                  AND item.pack_release IS NOT DISTINCT FROM anchor.pack_release
+                  AND item.pack_release_digest IS NOT DISTINCT FROM anchor.pack_release_digest
+                  AND item.executable_snapshot IS NOT DISTINCT FROM anchor.executable_snapshot
+                  AND (
+                        $8 = $12
+                        OR anchor.group_value IS NULL
+                        OR anchor.group_value = $13::jsonb
+                        OR (
+                            item.payload #> $7::text[] = anchor.group_value
+                            AND ($9 OR item.priority = anchor.priority)
+                        )
+                  )
+                ORDER BY item.priority DESC, item.created ASC, item.id ASC
+                LIMIT GREATEST($3 - $14, $15)
+                FOR UPDATE SKIP LOCKED
+            ),
+            extra_candidates AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (ORDER BY priority DESC, created ASC, id ASC) AS sort_order
+                FROM extra_candidates_locked
+            ),
+            candidate AS (
+                SELECT id, $16 AS sort_order
+                FROM anchor
+                UNION ALL
+                SELECT id, sort_order
+                FROM extra_candidates
+            ),
+            updated AS (
+                UPDATE work_queue_item AS item
+                SET status = $17::work_queue_item_status_enum,
+                    leased_execution = $4,
+                    lease_token = $5,
+                    lease_expires_at = $6,
+                    attempt_count = item.attempt_count + $18,
+                    updated = NOW()
+                FROM candidate
+                WHERE item.id = candidate.id
+                RETURNING candidate.sort_order, item.id, item.queue, item.queue_ref, item.pack_release, item.pack_release_digest, item.executable_snapshot, item.item_key, item.priority, item.status, item.payload, item.schema_binding, item.metadata, item.trace_tag, item.enqueue_source, item.requested_by_identity, item.requested_by_execution, item.requested_by_enforcement, item.leased_execution, item.lease_token, item.lease_expires_at, item.attempt_count, item.last_error, item.ack_summary, item.created, item.updated
+            )
+            SELECT id, queue, queue_ref, pack_release, pack_release_digest, executable_snapshot, item_key, priority, status, payload, schema_binding, metadata, trace_tag, enqueue_source, requested_by_identity, requested_by_execution, requested_by_enforcement, leased_execution, lease_token, lease_expires_at, attempt_count, last_error, ack_summary, created, updated
+            FROM updated AS item
+            ORDER BY item.sort_order ASC /* profile:top */",0,idle-ready-baseline-api-696f2eb5,0,0,72.75925099999984,True,1,0
+api,6999,baseline,False,"WITH candidate AS ( SELECT item.id FROM workflow_log_outbox item WHERE item.is_head AND item.delivered_at IS NULL AND item.failed_at IS NULL AND item.available_at <= clock_timestamp() AND (item.claim_expires_at IS NULL OR item.claim_expires_at <= clock_timestamp()) ORDER BY item.available_at, item.created, item.id FOR UPDATE OF item SKIP LOCKED LIMIT $3 ), claimed AS ( UPDATE workflow_log_outbox item SET claimed_by = $1, claim_expires_at = clock_timestamp() + ($2 * INTERVAL $4), attempt_count = attempt_count + $5 FROM candidate WHERE item.id = candidate.id RETURNING item.id, item.workflow_execution, item.sequence, item.kind, item.payload, item.claimed_by, item.attempt_count ) SELECT claimed.id, claimed.workflow_execution, claimed.sequence, claimed.kind, claimed.payload, workflow.execution AS parent_execution, execution.action_ref, claimed.claimed_by, claimed.attempt_count FROM claimed JOIN workflow_execution workflow ON workflow.id = claimed.workflow_execution JOIN execution ON execution.id = workflow.execution /* profile:top */",0,idle-ready-baseline-api-696f2eb5,6999,0,449.42168899999854,True,1,0
+api,360,baseline,False,"WITH candidates AS ( SELECT id FROM inquiry_callback_delivery WHERE state = $3 AND next_attempt_at <= clock_timestamp() ORDER BY next_attempt_at, created, id LIMIT $1 FOR UPDATE SKIP LOCKED ) UPDATE inquiry_callback_delivery AS delivery SET attempt_count = attempt_count + $4, next_attempt_at = clock_timestamp() + make_interval(secs => $2::double precision), updated = NOW() FROM candidates WHERE delivery.id = candidates.id RETURNING delivery.id /* profile:top */",0,idle-ready-baseline-api-696f2eb5,360,0,34.10667099999995,True,1,0
+api,1,baseline,False,"WITH completion AS MATERIALIZED (
+                 SELECT GREATEST($4::timestamptz, clock_timestamp()) AS at
+             )
+             UPDATE native_maintenance_schedule
+             SET next_due = completion.at + ($2::timestamptz - $4::timestamptz),
+                 last_success = CASE WHEN $3 THEN completion.at ELSE last_success END,
+                 deferred_since = CASE WHEN $3 THEN $5 ELSE COALESCE(deferred_since, completion.at) END
+             FROM completion
+              WHERE job = $1 /* profile:top */",1,idle-ready-baseline-api-696f2eb5,4,0,0.05493100000000001,True,1,82
+api,4,baseline,False,"WITH heads AS (
+            SELECT $3::timestamptz - interval $4 AS bucket
+            UNION SELECT bucket - interval $5 FROM native_summary_hour
+                WHERE kind = $1::text::native_summary_kind AND bucket > $2 AND bucket <= $3
+         ) SELECT bucket FROM heads b WHERE bucket >= $2 AND bucket < $3
+           AND NOT EXISTS (SELECT $6 FROM native_summary_hour h WHERE h.kind = $1::text::native_summary_kind AND h.bucket = b.bucket)
+         ORDER BY bucket DESC LIMIT $7 /* profile:top */",4,idle-ready-baseline-api-696f2eb5,8,0,1.188355,True,1,0
+api,128,baseline,False,"WITH locked AS MATERIALIZED (
+                SELECT kind FROM native_summary_state WHERE kind = $1::text::native_summary_kind FOR UPDATE
+             ), updated AS (
+                UPDATE native_summary_state s SET updated = clock_timestamp()
+                FROM locked l WHERE s.kind = l.kind RETURNING s.kind
+             ) SELECT ARRAY(
+                SELECT i.id FROM native_summary_invalidation i
+                WHERE u.kind = $1::text::native_summary_kind
+                    AND i.kind = $1::text::native_summary_kind AND i.bucket = $2
+                ORDER BY i.id LIMIT $3
+             ) FROM updated u /* profile:top */",128,idle-ready-baseline-api-696f2eb5,898,0,9.358783000000004,True,1,24968
+api,32,baseline,False,"WITH refreshed AS (
+                INSERT INTO event_volume_hourly_summary (bucket, trigger_ref, event_count)
+             SELECT $1, trigger_ref, count(*)::bigint FROM event
+             WHERE created >= $1 AND created < $2 GROUP BY trigger_ref RETURNING $5
+             ), coverage AS (
+                INSERT INTO native_summary_hour(kind,bucket,refreshed_at)
+                SELECT $3::text::native_summary_kind,$1,clock_timestamp() WHERE (SELECT count(*) FROM refreshed) >= $6
+                ON CONFLICT(kind,bucket) DO UPDATE SET refreshed_at = excluded.refreshed_at
+                RETURNING kind
+             ), acknowledged AS (
+                DELETE FROM native_summary_invalidation
+                WHERE kind = $3::text::native_summary_kind AND bucket = $1 AND id = ANY($4::bigint[])
+                    AND EXISTS (SELECT $7 FROM coverage)
+                RETURNING id
+             ) SELECT (SELECT count(*) FROM refreshed)::bigint,
+                      (SELECT count(*) FROM acknowledged)::bigint /* profile:top */",32,idle-ready-baseline-api-696f2eb5,194,0,2.589182,True,1,6368
+api,32,baseline,False,"WITH refreshed AS (
+                INSERT INTO execution_creation_hourly_summary (bucket, action_ref, execution_count)
+             SELECT $1, entity_ref, count(*)::bigint FROM execution_history
+             WHERE time >= $1 AND time < $2 AND operation = $5 GROUP BY entity_ref RETURNING $6
+             ), coverage AS (
+                INSERT INTO native_summary_hour(kind,bucket,refreshed_at)
+                SELECT $3::text::native_summary_kind,$1,clock_timestamp() WHERE (SELECT count(*) FROM refreshed) >= $7
+                ON CONFLICT(kind,bucket) DO UPDATE SET refreshed_at = excluded.refreshed_at
+                RETURNING kind
+             ), acknowledged AS (
+                DELETE FROM native_summary_invalidation
+                WHERE kind = $3::text::native_summary_kind AND bucket = $1 AND id = ANY($4::bigint[])
+                    AND EXISTS (SELECT $8 FROM coverage)
+                RETURNING id
+             ) SELECT (SELECT count(*) FROM refreshed)::bigint,
+                      (SELECT count(*) FROM acknowledged)::bigint /* profile:top */",32,idle-ready-baseline-api-696f2eb5,194,0,2.771827,True,1,6368
+api,32,baseline,False,"WITH refreshed AS (
+                INSERT INTO execution_status_hourly_summary (bucket, action_ref, new_status, transition_count)
+             SELECT $1, entity_ref, new_values->>$5, count(*)::bigint FROM execution_history
+             WHERE time >= $1 AND time < $2 AND $6 = ANY(changed_fields)
+             GROUP BY entity_ref, new_values->>'status' RETURNING $7
+             ), coverage AS (
+                INSERT INTO native_summary_hour(kind,bucket,refreshed_at)
+                SELECT $3::text::native_summary_kind,$1,clock_timestamp() WHERE (SELECT count(*) FROM refreshed) >= $8
+                ON CONFLICT(kind,bucket) DO UPDATE SET refreshed_at = excluded.refreshed_at
+                RETURNING kind
+             ), acknowledged AS (
+                DELETE FROM native_summary_invalidation
+                WHERE kind = $3::text::native_summary_kind AND bucket = $1 AND id = ANY($4::bigint[])
+                    AND EXISTS (SELECT $9 FROM coverage)
+                RETURNING id
+             ) SELECT (SELECT count(*) FROM refreshed)::bigint,
+                      (SELECT count(*) FROM acknowledged)::bigint /* profile:top */",32,idle-ready-baseline-api-696f2eb5,193,0,2.903609,True,1,6368
+api,32,baseline,False,"WITH refreshed AS (
+                INSERT INTO worker_status_hourly_summary (bucket, worker_name, new_status, transition_count)
+             SELECT $1, entity_ref, new_values->>$5, count(*)::bigint FROM worker_history
+             WHERE time >= $1 AND time < $2 AND $6 = ANY(changed_fields)
+             GROUP BY entity_ref, new_values->>'status' RETURNING $7
+             ), coverage AS (
+                INSERT INTO native_summary_hour(kind,bucket,refreshed_at)
+                SELECT $3::text::native_summary_kind,$1,clock_timestamp() WHERE (SELECT count(*) FROM refreshed) >= $8
+                ON CONFLICT(kind,bucket) DO UPDATE SET refreshed_at = excluded.refreshed_at
+                RETURNING kind
+             ), acknowledged AS (
+                DELETE FROM native_summary_invalidation
+                WHERE kind = $3::text::native_summary_kind AND bucket = $1 AND id = ANY($4::bigint[])
+                    AND EXISTS (SELECT $9 FROM coverage)
+                RETURNING id
+             ) SELECT (SELECT count(*) FROM refreshed)::bigint,
+                      (SELECT count(*) FROM acknowledged)::bigint /* profile:top */",32,idle-ready-baseline-api-696f2eb5,194,0,2.8372310000000014,True,1,14148
+api,133,current,False,BEGIN /* profile:top */,0,idle-ready-current-api-0c750f7e,0,0,0.07687800000000067,True,1,0
+api,129,current,False,COMMIT /* profile:top */,0,idle-ready-current-api-0c750f7e,0,0,0.06867099999999993,True,1,0
+api,32,current,False,DELETE FROM event_volume_hourly_summary WHERE bucket = $1 /* profile:top */,0,idle-ready-current-api-0c750f7e,64,0,0.20026300000000005,True,1,0
+api,32,current,False,DELETE FROM execution_creation_hourly_summary WHERE bucket = $1 /* profile:top */,0,idle-ready-current-api-0c750f7e,64,0,0.20732700000000007,True,1,0
+api,32,current,False,DELETE FROM execution_status_hourly_summary WHERE bucket = $1 /* profile:top */,0,idle-ready-current-api-0c750f7e,64,0,0.23986100000000002,True,1,0
+api,32,current,False,DELETE FROM worker_status_hourly_summary WHERE bucket = $1 /* profile:top */,0,idle-ready-current-api-0c750f7e,64,0,0.250539,True,1,0
+api,13,current,False,"INSERT INTO audit_event (category, event_type, outcome, actor_identity, actor_login, actor_token_type, actor_ip, actor_user_agent, request_id, resource_type, resource_id, resource_ref, http_method, http_path, http_status, duration_ms, details, correlation_chain) VALUES ($1, $2, $3, $4, $5, $6, $7::inet, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) /* profile:top */",13,idle-ready-current-api-0c750f7e,676,0,8.630456999999998,True,1,23256
+api,6,current,False,"INSERT INTO native_maintenance_schedule (job, next_due)
+             SELECT unnest(ARRAY[$1 /*, ... */]::text[]), $2
+             ON CONFLICT (job) DO NOTHING /* profile:top */",0,idle-ready-current-api-0c750f7e,48,0,3.3807090000000004,True,1,0
+api,6,current,False,"INSERT INTO runtime_retention_config (
+                id, enabled, check_interval_seconds, batch_size, max_batches_per_target, dry_run, advisory_lock_key,
+                cache_retention, native_maintenance
+             )
+             VALUES ($9, $1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (id) DO NOTHING /* profile:top */",0,idle-ready-current-api-0c750f7e,22,0,1.819726999999999,True,1,0
+api,6,current,False,"INSERT INTO runtime_retention_target_config (target, max_age_seconds)
+             SELECT target, max_age_seconds
+             FROM unnest($1::text[], $2::bigint[]) AS seed(target, max_age_seconds)
+             ON CONFLICT (target) DO NOTHING /* profile:top */",0,idle-ready-current-api-0c750f7e,193,0,7.966277,True,1,0
+api,33,current,False,LOCK TABLE ONLY event IN ACCESS SHARE MODE /* profile:top */,0,idle-ready-current-api-0c750f7e,8,0,0.46319500000000013,True,1,0
+api,66,current,False,LOCK TABLE ONLY execution_history IN ACCESS SHARE MODE /* profile:top */,0,idle-ready-current-api-0c750f7e,16,0,0.6584510000000005,True,1,0
+api,33,current,False,LOCK TABLE ONLY worker_history IN ACCESS SHARE MODE /* profile:top */,0,idle-ready-current-api-0c750f7e,0,0,0.20351799999999964,True,1,0
+api,4,current,False,ROLLBACK /* profile:top */,0,idle-ready-current-api-0c750f7e,0,0,0.003608,True,1,0
+api,180,current,False,"SELECT
+    id, runtime, runtime_ref, version,
+    version_major, version_minor, version_patch,
+    execution_config, distributions,
+    is_default, available, verified_at, meta, retired_at,
+    created, updated
+ FROM runtime_version WHERE runtime = ANY($1) AND retired_at IS NULL /* profile:top */",0,idle-ready-current-api-0c750f7e,180,0,16.353971000000005,True,1,0
+api,8,current,False,SELECT $1::regtype::oid /* profile:top */,8,idle-ready-current-api-0c750f7e,58,0,2.1683149999999998,True,1,0
+api,144,current,False,SELECT COUNT(*) FROM work_queue WHERE retired_at IS NULL AND effective_enabled = $1 /* profile:top */,144,idle-ready-current-api-0c750f7e,288,0,17.869580999999986,True,1,0
+api,144,current,False,SELECT COUNT(*) FROM work_queue_dispatch WHERE status = ANY($1) /* profile:top */,144,idle-ready-current-api-0c750f7e,144,0,10.698197000000002,True,1,0
+api,4,current,False,"SELECT b.bucket FROM generate_series($2::timestamptz, $3::timestamptz - interval $5, interval $6) AS b(bucket)
+             WHERE NOT EXISTS (SELECT $7 FROM native_summary_hour h WHERE h.kind = $1::text::native_summary_kind AND h.bucket = b.bucket)
+             ORDER BY b.bucket DESC LIMIT $4 /* profile:top */",0,idle-ready-current-api-0c750f7e,13,0,0.5495570000000001,True,1,0
+api,4,current,False,"SELECT b.bucket FROM generate_series($2::timestamptz, greatest($3::timestamptz, $2::timestamptz - ($4::bigint - $5) * interval $6), -interval $7) AS b(bucket)
+                 WHERE NOT EXISTS (SELECT $8 FROM native_summary_hour h WHERE h.kind = $1::text::native_summary_kind AND h.bucket = b.bucket) /* profile:top */",132,idle-ready-current-api-0c750f7e,4,0,0.378191,True,1,0
+api,4,current,False,"SELECT bucket FROM native_summary_invalidation WHERE kind = $1::text::native_summary_kind AND bucket >= $2 AND bucket < $3
+             GROUP BY bucket ORDER BY bucket LIMIT $4 /* profile:top */",0,idle-ready-current-api-0c750f7e,8,0,0.10773600000000001,True,1,0
+api,6,current,False,SELECT c.lease FROM pack_candidate_context c JOIN pack_install p ON p.id = c.install_id WHERE NOT c.revoked AND (c.expires_at <= clock_timestamp() OR p.status <> $2 OR p.started_at <= clock_timestamp() - INTERVAL $3) ORDER BY c.expires_at LIMIT $1 /* profile:top */,0,idle-ready-current-api-0c750f7e,0,0,0.5507170000000001,True,1,0
+api,144,current,False,"SELECT candidate.queue FROM unnest($1::bigint[]) AS candidate(queue)
+             WHERE EXISTS (
+                 SELECT $3 FROM work_queue_item item
+                 WHERE item.queue = candidate.queue
+                   AND item.status = ANY($2::work_queue_item_status_enum[])
+             ) /* profile:top */",0,idle-ready-current-api-0c750f7e,26,0,5.442764999999998,True,1,0
+api,180,current,False,SELECT clock_timestamp() /* profile:top */,180,idle-ready-current-api-0c750f7e,0,0,1.7768420000000003,True,1,0
+api,12,current,False,"SELECT compatibility_epoch, revision FROM platform_catalog_state WHERE singleton /* profile:top */",12,idle-ready-current-api-0c750f7e,24,0,0.7492370000000002,True,1,0
+api,6,current,False,"SELECT enabled, check_interval_seconds, batch_size, max_batches_per_target, dry_run, advisory_lock_key,
+                    cache_retention, native_maintenance
+             FROM runtime_retention_config
+             WHERE id = $1 /* profile:top */",6,idle-ready-current-api-0c750f7e,12,0,0.732394,True,1,0
+api,19,current,False,"SELECT enumlabel
+FROM pg_catalog.pg_enum
+WHERE enumtypid = $1
+ORDER BY enumsortorder /* profile:top */",78,idle-ready-current-api-0c750f7e,44,0,2.190997000000003,True,1,0
+api,12,current,False,"SELECT id, action, action_ref, pack_release, pack_release_digest, executable_snapshot, config, env_vars, parent, enforcement, executor, permission_set_refs, artifact_retention_policy, artifact_retention_limit, worker_selector, worker_tolerations, worker_affinity, worker, status, trace_tag, result, retry_count, max_retries, retry_reason, original_execution, started_at, timeout_seconds, workflow_task, created, updated FROM execution WHERE status = $1 AND updated < $2 ORDER BY updated ASC LIMIT $3 /* profile:top */",0,idle-ready-current-api-0c750f7e,24,0,0.7601910000000001,True,1,0
+api,12,current,False,"SELECT id, action, action_ref, pack_release, pack_release_digest, executable_snapshot, config, env_vars, parent, enforcement, executor, permission_set_refs, artifact_retention_policy, artifact_retention_limit, worker_selector, worker_tolerations, worker_affinity, worker, status, trace_tag, result, retry_count, max_retries, retry_reason, original_execution, started_at, timeout_seconds, workflow_task, created, updated FROM execution WHERE status = $1 ORDER BY created DESC, id DESC /* profile:top */",0,idle-ready-current-api-0c750f7e,36,0,1.3249259999999998,True,1,0
+api,180,current,False,"SELECT id, name, worker_type, worker_role, runtime, host, port, status, capabilities, meta, last_heartbeat, cordoned, cordon_reason, cordoned_by, cordoned_at, created, updated FROM worker WHERE id = $1 /* profile:top */",180,idle-ready-current-api-0c750f7e,186,0,20.00524499999999,True,1,378
+api,12,current,False,"SELECT id, name, worker_type, worker_role, runtime, host, port, status, capabilities, meta, last_heartbeat, cordoned, cordon_reason, cordoned_by, cordoned_at, created, updated FROM worker WHERE status = $1 ORDER BY name ASC /* profile:top */",60,idle-ready-current-api-0c750f7e,56,0,4.003214000000001,True,1,0
+api,180,current,False,"SELECT id, owner_roles, ref, label, description, version, conf_schema, config, meta, tags, runtime_deps, dependencies, is_standard, installers, worker_selector, worker_tolerations, worker_affinity, source_type, source_url, source_ref, checksum, checksum_verified, installed_at, installed_by, installation_method, storage_path, install_status, active_release, created, updated FROM pack WHERE id = ANY($1) /* profile:top */",180,idle-ready-current-api-0c750f7e,180,0,31.566339000000013,True,1,0
+api,144,current,False,"SELECT id, queue, queue_ref, execution, status, leased_item_count, created, updated FROM work_queue_dispatch WHERE status = ANY($1) ORDER BY created DESC LIMIT $2 OFFSET $3 /* profile:top */",0,idle-ready-current-api-0c750f7e,144,0,11.977304,True,1,0
+api,180,current,False,"SELECT id, ref, pack, pack_ref, description, name, aliases, distributions, installation, installers, execution_config, auto_detected, detection_config, retired_at, created, updated FROM runtime WHERE id = ANY($1) AND retired_at IS NULL /* profile:top */",180,idle-ready-current-api-0c750f7e,540,0,25.71748699999997,True,1,0
+api,144,current,False,"SELECT id, ref, pack, pack_ref, is_adhoc, label, description, effective_enabled AS enabled, enabled_override, accepting_new_items, dispatch_action, dispatch_action_ref, default_priority, allow_pending_update, update_strategy, batch_mode, item_schema, action_params, trace_tag_template, permission_set_refs, config, reference_visibility, reference_allowed_pack_refs, retired_at, created, updated FROM work_queue WHERE retired_at IS NULL AND effective_enabled = $1 ORDER BY ref ASC LIMIT $2 OFFSET $3 /* profile:top */",1152,idle-ready-current-api-0c750f7e,288,0,67.76524000000005,True,1,0
+api,180,current,False,"SELECT id, ref, pack, pack_ref, label, description, entrypoint, runtime, runtime_ref, runtime_version_constraint, effective_enabled AS enabled, enabled_override, param_schema, config, worker_selector, worker_tolerations, worker_affinity, log_retention_policy, log_retention_limit, artifact_retention_policy, artifact_retention_limit, retired_at, created, updated FROM sensor WHERE retired_at IS NULL ORDER BY ref ASC /* profile:top */",180,idle-ready-current-api-0c750f7e,360,0,50.14824399999999,True,1,0
+api,12,current,False,"SELECT job, next_due, last_success, deferred_since FROM native_maintenance_schedule ORDER BY job /* profile:top */",48,idle-ready-current-api-0c750f7e,24,0,1.819452,True,1,0
+api,1,current,False,"SELECT k.kind, d.notifications_at_least, d.notifications_at_least <= $1 AS count_exact,
+                  d.oldest_observed_notification, d.oldest_eligible_at
+             FROM unnest(enum_range($3::native_summary_kind)) AS k(kind)
+             CROSS JOIN LATERAL (
+                  SELECT count(*)::bigint AS notifications_at_least,
+                         min(n.created) AS oldest_observed_notification,
+                         min(GREATEST(n.created, n.bucket + interval $4)) AS oldest_eligible_at
+                  FROM (SELECT created, bucket FROM native_summary_invalidation WHERE kind = k.kind
+                        AND bucket < date_trunc($5, $2::timestamptz, $6)
+                        ORDER BY bucket, id LIMIT $1 + $7) n
+              ) d ORDER BY k.kind /* profile:top */",4,idle-ready-current-api-0c750f7e,26,0,0.252938,True,1,0
+api,19,current,False,"SELECT oid::regtype::text, typtype, typcategory, typrelid, typelem, typbasetype FROM pg_catalog.pg_type WHERE oid = $1 /* profile:top */",19,idle-ready-current-api-0c750f7e,77,0,2.45139,True,1,0
+api,6,current,False,SELECT pg_advisory_unlock($1) /* profile:top */,6,idle-ready-current-api-0c750f7e,0,0,0.137803,True,1,0
+api,6,current,False,SELECT pg_try_advisory_lock($1) /* profile:top */,6,idle-ready-current-api-0c750f7e,0,0,0.11101,True,1,0
+api,1,current,True,"SELECT query, toplevel, sum(calls)::bigint, sum(total_exec_time), sum(wal_bytes), sum(shared_blks_read), sum(shared_blks_hit), sum(rows) FROM pg_stat_statements WHERE dbid=(SELECT oid FROM pg_database WHERE datname=current_database()) GROUP BY query,toplevel /* profile:top */",3033,idle-ready-current-api-0c750f7e,9,0,48.894669,True,1,0
+api,1,current,False,"SELECT set_config($2,$1,$3) /* profile:top */",1,idle-ready-current-api-0c750f7e,0,0,0.010349999999999998,True,1,0
+api,6,current,False,"SELECT target, max_age_seconds
+             FROM runtime_retention_target_config
+             ORDER BY target ASC /* profile:top */",96,idle-ready-current-api-0c750f7e,12,0,0.8759129999999999,True,1,0
+api,180,current,False,"SELECT trigger.sensor AS sensor_id, rule.sensor_worker_selector, rule.sensor_worker_tolerations, rule.sensor_worker_affinity FROM trigger JOIN rule ON rule.trigger = trigger.id WHERE trigger.sensor = ANY($1) AND trigger.effective_enabled AND trigger.retired_at IS NULL AND rule.effective_enabled AND rule.retired_at IS NULL /* profile:top */",0,idle-ready-current-api-0c750f7e,1440,0,27.011437000000015,True,1,0
+api,721,current,False,"SELECT w.id, w.workflow_execution, w.task_name, w.kind, w.state, w.inquiry, w.target_execution, w.work_queue_item, w.result, w.resolved_at, w.released_at, w.created, w.updated FROM workflow_task_wait w WHERE (w.state = $1 AND ( (w.kind = $2 AND EXISTS ( SELECT $3 FROM inquiry i WHERE i.id = w.inquiry AND i.status <> $4 )) OR (w.kind = $5 AND (NOT EXISTS ( SELECT $6 FROM execution target WHERE target.id = w.target_execution ) OR EXISTS ( SELECT $7 FROM execution target WHERE target.id = w.target_execution AND target.status IN ($8 /*, ... */) ))) OR (w.kind = $9 AND (NOT EXISTS ( SELECT $10 FROM work_queue_item item WHERE item.id = w.work_queue_item ) OR EXISTS ( SELECT $11 FROM work_queue_item item WHERE item.id = w.work_queue_item AND item.status IN ($12 /*, ... */) ))) )) OR (w.state = $13 AND EXISTS ( SELECT $14 FROM execution e WHERE e.workflow_task->>$15 = w.workflow_execution::TEXT AND e.workflow_task->>$16 = w.task_name AND e.status = $17 )) OR (w.state IN ($18 /*, ... */) AND (w.result->>$19) IS DISTINCT FROM $20) ORDER BY w.id LIMIT $21 /* profile:top */",0,idle-ready-current-api-0c750f7e,2163,0,74.60619199999994,True,1,0
+api,132,current,False,SET LOCAL lock_timeout = $1 /* profile:top */,0,idle-ready-current-api-0c750f7e,0,0,0.3872279999999999,True,1,0
+api,132,current,False,SET LOCAL plan_cache_mode = $1 /* profile:top */,0,idle-ready-current-api-0c750f7e,0,0,0.22018999999999997,True,1,0
+api,644,current,False,SET LOCAL statement_timeout = $1 /* profile:top */,0,idle-ready-current-api-0c750f7e,0,0,1.8600379999999979,True,1,0
+api,128,current,False,SET LOCAL synchronous_commit = $1 /* profile:top */,0,idle-ready-current-api-0c750f7e,0,0,0.3651219999999998,True,1,0
+api,132,current,False,SET TRANSACTION ISOLATION LEVEL REPEATABLE READ /* profile:top */,0,idle-ready-current-api-0c750f7e,0,0,0.689711,True,1,0
+api,1081,current,False,"UPDATE inquiry SET status = $1, updated = NOW() WHERE status = $2 AND timeout_at IS NOT NULL AND timeout_at <= NOW() RETURNING id, created_by_execution, workflow_execution, workflow_task_name, action_attempt_family, purpose, prompt, response_schema, response_options, assigned_to, status, response, timeout_at, timeout_seconds, responded_by, external_actor, responded_at, created, updated /* profile:top */",0,idle-ready-current-api-0c750f7e,2162,0,110.95443999999974,True,1,0
+api,24,current,False,"UPDATE native_maintenance_schedule SET next_due = $3
+             WHERE job = $1 AND (next_due <= $2 OR $4) /* profile:top */",1,idle-ready-current-api-0c750f7e,50,0,3.1089709999999995,True,1,1069
+api,6,current,False,"UPDATE pack_install SET status = $1, candidate_access_token_hash = $2, error_message = $3, finished_at = NOW(), updated_at = NOW() WHERE (status IN ($4 /*, ... */) AND started_at < NOW() - make_interval(secs => $5)) OR (status = $6 AND updated_at < NOW() - make_interval(secs => $7)) RETURNING id, pack_ref, pack_version, status, trigger_reason, absent_metadata_policy, pack_id, requested_by, assigned_worker_id, candidate_access_token_hash, candidate_object_key, candidate_provider_version, candidate_archive_size, candidate_digest, test_execution_id, test_result, error_message, diagnostic_details, started_at, updated_at, finished_at /* profile:top */",0,idle-ready-current-api-0c750f7e,8,0,0.3354179999999999,True,1,0
+api,6,current,False,UPDATE supervisor_run SET heartbeat_at = NOW() WHERE id = $1 /* profile:top */,6,idle-ready-current-api-0c750f7e,24,0,1.0899009999999998,True,1,1311
+api,144,current,False,"UPDATE worker
+                SET last_heartbeat = $1,
+                    status = $2,
+                    updated = $1
+                WHERE id = $3 /* profile:top */",144,idle-ready-current-api-0c750f7e,4118,0,101.82696600000003,True,1,344439
+api,36,current,False,"UPDATE worker
+                SET last_heartbeat = $1,
+                    status = $2,
+                    updated = $3
+                WHERE id = $4 /* profile:top */",36,idle-ready-current-api-0c750f7e,1032,0,35.599683000000006,True,1,93198
+api,154,current,False,"WITH candidate AS ( SELECT item.id FROM workflow_log_outbox item WHERE item.is_head AND item.delivered_at IS NULL AND item.failed_at IS NULL AND item.available_at <= clock_timestamp() AND (item.claim_expires_at IS NULL OR item.claim_expires_at <= clock_timestamp()) ORDER BY item.available_at, item.created, item.id FOR UPDATE OF item SKIP LOCKED LIMIT $3 ), claimed AS ( UPDATE workflow_log_outbox item SET claimed_by = $1, claim_expires_at = clock_timestamp() + ($2 * INTERVAL $4), attempt_count = attempt_count + $5 FROM candidate WHERE item.id = candidate.id RETURNING item.id, item.workflow_execution, item.sequence, item.kind, item.payload, item.claimed_by, item.attempt_count ), resolved AS ( SELECT claimed.id, claimed.workflow_execution, claimed.sequence, claimed.kind, claimed.payload, workflow.execution AS parent_execution, execution.action_ref, claimed.claimed_by, claimed.attempt_count FROM claimed JOIN workflow_execution workflow ON workflow.id = claimed.workflow_execution JOIN execution ON execution.id = workflow.execution ) SELECT record.id, record.workflow_execution, record.sequence, record.kind, record.payload, record.parent_execution, record.action_ref, record.claimed_by, record.attempt_count, CASE WHEN record.id IS NOT NULL THEN $6 ELSE EXISTS( SELECT $7 FROM workflow_log_outbox pending WHERE pending.is_head AND pending.delivered_at IS NULL AND pending.failed_at IS NULL ) END AS pending FROM (VALUES ($8)) AS singleton(dummy) LEFT JOIN resolved record ON $9 /* profile:top */",154,idle-ready-current-api-0c750f7e,308,0,16.330841,True,1,0
+api,360,current,False,"WITH candidates AS ( SELECT id FROM inquiry_callback_delivery WHERE state = $3 AND next_attempt_at <= clock_timestamp() ORDER BY next_attempt_at, created, id LIMIT $1 FOR UPDATE SKIP LOCKED ) UPDATE inquiry_callback_delivery AS delivery SET attempt_count = attempt_count + $4, next_attempt_at = clock_timestamp() + make_interval(secs => $2::double precision), updated = NOW() FROM candidates WHERE delivery.id = candidates.id RETURNING delivery.id /* profile:top */",0,idle-ready-current-api-0c750f7e,360,0,38.22709800000001,True,1,0
+api,1,current,False,"WITH completion AS MATERIALIZED (
+                 SELECT GREATEST($4::timestamptz, clock_timestamp()) AS at
+             )
+             UPDATE native_maintenance_schedule
+             SET next_due = completion.at + ($2::timestamptz - $4::timestamptz),
+                 last_success = CASE WHEN $3 THEN completion.at ELSE last_success END,
+                 deferred_since = CASE WHEN $3 THEN $5 ELSE COALESCE(deferred_since, completion.at) END
+             FROM completion
+              WHERE job = $1 /* profile:top */",1,idle-ready-current-api-0c750f7e,4,0,0.10243899999999995,True,1,82
+api,4,current,False,"WITH heads AS (
+            SELECT $3::timestamptz - interval $4 AS bucket
+            UNION SELECT bucket - interval $5 FROM native_summary_hour
+                WHERE kind = $1::text::native_summary_kind AND bucket > $2 AND bucket <= $3
+         ) SELECT bucket FROM heads b WHERE bucket >= $2 AND bucket < $3
+           AND NOT EXISTS (SELECT $6 FROM native_summary_hour h WHERE h.kind = $1::text::native_summary_kind AND h.bucket = b.bucket)
+         ORDER BY bucket DESC LIMIT $7 /* profile:top */",4,idle-ready-current-api-0c750f7e,8,0,0.35024200000000005,True,1,0
+api,128,current,False,"WITH locked AS MATERIALIZED (
+                SELECT kind FROM native_summary_state WHERE kind = $1::text::native_summary_kind FOR UPDATE
+             ), updated AS (
+                UPDATE native_summary_state s SET updated = clock_timestamp()
+                FROM locked l WHERE s.kind = l.kind RETURNING s.kind
+             ) SELECT ARRAY(
+                SELECT i.id FROM native_summary_invalidation i
+                WHERE u.kind = $1::text::native_summary_kind
+                    AND i.kind = $1::text::native_summary_kind AND i.bucket = $2
+                ORDER BY i.id LIMIT $3
+             ) FROM updated u /* profile:top */",128,idle-ready-current-api-0c750f7e,898,0,10.853105,True,1,24968
+api,32,current,False,"WITH refreshed AS (
+                INSERT INTO event_volume_hourly_summary (bucket, trigger_ref, event_count)
+             SELECT $1, trigger_ref, count(*)::bigint FROM event
+             WHERE created >= $1 AND created < $2 GROUP BY trigger_ref RETURNING $5
+             ), coverage AS (
+                INSERT INTO native_summary_hour(kind,bucket,refreshed_at)
+                SELECT $3::text::native_summary_kind,$1,clock_timestamp() WHERE (SELECT count(*) FROM refreshed) >= $6
+                ON CONFLICT(kind,bucket) DO UPDATE SET refreshed_at = excluded.refreshed_at
+                RETURNING kind
+             ), acknowledged AS (
+                DELETE FROM native_summary_invalidation
+                WHERE kind = $3::text::native_summary_kind AND bucket = $1 AND id = ANY($4::bigint[])
+                    AND EXISTS (SELECT $7 FROM coverage)
+                RETURNING id
+             ) SELECT (SELECT count(*) FROM refreshed)::bigint,
+                      (SELECT count(*) FROM acknowledged)::bigint /* profile:top */",32,idle-ready-current-api-0c750f7e,200,0,3.4679620000000004,True,1,6368
+api,32,current,False,"WITH refreshed AS (
+                INSERT INTO execution_creation_hourly_summary (bucket, action_ref, execution_count)
+             SELECT $1, entity_ref, count(*)::bigint FROM execution_history
+             WHERE time >= $1 AND time < $2 AND operation = $5 GROUP BY entity_ref RETURNING $6
+             ), coverage AS (
+                INSERT INTO native_summary_hour(kind,bucket,refreshed_at)
+                SELECT $3::text::native_summary_kind,$1,clock_timestamp() WHERE (SELECT count(*) FROM refreshed) >= $7
+                ON CONFLICT(kind,bucket) DO UPDATE SET refreshed_at = excluded.refreshed_at
+                RETURNING kind
+             ), acknowledged AS (
+                DELETE FROM native_summary_invalidation
+                WHERE kind = $3::text::native_summary_kind AND bucket = $1 AND id = ANY($4::bigint[])
+                    AND EXISTS (SELECT $8 FROM coverage)
+                RETURNING id
+             ) SELECT (SELECT count(*) FROM refreshed)::bigint,
+                      (SELECT count(*) FROM acknowledged)::bigint /* profile:top */",32,idle-ready-current-api-0c750f7e,200,0,3.2093909999999997,True,1,6368
+api,32,current,False,"WITH refreshed AS (
+                INSERT INTO execution_status_hourly_summary (bucket, action_ref, new_status, transition_count)
+             SELECT $1, entity_ref, new_values->>$5, count(*)::bigint FROM execution_history
+             WHERE time >= $1 AND time < $2 AND $6 = ANY(changed_fields)
+             GROUP BY entity_ref, new_values->>'status' RETURNING $7
+             ), coverage AS (
+                INSERT INTO native_summary_hour(kind,bucket,refreshed_at)
+                SELECT $3::text::native_summary_kind,$1,clock_timestamp() WHERE (SELECT count(*) FROM refreshed) >= $8
+                ON CONFLICT(kind,bucket) DO UPDATE SET refreshed_at = excluded.refreshed_at
+                RETURNING kind
+             ), acknowledged AS (
+                DELETE FROM native_summary_invalidation
+                WHERE kind = $3::text::native_summary_kind AND bucket = $1 AND id = ANY($4::bigint[])
+                    AND EXISTS (SELECT $9 FROM coverage)
+                RETURNING id
+             ) SELECT (SELECT count(*) FROM refreshed)::bigint,
+                      (SELECT count(*) FROM acknowledged)::bigint /* profile:top */",32,idle-ready-current-api-0c750f7e,199,0,3.7262699999999986,True,1,6368
+api,32,current,False,"WITH refreshed AS (
+                INSERT INTO worker_status_hourly_summary (bucket, worker_name, new_status, transition_count)
+             SELECT $1, entity_ref, new_values->>$5, count(*)::bigint FROM worker_history
+             WHERE time >= $1 AND time < $2 AND $6 = ANY(changed_fields)
+             GROUP BY entity_ref, new_values->>'status' RETURNING $7
+             ), coverage AS (
+                INSERT INTO native_summary_hour(kind,bucket,refreshed_at)
+                SELECT $3::text::native_summary_kind,$1,clock_timestamp() WHERE (SELECT count(*) FROM refreshed) >= $8
+                ON CONFLICT(kind,bucket) DO UPDATE SET refreshed_at = excluded.refreshed_at
+                RETURNING kind
+             ), acknowledged AS (
+                DELETE FROM native_summary_invalidation
+                WHERE kind = $3::text::native_summary_kind AND bucket = $1 AND id = ANY($4::bigint[])
+                    AND EXISTS (SELECT $9 FROM coverage)
+                RETURNING id
+             ) SELECT (SELECT count(*) FROM refreshed)::bigint,
+                      (SELECT count(*) FROM acknowledged)::bigint /* profile:top */",32,idle-ready-current-api-0c750f7e,194,0,3.27792,True,1,14148
+volume,133,current,False,BEGIN /* profile:top */,0,idle-ready-repeat-current-vol-cf3658d9,0,0,0.06495400000000018,True,2,0
+volume,129,current,False,COMMIT /* profile:top */,0,idle-ready-repeat-current-vol-cf3658d9,0,0,0.07063999999999993,True,2,0
+volume,32,current,False,DELETE FROM event_volume_hourly_summary WHERE bucket = $1 /* profile:top */,0,idle-ready-repeat-current-vol-cf3658d9,64,0,0.24559399999999992,True,2,0
+volume,32,current,False,DELETE FROM execution_creation_hourly_summary WHERE bucket = $1 /* profile:top */,0,idle-ready-repeat-current-vol-cf3658d9,64,0,0.205553,True,2,0
+volume,32,current,False,DELETE FROM execution_status_hourly_summary WHERE bucket = $1 /* profile:top */,0,idle-ready-repeat-current-vol-cf3658d9,64,0,0.20991699999999996,True,2,0
+volume,32,current,False,DELETE FROM worker_status_hourly_summary WHERE bucket = $1 /* profile:top */,0,idle-ready-repeat-current-vol-cf3658d9,64,0,0.182765,True,2,0
+volume,13,current,False,"INSERT INTO audit_event (category, event_type, outcome, actor_identity, actor_login, actor_token_type, actor_ip, actor_user_agent, request_id, resource_type, resource_id, resource_ref, http_method, http_path, http_status, duration_ms, details, correlation_chain) VALUES ($1, $2, $3, $4, $5, $6, $7::inet, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) /* profile:top */",13,idle-ready-repeat-current-vol-cf3658d9,589,0,6.316643,True,2,37528
+volume,5,current,False,"INSERT INTO native_maintenance_schedule (job, next_due)
+             SELECT unnest(ARRAY[$1 /*, ... */]::text[]), $2
+             ON CONFLICT (job) DO NOTHING /* profile:top */",0,idle-ready-repeat-current-vol-cf3658d9,40,0,1.2093470000000002,True,2,0
+volume,5,current,False,"INSERT INTO runtime_retention_config (
+                id, enabled, check_interval_seconds, batch_size, max_batches_per_target, dry_run, advisory_lock_key,
+                cache_retention, native_maintenance
+             )
+             VALUES ($9, $1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (id) DO NOTHING /* profile:top */",0,idle-ready-repeat-current-vol-cf3658d9,10,0,1.5977880000000004,True,2,0
+volume,5,current,False,"INSERT INTO runtime_retention_target_config (target, max_age_seconds)
+             SELECT target, max_age_seconds
+             FROM unnest($1::text[], $2::bigint[]) AS seed(target, max_age_seconds)
+             ON CONFLICT (target) DO NOTHING /* profile:top */",0,idle-ready-repeat-current-vol-cf3658d9,161,0,3.3937479999999995,True,2,0
+volume,33,current,False,LOCK TABLE ONLY event IN ACCESS SHARE MODE /* profile:top */,0,idle-ready-repeat-current-vol-cf3658d9,8,0,0.29382900000000023,True,2,0
+volume,66,current,False,LOCK TABLE ONLY execution_history IN ACCESS SHARE MODE /* profile:top */,0,idle-ready-repeat-current-vol-cf3658d9,16,0,0.5714300000000002,True,2,0
+volume,33,current,False,LOCK TABLE ONLY worker_history IN ACCESS SHARE MODE /* profile:top */,0,idle-ready-repeat-current-vol-cf3658d9,8,0,0.3244170000000002,True,2,0
+volume,4,current,False,ROLLBACK /* profile:top */,0,idle-ready-repeat-current-vol-cf3658d9,0,0,0.0019560000000000133,True,2,0
+volume,180,current,False,"SELECT
+    id, runtime, runtime_ref, version,
+    version_major, version_minor, version_patch,
+    execution_config, distributions,
+    is_default, available, verified_at, meta, retired_at,
+    created, updated
+ FROM runtime_version WHERE runtime = ANY($1) AND retired_at IS NULL /* profile:top */",0,idle-ready-repeat-current-vol-cf3658d9,180,0,14.553851999999983,True,2,0
+volume,9,current,False,SELECT $1::regtype::oid /* profile:top */,9,idle-ready-repeat-current-vol-cf3658d9,66,0,2.556943000000002,True,2,0
+volume,144,current,False,SELECT COUNT(*) FROM work_queue WHERE retired_at IS NULL AND effective_enabled = $1 /* profile:top */,144,idle-ready-repeat-current-vol-cf3658d9,288,0,16.899604999999998,True,2,0
+volume,144,current,False,SELECT COUNT(*) FROM work_queue_dispatch WHERE status = ANY($1) /* profile:top */,144,idle-ready-repeat-current-vol-cf3658d9,144,0,10.319505,True,2,0
+volume,4,current,False,"SELECT b.bucket FROM generate_series($2::timestamptz, $3::timestamptz - interval $5, interval $6) AS b(bucket)
+             WHERE NOT EXISTS (SELECT $7 FROM native_summary_hour h WHERE h.kind = $1::text::native_summary_kind AND h.bucket = b.bucket)
+             ORDER BY b.bucket DESC LIMIT $4 /* profile:top */",0,idle-ready-repeat-current-vol-cf3658d9,7,0,0.23959799999999992,True,2,0
+volume,4,current,False,"SELECT b.bucket FROM generate_series($2::timestamptz, greatest($3::timestamptz, $2::timestamptz - ($4::bigint - $5) * interval $6), -interval $7) AS b(bucket)
+                 WHERE NOT EXISTS (SELECT $8 FROM native_summary_hour h WHERE h.kind = $1::text::native_summary_kind AND h.bucket = b.bucket) /* profile:top */",132,idle-ready-repeat-current-vol-cf3658d9,4,0,0.20564,True,2,0
+volume,4,current,False,"SELECT bucket FROM native_summary_invalidation WHERE kind = $1::text::native_summary_kind AND bucket >= $2 AND bucket < $3
+             GROUP BY bucket ORDER BY bucket LIMIT $4 /* profile:top */",0,idle-ready-repeat-current-vol-cf3658d9,8,0,0.055329,True,2,0
+volume,6,current,False,SELECT c.lease FROM pack_candidate_context c JOIN pack_install p ON p.id = c.install_id WHERE NOT c.revoked AND (c.expires_at <= clock_timestamp() OR p.status <> $2 OR p.started_at <= clock_timestamp() - INTERVAL $3) ORDER BY c.expires_at LIMIT $1 /* profile:top */,0,idle-ready-repeat-current-vol-cf3658d9,0,0,0.3100320000000001,True,2,0
+volume,144,current,False,"SELECT candidate.queue FROM unnest($1::bigint[]) AS candidate(queue)
+             WHERE EXISTS (
+                 SELECT $3 FROM work_queue_item item
+                 WHERE item.queue = candidate.queue
+                   AND item.status = ANY($2::work_queue_item_status_enum[])
+             ) /* profile:top */",0,idle-ready-repeat-current-vol-cf3658d9,26,0,4.551656000000002,True,2,0
+volume,180,current,False,SELECT clock_timestamp() /* profile:top */,180,idle-ready-repeat-current-vol-cf3658d9,0,0,1.7614099999999988,True,2,0
+volume,12,current,False,"SELECT compatibility_epoch, revision FROM platform_catalog_state WHERE singleton /* profile:top */",12,idle-ready-repeat-current-vol-cf3658d9,24,0,0.725751,True,2,0
+volume,5,current,False,"SELECT enabled, check_interval_seconds, batch_size, max_batches_per_target, dry_run, advisory_lock_key,
+                    cache_retention, native_maintenance
+             FROM runtime_retention_config
+             WHERE id = $1 /* profile:top */",5,idle-ready-repeat-current-vol-cf3658d9,10,0,0.3087000000000001,True,2,0
+volume,23,current,False,"SELECT enumlabel
+FROM pg_catalog.pg_enum
+WHERE enumtypid = $1
+ORDER BY enumsortorder /* profile:top */",94,idle-ready-repeat-current-vol-cf3658d9,52,0,2.2073430000000016,True,2,0
+volume,12,current,False,"SELECT id, action, action_ref, pack_release, pack_release_digest, executable_snapshot, config, env_vars, parent, enforcement, executor, permission_set_refs, artifact_retention_policy, artifact_retention_limit, worker_selector, worker_tolerations, worker_affinity, worker, status, trace_tag, result, retry_count, max_retries, retry_reason, original_execution, started_at, timeout_seconds, workflow_task, created, updated FROM execution WHERE status = $1 AND updated < $2 ORDER BY updated ASC LIMIT $3 /* profile:top */",0,idle-ready-repeat-current-vol-cf3658d9,24,0,0.6758110000000002,True,2,0
+volume,12,current,False,"SELECT id, action, action_ref, pack_release, pack_release_digest, executable_snapshot, config, env_vars, parent, enforcement, executor, permission_set_refs, artifact_retention_policy, artifact_retention_limit, worker_selector, worker_tolerations, worker_affinity, worker, status, trace_tag, result, retry_count, max_retries, retry_reason, original_execution, started_at, timeout_seconds, workflow_task, created, updated FROM execution WHERE status = $1 ORDER BY created DESC, id DESC /* profile:top */",0,idle-ready-repeat-current-vol-cf3658d9,39,0,1.202079,True,2,0
+volume,180,current,False,"SELECT id, name, worker_type, worker_role, runtime, host, port, status, capabilities, meta, last_heartbeat, cordoned, cordon_reason, cordoned_by, cordoned_at, created, updated FROM worker WHERE id = $1 /* profile:top */",180,idle-ready-repeat-current-vol-cf3658d9,599,0,23.701692999999977,True,2,752
+volume,12,current,False,"SELECT id, name, worker_type, worker_role, runtime, host, port, status, capabilities, meta, last_heartbeat, cordoned, cordon_reason, cordoned_by, cordoned_at, created, updated FROM worker WHERE status = $1 ORDER BY name ASC /* profile:top */",60,idle-ready-repeat-current-vol-cf3658d9,94,0,2.7561239999999994,True,2,0
+volume,180,current,False,"SELECT id, owner_roles, ref, label, description, version, conf_schema, config, meta, tags, runtime_deps, dependencies, is_standard, installers, worker_selector, worker_tolerations, worker_affinity, source_type, source_url, source_ref, checksum, checksum_verified, installed_at, installed_by, installation_method, storage_path, install_status, active_release, created, updated FROM pack WHERE id = ANY($1) /* profile:top */",180,idle-ready-repeat-current-vol-cf3658d9,180,0,26.351276,True,2,0
+volume,144,current,False,"SELECT id, queue, queue_ref, execution, status, leased_item_count, created, updated FROM work_queue_dispatch WHERE status = ANY($1) ORDER BY created DESC LIMIT $2 OFFSET $3 /* profile:top */",0,idle-ready-repeat-current-vol-cf3658d9,144,0,12.518288000000004,True,2,0
+volume,180,current,False,"SELECT id, ref, pack, pack_ref, description, name, aliases, distributions, installation, installers, execution_config, auto_detected, detection_config, retired_at, created, updated FROM runtime WHERE id = ANY($1) AND retired_at IS NULL /* profile:top */",180,idle-ready-repeat-current-vol-cf3658d9,540,0,24.865768000000003,True,2,0
+volume,144,current,False,"SELECT id, ref, pack, pack_ref, is_adhoc, label, description, effective_enabled AS enabled, enabled_override, accepting_new_items, dispatch_action, dispatch_action_ref, default_priority, allow_pending_update, update_strategy, batch_mode, item_schema, action_params, trace_tag_template, permission_set_refs, config, reference_visibility, reference_allowed_pack_refs, retired_at, created, updated FROM work_queue WHERE retired_at IS NULL AND effective_enabled = $1 ORDER BY ref ASC LIMIT $2 OFFSET $3 /* profile:top */",1152,idle-ready-repeat-current-vol-cf3658d9,288,0,74.41324600000004,True,2,0
+volume,180,current,False,"SELECT id, ref, pack, pack_ref, label, description, entrypoint, runtime, runtime_ref, runtime_version_constraint, effective_enabled AS enabled, enabled_override, param_schema, config, worker_selector, worker_tolerations, worker_affinity, log_retention_policy, log_retention_limit, artifact_retention_policy, artifact_retention_limit, retired_at, created, updated FROM sensor WHERE retired_at IS NULL ORDER BY ref ASC /* profile:top */",180,idle-ready-repeat-current-vol-cf3658d9,360,0,45.164111000000005,True,2,0
+volume,10,current,False,"SELECT job, next_due, last_success, deferred_since FROM native_maintenance_schedule ORDER BY job /* profile:top */",40,idle-ready-repeat-current-vol-cf3658d9,20,0,0.344311,True,2,0
+volume,1,current,False,"SELECT k.kind, d.notifications_at_least, d.notifications_at_least <= $1 AS count_exact,
+                  d.oldest_observed_notification, d.oldest_eligible_at
+             FROM unnest(enum_range($3::native_summary_kind)) AS k(kind)
+             CROSS JOIN LATERAL (
+                  SELECT count(*)::bigint AS notifications_at_least,
+                         min(n.created) AS oldest_observed_notification,
+                         min(GREATEST(n.created, n.bucket + interval $4)) AS oldest_eligible_at
+                  FROM (SELECT created, bucket FROM native_summary_invalidation WHERE kind = k.kind
+                        AND bucket < date_trunc($5, $2::timestamptz, $6)
+                        ORDER BY bucket, id LIMIT $1 + $7) n
+              ) d ORDER BY k.kind /* profile:top */",4,idle-ready-repeat-current-vol-cf3658d9,26,0,0.20306399999999997,True,2,0
+volume,1,current,False,"SELECT oid, typarray FROM pg_catalog.pg_type WHERE oid = $1::regtype::oid /* profile:top */",1,idle-ready-repeat-current-vol-cf3658d9,3,0,0.028653999999999957,True,2,0
+volume,24,current,False,"SELECT oid::regtype::text, typtype, typcategory, typrelid, typelem, typbasetype FROM pg_catalog.pg_type WHERE oid = $1 /* profile:top */",24,idle-ready-repeat-current-vol-cf3658d9,96,0,2.431326000000002,True,2,0
+volume,5,current,False,SELECT pg_advisory_unlock($1) /* profile:top */,5,idle-ready-repeat-current-vol-cf3658d9,0,0,0.045184,True,2,0
+volume,5,current,False,SELECT pg_try_advisory_lock($1) /* profile:top */,5,idle-ready-repeat-current-vol-cf3658d9,0,0,0.05310099999999998,True,2,0
+volume,1,current,True,"SELECT query, toplevel, sum(calls)::bigint, sum(total_exec_time), sum(wal_bytes), sum(shared_blks_read), sum(shared_blks_hit), sum(rows) FROM pg_stat_statements WHERE dbid=(SELECT oid FROM pg_database WHERE datname=current_database()) GROUP BY query,toplevel /* profile:top */",3032,idle-ready-repeat-current-vol-cf3658d9,9,0,21.236376,True,2,0
+volume,1,current,False,"SELECT set_config($2,$1,$3) /* profile:top */",1,idle-ready-repeat-current-vol-cf3658d9,0,0,0.011915000000000009,True,2,0
+volume,5,current,False,"SELECT target, max_age_seconds
+             FROM runtime_retention_target_config
+             ORDER BY target ASC /* profile:top */",80,idle-ready-repeat-current-vol-cf3658d9,10,0,0.278888,True,2,0
+volume,180,current,False,"SELECT trigger.sensor AS sensor_id, rule.sensor_worker_selector, rule.sensor_worker_tolerations, rule.sensor_worker_affinity FROM trigger JOIN rule ON rule.trigger = trigger.id WHERE trigger.sensor = ANY($1) AND trigger.effective_enabled AND trigger.retired_at IS NULL AND rule.effective_enabled AND rule.retired_at IS NULL /* profile:top */",0,idle-ready-repeat-current-vol-cf3658d9,1440,0,25.058805000000003,True,2,0
+volume,720,current,False,"SELECT w.id, w.workflow_execution, w.task_name, w.kind, w.state, w.inquiry, w.target_execution, w.work_queue_item, w.result, w.resolved_at, w.released_at, w.created, w.updated FROM workflow_task_wait w WHERE (w.state = $1 AND ( (w.kind = $2 AND EXISTS ( SELECT $3 FROM inquiry i WHERE i.id = w.inquiry AND i.status <> $4 )) OR (w.kind = $5 AND (NOT EXISTS ( SELECT $6 FROM execution target WHERE target.id = w.target_execution ) OR EXISTS ( SELECT $7 FROM execution target WHERE target.id = w.target_execution AND target.status IN ($8 /*, ... */) ))) OR (w.kind = $9 AND (NOT EXISTS ( SELECT $10 FROM work_queue_item item WHERE item.id = w.work_queue_item ) OR EXISTS ( SELECT $11 FROM work_queue_item item WHERE item.id = w.work_queue_item AND item.status IN ($12 /*, ... */) ))) )) OR (w.state = $13 AND EXISTS ( SELECT $14 FROM execution e WHERE e.workflow_task->>$15 = w.workflow_execution::TEXT AND e.workflow_task->>$16 = w.task_name AND e.status = $17 )) OR (w.state IN ($18 /*, ... */) AND (w.result->>$19) IS DISTINCT FROM $20) ORDER BY w.id LIMIT $21 /* profile:top */",0,idle-ready-repeat-current-vol-cf3658d9,2160,0,71.02522900000002,True,2,0
+volume,132,current,False,SET LOCAL lock_timeout = $1 /* profile:top */,0,idle-ready-repeat-current-vol-cf3658d9,0,0,0.37633100000000036,True,2,0
+volume,132,current,False,SET LOCAL plan_cache_mode = $1 /* profile:top */,0,idle-ready-repeat-current-vol-cf3658d9,0,0,0.29177499999999973,True,2,0
+volume,644,current,False,SET LOCAL statement_timeout = $1 /* profile:top */,0,idle-ready-repeat-current-vol-cf3658d9,0,0,2.1933679999999995,True,2,0
+volume,128,current,False,SET LOCAL synchronous_commit = $1 /* profile:top */,0,idle-ready-repeat-current-vol-cf3658d9,0,0,0.5070509999999996,True,2,0
+volume,132,current,False,SET TRANSACTION ISOLATION LEVEL REPEATABLE READ /* profile:top */,0,idle-ready-repeat-current-vol-cf3658d9,0,0,0.7658699999999989,True,2,0
+volume,1080,current,False,"UPDATE inquiry SET status = $1, updated = NOW() WHERE status = $2 AND timeout_at IS NOT NULL AND timeout_at <= NOW() RETURNING id, created_by_execution, workflow_execution, workflow_task_name, action_attempt_family, purpose, prompt, response_schema, response_options, assigned_to, status, response, timeout_at, timeout_seconds, responded_by, external_actor, responded_at, created, updated /* profile:top */",0,idle-ready-repeat-current-vol-cf3658d9,2160,0,100.47472799999983,True,2,0
+volume,20,current,False,"UPDATE native_maintenance_schedule SET next_due = $3
+             WHERE job = $1 AND (next_due <= $2 OR $4) /* profile:top */",1,idle-ready-repeat-current-vol-cf3658d9,42,0,0.7475129999999999,True,2,797
+volume,6,current,False,"UPDATE pack_install SET status = $1, candidate_access_token_hash = $2, error_message = $3, finished_at = NOW(), updated_at = NOW() WHERE (status IN ($4 /*, ... */) AND started_at < NOW() - make_interval(secs => $5)) OR (status = $6 AND updated_at < NOW() - make_interval(secs => $7)) RETURNING id, pack_ref, pack_version, status, trigger_reason, absent_metadata_policy, pack_id, requested_by, assigned_worker_id, candidate_access_token_hash, candidate_object_key, candidate_provider_version, candidate_archive_size, candidate_digest, test_execution_id, test_result, error_message, diagnostic_details, started_at, updated_at, finished_at /* profile:top */",0,idle-ready-repeat-current-vol-cf3658d9,6,0,0.190172,True,2,0
+volume,5,current,False,UPDATE supervisor_run SET heartbeat_at = NOW() WHERE id = $1 /* profile:top */,5,idle-ready-repeat-current-vol-cf3658d9,20,0,0.588034,True,2,997
+volume,144,current,False,"UPDATE worker
+                SET last_heartbeat = $1,
+                    status = $2,
+                    updated = $1
+                WHERE id = $3 /* profile:top */",144,idle-ready-repeat-current-vol-cf3658d9,4429,0,92.63369999999989,True,2,347811
+volume,36,current,False,"UPDATE worker
+                SET last_heartbeat = $1,
+                    status = $2,
+                    updated = $3
+                WHERE id = $4 /* profile:top */",36,idle-ready-repeat-current-vol-cf3658d9,1153,0,30.99927799999999,True,2,105225
+volume,169,current,False,"WITH candidate AS ( SELECT item.id FROM workflow_log_outbox item WHERE item.is_head AND item.delivered_at IS NULL AND item.failed_at IS NULL AND item.available_at <= clock_timestamp() AND (item.claim_expires_at IS NULL OR item.claim_expires_at <= clock_timestamp()) ORDER BY item.available_at, item.created, item.id FOR UPDATE OF item SKIP LOCKED LIMIT $3 ), claimed AS ( UPDATE workflow_log_outbox item SET claimed_by = $1, claim_expires_at = clock_timestamp() + ($2 * INTERVAL $4), attempt_count = attempt_count + $5 FROM candidate WHERE item.id = candidate.id RETURNING item.id, item.workflow_execution, item.sequence, item.kind, item.payload, item.claimed_by, item.attempt_count ), resolved AS ( SELECT claimed.id, claimed.workflow_execution, claimed.sequence, claimed.kind, claimed.payload, workflow.execution AS parent_execution, execution.action_ref, claimed.claimed_by, claimed.attempt_count FROM claimed JOIN workflow_execution workflow ON workflow.id = claimed.workflow_execution JOIN execution ON execution.id = workflow.execution ) SELECT record.id, record.workflow_execution, record.sequence, record.kind, record.payload, record.parent_execution, record.action_ref, record.claimed_by, record.attempt_count, CASE WHEN record.id IS NOT NULL THEN $6 ELSE EXISTS( SELECT $7 FROM workflow_log_outbox pending WHERE pending.is_head AND pending.delivered_at IS NULL AND pending.failed_at IS NULL ) END AS pending FROM (VALUES ($8)) AS singleton(dummy) LEFT JOIN resolved record ON $9 /* profile:top */",169,idle-ready-repeat-current-vol-cf3658d9,338,0,17.452801,True,2,0
+volume,360,current,False,"WITH candidates AS ( SELECT id FROM inquiry_callback_delivery WHERE state = $3 AND next_attempt_at <= clock_timestamp() ORDER BY next_attempt_at, created, id LIMIT $1 FOR UPDATE SKIP LOCKED ) UPDATE inquiry_callback_delivery AS delivery SET attempt_count = attempt_count + $4, next_attempt_at = clock_timestamp() + make_interval(secs => $2::double precision), updated = NOW() FROM candidates WHERE delivery.id = candidates.id RETURNING delivery.id /* profile:top */",0,idle-ready-repeat-current-vol-cf3658d9,360,0,34.779831999999985,True,2,0
+volume,1,current,False,"WITH completion AS MATERIALIZED (
+                 SELECT GREATEST($4::timestamptz, clock_timestamp()) AS at
+             )
+             UPDATE native_maintenance_schedule
+             SET next_due = completion.at + ($2::timestamptz - $4::timestamptz),
+                 last_success = CASE WHEN $3 THEN completion.at ELSE last_success END,
+                 deferred_since = CASE WHEN $3 THEN $5 ELSE COALESCE(deferred_since, completion.at) END
+             FROM completion
+              WHERE job = $1 /* profile:top */",1,idle-ready-repeat-current-vol-cf3658d9,4,0,0.06867400000000001,True,2,82
+volume,4,current,False,"WITH heads AS (
+            SELECT $3::timestamptz - interval $4 AS bucket
+            UNION SELECT bucket - interval $5 FROM native_summary_hour
+                WHERE kind = $1::text::native_summary_kind AND bucket > $2 AND bucket <= $3
+         ) SELECT bucket FROM heads b WHERE bucket >= $2 AND bucket < $3
+           AND NOT EXISTS (SELECT $6 FROM native_summary_hour h WHERE h.kind = $1::text::native_summary_kind AND h.bucket = b.bucket)
+         ORDER BY bucket DESC LIMIT $7 /* profile:top */",4,idle-ready-repeat-current-vol-cf3658d9,8,0,0.232256,True,2,0
+volume,128,current,False,"WITH locked AS MATERIALIZED (
+                SELECT kind FROM native_summary_state WHERE kind = $1::text::native_summary_kind FOR UPDATE
+             ), updated AS (
+                UPDATE native_summary_state s SET updated = clock_timestamp()
+                FROM locked l WHERE s.kind = l.kind RETURNING s.kind
+             ) SELECT ARRAY(
+                SELECT i.id FROM native_summary_invalidation i
+                WHERE u.kind = $1::text::native_summary_kind
+                    AND i.kind = $1::text::native_summary_kind AND i.bucket = $2
+                ORDER BY i.id LIMIT $3
+             ) FROM updated u /* profile:top */",128,idle-ready-repeat-current-vol-cf3658d9,898,0,9.50273,True,2,24966
+volume,32,current,False,"WITH refreshed AS (
+                INSERT INTO event_volume_hourly_summary (bucket, trigger_ref, event_count)
+             SELECT $1, trigger_ref, count(*)::bigint FROM event
+             WHERE created >= $1 AND created < $2 GROUP BY trigger_ref RETURNING $5
+             ), coverage AS (
+                INSERT INTO native_summary_hour(kind,bucket,refreshed_at)
+                SELECT $3::text::native_summary_kind,$1,clock_timestamp() WHERE (SELECT count(*) FROM refreshed) >= $6
+                ON CONFLICT(kind,bucket) DO UPDATE SET refreshed_at = excluded.refreshed_at
+                RETURNING kind
+             ), acknowledged AS (
+                DELETE FROM native_summary_invalidation
+                WHERE kind = $3::text::native_summary_kind AND bucket = $1 AND id = ANY($4::bigint[])
+                    AND EXISTS (SELECT $7 FROM coverage)
+                RETURNING id
+             ) SELECT (SELECT count(*) FROM refreshed)::bigint,
+                      (SELECT count(*) FROM acknowledged)::bigint /* profile:top */",32,idle-ready-repeat-current-vol-cf3658d9,200,0,2.886585000000002,True,2,14148
+volume,32,current,False,"WITH refreshed AS (
+                INSERT INTO execution_creation_hourly_summary (bucket, action_ref, execution_count)
+             SELECT $1, entity_ref, count(*)::bigint FROM execution_history
+             WHERE time >= $1 AND time < $2 AND operation = $5 GROUP BY entity_ref RETURNING $6
+             ), coverage AS (
+                INSERT INTO native_summary_hour(kind,bucket,refreshed_at)
+                SELECT $3::text::native_summary_kind,$1,clock_timestamp() WHERE (SELECT count(*) FROM refreshed) >= $7
+                ON CONFLICT(kind,bucket) DO UPDATE SET refreshed_at = excluded.refreshed_at
+                RETURNING kind
+             ), acknowledged AS (
+                DELETE FROM native_summary_invalidation
+                WHERE kind = $3::text::native_summary_kind AND bucket = $1 AND id = ANY($4::bigint[])
+                    AND EXISTS (SELECT $8 FROM coverage)
+                RETURNING id
+             ) SELECT (SELECT count(*) FROM refreshed)::bigint,
+                      (SELECT count(*) FROM acknowledged)::bigint /* profile:top */",32,idle-ready-repeat-current-vol-cf3658d9,194,0,2.9529820000000013,True,2,6368
+volume,32,current,False,"WITH refreshed AS (
+                INSERT INTO execution_status_hourly_summary (bucket, action_ref, new_status, transition_count)
+             SELECT $1, entity_ref, new_values->>$5, count(*)::bigint FROM execution_history
+             WHERE time >= $1 AND time < $2 AND $6 = ANY(changed_fields)
+             GROUP BY entity_ref, new_values->>'status' RETURNING $7
+             ), coverage AS (
+                INSERT INTO native_summary_hour(kind,bucket,refreshed_at)
+                SELECT $3::text::native_summary_kind,$1,clock_timestamp() WHERE (SELECT count(*) FROM refreshed) >= $8
+                ON CONFLICT(kind,bucket) DO UPDATE SET refreshed_at = excluded.refreshed_at
+                RETURNING kind
+             ), acknowledged AS (
+                DELETE FROM native_summary_invalidation
+                WHERE kind = $3::text::native_summary_kind AND bucket = $1 AND id = ANY($4::bigint[])
+                    AND EXISTS (SELECT $9 FROM coverage)
+                RETURNING id
+             ) SELECT (SELECT count(*) FROM refreshed)::bigint,
+                      (SELECT count(*) FROM acknowledged)::bigint /* profile:top */",32,idle-ready-repeat-current-vol-cf3658d9,194,0,2.8202810000000005,True,2,6368
+volume,32,current,False,"WITH refreshed AS (
+                INSERT INTO worker_status_hourly_summary (bucket, worker_name, new_status, transition_count)
+             SELECT $1, entity_ref, new_values->>$5, count(*)::bigint FROM worker_history
+             WHERE time >= $1 AND time < $2 AND $6 = ANY(changed_fields)
+             GROUP BY entity_ref, new_values->>'status' RETURNING $7
+             ), coverage AS (
+                INSERT INTO native_summary_hour(kind,bucket,refreshed_at)
+                SELECT $3::text::native_summary_kind,$1,clock_timestamp() WHERE (SELECT count(*) FROM refreshed) >= $8
+                ON CONFLICT(kind,bucket) DO UPDATE SET refreshed_at = excluded.refreshed_at
+                RETURNING kind
+             ), acknowledged AS (
+                DELETE FROM native_summary_invalidation
+                WHERE kind = $3::text::native_summary_kind AND bucket = $1 AND id = ANY($4::bigint[])
+                    AND EXISTS (SELECT $9 FROM coverage)
+                RETURNING id
+             ) SELECT (SELECT count(*) FROM refreshed)::bigint,
+                      (SELECT count(*) FROM acknowledged)::bigint /* profile:top */",32,idle-ready-repeat-current-vol-cf3658d9,193,0,2.845408,True,2,6368
+volume,1277,baseline,False,BEGIN /* profile:top */,0,idle-ready-repeat-base-vol-4761def1,0,0,1.6972919999999885,True,2,0
+volume,1273,baseline,False,COMMIT /* profile:top */,0,idle-ready-repeat-base-vol-4761def1,0,0,1.6515419999999992,True,2,0
+volume,32,baseline,False,DELETE FROM event_volume_hourly_summary WHERE bucket = $1 /* profile:top */,0,idle-ready-repeat-base-vol-4761def1,64,0,0.624572,True,2,0
+volume,32,baseline,False,DELETE FROM execution_creation_hourly_summary WHERE bucket = $1 /* profile:top */,0,idle-ready-repeat-base-vol-4761def1,64,0,0.1709980000000001,True,2,0
+volume,32,baseline,False,DELETE FROM execution_status_hourly_summary WHERE bucket = $1 /* profile:top */,0,idle-ready-repeat-base-vol-4761def1,64,0,0.18310400000000002,True,2,0
+volume,32,baseline,False,DELETE FROM worker_status_hourly_summary WHERE bucket = $1 /* profile:top */,0,idle-ready-repeat-base-vol-4761def1,64,0,0.1871270000000001,True,2,0
+volume,13,baseline,False,"INSERT INTO audit_event (category, event_type, outcome, actor_identity, actor_login, actor_token_type, actor_ip, actor_user_agent, request_id, resource_type, resource_id, resource_ref, http_method, http_path, http_status, duration_ms, details, correlation_chain) VALUES ($1, $2, $3, $4, $5, $6, $7::inet, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) /* profile:top */",13,idle-ready-repeat-base-vol-4761def1,586,0,11.088780000000002,True,2,36362
+volume,6,baseline,False,"INSERT INTO native_maintenance_schedule (job, next_due)
+             SELECT unnest(ARRAY[$1 /*, ... */]::text[]), $2
+             ON CONFLICT (job) DO NOTHING /* profile:top */",0,idle-ready-repeat-base-vol-4761def1,48,0,2.8996910000000002,True,2,0
+volume,6,baseline,False,"INSERT INTO runtime_retention_config (
+                id, enabled, check_interval_seconds, batch_size, max_batches_per_target, dry_run, advisory_lock_key,
+                cache_retention, native_maintenance
+             )
+             VALUES ($9, $1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (id) DO NOTHING /* profile:top */",0,idle-ready-repeat-base-vol-4761def1,22,0,1.9119429999999997,True,2,0
+volume,96,baseline,False,"INSERT INTO runtime_retention_target_config (target, max_age_seconds)
+                 VALUES ($1, $2)
+                 ON CONFLICT (target) DO NOTHING /* profile:top */",0,idle-ready-repeat-base-vol-4761def1,264,0,25.292735999999987,True,2,0
+volume,33,baseline,False,LOCK TABLE ONLY event IN ACCESS SHARE MODE /* profile:top */,0,idle-ready-repeat-base-vol-4761def1,8,0,0.4733120000000002,True,2,0
+volume,66,baseline,False,LOCK TABLE ONLY execution_history IN ACCESS SHARE MODE /* profile:top */,0,idle-ready-repeat-base-vol-4761def1,16,0,0.7734390000000009,True,2,0
+volume,33,baseline,False,LOCK TABLE ONLY worker_history IN ACCESS SHARE MODE /* profile:top */,0,idle-ready-repeat-base-vol-4761def1,8,0,0.5861870000000002,True,2,0
+volume,4,baseline,False,ROLLBACK /* profile:top */,0,idle-ready-repeat-base-vol-4761def1,0,0,0.005985999999999991,True,2,0
+volume,180,baseline,False,"SELECT
+    id, runtime, runtime_ref, version,
+    version_major, version_minor, version_patch,
+    execution_config, distributions,
+    is_default, available, verified_at, meta, retired_at,
+    created, updated
+ FROM runtime_version WHERE runtime = ANY($1) AND retired_at IS NULL /* profile:top */",0,idle-ready-repeat-base-vol-4761def1,180,0,16.475797999999998,True,2,0
+volume,10,baseline,False,SELECT $1::regtype::oid /* profile:top */,10,idle-ready-repeat-base-vol-4761def1,68,0,3.159484000000006,True,2,0
+volume,143,baseline,False,SELECT COUNT(*) FROM work_queue WHERE retired_at IS NULL AND effective_enabled = $1 /* profile:top */,143,idle-ready-repeat-base-vol-4761def1,286,0,20.657557999999995,True,2,0
+volume,1144,baseline,False,SELECT COUNT(*) FROM work_queue_dispatch WHERE queue = $1 AND status = ANY($2::work_queue_dispatch_status_enum[]) /* profile:top */,1144,idle-ready-repeat-base-vol-4761def1,2288,0,101.95490000000001,True,2,0
+volume,143,baseline,False,SELECT COUNT(*) FROM work_queue_dispatch WHERE status = ANY($1) /* profile:top */,143,idle-ready-repeat-base-vol-4761def1,143,0,11.865472999999994,True,2,0
+volume,4,baseline,False,"SELECT b.bucket FROM generate_series($2::timestamptz, $3::timestamptz - interval $5, interval $6) AS b(bucket)
+             WHERE NOT EXISTS (SELECT $7 FROM native_summary_hour h WHERE h.kind = $1::text::native_summary_kind AND h.bucket = b.bucket)
+             ORDER BY b.bucket DESC LIMIT $4 /* profile:top */",0,idle-ready-repeat-base-vol-4761def1,4,0,0.5703560000000001,True,2,0
+volume,4,baseline,False,"SELECT b.bucket FROM generate_series($2::timestamptz, greatest($3::timestamptz, $2::timestamptz - ($4::bigint - $5) * interval $6), -interval $7) AS b(bucket)
+                 WHERE NOT EXISTS (SELECT $8 FROM native_summary_hour h WHERE h.kind = $1::text::native_summary_kind AND h.bucket = b.bucket) /* profile:top */",132,idle-ready-repeat-base-vol-4761def1,4,0,0.5669379999999999,True,2,0
+volume,4,baseline,False,"SELECT bucket FROM native_summary_invalidation WHERE kind = $1::text::native_summary_kind AND bucket >= $2 AND bucket < $3
+             GROUP BY bucket ORDER BY bucket LIMIT $4 /* profile:top */",0,idle-ready-repeat-base-vol-4761def1,8,0,0.172687,True,2,0
+volume,6,baseline,False,SELECT c.lease FROM pack_candidate_context c JOIN pack_install p ON p.id = c.install_id WHERE NOT c.revoked AND (c.expires_at <= clock_timestamp() OR p.status <> $2 OR p.started_at <= clock_timestamp() - INTERVAL $3) ORDER BY c.expires_at LIMIT $1 /* profile:top */,0,idle-ready-repeat-base-vol-4761def1,0,0,0.3890520000000001,True,2,0
+volume,180,baseline,False,SELECT clock_timestamp() /* profile:top */,180,idle-ready-repeat-base-vol-4761def1,0,0,1.780908999999999,True,2,0
+volume,12,baseline,False,"SELECT compatibility_epoch, revision FROM platform_catalog_state WHERE singleton /* profile:top */",12,idle-ready-repeat-base-vol-4761def1,24,0,0.7449410000000001,True,2,0
+volume,6,baseline,False,"SELECT enabled, check_interval_seconds, batch_size, max_batches_per_target, dry_run, advisory_lock_key,
+                    cache_retention, native_maintenance
+             FROM runtime_retention_config
+             WHERE id = $1 /* profile:top */",6,idle-ready-repeat-base-vol-4761def1,12,0,0.580746,True,2,0
+volume,23,baseline,False,"SELECT enumlabel
+FROM pg_catalog.pg_enum
+WHERE enumtypid = $1
+ORDER BY enumsortorder /* profile:top */",106,idle-ready-repeat-base-vol-4761def1,52,0,2.6711190000000045,True,2,0
+volume,12,baseline,False,"SELECT id, action, action_ref, pack_release, pack_release_digest, executable_snapshot, config, env_vars, parent, enforcement, executor, permission_set_refs, artifact_retention_policy, artifact_retention_limit, worker_selector, worker_tolerations, worker_affinity, worker, status, trace_tag, result, retry_count, max_retries, retry_reason, original_execution, started_at, timeout_seconds, workflow_task, created, updated FROM execution WHERE status = $1 AND updated < $2 ORDER BY updated ASC LIMIT $3 /* profile:top */",0,idle-ready-repeat-base-vol-4761def1,24,0,0.8055360000000003,True,2,0
+volume,12,baseline,False,"SELECT id, action, action_ref, pack_release, pack_release_digest, executable_snapshot, config, env_vars, parent, enforcement, executor, permission_set_refs, artifact_retention_policy, artifact_retention_limit, worker_selector, worker_tolerations, worker_affinity, worker, status, trace_tag, result, retry_count, max_retries, retry_reason, original_execution, started_at, timeout_seconds, workflow_task, created, updated FROM execution WHERE status = $1 ORDER BY created DESC, id DESC /* profile:top */",0,idle-ready-repeat-base-vol-4761def1,24,0,0.7019389999999998,True,2,0
+volume,180,baseline,False,"SELECT id, name, worker_type, worker_role, runtime, host, port, status, capabilities, meta, last_heartbeat, cordoned, cordon_reason, cordoned_by, cordoned_at, created, updated FROM worker WHERE id = $1 /* profile:top */",180,idle-ready-repeat-base-vol-4761def1,420,0,25.25485399999999,True,2,1230
+volume,12,baseline,False,"SELECT id, name, worker_type, worker_role, runtime, host, port, status, capabilities, meta, last_heartbeat, cordoned, cordon_reason, cordoned_by, cordoned_at, created, updated FROM worker WHERE status = $1 ORDER BY name ASC /* profile:top */",60,idle-ready-repeat-base-vol-4761def1,68,0,4.318264,True,2,0
+volume,180,baseline,False,"SELECT id, owner_roles, ref, label, description, version, conf_schema, config, meta, tags, runtime_deps, dependencies, is_standard, installers, worker_selector, worker_tolerations, worker_affinity, source_type, source_url, source_ref, checksum, checksum_verified, installed_at, installed_by, installation_method, storage_path, install_status, active_release, created, updated FROM pack WHERE id = ANY($1) /* profile:top */",180,idle-ready-repeat-base-vol-4761def1,180,0,29.751802000000012,True,2,0
+volume,1144,baseline,False,"SELECT id, queue, queue_ref, execution, status, leased_item_count, created, updated FROM work_queue_dispatch WHERE queue = $1 AND status = ANY($2::work_queue_dispatch_status_enum[]) ORDER BY updated DESC LIMIT $3 /* profile:top */",0,idle-ready-repeat-base-vol-4761def1,2288,0,109.13088899999968,True,2,0
+volume,143,baseline,False,"SELECT id, queue, queue_ref, execution, status, leased_item_count, created, updated FROM work_queue_dispatch WHERE status = ANY($1) ORDER BY created DESC LIMIT $2 OFFSET $3 /* profile:top */",0,idle-ready-repeat-base-vol-4761def1,143,0,14.080715000000009,True,2,0
+volume,180,baseline,False,"SELECT id, ref, pack, pack_ref, description, name, aliases, distributions, installation, installers, execution_config, auto_detected, detection_config, retired_at, created, updated FROM runtime WHERE id = ANY($1) AND retired_at IS NULL /* profile:top */",180,idle-ready-repeat-base-vol-4761def1,540,0,28.94538900000002,True,2,0
+volume,143,baseline,False,"SELECT id, ref, pack, pack_ref, is_adhoc, label, description, effective_enabled AS enabled, enabled_override, accepting_new_items, dispatch_action, dispatch_action_ref, default_priority, allow_pending_update, update_strategy, batch_mode, item_schema, action_params, trace_tag_template, permission_set_refs, config, reference_visibility, reference_allowed_pack_refs, retired_at, created, updated FROM work_queue WHERE retired_at IS NULL AND effective_enabled = $1 ORDER BY ref ASC LIMIT $2 OFFSET $3 /* profile:top */",1144,idle-ready-repeat-base-vol-4761def1,286,0,41.66358600000004,True,2,0
+volume,180,baseline,False,"SELECT id, ref, pack, pack_ref, label, description, entrypoint, runtime, runtime_ref, runtime_version_constraint, effective_enabled AS enabled, enabled_override, param_schema, config, worker_selector, worker_tolerations, worker_affinity, log_retention_policy, log_retention_limit, artifact_retention_policy, artifact_retention_limit, retired_at, created, updated FROM sensor WHERE retired_at IS NULL ORDER BY ref ASC /* profile:top */",180,idle-ready-repeat-base-vol-4761def1,360,0,49.04382000000003,True,2,0
+volume,12,baseline,False,"SELECT job, next_due, last_success, deferred_since FROM native_maintenance_schedule ORDER BY job /* profile:top */",48,idle-ready-repeat-base-vol-4761def1,24,0,1.4219900000000005,True,2,0
+volume,1,baseline,False,"SELECT k.kind, d.notifications_at_least, d.notifications_at_least <= $1 AS count_exact,
+                  d.oldest_observed_notification, d.oldest_eligible_at
+             FROM unnest(enum_range($3::native_summary_kind)) AS k(kind)
+             CROSS JOIN LATERAL (
+                  SELECT count(*)::bigint AS notifications_at_least,
+                         min(n.created) AS oldest_observed_notification,
+                         min(GREATEST(n.created, n.bucket + interval $4)) AS oldest_eligible_at
+                  FROM (SELECT created, bucket FROM native_summary_invalidation WHERE kind = k.kind
+                        AND bucket < date_trunc($5, $2::timestamptz, $6)
+                        ORDER BY bucket, id LIMIT $1 + $7) n
+              ) d ORDER BY k.kind /* profile:top */",4,idle-ready-repeat-base-vol-4761def1,26,0,0.2585360000000001,True,2,0
+volume,23,baseline,False,"SELECT oid::regtype::text, typtype, typcategory, typrelid, typelem, typbasetype FROM pg_catalog.pg_type WHERE oid = $1 /* profile:top */",23,idle-ready-repeat-base-vol-4761def1,93,0,3.736494000000004,True,2,0
+volume,6,baseline,False,SELECT pg_advisory_unlock($1) /* profile:top */,6,idle-ready-repeat-base-vol-4761def1,0,0,0.06395999999999999,True,2,0
+volume,1144,baseline,False,"SELECT pg_advisory_xact_lock_shared(hashtextextended(current_schema() || $1, $2)), pg_backend_pid() AS backend /* profile:top */",1144,idle-ready-repeat-base-vol-4761def1,0,0,23.288847000000022,True,2,0
+volume,6,baseline,False,SELECT pg_try_advisory_lock($1) /* profile:top */,6,idle-ready-repeat-base-vol-4761def1,0,0,0.17591000000000004,True,2,0
+volume,1,baseline,True,"SELECT query, toplevel, sum(calls)::bigint, sum(total_exec_time), sum(wal_bytes), sum(shared_blks_read), sum(shared_blks_hit), sum(rows) FROM pg_stat_statements WHERE dbid=(SELECT oid FROM pg_database WHERE datname=current_database()) GROUP BY query,toplevel /* profile:top */",3031,idle-ready-repeat-base-vol-4761def1,9,0,35.680989000000004,True,2,0
+volume,1,baseline,False,"SELECT set_config($2,$1,$3) /* profile:top */",1,idle-ready-repeat-base-vol-4761def1,0,0,0.017923999999999995,True,2,0
+volume,6,baseline,False,"SELECT set_config($3, $1, $4), set_config($5, $2, $6) /* profile:top */",6,idle-ready-repeat-base-vol-4761def1,0,0,0.12686299999999995,True,2,0
+volume,6,baseline,False,"SELECT target, max_age_seconds
+             FROM runtime_retention_target_config
+             ORDER BY target ASC /* profile:top */",96,idle-ready-repeat-base-vol-4761def1,12,0,0.4725409999999999,True,2,0
+volume,180,baseline,False,"SELECT trigger.sensor AS sensor_id, rule.sensor_worker_selector, rule.sensor_worker_tolerations, rule.sensor_worker_affinity FROM trigger JOIN rule ON rule.trigger = trigger.id WHERE trigger.sensor = ANY($1) AND trigger.effective_enabled AND trigger.retired_at IS NULL AND rule.effective_enabled AND rule.retired_at IS NULL /* profile:top */",0,idle-ready-repeat-base-vol-4761def1,1440,0,28.907637000000015,True,2,0
+volume,720,baseline,False,"SELECT w.id, w.workflow_execution, w.task_name, w.kind, w.state, w.inquiry, w.target_execution, w.work_queue_item, w.result, w.resolved_at, w.released_at, w.created, w.updated FROM workflow_task_wait w WHERE (w.state = $1 AND ( (w.kind = $2 AND EXISTS ( SELECT $3 FROM inquiry i WHERE i.id = w.inquiry AND i.status <> $4 )) OR (w.kind = $5 AND (NOT EXISTS ( SELECT $6 FROM execution target WHERE target.id = w.target_execution ) OR EXISTS ( SELECT $7 FROM execution target WHERE target.id = w.target_execution AND target.status IN ($8 /*, ... */) ))) OR (w.kind = $9 AND (NOT EXISTS ( SELECT $10 FROM work_queue_item item WHERE item.id = w.work_queue_item ) OR EXISTS ( SELECT $11 FROM work_queue_item item WHERE item.id = w.work_queue_item AND item.status IN ($12 /*, ... */) ))) )) OR (w.state = $13 AND EXISTS ( SELECT $14 FROM execution e WHERE e.workflow_task->>$15 = w.workflow_execution::TEXT AND e.workflow_task->>$16 = w.task_name AND e.status = $17 )) OR (w.state IN ($18 /*, ... */) AND (w.result->>$19) IS DISTINCT FROM $20) ORDER BY w.id LIMIT $21 /* profile:top */",0,idle-ready-repeat-base-vol-4761def1,2160,0,67.27537300000024,True,2,0
+volume,132,baseline,False,SET LOCAL lock_timeout = $1 /* profile:top */,0,idle-ready-repeat-base-vol-4761def1,0,0,0.32373599999999986,True,2,0
+volume,132,baseline,False,SET LOCAL plan_cache_mode = $1 /* profile:top */,0,idle-ready-repeat-base-vol-4761def1,0,0,0.19663000000000008,True,2,0
+volume,644,baseline,False,SET LOCAL statement_timeout = $1 /* profile:top */,0,idle-ready-repeat-base-vol-4761def1,0,0,1.583342999999997,True,2,0
+volume,128,baseline,False,SET LOCAL synchronous_commit = $1 /* profile:top */,0,idle-ready-repeat-base-vol-4761def1,0,0,0.30669899999999983,True,2,0
+volume,132,baseline,False,SET TRANSACTION ISOLATION LEVEL REPEATABLE READ /* profile:top */,0,idle-ready-repeat-base-vol-4761def1,0,0,0.6125339999999998,True,2,0
+volume,1080,baseline,False,"UPDATE inquiry SET status = $1, updated = NOW() WHERE status = $2 AND timeout_at IS NOT NULL AND timeout_at <= NOW() RETURNING id, created_by_execution, workflow_execution, workflow_task_name, action_attempt_family, purpose, prompt, response_schema, response_options, assigned_to, status, response, timeout_at, timeout_seconds, responded_by, external_actor, responded_at, created, updated /* profile:top */",0,idle-ready-repeat-base-vol-4761def1,2160,0,130.18804299999945,True,2,0
+volume,24,baseline,False,"UPDATE native_maintenance_schedule SET next_due = $3
+             WHERE job = $1 AND (next_due <= $2 OR $4) /* profile:top */",1,idle-ready-repeat-base-vol-4761def1,50,0,2.4656249999999993,True,2,797
+volume,6,baseline,False,"UPDATE pack_install SET status = $1, candidate_access_token_hash = $2, error_message = $3, finished_at = NOW(), updated_at = NOW() WHERE (status IN ($4 /*, ... */) AND started_at < NOW() - make_interval(secs => $5)) OR (status = $6 AND updated_at < NOW() - make_interval(secs => $7)) RETURNING id, pack_ref, pack_version, status, trigger_reason, absent_metadata_policy, pack_id, requested_by, assigned_worker_id, candidate_access_token_hash, candidate_object_key, candidate_provider_version, candidate_archive_size, candidate_digest, test_execution_id, test_result, error_message, diagnostic_details, started_at, updated_at, finished_at /* profile:top */",0,idle-ready-repeat-base-vol-4761def1,6,0,0.21569299999999997,True,2,0
+volume,6,baseline,False,UPDATE supervisor_run SET heartbeat_at = NOW() WHERE id = $1 /* profile:top */,6,idle-ready-repeat-base-vol-4761def1,24,0,0.7821049999999998,True,2,2196
+volume,144,baseline,False,"UPDATE worker
+                SET last_heartbeat = $1,
+                    status = $2,
+                    updated = $1
+                WHERE id = $3 /* profile:top */",144,idle-ready-repeat-base-vol-4761def1,4285,0,102.95104700000007,True,2,318043
+volume,36,baseline,False,"UPDATE worker
+                SET last_heartbeat = $1,
+                    status = $2,
+                    updated = $3
+                WHERE id = $4 /* profile:top */",36,idle-ready-repeat-base-vol-4761def1,1111,0,33.72526999999999,True,2,129154
+volume,1144,baseline,False,"WITH anchor AS (
+                SELECT id,
+                       priority,
+                       historical_requester_identity,
+                       pack_release,
+                       pack_release_digest,
+                       executable_snapshot,
+                       payload #> $7::text[] AS group_value
+                FROM work_queue_item
+                WHERE queue = $1
+                  AND status = ANY($2::work_queue_item_status_enum[])
+                ORDER BY priority DESC, created ASC, id ASC
+                LIMIT $11
+                FOR UPDATE SKIP LOCKED
+            ),
+            extra_candidates_locked AS (
+                SELECT item.id,
+                       item.priority,
+                       item.created
+                FROM work_queue_item AS item
+                CROSS JOIN anchor
+                WHERE item.queue = $1
+                  AND item.status = ANY($2::work_queue_item_status_enum[])
+                  AND item.id <> anchor.id
+                  AND (NOT $10 OR item.historical_requester_identity IS NOT DISTINCT FROM anchor.historical_requester_identity)
+                  AND item.pack_release IS NOT DISTINCT FROM anchor.pack_release
+                  AND item.pack_release_digest IS NOT DISTINCT FROM anchor.pack_release_digest
+                  AND item.executable_snapshot IS NOT DISTINCT FROM anchor.executable_snapshot
+                  AND (
+                        $8 = $12
+                        OR anchor.group_value IS NULL
+                        OR anchor.group_value = $13::jsonb
+                        OR (
+                            item.payload #> $7::text[] = anchor.group_value
+                            AND ($9 OR item.priority = anchor.priority)
+                        )
+                  )
+                ORDER BY item.priority DESC, item.created ASC, item.id ASC
+                LIMIT GREATEST($3 - $14, $15)
+                FOR UPDATE SKIP LOCKED
+            ),
+            extra_candidates AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (ORDER BY priority DESC, created ASC, id ASC) AS sort_order
+                FROM extra_candidates_locked
+            ),
+            candidate AS (
+                SELECT id, $16 AS sort_order
+                FROM anchor
+                UNION ALL
+                SELECT id, sort_order
+                FROM extra_candidates
+            ),
+            updated AS (
+                UPDATE work_queue_item AS item
+                SET status = $17::work_queue_item_status_enum,
+                    leased_execution = $4,
+                    lease_token = $5,
+                    lease_expires_at = $6,
+                    attempt_count = item.attempt_count + $18,
+                    updated = NOW()
+                FROM candidate
+                WHERE item.id = candidate.id
+                RETURNING candidate.sort_order, item.id, item.queue, item.queue_ref, item.pack_release, item.pack_release_digest, item.executable_snapshot, item.item_key, item.priority, item.status, item.payload, item.schema_binding, item.metadata, item.trace_tag, item.enqueue_source, item.requested_by_identity, item.requested_by_execution, item.requested_by_enforcement, item.leased_execution, item.lease_token, item.lease_expires_at, item.attempt_count, item.last_error, item.ack_summary, item.created, item.updated
+            )
+            SELECT id, queue, queue_ref, pack_release, pack_release_digest, executable_snapshot, item_key, priority, status, payload, schema_binding, metadata, trace_tag, enqueue_source, requested_by_identity, requested_by_execution, requested_by_enforcement, leased_execution, lease_token, lease_expires_at, attempt_count, last_error, ack_summary, created, updated
+            FROM updated AS item
+            ORDER BY item.sort_order ASC /* profile:top */",0,idle-ready-repeat-base-vol-4761def1,0,0,73.93335200000004,True,2,0
+volume,6990,baseline,False,"WITH candidate AS ( SELECT item.id FROM workflow_log_outbox item WHERE item.is_head AND item.delivered_at IS NULL AND item.failed_at IS NULL AND item.available_at <= clock_timestamp() AND (item.claim_expires_at IS NULL OR item.claim_expires_at <= clock_timestamp()) ORDER BY item.available_at, item.created, item.id FOR UPDATE OF item SKIP LOCKED LIMIT $3 ), claimed AS ( UPDATE workflow_log_outbox item SET claimed_by = $1, claim_expires_at = clock_timestamp() + ($2 * INTERVAL $4), attempt_count = attempt_count + $5 FROM candidate WHERE item.id = candidate.id RETURNING item.id, item.workflow_execution, item.sequence, item.kind, item.payload, item.claimed_by, item.attempt_count ) SELECT claimed.id, claimed.workflow_execution, claimed.sequence, claimed.kind, claimed.payload, workflow.execution AS parent_execution, execution.action_ref, claimed.claimed_by, claimed.attempt_count FROM claimed JOIN workflow_execution workflow ON workflow.id = claimed.workflow_execution JOIN execution ON execution.id = workflow.execution /* profile:top */",0,idle-ready-repeat-base-vol-4761def1,6990,0,468.4859349999966,True,2,0
+volume,360,baseline,False,"WITH candidates AS ( SELECT id FROM inquiry_callback_delivery WHERE state = $3 AND next_attempt_at <= clock_timestamp() ORDER BY next_attempt_at, created, id LIMIT $1 FOR UPDATE SKIP LOCKED ) UPDATE inquiry_callback_delivery AS delivery SET attempt_count = attempt_count + $4, next_attempt_at = clock_timestamp() + make_interval(secs => $2::double precision), updated = NOW() FROM candidates WHERE delivery.id = candidates.id RETURNING delivery.id /* profile:top */",0,idle-ready-repeat-base-vol-4761def1,360,0,40.20084800000001,True,2,0
+volume,1,baseline,False,"WITH completion AS MATERIALIZED (
+                 SELECT GREATEST($4::timestamptz, clock_timestamp()) AS at
+             )
+             UPDATE native_maintenance_schedule
+             SET next_due = completion.at + ($2::timestamptz - $4::timestamptz),
+                 last_success = CASE WHEN $3 THEN completion.at ELSE last_success END,
+                 deferred_since = CASE WHEN $3 THEN $5 ELSE COALESCE(deferred_since, completion.at) END
+             FROM completion
+              WHERE job = $1 /* profile:top */",1,idle-ready-repeat-base-vol-4761def1,4,0,0.07909899999999997,True,2,82
+volume,4,baseline,False,"WITH heads AS (
+            SELECT $3::timestamptz - interval $4 AS bucket
+            UNION SELECT bucket - interval $5 FROM native_summary_hour
+                WHERE kind = $1::text::native_summary_kind AND bucket > $2 AND bucket <= $3
+         ) SELECT bucket FROM heads b WHERE bucket >= $2 AND bucket < $3
+           AND NOT EXISTS (SELECT $6 FROM native_summary_hour h WHERE h.kind = $1::text::native_summary_kind AND h.bucket = b.bucket)
+         ORDER BY bucket DESC LIMIT $7 /* profile:top */",4,idle-ready-repeat-base-vol-4761def1,8,0,0.5986959999999999,True,2,0
+volume,128,baseline,False,"WITH locked AS MATERIALIZED (
+                SELECT kind FROM native_summary_state WHERE kind = $1::text::native_summary_kind FOR UPDATE
+             ), updated AS (
+                UPDATE native_summary_state s SET updated = clock_timestamp()
+                FROM locked l WHERE s.kind = l.kind RETURNING s.kind
+             ) SELECT ARRAY(
+                SELECT i.id FROM native_summary_invalidation i
+                WHERE u.kind = $1::text::native_summary_kind
+                    AND i.kind = $1::text::native_summary_kind AND i.bucket = $2
+                ORDER BY i.id LIMIT $3
+             ) FROM updated u /* profile:top */",128,idle-ready-repeat-base-vol-4761def1,898,0,9.172516999999992,True,2,24968
+volume,32,baseline,False,"WITH refreshed AS (
+                INSERT INTO event_volume_hourly_summary (bucket, trigger_ref, event_count)
+             SELECT $1, trigger_ref, count(*)::bigint FROM event
+             WHERE created >= $1 AND created < $2 GROUP BY trigger_ref RETURNING $5
+             ), coverage AS (
+                INSERT INTO native_summary_hour(kind,bucket,refreshed_at)
+                SELECT $3::text::native_summary_kind,$1,clock_timestamp() WHERE (SELECT count(*) FROM refreshed) >= $6
+                ON CONFLICT(kind,bucket) DO UPDATE SET refreshed_at = excluded.refreshed_at
+                RETURNING kind
+             ), acknowledged AS (
+                DELETE FROM native_summary_invalidation
+                WHERE kind = $3::text::native_summary_kind AND bucket = $1 AND id = ANY($4::bigint[])
+                    AND EXISTS (SELECT $7 FROM coverage)
+                RETURNING id
+             ) SELECT (SELECT count(*) FROM refreshed)::bigint,
+                      (SELECT count(*) FROM acknowledged)::bigint /* profile:top */",32,idle-ready-repeat-base-vol-4761def1,194,0,2.671052999999999,True,2,14148
+volume,32,baseline,False,"WITH refreshed AS (
+                INSERT INTO execution_creation_hourly_summary (bucket, action_ref, execution_count)
+             SELECT $1, entity_ref, count(*)::bigint FROM execution_history
+             WHERE time >= $1 AND time < $2 AND operation = $5 GROUP BY entity_ref RETURNING $6
+             ), coverage AS (
+                INSERT INTO native_summary_hour(kind,bucket,refreshed_at)
+                SELECT $3::text::native_summary_kind,$1,clock_timestamp() WHERE (SELECT count(*) FROM refreshed) >= $7
+                ON CONFLICT(kind,bucket) DO UPDATE SET refreshed_at = excluded.refreshed_at
+                RETURNING kind
+             ), acknowledged AS (
+                DELETE FROM native_summary_invalidation
+                WHERE kind = $3::text::native_summary_kind AND bucket = $1 AND id = ANY($4::bigint[])
+                    AND EXISTS (SELECT $8 FROM coverage)
+                RETURNING id
+             ) SELECT (SELECT count(*) FROM refreshed)::bigint,
+                      (SELECT count(*) FROM acknowledged)::bigint /* profile:top */",32,idle-ready-repeat-base-vol-4761def1,194,0,2.5205119999999988,True,2,6368
+volume,32,baseline,False,"WITH refreshed AS (
+                INSERT INTO execution_status_hourly_summary (bucket, action_ref, new_status, transition_count)
+             SELECT $1, entity_ref, new_values->>$5, count(*)::bigint FROM execution_history
+             WHERE time >= $1 AND time < $2 AND $6 = ANY(changed_fields)
+             GROUP BY entity_ref, new_values->>'status' RETURNING $7
+             ), coverage AS (
+                INSERT INTO native_summary_hour(kind,bucket,refreshed_at)
+                SELECT $3::text::native_summary_kind,$1,clock_timestamp() WHERE (SELECT count(*) FROM refreshed) >= $8
+                ON CONFLICT(kind,bucket) DO UPDATE SET refreshed_at = excluded.refreshed_at
+                RETURNING kind
+             ), acknowledged AS (
+                DELETE FROM native_summary_invalidation
+                WHERE kind = $3::text::native_summary_kind AND bucket = $1 AND id = ANY($4::bigint[])
+                    AND EXISTS (SELECT $9 FROM coverage)
+                RETURNING id
+             ) SELECT (SELECT count(*) FROM refreshed)::bigint,
+                      (SELECT count(*) FROM acknowledged)::bigint /* profile:top */",32,idle-ready-repeat-base-vol-4761def1,194,0,2.8099540000000003,True,2,6368
+volume,32,baseline,False,"WITH refreshed AS (
+                INSERT INTO worker_status_hourly_summary (bucket, worker_name, new_status, transition_count)
+             SELECT $1, entity_ref, new_values->>$5, count(*)::bigint FROM worker_history
+             WHERE time >= $1 AND time < $2 AND $6 = ANY(changed_fields)
+             GROUP BY entity_ref, new_values->>'status' RETURNING $7
+             ), coverage AS (
+                INSERT INTO native_summary_hour(kind,bucket,refreshed_at)
+                SELECT $3::text::native_summary_kind,$1,clock_timestamp() WHERE (SELECT count(*) FROM refreshed) >= $8
+                ON CONFLICT(kind,bucket) DO UPDATE SET refreshed_at = excluded.refreshed_at
+                RETURNING kind
+             ), acknowledged AS (
+                DELETE FROM native_summary_invalidation
+                WHERE kind = $3::text::native_summary_kind AND bucket = $1 AND id = ANY($4::bigint[])
+                    AND EXISTS (SELECT $9 FROM coverage)
+                RETURNING id
+             ) SELECT (SELECT count(*) FROM refreshed)::bigint,
+                      (SELECT count(*) FROM acknowledged)::bigint /* profile:top */",32,idle-ready-repeat-base-vol-4761def1,193,0,2.949817000000003,True,2,6368

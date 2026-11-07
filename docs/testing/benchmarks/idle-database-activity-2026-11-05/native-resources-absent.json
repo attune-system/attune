@@ -1,0 +1,6 @@
+{
+  "container": "attune-native-idle-968900f02cc0-18-alpine",
+  "volume": "attune-native-idle-968900f02cc0-18-alpine-data",
+  "container_absent": true,
+  "volume_absent": true
+}

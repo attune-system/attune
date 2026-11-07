@@ -1,0 +1,21 @@
+{
+  "decision_utc": "2026-11-05T22:43:23.931627+00:00",
+  "reason": "Initial shared-file pair shows materially fewer idle calls but mixed completion latency and worse p95 in 9/12 profiles; independently repeat the whole matched matrix to assess repeatability.",
+  "initial_pair_order": [
+    "baseline",
+    "current"
+  ],
+  "repeat_pair_order": [
+    "current",
+    "baseline"
+  ],
+  "samples_per_profile": 100,
+  "profiles_per_revision": 12,
+  "idle_seconds": 360,
+  "settle_seconds": 60,
+  "capture_budget_ms": 10000,
+  "same_collector_and_images": true,
+  "retain_all_trials": true,
+  "no_fastest_trial_selection": true,
+  "runtime_revision": "0c37e1dd8792de0ec93bf7ed397e674a2cb4def8"
+}

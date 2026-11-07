@@ -6,6 +6,12 @@
 
 The supervisor is a single-purpose operations service. It should normally run as one replica, but every maintenance cycle is protected by a PostgreSQL advisory lock so accidental multiple replicas skip work instead of racing each other.
 
+The leader socket returns to the pool only after an acknowledged advisory unlock
+(or a confirmed failed acquisition). Cancellation, panic, SQL failure, and an
+unlock that reports no held lock discard the socket. Maintenance jobs cannot
+change that session's transaction state or settings. Physical-cleanup and probe
+connections retain their separate disposal fences.
+
 The executor still owns normal execution scheduling, workflow advancement, worker timeout reconciliation, and queue dispatch. The supervisor acts as the maintenance and safety-net layer for data that can otherwise grow without bound or remain stale after an abnormal shutdown.
 
 The service connects to:

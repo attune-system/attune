@@ -59,18 +59,6 @@ struct Cli {
     #[arg(long, env = "ATTUNE_MCP_ACCESS_POLICY")]
     access_policy: Option<String>,
 
-    /// Further restrict an access policy; cannot expand the selected policy
-    #[arg(long, env = "ATTUNE_MCP_ACCESS_MODE")]
-    access_mode: Option<AccessMode>,
-
-    /// Only expose these exact tool names (repeatable; env is comma-separated)
-    #[arg(
-        long = "allowed-tool",
-        env = "ATTUNE_MCP_ALLOWED_TOOLS",
-        value_delimiter = ','
-    )]
-    allowed_tools: Option<Vec<String>>,
-
     /// Listen address for the HTTP transport
     #[arg(long, env = "ATTUNE_MCP_LISTEN_ADDR", default_value = "0.0.0.0:8090")]
     listen_addr: String,
@@ -114,26 +102,31 @@ enum Transport {
     Http,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum AccessMode {
-    Full,
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ToolPolicy {
     ReadOnly,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ToolPolicy {
-    #[serde(rename = "access_mode")]
-    mode: AccessMode,
-    allowed_tools: Option<Vec<String>>,
+    FullAccess,
+    Allowlist(Vec<String>),
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AccessPolicies {
     default_policy: Option<String>,
-    policies: HashMap<String, ToolPolicy>,
+    #[serde(deserialize_with = "deserialize_policy_lists")]
+    policies: HashMap<String, Vec<String>>,
+}
+
+// YAML may otherwise coerce null to an empty collection or numeric list entries
+// to strings. Preserve value types before accepting an explicit map of lists.
+fn deserialize_policy_lists<'de, D>(
+    deserializer: D,
+) -> std::result::Result<HashMap<String, Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
 }
 
 impl AccessPolicies {
@@ -144,19 +137,24 @@ impl AccessPolicies {
                 !matches!(name.as_str(), "read-only" | "full-access"),
                 "MCP policy name '{name}' is reserved for a built-in access policy"
             );
-            ToolPolicy::new(policy.mode, policy.allowed_tools.clone())?;
+            for tool_name in policy {
+                anyhow::ensure!(
+                    tool_defs().iter().any(|tool| tool.name == tool_name),
+                    "Unknown MCP allowed tool '{tool_name}' in policy '{name}'"
+                );
+            }
         }
         let name = name
             .or(self.default_policy.as_deref())
             .unwrap_or("read-only");
         if let Some(policy) = self.policies.get(name) {
-            return Ok(policy.clone());
+            return Ok(ToolPolicy::Allowlist(policy.clone()));
         }
         if name == "read-only" {
-            return Ok(ToolPolicy::read_only());
+            return Ok(ToolPolicy::ReadOnly);
         }
         if name == "full-access" {
-            return ToolPolicy::new(AccessMode::Full, None);
+            return Ok(ToolPolicy::FullAccess);
         }
         Err(anyhow!("Unknown MCP access policy '{name}'"))
     }
@@ -171,10 +169,6 @@ fn build_tool_policy(cli: &Cli) -> Result<ToolPolicy> {
 }
 
 fn build_tool_policy_with_default(cli: &Cli, user_path: &std::path::Path) -> Result<ToolPolicy> {
-    let limits = ToolPolicy::new(
-        cli.access_mode.unwrap_or(AccessMode::Full),
-        cli.allowed_tools.clone(),
-    )?;
     let path = cli.policy_config.as_deref().unwrap_or(user_path);
     let policies = match std::fs::read_to_string(path) {
         Ok(content) => serde_yaml_ng::from_str::<AccessPolicies>(&content)
@@ -192,57 +186,16 @@ fn build_tool_policy_with_default(cli: &Cli, user_path: &std::path::Path) -> Res
                 .with_context(|| format!("Failed to read MCP policy config '{}'", path.display()))
         }
     };
-    let mut policy = policies.select(cli.access_policy.as_deref())?;
-    // Startup flags can only narrow a named policy, never expand it.
-    if limits.mode == AccessMode::ReadOnly {
-        policy.mode = AccessMode::ReadOnly;
-    }
-    if let Some(names) = limits.allowed_tools {
-        policy.allowed_tools = Some(
-            names
-                .into_iter()
-                .filter(|name| {
-                    policy
-                        .allowed_tools
-                        .as_ref()
-                        .is_none_or(|allowed| allowed.contains(name))
-                })
-                .collect(),
-        );
-    }
-    Ok(policy)
+    policies.select(cli.access_policy.as_deref())
 }
 
 impl ToolPolicy {
-    fn read_only() -> Self {
-        Self {
-            mode: AccessMode::ReadOnly,
-            allowed_tools: None,
-        }
-    }
-
-    fn new(mode: AccessMode, allowed_tools: Option<Vec<String>>) -> Result<Self> {
-        if let Some(names) = &allowed_tools {
-            let catalog = tool_defs();
-            for name in names {
-                anyhow::ensure!(
-                    catalog.iter().any(|tool| tool.name == name),
-                    "Unknown MCP allowed tool '{name}'"
-                );
-            }
-        }
-        Ok(Self {
-            mode,
-            allowed_tools,
-        })
-    }
-
     fn allows(&self, tool: &ToolDef) -> bool {
-        (self.mode == AccessMode::Full || tool.read_only)
-            && self
-                .allowed_tools
-                .as_ref()
-                .is_none_or(|names| names.iter().any(|name| name == tool.name))
+        match self {
+            Self::ReadOnly => tool.read_only,
+            Self::FullAccess => true,
+            Self::Allowlist(names) => names.iter().any(|name| name == tool.name),
+        }
     }
 }
 
@@ -311,7 +264,7 @@ impl McpServer {
             cache_refreshes: HashMap::new(),
             cache_refresh_order: VecDeque::new(),
             packs_check_access,
-            tool_policy: ToolPolicy::read_only(),
+            tool_policy: ToolPolicy::ReadOnly,
         }
     }
 
@@ -370,7 +323,7 @@ impl McpServer {
                         "name": "attune-mcp",
                         "version": env!("CARGO_PKG_VERSION")
                     },
-                    "instructions": if self.tool_policy.mode == AccessMode::ReadOnly {
+                    "instructions": if matches!(self.tool_policy, ToolPolicy::ReadOnly) {
                         "Attune MCP is in read-only mode. Use the available tools for information and inspection only. Tool access is also limited by the configured allowlist and Attune API permissions."
                     } else {
                         "Use available Attune tools for discovery, execution, queue interaction, artifacts, events, and inquiries. Tool access is limited by server configuration and Attune API permissions. Event creation is intentionally omitted."
@@ -2881,8 +2834,7 @@ async fn build_server(cli: &Cli) -> Result<McpServer> {
     tracing::info!(
         api_url = %sanitize_url_for_display(&effective_api_url),
         transport = ?cli.transport,
-        access_mode = ?tool_policy.mode,
-        allowed_tools = ?tool_policy.allowed_tools,
+        access_policy = ?tool_policy,
         auth_mode = %match auth_mode {
             AuthMode::ExecutionToken => "execution_token",
             AuthMode::ExplicitToken => "explicit_token",
@@ -3179,37 +3131,15 @@ mod tests {
             assert_eq!(policy.allows(tool), tool.read_only, "{}", tool.name);
         }
         assert!(!path.exists());
-        // A legacy-style mode flag must not silently expand the safe default.
-        cli.access_mode = Some(AccessMode::Full);
-        let policy = build_tool_policy_with_default(&cli, &path).unwrap();
-        assert_eq!(policy.mode, AccessMode::ReadOnly);
         cli.access_policy = Some("full-access".into());
         let full = build_tool_policy_with_default(&cli, &path).unwrap();
         assert!(tool_defs().iter().all(|tool| full.allows(tool)));
-        cli.access_mode = Some(AccessMode::ReadOnly);
-        let restricted = build_tool_policy_with_default(&cli, &path).unwrap();
-        assert!(tool_defs()
-            .iter()
-            .all(|tool| restricted.allows(tool) == tool.read_only));
-        cli.access_mode = None;
-        cli.allowed_tools = Some(vec!["events_get".into()]);
-        let restricted = build_tool_policy_with_default(&cli, &path).unwrap();
-        assert!(tool_defs()
-            .iter()
-            .all(|tool| restricted.allows(tool) == (tool.name == "events_get")));
-        // User policy files may deliberately select either built-in default.
         cli.access_policy = None;
-        cli.allowed_tools = None;
         std::fs::write(&path, "default_policy: full-access\npolicies: {}\n").unwrap();
         let full = build_tool_policy_with_default(&cli, &path).unwrap();
         assert!(tool_defs().iter().all(|tool| full.allows(tool)));
-        // Built-in names are stable and cannot be shadowed by user definitions.
         for name in ["read-only", "full-access"] {
-            std::fs::write(
-                &path,
-                format!("policies:\n  {name}:\n    access_mode: full\n"),
-            )
-            .unwrap();
+            std::fs::write(&path, format!("policies:\n  {name}: [events_get]\n")).unwrap();
             assert!(build_tool_policy_with_default(&cli, &path)
                 .unwrap_err()
                 .to_string()
@@ -3218,72 +3148,98 @@ mod tests {
     }
 
     #[test]
-    fn access_policies_validate_selection_and_reject_misconfiguration() {
-        let yaml = r#"
-default_policy: observer
-policies:
-  observer:
-    access_mode: read-only
-  operator:
-    access_mode: full
-    allowed_tools: [actions_list, actions_execute]
-  disabled:
-    access_mode: full
-    allowed_tools: []
-"#;
+    fn custom_access_policies_permit_exactly_their_explicit_lists() {
+        let yaml = "default_policy: operator\npolicies:\n  operator: [actions_list, actions_execute]\n  disabled: []\n";
         let parse = || serde_yaml_ng::from_str::<AccessPolicies>(yaml).unwrap();
-        let catalog = tool_defs();
-        let execute = catalog
-            .iter()
-            .find(|t| t.name == "actions_execute")
-            .unwrap();
-        let list = catalog.iter().find(|t| t.name == "actions_list").unwrap();
-        assert!(!parse().select(None).unwrap().allows(execute));
-        let operator = parse().select(Some("operator")).unwrap();
-        assert!(operator.allows(execute));
-        assert!(operator.allows(list));
-        assert!(!parse().select(Some("disabled")).unwrap().allows(list));
+        let policy = parse().select(None).unwrap();
+        for tool in tool_defs() {
+            assert_eq!(
+                policy.allows(tool),
+                matches!(tool.name, "actions_list" | "actions_execute"),
+                "{}",
+                tool.name
+            );
+        }
+        // Explicitly listed modifying tools are permitted without a mode field.
+        assert!(policy.allows(
+            tool_defs()
+                .iter()
+                .find(|t| t.name == "actions_execute")
+                .unwrap()
+        ));
+        let disabled = parse().select(Some("disabled")).unwrap();
+        assert!(tool_defs().iter().all(|tool| !disabled.allows(tool)));
         assert!(parse().select(Some("missing")).is_err());
-        assert!(serde_yaml_ng::from_str::<AccessPolicies>(
-            &yaml.replace("allowed_tools: []", "allowed_tool: []")
-        )
-        .is_err());
-        assert!(serde_yaml_ng::from_str::<AccessPolicies>(
-            &yaml.replace("actions_execute", "actions_exceute")
-        )
-        .unwrap()
-        .select(None)
-        .is_err());
         assert_eq!(
             serde_yaml_ng::from_str::<AccessPolicies>(
-                &yaml.replace("default_policy: observer", "")
+                &yaml.replace("default_policy: operator", "")
             )
             .unwrap()
             .select(None)
-            .unwrap()
-            .mode,
-            AccessMode::ReadOnly
+            .unwrap(),
+            ToolPolicy::ReadOnly
         );
     }
 
     #[test]
-    fn access_policy_startup_limits_only_narrow_permissions() {
+    fn access_policy_configuration_rejects_invalid_or_nested_definitions() {
+        for definition in [
+            "null",
+            "true",
+            "events_get",
+            "[null]",
+            "[42]",
+            "{access_mode: full, allowed_tools: [events_get]}",
+            "{allowed_tools: [events_get]}",
+            "{unexpected: [events_get]}",
+        ] {
+            let yaml = format!("policies:\n  custom: {definition}\n");
+            assert!(
+                serde_yaml_ng::from_str::<AccessPolicies>(&yaml).is_err(),
+                "{definition} must be a list of tool names"
+            );
+        }
+        assert!(serde_yaml_ng::from_str::<AccessPolicies>(
+            "default_policy: read-only\npolicies: {}\nunexpected: true\n"
+        )
+        .is_err());
+        let invalid_inactive: AccessPolicies = serde_yaml_ng::from_str(
+            "default_policy: read-only\npolicies:\n  inactive: [actions_exceute]\n",
+        )
+        .unwrap();
+        assert!(invalid_inactive
+            .select(None)
+            .unwrap_err()
+            .to_string()
+            .contains("Unknown MCP allowed tool"));
+    }
+
+    #[test]
+    fn access_policy_startup_selection_rejects_unknown_names_and_invalid_files() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("policies.yaml");
-        std::fs::write(&path, "default_policy: operator\npolicies:\n  operator:\n    access_mode: full\n    allowed_tools: [actions_list, actions_execute]\n").unwrap();
+        std::fs::write(
+            &path,
+            "policies:\n  operator: [actions_execute, events_get]\n",
+        )
+        .unwrap();
         let mut cli = Cli::try_parse_from(["attune-mcp"]).unwrap();
         cli.policy_config = Some(path.clone());
-        cli.access_mode = Some(AccessMode::ReadOnly);
-        cli.allowed_tools = Some(vec!["actions_execute".into(), "events_list".into()]);
+        cli.access_policy = Some("operator".into());
         let policy = build_tool_policy(&cli).unwrap();
-        assert!(tool_defs().iter().all(|t| !policy.allows(t)));
+        assert!(tool_defs().iter().all(
+            |tool| policy.allows(tool) == matches!(tool.name, "actions_execute" | "events_get")
+        ));
         cli.access_policy = Some("missing".into());
         assert!(build_tool_policy(&cli).is_err());
         cli.access_policy = None;
-        std::fs::write(path, "policies: invalid").unwrap();
+        std::fs::write(&path, "policies: invalid\n").unwrap();
         assert!(build_tool_policy(&cli).is_err());
-        assert!(Cli::try_parse_from(["attune-mcp", "--access-policy", "observer"]).is_ok());
-        assert!(Cli::try_parse_from(["attune-mcp", "--access-mode", "readonly"]).is_err());
+        std::fs::remove_file(path).unwrap();
+        assert!(build_tool_policy(&cli).is_err());
+        for flag in ["--access-mode", "--allowed-tool"] {
+            assert!(Cli::try_parse_from(["attune-mcp", flag, "read-only"]).is_err());
+        }
     }
 
     #[tokio::test]
@@ -3292,8 +3248,11 @@ policies:
         // A policy permits both operations without asserting that the user
         // holds either grant. The API remains authoritative for each target.
         let policy = serde_yaml_ng::from_str::<AccessPolicies>(
-            "default_policy: mine\npolicies:\n  mine:\n    access_mode: full\n    allowed_tools: [actions_execute, events_get]\n"
-        ).unwrap().select(None).unwrap();
+            "default_policy: mine\npolicies:\n  mine: [actions_execute, events_get]\n",
+        )
+        .unwrap()
+        .select(None)
+        .unwrap();
         for (action_ref, status, body) in [
             (
                 "production.deploy",
@@ -3393,7 +3352,7 @@ policies:
             );
         }
         let mut server = test_server(api.uri());
-        server.tool_policy = ToolPolicy::new(AccessMode::ReadOnly, None).unwrap();
+        server.tool_policy = ToolPolicy::ReadOnly;
         server.credentials = Some(LoginCredentials {
             api_url: api.uri(),
             login: "privileged".into(),
@@ -3446,7 +3405,7 @@ policies:
     }
 
     #[tokio::test]
-    async fn http_access_policy_allows_reads_and_rejects_unlisted_and_write_tools() {
+    async fn http_access_policy_allows_exact_list_and_rejects_unlisted_tools() {
         let api = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/events/42"))
@@ -3454,9 +3413,16 @@ policies:
             .expect(1)
             .mount(&api)
             .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/executions/execute"))
+            .and(body_json(json!({"action_ref":"core.echo"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{"id":7}})))
+            .expect(1)
+            .mount(&api)
+            .await;
         let mut server = test_server_with_access(api.uri(), PacksCheckAccess::Disabled);
         server.tool_policy = serde_yaml_ng::from_str::<AccessPolicies>(
-            "default_policy: observer\npolicies:\n  observer:\n    access_mode: read-only\n    allowed_tools: [events_get, actions_execute, packs_check]\n"
+            "default_policy: observer\npolicies:\n  observer: [events_get, actions_execute, packs_check]\n"
         ).unwrap().select(None).unwrap();
         let app = Router::new()
             .route("/mcp", post(http_mcp))
@@ -3482,7 +3448,7 @@ policies:
             ),
             (
                 "tools/call",
-                json!({"name":"actions_execute","arguments":{"ref":"core.echo"}}),
+                json!({"name":"actions_execute","arguments":{"action_ref":"core.echo"}}),
             ),
             ("tools/call", json!({"name":"events_list"})),
             (
@@ -3504,12 +3470,13 @@ policies:
         }
         stop.send(()).unwrap();
         task.await.unwrap();
-        assert_eq!(replies[0]["result"]["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(replies[0]["result"]["tools"].as_array().unwrap().len(), 2);
         assert_eq!(replies[1]["result"]["isError"], false);
-        for reply in &replies[2..] {
+        assert_eq!(replies[2]["result"]["isError"], false);
+        for reply in &replies[3..] {
             assert_eq!(reply["result"]["isError"], true);
         }
-        assert_eq!(api.received_requests().await.unwrap().len(), 1);
+        assert_eq!(api.received_requests().await.unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -3812,7 +3779,7 @@ policies:
             None,
             packs_check_access,
         );
-        server.tool_policy = ToolPolicy::new(AccessMode::Full, None).unwrap();
+        server.tool_policy = ToolPolicy::FullAccess;
         server
     }
 
@@ -5046,8 +5013,6 @@ policies:
             profile: None,
             api_url: None,
             transport: Transport::Stdio,
-            access_mode: Some(AccessMode::Full),
-            allowed_tools: None,
             policy_config: None,
             access_policy: None,
             listen_addr: "127.0.0.1:8090".to_string(),
@@ -5074,8 +5039,6 @@ policies:
             profile: None,
             api_url: None,
             transport: Transport::Stdio,
-            access_mode: Some(AccessMode::Full),
-            allowed_tools: None,
             policy_config: None,
             access_policy: None,
             listen_addr: "127.0.0.1:8090".to_string(),
@@ -5102,8 +5065,6 @@ policies:
             profile: None,
             api_url: None,
             transport: Transport::Stdio,
-            access_mode: Some(AccessMode::Full),
-            allowed_tools: None,
             policy_config: None,
             access_policy: None,
             listen_addr: "127.0.0.1:8090".to_string(),

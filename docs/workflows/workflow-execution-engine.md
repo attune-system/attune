@@ -464,6 +464,19 @@ freshness, page-retry, or failed-page fields.
 
 ## Retry Strategies
 
+Retries preserve the failed attempt's executable snapshot, schema, parameters,
+encrypted input records, task/index lineage, and original execution ID. They do
+not rerender templates or resolve new defaults. Duplicate completion delivery
+reuses an existing successor. Recovery republishes that same Requested row after
+its committed backoff deadline.
+
+Managed tasks require their retained invocation and accepted-input evidence;
+missing or revoked evidence cannot fall back to human IAM. Wholly ad hoc
+workflows and tasks retain their explicit active executor, recheck delegated
+permission refs and ordinary secret origins, and acquire no pack runtime
+authority. Their retry recovery requires the source execution row to survive.
+Cancellation and workflow/task eligibility checks apply before publication.
+
 ### Constant Backoff
 
 Fixed delay between retries:
@@ -761,6 +774,60 @@ See `docs/workflows/` for complete workflow examples demonstrating:
 - Conditional execution
 - Error handling and retries
 - Complex workflows with decisions
+
+## Durable workflow activity logs
+
+The executor records workflow activity in `workflow_log_outbox` and delivers it
+through the normal artifact transport. Only a workflow's undelivered FIFO head
+can be claimed. Claims, attempt identity, delivery sequence, append idempotency,
+seal reconciliation and effect authorization remain database-backed fences.
+A wakeup never grants delivery authority.
+
+Executors listen on `workflow_log_outbox_ready`. The forward migration
+`20261105000001_workflow_log_outbox_wakeups.sql` publishes an empty notification
+when a live head is inserted, promoted, explicitly retried, or made eligible
+sooner. Retry release also wakes listeners, even if its actual due time is in
+the future. PostgreSQL delivers these hints only after commit and discards them
+on rollback; identical hints can coalesce within a transaction. Ordinary claims
+and lease extension do not wake every competing executor.
+
+The claim statement returns both a possible claimed record and, when nothing
+can be claimed, whether a live head still exists in that same statement's
+snapshot. Pending heads keep the existing 100 ms polling cadence, including
+future retries, another executor's active lease, and temporarily locked rows.
+This preserves lease/retry timing without a second deadline query or a new
+index on frequently changing claim fields.
+
+When no live head exists and LISTEN is healthy, the dispatcher waits for a hint
+or a per-instance staggered 4–5 second reconciliation timer. A missed notification
+can therefore delay detection until that fallback scan; five seconds bounds the
+wait, not total delivery latency under load. Failed heads alone do not keep the
+dispatcher busy; explicit requeue publishes a new hint.
+
+Registration and every reconnection force an immediate durable scan, covering
+work committed before subscription or during disconnection. Without a usable
+listener, empty checks stay at 100 ms. Connection attempts have a three-second
+budget and a one-second retry delay; they advance within the dispatcher's async
+future without blocking work polling. Existing delivery errors retain their
+one-second error backoff. Busy delivery drains a bounded batch of already-ready
+hints without waiting. Reaching the drain budget discards the hint socket so a
+slow replica cannot retain a perpetually backlogged listener; durable scans
+continue and subscription resumes on the next idle wait. Busy delivery also
+cancels unfinished subscription attempts when work resumes. Unexpected dispatch errors discard the listener until
+reconciliation can resume, avoiding an indefinitely unread connection.
+
+Each executor may hold one additional, dedicated PostgreSQL backend for these hints,
+independent of the work pool's configured capacity. Its application name carries
+the `workflow-log-wakeup` purpose. Channels are registered once with
+`listen_all` per connection. Normal shutdown drains in-flight delivery and then
+closes the listener pool. Cancellation discards the dedicated listener socket
+using the shared SQLx cancellation capability; no detached listener task is
+created. Include this extra backend in deployment connection budgets.
+
+Apply the forward migration before running the updated executors. Older
+executors ignore the new hints and retain their polling behavior. The new
+fallback remains a recovery mechanism, not an alternative to deploying the
+migration. No RabbitMQ notification dependency or PostgreSQL extension is added.
 
 ## Related Documentation
 

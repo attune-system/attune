@@ -23,22 +23,16 @@ impl DeliveryEffectFence {
         self.check_at(Utc::now())
     }
     pub async fn ensure_fresh_on(&self, connection: &mut PgConnection) -> Result<()> {
-        self.approval.ensure_fresh_on(connection).await?;
         let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
             .fetch_one(&mut *connection)
             .await?;
         self.check_at(now)
     }
     fn check_at(&self, now: DateTime<Utc>) -> Result<()> {
-        // Supplement A's opaque validation, never replace it with a cached
-        // timestamp. Test BOTH retained bounds at the last DB sample so expiry
-        // between these two clock queries cannot outlive either deadline.
-        if now >= self.deadline
-            || self
-                .approval
-                .approval_deadline()
-                .is_some_and(|expiry| now >= expiry)
-        {
+        // One database wall-clock sample validates both retained bounds. This
+        // check still runs after target/file waits at each effect boundary.
+        self.approval.check_at(now)?;
+        if now >= self.deadline {
             return Err(denied());
         }
         Ok(())
@@ -120,17 +114,11 @@ impl WorkerDeliveryRepository {
         super::runtime_authority::RuntimeAdmissionRecord,
         DeliveryEffectFence,
     )> {
-        let admission = ExecutionAdmissionRepository::require(
+        let (admission, approval) = ExecutionAdmissionRepository::require_with_fence(
             connection,
             RuntimeOwner::Execution(context.execution),
         )
         .await?;
-        let approval =
-            super::runtime_authority::RuntimeAuthorityRepository::retained_admission_fence(
-                connection,
-                admission.id,
-            )
-            .await?;
         let persisted = Self::for_execution(connection, context.execution)
             .await?
             .ok_or_else(denied)?;
@@ -195,15 +183,11 @@ impl WorkerDeliveryRepository {
         if instance.is_nil() || deadline <= Utc::now() {
             return Err(denied());
         }
-        let admission =
-            ExecutionAdmissionRepository::require(connection, RuntimeOwner::Execution(execution))
-                .await?;
-        let approval =
-            super::runtime_authority::RuntimeAuthorityRepository::retained_admission_fence(
-                connection,
-                admission.id,
-            )
-            .await?;
+        let (admission, approval) = ExecutionAdmissionRepository::require_with_fence(
+            connection,
+            RuntimeOwner::Execution(execution),
+        )
+        .await?;
         let assigned: Option<(Option<i64>, String)> =
             sqlx::query_as("SELECT worker,status::text FROM execution WHERE id=$1 FOR SHARE")
                 .bind(execution)
@@ -397,15 +381,11 @@ impl WorkerDeliveryRepository {
         let initial: Option<(i64,)> = sqlx::query_as("SELECT c.execution FROM worker_delivery_permit p JOIN worker_delivery_context c ON c.token=p.context WHERE p.token=$1")
             .bind(permit).fetch_optional(&mut *connection).await?;
         let execution = initial.ok_or_else(denied)?.0;
-        let admission =
-            ExecutionAdmissionRepository::require(connection, RuntimeOwner::Execution(execution))
-                .await?;
-        let approval =
-            super::runtime_authority::RuntimeAuthorityRepository::retained_admission_fence(
-                connection,
-                admission.id,
-            )
-            .await?;
+        let (admission, approval) = ExecutionAdmissionRepository::require_with_fence(
+            connection,
+            RuntimeOwner::Execution(execution),
+        )
+        .await?;
         let context = Self::for_execution(connection, execution)
             .await?
             .ok_or_else(denied)?;

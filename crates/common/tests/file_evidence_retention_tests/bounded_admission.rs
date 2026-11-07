@@ -642,20 +642,36 @@ async fn over_budget_first_deletion_does_not_hide_the_257th_candidate() {
     let db = database().await;
     sqlx::query("INSERT INTO object_maintenance_ledger(object_key,object_kind,provider_version,state,eligible_at) SELECT 'bounded/fair/'||n,'artifact','v:bounded','deletion_pending',NOW()-INTERVAL '1 hour' FROM generate_series(1,257) n ORDER BY n")
         .execute(db.pool()).await.unwrap();
-    sqlx::raw_sql("CREATE FUNCTION owned_claim_delay() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN IF OLD.object_key='bounded/fair/1' THEN PERFORM pg_sleep(0.3); END IF; RETURN NEW; END; $$; CREATE TRIGGER owned_claim_delay BEFORE UPDATE OF state ON object_maintenance_ledger FOR EACH ROW WHEN (NEW.state='deleting') EXECUTE FUNCTION owned_claim_delay()")
+    // Sequences survive rollback: the second candidate times out once, then
+    // becomes cheap on the next frozen pass. Reaching 257 alone must not end
+    // the test before that deferred candidate has been revisited.
+    sqlx::raw_sql("CREATE SEQUENCE owned_claim_attempt; CREATE FUNCTION owned_claim_delay() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN IF OLD.object_key='bounded/fair/1' THEN PERFORM pg_sleep(1.5); ELSIF OLD.object_key='bounded/fair/2' AND nextval('owned_claim_attempt')=1 THEN PERFORM pg_sleep(1.5); END IF; RETURN NEW; END; $$; CREATE TRIGGER owned_claim_delay BEFORE UPDATE OF state ON object_maintenance_ledger FOR EACH ROW WHEN (NEW.state='deleting') EXECUTE FUNCTION owned_claim_delay()")
         .execute(db.pool()).await.unwrap();
+    // Use the deployment statement budget so incidental socket/commit latency
+    // is not the timeout source; the trigger remains six times over budget.
     let budget = MaintenanceBudget {
-        statement_timeout: Duration::from_millis(50),
+        statement_timeout: Duration::from_millis(250),
         ..Default::default()
     };
     let cancel = CancellationToken::new();
     let cutoff = Utc::now();
     let mut claimed = std::collections::HashSet::new();
     let mut oldest = None;
-    for _ in 0..270 {
-        let report =
-            Objects::claim_deletions_bounded(db.pool(), cutoff, 256, &budget, deadline(), &cancel)
-                .await;
+    let completion_deadline = Instant::now() + Duration::from_secs(60);
+    while claimed.len() < 256 {
+        assert!(
+            Instant::now() < completion_deadline,
+            "cheap candidates must complete across retry passes: {claimed:?}"
+        );
+        let report = Objects::claim_deletions_bounded(
+            db.pool(),
+            cutoff,
+            256,
+            &budget,
+            deadline().min(completion_deadline),
+            &cancel,
+        )
+        .await;
         assert!(
             matches!(
                 report.outcome,
@@ -686,15 +702,18 @@ async fn over_budget_first_deletion_does_not_hide_the_257th_candidate() {
         } else {
             oldest = age;
         }
-        if claimed.contains("bounded/fair/257") {
-            break;
-        }
     }
     assert_eq!(
         claimed.len(),
         256,
         "a slow first claim cannot hide the cheap tail"
     );
+    assert!(claimed.contains("bounded/fair/257"));
+    let attempts: i64 = sqlx::query_scalar("SELECT last_value FROM owned_claim_attempt")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert!(attempts >= 2, "the transient timeout must be retried");
     assert!(oldest.is_some());
     assert!(Objects::deletion_scan_pending(db.pool()).await.unwrap());
     let slow: (String, i32) = sqlx::query_as(
@@ -704,9 +723,23 @@ async fn over_budget_first_deletion_does_not_hide_the_257th_candidate() {
     .await
     .unwrap();
     assert_eq!(slow, ("deletion_pending".into(), 0));
-    let repeated =
+    let mut repeated =
         Objects::claim_deletions_bounded(db.pool(), cutoff, 256, &budget, deadline(), &cancel)
             .await;
+    // Completing an earlier deferred candidate can leave the current frozen
+    // pass before its empty tail. Acknowledge that tail before retrying the
+    // permanently slow head; neither visit may return another claim.
+    if repeated.outcome == MaintenanceOutcome::NoWork {
+        assert_eq!(repeated.changed, 0);
+        assert!(repeated.value.as_ref().is_some_and(Vec::is_empty));
+        assert_eq!(
+            Objects::deletion_deferred_since(db.pool()).await.unwrap(),
+            oldest
+        );
+        repeated =
+            Objects::claim_deletions_bounded(db.pool(), cutoff, 256, &budget, deadline(), &cancel)
+                .await;
+    }
     assert_eq!(
         repeated.outcome,
         MaintenanceOutcome::DeadlineDeferred,
@@ -717,7 +750,7 @@ async fn over_budget_first_deletion_does_not_hide_the_257th_candidate() {
     let age: Option<chrono::DateTime<Utc>> = sqlx::query_scalar("SELECT LEAST(deferred_since,oversized_since) FROM graph_reclamation_progress WHERE phase='object_deletions'")
         .fetch_one(db.pool()).await.unwrap();
     assert_eq!(age, oldest);
-    sqlx::raw_sql("DROP TRIGGER owned_claim_delay ON object_maintenance_ledger; DROP FUNCTION owned_claim_delay()")
+    sqlx::raw_sql("DROP TRIGGER owned_claim_delay ON object_maintenance_ledger; DROP FUNCTION owned_claim_delay(); DROP SEQUENCE owned_claim_attempt")
         .execute(db.pool()).await.unwrap();
     let mut repaired = 0;
     for _ in 0..3 {

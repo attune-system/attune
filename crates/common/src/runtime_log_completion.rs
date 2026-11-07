@@ -5,6 +5,30 @@ use crate::{runtime_read_log, Error, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Positive evidence of intentional silence, recorded only after worker capture
+/// settled. Missing metadata (including crash/supervisor settlement) is unknown.
+/// Callers still authorize execution visibility before interpreting this marker.
+pub fn execution_stream_is_empty(execution: &crate::models::Execution, stream: &str) -> bool {
+    matches!(
+        execution.status,
+        crate::models::ExecutionStatus::Completed
+            | crate::models::ExecutionStatus::Failed
+            | crate::models::ExecutionStatus::Cancelled
+            | crate::models::ExecutionStatus::Timeout
+    ) && matches!(stream, "stdout" | "stderr")
+        && execution.result.as_ref().is_some_and(|result| {
+            result
+                .get("logs_incomplete")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+                && result
+                    .get("runtime_log_capture")
+                    .and_then(|capture| capture.get(stream))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("empty")
+        })
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FinalLogManifest {
@@ -205,6 +229,33 @@ impl<'a> FrameVerifier<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_stream_requires_terminal_positive_capture_evidence() {
+        use crate::models::ExecutionStatus;
+        let mut execution: crate::models::Execution = serde_json::from_value(serde_json::json!({
+            "id": 1, "action_ref": "core.echo", "status": "completed", "permission_set_refs": [],
+            "retry_count": 0, "created": "2026-11-04T00:00:00Z", "updated": "2026-11-04T00:00:01Z",
+            "result": {"runtime_log_capture":{"stdout":"empty", "stderr":"captured"}}
+        }))
+        .unwrap();
+        assert!(execution_stream_is_empty(&execution, "stdout"));
+        assert!(!execution_stream_is_empty(&execution, "stderr"));
+        assert!(!execution_stream_is_empty(&execution, "other"));
+        for status in [
+            ExecutionStatus::Running,
+            ExecutionStatus::Canceling,
+            ExecutionStatus::Abandoned,
+        ] {
+            execution.status = status;
+            assert!(!execution_stream_is_empty(&execution, "stdout"));
+        }
+        execution.status = ExecutionStatus::Failed;
+        execution.result.as_mut().unwrap()["logs_incomplete"] = serde_json::json!(true);
+        assert!(!execution_stream_is_empty(&execution, "stdout"));
+        execution.result = Some(serde_json::json!({}));
+        assert!(!execution_stream_is_empty(&execution, "stdout"));
+    }
 
     #[test]
     fn zero_plaintext_nonzero_empty_frames_require_exact_manifest() {

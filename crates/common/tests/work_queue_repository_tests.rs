@@ -27,17 +27,22 @@ async fn create_queue_fixture() -> (
     attune_common::models::work_queue::WorkQueue,
 ) {
     let pool = create_test_pool().await.expect("test pool");
+    let queue = create_queue(&pool).await;
+    (pool, queue)
+}
+
+async fn create_queue(pool: &sqlx::PgPool) -> attune_common::models::work_queue::WorkQueue {
     let pack = PackFixture::new_unique("queue_repo")
-        .create(&pool)
+        .create(pool)
         .await
         .expect("pack");
     let action = ActionFixture::new_unique(pack.id, &pack.r#ref, "dispatch")
-        .create(&pool)
+        .create(pool)
         .await
         .expect("action");
 
-    let queue = WorkQueueRepository::create(
-        &pool,
+    WorkQueueRepository::create(
+        pool,
         CreateWorkQueueInput {
             r#ref: format!("{}.inbox", pack.r#ref),
             pack: Some(pack.id),
@@ -73,9 +78,7 @@ async fn create_queue_fixture() -> (
         },
     )
     .await
-    .expect("queue");
-
-    (pool, queue)
+    .expect("queue")
 }
 
 #[tokio::test]
@@ -1041,6 +1044,102 @@ async fn work_queue_item_repository_falls_back_to_fifo_when_group_value_is_missi
 }
 
 #[tokio::test]
+async fn active_dispatch_count_is_queue_scoped_and_tracks_terminal_transitions() {
+    let (db, queue) = create_queue_fixture().await;
+    assert_eq!(
+        WorkQueueDispatchRepository::count_active_for_queue(&db, queue.id)
+            .await
+            .unwrap(),
+        0
+    );
+    // A second queue in the same database makes cross-queue leakage observable.
+    let other = create_queue(&db).await;
+    let mut active_ids = Vec::new();
+    for (index, status) in [
+        WorkQueueDispatchStatus::Leased,
+        WorkQueueDispatchStatus::Dispatched,
+        WorkQueueDispatchStatus::Completed,
+        WorkQueueDispatchStatus::Failed,
+        WorkQueueDispatchStatus::Released,
+        WorkQueueDispatchStatus::Cancelled,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for target in [&queue, &other] {
+            let dispatch = WorkQueueDispatchRepository::create(
+                &db,
+                CreateWorkQueueDispatchInput {
+                    id: None,
+                    queue: target.id,
+                    queue_ref: target.r#ref.clone(),
+                    execution: target.id * 100 + index as i64,
+                    status,
+                    leased_item_count: 1,
+                },
+            )
+            .await
+            .unwrap();
+            if target.id == queue.id
+                && matches!(
+                    status,
+                    WorkQueueDispatchStatus::Leased | WorkQueueDispatchStatus::Dispatched
+                )
+            {
+                active_ids.push(dispatch.id);
+            }
+        }
+    }
+    let search = WorkQueueDispatchRepository::search(
+        &db,
+        &WorkQueueDispatchSearchFilters {
+            queue: Some(queue.id),
+            statuses: Some(vec![
+                WorkQueueDispatchStatus::Leased,
+                WorkQueueDispatchStatus::Dispatched,
+            ]),
+            limit: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(search.rows.len(), 1);
+    assert_eq!(search.total, 2);
+    assert_eq!(
+        WorkQueueDispatchRepository::count_active_for_queue(&db, queue.id)
+            .await
+            .unwrap(),
+        search.total
+    );
+    for (index, dispatch) in active_ids.into_iter().enumerate() {
+        WorkQueueDispatchRepository::update(
+            &db,
+            dispatch,
+            UpdateWorkQueueDispatchInput {
+                status: Some(WorkQueueDispatchStatus::Completed),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            WorkQueueDispatchRepository::count_active_for_queue(&db, queue.id)
+                .await
+                .unwrap(),
+            1 - index as u64
+        );
+    }
+    assert_eq!(
+        WorkQueueDispatchRepository::count_active_for_queue(&db, other.id)
+            .await
+            .unwrap(),
+        2
+    );
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
 async fn work_queue_dispatch_repository_tracks_active_and_terminal_dispatches() {
     let (pool, queue) = create_queue_fixture().await;
 
@@ -1100,4 +1199,85 @@ async fn work_queue_dispatch_repository_tracks_active_and_terminal_dispatches() 
         .await
         .expect("list active after completion");
     assert!(!active_after.iter().any(|row| row.id == dispatch.id));
+}
+
+#[tokio::test]
+async fn readiness_hints_only_include_selected_queues_with_dispatchable_statuses() {
+    let (db, empty) = create_queue_fixture().await;
+    let mut selected = vec![empty.id];
+    let mut expected = Vec::new();
+    for status in [
+        WorkQueueItemStatus::Queued,
+        WorkQueueItemStatus::Retry,
+        WorkQueueItemStatus::Leased,
+        WorkQueueItemStatus::Completed,
+        WorkQueueItemStatus::Failed,
+        WorkQueueItemStatus::Skipped,
+        WorkQueueItemStatus::Cancelled,
+    ] {
+        let queue = create_queue(&db).await;
+        selected.push(queue.id);
+        if matches!(
+            status,
+            WorkQueueItemStatus::Queued | WorkQueueItemStatus::Retry
+        ) {
+            expected.push(queue.id);
+        }
+        WorkQueueItemRepository::create(
+            &db,
+            CreateWorkQueueItemInput {
+                queue: queue.id,
+                queue_ref: queue.r#ref.clone(),
+                item_key: None,
+                priority: 0,
+                status,
+                payload: json!({"order_id": 1}),
+                metadata: json!({}),
+                trace_tag: None,
+                enqueue_source: "api".into(),
+                requested_by_identity: None,
+                requested_by_execution: None,
+                requested_by_enforcement: None,
+                leased_execution: None,
+                lease_token: (status == WorkQueueItemStatus::Leased).then(Uuid::new_v4),
+                lease_expires_at: (status == WorkQueueItemStatus::Leased)
+                    .then(|| Utc::now() + Duration::minutes(5)),
+                attempt_count: 0,
+                last_error: None,
+                ack_summary: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let mut ready = WorkQueueItemRepository::queues_with_ready_items(&db, &selected)
+        .await
+        .unwrap();
+    ready.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(ready, expected);
+    assert!(
+        WorkQueueItemRepository::queues_with_ready_items(&db, &[empty.id])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(WorkQueueItemRepository::queues_with_ready_items(&db, &[])
+        .await
+        .unwrap()
+        .is_empty());
+
+    // This is not a remembered empty result: the next snapshot sees new work.
+    sqlx::query("UPDATE work_queue_item SET status = 'retry', lease_token = NULL, lease_expires_at = NULL WHERE queue = $1")
+        .bind(selected[3])
+        .execute(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        WorkQueueItemRepository::queues_with_ready_items(&db, &[selected[3]])
+            .await
+            .unwrap(),
+        vec![selected[3]]
+    );
+    db.cleanup().await.unwrap();
 }

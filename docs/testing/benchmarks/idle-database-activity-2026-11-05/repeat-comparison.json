@@ -1,0 +1,71 @@
+{
+  "volume": {
+    "database_terminal_p50_ms": {
+      "median_paired_change_percent": -3.446354765870019,
+      "improved_profiles": 7,
+      "worst_change_percent": 18.36460325461198,
+      "best_change_percent": -27.870044752997515,
+      "baseline_profile_mean": 792.100658082442,
+      "current_profile_mean": 730.2074558319873
+    },
+    "database_terminal_p95_ms": {
+      "median_paired_change_percent": -5.977372544784821,
+      "improved_profiles": 10,
+      "worst_change_percent": 9.116555391088665,
+      "best_change_percent": -27.50541229797755,
+      "baseline_profile_mean": 1012.7972690837245,
+      "current_profile_mean": 899.1987514988674
+    },
+    "top_level_statement_calls_per_job": {
+      "median_paired_change_percent": -3.176942351004608,
+      "improved_profiles": 12,
+      "worst_change_percent": -1.3436897607438492,
+      "best_change_percent": -4.027261462205701,
+      "baseline_profile_mean": 499.9825,
+      "current_profile_mean": 484.97083333333336
+    },
+    "top_level_exec_ms_per_job": {
+      "median_paired_change_percent": -1.5601782975692757,
+      "improved_profiles": 8,
+      "worst_change_percent": 13.501680930487868,
+      "best_change_percent": -31.889912053482284,
+      "baseline_profile_mean": 305.5334179775001,
+      "current_profile_mean": 250.88888541333407
+    },
+    "top_level_wal_bytes_per_job": {
+      "median_paired_change_percent": -0.4216739989096774,
+      "improved_profiles": 7,
+      "worst_change_percent": 1.1967093504767545,
+      "best_change_percent": -1.6744681420410856,
+      "baseline_profile_mean": 59110.14666666667,
+      "current_profile_mean": 59046.54666666667
+    },
+    "idle": {
+      "top_level_statement_calls_per_minute": {
+        "baseline": 3383.7234825718615,
+        "current": 1109.662740191933,
+        "change_percent": -67.20586815360831
+      },
+      "top_level_exec_ms_per_minute": {
+        "baseline": 258.4716526056594,
+        "current": 117.49169800486052,
+        "change_percent": -54.54368135908767
+      },
+      "top_level_wal_bytes_per_minute": {
+        "baseline": 91002.08097792526,
+        "current": 91887.54040685295,
+        "change_percent": 0.9730100887939797
+      },
+      "top_level_counter_query_exec_ms_per_minute": {
+        "baseline": 5.946052714143724,
+        "current": 3.5388519573368673,
+        "change_percent": -40.48401305089189
+      },
+      "top_level_exec_ms_excluding_counter_queries_per_minute": {
+        "baseline": 252.52559989151572,
+        "current": 113.95284604752366,
+        "change_percent": -54.87473503815951
+      }
+    }
+  }
+}

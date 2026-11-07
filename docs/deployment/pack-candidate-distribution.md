@@ -76,3 +76,23 @@ ATTUNE_TEST_RUN_ID=pack-candidate-s3 cargo test -p attune-api \
 
 The external-service test is excluded from infrastructure-free runs only; pack
 installation tests are not skipped by this change.
+
+## Shared-volume release verification
+
+Installed shared-volume releases retain their content-addressed archive and
+extracted tree. The volume transport hashes an unverified archive before use,
+using a bounded buffer on a blocking task. Warm Unix consumers retain a bounded,
+process-local proof keyed by archive path, expected digest, device, inode, size,
+mtime and ctime (including nanoseconds). Concurrent checks of one release share
+its verification. Replacement or mutation invalidates the proof, as does
+transport eviction; missing manifests or archives always fail. Verification
+checks descriptor and path identity again after hashing before retaining proof.
+Platforms without Unix change-time evidence rehash instead of caching.
+
+This relies on the existing immutable-release storage boundary: the mounted
+filesystem must supply coherent file identity/change metadata, and extracted
+release trees must not be edited in place. It does not verify extracted code
+against the archive on every invocation, or treat a ready-marker file as a
+content-integrity proof. Restarting the consumer discards all retained proofs.
+Pack candidates continue to download pinned archives from the configured object
+backend and do not use this installed-release shortcut.

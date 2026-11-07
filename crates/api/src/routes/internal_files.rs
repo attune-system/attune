@@ -2045,7 +2045,12 @@ struct SealLogQuery {
     truncated: bool,
 }
 
-#[tracing::instrument(name = "log_stream_seal", level = "debug", skip_all)]
+#[tracing::instrument(
+    name = "log_stream_seal",
+    level = "debug",
+    skip_all,
+    fields(artifact_version)
+)]
 async fn seal_log_stream(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
@@ -2053,7 +2058,8 @@ async fn seal_log_stream(
     Query(query): Query<SealLogQuery>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let version = authorize_log_version(&state, &user, artifact_version).await?;
+    tracing::Span::current().record("artifact_version", artifact_version);
+    let version = authorize_seal_log_version(&state, &user, artifact_version).await?;
     let stream = LogStreamRepository::find_by_artifact_version(&state.db, artifact_version)
         .await
         .map_err(map_repository_error)?
@@ -2081,9 +2087,16 @@ async fn seal_log_stream(
             .await
             .map_err(map_repository_error)?;
         trace.stage("encrypted_seal_proof");
-        let proof =
-            encrypted_log_seal_proof(&mut transaction, &state, &user, &version, &stream, &headers)
-                .await?;
+        let proof = encrypted_log_seal_proof(
+            &mut transaction,
+            &state,
+            &user,
+            &version,
+            &stream,
+            &headers,
+            &effect,
+        )
+        .await?;
         let mut verifier = proof.as_ref().map(|proof| {
             attune_common::runtime_log_completion::FrameVerifier::new(
                 state
@@ -2114,8 +2127,12 @@ async fn seal_log_stream(
                 .map_err(map_transport_error)?
                 .is_some()
             {
-                let permit = attune_common::repositories::worker_delivery::WorkerDeliveryRepository::for_version(&mut transaction,version.id)
-                .await.map_err(map_transport_error)?.ok_or_else(|| (StatusCode::FORBIDDEN,"Worker delivery permit unavailable".into()))?;
+                let (_, permit, _) = effect.worker.as_ref().ok_or_else(|| {
+                    (
+                        StatusCode::FORBIDDEN,
+                        "Worker delivery proof unavailable".into(),
+                    )
+                })?;
                 transport
                     .inspect_log_file(file_path, Some(permit.max_bytes as u64))
                     .await
@@ -2270,42 +2287,35 @@ async fn seal_log_stream(
         }
 
         trace.stage("publication_revalidation");
-        let current_version =
-            ArtifactVersionRepository::find_by_id_for_update(&mut transaction, artifact_version)
-                .await
-                .map_err(map_repository_error)?
-                .ok_or_else(|| {
-                    (
-                        StatusCode::CONFLICT,
-                        "Log artifact disappeared while sealing".to_string(),
-                    )
-                })?;
-        let locked = LogStreamRepository::lock(&mut transaction, stream.id)
-            .await
-            .map_err(map_repository_error)?;
-        check_delivery_bounds(
-            &mut transaction,
-            &user,
-            artifact_version,
-            Some(stream.id),
-            DeliveryOperation::Seal {
-                sequences: locked.next_sequence,
-                bytes: size,
-            },
-        )
-        .await?;
-        if locked.backend == LogStreamBackend::ObjectSegments
-            && ArtifactUploadGrantRepository::active_log_segment_exists(
-                &mut *transaction,
+        // These rows have remained locked since version_and_stream_locks;
+        // storage verification cannot release them. Reuse that locked snapshot.
+        let current_version = &version;
+        let locked = &stream;
+        if let Some((_, permit, _)) = &effect.worker {
+            if !permit.allows(
+                Some(stream.id),
+                DeliveryOperation::Seal {
+                    sequences: locked.next_sequence,
+                    bytes: size,
+                },
+            ) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "Worker delivery exceeds seal bounds".into(),
+                ));
+            }
+        } else {
+            check_delivery_bounds(
+                &mut transaction,
+                &user,
                 artifact_version,
+                Some(stream.id),
+                DeliveryOperation::Seal {
+                    sequences: locked.next_sequence,
+                    bytes: size,
+                },
             )
-            .await
-            .map_err(map_repository_error)?
-        {
-            return Err((
-                StatusCode::CONFLICT,
-                "A log segment upload is still settling".to_string(),
-            ));
+            .await?;
         }
         if locked.sealed {
             if log_stream_seal_is_complete(
@@ -2333,21 +2343,6 @@ async fn seal_log_stream(
             return Err((
                 StatusCode::CONFLICT,
                 "Log stream was concurrently sealed with different state".to_string(),
-            ));
-        }
-        if locked.backend != stream.backend {
-            return Err((
-                StatusCode::CONFLICT,
-                "Log stream backend changed while sealing".to_string(),
-            ));
-        }
-        if locked.backend == LogStreamBackend::ObjectSegments
-            && (locked.next_sequence != stream.next_sequence
-                || locked.total_bytes != stream.total_bytes)
-        {
-            return Err((
-                StatusCode::CONFLICT,
-                "Log stream changed while sealing".to_string(),
             ));
         }
         if current_version.body_state != Some(ArtifactBodyState::Pending) {
@@ -2461,6 +2456,7 @@ async fn encrypted_log_seal_proof(
     version: &attune_common::models::artifact_version::ArtifactVersion,
     stream: &LogStream,
     headers: &HeaderMap,
+    effect: &crate::recorded_files::FileMutationProof,
 ) -> Result<Option<EncryptedLogSeal>, (StatusCode, String)> {
     use attune_common::repositories::worker_delivery::WorkerDeliveryRepository;
     let denied = || {
@@ -2469,9 +2465,12 @@ async fn encrypted_log_seal_proof(
             "Authenticated encrypted log final manifest required".into(),
         )
     };
-    let permit = WorkerDeliveryRepository::for_version(tx, version.id)
-        .await
-        .map_err(map_transport_error)?;
+    let permit = match &effect.worker {
+        Some((_, permit, _)) => Some(permit.clone()),
+        None => WorkerDeliveryRepository::for_version(tx, version.id)
+            .await
+            .map_err(map_transport_error)?,
+    };
     let encoding = version
         .meta
         .as_ref()
@@ -2494,11 +2493,14 @@ async fn encrypted_log_seal_proof(
         .map_err(map_transport_error)?
         .ok_or_else(denied)?;
     let permit = permit.ok_or_else(denied)?;
-    let context =
-        WorkerDeliveryRepository::for_execution(tx, version.execution.ok_or_else(denied)?)
-            .await
-            .map_err(map_transport_error)?
-            .ok_or_else(denied)?;
+    let context = effect
+        .worker
+        .as_ref()
+        .map(|(context, _, _)| context.clone())
+        .ok_or_else(denied)?;
+    if version.execution != Some(context.execution) {
+        return Err(denied());
+    }
     if credential.permit != permit.id
         || permit.context != context.id
         || permit.log_stream != Some(stream.id)
@@ -2565,6 +2567,47 @@ fn validate_log_snapshot(
         ));
     }
     Ok(())
+}
+
+/// Structural path validation is not an authority grant. Purpose-specific worker
+/// seals acquire their source fence once, in the actual sealing transaction,
+/// before any version/file effects. Other credential types keep their preflight.
+async fn authorize_seal_log_version(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    artifact_version: i64,
+) -> Result<attune_common::models::artifact_version::ArtifactVersion, (StatusCode, String)> {
+    let Some(credential) =
+        attune_common::worker_delivery::credential(&user.claims).map_err(map_transport_error)?
+    else {
+        return authorize_log_version(state, user, artifact_version).await;
+    };
+    if credential.version != artifact_version {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Worker delivery version mismatch".into(),
+        ));
+    }
+    let version = ArtifactVersionRepository::find_by_id(&state.db, artifact_version)
+        .await
+        .map_err(map_repository_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact version not found".into()))?;
+    let path = version.file_path.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Log artifact version has no authorization path".into(),
+        )
+    })?;
+    let bound = validate_file_path_binding(state, path)
+        .await?
+        .ok_or_else(|| (StatusCode::FORBIDDEN, "Worker log path unavailable".into()))?;
+    if bound.id != version.id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Worker log path binding changed".into(),
+        ));
+    }
+    Ok(version)
 }
 
 async fn authorize_log_version(
@@ -4330,43 +4373,50 @@ fn map_pack_archive_repository_error(error: attune_common::error::Error) -> (Sta
     )
 }
 
+async fn validate_file_path_binding(
+    state: &Arc<AppState>,
+    file_path: &str,
+) -> Result<Option<attune_common::models::artifact_version::ArtifactVersion>, (StatusCode, String)>
+{
+    ValidatedRelativePath::new(file_path).map_err(map_transport_error)?;
+    let mut conn = state.db.acquire().await.map_err(map_sqlx_error)?;
+    let version = ArtifactVersionRepository::find_unique_by_file_path(&mut *conn, file_path)
+        .await
+        .map_err(map_repository_error)?;
+    let guarded = attune_common::repositories::file_origin::FileOriginRepository::guarded_path(
+        &mut conn, file_path,
+    )
+    .await
+    .map_err(map_transport_error)?;
+    if (file_path.starts_with("files/versions/") && version.is_none())
+        || (guarded
+            && match version.as_ref() {
+                Some(version) => {
+                    attune_common::repositories::file_origin::FileOriginRepository::find(
+                        &mut conn, version.id,
+                    )
+                    .await
+                    .map_err(map_transport_error)?
+                    .is_none()
+                }
+                None => true,
+            })
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Version staging has no live source binding".into(),
+        ));
+    }
+    Ok(version)
+}
+
 async fn authorize_file_transfer(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
     file_path: &str,
     operation: FileOperation,
 ) -> Result<(), (StatusCode, String)> {
-    ValidatedRelativePath::new(file_path).map_err(map_transport_error)?;
-    {
-        let mut conn = state.db.acquire().await.map_err(map_sqlx_error)?;
-        let version = ArtifactVersionRepository::find_unique_by_file_path(&mut *conn, file_path)
-            .await
-            .map_err(map_repository_error)?;
-        let guarded = attune_common::repositories::file_origin::FileOriginRepository::guarded_path(
-            &mut conn, file_path,
-        )
-        .await
-        .map_err(map_transport_error)?;
-        if (file_path.starts_with("files/versions/") && version.is_none())
-            || (guarded
-                && match version.as_ref() {
-                    Some(version) => {
-                        attune_common::repositories::file_origin::FileOriginRepository::find(
-                            &mut conn, version.id,
-                        )
-                        .await
-                        .map_err(map_transport_error)?
-                        .is_none()
-                    }
-                    None => true,
-                })
-        {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "Version staging has no live source binding".into(),
-            ));
-        }
-    }
+    validate_file_path_binding(state, file_path).await?;
 
     if operation == FileOperation::Mutate
         && !crate::recorded_consumers::is_recorded(user).map_err(map_api_error)?

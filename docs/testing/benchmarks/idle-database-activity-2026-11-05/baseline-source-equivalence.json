@@ -1,0 +1,28 @@
+{
+  "runtime_revision": "747832c97e09cbc122f72af1304e66375e3dde0e",
+  "merged_main": "4846e6073c72325afd9583a550cc772dcd342057",
+  "all_intervening_changed_paths": [
+    "crates/api/tests/rbac_scoped_resources_api_tests.rs",
+    "docker-compose.worker-lifecycle-benchmark.yaml",
+    "docs/plans/database-activity-reduction.md",
+    "docs/plans/idle-database-activity-analysis.md",
+    "docs/testing/benchmarks/database-activity-2026-11-05/README.md",
+    "docs/testing/benchmarks/database-activity-2026-11-05/collection-audit.json",
+    "docs/testing/benchmarks/database-activity-2026-11-05/comparison.html",
+    "docs/testing/benchmarks/database-activity-2026-11-05/default-budget.json",
+    "docs/testing/benchmarks/database-activity-2026-11-05/graph-transactions.csv",
+    "docs/testing/benchmarks/database-activity-2026-11-05/idle-breakdown.html",
+    "docs/testing/benchmarks/database-activity-2026-11-05/idle-follow-up.json",
+    "docs/testing/benchmarks/database-activity-2026-11-05/phases.csv",
+    "docs/testing/benchmarks/database-activity-2026-11-05/profiles.csv",
+    "docs/testing/benchmarks/database-activity-2026-11-05/runs.json",
+    "docs/testing/benchmarks/database-activity-2026-11-05/runtime-source-equivalence.json",
+    "docs/testing/benchmarks/database-activity-2026-11-05/samples.csv",
+    "scripts/analyze-worker-lifecycle-benchmark.py",
+    "tests/e2e/api/test_worker_lifecycle_performance.py"
+  ],
+  "exact_image_verification": "baseline-image-verification.json",
+  "agent_digest_verification": "baseline-agent-verification.json",
+  "runtime_and_build_source_files_unchanged": true,
+  "recorded_build_identity_differs_from_merged_main": true
+}

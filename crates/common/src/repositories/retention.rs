@@ -188,17 +188,25 @@ impl RetentionRepository {
         .execute(pool)
         .await?;
 
-        for (target, config) in Self::target_config_pairs(&defaults.targets) {
-            sqlx::query(
-                "INSERT INTO runtime_retention_target_config (target, max_age_seconds)
-                 VALUES ($1, $2)
-                 ON CONFLICT (target) DO NOTHING",
-            )
-            .bind(target.name())
-            .bind(config.max_age_seconds.map(|value| value as i64))
-            .execute(pool)
-            .await?;
-        }
+        let (targets, max_ages): (Vec<_>, Vec<_>) = Self::target_config_pairs(&defaults.targets)
+            .into_iter()
+            .map(|(target, config)| {
+                (
+                    target.name(),
+                    config.max_age_seconds.map(|value| value as i64),
+                )
+            })
+            .unzip();
+        sqlx::query(
+            "INSERT INTO runtime_retention_target_config (target, max_age_seconds)
+             SELECT target, max_age_seconds
+             FROM unnest($1::text[], $2::bigint[]) AS seed(target, max_age_seconds)
+             ON CONFLICT (target) DO NOTHING",
+        )
+        .bind(targets)
+        .bind(max_ages)
+        .execute(pool)
+        .await?;
 
         Ok(())
     }

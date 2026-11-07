@@ -30,7 +30,7 @@ use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::time::{timeout, Duration, Instant as TokioInstant};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, Instrument};
 
 const ETXTBSY_RETRY_ATTEMPTS: usize = 5;
 const ETXTBSY_RETRY_DELAY_MS: u64 = 25;
@@ -419,22 +419,34 @@ pub async fn execute_streaming_cancellable(
     let stdout_cancel = output_cancel.clone();
     let stderr_cancel = output_cancel.clone();
 
-    let stdout_task = tokio::spawn(capture_output(
-        stdout_reader,
-        stdout_writer,
-        stdout_log_writer,
-        stdout_cancel,
-        RuntimeLogStream::Stdout,
-        !delay_action_mirror,
-    ));
-    let stderr_task = tokio::spawn(capture_output(
-        stderr_reader,
-        stderr_writer,
-        stderr_log_writer,
-        stderr_cancel,
-        RuntimeLogStream::Stderr,
-        !delay_action_mirror,
-    ));
+    let stdout_task = tokio::spawn(
+        capture_output(
+            stdout_reader,
+            stdout_writer,
+            stdout_log_writer,
+            stdout_cancel,
+            RuntimeLogStream::Stdout,
+            !delay_action_mirror,
+        )
+        .instrument(tracing::debug_span!(
+            "runtime_log_capture",
+            stream = "stdout"
+        )),
+    );
+    let stderr_task = tokio::spawn(
+        capture_output(
+            stderr_reader,
+            stderr_writer,
+            stderr_log_writer,
+            stderr_cancel,
+            RuntimeLogStream::Stderr,
+            !delay_action_mirror,
+        )
+        .instrument(tracing::debug_span!(
+            "runtime_log_capture",
+            stream = "stderr"
+        )),
+    );
 
     // Stdin delivery is part of the action's execution budget. Output capture
     // starts first so a child that writes before reading stdin cannot deadlock.
@@ -506,6 +518,13 @@ pub async fn execute_streaming_cancellable(
             )
         }
     };
+    let process_wait_elapsed_us = start.elapsed().as_micros() as u64;
+    let settlement_started = Instant::now();
+    tracing::debug!(
+        phase = "process_wait",
+        elapsed_us = process_wait_elapsed_us,
+        "Worker lifecycle phase"
+    );
     let (wait_result, mut was_cancelled, mut was_timed_out, stdin_write_error) = wait;
 
     let output_results = async {
@@ -607,6 +626,11 @@ pub async fn execute_streaming_cancellable(
     }
 
     // Handle process wait result
+    tracing::debug!(
+        phase = "log_capture_settlement",
+        elapsed_us = settlement_started.elapsed().as_micros() as u64,
+        "Worker lifecycle phase"
+    );
     let (exit_code, process_error) = match wait_result {
         Ok(status) => (status.code().unwrap_or(-1), None),
         Err(e) => {

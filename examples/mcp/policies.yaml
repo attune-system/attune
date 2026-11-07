@@ -9,19 +9,15 @@
 default_policy: read-only
 policies:
   my-incident-reader:
-    access_mode: read-only
-    allowed_tools:
-      - events_list
-      - events_get
-      - executions_list
-      - executions_get
-      - traces_get_report
+    - events_list
+    - events_get
+    - executions_list
+    - executions_get
+    - traces_get_report
   my-operator:
-    access_mode: full
-    allowed_tools:
-      - actions_list
-      - actions_get
-      - actions_execute
-      - executions_list
-      - executions_get
-      - executions_cancel
+    - actions_list
+    - actions_get
+    - actions_execute
+    - executions_list
+    - executions_get
+    - executions_cancel

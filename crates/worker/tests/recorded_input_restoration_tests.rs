@@ -409,3 +409,121 @@ async fn worker_rechecks_terminal_and_explicit_admission_revocation() {
         .is_err());
     fixture.db.cleanup().await.unwrap();
 }
+
+#[tokio::test]
+async fn existing_authority_validation_never_replays_admission_or_attempt_inserts() {
+    let fixture = fixture(true).await;
+    // Statement triggers also reject INSERT ... ON CONFLICT DO NOTHING. Counts
+    // alone would miss the redundant creation work this path used to replay.
+    sqlx::raw_sql(
+        "CREATE FUNCTION reject_recreated_admission() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'existing validation attempted an admission insert'; END $$;
+         CREATE TRIGGER reject_admission_insert BEFORE INSERT ON runtime_authority_admission
+         FOR EACH STATEMENT EXECUTE FUNCTION reject_recreated_admission();
+         CREATE TRIGGER reject_attempt_insert BEFORE INSERT ON runtime_authority_execution_attempt
+         FOR EACH STATEMENT EXECUTE FUNCTION reject_recreated_admission();
+         CREATE TRIGGER reject_fence_insert BEFORE INSERT ON runtime_authority_execution_fence
+         FOR EACH STATEMENT EXECUTE FUNCTION reject_recreated_admission();",
+    )
+    .execute(&fixture.db)
+    .await
+    .unwrap();
+    let mut tx = fixture.db.begin().await.unwrap();
+    for _ in 0..2 {
+        let record = attune_common::repositories::execution_admission::ExecutionAdmissionRepository::require(
+            &mut tx,
+            attune_common::repositories::runtime_authority::RuntimeOwner::Execution(fixture.execution),
+        ).await.unwrap();
+        assert_eq!(record.id, fixture.admission);
+    }
+    tx.rollback().await.unwrap();
+    fixture.db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn missing_action_or_binding_persists_a_safe_failure_before_launch() {
+    use attune_common::{
+        artifact_transport::VolumeTransport, auth::jwt::JwtConfig, log_stream::SegmentedLogConfig,
+        repositories::FindById,
+    };
+    use attune_worker::{artifacts::ArtifactManager, runtime::RuntimeRegistry, ActionExecutor};
+    let fixture = fixture(true).await;
+    let source = ExecutionRepository::find_by_id(&fixture.db, fixture.execution)
+        .await
+        .unwrap()
+        .unwrap();
+    let snapshot = source.executable_snapshot.as_ref().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let artifacts = directory.path().join("artifacts");
+    let executor = ActionExecutor::new(
+        fixture.db.pool().clone(),
+        RuntimeRegistry::new(),
+        ArtifactManager::new(artifacts.clone()),
+        SecretManager::new(fixture.db.pool().clone(), Some(ENCRYPTION_KEY.into())).unwrap(),
+        1024,
+        1024,
+        false,
+        false,
+        "preparation-test".into(),
+        uuid::Uuid::new_v4(),
+        SegmentedLogConfig {
+            initial_segment_bytes: 1024,
+            max_segment_bytes: 1024,
+            flush_interval_ms: 100,
+            retry_max_attempts: 1,
+            retry_attempt_timeout_ms: 100,
+            retry_initial_backoff_ms: 1,
+            retry_max_backoff_ms: 1,
+            finalization_timeout_ms: 100,
+        },
+        None,
+        None,
+        directory.path().join("packs"),
+        artifacts.clone(),
+        directory.path().join("runtimes"),
+        "http://127.0.0.1:1".into(),
+        JwtConfig::default(),
+        std::sync::Arc::new(VolumeTransport::new(artifacts.to_str().unwrap())),
+    );
+    let missing_action = ExecutionRepository::create(
+        &fixture.db,
+        CreateExecutionInput {
+            action_ref: "missing.action".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let missing_binding = ExecutionRepository::create_pinned(
+        &fixture.db,
+        CreateExecutionInput {
+            action: source.action,
+            action_ref: source.action_ref,
+            executor: source.executor,
+            ..Default::default()
+        },
+        snapshot,
+    )
+    .await
+    .unwrap();
+    for (execution, diagnostic) in [
+        (missing_action, "Failed to load pinned action"),
+        (missing_binding, "Execution schema binding unavailable"),
+    ] {
+        assert!(executor.execute(execution.id).await.is_err());
+        let stored = ExecutionRepository::find_by_id(&fixture.db, execution.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, ExecutionStatus::Failed);
+        assert_eq!(
+            stored.result,
+            Some(json!({"succeeded":false,"error":diagnostic}))
+        );
+        assert!(attune_common::repositories::artifact::ArtifactVersionRepository::find_file_versions_by_execution(
+            &fixture.db, execution.id).await.unwrap().is_empty());
+    }
+    drop(executor);
+    directory.close().unwrap();
+    fixture.db.cleanup().await.unwrap();
+}
