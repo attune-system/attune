@@ -1073,18 +1073,51 @@ async fn accepted_mixed_requester_queue_keeps_policy_and_attribution_after_human
         )
         .await
         .unwrap();
-        Admission::admit_queue_item(
+        let actor = Some(HumanAttribution {
+            identity_id: identity,
+            login: format!("historical-{identity}"),
+        });
+        let denied = Admission::admit_queue_item(&mut tx, &queue, &item, actor.clone(), &snapshot)
+            .await
+            .unwrap_err();
+        assert!(denied.to_string().contains("coordinated admission"));
+        let written: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM work_queue_item_runtime_admission WHERE item=$1",
+        )
+        .bind(item.id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(written, 0, "disabled admission must not write authority");
+
+        // Model a genuinely pre-admitted item for this retention consumer test.
+        // The selector still validates policy, executable, targets and approvals;
+        // only this fixture-owned historical table write bypasses new admission.
+        let admitted = Admission::select(
             &mut tx,
-            &queue,
-            &item,
-            Some(HumanAttribution {
-                identity_id: identity,
-                login: format!("historical-{identity}"),
-            }),
+            policy.owner.pack_id,
+            InvocationBinding::Queue {
+                queue_ref: queue.r#ref.clone(),
+                action_ref: snapshot.executable.action.r#ref.clone(),
+            },
             &snapshot,
+            queue.permission_set_refs.as_ref().unwrap(),
+            RequestAttribution::QueueBatch {
+                queue_ref: queue.r#ref.clone(),
+                items: std::collections::BTreeMap::from([(item.id, actor)]),
+            },
+            attune_common::repositories::runtime_target::RuntimeTarget::Component(
+                attune_common::repositories::runtime_target::ComponentTarget::Queue,
+                queue.id,
+            ),
         )
         .await
         .unwrap();
+        let authority = admitted.authority();
+        sqlx::query("INSERT INTO work_queue_item_runtime_admission(item,policy_revision,authority,authority_digest) VALUES($1,$2,$3,$4)")
+            .bind(item.id).bind(authority.policy_id).bind(sqlx::types::Json(authority))
+            .bind(fixture_digest(authority)).execute(&mut *tx).await.unwrap();
+        admitted.ensure_fresh_on(&mut tx).await.unwrap();
         items.push(item);
     }
     let old = Admission::queue_batch(&mut tx, &queue, &items, &snapshot)
