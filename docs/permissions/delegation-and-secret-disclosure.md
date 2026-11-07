@@ -213,6 +213,16 @@ the original active owner, selected refs, grant digest, executable and schema;
 later rule edits cannot reselect that pending enforcement's authority. Queue
 contributors likewise retain their accepted owner and selection.
 
+Protected queue acknowledgements are consumed under the original active owner's
+current admitted read scope and the closed assigned worker attempt. Scoped
+`standard` applies to native controls, without granting the human owner private
+body disclosure. Completion retains
+the queue lease generation through commit and validates the acknowledgement's
+version, item IDs and statuses. Only those protocol controls update ordinary queue
+state. Freeform summary/error details remain in the encrypted execution result;
+they are not copied into queue item summaries or errors. Invalid protected
+acknowledgements produce a fixed diagnostic without echoing their private fields.
+
 Worker startup advertises `delegated_execution_authority_v1` only for the protected
 input/token/log/completion implementation with output encryption configured.
 Dispatch requires that capability;

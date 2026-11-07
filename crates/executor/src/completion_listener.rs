@@ -30,7 +30,7 @@ use attune_common::{
     },
 };
 use serde_json::{json, Value as JsonValue};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -40,6 +40,8 @@ use crate::{
     scheduler::{ExecutionScheduler, SchedulerMetadataCaches},
     work_queue_events,
 };
+
+type QueueAckValidation = std::result::Result<WorkQueueAck, (&'static str, String)>;
 
 /// Completion listener that handles execution completion messages
 pub struct CompletionListener {
@@ -461,13 +463,20 @@ impl CompletionListener {
         }
 
         let expected_item_ids: Vec<_> = leased_items.iter().map(|item| item.id).collect();
-        let queue_ack = match Self::validated_queue_ack_for_execution(
+        let mut tx = pool.begin().await?;
+        Self::lock_queue_completion_items(&mut tx, execution.id, &leased_items).await?;
+        let queue_ack = match Self::queue_ack_for_completion(
+            &mut tx,
             execution,
             &expected_item_ids,
             expected_ack_version,
-        ) {
+            encryption_key,
+        )
+        .await?
+        {
             Ok(queue_ack) => queue_ack,
             Err((error_code, message)) => {
+                tx.rollback().await?;
                 return Self::fail_queue_dispatch_completion(
                     pool,
                     execution,
@@ -484,7 +493,6 @@ impl CompletionListener {
             }
         };
 
-        let mut tx = pool.begin().await?;
         for leased_item in &leased_items {
             let ack_item = queue_ack
                 .item_for(leased_item.id)
@@ -588,6 +596,8 @@ impl CompletionListener {
         publisher: &Publisher,
     ) -> Result<Execution> {
         let mut tx = pool.begin().await?;
+        Self::lock_queue_completion_items(&mut tx, execution.id, leased_items).await?;
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::require_closed_output(&mut tx, execution.id).await?;
         let retry_error = json!({
             "code": failure.error_code,
             "message": failure.error_message,
@@ -709,11 +719,69 @@ impl CompletionListener {
             .unwrap_or(0)
     }
 
+    async fn lock_queue_completion_items(
+        conn: &mut PgConnection,
+        execution: i64,
+        items: &[WorkQueueItem],
+    ) -> Result<()> {
+        let mut ordered = items.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|item| item.id);
+        for expected in ordered {
+            let current = WorkQueueItemRepository::find_by_id_for_update(conn, expected.id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Queue completion lease is unavailable"))?;
+            if current.status != WorkQueueItemStatus::Leased
+                || current.leased_execution != Some(execution)
+                || current.lease_token.is_none()
+                || current.lease_token != expected.lease_token
+                || current.attempt_count != expected.attempt_count
+                || current.queue != expected.queue
+            {
+                anyhow::bail!("Queue completion lease changed");
+            }
+        }
+        Ok(())
+    }
+
+    async fn queue_ack_for_completion(
+        conn: &mut PgConnection,
+        execution: &Execution,
+        expected_item_ids: &[i64],
+        expected_ack_version: i32,
+        encryption_key: Option<&str>,
+    ) -> Result<QueueAckValidation> {
+        use attune_common::repositories::delegated_execution::{
+            DelegatedExecutionRepository, ProtectedQueueAck,
+        };
+        Ok(
+            match DelegatedExecutionRepository::protected_queue_ack_controls(
+                conn,
+                execution.id,
+                expected_item_ids,
+                expected_ack_version,
+                encryption_key,
+            )
+            .await?
+            {
+                ProtectedQueueAck::Unprotected => Self::validated_queue_ack_for_execution(
+                    execution,
+                    expected_item_ids,
+                    expected_ack_version,
+                ),
+                ProtectedQueueAck::Controls(ack) => Ok(ack),
+                ProtectedQueueAck::Invalid => Err((
+                    "queue_ack_invalid",
+                    "Protected queue acknowledgement is invalid".into(),
+                )),
+            },
+        )
+    }
+
     fn validated_queue_ack_for_execution(
         execution: &Execution,
         expected_item_ids: &[i64],
         expected_ack_version: i32,
-    ) -> std::result::Result<WorkQueueAck, (&'static str, String)> {
+    ) -> QueueAckValidation {
         if !Self::can_honor_queue_ack_for_status(execution.status) {
             return Err((
                 "queue_dispatch_execution_failed",
@@ -1272,6 +1340,150 @@ mod tests {
         let result = queue_manager.release_active_slot(execution_id).await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn queue_completion_retains_lease_lock_and_denies_reassigned_generation() -> Result<()> {
+        use attune_common::{
+            config::Config,
+            models::{ActionReferenceVisibility, WorkQueueBatchMode, WorkQueueUpdateStrategy},
+            repositories::{
+                work_queue::{CreateWorkQueueInput, CreateWorkQueueItemInput},
+                Create,
+            },
+            test_database::TestDatabase,
+        };
+        let config = Config::load_from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config.test.yaml"
+        ))?;
+        let db = TestDatabase::create(&config.database).await?;
+        let queue = WorkQueueRepository::create(
+            db.pool(),
+            CreateWorkQueueInput {
+                r#ref: "fixture.completion".into(),
+                pack: None,
+                pack_ref: None,
+                is_adhoc: true,
+                label: "Completion fence".into(),
+                description: None,
+                enabled: true,
+                accepting_new_items: true,
+                dispatch_action: None,
+                dispatch_action_ref: "fixture.run".into(),
+                default_priority: 0,
+                allow_pending_update: false,
+                update_strategy: WorkQueueUpdateStrategy::MergePatch,
+                batch_mode: WorkQueueBatchMode::Single,
+                item_schema: json!({}),
+                action_params: json!({}),
+                trace_tag_template: None,
+                permission_set_refs: Some(vec![]),
+                config: json!({}),
+                reference_visibility: ActionReferenceVisibility::Public,
+                reference_allowed_pack_refs: vec![],
+            },
+        )
+        .await?;
+        let token = uuid::Uuid::new_v4();
+        let item = WorkQueueItemRepository::create(
+            db.pool(),
+            CreateWorkQueueItemInput {
+                queue: queue.id,
+                queue_ref: queue.r#ref,
+                item_key: None,
+                priority: 0,
+                status: WorkQueueItemStatus::Leased,
+                payload: json!({}),
+                metadata: json!({}),
+                trace_tag: None,
+                enqueue_source: "fixture".into(),
+                requested_by_identity: None,
+                requested_by_execution: None,
+                requested_by_enforcement: None,
+                leased_execution: Some(42),
+                lease_token: Some(token),
+                lease_expires_at: Some(Utc::now() + chrono::Duration::minutes(5)),
+                attempt_count: 1,
+                last_error: None,
+                ack_summary: None,
+            },
+        )
+        .await?;
+        let mut held = db.begin().await?;
+        CompletionListener::lock_queue_completion_items(&mut held, 42, std::slice::from_ref(&item))
+            .await?;
+        let mut writer_connection = db.pool().acquire().await?;
+        let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *writer_connection)
+            .await?;
+        let next_token = uuid::Uuid::new_v4();
+        let item_id = item.id;
+        let writer = tokio::spawn(async move {
+            WorkQueueItemRepository::update_if_statuses(
+                &mut *writer_connection,
+                item_id,
+                &[WorkQueueItemStatus::Leased],
+                UpdateWorkQueueItemInput {
+                    leased_execution: Some(Patch::Set(42)),
+                    lease_token: Some(Patch::Set(next_token)),
+                    attempt_count: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+        });
+        let blocked = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let blocked: bool =
+                    sqlx::query_scalar("SELECT cardinality(pg_blocking_pids($1)) > 0")
+                        .bind(writer_pid)
+                        .fetch_one(db.pool())
+                        .await?;
+                if blocked {
+                    return Ok::<_, sqlx::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        held.commit().await?;
+        let renewed = writer
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("renewed lease missing"))?;
+        blocked??;
+        let mut stale = db.begin().await?;
+        assert!(
+            CompletionListener::lock_queue_completion_items(
+                &mut stale,
+                42,
+                std::slice::from_ref(&item)
+            )
+            .await
+            .is_err(),
+            "same execution ID cannot reuse a prior lease generation"
+        );
+        stale.rollback().await?;
+        let mut current = db.begin().await?;
+        CompletionListener::lock_queue_completion_items(
+            &mut current,
+            42,
+            std::slice::from_ref(&renewed),
+        )
+        .await?;
+        assert!(
+            CompletionListener::lock_queue_completion_items(
+                &mut current,
+                43,
+                std::slice::from_ref(&renewed)
+            )
+            .await
+            .is_err(),
+            "another execution cannot acknowledge this lease"
+        );
+        current.rollback().await?;
+        db.cleanup().await?;
+        Ok(())
     }
 
     #[test]

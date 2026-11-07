@@ -54,7 +54,10 @@ if p['plaintext']:
             pass
 else:
     assert status in (200,403,404) and value is None
-print(json.dumps({'value':value,'credential':token,'unrelated_denied':True,'plaintext':p['plaintext']}))
+output={'value':value,'credential':token,'unrelated_denied':True,'plaintext':p['plaintext']}
+if p.get('item_id') is not None:
+    output['queue_ack']={'version':1,'items':[{'id':p['item_id'],'status':value if p.get('ack_invalid') else 'completed','summary':{'value':value},'error':{'value':value}}]}
+print(json.dumps(output))
 '''
 
 
@@ -243,7 +246,7 @@ def main():
         action_ref = pack_ref + '.read_system'
         (pack / 'pack.yaml').write_text(yaml.safe_dump({'ref': pack_ref, 'name': pack_ref, 'version': '1.0.0', 'description': 'Delegated authority acceptance'}))
         (pack / 'runtimes/python.yaml').write_text(yaml.safe_dump({'ref': pack_ref + '.python', 'name': 'Python', 'aliases': ['python3'], 'execution_config': {'interpreter': {'binary': 'python3', 'args': ['-u'], 'file_extension': '.py'}}}))
-        (pack / 'actions/read_system.yaml').write_text(yaml.safe_dump({'ref': action_ref, 'name': 'read_system', 'label': 'Read system Key', 'runner_type': pack_ref + '.python', 'entry_point': 'read_system.py', 'parameter_delivery': 'stdin', 'parameter_format': 'json', 'output_format': 'json', 'parameters': {'key': {'type': 'string', 'required': True}, 'other': {'type': 'string', 'required': True}, 'plaintext': {'type': 'boolean', 'required': True}, 'fail_once': {'type': 'boolean', 'default': False}, 'marker': {'type': 'string', 'default': ''}}}))
+        (pack / 'actions/read_system.yaml').write_text(yaml.safe_dump({'ref': action_ref, 'name': 'read_system', 'label': 'Read system Key', 'runner_type': pack_ref + '.python', 'entry_point': 'read_system.py', 'parameter_delivery': 'stdin', 'parameter_format': 'json', 'output_format': 'json', 'parameters': {'key': {'type': 'string', 'required': True}, 'other': {'type': 'string', 'required': True}, 'plaintext': {'type': 'boolean', 'required': True}, 'fail_once': {'type': 'boolean', 'default': False}, 'marker': {'type': 'string', 'default': ''}, 'item_id': {'type':'integer'}, 'ack_invalid': {'type':'boolean','default':False}}}))
         (pack / 'actions/read_system.py').write_text(ACTION)
         (pack / 'actions/workflows').mkdir()
         flow_ref=pack_ref+'.read_flow'
@@ -283,7 +286,7 @@ except urllib.error.HTTPError as e:
 print(json.dumps({'assertion':result['assertion'],'raw_denied':True,'profile_denied':True}))
 """)
         (pack/'permission_sets/sign_system.yaml').write_text(yaml.safe_dump({'ref':signer_ref,'scope':'external','grants':[{'resource':'keys','actions':['use'],'constraints':{'refs':[signer['ref']],'owner_types':['system']}}]}))
-        (pack / 'permission_sets/invoke.yaml').write_text(yaml.safe_dump({'ref': pack_ref + '.invoke', 'grants': [{'resource': 'actions', 'actions': ['execute'], 'constraints': {'refs': [action_ref,signer_ref]}}, {'resource': 'executions', 'actions': ['read', 'decrypt'], 'constraints': {'refs': [action_ref,signer_ref]}}, {'resource':'artifacts','actions':['read']}]}))
+        (pack / 'permission_sets/invoke.yaml').write_text(yaml.safe_dump({'ref': pack_ref + '.invoke', 'grants': [{'resource': 'actions', 'actions': ['execute'], 'constraints': {'refs': [action_ref,signer_ref]}}, {'resource': 'executions', 'actions': ['read', 'decrypt'], 'constraints': {'refs': [action_ref,signer_ref]}}, {'resource':'artifacts','actions':['read']}, {'resource':'queues','actions':['create'],'constraints':{'refs':[pack_ref+'.private_ack_queue',pack_ref+'.invalid_ack_queue']}}]}))
         event_ref=pack_ref+'.authority_event'
         emitter_ref=pack_ref+'.emit_event'
         (pack/'triggers/authority_event.yaml').write_text(yaml.safe_dump({'ref':event_ref,'label':'Authority acceptance event','out_schema':{'marker':{'type':'string'}}}))
@@ -435,6 +438,32 @@ print(json.dumps({'assertion':result['assertion'],'raw_denied':True,'profile_den
         assert sponsored.status_code==501 and 'readiness' in sponsored.text, 'recorded queue did not report readiness separately'
         assert int(psql("SELECT count(*) FROM work_queue_item WHERE queue_ref='"+managed_queue_ref+"'"))==0
         result['checks'] += ['attributed delegated queue completes; recorded-only managed queue rejects before enqueue with readiness diagnostic']
+
+        # Protected queue results expose only validated control effects. Opaque
+        # summary/error values remain solely in the encrypted execution result.
+        for invalid in [False, True]:
+            private_queue_ref=pack_ref+('.invalid_ack_queue' if invalid else '.private_ack_queue')
+            api('POST','/queues',json={'ref':private_queue_ref,'pack_ref':pack_ref,'label':'Protected acknowledgement','dispatch_action_ref':action_ref,'permission_set_refs':['standard',pack_ref+'.read_system'],'action_params':{'key':keys[0],'other':keys[1],'plaintext':True,'item_id':'{{ queue_item.id }}','ack_invalid':invalid}})
+            accepted=caller.post(base+'/api/v1/queues/'+private_queue_ref+'/items',json={'payload':{}},timeout=30)
+            assert accepted.status_code==201, 'narrow queue admission rejected: HTTP '+str(accepted.status_code)
+            def private_queue_terminal():
+                state=psql("SELECT status::text FROM work_queue_item WHERE queue_ref='"+private_queue_ref+"'")
+                return state if state in ('completed','failed','cancelled') else None
+            status=wait_for(private_queue_terminal,90,'protected queue acknowledgement')
+            assert status==('failed' if invalid else 'completed'), 'protected queue acknowledgement state mismatch'
+            ordinary=psql("SELECT json_build_object('summary',ack_summary,'error',last_error)::text FROM work_queue_item WHERE queue_ref='"+private_queue_ref+"'")
+            assert secret not in ordinary, 'private acknowledgement disclosed through queue fields'
+            ordinary=json.loads(ordinary)
+            if invalid:
+                assert ordinary['error']['code']=='queue_ack_invalid' and ordinary['error']['message']=='Protected queue acknowledgement is invalid'
+            else:
+                assert ordinary['summary']=={'status':'completed'}
+            queue_execution=psql("SELECT execution FROM work_queue_dispatch WHERE queue_ref='"+private_queue_ref+"' ORDER BY id DESC LIMIT 1")
+            assert psql('SELECT executor FROM execution WHERE id='+queue_execution)==str(caller_identity['id'])
+            assert int(psql("SELECT count(*) FROM execution_secret_value WHERE entity_type='execution_result' AND entity_id="+queue_execution+" AND json_path='/queue_ack'"))==1
+            protected=api('GET','/executions/'+queue_execution+'?include_secret_values=true')['result']['queue_ack']
+            assert protected['items'][0]['summary']['value']==secret and protected['items'][0]['error']['value']==secret
+        result['checks'] += ['API-capable system-Key queue consumes closed-attempt acknowledgement controls while freeform details remain encrypted', 'malformed protected acknowledgement fails without leaking parser input through queue errors']
 
         # A principal with only execute/observe rights cannot borrow pack sponsorship.
         login_name = run + '@example.test'

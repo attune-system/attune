@@ -25,6 +25,30 @@ pub struct ExecutionAuthoritySelection {
     pub output_grants: Option<serde_json::Value>,
 }
 pub struct DelegatedExecutionRepository;
+
+/// A native consumer receives controls, never the decrypted private fields.
+pub enum ProtectedQueueAck {
+    Unprotected,
+    Invalid,
+    Controls(crate::models::WorkQueueAck),
+}
+
+impl ProtectedQueueAck {
+    fn validate(value: &serde_json::Value, items: &[Id], version: i32) -> Self {
+        let Ok(Some(mut ack)) = crate::models::WorkQueueAck::from_execution_result(value) else {
+            return Self::Invalid;
+        };
+        if ack.validate_for_items(items, version).is_err() {
+            return Self::Invalid;
+        }
+        for item in &mut ack.items {
+            item.summary = None;
+            item.error = None;
+        }
+        Self::Controls(ack)
+    }
+}
+
 impl DelegatedExecutionRepository {
     pub async fn find(
         conn: &mut PgConnection,
@@ -249,6 +273,63 @@ impl DelegatedExecutionRepository {
         }
         Ok(selection)
     }
+    /// Native consumers may read protected terminal output only from the closed
+    /// attempt that was assigned this execution. This never authorizes a token.
+    pub async fn require_closed_output(
+        conn: &mut PgConnection,
+        execution: Id,
+    ) -> Result<ExecutionAuthoritySelection> {
+        let selection = Box::pin(Self::validate(conn, execution)).await?;
+        let closed: Option<Id> = sqlx::query_scalar("SELECT e.id FROM execution e JOIN delegated_execution_attempt a ON a.execution=e.id AND a.worker=e.worker WHERE e.id=$1 AND a.closed AND e.status IN ('completed','failed','cancelled','timeout','abandoned') FOR SHARE OF e,a")
+            .bind(execution).fetch_optional(conn).await?;
+        if !selection.explicit || closed.is_none() {
+            return Err(denied());
+        }
+        Ok(selection)
+    }
+
+    /// The caller holds queue lease locks and retains this transaction through
+    /// the control effect. Private acknowledgement details never leave here.
+    pub async fn protected_queue_ack_controls(
+        conn: &mut PgConnection,
+        execution: Id,
+        items: &[Id],
+        version: i32,
+        encryption_key: Option<&str>,
+    ) -> Result<ProtectedQueueAck> {
+        use crate::secret_values::{restore_secret_values, ENTITY_EXECUTION_RESULT};
+        Self::require_closed_output(conn, execution).await?;
+        let mut secrets =
+            super::execution_secret_value::ExecutionSecretValueRepository::find_stored_by_entity(
+                &mut *conn,
+                ENTITY_EXECUTION_RESULT,
+                execution,
+            )
+            .await?;
+        secrets.retain(|secret| {
+            secret.json_path == "/queue_ack" || secret.json_path.starts_with("/queue_ack/")
+        });
+        if secrets.is_empty() {
+            return Ok(ProtectedQueueAck::Unprotected);
+        }
+        crate::key_access::authorize_execution_control_origins(conn, execution, &secrets).await?;
+        let source = ExecutionRepository::find_by_id(&mut *conn, execution)
+            .await?
+            .ok_or_else(denied)?;
+        let Some(ack) = source
+            .result
+            .as_ref()
+            .and_then(|result| result.get("queue_ack"))
+        else {
+            return Ok(ProtectedQueueAck::Invalid);
+        };
+        let key = encryption_key.ok_or_else(|| {
+            Error::validation("Protected queue acknowledgement encryption is unavailable")
+        })?;
+        let restored = restore_secret_values(serde_json::json!({"queue_ack":ack}), &secrets, key)?;
+        Ok(ProtectedQueueAck::validate(&restored, items, version))
+    }
+
     pub async fn start(conn: &mut PgConnection, execution: Id, worker: Id) -> Result<Uuid> {
         let selection = Box::pin(Self::validate(conn, execution)).await?;
         if !selection.explicit {
@@ -593,4 +674,40 @@ fn denied() -> Error {
 struct OutputDisclosureBinding {
     execution: Id,
     digest: String,
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn protected_ack_exposes_only_validated_protocol_controls() {
+        let original = json!({"queue_ack":{"version":1,"items":[{"id":10,"status":"completed","summary":{"value":"private"},"error":{"value":"private"}}]}});
+        let ProtectedQueueAck::Controls(ack) = ProtectedQueueAck::validate(&original, &[10], 1)
+        else {
+            panic!("valid controls rejected")
+        };
+        assert_eq!(ack.items[0].id, 10);
+        assert_eq!(
+            ack.items[0].status,
+            crate::models::WorkQueueAckItemStatus::Completed
+        );
+        assert!(ack.items[0].summary.is_none() && ack.items[0].error.is_none());
+        assert!(original.to_string().contains("private"));
+    }
+
+    #[test]
+    fn protected_ack_parse_and_binding_errors_do_not_return_private_fields() {
+        for ack in [
+            json!({"version":1,"items":[{"id":10,"status":"private"}]}),
+            json!({"version":1,"items":[{"id":987654321,"status":"completed"}]}),
+            json!({"version":987654321,"items":[{"id":10,"status":"completed"}]}),
+        ] {
+            assert!(matches!(
+                ProtectedQueueAck::validate(&json!({"queue_ack":ack}), &[10], 1),
+                ProtectedQueueAck::Invalid
+            ));
+        }
+    }
 }

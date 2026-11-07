@@ -193,6 +193,31 @@ pub async fn authorize_execution_parameter_key_origins_with_conn(
     Ok(())
 }
 
+/// Validate private native acknowledgement origins using only the producer's
+/// closed delegated selection and its active owner's input rights. The caller
+/// retains this transaction and emits validated protocol controls, never bodies.
+pub(crate) async fn authorize_execution_control_origins(
+    connection: &mut sqlx::PgConnection,
+    execution: Id,
+    secrets: &[crate::secret_values::StoredSecretValue],
+) -> Result<()> {
+    let authorities =
+        [DelegationAuthority::for_closed_execution_controls(connection, execution).await?];
+    for secret in secrets {
+        check_parameter_origins(
+            connection,
+            &authorities,
+            None,
+            &secret.json_path,
+            secret,
+            &mut std::collections::BTreeSet::new(),
+            0,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 pub async fn authorize_parameter_key_origins_with_conn(
     connection: &mut sqlx::PgConnection,
     identity_id: Option<Id>,

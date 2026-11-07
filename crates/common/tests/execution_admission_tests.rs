@@ -3582,7 +3582,100 @@ async fn delegated_authority_is_explicit_immutable_and_attempt_fenced() {
     closer.rollback().await.unwrap();
     tx.commit().await.unwrap();
     let mut tx = db.begin().await.unwrap();
+    assert!(Delegated::require_closed_output(&mut tx, execution.id)
+        .await
+        .is_err());
     Delegated::close(&mut tx, execution.id).await.unwrap();
+    assert!(
+        Delegated::require_closed_output(&mut tx, execution.id)
+            .await
+            .is_err(),
+        "closing a running attempt does not publish terminal output"
+    );
+    ExecutionRepository::update(
+        &mut *tx,
+        execution.id,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Completed),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        Delegated::require_closed_output(&mut tx, execution.id)
+            .await
+            .unwrap()
+            .owner,
+        Some(human)
+    );
+    sqlx::query("UPDATE execution SET worker=NULL WHERE id=$1")
+        .bind(execution.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    assert!(
+        Delegated::require_closed_output(&mut tx, execution.id)
+            .await
+            .is_err(),
+        "a closed output must retain its assigned worker"
+    );
+    ExecutionRepository::update(
+        &mut *tx,
+        execution.id,
+        UpdateExecutionInput {
+            worker: Some(worker.id),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    // Native controls retain scoped standard without granting the human owner
+    // the private body or copying freeform details to ordinary queue columns.
+    let output_origin = Delegated::output_origin(&mut tx, execution.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let provenance = attune_common::secret_provenance::SecretProvenance {
+        origins: vec![output_origin],
+        templates: vec![],
+    };
+    let key = "owned-native-queue-control-test-encryption-key";
+    let prepared = attune_common::secret_values::prepare_secret_values(vec![attune_common::secret_values::SecretValueInput {
+        json_path:"/queue_ack".into(),
+        value:json!({"version":1,"items":[{"id":10,"status":"completed","summary":{"value":"private"},"error":{"value":"private"}}]}),
+        source_kind:"provenance".into(), source_ref:Some(serde_json::to_string(&provenance).unwrap()),
+    }], key).unwrap();
+    attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::upsert_many_with_conn(&mut tx, attune_common::secret_values::ENTITY_EXECUTION_RESULT, execution.id, &prepared).await.unwrap();
+    ExecutionRepository::update(
+        &mut *tx,
+        execution.id,
+        UpdateExecutionInput {
+            result: Some(json!({"queue_ack":attune_common::secret_values::redaction_marker()})),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let stored = attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::find_stored_by_entity(&mut *tx, attune_common::secret_values::ENTITY_EXECUTION_RESULT, execution.id).await.unwrap();
+    assert!(
+        attune_common::key_access::authorize_parameter_key_origins_with_conn(
+            &mut tx,
+            Some(human),
+            &stored
+        )
+        .await
+        .is_err(),
+        "control consumption must not grant human body disclosure"
+    );
+    let attune_common::repositories::delegated_execution::ProtectedQueueAck::Controls(controls) =
+        Delegated::protected_queue_ack_controls(&mut tx, execution.id, &[10], 1, Some(key))
+            .await
+            .unwrap()
+    else {
+        panic!("closed standard controls rejected")
+    };
+    assert!(controls.items[0].summary.is_none() && controls.items[0].error.is_none());
     assert!(Delegated::retain_claims(&mut tx, &claims).await.is_err());
 
     assert!(Delegated::validate_claims(&mut tx, &claims).await.is_err());
