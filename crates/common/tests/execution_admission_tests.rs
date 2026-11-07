@@ -3813,6 +3813,42 @@ async fn native_workflow_authority_fences_children_and_private_controls() {
             .is_none(),
         "managed delegated callbacks must use explicit selected mode, not ownership"
     );
+    let original = snapshot.executable.workflow_definition.as_ref().unwrap();
+    let other = attune_common::repositories::workflow::WorkflowDefinitionRepository::create(
+        &mut *tx,
+        attune_common::repositories::workflow::CreateWorkflowDefinitionInput {
+            r#ref: format!("{}.other_native_binding", original.pack_ref),
+            pack: original.pack,
+            pack_ref: original.pack_ref.clone(),
+            label: "Different binding".into(),
+            description: None,
+            version: "1.0.0".into(),
+            param_schema: None,
+            out_schema: None,
+            definition: original.definition.clone(),
+            tags: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE workflow_execution SET workflow_def=$1 WHERE id=$2")
+        .bind(other.id)
+        .bind(workflow.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    assert!(
+        Native::prepare_for_completion(&mut tx, child.id)
+            .await
+            .is_err(),
+        "delegated callbacks retain their immutable workflow definition binding"
+    );
+    sqlx::query("UPDATE workflow_execution SET workflow_def=$1 WHERE id=$2")
+        .bind(original.id)
+        .bind(workflow.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     Delegated::close(&mut tx, root.id).await.unwrap();
     assert!(
         Native::prepare_for_completion(&mut tx, child.id)

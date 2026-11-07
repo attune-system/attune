@@ -275,6 +275,19 @@ impl NativeFailureMaterializationRepository {
         {
             return Ok(None);
         }
+        if workflow.workflow_def
+            != parent
+                .executable_snapshot
+                .as_ref()
+                .ok_or_else(changed)?
+                .executable
+                .workflow_definition
+                .as_ref()
+                .ok_or_else(changed)?
+                .id
+        {
+            return Err(changed());
+        }
         if super::execution_admission::ExecutionAdmissionRepository::existing_authority(
             conn, parent.id,
         )
@@ -301,19 +314,6 @@ impl NativeFailureMaterializationRepository {
             .definition;
         if !ordinary_terminal_graph(graph)? {
             return Ok(None);
-        }
-        if workflow.workflow_def
-            != parent
-                .executable_snapshot
-                .as_ref()
-                .ok_or_else(changed)?
-                .executable
-                .workflow_definition
-                .as_ref()
-                .ok_or_else(changed)?
-                .id
-        {
-            return Err(changed());
         }
         let output_contract = original_contract(conn, &parent).await?;
         let mut fences = vec![Authority::retained_admission_fence(conn, admission.id).await?];
