@@ -43,6 +43,13 @@ pub trait Connection: Send {
     /// Checks if a connection to the database is still valid.
     fn ping(&mut self) -> BoxFuture<'_, Result<(), Error>>;
 
+    /// Drain pending work and verify that this session is safe for a new pool owner.
+    /// Drivers may impose stricter requirements than ordinary in-transaction ping.
+    #[doc(hidden)]
+    fn prepare_for_pool(&mut self) -> BoxFuture<'_, Result<(), Error>> {
+        Box::pin(async move { Ok(()) })
+    }
+
     /// Begin a new transaction or establish a savepoint within the active transaction.
     ///
     /// Returns a [`Transaction`] for controlling and tracking the new transaction.

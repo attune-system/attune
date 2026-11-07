@@ -274,6 +274,9 @@ pub struct PreparedStagedValue {
     receipt: ReceiptContext,
 }
 impl PreparedStagedValue {
+    pub(crate) fn receipt(&self) -> &ReceiptContext {
+        &self.receipt
+    }
     pub(crate) fn held_native_metadata(
         &self,
     ) -> &[super::native_input_snapshot::NativeSnapshotMetadata] {
@@ -2412,6 +2415,50 @@ impl InheritedInputRepository {
             });
         }
         if session.controls.len() > 256 {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
+    /// Retain an owning frame's genuine same-transaction publication as
+    /// CONTROL, including its issued prospective reads. Reopening only its
+    /// origin would discard those witnesses and incorrectly require release.
+    pub(crate) fn attach_recorded_control(
+        session: &mut RenderSession,
+        receipt: &ReceiptContext,
+    ) -> Result<()> {
+        require_own_recorded_control(
+            &session.transaction,
+            session.permit.source.owner_id,
+            receipt,
+        )?;
+        let source = PreparedInputSource {
+            renderer: session.permit.source.id,
+            receipt: receipt.copy_held(),
+            controls: vec![],
+        };
+        Self::attach_prepared_control(session, &source)
+    }
+
+    /// Literal variant of the same CONTROL attachment. This never binds the
+    /// historical publication as a replacement VALUE or changes its plaintext.
+    pub(crate) fn attach_recorded_literal_control(
+        rendered: &mut RenderedReceiptContext,
+        receipt: &ReceiptContext,
+    ) -> Result<()> {
+        require_own_recorded_control(&rendered.transaction, rendered.renderer.owner_id, receipt)?;
+        rendered.fence = rendered.fence.intersect(&receipt.fence);
+        merge_wait_reads(&mut rendered.wait_reads, &receipt.wait_reads)?;
+        merge_result_reads(&mut rendered.result_reads, &receipt.result_reads)?;
+        merge_empty_reads(&mut rendered.empty_reads, &receipt.empty_reads)?;
+        rendered.selections.push(ReadSelection {
+            context_path: "$control".into(),
+            source: SelectionSource::Control {
+                receipt: receipt.id,
+                site: receipt.site.clone(),
+            },
+        });
+        if rendered.selections.len() > 256 {
             return Err(denied());
         }
         Ok(())
@@ -5231,6 +5278,21 @@ fn iteration_value(array: &Value, ordinal: usize, batch_size: Option<usize>) -> 
     }
 }
 
+fn require_own_recorded_control(
+    transaction: &str,
+    execution: Id,
+    receipt: &ReceiptContext,
+) -> Result<()> {
+    if !receipt.newly_recorded
+        || receipt.transaction != transaction
+        || receipt.site.execution != execution
+        || receipt.site.kind != InputEntityKind::WorkflowVariables
+    {
+        return Err(denied());
+    }
+    receipt.ensure_fresh()
+}
+
 fn denied() -> Error {
     Error::PermissionDenied(
         "Purpose input receipt, selection, value shape or lineage does not match".into(),
@@ -5444,6 +5506,55 @@ async fn retained_input_approval(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn recorded_frame_controls_reject_foreign_and_reopened_receipts() {
+        let mut receipt = ReceiptContext {
+            empty_reads: vec![],
+            graph_accounting: None,
+            result_reads: vec![],
+            wait_reads: vec![],
+            source_receipts: vec![],
+            native_sources: vec![],
+            newly_recorded: true,
+            transaction: "issuing-transaction".into(),
+            id: 1,
+            site: InputSite {
+                execution: 7,
+                kind: InputEntityKind::WorkflowVariables,
+                purpose: InputSitePurpose::Value,
+                path: "/publish/value".into(),
+            },
+            value: json!("held value"),
+            origins: vec![],
+            public_sources: vec![],
+            outcomes: vec![],
+            fence: ApprovalEffectFence::from_input_approval(None).unwrap(),
+        };
+        // A genuine frame may carry either a value publication or a condition
+        // as CONTROL. Neither is a replacement destination VALUE capability.
+        for purpose in [
+            InputSitePurpose::Value,
+            InputSitePurpose::Condition,
+            InputSitePurpose::Control,
+        ] {
+            receipt.site.purpose = purpose;
+            require_own_recorded_control("issuing-transaction", 7, &receipt).unwrap();
+        }
+        assert!(require_own_recorded_control("other-transaction", 7, &receipt).is_err());
+        assert!(require_own_recorded_control("issuing-transaction", 8, &receipt).is_err());
+        receipt.newly_recorded = false;
+        assert!(require_own_recorded_control("issuing-transaction", 7, &receipt).is_err());
+        receipt.newly_recorded = true;
+        for kind in [
+            InputEntityKind::ExecutionConfig,
+            InputEntityKind::ExecutionResult,
+        ] {
+            receipt.site.kind = kind;
+            assert!(require_own_recorded_control("issuing-transaction", 7, &receipt).is_err());
+        }
+    }
+
     #[test]
     fn held_deadline_summary_keeps_independent_control_expiry() {
         let now = chrono::Utc::now();

@@ -1,0 +1,12 @@
+[package]
+name = "attune-sqlx-session-regressions"
+version = "0.1.0"
+edition = "2021"
+publish = false
+[workspace]
+[dependencies]
+sqlx = { version = "=0.8.6", default-features = false, features = ["runtime-tokio", "postgres"] }
+tokio = { version = "=1.53.3", features = ["full"] }
+[patch.crates-io]
+sqlx-core = { path = "../../vendor/sqlx-core-0.8.6" }
+sqlx-postgres = { path = "../../vendor/sqlx-postgres-0.8.6" }

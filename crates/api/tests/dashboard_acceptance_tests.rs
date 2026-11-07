@@ -2095,3 +2095,95 @@ async fn dashboard_default_home_assignment_clears_previous_default_in_scope() ->
 
     Ok(())
 }
+
+#[path = "../../../tests/sqlx-session/src/relay.rs"]
+mod transaction_relay;
+
+#[tokio::test]
+async fn cancelled_dashboard_begin_cannot_contaminate_later_api_requests() -> Result<()> {
+    use std::sync::Arc;
+    use std::time::Duration as StdDuration;
+    let mut ctx = TestContext::new().await?;
+    let token = register_user_with_grants(
+        &ctx,
+        "cancelled_dashboard",
+        json!([
+            {"resource":"dashboards","actions":["read","create"]},
+            {"resource":"events","actions":["read"]}
+        ]),
+    )
+    .await?;
+    let spec = dashboard_acceptance_fixtures::dashboard_spec(
+        &[("events", "event_count")],
+        &[("events_card", "events")],
+        None,
+    );
+    create_dashboard(
+        &ctx,
+        "test.cancelled_reader",
+        "Cancellation probe",
+        spec.clone(),
+    )
+    .await?;
+    let search_path = format!("{},public", ctx.schema);
+    let options = ctx
+        .pool
+        .connect_options()
+        .as_ref()
+        .clone()
+        .options([("search_path", search_path.as_str())])
+        .ssl_mode(sqlx::postgres::PgSslMode::Disable);
+    let (port, seen, release, relay) = transaction_relay::relay(
+        format!("{}:{}", options.get_host(), options.get_port()),
+        b'T',
+        1,
+    )
+    .await;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone().host("127.0.0.1").port(port))
+        .await?;
+    let mut state = (*ctx.state).clone();
+    state.db = pool.clone();
+    ctx.state = Arc::new(state);
+    ctx.app = attune_api::server::Server::new(ctx.state.clone()).router();
+    {
+        let request = ctx.post("/api/v1/dashboards/test.cancelled_reader/data",
+            json!({"include_meta":true,"time_range":{"start":(Utc::now()-Duration::hours(2)).to_rfc3339(),"end":Utc::now().to_rfc3339()}}), Some(&token));
+        tokio::pin!(request);
+        tokio::select! {
+            _ = seen => (),
+            result = &mut request => panic!("dashboard completed before BEGIN gate: {:?}", result.map(|response| response.status())),
+            _ = tokio::time::sleep(StdDuration::from_secs(15)) => panic!("dashboard BEGIN deadline"),
+        }
+    }
+    pool.set_connect_options(options);
+    release.send(()).unwrap();
+    let response = ctx.get("/auth/me", Some(&token)).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = ctx
+        .post(
+            "/api/v1/dashboards",
+            json!({
+                "ref":"test.after_cancellation", "label":"Independent committed write",
+                "scope_type":"global", "spec":spec,
+            }),
+            Some(&token),
+        )
+        .await?;
+    let status = response.status();
+    let body: Value = response.json().await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let committed: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM dashboard WHERE ref='test.after_cancellation'")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(
+        committed, 1,
+        "later HTTP write must be visible to an independent pool"
+    );
+    pool.close().await;
+    tokio::time::timeout(StdDuration::from_secs(10), relay).await??;
+    ctx.cleanup().await?;
+    Ok(())
+}

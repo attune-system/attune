@@ -329,7 +329,8 @@ pub async fn run_cycle_with_budget(
     metrics.pending_collection = ObjectMaintenanceRepository::pending_count(pool).await?;
     metrics.metadata_scan_pending = ObjectMaintenanceRepository::deletion_scan_pending(pool)
         .await?
-        || Evidence::audit_scan_pending(pool).await?;
+        || Evidence::audit_scan_pending(pool).await?
+        || StorageMaintenanceRepository::abandoned_discovery_pending(pool).await?;
     metrics.oldest_metadata_deferral_seconds = [
         Evidence::audit_deferred_since(pool).await?,
         ObjectMaintenanceRepository::deletion_deferred_since(pool).await?,

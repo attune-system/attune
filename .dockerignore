@@ -5,6 +5,8 @@ target/
 *.pdb
 
 # Development artifacts
+.handoff/
+.scratch/
 .env
 .env.*
 *.log

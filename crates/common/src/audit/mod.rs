@@ -8,7 +8,7 @@
 //!
 //! Emission is non-blocking: callers construct an [`AuditEvent`] (typically
 //! via [`AuditEventBuilder`]) and pass it to [`AuditEmitter::emit`], which
-//! sends it on an unbounded mpsc channel. A background [`AuditWriter`] task
+//! sends it on a bounded mpsc channel. A background [`AuditWriter`] task
 //! batch-inserts events into the ordinary PostgreSQL `audit_event` table.
 //!
 //! On channel-receiver-dropped or DB error we log the failure but never

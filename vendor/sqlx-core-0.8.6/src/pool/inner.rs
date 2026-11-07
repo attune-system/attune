@@ -362,6 +362,10 @@ impl<DB: Database> PoolInner<DB> {
                         Ok(())
                     };
 
+                    let res = match res {
+                        Ok(()) => raw.prepare_for_pool().await,
+                        Err(error) => Err(error),
+                    };
                     match res {
                         Ok(()) => return Ok(Floating::new_live(raw, guard)),
                         Err(error) => {
@@ -498,6 +502,12 @@ async fn check_idle_conn<DB: Database>(
 
             Ok(true) => {}
         }
+    }
+
+    // Hooks can issue SQL, including BEGIN. Check after their final response.
+    if let Err(error) = conn.live.raw.prepare_for_pool().await {
+        tracing::warn!(%error, "session rejected before acquisition");
+        return Err(conn.close_hard().await);
     }
 
     // No need to re-connect; connection is alive or we don't care

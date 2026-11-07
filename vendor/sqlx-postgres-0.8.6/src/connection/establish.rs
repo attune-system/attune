@@ -142,6 +142,8 @@ impl PgConnection {
                 secret_key,
                 cancel_options: std::sync::Arc::new(options.clone()),
                 transaction_status,
+                transaction_startup_uncertain: false,
+                suppress_rollback_once: false,
                 transaction_depth: 0,
                 pending_ready_for_query_count: 0,
                 next_statement_id: StatementId::NAMED_START,
