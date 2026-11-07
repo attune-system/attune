@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use attune_common::device_auth::{
     DeviceAuthorizationResponse, DevicePollResponse, DeviceWaitReason,
 };
@@ -267,7 +267,7 @@ async fn handle_sso_login(
     no_browser: bool,
     output_format: OutputFormat,
 ) -> Result<()> {
-    let config = CliConfig::load()?;
+    let mut config = CliConfig::load()?;
     let target_profile_name = profile
         .cloned()
         .unwrap_or_else(|| config.current_profile.clone());
@@ -324,8 +324,8 @@ async fn handle_sso_login(
         _ = tokio::signal::ctrl_c() => anyhow::bail!("SSO device login cancelled"),
     };
 
-    // Persist tokens.
-    let mut config = CliConfig::load()?;
+    // Keep the pre-authentication snapshot so a concurrent profile change or
+    // deletion cannot rebind these tokens or recreate a deleted profile.
     let p = config
         .profiles
         .entry(target_profile_name.clone())
@@ -527,7 +527,9 @@ async fn handle_login(
         config.save()?;
     }
 
-    let mut login_config = CliConfig::load()?;
+    // The persistence owner retains the snapshot from before authentication.
+    // Only this clone is cleared for the anonymous login request.
+    let mut login_config = config.clone();
     login_config.current_profile = target_profile_name.clone();
 
     let password = match password {
@@ -576,20 +578,21 @@ async fn handle_login(
 
     let response: LoginResponse = client.post(login_path, &login_req).await?;
 
-    let mut config = CliConfig::load()?;
-    if let Some(p) = config.profiles.get_mut(&target_profile_name) {
-        p.clear_credentials();
-        p.auth_token = Some(response.access_token.clone());
-        p.refresh_token = Some(response.refresh_token.clone());
-        p.auth_method = Some(auth_method.to_string());
-        p.username = Some(username);
-        config.save()?;
-    } else {
-        config.set_auth(
-            response.access_token.clone(),
-            response.refresh_token.clone(),
-        )?;
+    let p = config
+        .profiles
+        .get_mut(&target_profile_name)
+        .context("Login target profile is missing; retry login")?;
+    // Preserve the authenticated endpoint; save rejects a changed/deleted target
+    // against its original snapshot instead of falling back to the active profile.
+    if crate::credentials::endpoint(&p.api_url)? != client.base_url() {
+        anyhow::bail!("Login endpoint changed; retry login");
     }
+    p.clear_credentials();
+    p.auth_token = Some(response.access_token.clone());
+    p.refresh_token = Some(response.refresh_token.clone());
+    p.auth_method = Some(auth_method.to_string());
+    p.username = Some(username);
+    config.save()?;
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {
@@ -649,7 +652,9 @@ async fn handle_token_login(
         config.save()?;
     }
 
-    let mut login_config = CliConfig::load()?;
+    // The persistence owner retains the snapshot from before authentication.
+    // Only this clone is cleared for the anonymous login request.
+    let mut login_config = config.clone();
     login_config.current_profile = target_profile_name.clone();
 
     let token = match token {
@@ -666,20 +671,21 @@ async fn handle_token_login(
         .post("/auth/token-login", &TokenLoginRequest { token })
         .await?;
 
-    let mut config = CliConfig::load()?;
-    if let Some(p) = config.profiles.get_mut(&target_profile_name) {
-        p.clear_credentials();
-        p.auth_token = Some(response.access_token.clone());
-        p.refresh_token = Some(response.refresh_token.clone());
-        p.auth_method = Some("token".to_string());
-        p.username = None;
-        config.save()?;
-    } else {
-        config.set_auth(
-            response.access_token.clone(),
-            response.refresh_token.clone(),
-        )?;
+    let p = config
+        .profiles
+        .get_mut(&target_profile_name)
+        .context("Login target profile is missing; retry login")?;
+    // Preserve the authenticated endpoint; save rejects a changed/deleted target
+    // against its original snapshot instead of falling back to the active profile.
+    if crate::credentials::endpoint(&p.api_url)? != client.base_url() {
+        anyhow::bail!("Login endpoint changed; retry login");
     }
+    p.clear_credentials();
+    p.auth_token = Some(response.access_token.clone());
+    p.refresh_token = Some(response.refresh_token.clone());
+    p.auth_method = Some("token".to_string());
+    p.username = None;
+    config.save()?;
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {

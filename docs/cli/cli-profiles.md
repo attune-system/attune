@@ -478,7 +478,10 @@ use mode `0600`; Windows files use a protected DACL granting the owner access.
 Independent profile edits merge; conflicting changes to one profile fail with a
 retry message. CLI and MCP serialize refreshes for the same profile, and token
 rotation is saved back to its originating profile without changing the active
-profile. A successful refresh whose persistence fails reports an error.
+profile. Login retains its pre-authentication profile snapshot: a concurrent
+change or deletion rejects the returned credentials rather than rebinding them
+or falling back to another profile. A successful refresh whose persistence fails
+reports an error.
 
 Saved tokens are bound to the configured API endpoint. Changing the profile URL
 clears its credentials; a different `--api-url` cannot reuse them. Supply runtime

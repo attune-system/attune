@@ -318,3 +318,143 @@ async fn named_profile_plaintext_optout_does_not_change_the_active_profile() {
     );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("private-access"));
 }
+
+#[derive(Clone, Copy)]
+enum LoginFlow {
+    Password,
+    Ldap,
+    Integration,
+    Sso,
+}
+
+async fn assert_login_rejects_concurrent_profile_change(flow: LoginFlow, delete: bool) {
+    let authenticated_server = MockServer::start().await;
+    let other_server = MockServer::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let config_path = setup(home.path(), &other_server.uri());
+    run(
+        home.path(),
+        &[
+            "config",
+            "add-profile",
+            "staging",
+            "--api-url",
+            &authenticated_server.uri(),
+        ],
+    );
+    Mock::given(method("GET"))
+        .and(request_path("/auth/settings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{
+            "local_password_enabled": !matches!(flow, LoginFlow::Ldap), "ldap_enabled": true
+        }})))
+        .mount(&authenticated_server)
+        .await;
+    if matches!(flow, LoginFlow::Sso) {
+        Mock::given(method("POST"))
+            .and(request_path("/auth/oidc/device/start"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{
+                "device_code":"owned-device-session", "user_code":"ABCD-1234",
+                "verification_uri":"https://idp.example.com/device", "expires_in":30, "interval":1
+            }})))
+            .mount(&authenticated_server)
+            .await;
+    }
+    let response_path = match flow {
+        LoginFlow::Password => "/auth/login",
+        LoginFlow::Ldap => "/auth/ldap/login",
+        LoginFlow::Integration => "/auth/token-login",
+        LoginFlow::Sso => "/auth/oidc/device/poll",
+    };
+    let owned_home = home.path().to_owned();
+    let other_url = other_server.uri();
+    Mock::given(method("POST")).and(request_path(response_path))
+        .respond_with(move |_: &wiremock::Request| {
+            // The authenticated request has arrived, but its tokens have not
+            // been returned. Complete the competing edit before releasing them.
+            if delete {
+                run(&owned_home, &["config", "remove-profile", "staging"]);
+            } else {
+                run(&owned_home, &["--profile", "staging", "config", "set", "api_url", &other_url]);
+            }
+            let tokens = json!({"access_token":"server-a-access", "refresh_token":"server-a-refresh", "expires_in":3600});
+            let data = if matches!(flow, LoginFlow::Sso) { json!({"status":"authorized", "tokens":tokens}) } else { tokens };
+            ResponseTemplate::new(200).set_body_json(json!({"data":data}))
+        }).expect(1).mount(&authenticated_server).await;
+    let args = match flow {
+        LoginFlow::Password | LoginFlow::Ldap => vec![
+            "--profile",
+            "staging",
+            "auth",
+            "login",
+            "--username",
+            "alice",
+            "--password",
+            "test-password",
+        ],
+        LoginFlow::Integration => vec![
+            "--profile",
+            "staging",
+            "auth",
+            "token-login",
+            "--token",
+            "integration-secret",
+        ],
+        LoginFlow::Sso => vec!["--profile", "staging", "auth", "sso-login", "--no-browser"],
+    };
+    let output = command("attune", home.path()).args(args).output().unwrap();
+    assert!(
+        !output.status.success(),
+        "stale login unexpectedly succeeded"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Profile changed in another process"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value =
+        serde_yaml_ng::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+    assert_eq!(value["profile"], "default");
+    assert!(value["profiles"]["default"].get("credentials").is_none());
+    if delete {
+        assert!(
+            value["profiles"].get("staging").is_none(),
+            "login recreated the deleted profile"
+        );
+    } else {
+        assert_eq!(value["profiles"]["staging"]["api_url"], other_server.uri());
+        assert!(value["profiles"]["staging"].get("credentials").is_none());
+        let whoami = command("attune", home.path())
+            .args(["--profile", "staging", "auth", "whoami"])
+            .output()
+            .unwrap();
+        assert!(!whoami.status.success());
+    }
+    assert!(
+        other_server.received_requests().await.unwrap().is_empty(),
+        "server A's credentials reached another server"
+    );
+}
+
+#[tokio::test]
+async fn login_rejects_concurrent_endpoint_changes_for_all_login_methods() {
+    for flow in [
+        LoginFlow::Password,
+        LoginFlow::Ldap,
+        LoginFlow::Integration,
+        LoginFlow::Sso,
+    ] {
+        assert_login_rejects_concurrent_profile_change(flow, false).await;
+    }
+}
+
+#[tokio::test]
+async fn login_rejects_concurrent_profile_deletion_for_all_login_methods() {
+    for flow in [
+        LoginFlow::Password,
+        LoginFlow::Ldap,
+        LoginFlow::Integration,
+        LoginFlow::Sso,
+    ] {
+        assert_login_rejects_concurrent_profile_change(flow, true).await;
+    }
+}

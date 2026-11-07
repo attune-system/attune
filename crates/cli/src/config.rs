@@ -345,6 +345,9 @@ impl CliConfig {
         }
         let path = self.path()?;
         let _lock = storage::lock(&path)?;
+        if self.snapshot.borrow().is_some() && !path.exists() {
+            anyhow::bail!("Configuration was removed in another process; retry the operation");
+        }
         let desired = self.disk_value()?;
         let mut latest = if path.exists() {
             Self::read_disk(&path)?.0
@@ -387,10 +390,14 @@ impl CliConfig {
                 }
             }
         } else {
-            latest = desired;
+            latest = desired.clone();
         }
         storage::write(&path, serde_yaml_ng::to_string(&latest)?.as_bytes())?;
-        *self.snapshot.borrow_mut() = Some(Snapshot(latest));
+        // Track this object's serialized state, not concurrent edits merged
+        // into the file. The object still holds its original values for those
+        // fields; treating the merged file as its baseline would turn stale
+        // values into apparent edits on its next save (including old tokens).
+        *self.snapshot.borrow_mut() = Some(Snapshot(desired));
         Ok(())
     }
 
@@ -1049,6 +1056,62 @@ mod credential_tests {
         fresh.save().unwrap();
         stale.current_profile_mut().unwrap().description = Some("stale".into());
         assert!(stale.save().is_err());
+    }
+
+    #[test]
+    fn repeated_saves_preserve_concurrent_logout_and_metadata_edits() {
+        // Exercise both representations: stale plaintext must not be written
+        // back, and an old encrypted envelope must not be restored either.
+        for encrypted in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.yaml");
+            let mut initial = CliConfig::load_at(&path).unwrap();
+            initial.set_encryption(encrypted).unwrap();
+            initial
+                .set_auth("access-secret".into(), "refresh-secret".into())
+                .unwrap();
+            initial
+                .set_profile(
+                    "other".into(),
+                    CliConfig::default().current_profile().unwrap().clone(),
+                )
+                .unwrap();
+            let mut stale = CliConfig::load_at(&path).unwrap();
+            let mut fresh = CliConfig::load_at(&path).unwrap();
+            fresh.clear_auth().unwrap();
+            fresh.current_profile_mut().unwrap().description = Some("concurrent edit".into());
+            fresh.format = "json".into();
+            fresh.save().unwrap();
+            stale.select_profile("other").unwrap();
+            stale.current_profile_mut().unwrap().description = Some("first edit".into());
+            stale.save().unwrap();
+            stale.current_profile_mut().unwrap().description = Some("second edit".into());
+            stale.save().unwrap();
+            // A third no-op save must also leave concurrent state untouched.
+            stale.save().unwrap();
+            let loaded = CliConfig::load_at(&path).unwrap();
+            assert!(!loaded.profiles["default"].has_credentials());
+            assert_eq!(
+                loaded.profiles["default"].description.as_deref(),
+                Some("concurrent edit")
+            );
+            assert_eq!(
+                loaded.profiles["other"].description.as_deref(),
+                Some("second edit")
+            );
+            assert_eq!(loaded.format, "json");
+        }
+    }
+
+    #[test]
+    fn saving_an_existing_snapshot_cannot_recreate_a_deleted_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let mut config = CliConfig::load_at(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        config.current_profile_mut().unwrap().description = Some("stale edit".into());
+        assert!(config.save().is_err());
+        assert!(!path.exists());
     }
 
     #[test]
