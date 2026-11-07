@@ -62,7 +62,7 @@ pub async fn token(ctx: &super::TestContext, owner: i64, refs: &[String]) -> sup
         },
     )
     .await?;
-    Ok(execution_token(ctx, execution.id).await?)
+    execution_token(ctx, execution.id).await
 }
 
 pub async fn execution_token(ctx: &super::TestContext, execution: i64) -> super::Result<String> {
