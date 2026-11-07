@@ -298,7 +298,7 @@ impl DelegatedExecutionRepository {
         encryption_key: Option<&str>,
     ) -> Result<ProtectedQueueAck> {
         use crate::secret_values::{restore_secret_values, ENTITY_EXECUTION_RESULT};
-        Self::require_closed_output(conn, execution).await?;
+        let selected = Self::require_closed_output(conn, execution).await?;
         let mut secrets =
             super::execution_secret_value::ExecutionSecretValueRepository::find_stored_by_entity(
                 &mut *conn,
@@ -310,7 +310,13 @@ impl DelegatedExecutionRepository {
             secret.json_path == "/queue_ack" || secret.json_path.starts_with("/queue_ack/")
         });
         if secrets.is_empty() {
-            return Ok(ProtectedQueueAck::Unprotected);
+            return Ok(if selected.selected_refs.is_empty() {
+                ProtectedQueueAck::Unprotected
+            } else {
+                // API-capable opaque output is protected even when provenance
+                // is missing; absence must never select public consumption.
+                ProtectedQueueAck::Invalid
+            });
         }
         crate::key_access::authorize_execution_control_origins(conn, execution, &secrets).await?;
         let source = ExecutionRepository::find_by_id(&mut *conn, execution)

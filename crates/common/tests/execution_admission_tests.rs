@@ -3641,6 +3641,19 @@ async fn delegated_authority_is_explicit_immutable_and_attempt_fenced() {
         templates: vec![],
     };
     let key = "owned-native-queue-control-test-encryption-key";
+    ExecutionRepository::update(&mut *tx, execution.id, UpdateExecutionInput {
+        result:Some(json!({"queue_ack":{"version":1,"items":[{"id":10,"status":"completed","summary":{"value":"private"}}]}})),
+        ..Default::default()
+    }).await.unwrap();
+    assert!(
+        matches!(
+            Delegated::protected_queue_ack_controls(&mut tx, execution.id, &[10], 1, Some(key))
+                .await
+                .unwrap(),
+            attune_common::repositories::delegated_execution::ProtectedQueueAck::Invalid
+        ),
+        "missing encrypted output evidence cannot authorize public acknowledgement details"
+    );
     let prepared = attune_common::secret_values::prepare_secret_values(vec![attune_common::secret_values::SecretValueInput {
         json_path:"/queue_ack".into(),
         value:json!({"version":1,"items":[{"id":10,"status":"completed","summary":{"value":"private"},"error":{"value":"private"}}]}),
