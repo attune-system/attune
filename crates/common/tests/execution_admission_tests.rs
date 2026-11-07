@@ -4203,13 +4203,13 @@ async fn authority_upgrade_drains_old_delegation_and_preserves_recorded_bindings
     use attune_common::{config::Config, repositories::execution::UpdateExecutionInput};
     let db = TestDatabase::create_before(
         &Config::load().unwrap().database,
-        "20261106000001_execution_authority_selection.sql",
+        "20261107000001_execution_authority_selection.sql",
     )
     .await
     .unwrap();
     let (db, snapshot, policy, human) = fixture_on_database(db, false, false, None).await;
     let migration =
-        include_str!("../../../migrations/20261106000001_execution_authority_selection.sql");
+        include_str!("../../../migrations/20261107000001_execution_authority_selection.sql");
     // Both ad hoc ownership and a missing managed admission are insufficient
     // authority evidence. Running/queued old work must drain without mutation.
     let mut old_snapshot = snapshot.clone();

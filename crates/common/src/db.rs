@@ -367,6 +367,67 @@ pub struct PoolStats {
     pub idle_connections: usize,
 }
 
+/// Owns a session across transaction boundaries (for session advisory locks).
+/// Cancellation at any suspension point disposes the socket. Only an explicitly
+/// confirmed normal cleanup may return this connection to the pool.
+pub struct SessionLease(Option<sqlx::pool::PoolConnection<sqlx::Postgres>>);
+
+impl SessionLease {
+    pub async fn acquire(pool: &PgPool) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self(Some(pool.acquire().await?)))
+    }
+
+    /// Track the transaction without lending the session across its commit.
+    /// This lease owns disposal if any boundary future is cancelled or fails.
+    pub async fn begin_transaction(&mut self) -> std::result::Result<(), sqlx::Error> {
+        use sqlx::TransactionManager;
+        sqlx::postgres::PgTransactionManager::begin(self, None).await
+    }
+
+    pub async fn commit_transaction(&mut self) -> std::result::Result<(), sqlx::Error> {
+        use sqlx::TransactionManager;
+        sqlx::postgres::PgTransactionManager::commit(self).await
+    }
+
+    pub async fn rollback_transaction(&mut self) -> std::result::Result<(), sqlx::Error> {
+        use sqlx::TransactionManager;
+        sqlx::postgres::PgTransactionManager::rollback(self).await
+    }
+
+    /// Call only after acknowledged transaction completion and session unlock.
+    pub fn release_clean(mut self) {
+        drop(self.0.take());
+    }
+}
+
+impl std::ops::Deref for SessionLease {
+    type Target = PgConnection;
+    fn deref(&self) -> &PgConnection {
+        self.0.as_ref().expect("session lease released")
+    }
+}
+impl std::ops::DerefMut for SessionLease {
+    fn deref_mut(&mut self) -> &mut PgConnection {
+        self.0.as_mut().expect("session lease released")
+    }
+}
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        if let Some(conn) = self.0.as_mut() {
+            static DISPOSALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let uncertain_session_disposals = DISPOSALS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .wrapping_add(1);
+            tracing::warn!(
+                operation = "session_lease_dispose",
+                uncertain_session_disposals,
+                "session owner did not confirm reuse; disposing connection"
+            );
+            conn.close_on_drop();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

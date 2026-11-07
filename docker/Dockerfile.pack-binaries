@@ -64,6 +64,8 @@ RUN apt-get update && apt-get install -y \
 # This replaces native musl-gcc and avoids the -m64 flag mismatch that occurs
 # when the host arch doesn't match the target arch (e.g., building x86_64 musl
 # binaries on an arm64 host).
+ARG CARGO_BUILD_JOBS=4
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 RUN pip3 install --break-system-packages --no-cache-dir "ziglang==${ZIG_VERSION}" && \
     cargo install --locked --version "${CARGO_ZIGBUILD_VERSION}" cargo-zigbuild
 

@@ -135,6 +135,17 @@ native stack limit is unchanged. The Windows CLI workflow runs the same script.
 
 ## Docker-owned integration runs
 
+For memory-limited owned hosts, the full-stack runner supports
+`ATTUNE_E2E_SERIAL_BUILD=1 ATTUNE_E2E_CARGO_BUILD_JOBS=1`. It builds each
+service in a separate foreground Compose invocation, and the Cargo job budget
+also covers bootstrap tool installation. This changes build concurrency only;
+normal test selection, ownership and teardown still apply. For example:
+
+```bash
+ATTUNE_E2E_SERIAL_BUILD=1 ATTUNE_E2E_CARGO_BUILD_JOBS=1 \
+  bash scripts/run-integration-tests.sh --tier 1 -x
+```
+
 ### Private pack-source authentication
 
 The normal API suite includes managed-index HTTPS Git installation and

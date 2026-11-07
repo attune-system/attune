@@ -323,3 +323,44 @@ async fn default_partition_repair_preserves_bindings_and_partition_expiry_prunes
         .is_none());
     db.cleanup().await.unwrap();
 }
+
+#[tokio::test]
+async fn system_alert_optional_fields_pass_canonical_internal_admission() {
+    use attune_common::{
+        repositories::platform_catalog::PlatformCatalogRepository,
+        system_alert::{emit_core_alert, SystemAlert},
+    };
+    let db = create_test_pool().await.unwrap();
+    PlatformCatalogRepository::reconcile(&db).await.unwrap();
+    for present in [false, true] {
+        let event = emit_core_alert(
+            &db,
+            None,
+            SystemAlert {
+                severity: "warning".into(),
+                category: "maintenance".into(),
+                failure_type: "graph_reclamation_deferred".into(),
+                component_type: "supervisor".into(),
+                component_id: present.then_some(123),
+                component_ref: present.then(|| "core.maintenance".into()),
+                worker_role: present.then(|| "action".into()),
+                observed_at: chrono::Utc::now(),
+                summary: "Owned maintenance deferral probe".into(),
+                details: if present {
+                    json!({})
+                } else {
+                    serde_json::Value::Null
+                },
+                correlation_id: present.then(|| "owned-probe".into()),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("platform alert trigger exists");
+        assert_eq!(
+            event.payload.unwrap().get("component_id").is_some(),
+            present
+        );
+    }
+    db.cleanup().await.unwrap();
+}

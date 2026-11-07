@@ -950,3 +950,189 @@ async fn migration_switch_is_atomic_and_preserves_snapshot_pointer() {
     .unwrap());
     retry.rollback().await.unwrap();
 }
+
+#[tokio::test]
+async fn body_discovery_bounds_windows_and_reaches_past_pinned_prefix() {
+    let db = create_test_pool().await.unwrap();
+    let artifact = ArtifactRepository::create(&db, artifact_input("discovery"))
+        .await
+        .unwrap();
+    let ids: Vec<i64> = sqlx::query_scalar("INSERT INTO artifact_version (artifact,version,body_state,object_key,body_updated) SELECT $1,n,'pending','owned-discovery/'||n, NOW()-interval '2 days' FROM generate_series(1,17) n RETURNING id")
+        .bind(artifact.id).fetch_all(&*db).await.unwrap();
+    sqlx::query("UPDATE artifact_version SET body_updated=NOW()+INTERVAL '1 hour' WHERE id=$1")
+        .bind(ids[0])
+        .execute(&*db)
+        .await
+        .unwrap();
+    let owner = ids.last().unwrap() + 100000;
+    sqlx::query("INSERT INTO file_evidence_owner(version,artifact,root_read) VALUES($1,$2,$1)")
+        .bind(owner)
+        .bind(artifact.id)
+        .execute(&*db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO file_evidence_pin(owner,kind,source) SELECT $1,'artifact_version',unnest($2::bigint[])").bind(owner).bind(&ids[1..16]).execute(&*db).await.unwrap();
+    let mut found = Vec::new();
+    for page in 0..5 {
+        let candidates = StorageMaintenanceRepository::abandoned_pending(
+            &db,
+            Utc::now() - Duration::hours(1),
+            4,
+        )
+        .await
+        .unwrap();
+        assert!(candidates.len() <= 4);
+        found.extend(candidates.into_iter().map(|candidate| candidate.id));
+        assert_eq!(
+            StorageMaintenanceRepository::abandoned_discovery_pending(&db)
+                .await
+                .unwrap(),
+            page < 4
+        );
+    }
+    assert_eq!(
+        found,
+        vec![ids[16]],
+        "pinned prefix must not starve the later eligible row"
+    );
+    let cursor: i64 =
+        sqlx::query_scalar("SELECT last_id FROM object_body_discovery WHERE kind='abandoned'")
+            .fetch_one(&*db)
+            .await
+            .unwrap();
+    assert_eq!(cursor, ids[16]);
+    // A completed sweep wraps; none of the retained pinned rows becomes cleanup authority.
+    assert!(StorageMaintenanceRepository::abandoned_pending(
+        &db,
+        Utc::now() - Duration::hours(1),
+        4
+    )
+    .await
+    .unwrap()
+    .is_empty());
+    let retained: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM artifact_version WHERE id=ANY($1)")
+            .bind(&ids)
+            .fetch_one(&*db)
+            .await
+            .unwrap();
+    assert_eq!(retained, 17);
+    // Eligibility can change behind the cursor. Continuous new arrivals must
+    // not postpone revisiting the earlier, newly old-enough row beyond a finite sweep.
+    sqlx::query("UPDATE artifact_version SET body_updated=NOW()-INTERVAL '2 days' WHERE id=$1")
+        .bind(ids[0])
+        .execute(&*db)
+        .await
+        .unwrap();
+    let mut revisited = false;
+    for page in 0..10 {
+        sqlx::query("INSERT INTO artifact_version (artifact,version,body_state,object_key,body_updated) VALUES($1,$2,'pending',$3,NOW()-interval '2 days')")
+            .bind(artifact.id).bind(18 + page).bind(format!("owned-discovery/new-{page}"))
+            .execute(&*db).await.unwrap();
+        let candidates = StorageMaintenanceRepository::abandoned_pending(
+            &db,
+            Utc::now() - Duration::hours(1),
+            4,
+        )
+        .await
+        .unwrap();
+        assert!(candidates.len() <= 4);
+        if candidates.iter().any(|candidate| candidate.id == ids[0]) {
+            revisited = true;
+            break;
+        }
+    }
+    assert!(
+        revisited,
+        "fixed high-water sweeps must revisit changed eligibility despite inserts"
+    );
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn body_discovery_workload_visits_bounded_windows_through_ineligible_prefix() {
+    let db = create_test_pool().await.unwrap();
+    let artifact = ArtifactRepository::create(&db, artifact_input("discovery_workload"))
+        .await
+        .unwrap();
+    // Pending bodies with retained evidence reproduce an eligibility-filtered
+    // prefix: only the final unpinned body can be reclaimed.
+    let ids: Vec<i64> = sqlx::query_scalar("INSERT INTO artifact_version (artifact,version,body_state,object_key,body_updated) SELECT $1,n,'pending','owned-workload/'||n,NOW()-interval '2 days' FROM generate_series(1,4097) n ORDER BY n RETURNING id")
+        .bind(artifact.id).fetch_all(&*db).await.unwrap();
+    let tail = *ids.last().unwrap();
+    let owner = tail + 100000;
+    sqlx::query("INSERT INTO file_evidence_owner(version,artifact,root_read) VALUES($1,$2,$1)")
+        .bind(owner)
+        .bind(artifact.id)
+        .execute(&*db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO file_evidence_pin(owner,kind,source) SELECT $1,'artifact_version',unnest($2::bigint[])")
+        .bind(owner).bind(&ids[..4096]).execute(&*db).await.unwrap();
+    sqlx::query("ANALYZE artifact_version, file_evidence_pin, file_evidence_owner")
+        .execute(&*db)
+        .await
+        .unwrap();
+    let explain = std::env::var_os("ATTUNE_BODY_DISCOVERY_EXPLAIN").is_some();
+    let search_path = format!("{},public", db.schema());
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |conn, _| {
+            Box::pin(async move {
+                if explain {
+                    // Optional owned-fixture instrumentation, never required from
+                    // production roles or ordinary correctness test environments.
+                    for statement in [
+                        "LOAD 'auto_explain'",
+                        "SET auto_explain.log_min_duration=0",
+                        "SET auto_explain.log_analyze=on",
+                        "SET auto_explain.log_buffers=on",
+                        "SET auto_explain.log_format='json'",
+                    ] {
+                        sqlx::query(statement).execute(&mut *conn).await?;
+                    }
+                }
+                Ok(())
+            })
+        })
+        .connect_with(
+            db.connect_options()
+                .as_ref()
+                .clone()
+                .options([("search_path", search_path.as_str())]),
+        )
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let mut found = Vec::new();
+    for page in 0..17 {
+        let before = std::time::Instant::now();
+        let candidates = StorageMaintenanceRepository::abandoned_pending(
+            &pool,
+            Utc::now() - Duration::hours(1),
+            256,
+        )
+        .await
+        .unwrap();
+        eprintln!(
+            "body discovery page={page} candidates={} elapsed_us={}",
+            candidates.len(),
+            before.elapsed().as_micros()
+        );
+        assert!(candidates.len() <= 256);
+        found.extend(candidates.into_iter().map(|candidate| candidate.id));
+        assert_eq!(
+            StorageMaintenanceRepository::abandoned_discovery_pending(&pool)
+                .await
+                .unwrap(),
+            page < 16
+        );
+    }
+    assert_eq!(found, vec![tail]);
+    eprintln!(
+        "body discovery rows=4097 windows=17 total_us={}",
+        started.elapsed().as_micros()
+    );
+    pool.close().await;
+    db.cleanup().await.unwrap();
+}

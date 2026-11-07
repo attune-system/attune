@@ -2421,6 +2421,19 @@ impl ExecutionScheduler {
             {
                 return Ok(());
             }
+            // Select the authenticated cache frontier before legacy target locks.
+            if Self::checkpoint_native_cache(
+                pool,
+                publisher,
+                parent_execution,
+                &task_node.name,
+                encryption_key,
+                None,
+            )
+            .await?
+            {
+                return Ok(());
+            }
             let mut transaction = pool.begin().await?;
             CacheEntryRepository::protect_transaction(
                 &mut transaction,
@@ -7401,12 +7414,12 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
                 Self::checkpoint_native_wait(pool, publisher, &wait, key).await?;
                 return Ok(true);
             }
-            let mut conn = pool.acquire().await?;
+            let mut conn = attune_common::db::SessionLease::acquire(pool).await?;
             let mut prepared = None;
             let mut locked = false;
             let mut committed = false;
             let result = async {
-                sqlx::query("BEGIN").execute(&mut *conn).await?;
+                conn.begin_transaction().await?;
                 CacheEntryRepository::protect_transaction(
                     &mut conn,
                     CacheTransactionMode::PinMutation,
@@ -7418,7 +7431,7 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
                 .await?;
                 prepared = Initial::prepare(&mut conn, workflow, task, key, triggered_by).await?;
                 let Some(plan) = prepared.as_mut() else {
-                    sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+                    conn.rollback_transaction().await?;
                     return Ok::<_, anyhow::Error>(false);
                 };
                 let key = key.ok_or_else(|| {
@@ -7433,14 +7446,14 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
                     InitialWaitApply::Existing => {
                         // Do not commit a losing factory's source-phase child or
                         // snapshot. The winner already registered atomically.
-                        sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+                        conn.rollback_transaction().await?;
                         return Ok(true);
                     }
                     InitialWaitApply::Registered(child) => child.into_iter().collect(),
                     InitialWaitApply::Recovered(children) => children,
                 };
                 plan.ensure_fresh_on(&mut conn).await?;
-                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                conn.commit_transaction().await?;
                 committed = true;
                 plan.ensure_fresh()?;
                 for child in children {
@@ -7487,14 +7500,20 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
             }
             .await;
             if result.is_err() {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                let _ = conn.rollback_transaction().await;
             }
             let unlock = if locked {
-                sqlx::query("SELECT pg_advisory_unlock($1)")
+                sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
                     .bind(prepared.as_ref().expect("locked initial wait").workflow())
-                    .execute(&mut *conn)
+                    .fetch_one(&mut *conn)
                     .await
-                    .map(|_| ())
+                    .and_then(|unlocked| {
+                        if unlocked {
+                            Ok(())
+                        } else {
+                            Err(sqlx::Error::Protocol("session lock was not owned".into()))
+                        }
+                    })
             } else {
                 Ok(())
             };
@@ -7506,6 +7525,7 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
             }
             let handled = result?;
             unlock?;
+            conn.release_clean();
             Ok(handled)
         })
     }
@@ -7531,34 +7551,34 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
                     "Native cache checkpoint requires encryption"
                 ));
             };
-            let mut conn = pool.acquire().await?;
+            let mut conn = attune_common::db::SessionLease::acquire(pool).await?;
             let mut locked = false;
             let mut plan = None;
             let mut sources = None;
             let result = async {
-            sqlx::query("BEGIN").execute(&mut *conn).await?;
+            conn.begin_transaction().await?;
             CacheEntryRepository::protect_transaction(&mut conn, CacheTransactionMode::PinMutation).await?;
             attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut conn).await?;
             let actual = ExecutionRepository::find_by_id(&mut *conn, parent.id).await?
                 .ok_or_else(|| anyhow::anyhow!("Native cache parent disappeared"))?;
             if !attune_common::repositories::execution_runtime_admission::ExecutionAdmissionRepository::is_recorded(&mut conn, actual.id).await? {
-                sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+                conn.rollback_transaction().await?;
                 return Ok::<_, anyhow::Error>(false);
             }
             if actual.status != ExecutionStatus::Running {
-                sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+                conn.rollback_transaction().await?;
                 // Terminal-message reconciliation and cancellation finalization
                 // remain with their existing owner. Do not swallow that work.
                 return Ok(false);
             }
             let workflow = WorkflowExecutionRepository::find_by_execution(&mut *conn, actual.id).await?;
             if workflow.as_ref().is_none_or(|workflow| workflow.status != ExecutionStatus::Running || !workflow.failed_tasks.is_empty()) {
-                sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+                conn.rollback_transaction().await?;
                 return Ok(false);
             }
             if ExecutionRepository::summarize_workflow_task_latest_attempts(&mut *conn,
                 workflow.as_ref().expect("running workflow").id, task).await?.has_failed {
-                sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+                conn.rollback_transaction().await?;
                 return Ok(false);
             }
             if let Some(completed) = completed {
@@ -7590,7 +7610,7 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
             })).transpose()?;
             prepared.ensure_fresh_on(&mut conn).await?;
             sources.as_ref().expect("prepared native cache sources").ensure_fresh_on(&mut conn).await?;
-            sqlx::query("COMMIT").execute(&mut *conn).await?;
+            conn.commit_transaction().await?;
             prepared.ensure_fresh()?;
             sources.as_ref().expect("prepared native cache sources").ensure_fresh()?;
             for request in pending {
@@ -7610,23 +7630,30 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
             Ok(true)
         }.await;
             if result.is_err() {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                let _ = conn.rollback_transaction().await;
             }
             let unlock = if locked {
-                sqlx::query("SELECT pg_advisory_unlock($1)")
+                sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
                     .bind(
                         plan.as_ref()
                             .expect("locked prepared cache checkpoint")
                             .workflow(),
                     )
-                    .execute(&mut *conn)
+                    .fetch_one(&mut *conn)
                     .await
-                    .map(|_| ())
+                    .and_then(|unlocked| {
+                        if unlocked {
+                            Ok(())
+                        } else {
+                            Err(sqlx::Error::Protocol("session lock was not owned".into()))
+                        }
+                    })
             } else {
                 Ok(())
             };
             let handled = result?;
             unlock?;
+            conn.release_clean();
             if let Some(plan) = &plan {
                 plan.ensure_fresh()?;
             }
@@ -7645,11 +7672,11 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
         wait: &attune_common::models::WorkflowTaskWait,
         encryption_key: Option<&str>,
     ) -> Result<bool> {
-        let mut conn = pool.acquire().await?;
+        let mut conn = attune_common::db::SessionLease::acquire(pool).await?;
         let mut prepared = None;
         let mut locked = false;
         let result = async {
-            sqlx::query("BEGIN").execute(&mut *conn).await?;
+            conn.begin_transaction().await?;
             CacheEntryRepository::protect_transaction(&mut conn, CacheTransactionMode::PinMutation)
                 .await?;
             attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
@@ -7663,7 +7690,7 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
             ))
             .await?;
             let Some(plan) = prepared.as_mut() else {
-                sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+                conn.rollback_transaction().await?;
                 return Ok::<_, anyhow::Error>(false);
             };
             let key = encryption_key
@@ -7675,7 +7702,7 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
             locked = true;
             let children = plan.apply(&mut conn, key).await?;
             plan.ensure_fresh_on(&mut conn).await?;
-            sqlx::query("COMMIT").execute(&mut *conn).await?;
+            conn.commit_transaction().await?;
             plan.ensure_fresh()?;
             for child in children {
                 let pending = PendingExecutionRequested {
@@ -7721,19 +7748,26 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
         }
         .await;
         if result.is_err() {
-            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            let _ = conn.rollback_transaction().await;
         }
         let unlock = if locked {
-            sqlx::query("SELECT pg_advisory_unlock($1)")
+            sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
                 .bind(prepared.as_ref().expect("locked prepared wait").workflow())
-                .execute(&mut *conn)
+                .fetch_one(&mut *conn)
                 .await
-                .map(|_| ())
+                .and_then(|unlocked| {
+                    if unlocked {
+                        Ok(())
+                    } else {
+                        Err(sqlx::Error::Protocol("session lock was not owned".into()))
+                    }
+                })
         } else {
             Ok(())
         };
         let handled = result?;
         unlock?;
+        conn.release_clean();
         if handled {
             prepared
                 .as_ref()
@@ -11172,6 +11206,11 @@ mod tests {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/adhoc_workflow_delegation_fixture/mod.rs"
+    ));
+
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/session_cancellation/mod.rs"
     ));
 
     struct InquirySchedulerFixture {

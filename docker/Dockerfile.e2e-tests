@@ -11,6 +11,8 @@ RUN apt-get update -qq \
 
 WORKDIR /build
 ENV RUST_MIN_STACK=67108864
+ARG CARGO_BUILD_JOBS=4
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 
 COPY Cargo.toml Cargo.lock ./
 COPY vendor/ ./vendor/

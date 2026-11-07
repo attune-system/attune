@@ -71,6 +71,8 @@ pub struct PgConnectionInner {
 
     // current transaction status
     transaction_status: TransactionStatus,
+    pub(crate) transaction_startup_uncertain: bool,
+    pub(crate) suppress_rollback_once: bool,
     pub(crate) transaction_depth: usize,
 
     log_settings: LogSettings,
@@ -132,6 +134,11 @@ impl PgConnection {
         Ok(())
     }
 
+    // Idle excludes both open and failed caller-owned transactions.
+    pub(crate) fn is_transaction_idle(&self) -> bool {
+        matches!(self.inner.transaction_status, TransactionStatus::Idle)
+    }
+
     pub(crate) fn in_transaction(&self) -> bool {
         match self.inner.transaction_status {
             TransactionStatus::Transaction => true,
@@ -170,6 +177,34 @@ impl Connection for PgConnection {
         Box::pin(async move {
             self.inner.stream.shutdown().await?;
 
+            Ok(())
+        })
+    }
+
+    fn prepare_for_pool(&mut self) -> BoxFuture<'_, Result<(), Error>> {
+        Box::pin(async move {
+            self.wait_until_ready().await?;
+            if self.inner.transaction_startup_uncertain
+                || self.inner.transaction_depth != 0
+                || !self.is_transaction_idle()
+                || self.inner.pending_ready_for_query_count != 0
+                || !self.inner.stream.write_buffer_mut().is_empty()
+            {
+                static REJECTIONS: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let reuse_rejections = REJECTIONS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    .wrapping_add(1);
+                tracing::warn!(
+                    operation = "pool_reuse",
+                    reuse_rejections,
+                    transaction_depth = self.inner.transaction_depth,
+                    startup_uncertain = self.inner.transaction_startup_uncertain,
+                    pending_responses = self.inner.pending_ready_for_query_count,
+                    "unclean session rejected; pool must dispose connection"
+                );
+                return Err(err_protocol!("session is not clean for pool reuse"));
+            }
             Ok(())
         })
     }
