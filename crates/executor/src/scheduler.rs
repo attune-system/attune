@@ -12127,8 +12127,16 @@ true,
                 .expect("queued native root completion");
             assert_eq!(completed.execution_id, fixture.parent.id);
             assert_eq!(completed.status, ExecutionStatus::Cancelled);
-            attune_common::repositories::delegated_execution::DelegatedExecutionRepository::require_closed_output(
-                &mut tx, fixture.parent.id).await.unwrap();
+            // This owning inquiry fixture is recorded. Completion publication
+            // must preserve its selected mode rather than treating it as human
+            // delegation; delegated producer closure has separate boundary tests.
+            assert_eq!(
+                attune_common::repositories::execution_admission::ExecutionAdmissionRepository::selected_authority(
+                    &mut tx, fixture.parent.id).await.unwrap(),
+                attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Recorded,
+            );
+            assert!(attune_common::repositories::delegated_execution::DelegatedExecutionRepository::require_closed_output(
+                &mut tx, fixture.parent.id).await.is_err());
             tx.commit().await.unwrap();
         }
         WorkQueueDispatchRepository::update(
