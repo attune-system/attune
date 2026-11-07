@@ -293,6 +293,7 @@ export class QueuesService {
         403: `Insufficient permissions`,
         404: `Queue not found`,
         409: `Pending item conflict`,
+        501: `Queue sponsorship or protected delegated output is not ready`,
       },
     });
   }
@@ -323,6 +324,7 @@ export class QueuesService {
         403: `Insufficient permissions`,
         404: `Queue not found`,
         409: `Queue is not accepting items or pending item conflict`,
+        501: `Queue sponsorship or protected delegated output is not ready`,
       },
     });
   }

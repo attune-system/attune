@@ -1,10 +1,7 @@
 mod helpers;
 
 use attune_common::{
-    auth::jwt::{
-        generate_execution_token, generate_execution_token_with_permission_sets,
-        generate_worker_token, JwtConfig,
-    },
+    auth::jwt::{generate_worker_token, JwtConfig},
     repositories::{
         identity::{
             CreateIdentityInput, CreatePermissionAssignmentInput, CreatePermissionSetInput,
@@ -208,7 +205,7 @@ async fn unauthorized_execution_and_worker_tokens_cannot_update_rule_trace_tag_t
     let ctx = TestContext::new().await?;
     let (rule_ref, identity_id) = seed_rule_and_identity(&ctx, "denied").await?;
     let tokens = [
-        generate_execution_token(identity_id, 1, "test.action", &jwt_config(), Some(600))?,
+        helpers::delegated_source::token(&ctx, identity_id, &["standard".into()]).await?,
         generate_worker_token(identity_id, "test-worker", &jwt_config(), Some(600))?,
     ];
 
@@ -258,14 +255,9 @@ async fn execution_token_with_rules_update_permission_can_update_trace_tag_templ
     )
     .await?;
     attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
-    let token = generate_execution_token_with_permission_sets(
-        identity_id,
-        2,
-        "test.action",
-        &jwt_config(),
-        Some(600),
-        &[permission_set_ref.to_string()],
-    )?;
+    let token =
+        helpers::delegated_source::token(&ctx, identity_id, &[permission_set_ref.to_string()])
+            .await?;
 
     let response = ctx
         .put(

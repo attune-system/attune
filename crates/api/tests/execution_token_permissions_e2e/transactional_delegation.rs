@@ -200,10 +200,12 @@ async fn transactional_execution_delegation_preserves_token_ceiling_and_current_
         let standard_write = create_permission_set(&ctx.pool, "transactional.standard_write", json!([
             {"resource":"caches","actions":["update"],"constraints":{"owner_types":["pack"],"owner_refs":["fixture"]}}
         ])).await?;
-        let user = principal(&generate_execution_token_with_permission_sets_and_standard_access(
-            identity.id, 11, "fixture.run", &jwt_config(), Some(600),
-            &[read.r#ref.clone(), STANDARD_EXECUTION_ACCESS_REF.into()], &["fixture.run".into()],
-        )?)?;
+        let pack = create_pack(&ctx.pool, "fixture", "Transactional execution").await?;
+        let action = create_action_with_default_access(&ctx.pool, &pack, "run", Vec::new()).await?;
+        helpers::activate_test_pack_release(&ctx.pool, &pack).await?;
+        let refs = vec![read.r#ref.clone(), STANDARD_EXECUTION_ACCESS_REF.into()];
+        let execution = create_pinned_ad_hoc_parent(&ctx.pool, &action, &identity, &refs).await?;
+        let user = principal(&execution_token(&ctx.pool, &identity, &execution, &action, &refs).await?)?;
         let recorded = principal(&generate_admitted_execution_token(
             &RuntimeCredentialBinding {
                 execution_id: 11, admission_id: 12, sponsor_identity_id: identity.id,

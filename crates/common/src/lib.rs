@@ -24,6 +24,7 @@ pub mod device_auth;
 pub mod error;
 pub mod event_schema;
 mod execution_attribution;
+pub mod execution_authority;
 pub mod execution_env;
 pub mod file_legacy_controller;
 mod http_client;

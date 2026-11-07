@@ -300,7 +300,11 @@ impl ExecutionRepository {
             (Some(expected), Some(actual)) if expected == actual.id => Some(
                 RuntimeAuthorityRepository::retained_admission_fence(connection, actual.id).await?,
             ),
-            (None, None) if snapshot.executable.action.is_adhoc => None,
+            (None, None) => {
+                super::delegated_execution::DelegatedExecutionRepository::validate(connection, id)
+                    .await?;
+                None
+            }
             _ => {
                 return Err(Error::PermissionDenied(
                     "Initial input admission does not match the new execution".into(),

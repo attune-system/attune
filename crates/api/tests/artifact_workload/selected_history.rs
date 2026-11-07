@@ -79,8 +79,25 @@ async fn assert_fixture_integrity(fixture: &RetainedHistory, expected: i64) -> R
     .fetch_one(&ctx.pool)
     .await?;
     assert_eq!(
-        admissions, 1,
-        "historical read targets must not clone authority"
+        admissions, 0,
+        "delegated seed and historical read targets must not acquire recorded authority"
+    );
+    let (delegated, selected_seed, historical_authority): (i64, i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE s.mode='delegated' AND s.explicit), \
+         count(*) FILTER (WHERE e.id=$2 AND s.mode='delegated' AND s.explicit), \
+         count(*) FILTER (WHERE e.id<>$2 AND (s.explicit OR s.admission IS NOT NULL \
+         OR EXISTS(SELECT 1 FROM delegated_execution_attempt a WHERE a.execution=e.id))) \
+         FROM execution e JOIN execution_authority_selection s ON s.execution=e.id \
+         WHERE e.action_ref=$1",
+    )
+    .bind(&seed.action_ref)
+    .bind(selected.execution)
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(
+        (delegated, selected_seed, historical_authority),
+        (1, 1, 0),
+        "only the API-accepted seed may retain executable delegated authority"
     );
     let mut tx = ctx.pool.begin().await?;
     for version in selected.versions {

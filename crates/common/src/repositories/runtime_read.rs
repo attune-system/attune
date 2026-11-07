@@ -497,6 +497,8 @@ impl RuntimeReadRepository {
         connection: &mut PgConnection,
         execution: Id,
     ) -> Result<Vec<SecretOrigin>> {
+        super::delegated_execution::DelegatedExecutionRepository::close(connection, execution)
+            .await?;
         let admission: Option<Id> = sqlx::query_scalar("SELECT id FROM runtime_authority_admission WHERE owner_kind = 'execution' AND owner_id = $1")
             .bind(execution).fetch_optional(&mut *connection).await?;
         let Some(admission) = admission else {

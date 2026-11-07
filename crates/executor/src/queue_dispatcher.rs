@@ -675,21 +675,20 @@ impl WorkQueueDispatcher {
         }
         let dispatch_action = &dispatch_snapshot.executable.action;
         let recorded = !queue.is_adhoc || attune_common::repositories::execution_admission::ExecutionAdmissionRepository::has_queue_item_admission(&mut tx, &items).await?;
+        if recorded {
+            attune_common::execution_authority::RecordedConsumerReadiness::default()
+                .require_ready()?;
+        }
         let admission = if recorded {
             Some(attune_common::repositories::execution_admission::ExecutionAdmissionRepository::queue_batch(&mut tx, queue, &items, &dispatch_snapshot).await?)
         } else {
             None
         };
-        let permission_set_refs = admission
-            .as_ref()
-            .map(|admission| admission.authority().selected_refs.clone())
-            .unwrap_or_else(|| {
-                queue.permission_set_refs.clone().unwrap_or_else(|| {
-                    dispatch_action
-                        .default_execution_permission_set_refs
-                        .clone()
-                })
-            });
+        let permission_set_refs = if let Some(admission) = &admission {
+            admission.authority().selected_refs.clone()
+        } else {
+            attune_common::repositories::delegated_execution::DelegatedExecutionRepository::queue_refs(&mut tx,&items).await?
+        };
         let binding = if accepted_queue.is_some() {
             attune_common::repositories::ad_hoc_queue_admission::AdHocQueueAdmissionRepository::schema(&mut tx, items[0].id).await?
         } else if recorded {
@@ -917,6 +916,14 @@ impl WorkQueueDispatcher {
             &binding,
         )
         .await?;
+        if admission.is_none() && executor_identity.is_some() {
+            attune_common::repositories::delegated_execution::DelegatedExecutionRepository::select(
+                &mut tx,
+                execution.id,
+                None,
+            )
+            .await?;
+        }
         if let Some(inputs) = ad_hoc_secret_inputs {
             let (config, inputs) = attune_common::repositories::declared_input_materialization::DeclaredInputMaterializationRepository::workflow_child_defaults(&mut tx, execution.id, &supplied_config, inputs, encryption_key).await?;
             prepared_secrets = if inputs.is_empty() {
@@ -1447,6 +1454,7 @@ impl WorkQueueDispatcher {
         // retained delivery proofs, never reseal with current grants or rewrite
         // the config with a cached pre-seal ciphertext/provenance buffer.
         let mut source = self.pool.begin().await?;
+        attune_common::repositories::execution_admission::ExecutionAdmissionRepository::existing_authority(&mut source, dispatch.execution_id).await?;
         let record =
             attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
                 &mut source,
