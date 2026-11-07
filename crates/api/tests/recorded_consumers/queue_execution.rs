@@ -61,6 +61,123 @@ async fn managed_queue(
     Ok(queue)
 }
 
+/// Persist an authentic pre-rollout recorded item for consumer tests. New API
+/// sponsorship is tested separately and stays disabled. The repository selector
+/// validates the retained policy, executable, source target and approval fences;
+/// only the historical item table write is fixture-owned (there is deliberately
+/// no ungated production managed-item admission writer).
+async fn pre_admitted_item(
+    fixture: &Fixture,
+    queue: &attune_common::models::WorkQueue,
+    key: Option<&str>,
+    payload: Value,
+    source: attune_common::repositories::ad_hoc_queue_admission::AdHocQueueSource,
+) -> Result<attune_common::models::WorkQueueItem> {
+    use attune_common::repositories::{
+        ad_hoc_queue_admission::{AdHocQueueAdmissionRepository, AdHocQueueSource},
+        execution_runtime_admission::ExecutionAdmissionRepository as Admissions,
+        recorded_input_authority::RecordedInputAuthorityRepository as Inputs,
+        runtime_target::{ComponentTarget, RuntimeTarget},
+        work_queue::{CreateWorkQueueItemInput, WorkQueueItemRepository, WorkQueueRepository},
+    };
+    let mut tx = fixture.ctx.pool.begin().await?;
+    let snapshot =
+        ExecutableSnapshotRepository::resolve_for_action_ref(&mut *tx, &queue.dispatch_action_ref)
+            .await?;
+    let schema_source = WorkQueueRepository::item_schema_source(&mut tx, queue.id).await?;
+    let contract = if queue.is_adhoc {
+        let pack = attune_common::repositories::pack::PackRepository::find_by_id(
+            &mut *tx,
+            queue.pack.unwrap(),
+        )
+        .await?
+        .unwrap();
+        SchemaContractRepository::compile_owned_assignment(
+            &mut tx,
+            schema_source,
+            attune_common::value_schema::SchemaContext::FlatDocument,
+            &queue.item_schema,
+            &pack,
+        )
+        .await?
+    } else {
+        SchemaContractRepository::materialize(
+            &mut tx,
+            schema_source,
+            attune_common::value_schema::SchemaContext::FlatDocument,
+            &queue.item_schema,
+        )
+        .await?
+    };
+    let binding = attune_common::value_schema::ValueSchemaBinding {
+        authored_schema: queue.item_schema.clone(),
+        contract,
+    };
+    let (human, parent, actor) = match &source {
+        AdHocQueueSource::Execution(id) => (None, Some(*id), None),
+        AdHocQueueSource::Human(actor) => (Some(actor.identity_id), None, Some(actor.clone())),
+    };
+    let item = WorkQueueItemRepository::create_bound_pinned(
+        &mut *tx,
+        CreateWorkQueueItemInput {
+            queue: queue.id,
+            queue_ref: queue.r#ref.clone(),
+            item_key: key.map(str::to_owned),
+            priority: 0,
+            status: attune_common::models::WorkQueueItemStatus::Queued,
+            payload,
+            metadata: json!({}),
+            trace_tag: None,
+            enqueue_source: "api".into(),
+            requested_by_identity: human,
+            requested_by_execution: parent,
+            requested_by_enforcement: None,
+            leased_execution: None,
+            lease_token: None,
+            lease_expires_at: None,
+            attempt_count: 0,
+            last_error: None,
+            ack_summary: None,
+        },
+        &snapshot,
+        &binding,
+    )
+    .await?;
+    if queue.is_adhoc {
+        AdHocQueueAdmissionRepository::accept(&mut tx, queue, &item, source, &snapshot).await?;
+    } else {
+        let selected = Admissions::select(
+            &mut tx,
+            queue.pack.unwrap(),
+            InvocationBinding::Queue {
+                queue_ref: queue.r#ref.clone(),
+                action_ref: snapshot.executable.action.r#ref.clone(),
+            },
+            &snapshot,
+            queue.permission_set_refs.as_deref().unwrap_or(&[]),
+            RequestAttribution::QueueBatch {
+                queue_ref: queue.r#ref.clone(),
+                items: BTreeMap::from([(item.id, actor)]),
+            },
+            RuntimeTarget::Component(ComponentTarget::Queue, queue.id),
+        )
+        .await?;
+        let authority = selected.authority();
+        use sha2::Digest;
+        let digest = hex::encode(sha2::Sha256::digest(serde_jcs::to_vec(authority)?));
+        sqlx::query("INSERT INTO work_queue_item_runtime_admission(item,policy_revision,authority,authority_digest) VALUES($1,$2,$3,$4)")
+            .bind(item.id).bind(authority.policy_id).bind(sqlx::types::Json(authority)).bind(digest).execute(&mut *tx).await?;
+        selected.ensure_fresh_on(&mut tx).await?;
+    }
+    if let Some(parent) = parent {
+        Inputs::copy(&mut tx, "execution", parent, "queue_item", item.id).await?;
+    } else {
+        Inputs::capture_human(&mut tx, "queue_item", item.id, human.unwrap()).await?;
+    }
+    tx.commit().await?;
+    Ok(item)
+}
+
 async fn sibling(fixture: &Fixture) -> Result<(RuntimeCredentialBinding, String)> {
     let mut tx = fixture.ctx.pool.begin().await?;
     let policy = RuntimeAuthorityRepository::find_policy(&mut tx, fixture.policy_id)
@@ -179,7 +296,7 @@ async fn recorded_queue_operations_use_structural_ownership_and_exact_execution_
                 source_id: None,
                 dispatch_template_digest: None,
                 binding: InvocationBinding::Queue {
-                    queue_ref: installed.r#ref,
+                    queue_ref: installed.r#ref.clone(),
                     action_ref: dispatch.r#ref.clone(),
                 },
                 target_release_id: snapshot.release.id,
@@ -202,9 +319,31 @@ async fn recorded_queue_operations_use_structural_ownership_and_exact_execution_
             Some(&fixture.token),
         )
         .await?;
-    assert_eq!(accepted.status(), StatusCode::CREATED);
-    let body: Value = accepted.json().await?;
-    let id = body["data"]["id"].as_i64().unwrap();
+    assert_eq!(accepted.status(), StatusCode::NOT_IMPLEMENTED);
+    assert!(
+        attune_common::repositories::work_queue::WorkQueueItemRepository::search(
+            &fixture.ctx.pool,
+            &attune_common::repositories::work_queue::WorkQueueItemSearchFilters {
+                queue: Some(installed.id),
+                limit: 10,
+                ..Default::default()
+            }
+        )
+        .await?
+        .rows
+        .is_empty()
+    );
+    let id = pre_admitted_item(
+        &fixture,
+        &installed,
+        Some("one"),
+        json!({"message":"literal"}),
+        attune_common::repositories::ad_hoc_queue_admission::AdHocQueueSource::Execution(
+            fixture.credential.execution_id,
+        ),
+    )
+    .await?
+    .id;
     use attune_common::repositories::action::UpdateActionInput;
     ActionRepository::update(
         &fixture.ctx.pool,
@@ -256,7 +395,35 @@ async fn recorded_queue_operations_use_structural_ownership_and_exact_execution_
             Some(&fixture.token),
         )
         .await?;
-    assert_eq!(bulk.status(), StatusCode::CREATED);
+    assert_eq!(bulk.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        attune_common::repositories::work_queue::WorkQueueItemRepository::search(
+            &fixture.ctx.pool,
+            &attune_common::repositories::work_queue::WorkQueueItemSearchFilters {
+                queue: Some(installed.id),
+                limit: 10,
+                ..Default::default()
+            }
+        )
+        .await?
+        .rows
+        .len(),
+        1,
+        "rejected bulk admission must not leave partially accepted items"
+    );
+
+    for (key, message) in [("two", "literal two"), ("three", "literal three")] {
+        pre_admitted_item(
+            &fixture,
+            &installed,
+            Some(key),
+            json!({"message":message}),
+            attune_common::repositories::ad_hoc_queue_admission::AdHocQueueSource::Execution(
+                fixture.credential.execution_id,
+            ),
+        )
+        .await?;
+    }
     let reprioritized = fixture
         .ctx
         .post(
@@ -352,9 +519,9 @@ async fn recorded_queue_operations_use_structural_ownership_and_exact_execution_
     attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(fixture.requester)
         .await;
     attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
-    // Real Access-token enqueue captures this DIFFERENT input ceiling in its
-    // original acceptance transaction. No post-acceptance capture/proof rewrite.
-    let human_acceptance = fixture
+    // Historical human acceptance retains its original input ceiling. New
+    // managed queue sponsorship is unavailable even for an authorized human.
+    let rejected = fixture
         .ctx
         .post(
             &items,
@@ -362,15 +529,21 @@ async fn recorded_queue_operations_use_structural_ownership_and_exact_execution_
             fixture.ctx.token(),
         )
         .await?;
-    let human_status = human_acceptance.status();
-    let human_body: Value = human_acceptance.json().await?;
-    assert_eq!(human_status, StatusCode::CREATED, "{human_body}");
-    let human_item = human_body["data"]["id"].as_i64().unwrap();
-    assert_eq!(
-        human_body["data"]["requested_by_identity"],
-        fixture.requester
-    );
-    assert!(human_body["data"]["requested_by_execution"].is_null());
+    assert_eq!(rejected.status(), StatusCode::NOT_IMPLEMENTED);
+    let human_item = pre_admitted_item(
+        &fixture,
+        &installed,
+        Some("human-input"),
+        json!({"message":"human accepted literal"}),
+        attune_common::repositories::ad_hoc_queue_admission::AdHocQueueSource::Human(
+            HumanAttribution {
+                identity_id: fixture.requester,
+                login: fixture.ctx.user.as_ref().unwrap().login.clone(),
+            },
+        ),
+    )
+    .await?
+    .id;
     let (_, sibling_token) = sibling(&fixture).await?;
 
     for phase in ["original acceptance", "live grants removed", "human frozen"] {
@@ -548,7 +721,7 @@ async fn recorded_queue_operations_use_structural_ownership_and_exact_execution_
 }
 
 #[tokio::test]
-async fn recorded_api_child_is_admitted_and_metadata_control_does_not_borrow_human_iam(
+async fn api_sponsorship_rejects_but_pre_admitted_child_control_does_not_borrow_human_iam(
 ) -> Result<()> {
     let fixture = fixture_with_additional_grants(
         false,
@@ -566,6 +739,55 @@ async fn recorded_api_child_is_admitted_and_metadata_control_does_not_borrow_hum
     let mut tx = fixture.ctx.pool.begin().await?;
     RuntimeAuthorityRepository::activate_policy(&mut tx, fixture.policy_id).await?;
     tx.commit().await?;
+    let child = fixture.ctx.post("/api/v1/executions/execute", json!({"action_ref":"recorded_emitter.emit", "parameters":{}, "permission_set_refs":[]}), Some(&fixture.token)).await?;
+    assert_eq!(
+        child.status(),
+        StatusCode::NOT_IMPLEMENTED,
+        "{}",
+        child.text().await?
+    );
+    assert!(ExecutionRepository::find_by_parent(
+        &fixture.ctx.pool,
+        fixture.credential.execution_id
+    )
+    .await?
+    .is_empty());
+    let mut tx = fixture.ctx.pool.begin().await?;
+    let snapshot =
+        ExecutableSnapshotRepository::resolve_for_action_ref(&mut *tx, "recorded_emitter.emit")
+            .await?;
+    let selected = attune_common::repositories::execution_runtime_admission::ExecutionAdmissionRepository::select(&mut tx, fixture.pack_id,
+        InvocationBinding::Action { action_ref: "recorded_emitter.emit".into() }, &snapshot, &[],
+        RequestAttribution::ParentExecution { execution_id: fixture.credential.execution_id },
+        attune_common::repositories::runtime_target::RuntimeTarget::Component(attune_common::repositories::runtime_target::ComponentTarget::Action, snapshot.executable.action.id)).await?;
+    let child = ExecutionRepository::create_pinned(
+        &mut *tx,
+        CreateExecutionInput {
+            action: Some(snapshot.executable.action.id),
+            action_ref: "recorded_emitter.emit".into(),
+            parent: Some(fixture.credential.execution_id),
+            config: Some(json!({})),
+            status: ExecutionStatus::Requested,
+            permission_set_refs: vec![],
+            ..Default::default()
+        },
+        &snapshot,
+    )
+    .await?;
+    let binding = SchemaContractRepository::materialize_action(&mut tx, &snapshot).await?;
+    SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, child.id, &binding).await?;
+    selected
+        .attach(&mut tx, RuntimeOwner::Execution(child.id))
+        .await?;
+    attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::copy(
+        &mut tx,
+        "execution",
+        fixture.credential.execution_id,
+        "execution",
+        child.id,
+    )
+    .await?;
+    tx.commit().await?;
     IdentityRepository::update(
         &fixture.ctx.pool,
         fixture.requester,
@@ -575,15 +797,7 @@ async fn recorded_api_child_is_admitted_and_metadata_control_does_not_borrow_hum
         },
     )
     .await?;
-    let child = fixture.ctx.post("/api/v1/executions/execute", json!({"action_ref":"recorded_emitter.emit", "parameters":{}, "permission_set_refs":[]}), Some(&fixture.token)).await?;
-    assert_eq!(
-        child.status(),
-        StatusCode::CREATED,
-        "{}",
-        child.text().await?
-    );
-    let child: Value = child.json().await?;
-    let id = child["data"]["id"].as_i64().unwrap();
+    let id = child.id;
     let persisted = ExecutionRepository::find_by_id(&fixture.ctx.pool, id)
         .await?
         .unwrap();
@@ -869,16 +1083,29 @@ async fn recorded_ad_hoc_batch_seals_every_independent_source_before_authority_u
 }
 
 #[tokio::test]
-async fn human_ad_hoc_single_dispatch_retains_action_admission_and_requester() -> Result<()> {
-    human_ad_hoc_dispatch_case(attune_common::models::WorkQueueBatchMode::Single).await
+async fn human_ad_hoc_single_dispatch_retains_delegation_and_requires_active_requester(
+) -> Result<()> {
+    human_ad_hoc_dispatch_case(attune_common::models::WorkQueueBatchMode::Single, false).await
 }
 
 #[tokio::test]
-async fn human_ad_hoc_batch_dispatch_retains_action_admission_and_requesters() -> Result<()> {
-    human_ad_hoc_dispatch_case(attune_common::models::WorkQueueBatchMode::Batch).await
+async fn human_ad_hoc_batch_dispatch_retains_delegation_and_requires_active_requester() -> Result<()>
+{
+    human_ad_hoc_dispatch_case(attune_common::models::WorkQueueBatchMode::Batch, false).await
 }
 
-async fn human_ad_hoc_dispatch_case(mode: attune_common::models::WorkQueueBatchMode) -> Result<()> {
+#[tokio::test]
+async fn pre_admitted_human_single_retains_recorded_independence() -> Result<()> {
+    human_ad_hoc_dispatch_case(attune_common::models::WorkQueueBatchMode::Single, true).await
+}
+#[tokio::test]
+async fn pre_admitted_human_batch_retains_recorded_independence() -> Result<()> {
+    human_ad_hoc_dispatch_case(attune_common::models::WorkQueueBatchMode::Batch, true).await
+}
+async fn human_ad_hoc_dispatch_case(
+    mode: attune_common::models::WorkQueueBatchMode,
+    historical: bool,
+) -> Result<()> {
     use attune_common::repositories::{
         accepted_batch_dependency::AcceptedBatchDependencyRepository as Batches,
         action::{ActionRepository, UpdateActionInput},
@@ -1041,6 +1268,22 @@ async fn human_ad_hoc_dispatch_case(mode: attune_common::models::WorkQueueBatchM
     } else {
         2
     } {
+        if historical {
+            pre_admitted_item(
+                &fixture,
+                &queue,
+                None,
+                json!({"message":format!("item {index}")}),
+                attune_common::repositories::ad_hoc_queue_admission::AdHocQueueSource::Human(
+                    HumanAttribution {
+                        identity_id: human.id,
+                        login: human.login.clone(),
+                    },
+                ),
+            )
+            .await?;
+            continue;
+        }
         let response = fixture
             .ctx
             .post(
@@ -1055,6 +1298,82 @@ async fn human_ad_hoc_dispatch_case(mode: attune_common::models::WorkQueueBatchM
             "{}",
             response.text().await?
         );
+    }
+    if !historical {
+        use attune_common::repositories::delegated_execution::DelegatedExecutionRepository as Delegated;
+        let mut tx = fixture.ctx.pool.begin().await?;
+        let items = WorkQueueItemRepository::search_with_conn(
+            &mut tx,
+            &attune_common::repositories::work_queue::WorkQueueItemSearchFilters {
+                queue: Some(queue.id),
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .await?
+        .rows;
+        assert_eq!(
+            items.len(),
+            if mode == attune_common::models::WorkQueueBatchMode::Single {
+                1
+            } else {
+                2
+            }
+        );
+        assert!(items
+            .iter()
+            .all(|item| item.requested_by_identity == Some(human.id)
+                && item.requested_by_execution.is_none()
+                && item.executable_snapshot.is_some()));
+        assert!(AdHoc::template(&mut tx, &queue, &items).await?.is_none());
+        assert!(!Admissions::has_queue_item_admission(&mut tx, &items).await?);
+        assert!(Delegated::queue_refs(&mut tx, &items).await?.is_empty());
+        let snapshot: attune_common::models::ExecutionExecutableSnapshot =
+            serde_json::from_value(items[0].executable_snapshot.clone().unwrap())?;
+        let binding = SchemaContractRepository::materialize_action(&mut tx, &snapshot).await?;
+        let dispatch = ExecutionRepository::create_pinned(
+            &mut *tx,
+            CreateExecutionInput {
+                action: Some(action.id),
+                action_ref: action.r#ref.clone(),
+                executor: Some(human.id),
+                permission_set_refs: vec![],
+                config: Some(json!({})),
+                status: ExecutionStatus::Requested,
+                ..Default::default()
+            },
+            &snapshot,
+        )
+        .await?;
+        SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, dispatch.id, &binding)
+            .await?;
+        Delegated::select(&mut tx, dispatch.id, None).await?;
+        assert_eq!(
+            Delegated::find(&mut tx, dispatch.id).await?.mode,
+            "delegated"
+        );
+        tx.commit().await?;
+        IdentityRepository::update(
+            &fixture.ctx.pool,
+            human.id,
+            UpdateIdentityInput {
+                frozen: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let mut tx = fixture.ctx.pool.begin().await?;
+        assert!(Delegated::queue_refs(&mut tx, &items).await.is_err());
+        assert!(Delegated::validate(&mut tx, dispatch.id).await.is_err());
+        tx.rollback().await?;
+        assert!(IdentityRepository::delete(&fixture.ctx.pool, human.id).await?);
+        let mut tx = fixture.ctx.pool.begin().await?;
+        assert!(Delegated::queue_refs(&mut tx, &items).await.is_err());
+        let retained = Delegated::find(&mut tx, dispatch.id).await?;
+        assert_eq!(retained.mode, "delegated");
+        assert_eq!(retained.owner, Some(human.id));
+        tx.rollback().await?;
+        return fixture.ctx.cleanup().await;
     }
     IdentityRepository::update(
         &fixture.ctx.pool,
@@ -1286,10 +1605,31 @@ async fn ad_hoc_literal_dispatch_case(
         .await?;
     assert_eq!(
         response.status(),
-        StatusCode::CREATED,
+        StatusCode::NOT_IMPLEMENTED,
         "{}",
         response.text().await?
     );
+    assert!(WorkQueueItemRepository::search(
+        &fixture.ctx.pool,
+        &attune_common::repositories::work_queue::WorkQueueItemSearchFilters {
+            queue: Some(queue.id),
+            limit: 10,
+            ..Default::default()
+        }
+    )
+    .await?
+    .rows
+    .is_empty());
+    pre_admitted_item(
+        &fixture,
+        &queue,
+        None,
+        json!({"message":"literal"}),
+        attune_common::repositories::ad_hoc_queue_admission::AdHocQueueSource::Execution(
+            fixture.credential.execution_id,
+        ),
+    )
+    .await?;
     let item = WorkQueueItemRepository::search(
         &fixture.ctx.pool,
         &attune_common::repositories::work_queue::WorkQueueItemSearchFilters {
@@ -1315,10 +1655,20 @@ async fn ad_hoc_literal_dispatch_case(
             .await?;
         assert_eq!(
             response.status(),
-            StatusCode::CREATED,
+            StatusCode::NOT_IMPLEMENTED,
             "{}",
             response.text().await?
         );
+        pre_admitted_item(
+            &fixture,
+            &queue,
+            None,
+            json!({"message":"independent contributor"}),
+            attune_common::repositories::ad_hoc_queue_admission::AdHocQueueSource::Execution(
+                source.execution_id,
+            ),
+        )
+        .await?;
         Some(source)
     } else {
         None
@@ -1742,6 +2092,46 @@ async fn admitted_manual_default_keeps_supplied_strings_literal_with_empty_api_s
         id,
     )
     .await?;
+    tx.rollback().await?;
+    let selected =
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::find(
+            &mut *fixture.ctx.pool.acquire().await?,
+            id,
+        )
+        .await?;
+    assert_eq!(selected.mode, "delegated");
+    assert!(selected.selected_refs.is_empty());
+    assert_eq!(selected.owner, fixture.ctx.user.as_ref().map(|u| u.id));
+    assert!(
+        selected.admission.is_none()
+            && selected.schema_digest.is_some()
+            && selected.executable_snapshot.is_some()
+    );
+    let mut start = fixture.ctx.pool.begin().await?;
+    helpers::delegated::start(&mut start, id).await?;
+    start.commit().await?;
+    let stored = ExecutionRepository::find_by_id(&fixture.ctx.pool, id)
+        .await?
+        .unwrap();
+    let restored = attune_worker::secrets::SecretManager::new(
+        fixture.ctx.pool.clone(),
+        Some(encryption_key.to_string()),
+    )?
+    .restore_execution_parameters(id, stored.config.clone().unwrap())
+    .await?;
+    assert_eq!(restored["private_token"], "caller-owned secret");
+    let mut binding_conn = fixture.ctx.pool.acquire().await?;
+    let binding = SchemaContractRepository::find(&mut binding_conn, BindingOwner::Execution, id)
+        .await?
+        .unwrap();
+    attune_common::value_schema::CompiledContract::new(&binding.input)?.validate(&restored)?;
+    drop(binding_conn);
+    assert!(actual.iter().all(|row| !row
+        .encrypted_value
+        .to_string()
+        .contains("caller-owned secret")));
+
+    let mut tx = fixture.ctx.pool.begin().await?;
     assert_eq!(actual.len(), 1);
     let provenance: attune_common::secret_provenance::SecretProvenance =
         serde_json::from_str(actual[0].source_ref.as_deref().unwrap())?;
@@ -1753,7 +2143,7 @@ async fn admitted_manual_default_keeps_supplied_strings_literal_with_empty_api_s
         path: "/private_token".into(),
     };
     assert!(
-        attune_common::repositories::inherited_input::InheritedInputRepository::delivery_allowed(
+        !attune_common::repositories::inherited_input::InheritedInputRepository::delivery_allowed(
             &mut tx,
             &site,
             &provenance.origins[0],
@@ -1762,10 +2152,70 @@ async fn admitted_manual_default_keeps_supplied_strings_literal_with_empty_api_s
         .await?
     );
     assert!(
-        matches!(&provenance.origins[0], attune_common::secret_provenance::SecretOrigin::Entity { entity_type, path, .. }
-        if entity_type == "declared_input:execution_config:value" && path == "/private_token")
+        matches!(&provenance.origins[0], attune_common::secret_provenance::SecretOrigin::Local { source_kind, .. } if source_kind == "parameter_schema")
     );
+    assert!(attune_common::secret_values::is_redaction_marker(
+        &stored.config.as_ref().unwrap()["private_token"]
+    ));
     tx.rollback().await?;
+    let manager = attune_worker::secrets::SecretManager::new(
+        fixture.ctx.pool.clone(),
+        Some(encryption_key.to_string()),
+    )?;
+    let owner = stored.executor.unwrap();
+    IdentityRepository::update(
+        &fixture.ctx.pool,
+        owner,
+        UpdateIdentityInput {
+            frozen: Some(true),
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert!(manager
+        .restore_execution_parameters(id, stored.config.clone().unwrap())
+        .await
+        .is_err());
+    IdentityRepository::update(
+        &fixture.ctx.pool,
+        owner,
+        UpdateIdentityInput {
+            frozen: Some(false),
+            ..Default::default()
+        },
+    )
+    .await?;
+    ExecutionRepository::transition_worker(
+        &fixture.ctx.pool,
+        id,
+        stored.worker,
+        ExecutionStatus::Completed,
+        None,
+    )
+    .await?;
+    // Production executor claims Running before SecretManager is called. The
+    // trusted restorer is not a credential boundary; a terminal delivery cannot
+    // enter that preparation path or open another attempt.
+    assert!(ExecutionRepository::transition_worker(
+        &fixture.ctx.pool,
+        id,
+        stored.worker,
+        ExecutionStatus::Running,
+        None
+    )
+    .await
+    .is_err());
+    let mut denied = fixture.ctx.pool.begin().await?;
+    assert!(
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::start(
+            &mut denied,
+            id,
+            stored.worker.unwrap()
+        )
+        .await
+        .is_err()
+    );
+    denied.rollback().await?;
     fixture.ctx.cleanup().await?;
     Ok(())
 }

@@ -275,8 +275,18 @@ async fn recorded_caller_without_cancel_cannot_reschedule_an_authentic_target() 
         .await?;
     let status = response.status();
     let count = marks(&fixture, target.execution.id).await?;
+    let mut tx = fixture.ctx.pool.begin().await?;
+    let authority =
+        RuntimeAuthorityRepository::validate_execution_credential(&mut tx, &fixture.credential)
+            .await?;
+    assert!(
+        ExecutionRepository::cancel_recorded_tree(&mut tx, target.execution.id, &authority)
+            .await
+            .is_err()
+    );
+    tx.rollback().await?;
     fixture.ctx.cleanup().await?;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
     assert_eq!(count, 0);
     Ok(())
 }
