@@ -355,7 +355,7 @@ async fn actual_human_and_recorded_routes_do_not_repair_missing_target_acceptanc
 }
 
 #[tokio::test]
-#[ignore = "requires run-owned PostgreSQL and disposable RabbitMQ vhost via ATTUNE_REQUESTED_PUBLICATION_MQ_URL"]
+#[ignore = "requires run-owned PostgreSQL and a separate empty RabbitMQ vhost via ATTUNE_REQUESTED_PUBLICATION_FAILURE_MQ_URL"]
 async fn actual_human_and_recorded_publish_errors_roll_back_reschedule_marks() -> Result<()> {
     for recorded in [false, true] {
         let fixture = fixture_with_additional_grants(
@@ -367,8 +367,23 @@ async fn actual_human_and_recorded_publish_errors_roll_back_reschedule_marks() -
         )
         .await?;
         let target = target(&fixture, true).await?;
-        let connection = broker(&fixture).await?;
-        connection.close().await?;
+        // Envelope publication uses its message type's exchange, and closed
+        // connections recover. This separate run-owned vhost deliberately has
+        // no common topology, so the real execution exchange remains absent on
+        // the first attempt and any channel-recovery attempt.
+        let url = std::env::var("ATTUNE_REQUESTED_PUBLICATION_FAILURE_MQ_URL")
+            .map_err(|_| "Set ATTUNE_REQUESTED_PUBLICATION_FAILURE_MQ_URL to a separate run-owned empty RabbitMQ vhost")?;
+        let connection = Connection::connect(&url).await?;
+        let publisher = Publisher::new(
+            &connection,
+            PublisherConfig {
+                confirm_publish: true,
+                timeout_secs: 3,
+                exchange: "attune.executions".into(),
+            },
+        )
+        .await?;
+        fixture.ctx.state.set_publisher(Arc::new(publisher)).await;
         let token = if recorded {
             fixture.token.as_str()
         } else {
@@ -385,10 +400,11 @@ async fn actual_human_and_recorded_publish_errors_roll_back_reschedule_marks() -
         let status = response.status();
         let count = marks(&fixture, target.execution.id).await?;
         *fixture.ctx.state.publisher.write().await = None;
+        connection.close().await?;
         fixture.ctx.cleanup().await?;
         assert!(
             status.is_server_error(),
-            "closed publisher should fail, not commit a mark: {status}"
+            "absent exchange must fail publication, not commit a mark: {status}"
         );
         assert_eq!(count, 0);
     }
