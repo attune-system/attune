@@ -288,6 +288,7 @@ plaintext, execute-only callers, terminal credentials, closed attempts during
 status lag and incompatible workers.
 An approved use-only signing case remains separate from raw read/decrypt.
 Assertions include encrypted logs/results and disclosure denials, workflow retry,
+native workflow `output_map` queues with public and protected acknowledgements,
 ad hoc execution, attributed queue dispatch, rejection of recorded-only queue
 sponsorship, and tokenless stdin/completion. Recorded readiness stays disabled.
 The focused `execution_admission_tests` filter `authority_` additionally exercises
