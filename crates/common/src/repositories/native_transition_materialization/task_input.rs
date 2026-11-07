@@ -126,23 +126,24 @@ impl PreparedNativeTransitions {
                 .await?;
                 self.bind_prepared_frame(conn, &mut session, binding, key)
                     .await?;
-                for (site, origin) in &controls {
-                    Inputs::attach_control(conn, &mut session, site, origin, key).await?;
+                for control in &controls {
+                    Inputs::attach_recorded_control(&mut session, control)?;
                 }
                 Inputs::evaluate_with_keys(conn, session, key).await?
             } else {
                 if contains_template(value) {
                     return Err(changed());
                 }
-                let mut rendered = Inputs::controlled_literal(
+                let mut rendered = Inputs::literal(
                     conn,
                     self.execution(),
                     &revision,
                     &format!("{path}/input{destination}"),
-                    &controls,
-                    key,
                 )
                 .await?;
+                for control in &controls {
+                    Inputs::attach_recorded_literal_control(&mut rendered, control)?;
+                }
                 self.attach_frame_literal(&mut rendered)?;
                 rendered
             };
@@ -173,44 +174,35 @@ impl PreparedNativeTransitions {
         })
     }
 
-    fn task_input_controls(
-        &self,
-    ) -> Result<Vec<(InputSite, crate::secret_provenance::SecretOrigin)>> {
-        let mut controls = Vec::new();
-        let mut retain =
-            |site: &InputSite, origin: crate::secret_provenance::SecretOrigin| -> Result<()> {
-                let identity = (site.clone(), origin);
-                if !controls.contains(&identity) {
-                    controls.push(identity);
-                }
-                if controls.len() > 256 {
-                    return Err(changed());
-                }
-                Ok(())
-            };
-        // Immutable earlier versions remain CONTROL even when a later version
-        // has the same path. Deduplicate complete identity, never just the path.
+    fn task_input_controls<'a>(&'a self) -> Result<Vec<&'a ReceiptContext>> {
+        let mut controls: Vec<&'a ReceiptContext> = Vec::new();
+        let mut retain = |receipt: &'a ReceiptContext| -> Result<()> {
+            if !controls
+                .iter()
+                .any(|held| held.site() == receipt.site() && held.origin() == receipt.origin())
+            {
+                controls.push(receipt);
+            }
+            if controls.len() > 256 {
+                return Err(changed());
+            }
+            Ok(())
+        };
+        // Retain each opaque publication, including overwritten versions. Its
+        // original same-advance witnesses cannot be recovered from an ID alone.
         for transition in &self.transitions {
             for publication in &transition.publications {
                 for (_, proof) in &publication.leaves {
                     match proof {
-                        PublicationProof::Staged(stage) => {
-                            let provenance = stage.provenance();
-                            let [origin] = provenance.origins.as_slice() else {
-                                return Err(changed());
-                            };
-                            retain(stage.site(), origin.clone())?;
-                        }
-                        PublicationProof::WholeResult(stage) => {
-                            retain(stage.receipt().site(), stage.receipt().origin())?;
-                        }
+                        PublicationProof::Staged(stage) => retain(stage.receipt())?,
+                        PublicationProof::WholeResult(stage) => retain(stage.receipt())?,
                         PublicationProof::Independent(_, _) => {}
                     }
                 }
             }
         }
         for receipt in self.recorded.get().ok_or_else(changed)? {
-            retain(receipt.site(), receipt.origin())?;
+            retain(receipt)?;
         }
         Ok(controls)
     }

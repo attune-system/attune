@@ -2380,6 +2380,21 @@ impl ExecutionScheduler {
         {
             return Ok(());
         }
+        // Initial activation must produce the same authenticated frontier that
+        // subsequent source-first checkpoints require for completion. Select
+        // this owner before acquiring legacy workflow/target locks.
+        if Self::checkpoint_native_cache(
+            pool,
+            publisher,
+            parent_execution,
+            &task_node.name,
+            encryption_key,
+            None,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         let mut transaction = pool.begin().await?;
         CacheEntryRepository::protect_transaction(
             &mut transaction,

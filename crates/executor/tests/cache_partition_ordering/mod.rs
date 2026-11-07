@@ -1810,6 +1810,11 @@ async fn broker_cache_refill_completion_replay_and_terminal_cascade() {
             .status,
         ExecutionStatus::Completed
     );
+    let terminal = broker.receive().await;
+    assert_eq!(terminal["message_type"], "ExecutionCompleted");
+    assert_eq!(terminal["payload"]["execution_id"], fixture.parent.id);
+    assert_eq!(terminal["payload"]["status"], "completed");
+    broker.assert_empty().await;
     // A duplicate final completion must neither create a fourth child nor publish.
     advance_cache_via_broker(&fixture, &broker, child, ExecutionStatus::Completed).await;
     broker.assert_empty().await;
@@ -1889,7 +1894,19 @@ async fn broker_cache_cleanup_first_blocks_real_transaction_entry_before_rows() 
     let ((), ()) = tokio::join!(activation, observed);
     let terminal = broker.receive().await;
     assert_eq!(terminal["message_type"], "ExecutionCompleted");
-    assert_eq!(terminal["payload"]["status"], "failed");
+    // The captured parameter selects "active". The caller's modified TaskNode
+    // cannot replace that recorded selector with the deleted generation ID.
+    // Source preparation runs after cleanup and observes the empty replacement.
+    assert_eq!(terminal["payload"]["execution_id"], fixture.parent.id);
+    assert_eq!(terminal["payload"]["status"], "completed");
+    let iteration = cache_iteration(&fixture).await;
+    assert_ne!(iteration.generation, generation);
+    assert_eq!(iteration.dispatched_count, 0);
+    assert_eq!(iteration.state, WorkflowCacheIterationState::Completed);
+    assert!(CacheGenerationRepository::find_by_id(pool, generation)
+        .await
+        .unwrap()
+        .is_none());
     broker.assert_empty().await;
     broker.close().await;
     fixture.database.cleanup().await.unwrap();
@@ -2018,6 +2035,12 @@ async fn assert_broker_terminal_advancement_waits_before_rows(
             .status,
         status
     );
+    if status == ExecutionStatus::Completed {
+        let terminal = broker.receive().await;
+        assert_eq!(terminal["message_type"], "ExecutionCompleted");
+        assert_eq!(terminal["payload"]["execution_id"], fixture.parent.id);
+        assert_eq!(terminal["payload"]["status"], "completed");
+    }
     broker.assert_empty().await;
     reclaim_terminal_cache(&fixture, generation).await;
     broker.close().await;

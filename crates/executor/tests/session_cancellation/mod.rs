@@ -12,6 +12,7 @@ mod checkpoint_cancellation {
         sync::oneshot,
     };
 
+    #[derive(Debug)]
     enum Gate {
         Lock,
         Publication,
@@ -31,6 +32,11 @@ mod checkpoint_cancellation {
         let task = tokio::spawn(async move {
             let (mut client, _) = listener.accept().await.unwrap();
             let mut server = TcpStream::connect(target).await.unwrap();
+            // This relay forwards individual protocol frames. Nagle buffering
+            // combined with delayed ACKs otherwise adds latency to each small
+            // exchange and can consume the source-preparation deadline.
+            client.set_nodelay(true).unwrap();
+            server.set_nodelay(true).unwrap();
             let (mut cr, mut cw) = client.split();
             let (mut sr, mut sw) = server.split();
             let armed = Arc::new(AtomicBool::new(false));
@@ -106,7 +112,7 @@ mod checkpoint_cancellation {
         (port, seen, release, task)
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Debug, Clone, Copy)]
     enum Path {
         Cache,
         InitialWait,
@@ -182,7 +188,7 @@ mod checkpoint_cancellation {
             .unwrap();
         // A waiting inquiry emits no child. Resolve its real source before the
         // publication gate so the production checkpoint publishes a child.
-        if publication && matches!(path, Path::Wait | Path::InitialWait) {
+        if matches!(path, Path::Wait) || publication && matches!(path, Path::InitialWait) {
             let fixture = inquiry.as_ref().unwrap();
             InquiryRepository::respond_pending(
                 observer,
@@ -284,7 +290,9 @@ mod checkpoint_cancellation {
         if let Some(fixture) = inquiry {
             fixture.database.cleanup().await.unwrap();
         }
-        result.expect("real checkpoint must reach the acknowledgement gate");
+        result.unwrap_or_else(|error| {
+            panic!("{path:?} checkpoint at publication={publication} must reach its gate: {error}")
+        });
         gone.expect("cancelled checkpoint backend and its session locks must terminate");
     }
 
