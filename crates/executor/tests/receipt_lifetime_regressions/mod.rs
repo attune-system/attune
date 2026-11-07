@@ -156,20 +156,18 @@ async fn adhoc_target_under_recorded_parent_cannot_reopen_without_child_admissio
 async fn legitimate_adhoc_reuse_reopens_and_standalone_fanout_rejects_payload_mismatch() {
     use attune_common::repositories::{
         execution_admission::ExecutionAdmissionRepository as Admission,
-        identity::{CreatePermissionAssignmentInput, PermissionAssignmentRepository},
         runtime_authority::RuntimeOwner,
     };
-    let fixture = AdhocWorkflowDelegationFixture::create().await.unwrap();
+    // Reuse starts from a caller-covered selection at admission. Granting the
+    // owner more IAM afterward cannot widen the parent's frozen child ceiling.
+    let fixture = AdhocWorkflowDelegationFixture::create_with_selection(true)
+        .await
+        .unwrap();
     let pool = fixture.database.pool();
-    PermissionAssignmentRepository::create(
-        pool,
-        CreatePermissionAssignmentInput {
-            identity: fixture.identity_id,
-            permset: fixture.permission_set_id,
-        },
-    )
-    .await
-    .unwrap();
+    assert_eq!(
+        fixture.parent.permission_set_refs,
+        vec!["standard", ADHOC_WORKFLOW_PERMISSION_REF]
+    );
     let mut tx = pool.begin().await.unwrap();
     CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
         .await
@@ -194,6 +192,10 @@ async fn legitimate_adhoc_reuse_reopens_and_standalone_fanout_rejects_payload_mi
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(
+        original.permission_set_refs,
+        vec![ADHOC_WORKFLOW_PERMISSION_REF]
+    );
     // Re-read the persisted row just as the standalone fanout reuse fast path
     // does. This is not fabricated execution/receipt evidence.
     let reused = ExecutionRepository::find_by_id(&mut *tx, original.id)
