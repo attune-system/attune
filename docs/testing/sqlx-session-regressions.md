@@ -47,3 +47,30 @@ and protocol relays gate the real advisory-lock acknowledgement or publisher
 confirmation. Independent observation checks the retained lock and transaction
 state, and cancellation must terminate that backend before awaited teardown.
 The tests do not replace publication with a synthetic pending future.
+
+The cancellation relay enables TCP_NODELAY on both streams so deliberate
+per-frame forwarding does not add delayed-ACK latency. The registered-wait
+fixture must have a real response before either cancellation gate; the initial
+wait fixture stays pending when testing registration itself.
+
+The executor's six `receipt_deadline` cases require their owned broker vhosts
+and explicit `--ignored --test-threads=4` invocation. They cover expiry at commit,
+first publication and recovered publisher readiness, with a positive control.
+Keep the declared consent windows and gate watchdogs unchanged. On Docker
+Desktop, run the host-built executable in the owned database/broker network
+when published-port latency consumes short consent windows. Record the binary
+hash, runtime prerequisites and test run identity; changing the network is not
+permission to bypass source or freshness checks.
+
+Same-advance task input preserves opaque receipts for recorded workflow
+publications when attaching CONTROL dependencies. These retain prospective
+result/wait/empty witnesses from the issuing transaction. The internal path
+requires a newly recorded workflow-variable receipt from that transaction and
+execution; it cannot reopen an old origin as fresh approval or bind CONTROL as
+replacement VALUE.
+
+The cache-generation cleanup acknowledgement suite also distinguishes server
+effect from client acknowledgement. When a relay holds BEGIN's response, the
+startup guard can queue and flush rollback, making the backend idle. The caller
+must still return the exact recovery deadline error if acknowledgement never
+arrives. The test retains the held gate, absolute grace and durable quota checks.

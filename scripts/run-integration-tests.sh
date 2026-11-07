@@ -97,6 +97,7 @@ while [[ $# -gt 0 ]]; do
       echo ""
       echo "Environment:"
       echo "  ATTUNE_E2E_RUN_ID         Optional unique run identity"
+      echo "  ATTUNE_E2E_SERIAL_BUILD   Set to 1 to build one service at a time"
       echo "  ATTUNE_E2E_PROJECT_NAME  Optional Compose project for a pre-started stack"
       echo "  ATTUNE_DOCKER_CONFIG_PATH  Config mounted into owned stacks"
       echo "                            Default: docker/distributable/config.docker.yaml"
@@ -315,11 +316,24 @@ fi
 # ── Step 1: Build ─────────────────────────────────────────────────────────
 if [[ "$DO_BUILD" == true ]]; then
   log_header "Building Docker images..."
-  compose build --quiet \
-    --build-arg CARGO_BUILD_JOBS="${ATTUNE_E2E_CARGO_BUILD_JOBS:-2}" \
-    e2e-tests \
-    migrations init-user init-pack-binaries init-packs init-agent pack-release-upgrade \
+  BUILD_SERVICES=(
+    e2e-tests
+    migrations init-user init-pack-binaries init-packs init-agent pack-release-upgrade
     api executor executor-2 notifier supervisor
+  )
+  if [[ "${ATTUNE_E2E_SERIAL_BUILD:-0}" == "1" ]]; then
+    # Compose can submit a multi-service BuildKit graph concurrently despite its
+    # engine-call parallel limit. Separate foreground calls bound Rust builds.
+    for service in "${BUILD_SERVICES[@]}"; do
+      # These services use published images and have no build definition.
+      case "$service" in migrations|init-user|init-packs) continue ;; esac
+      log_info "Building ${service} sequentially..."
+      compose build --build-arg CARGO_BUILD_JOBS="${ATTUNE_E2E_CARGO_BUILD_JOBS:-2}" "$service"
+    done
+  else
+    compose build --quiet \
+      --build-arg CARGO_BUILD_JOBS="${ATTUNE_E2E_CARGO_BUILD_JOBS:-2}" "${BUILD_SERVICES[@]}"
+  fi
   log_success "Build complete"
 fi
 

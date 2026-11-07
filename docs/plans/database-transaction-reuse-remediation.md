@@ -1,7 +1,7 @@
 # Database transaction reuse remediation
 
-Date: 2026-11-06
-Status: work in progress; checkpoint published in draft PR #28, remaining validation tracked there
+Date: 2026-11-06; updated 2026-11-07
+Status: implementation and affected local validation complete; required CI/review pending
 
 Attune must prevent cancelled transaction startup from leaking transaction
 ownership and independently reject dirty or uncertain sessions at pool reuse.
@@ -227,110 +227,137 @@ Validation: commands/results, tested revision and uncommitted changes, scope
 Gaps: remaining implementation, unavailable evidence, unrun/failed checks, CI
 ```
 
-## Replacement implementation checkpoint (2026-11-06)
+## Implementation completion and validation (2026-11-07)
 
-The coordinator remains local. All implementation edits, compilation, test
-execution, and disposable services run over SSH on `192.168.1.38`, in
-`/home/david/attune-transaction-remote-5VcMrDI8/source`. The remote directory is a
-source snapshot without Git metadata. Source is synchronized back to the assigned
-review worktree, excluding build outputs and dependency/service state.
+Status: work in progress until required CI and review complete. PR:
+<https://github.com/attune-system/attune/pull/28>, branch `t3/cd751dc2`, based on
+`feat/mcp-access-policies` at `880b1b2a138a335eb549c08452f0d3440de68d41`.
+The user authorized implementation, commits, pushes and PR updates. Merging,
+deployment, releases and live mutations remain unauthorized.
 
-Preserved implementation includes startup cleanup independent of depth, nested
-completion quarantine, final driver pool checks after hooks and draining,
-tracked execution repository transactions, and session leases in all three
-native scheduler checkpoint paths. Leases dispose on cancellation before lock
-acknowledgement and span post-commit publication. Audit batches reserve stable
-partitioned identities, retry within bounded deadlines, expose failure-aware
-flush/loss counters, and drain/join at API shutdown. Optional alert fields are
-omitted and tested through internal event-schema admission. Body discovery
-reserves bounded primary-key windows with persistent fixed-high-water sweeps;
-existing claim/delete transactions retain final eligibility and identity checks.
-No new performance index is justified or claimed.
+The coordinator remained local. All source edits, compilation, tests and
+disposable services ran over SSH on `192.168.1.38` in
+`/home/david/attune-transaction-remote-5VcMrDI8/source`. This is a plain source
+snapshot, not a Git checkout. Finished source and sanitized evidence were
+synchronized to `/home/david/.t3/worktrees/attune/t3-cd751dc2` without target
+directories, dependency caches, credentials or database state.
 
-Additional regressions cover shutdown with live emitter clones, exact queue loss
-on abort, and revisiting newly eligible older rows despite continuous inserts.
-The standalone driver suite and prior emitter passes were reported by the stopped
-implementation agent; their historical logs are unavailable in this snapshot,
-so they are not independently verified evidence. New remote run results are
-recorded separately. Shared lease tests alone do not certify cancellation through
-each real scheduler checkpoint; representative query-plan/workload evidence and
-full affected-consumer results remain required until explicitly recorded.
+### Completed behavior
 
+- The vendored driver cleans up interrupted ordinary/custom BEGIN independently
+  of depth and quarantines uncertain nested startup/completion without adopting
+  or rolling back another caller's transaction. Pool checks after draining and
+  hooks independently require confirmed clean state. Healthy reuse remains
+  supported. Both provenance notes describe the maintained patch.
+- Execution wrappers use tracked transactions. Analytics retains its snapshot
+  and source-lock contracts. All three native scheduler wrappers retain session
+  leases through lock acquisition, acknowledgement, commit, publication and
+  unlock. Tests gate actual PostgreSQL acknowledgement and broker confirmation.
+- Initial native cache activation now creates the authenticated frontier used by
+  subsequent checkpoints, before legacy locks. This narrowly fixes the two
+  broker completion failures reproduced on the isolated application baseline;
+  source selectors, authority checks and admission/parent lock order remain.
+- Same-advance task input carries opaque, owning-frame CONTROL receipts and
+  their original prospective result/wait/empty witnesses. It rejects foreign,
+  reopened and wrong-kind receipts. VALUE binding, graph limits and freshness
+  checks remain separate. No deadline or watchdog was increased.
+- Audit retries retain stable partitioned identities, bound queue/batch/retry
+  work, expose failure-aware flush and loss counts, and drain/join at shutdown.
+  Optional alert fields are omitted and admitted through the actual internal
+  schema repository.
+- Body discovery reserves bounded primary-key windows with persistent
+  fixed-high-water sweeps; final eligibility, pins, identity and transaction
+  checks remain at claim/deletion. The migration supports that sweep state.
+  No new index or speculative performance claim is made.
+- The cleanup acknowledgement regression now expects the startup guard's
+  queued rollback to reach PostgreSQL while BEGIN acknowledgement remains held.
+  It still requires the exact unacknowledged-rollback error, original absolute
+  grace, live held gate and unchanged durable counters. Backend idleness alone
+  is never accepted as recovery acknowledgement.
+- Optional serial E2E image builds use separate foreground Compose calls.
+  The build-job argument covers bootstrap and application Cargo commands in
+  all relevant Rust Dockerfiles; private handoff/evidence directories are
+  excluded from Docker contexts.
 
-## Authorized checkpoint PR and validation handoff
+### Validation
 
-The user subsequently authorized committing, pushing and opening a PR to track
-remaining work. Draft PR: <https://github.com/attune-system/attune/pull/28>.
-Implementation checkpoint: `a03812373f18a62efc8c922744bbb35be57248b6` on
-`t3/cd751dc2`. Its base is `feat/mcp-access-policies` at the existing source
-baseline `880b1b2a138a335eb549c08452f0d3440de68d41`, so the PR diff isolates this
-remediation. No merge or deployment is authorized.
+The final application code starts from `357dbd3f152ee6b98e417cdc62de38f020c901f8`
+plus the follow-up implementation diff. Each result has exact command, unique
+run identity, source-file SHA-256 manifests, executable SHA-256 where applicable,
+exit status, count and cleanup evidence under `.handoff/resume-evidence/`.
+The assigned review worktree receives a sanitized copy under
+`.scratch/transaction-remediation-5VcMrDI8/`. Git-less build metadata uses the
+passed base SHA; it is not a claim that the uncommitted source equals that base.
 
-### Validation established
+All application integration binaries used the repository's normal test profile,
+ran sequentially and used four test threads. The same host-built binaries ran
+inside each owned database's Docker network with read-only host ABI libraries.
+This avoids Docker Desktop published-port latency; the unchanged 20-second
+single-child receipt window passes without enlarging it. Recovery tests retain
+their existing 120-second window. No source proof, watchdog or assertion was
+disabled to obtain these results.
 
-All implementation, compilation, tests and disposable services ran over SSH on
-the remote host. The coordinator stayed local. Authorized Git publication used
-the assigned local review worktree after source synchronization; no local build
-or test service was run.
+| Coverage | PostgreSQL 16.14 | PostgreSQL 18.6 |
+| --- | --- | --- |
+| Standalone driver session regressions | 19 passed | 19 passed |
+| Executor default library | 302 passed; 16 explicit prerequisite cases run below | same |
+| Actual checkpoint cancellation wrappers, each lock and post-commit modes | 3 passed | 3 passed |
+| Broker cache ordering/completion/replay | 6 passed | 6 passed |
+| Receipt-deadline commit/delivery/recovery suite | 6 passed | 6 passed |
+| Service-creation prerequisite case | 1 passed | 1 passed |
+| Runtime authority repository, including 21 native-wait and 14 native-cache cases | 269 passed | 269 passed |
+| Audit resilience, final batch ceiling | 5 passed | 5 passed |
+| Analytics / session leases / execution repository | 12 / 3 / 27 passed | 12 / 3 / 27 passed |
+| Actual event-schema binding / storage maintenance | 4 / 30 passed | 4 / 30 passed |
+| Dashboard API, including cross-request cancellation | 19 passed; 1 deferred | same |
+| Supervisor with Python cross-process fixture prerequisite | 53 passed | 53 passed |
+| Cache generation cleanup acknowledgement suite | 14 passed | 14 passed |
 
-- Independently verified driver regressions: 19 passed on PostgreSQL 16.14 and
-  18.6. Compatible baseline cases reproduce ordinary/custom startup cancellation
-  and raw-session containment defects with a passing healthy control.
-- Each PostgreSQL version passed analytics (12), lease (3), execution repository
-  (27), actual event-schema binding (4), storage maintenance (30), native wait
-  repository paths (21), native cache checkpoint repository paths (14 under the
-  normal optimized test profile), dashboard acceptance (19, plus one existing
-  ignored case), supervisor binary tests (53), and default scheduler tests (136,
-  plus 12 explicit external-service cases ignored at that stage).
-- Audit resilience passed five cases on each version before the final batch
-  tuning ceiling. The ceiling-adjusted five-case suite passed on PostgreSQL 16;
-  PostgreSQL 18 has not rerun that final adjustment. Emitter unit tests passed
-  five cases; DB identity/options unit tests passed seven.
-- Earlier workspace all-target checks, workspace Clippy with `-D warnings`,
-  workspace/standalone/vendor formatting, and owned PostgreSQL-backed SQLx
-  preparation passed. SQLx found no compile-time query metadata to generate.
-  These earlier checks do not certify the final added scheduler test module.
-- Actual dense-pin plans on both versions processed 4,097 versions (4,096 pinned,
-  one eligible tail) in 17 materialized windows with at most 256 candidates.
-  Eventual tail discovery and revisiting newly eligible older rows under
-  continuous inserts passed. No new index claim is made.
+All 318 distinct executor library cases ran on each version: the 16 ignored by
+the default invocation were explicitly run with owned broker prerequisites.
+Pure unit checks additionally passed inherited input (16), DB options (7), and
+audit emitter (5). Fresh migrations passed on both versions.
+`cargo sqlx prepare --workspace -- --all-targets` passed against owned
+PostgreSQL 18 and reported no compile-time queries requiring metadata artifacts.
 
-### Unresolved failures and unrun checks
+Final workspace `cargo check --locked --workspace --all-targets`, Clippy with
+`-D warnings`, workspace formatting, standalone formatting and all six maintained
+driver/core file format checks passed. No new Rust warnings remain.
+The owned full-stack command `ATTUNE_E2E_SERIAL_BUILD=1 ATTUNE_E2E_CARGO_BUILD_JOBS=1 bash scripts/run-integration-tests.sh --tier 1 tests/e2e/api/test_sse_execution_stream.py -x` passed all 36 selected cases (tier 1 plus five SSE cases), with zero failures or skips on PostgreSQL 18.6. Run `zb58e461325c847a` took 7,148.55 seconds including serial release builds; pytest took 206.53 seconds. Bootstrap revocation completed and independent verification found zero remaining project containers, networks or volumes.
 
-- The three new real scheduler-wrapper cancellation tests compiled, then all
-  failed on PostgreSQL 16: registered-wait returned `Ok(false)` before its gate;
-  cache and initial-wait cases reached their gate deadlines. These failures are
-  unresolved, and **do not provide passing per-checkpoint cancellation proof**.
-  Shared lease tests remain separate passing evidence. Diagnose the real path
-  and relay/fixture behavior without weakening source or authorization guards.
-- The broker suite has two existing source/frontier-denial failures on both
-  versions: `broker_cache_completion_waits_for_cleanup_parent_before_workflow_rows`
-  and `broker_cache_refill_completion_replay_and_terminal_cascade` (four other
-  cases pass). A separate target-directory build of the unchanged application
-  baseline reproduced exactly those two failures on PostgreSQL 16, with unchanged
-  source and verified cleanup. An earlier attempt that reused an implementation
-  binary is explicitly excluded from baseline evidence.
-- The final receipt-deadline invocation reported failures before being stopped;
-  its run is incomplete and provides no passing six-case suite result. The
-  baseline status of these failures has not been established.
-- The final PostgreSQL 18 checkpoint/audit/receipt reruns and final workspace
-  check/Clippy/format round were not reached. The latest optimized executor test
-  binary compiled successfully; compilation is not passing runtime validation.
-- An earlier unoptimized native-cache run hit its existing five-second watchdog;
-  normal-profile reruns passed all 14 cases on both versions without changing
-  that watchdog. The full workspace suite and full-stack E2E remain unrun.
-- Required PR CI has started independently; no passing CI or review outcome is
-  claimed here. The ignored dashboard timezone case remains deferred.
+Earlier deterministic baseline driver failures with a passing healthy control,
+and dense-pin plans on both versions, remain valid evidence: the driver and
+discovery code did not change during these follow-ups. The dense-pin workload
+has 4,097 bodies, 4,096 pinned and one eligible tail, processed in 17 materialized
+windows of at most 256 candidates. Repository tests additionally prove revisits
+of newly eligible older rows under continuous insertion. An isolated,
+separately-built application baseline reproduced exactly the two broker failures;
+the earlier attempt that reused an implementation target is excluded.
 
-Following the checkpoint PR request, the active test executable and Cargo owner
-were stopped before interrupting the owning runner. Its finally block removed
-the exact owned PostgreSQL and RabbitMQ containers and verified absence. No
-owned validation compiler/test/service was left running. No local containers or
-unowned remote databases were reused or cleaned up.
+The three scheduler fixture failures were resolved by using an actually
+responded registered-wait fixture and TCP_NODELAY on frame relays, together with
+the initial cache activation correction above. Receipt tests additionally needed
+the original opaque prospective witnesses and a low-latency owned network.
+Failed diagnostics, interrupted build attempts and the initial supervisor run
+without its Python prerequisite remain recorded as failures, not passes.
 
-Detailed commands, run IDs, source manifests, failed attempts and cleanup records
-are retained remotely under `.handoff/evidence/` and exported without raw server
-logs or build outputs to the assigned review worktree's
-`.scratch/transaction-remediation-5VcMrDI8/`. A Markdown whitespace correction and
-this progress update occurred after the tested implementation snapshot; the
-implementation/test source hashes are compared separately at handoff.
+### Gaps and delivery gate
+
+Required CI on the new PR head and review remain pending; the parent coordinator
+owns that gate. The former head's CI failure in cleanup acknowledgement was
+corrected and its full 14-case target rerun on both versions. Local scoped results
+do not replace the complete required CI suite.
+
+The existing dashboard timezone case is a setup-only placeholder for an
+unimplemented bucketing feature, so it remains deferred and is not counted as a
+pass. The six policy-deferred deployment cases retain their documented
+prerequisites/scope in `docs/testing/supported-deployment-scope.md`; they are
+never passing release evidence. The complete workspace test suite was not run
+locally; affected repositories, API, scheduler, audit, retention, drivers and
+the selected cross-service smoke were exercised explicitly.
+
+Owned fixture and Compose project containers, networks and anonymous volumes
+were removed and absence verified. Warm target/BuildKit caches were retained.
+No local test services or unowned remote databases were touched. The original
+incident's precise leaking request and live data loss remain unproven; this
+validation does not claim live incident forensics.
