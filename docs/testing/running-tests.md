@@ -271,12 +271,14 @@ Repeat with release binaries using `cargo build --release` and
 `--bin-dir target/release` to cover the production build profile. Keep binary
 snapshots and other large artifacts under `.scratch/`, outside `/tmp` tmpfs.
 
-For a container runtime check, supply Linux static release binaries with
+For a container runtime check, supply compatible Linux release binaries with
 `--bin-dir <directory> --service-image python:3.12-bookworm`. The runner pins
 and records the image ID, mounts only its owned evidence directory and supplied
 binaries, and starts the services on an owned Docker network. To exercise the
 production injected agent, place a symlink named `attune-worker` to the built
 `attune-agent` in that directory; the resolved binary path and hash are recorded.
+Match the production targets: API/executor use GNU/glibc binaries compatible with
+the runtime image (Bookworm provides glibc 2.36), and the injected agent uses musl.
 The image must not override `RUST_MIN_STACK` for a default-stack run.
 
 The action reads an encrypted **system-owned** Key through a pack-defined,

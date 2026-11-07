@@ -79,7 +79,7 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--bin-dir', type=Path, default=ROOT / 'target/debug')
     parser.add_argument('--runtime-stack-bytes',type=int,default=0,help='Default: leave RUST_MIN_STACK unset; a positive value is an explicitly recorded diagnostic override')
-    parser.add_argument('--service-image', help='Run the supplied static release binaries in this Docker runtime image on an owned network')
+    parser.add_argument('--service-image', help='Run the supplied Linux release binaries in this ABI-compatible Docker runtime image on an owned network')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False, mode=0o700)
     evidence = args.output.resolve()
