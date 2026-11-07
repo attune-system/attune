@@ -60,7 +60,11 @@ Keep the declared consent windows and gate watchdogs unchanged. On Docker
 Desktop, run the host-built executable in the owned database/broker network
 when published-port latency consumes short consent windows. Record the binary
 hash, runtime prerequisites and test run identity; changing the network is not
-permission to bypass source or freshness checks.
+permission to bypass source or freshness checks. The recovery proxy also requires
+an explicit literal loopback broker endpoint. For a container test executable,
+share the run-owned broker's network namespace (`--network container:<owned-broker>`)
+and use its internal `127.0.0.1:5672` endpoint; keep PostgreSQL reachable on the
+owned network. Do not relax the proxy's loopback check to use a service broker.
 
 Same-advance task input preserves opaque receipts for recorded workflow
 publications when attaching CONTROL dependencies. These retain prospective
