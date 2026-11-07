@@ -84,7 +84,8 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False, mode=0o700)
     evidence = args.output.resolve()
     run = 'authority-' + uuid.uuid4().hex[:12]
-    containers, processes, logs = [], [], []
+    containers, processes, logs, volumes = [], [], [], []
+    service_mounts = []
     network = None
     secret = secrets.token_hex(24)
     result = {'run': run, 'head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(), 'checks': []}
@@ -140,12 +141,14 @@ def main():
         containers.append(name)
         argv=['docker','run','--name',name,'--label','attune.authority.run='+run,
               '--network',network,'--user',str(os.getuid())+':'+str(os.getgid()),
+              '--workdir',str(evidence),
               '--entrypoint','/usr/local/bin/attune-service',
               '-v',str(evidence)+':'+str(evidence),
               '-v',str((args.bin_dir/binary).resolve())+':/usr/local/bin/attune-service:ro',
               '-e','ATTUNE__ENVIRONMENT=authority_acceptance','-e','RUST_LOG=info',
               '-e','ATTUNE_WORKER_NAME='+run,
               '-e','ATTUNE_API_URL=http://'+run+'-api:'+str(api_port)]
+        argv += service_mounts
         if args.runtime_stack_bytes:
             argv += ['-e','RUST_MIN_STACK='+str(args.runtime_stack_bytes)]
         if binary=='attune-api' and not migrate:
@@ -175,6 +178,27 @@ def main():
             result['service_image_id']=args.service_image
             network=run
             command(['docker','network','create','--label','attune.authority.run='+run,network],stdout=subprocess.DEVNULL)
+            # Match production's native data volumes. Virtualized host bind
+            # shares may reject sendfile into read-only release projections.
+            volume_mounts=[]
+            roots=[]
+            result['data_volumes']={}
+            for key in ['packs_base_dir','runtime_envs_dir','artifacts_dir','blobs']:
+                name=run+'-'+key
+                existing=subprocess.run(['docker','volume','inspect',name],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=20)
+                assert existing.returncode!=0, 'refusing an existing data volume'
+                volumes.append(name)
+                command(['docker','volume','create','--label','attune.authority.run='+run,name],stdout=subprocess.DEVNULL)
+                (evidence/key).mkdir(exist_ok=True)
+                service_mounts += ['-v',name+':'+str(evidence/key)]
+                volume_mounts += ['-v',name+':/owned/'+key]
+                roots.append('/owned/'+key)
+                result['data_volumes'][key]=name
+            initializer=run+'-volume-init'
+            containers.append(initializer)
+            command(['docker','run','--name',initializer,'--label','attune.authority.run='+run,
+                     '--user','0:0','--entrypoint','/bin/chown',*volume_mounts,args.service_image,
+                     str(os.getuid())+':'+str(os.getgid()),*roots],stdout=subprocess.DEVNULL,timeout=120)
         pg = docker_container('pg', 'postgres:18-alpine', [5432], ['-e', 'POSTGRES_HOST_AUTH_METHOD=trust', '-e', 'POSTGRES_USER=attune', '-e', 'POSTGRES_DB=attune', '--tmpfs', '/var/lib/postgresql'])
         broker = docker_container('mq', 'rabbitmq:4.3.6-management-alpine', [5672], ['-e', 'RABBITMQ_DEFAULT_USER=attune', '-e', 'RABBITMQ_DEFAULT_PASS=attune', '-e', 'RABBITMQ_DEFAULT_VHOST=' + run])
         wait_for(lambda: subprocess.run(['docker', 'exec', pg, 'pg_isready', '-h', '127.0.0.1', '-U', 'attune'], stdout=subprocess.DEVNULL, timeout=10).returncode == 0, 90, 'PostgreSQL')
@@ -194,7 +218,7 @@ def main():
         config['log'].update(level='info', mirror_runtime_stdout_to_stdio=True, mirror_runtime_stderr_to_stdio=True)
         for key in ['packs_base_dir', 'runtime_envs_dir', 'artifacts_dir']:
             path = evidence / key
-            path.mkdir()
+            path.mkdir(exist_ok=True)
             config[key] = str(path)
         config['artifacts'] = {'transport': 'volume'}
         config['storage'] = {'provider': 'filesystem', 'root': str(evidence / 'blobs')}
@@ -542,6 +566,11 @@ print(json.dumps({'assertion':result['assertion'],'raw_denied':True,'profile_den
         assert int(psql(f"SELECT count(*) FROM delegated_execution_attempt WHERE execution={blocked['id']}"))==0
         psql("UPDATE worker SET capabilities=jsonb_set(capabilities,'{delegated_execution_authority_v1}','true') WHERE name='"+run+"'")
         result['checks'] += ['worker without delegated completion capability rejected before dispatch']
+        if args.service_image:
+            command(['docker','cp',run+'-api:'+str(evidence/'artifacts_dir')+'/.',str(evidence/'artifacts_dir')],timeout=120)
+            exported=sum(path.is_file() for path in (evidence/'artifacts_dir').rglob('*'))
+            assert exported>0, 'native volume logs must be exported for plaintext checks'
+            result['exported_artifact_files']=exported
         for path in (evidence / 'artifacts_dir').rglob('*'):
             if path.is_file():
                 assert secret.encode() not in path.read_bytes(), 'plaintext in artifact storage'
@@ -551,6 +580,12 @@ print(json.dumps({'assertion':result['assertion'],'raw_denied':True,'profile_den
         result['checks'] += ['logs/results have no plaintext file copies', 'runtime stdout/stderr mirroring suppressed']
         result['status'] = 'passed'
     except BaseException as error:
+        if 'pg' in locals():
+            try:
+                diagnostics=psql("SELECT coalesce(json_agg(json_build_object('id',id,'pack_ref',pack_ref,'status',status,'error',error_message,'diagnostics',diagnostic_details))::text,'[]') FROM pack_install")
+                (evidence/'install-failure.json').write_text(diagnostics)
+            except Exception as diagnostic_error:
+                (evidence/'install-diagnostic-error.txt').write_text(type(diagnostic_error).__name__)
         result['status'] = 'failed'
         result['error'] = str(error)
         raise
@@ -572,6 +607,19 @@ print(json.dumps({'assertion':result['assertion'],'raw_denied':True,'profile_den
             cleanup = subprocess.run(['docker', 'rm', '-f', '-v', name], stdout=subprocess.DEVNULL, timeout=60)
             if cleanup.returncode:
                 failures.append(name)
+        for name in reversed(volumes):
+            try:
+                owner=subprocess.run(['docker','volume','inspect','--format','{{index .Labels "attune.authority.run"}}',name],capture_output=True,text=True,timeout=20)
+                if owner.returncode:
+                    continue
+                if owner.stdout.strip()!=run:
+                    failures.append('volume ownership mismatch: '+name)
+                    continue
+                cleanup=subprocess.run(['docker','volume','rm',name],stdout=subprocess.DEVNULL,timeout=60)
+                if cleanup.returncode:
+                    failures.append(name)
+            except Exception as cleanup_error:
+                failures.append(name+': '+type(cleanup_error).__name__)
         if network:
             cleanup=subprocess.run(['docker','network','rm',network],stdout=subprocess.DEVNULL,timeout=60)
             if cleanup.returncode:

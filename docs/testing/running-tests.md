@@ -273,8 +273,12 @@ snapshots and other large artifacts under `.scratch/`, outside `/tmp` tmpfs.
 
 For a container runtime check, supply compatible Linux release binaries with
 `--bin-dir <directory> --service-image python:3.12-bookworm`. The runner pins
-and records the image ID, mounts only its owned evidence directory and supplied
-binaries, and starts the services on an owned Docker network. To exercise the
+and records the image ID, mounts its owned evidence directory and supplied
+binaries, and starts the services on an owned Docker network. Pack, runtime,
+artifact and blob data use run-owned named volumes, matching production. The runner
+exports completed artifact logs for its plaintext checks and removes the volumes
+after stopping the services. Virtualized host bind shares can reject copying
+read-only release files with `EXDEV`/`EACCES`; they are not the data-volume lane. To exercise the
 production injected agent, place a symlink named `attune-worker` to the built
 `attune-agent` in that directory; the resolved binary path and hash are recorded.
 Match the production targets: API/executor use GNU/glibc binaries compatible with
