@@ -298,7 +298,7 @@ except urllib.error.HTTPError as e:
 print(json.dumps({'assertion':result['assertion'],'raw_denied':True,'profile_denied':True}))
 """)
         (pack/'permission_sets/sign_system.yaml').write_text(yaml.safe_dump({'ref':signer_ref,'scope':'external','grants':[{'resource':'keys','actions':['use'],'constraints':{'refs':[signer['ref']],'owner_types':['system']}}]}))
-        (pack / 'permission_sets/invoke.yaml').write_text(yaml.safe_dump({'ref': pack_ref + '.invoke', 'grants': [{'resource': 'actions', 'actions': ['execute'], 'constraints': {'refs': [action_ref,signer_ref]}}, {'resource': 'executions', 'actions': ['read', 'decrypt'], 'constraints': {'refs': [action_ref,signer_ref]}}, {'resource':'artifacts','actions':['read']}, {'resource':'queues','actions':['create'],'constraints':{'refs':[pack_ref+'.private_ack_queue',pack_ref+'.invalid_ack_queue']}}]}))
+        (pack / 'permission_sets/invoke.yaml').write_text(yaml.safe_dump({'ref': pack_ref + '.invoke', 'grants': [{'resource': 'actions', 'actions': ['execute'], 'constraints': {'refs': [action_ref,signer_ref]}}, {'resource': 'executions', 'actions': ['read', 'decrypt'], 'constraints': {'refs': [action_ref,signer_ref]}}, {'resource':'artifacts','actions':['read']}, {'resource':'queue_items','actions':['create'],'constraints':{'refs':[pack_ref+'.private_ack_queue',pack_ref+'.invalid_ack_queue']}}]}))
         event_ref=pack_ref+'.authority_event'
         emitter_ref=pack_ref+'.emit_event'
         (pack/'triggers/authority_event.yaml').write_text(yaml.safe_dump({'ref':event_ref,'label':'Authority acceptance event','out_schema':{'marker':{'type':'string'}}}))
