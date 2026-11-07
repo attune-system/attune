@@ -570,7 +570,7 @@ impl Harness {
             attempt,
         )?;
         // Transport readers must survive terminal execution transitions. Give
-        // a separate human only this execution and artifact, not workload rights.
+        // a separate human this execution and its frozen output audience.
         let reader = IdentityRepository::create(
             self.database.pool(),
             CreateIdentityInput {
@@ -581,13 +581,18 @@ impl Harness {
             },
         )
         .await?;
-        let permissions = PermissionSetRepository::create(self.database.pool(), CreatePermissionSetInput {
-            r#ref: format!("fixture.reader_{}", uuid::Uuid::new_v4().simple()), pack: None, pack_ref: None,
-            label: None, description: None, grants: serde_json::json!([
-                {"resource":"executions","actions":["read","decrypt"],"constraints":{"ids":[execution_id]}},
-                {"resource":"artifacts","actions":["read"],"constraints":{"ids":[artifact_id]}}
-            ]),
-        }).await?;
+        let permissions = PermissionSetRepository::create(
+            self.database.pool(),
+            CreatePermissionSetInput {
+                r#ref: format!("fixture.reader_{}", uuid::Uuid::new_v4().simple()),
+                pack: None,
+                pack_ref: None,
+                label: None,
+                description: None,
+                grants: log_reader_grants(execution_id, action_ref),
+            },
+        )
+        .await?;
         PermissionAssignmentRepository::create(
             self.database.pool(),
             CreatePermissionAssignmentInput {
@@ -617,6 +622,20 @@ impl Harness {
         self.database.cleanup().await?;
         Ok(())
     }
+}
+
+// Opaque workload output requires the complete frozen read ceiling, even
+// before any Key is fetched. Limit this audience to the producing action/pack
+// and execution read/decrypt to the single row.
+fn log_reader_grants(execution: i64, action: &str) -> serde_json::Value {
+    let pack = action.split_once('.').unwrap().0;
+    serde_json::json!([
+        {"resource":"executions","actions":["read","decrypt"],"constraints":{"ids":[execution]}},
+        {"resource":"keys","actions":["read","decrypt"],"constraints":{"owner_types":["pack","action"],"owner_refs":[pack,action]}},
+        {"resource":"artifacts","actions":["read"],"constraints":{"owner_types":["pack","action"],"owner_refs":[pack,action]}},
+        {"resource":"caches","actions":["read"],"constraints":{"owner_types":["pack"],"owner_refs":[pack]}},
+        {"resource":"caches","actions":["read"],"constraints":{"owner_types":["action"],"owner_refs":[action]}}
+    ])
 }
 
 struct LogFixture {
@@ -942,10 +961,7 @@ async fn artifact_preview_streams_object_segment_logs() -> Result<()> {
             pack_ref: None,
             label: None,
             description: None,
-            grants: serde_json::json!([
-                {"resource":"artifacts","actions":["read"],"constraints":{"ids":[fixture.artifact_id]}},
-                {"resource":"executions","actions":["read","decrypt"],"constraints":{"ids":[fixture.execution_id]}}
-            ]),
+            grants: log_reader_grants(fixture.execution_id, &fixture.action_ref),
         },
     )
     .await?;
@@ -1096,10 +1112,10 @@ async fn object_artifact_stream_rechecks_recorded_key_authority_between_frames()
         },
     )
     .await?;
-    let base = vec![
-        serde_json::json!({"resource":"artifacts","actions":["read"],"constraints":{"ids":[fixture.artifact_id]}}),
-        serde_json::json!({"resource":"executions","actions":["read","decrypt"],"constraints":{"ids":[fixture.execution_id]}}),
-    ];
+    let base = log_reader_grants(fixture.execution_id, &fixture.action_ref)
+        .as_array()
+        .unwrap()
+        .clone();
     let mut allowed = base.clone();
     allowed.push(serde_json::json!({"resource":"keys","actions":["read","decrypt"],"constraints":{"refs":[key.r#ref]}}));
     let permissions = PermissionSetRepository::create(
