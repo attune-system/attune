@@ -416,6 +416,27 @@ async fn start_delegated_fixture(conn: &mut sqlx::PgConnection, execution: i64) 
         execution::UpdateExecutionInput,
         runtime::{CreateWorkerInput, WorkerRepository},
     };
+    let source = ExecutionRepository::find_by_id(&mut *conn, execution)
+        .await?
+        .unwrap();
+    if source
+        .executable_snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.executable.workflow_definition.is_some())
+    {
+        // Native workflow admission already created its noncredential producer
+        // fence. It runs in the executor without an assigned worker.
+        ExecutionRepository::update(
+            &mut *conn,
+            execution,
+            UpdateExecutionInput {
+                status: Some(ExecutionStatus::Running),
+                ..Default::default()
+            },
+        )
+        .await?;
+        return Ok(());
+    }
     let worker = WorkerRepository::create(
         &mut *conn,
         CreateWorkerInput {
