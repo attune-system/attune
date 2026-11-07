@@ -465,6 +465,13 @@ print(json.dumps({'assertion':result['assertion'],'raw_denied':True,'profile_den
             assert protected['items'][0]['summary']['value']==secret and protected['items'][0]['error']['value']==secret
         result['checks'] += ['API-capable system-Key queue consumes closed-attempt acknowledgement controls while freeform details remain encrypted', 'malformed protected acknowledgement fails without leaking parser input through queue errors']
 
+        native_queue_ref=pack_ref+'.native_queue'
+        api('POST','/queues',json={'ref':native_queue_ref,'pack_ref':pack_ref,'label':'Native queue readiness','dispatch_action_ref':flow_ref,'permission_set_refs':['standard',pack_ref+'.read_system'],'action_params':{'key':keys[0],'other':keys[1],'plaintext':True}})
+        native_rejected=admin.post(base+'/api/v1/queues/'+native_queue_ref+'/items',json={'payload':{}},timeout=20)
+        assert native_rejected.status_code==501 and 'native completion readiness' in native_rejected.text
+        assert psql("SELECT count(*) FROM work_queue_item WHERE queue_ref='"+native_queue_ref+"'")=='0'
+        result['checks'].append('unsupported native workflow queue target rejects with readiness before enqueue while direct workflows remain supported')
+
         # A principal with only execute/observe rights cannot borrow pack sponsorship.
         login_name = run + '@example.test'
         identity = api('POST', '/identities', json={'login': login_name, 'password': 'TestPass123!', 'display_name': run})

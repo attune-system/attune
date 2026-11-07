@@ -481,6 +481,19 @@ impl DelegatedExecutionRepository {
         Ok((owner, refs))
     }
 
+    /// Workflow queue targets need a native producer/completion binding. Do not
+    /// accept them and discover that missing authority after the action runs.
+    pub fn require_queue_target_ready(
+        snapshot: &crate::models::ExecutionExecutableSnapshot,
+    ) -> Result<()> {
+        if snapshot.executable.action.is_workflow {
+            return Err(Error::validation(
+                "Workflow queue dispatch requires coordinated native completion readiness",
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn accept_queue_item(
         conn: &mut PgConnection,
         queue: &crate::models::WorkQueue,
@@ -498,6 +511,7 @@ impl DelegatedExecutionRepository {
             .await?
             .require_refs_for_share(conn, refs)
             .await?;
+        Self::require_queue_target_ready(snapshot)?;
         let grants = Self::selected_grants(conn, refs).await?;
         if let Some(source) = item.requested_by_execution {
             let parent = Box::pin(Self::validate(conn, source)).await?;

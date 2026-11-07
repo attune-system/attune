@@ -678,6 +678,8 @@ impl WorkQueueDispatcher {
         if recorded {
             attune_common::execution_authority::RecordedConsumerReadiness::default()
                 .require_ready()?;
+        } else {
+            attune_common::repositories::delegated_execution::DelegatedExecutionRepository::require_queue_target_ready(&dispatch_snapshot)?;
         }
         let admission = if recorded {
             Some(attune_common::repositories::execution_admission::ExecutionAdmissionRepository::queue_batch(&mut tx, queue, &items, &dispatch_snapshot).await?)

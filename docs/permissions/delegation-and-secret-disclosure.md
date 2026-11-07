@@ -222,6 +222,9 @@ version, item IDs and statuses. Only those protocol controls update ordinary que
 state. Freeform summary/error details remain in the encrypted execution result;
 they are not copied into queue item summaries or errors. Invalid protected
 acknowledgements produce a fixed diagnostic without echoing their private fields.
+Native workflows as queue dispatch targets require separate producer/completion
+readiness and are rejected before enqueue. Direct workflow execution, worker
+child fanout and retries remain supported by delegated authority.
 
 Worker startup advertises `delegated_execution_authority_v1` only for the protected
 input/token/log/completion implementation with output encryption configured.
