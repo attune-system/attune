@@ -25,6 +25,8 @@ use attune_common::{
 };
 
 mod helpers;
+#[path = "recorded_consumers/pre_admitted_queue.rs"]
+mod pre_admitted_queue;
 
 async fn create_pack_with_action(
     ctx: &TestContext,
@@ -592,7 +594,12 @@ async fn private_queue_item_submission_requires_constrained_item_grant() {
         )
         .await
         .expect("enqueue public queue");
-    assert_eq!(enqueue_public.status(), StatusCode::CREATED);
+    assert_eq!(enqueue_public.status(), StatusCode::NOT_IMPLEMENTED);
+    let diagnostic: serde_json::Value = enqueue_public.json().await.expect("readiness diagnostic");
+    assert!(diagnostic["error"]
+        .as_str()
+        .unwrap()
+        .contains("Recorded queue sponsorship"));
 
     let enqueue_private_broad = ctx
         .post(
@@ -628,7 +635,24 @@ async fn private_queue_item_submission_requires_constrained_item_grant() {
         )
         .await
         .expect("enqueue private queue with constrained grant");
-    assert_eq!(enqueue_private_constrained.status(), StatusCode::CREATED);
+    assert_eq!(
+        enqueue_private_constrained.status(),
+        StatusCode::NOT_IMPLEMENTED
+    );
+    let diagnostic: serde_json::Value = enqueue_private_constrained
+        .json()
+        .await
+        .expect("readiness diagnostic");
+    assert!(diagnostic["error"]
+        .as_str()
+        .unwrap()
+        .contains("Recorded queue sponsorship"));
+    for queue in [&public_queue, &private_queue] {
+        assert!(WorkQueueItemRepository::list_for_queue(&ctx.pool, queue.id)
+            .await
+            .expect("pending items")
+            .is_empty());
+    }
 }
 
 #[tokio::test]
@@ -1189,9 +1213,37 @@ async fn queue_api_allows_pack_queue_labels_and_flags_but_blocks_deletion() {
         )
         .await
         .expect("accept pending item");
-    assert_eq!(accepted.status(), StatusCode::CREATED);
-    let item: serde_json::Value = accepted.json().await.expect("accepted item");
-    let item_id = item["data"]["id"].as_i64().expect("accepted item id");
+    assert_eq!(accepted.status(), StatusCode::NOT_IMPLEMENTED);
+    assert!(WorkQueueItemRepository::list_for_queue(&ctx.pool, queue.id)
+        .await
+        .expect("no new sponsorship")
+        .is_empty());
+    // Metadata/lifecycle controls still apply to genuinely pre-admitted rows.
+    // Populate one using the canonical selector rather than enabling readiness.
+    let owner: i64 = attune_common::auth::jwt::validate_token(&admin_token, &ctx.state.jwt_config)
+        .unwrap()
+        .sub
+        .parse()
+        .unwrap();
+    let actor = IdentityRepository::find_by_id(&ctx.pool, owner)
+        .await
+        .unwrap()
+        .unwrap();
+    let item_id = pre_admitted_queue::pre_admitted_item(
+        &ctx,
+        &queue,
+        None,
+        json!({"item":{"id":"retained-item"}}),
+        attune_common::repositories::ad_hoc_queue_admission::AdHocQueueSource::Human(
+            attune_common::runtime_authority::HumanAttribution {
+                identity_id: actor.id,
+                login: actor.login,
+            },
+        ),
+    )
+    .await
+    .expect("pre-admitted item")
+    .id;
     let before = WorkQueueRepository::find_by_ref(&ctx.pool, &queue.r#ref)
         .await
         .expect("queue")
