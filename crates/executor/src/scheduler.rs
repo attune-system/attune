@@ -1304,6 +1304,30 @@ impl ExecutionScheduler {
         }
 
         if execution.status != ExecutionStatus::Requested {
+            if matches!(
+                execution.status,
+                ExecutionStatus::Completed
+                    | ExecutionStatus::Failed
+                    | ExecutionStatus::Cancelled
+                    | ExecutionStatus::Timeout
+                    | ExecutionStatus::Abandoned
+            ) && execution
+                .executable_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.executable.workflow_definition.is_some())
+            {
+                // Recover immediate native completion after a failed post-commit
+                // broker publication. The consumer validates current authority
+                // and lease generation before applying any result controls.
+                let mut connection = pool.acquire().await?;
+                let pending =
+                    Self::workflow_completion_publication(&mut connection, &execution).await?;
+                drop(connection);
+                if let Some(pending) = pending {
+                    Self::publish_execution_completed_payload(publisher, pending).await?;
+                }
+            }
+
             debug!(
                 "Skipping execution {} with status {:?}; only Requested executions are schedulable",
                 execution_id, execution.status
@@ -2051,7 +2075,7 @@ impl ExecutionScheduler {
                             "Workflow has no entry-point tasks; completing immediately",
                         )
                         .await?;
-                    Self::complete_workflow_with_conn(
+                    let completed = Self::complete_workflow_with_conn(
                         &mut transaction,
                         execution.id,
                         workflow_execution.id,
@@ -2060,6 +2084,8 @@ impl ExecutionScheduler {
                         Some(output),
                     )
                     .await?;
+                    let pending =
+                        Self::workflow_completion_publication(&mut transaction, &completed).await?;
                     logger
                         .log_with_conn(&mut transaction, LogLevel::Info, "Workflow completed")
                         .await?;
@@ -2069,6 +2095,11 @@ impl ExecutionScheduler {
                     transaction.commit().await?;
                     plan.ensure_fresh()?;
                     sources.ensure_fresh()?;
+                    if let Some(pending) = pending {
+                        Self::publish_execution_completed_payload(publisher, pending).await?;
+                        plan.ensure_fresh()?;
+                        sources.ensure_fresh()?;
+                    }
                     return Ok(());
                 }
                 logger
@@ -2078,7 +2109,7 @@ impl ExecutionScheduler {
                         "Workflow has no entry-point tasks; completing immediately",
                     )
                     .await?;
-                Self::complete_workflow_with_conn(
+                let completed = Self::complete_workflow_with_conn(
                     &mut transaction,
                     execution.id,
                     workflow_execution.id,
@@ -2087,6 +2118,8 @@ impl ExecutionScheduler {
                     None,
                 )
                 .await?;
+                let pending =
+                    Self::workflow_completion_publication(&mut transaction, &completed).await?;
                 logger
                     .log_with_conn(
                         &mut transaction,
@@ -2096,6 +2129,9 @@ impl ExecutionScheduler {
                     .await?;
                 logger.seal_with_conn(&mut transaction).await?;
                 transaction.commit().await?;
+                if let Some(pending) = pending {
+                    Self::publish_execution_completed_payload(publisher, pending).await?;
+                }
                 return Ok(());
             }
 
@@ -6508,6 +6544,41 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
         Ok(())
     }
 
+    /// Queued root workflows need the same fenced acknowledgement consumer as
+    /// workers. Ordinary roots keep their existing notification behavior.
+    fn workflow_completion_publication<'a>(
+        conn: &'a mut PgConnection,
+        execution: &'a Execution,
+    ) -> futures::future::BoxFuture<'a, Result<Option<PendingExecutionCompleted>>> {
+        Box::pin(async move {
+            if execution.parent.is_none() {
+                let Some(dispatch) = attune_common::repositories::work_queue::WorkQueueDispatchRepository::find_by_execution(
+                    &mut *conn, execution.id,
+                ).await? else { return Ok(None) };
+                if !matches!(
+                    dispatch.status,
+                    attune_common::models::WorkQueueDispatchStatus::Leased
+                        | attune_common::models::WorkQueueDispatchStatus::Dispatched
+                ) {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(PendingExecutionCompleted {
+                execution_id: execution.id,
+                action_id: execution.action.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Completed workflow execution {} has no action id",
+                        execution.id,
+                    )
+                })?,
+                action_ref: execution.action_ref.clone(),
+                status: execution.status,
+                result: execution.result.clone(),
+                completed_at: execution.updated,
+            }))
+        })
+    }
+
     async fn publish_execution_completed_payload(
         publisher: &Publisher,
         pending: PendingExecutionCompleted,
@@ -8267,22 +8338,6 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
                 plan.require_current(&workflow_execution)?;
             }
 
-            // Already fully terminal (Completed / Failed) — nothing to do
-            if matches!(
-                workflow_execution.status,
-                ExecutionStatus::Completed | ExecutionStatus::Failed
-            ) {
-                debug!(
-                    "Workflow execution {} already in terminal state {:?}, skipping advance",
-                    workflow_execution_id, workflow_execution.status
-                );
-                return Ok(WorkflowAdvanceOutcome::default());
-            }
-
-            let mut pending_messages = WorkflowPublications::default();
-            let mut pending_completed_children = Vec::new();
-            let mut pending_completed_execution = None;
-
             let parent_execution =
                 ExecutionRepository::find_by_id(&mut *conn, workflow_execution.execution)
                     .await?
@@ -8293,6 +8348,32 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
                             workflow_execution_id
                         )
                     })?;
+
+            // Replay the stored, redacted completion after a broker failure.
+            // Queue controls remain fenced and idempotent at their consumer.
+            if matches!(
+                workflow_execution.status,
+                ExecutionStatus::Completed | ExecutionStatus::Failed
+            ) || (workflow_execution.status == ExecutionStatus::Cancelled
+                && parent_execution.status == ExecutionStatus::Cancelled)
+            {
+                debug!(
+                    "Workflow execution {} already in terminal state {:?}, skipping advance",
+                    workflow_execution_id, workflow_execution.status
+                );
+                return Ok(WorkflowAdvanceOutcome {
+                    completed_execution: Self::workflow_completion_publication(
+                        conn,
+                        &parent_execution,
+                    )
+                    .await?,
+                    ..Default::default()
+                });
+            }
+
+            let mut pending_messages = WorkflowPublications::default();
+            let mut pending_completed_children = Vec::new();
+            let mut pending_completed_execution = None;
 
             if let Some(plan) = prepared_failure {
                 plan.require_completed_execution(execution)?;
@@ -8387,22 +8468,9 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
                         )
                         .await?;
                         if let Some(completed_execution) = completed_execution {
-                            if completed_execution.parent.is_some() {
-                                let action_id = completed_execution.action.ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "Cancelled nested workflow execution {} has no action id",
-                                        completed_execution.id
-                                    )
-                                })?;
-                                pending_completed_execution = Some(PendingExecutionCompleted {
-                                    execution_id: completed_execution.id,
-                                    action_id,
-                                    action_ref: completed_execution.action_ref.clone(),
-                                    status: completed_execution.status,
-                                    result: completed_execution.result.clone(),
-                                    completed_at: Utc::now(),
-                                });
-                            }
+                            pending_completed_execution =
+                                Self::workflow_completion_publication(conn, &completed_execution)
+                                    .await?;
                         }
                     } else {
                         debug!(
@@ -9577,22 +9645,8 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
                     output_map_result,
                 )
                 .await?;
-                if completed_execution.parent.is_some() {
-                    let action_id = completed_execution.action.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Completed nested workflow execution {} has no action id",
-                            completed_execution.id
-                        )
-                    })?;
-                    pending_completed_execution = Some(PendingExecutionCompleted {
-                        execution_id: completed_execution.id,
-                        action_id,
-                        action_ref: completed_execution.action_ref.clone(),
-                        status: completed_execution.status,
-                        result: completed_execution.result.clone(),
-                        completed_at: Utc::now(),
-                    });
-                }
+                pending_completed_execution =
+                    Self::workflow_completion_publication(conn, &completed_execution).await?;
             }
 
             if let Some(closure) = &native_closure {
@@ -11981,7 +12035,7 @@ true,
             .begin()
             .await
             .expect("begin workflow advancement");
-        ExecutionScheduler::advance_workflow_serialized(
+        let outcome = ExecutionScheduler::advance_workflow_serialized(
             &mut transaction,
             &AtomicUsize::new(0),
             Some(INQUIRY_SCHEDULER_INPUT_KEY),
@@ -11990,6 +12044,10 @@ true,
         )
         .await
         .expect("advance cancelled workflow child");
+        assert!(
+            outcome.completed_execution.is_none(),
+            "ordinary roots keep their notification behavior"
+        );
         transaction
             .commit()
             .await
@@ -12014,6 +12072,91 @@ true,
             .cleanup()
             .await
             .expect("clean test database");
+    }
+
+    #[tokio::test]
+    async fn queued_root_workflow_completion_is_published_and_replayable() {
+        use attune_common::repositories::work_queue::{
+            CreateWorkQueueDispatchInput, UpdateWorkQueueDispatchInput, WorkQueueDispatchRepository,
+        };
+        let fixture = InquirySchedulerFixture::create().await;
+        let queue = WorkQueueRepository::find_by_ref(
+            fixture.database.pool(),
+            "scheduler_inquiry_it.wait_targets",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let dispatch = WorkQueueDispatchRepository::create(
+            fixture.database.pool(),
+            CreateWorkQueueDispatchInput {
+                id: None,
+                queue: queue.id,
+                queue_ref: queue.r#ref,
+                execution: fixture.parent.id,
+                status: attune_common::models::WorkQueueDispatchStatus::Dispatched,
+                leased_item_count: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let child = ExecutionRepository::update(
+            fixture.database.pool(),
+            fixture.request.id,
+            UpdateExecutionInput {
+                status: Some(ExecutionStatus::Cancelled),
+                result: Some(serde_json::json!({"error":"cancelled"})),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for _ in 0..2 {
+            let mut tx = fixture.database.begin().await.unwrap();
+            let outcome = ExecutionScheduler::advance_workflow_serialized(
+                &mut tx,
+                &AtomicUsize::new(0),
+                Some(INQUIRY_SCHEDULER_INPUT_KEY),
+                &child,
+                &SchedulerMetadataCaches::new(),
+            )
+            .await
+            .unwrap();
+            let completed = outcome
+                .completed_execution
+                .expect("queued native root completion");
+            assert_eq!(completed.execution_id, fixture.parent.id);
+            assert_eq!(completed.status, ExecutionStatus::Cancelled);
+            attune_common::repositories::delegated_execution::DelegatedExecutionRepository::require_closed_output(
+                &mut tx, fixture.parent.id).await.unwrap();
+            tx.commit().await.unwrap();
+        }
+        WorkQueueDispatchRepository::update(
+            fixture.database.pool(),
+            dispatch.id,
+            UpdateWorkQueueDispatchInput {
+                status: Some(attune_common::models::WorkQueueDispatchStatus::Cancelled),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut tx = fixture.database.begin().await.unwrap();
+        let outcome = ExecutionScheduler::advance_workflow_serialized(
+            &mut tx,
+            &AtomicUsize::new(0),
+            Some(INQUIRY_SCHEDULER_INPUT_KEY),
+            &child,
+            &SchedulerMetadataCaches::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            outcome.completed_execution.is_none(),
+            "consumed root controls are not republished"
+        );
+        tx.rollback().await.unwrap();
+        fixture.database.cleanup().await.unwrap();
     }
 
     #[tokio::test]

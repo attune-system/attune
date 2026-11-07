@@ -216,6 +216,9 @@ the original active owner, selected refs, grant digest, executable and schema;
 later rule edits cannot reselect that pending enforcement's authority. Queue
 contributors likewise retain their accepted owner and selection.
 
+Queued native workflows publish terminal completions through the same consumer
+as workers, including cancellation and immediate completion. Redelivery can replay
+a pending completion after broker failure and stops once its dispatch is terminal.
 Protected queue acknowledgements are consumed under the original active owner's
 current admitted read scope and the closed worker or native workflow producer
 attempt. Native compiler-tracked public literals remain public; protected values,

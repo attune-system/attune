@@ -298,7 +298,7 @@ except urllib.error.HTTPError as e:
 print(json.dumps({'assertion':result['assertion'],'raw_denied':True,'profile_denied':True}))
 """)
         (pack/'permission_sets/sign_system.yaml').write_text(yaml.safe_dump({'ref':signer_ref,'scope':'external','grants':[{'resource':'keys','actions':['use'],'constraints':{'refs':[signer['ref']],'owner_types':['system']}}]}))
-        (pack / 'permission_sets/invoke.yaml').write_text(yaml.safe_dump({'ref': pack_ref + '.invoke', 'grants': [{'resource': 'actions', 'actions': ['execute'], 'constraints': {'refs': [action_ref,signer_ref]}}, {'resource': 'executions', 'actions': ['read', 'decrypt'], 'constraints': {'refs': [action_ref,signer_ref]}}, {'resource':'artifacts','actions':['read']}, {'resource':'queue_items','actions':['create'],'constraints':{'refs':[pack_ref+'.private_ack_queue',pack_ref+'.invalid_ack_queue']}}]}))
+        (pack / 'permission_sets/invoke.yaml').write_text(yaml.safe_dump({'ref': pack_ref + '.invoke', 'scope':'external', 'grants': [{'resource': 'actions', 'actions': ['execute'], 'constraints': {'refs': [action_ref,signer_ref]}}, {'resource': 'executions', 'actions': ['read', 'decrypt'], 'constraints': {'refs': [action_ref,signer_ref]}}, {'resource':'artifacts','actions':['read'],'constraints':{'owner_types':['action'],'owner_refs':[action_ref,signer_ref]}}, {'resource':'queue_items','actions':['create'],'constraints':{'refs':[pack_ref+'.private_ack_queue',pack_ref+'.invalid_ack_queue']}}]}))
         event_ref=pack_ref+'.authority_event'
         emitter_ref=pack_ref+'.emit_event'
         (pack/'triggers/authority_event.yaml').write_text(yaml.safe_dump({'ref':event_ref,'label':'Authority acceptance event','out_schema':{'marker':{'type':'string'}}}))
@@ -457,7 +457,9 @@ print(json.dumps({'assertion':result['assertion'],'raw_denied':True,'profile_den
             private_queue_ref=pack_ref+('.invalid_ack_queue' if invalid else '.private_ack_queue')
             api('POST','/queues',json={'ref':private_queue_ref,'pack_ref':pack_ref,'label':'Protected acknowledgement','dispatch_action_ref':action_ref,'permission_set_refs':['standard',pack_ref+'.read_system'],'action_params':{'key':keys[0],'other':keys[1],'plaintext':True,'item_id':'{{ queue_item.id }}','ack_invalid':invalid}})
             accepted=caller.post(base+'/api/v1/queues/'+private_queue_ref+'/items',json={'payload':{}},timeout=30)
-            assert accepted.status_code==201, 'narrow queue admission rejected: HTTP '+str(accepted.status_code)
+            if accepted.status_code!=201:
+                (evidence/'queue-admission-error.json').write_text(accepted.text)
+            assert accepted.status_code==201, 'narrow queue admission rejected: HTTP '+str(accepted.status_code)+'; inspect queue-admission-error.json'
             def private_queue_terminal():
                 state=psql("SELECT status::text FROM work_queue_item WHERE queue_ref='"+private_queue_ref+"'")
                 return state if state in ('completed','failed','cancelled') else None
