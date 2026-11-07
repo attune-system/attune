@@ -932,10 +932,7 @@ async fn test_pack_scoped_queue_permissions_cover_definitions_and_items() {
 
 mod artifact_authz_tests {
     use super::*;
-    use attune_common::auth::jwt::{
-        generate_execution_token,
-        generate_execution_token_with_permission_sets_and_standard_access, JwtConfig,
-    };
+    use attune_common::auth::jwt::{generate_execution_token, JwtConfig};
 
     fn jwt_config() -> JwtConfig {
         JwtConfig {
@@ -1241,17 +1238,26 @@ mod artifact_authz_tests {
             .expect("lookup")
             .expect("identity");
 
-        // Mint an execution token whose action_ref lives in pack `pack_x`.
-        let exec_token = generate_execution_token_with_permission_sets_and_standard_access(
-            identity.id,
-            424242, // execution_id, not validated by route
-            "pack_x.deploy",
-            &jwt_config(),
-            Some(300),
-            &[STANDARD_EXECUTION_ACCESS_REF.to_string()],
-            &["pack_x.deploy".to_string()],
-        )
-        .expect("mint exec token");
+        // Select the caller's explicit artifact-write grant as well as standard.
+        // Standard alone does not grant artifact creation or mutation.
+        let mut refs = PermissionSetRepository::find_by_identity(&ctx.pool, identity.id)
+            .await
+            .expect("assigned sets")
+            .into_iter()
+            .map(|set| set.r#ref)
+            .collect::<Vec<_>>();
+        refs.push(STANDARD_EXECUTION_ACCESS_REF.into());
+        let exec_token = helpers::delegated_source::token(&ctx, identity.id, &refs)
+            .await
+            .expect("admit source");
+        let claims =
+            attune_common::auth::jwt::validate_token(&exec_token, &jwt_config()).expect("claims");
+        let source_pack = claims.metadata.as_ref().unwrap()["action_ref"]
+            .as_str()
+            .unwrap()
+            .split_once('.')
+            .unwrap()
+            .0;
 
         // Create a private artifact owned by a *different* pack.
         let art = create_artifact_row(
@@ -1296,9 +1302,9 @@ mod artifact_authz_tests {
             .post(
                 "/api/v1/artifacts",
                 json!({
-                    "ref": format!("pack_x.created_{}", uuid::Uuid::new_v4().simple()),
+                    "ref": format!("{source_pack}.created_{}", uuid::Uuid::new_v4().simple()),
                     "scope": "pack",
-                    "owner": "pack_x",
+                    "owner": source_pack,
                     "type": "file_text",
                     "name": "x"
                 }),
@@ -1332,15 +1338,13 @@ mod artifact_authz_tests {
             .expect("lookup")
             .expect("identity");
 
-        // Mint a normal execution token in pack `pack_x`.
-        let exec_token = generate_execution_token(
+        let exec_token = helpers::delegated_source::token(
+            &ctx,
             identity.id,
-            12345,
-            "pack_x.deploy",
-            &jwt_config(),
-            Some(300),
+            &[STANDARD_EXECUTION_ACCESS_REF.to_string()],
         )
-        .expect("mint exec token");
+        .await
+        .expect("admit source");
 
         // Create a private action-scoped artifact with a malformed (dotless)
         // owner ref. `derive_pack_ref` must return `None` for this owner;
@@ -1367,7 +1371,7 @@ mod artifact_authz_tests {
 
     /// An execution token with an empty `action_ref` cannot derive a token
     /// pack; cross-pack writes against pack-derivable artifacts must be
-    /// refused with 403, not silently allowed.
+    /// rejected at authentication with 401 before artifact authorization.
     #[tokio::test]
     async fn execution_token_with_empty_action_ref_is_refused() {
         let ctx = TestContext::new().await.expect("test ctx");
@@ -1407,7 +1411,7 @@ mod artifact_authz_tests {
             )
             .await
             .expect("append");
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
         // Same for create against a pack-scoped target.
         let create_resp = ctx
@@ -1424,6 +1428,6 @@ mod artifact_authz_tests {
             )
             .await
             .expect("create");
-        assert_eq!(create_resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(create_resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

@@ -17,10 +17,7 @@ use async_trait::async_trait;
 use attune_api::{postgres_listener, AppState, Server};
 use attune_common::{
     artifact_transport::{ApiTransport, ArtifactFileTransport},
-    auth::jwt::{
-        generate_access_token, generate_execution_token_with_permission_sets,
-        generate_worker_token, JwtConfig,
-    },
+    auth::jwt::{generate_access_token, generate_worker_token, JwtConfig},
     blob_store::{
         BlobBody, BlobReader, BlobStore, BlobStoreError, ByteRange, DirectUploadAuthorization,
         DirectUploadSpec, ObjectKey, ProviderVersion, S3BlobStore, StoredObject,
@@ -263,6 +260,7 @@ struct Harness {
     controls: Vec<Arc<StoreControl>>,
     _root: tempfile::TempDir,
     worker_token: String,
+    worker_id: i64,
     execution_identity: i64,
     jwt: JwtConfig,
 }
@@ -301,7 +299,6 @@ impl Harness {
             access_token_expiration: 300,
             refresh_token_expiration: 3600,
         };
-        let worker_token = generate_worker_token(1, "replica-test", &jwt, None)?;
         let execution_identity = IdentityRepository::create(
             database.pool(),
             CreateIdentityInput {
@@ -313,6 +310,26 @@ impl Harness {
         )
         .await?
         .id;
+        use attune_common::{
+            models::{WorkerStatus, WorkerType},
+            repositories::runtime::{CreateWorkerInput, WorkerRepository},
+        };
+        let worker = WorkerRepository::create(
+            database.pool(),
+            CreateWorkerInput {
+                name: format!("replica-{}", uuid::Uuid::new_v4()),
+                worker_type: WorkerType::Local,
+                runtime: None,
+                host: None,
+                port: None,
+                status: Some(WorkerStatus::Active),
+                capabilities: None,
+                meta: None,
+            },
+        )
+        .await?;
+        let worker_token =
+            generate_worker_token(execution_identity, &worker.id.to_string(), &jwt, None)?;
         let mut replicas = Vec::new();
         let mut controls = Vec::new();
         for listen_for_notifications in notification_listeners {
@@ -360,6 +377,7 @@ impl Harness {
             controls,
             _root: root,
             worker_token,
+            worker_id: worker.id,
             execution_identity,
             jwt,
         })
@@ -474,6 +492,37 @@ impl Harness {
         .await?;
         SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, execution.id, &binding)
             .await?;
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::select(
+            &mut tx,
+            execution.id,
+            None,
+        )
+        .await?;
+        use attune_common::repositories::{execution::UpdateExecutionInput, Update};
+        ExecutionRepository::update(
+            &mut *tx,
+            execution.id,
+            UpdateExecutionInput {
+                worker: Some(self.worker_id),
+                status: Some(ExecutionStatus::Scheduled),
+                ..Default::default()
+            },
+        )
+        .await?;
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::start(
+            &mut tx,
+            execution.id,
+            self.worker_id,
+        )
+        .await?;
+        ExecutionRepository::transition_worker(
+            &mut *tx,
+            execution.id,
+            Some(self.worker_id),
+            ExecutionStatus::Running,
+            None,
+        )
+        .await?;
         tx.commit().await?;
         Ok(execution)
     }
@@ -505,13 +554,18 @@ impl Harness {
             100,
         )
         .await?;
-        let execution_token = generate_execution_token_with_permission_sets(
+        let mut tx = self.database.pool().begin().await?;
+        let attempt = attune_common::repositories::delegated_execution::DelegatedExecutionRepository::current_attempt(&mut tx, execution_id).await?;
+        tx.commit().await?;
+        let execution_token = attune_common::auth::jwt::generate_delegated_execution_token(
             self.execution_identity,
             execution_id,
             action_ref,
             &self.jwt,
-            None,
+            600,
             &["standard".into()],
+            &[],
+            attempt,
         )?;
         Ok(LogFixture {
             execution_id,

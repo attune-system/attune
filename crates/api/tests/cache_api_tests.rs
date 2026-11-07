@@ -13,9 +13,8 @@ use serde_json::{json, Value};
 use attune_common::{
     audit::{AuditCategory, AuditEventFilters, AuditOutcome, AuditRepository},
     auth::jwt::{
-        generate_execution_token_with_permission_sets, generate_sensor_token,
-        generate_sensor_token_with_cache_authority_and_workload_fence, generate_token,
-        generate_worker_token_with_instance, validate_token, JwtConfig, TokenType,
+        generate_sensor_token, generate_sensor_token_with_cache_authority_and_workload_fence,
+        generate_token, generate_worker_token_with_instance, validate_token, JwtConfig, TokenType,
     },
     config::CacheAdmissionConfig,
     models::{
@@ -1312,6 +1311,15 @@ async fn execution_refresh_attribution_survives_reuse_and_metadata_reads() -> Re
         "cache_coord_execution.populate",
     )
     .await?;
+    helpers::activate_test_pack_release_with_projections(
+        &ctx.pool,
+        &pack,
+        &attune_common::repositories::component_lifecycle::PackProjectionIds {
+            actions: vec![action.id],
+            ..Default::default()
+        },
+    )
+    .await?;
     let grants = pack_writer_grants(&pack.r#ref);
     let (token, identity_id) = register_user(&ctx, "cache_coord_execution", grants.clone()).await?;
     let permission_set = PermissionSetRepository::create(
@@ -1339,7 +1347,7 @@ async fn execution_refresh_attribution_survives_reuse_and_metadata_reads() -> Re
     let mut executions = Vec::new();
     for _ in 0..2 {
         executions.push(
-            ExecutionRepository::create(
+            helpers::delegated_source::create(
                 &ctx.pool,
                 CreateExecutionInput {
                     action: Some(action.id),
@@ -1364,14 +1372,8 @@ async fn execution_refresh_attribution_survives_reuse_and_metadata_reads() -> Re
     assert_eq!(response.status(), StatusCode::CREATED);
     let mut generation_id = None;
     for (index, execution) in executions.iter().enumerate() {
-        let execution_token = generate_execution_token_with_permission_sets(
-            identity_id,
-            execution.id,
-            &action.r#ref,
-            &test_jwt_config(),
-            Some(300),
-            std::slice::from_ref(&permission_set.r#ref),
-        )?;
+        let execution_token =
+            helpers::delegated_source::execution_token(&ctx, execution.id).await?;
         let response = ctx
             .post(
                 "/api/v1/cache/namespaces/users/generations",

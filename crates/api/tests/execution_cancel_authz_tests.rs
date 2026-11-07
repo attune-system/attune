@@ -210,14 +210,8 @@ async fn execution_token_requires_embedded_cancel_permission_and_respects_owner_
     let cancel = create_permission_set(&ctx.pool, "execution_cancel", &["cancel"]).await?;
     attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
 
-    let denied_token = generate_execution_token_with_permission_sets(
-        caller.id,
-        owned.id,
-        "test.cancel_caller",
-        &jwt_config(),
-        Some(300),
-        &[],
-    )?;
+    let denied_token =
+        helpers::delegated_source::token(&ctx, caller.id, &["standard".into()]).await?;
     let denied = ctx
         .post(
             &format!("/api/v1/executions/{}/cancel", owned.id),
@@ -247,12 +241,15 @@ async fn execution_token_requires_embedded_cancel_permission_and_respects_owner_
             Some(&allowed_token),
         )
         .await?;
-    assert_eq!(undelegable.status(), StatusCode::FORBIDDEN);
+    // A legacy, unbound credential cannot reach route authorization even if
+    // it claims a selected permission set.
+    assert_eq!(undelegable.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
         execution_status(&ctx.pool, owned.id).await?,
         ExecutionStatus::Requested
     );
     assign_permission_set(&ctx.pool, &caller, &cancel).await?;
+    let allowed_token = helpers::delegated_source::token(&ctx, caller.id, &permission_refs).await?;
     let foreign_denied = ctx
         .post(
             &format!("/api/v1/executions/{}/cancel", foreign.id),
