@@ -80,7 +80,7 @@ pub async fn execution_token(ctx: &super::TestContext, execution: i64) -> super:
             &ctx.state.jwt_config,
             600,
             &row.permission_set_refs,
-            &[],
+            std::slice::from_ref(&row.action_ref),
             attempt,
         )?,
     )

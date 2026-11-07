@@ -1238,18 +1238,14 @@ mod artifact_authz_tests {
             .expect("lookup")
             .expect("identity");
 
-        // Select the caller's explicit artifact-write grant as well as standard.
-        // Standard alone does not grant artifact creation or mutation.
-        let mut refs = PermissionSetRepository::find_by_identity(&ctx.pool, identity.id)
-            .await
-            .expect("assigned sets")
-            .into_iter()
-            .map(|set| set.r#ref)
-            .collect::<Vec<_>>();
-        refs.push(STANDARD_EXECUTION_ACCESS_REF.into());
-        let exec_token = helpers::delegated_source::token(&ctx, identity.id, &refs)
-            .await
-            .expect("admit source");
+        // Standard carries the admitted action/pack scope, including writes.
+        let exec_token = helpers::delegated_source::token(
+            &ctx,
+            identity.id,
+            &[STANDARD_EXECUTION_ACCESS_REF.to_string()],
+        )
+        .await
+        .expect("admit source");
         let claims =
             attune_common::auth::jwt::validate_token(&exec_token, &jwt_config()).expect("claims");
         let source_pack = claims.metadata.as_ref().unwrap()["action_ref"]

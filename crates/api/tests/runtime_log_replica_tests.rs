@@ -262,6 +262,7 @@ struct Harness {
     worker_token: String,
     worker_id: i64,
     execution_identity: i64,
+    execution_refs: Vec<String>,
     jwt: JwtConfig,
 }
 
@@ -379,6 +380,7 @@ impl Harness {
             worker_token,
             worker_id: worker.id,
             execution_identity,
+            execution_refs: vec!["standard".into()],
             jwt,
         })
     }
@@ -474,7 +476,7 @@ impl Harness {
                 parent: None,
                 enforcement: None,
                 executor: Some(self.execution_identity),
-                permission_set_refs: vec!["standard".into()],
+                permission_set_refs: self.execution_refs.clone(),
                 artifact_retention_policy: None,
                 artifact_retention_limit: None,
                 worker_selector: None,
@@ -563,10 +565,38 @@ impl Harness {
             action_ref,
             &self.jwt,
             600,
-            &["standard".into()],
-            &[],
+            &self.execution_refs,
+            &[action_ref.to_string()],
             attempt,
         )?;
+        // Transport readers must survive terminal execution transitions. Give
+        // a separate human only this execution and artifact, not workload rights.
+        let reader = IdentityRepository::create(
+            self.database.pool(),
+            CreateIdentityInput {
+                login: format!("log-reader-{}", uuid::Uuid::new_v4()),
+                display_name: None,
+                password_hash: None,
+                attributes: serde_json::json!({}),
+            },
+        )
+        .await?;
+        let permissions = PermissionSetRepository::create(self.database.pool(), CreatePermissionSetInput {
+            r#ref: format!("fixture.reader_{}", uuid::Uuid::new_v4().simple()), pack: None, pack_ref: None,
+            label: None, description: None, grants: serde_json::json!([
+                {"resource":"executions","actions":["read","decrypt"],"constraints":{"ids":[execution_id]}},
+                {"resource":"artifacts","actions":["read"],"constraints":{"ids":[artifact_id]}}
+            ]),
+        }).await?;
+        PermissionAssignmentRepository::create(
+            self.database.pool(),
+            CreatePermissionAssignmentInput {
+                identity: reader.id,
+                permset: permissions.id,
+            },
+        )
+        .await?;
+        let reader_token = generate_access_token(reader.id, &reader.login, &self.jwt)?;
         Ok(LogFixture {
             execution_id,
             artifact_id,
@@ -576,6 +606,7 @@ impl Harness {
             action_ref: action_ref.to_string(),
             artifact_ref: artifact_ref.to_string(),
             execution_token,
+            reader_token,
         })
     }
 
@@ -597,6 +628,7 @@ struct LogFixture {
     action_ref: String,
     artifact_ref: String,
     execution_token: String,
+    reader_token: String,
 }
 
 async fn open_log_stream(
@@ -612,7 +644,7 @@ async fn open_log_stream(
             "{}/api/v1/executions/{}/logs/stdout/stream",
             replica.url, fixture.execution_id
         ))
-        .bearer_auth(&fixture.execution_token);
+        .bearer_auth(&fixture.reader_token);
     if let Some(offset) = offset {
         request = request.header("Last-Event-ID", offset);
     }
@@ -910,11 +942,10 @@ async fn artifact_preview_streams_object_segment_logs() -> Result<()> {
             pack_ref: None,
             label: None,
             description: None,
-            grants: serde_json::json!([{
-                "resource": "artifacts",
-                "actions": ["read"],
-                "constraints": {"ids": [fixture.artifact_id]},
-            }]),
+            grants: serde_json::json!([
+                {"resource":"artifacts","actions":["read"],"constraints":{"ids":[fixture.artifact_id]}},
+                {"resource":"executions","actions":["read","decrypt"],"constraints":{"ids":[fixture.execution_id]}}
+            ]),
         },
     )
     .await?;
@@ -996,8 +1027,7 @@ async fn object_artifact_stream_rechecks_recorded_key_authority_between_frames()
         secret_provenance::SecretProvenance,
         secret_values::{prepare_secret_values, SecretValueInput, ENTITY_EXECUTION_CONFIG},
     };
-    let harness = Harness::start(&[true, true]).await?;
-    let fixture = harness.fixture(LogStreamBackend::ObjectSegments).await?;
+    let mut harness = Harness::start(&[true, true]).await?;
     let encryption = harness.replicas[0]
         .state
         .config
@@ -1025,6 +1055,20 @@ async fn object_artifact_stream_rechecks_recorded_key_authority_between_frames()
         encryption,
     )
     .await?;
+    let origin_grant = PermissionSetRepository::create(harness.database.pool(), CreatePermissionSetInput {
+        r#ref: "fixture.selected_origin".into(), pack: None, pack_ref: None, label: None, description: None,
+        grants: serde_json::json!([{ "resource":"keys", "actions":["read","decrypt"], "constraints":{"refs":[key.r#ref]} }]),
+    }).await?;
+    PermissionAssignmentRepository::create(
+        harness.database.pool(),
+        CreatePermissionAssignmentInput {
+            identity: harness.execution_identity,
+            permset: origin_grant.id,
+        },
+    )
+    .await?;
+    harness.execution_refs.push(origin_grant.r#ref);
+    let fixture = harness.fixture(LogStreamBackend::ObjectSegments).await?;
     let provenance = SecretProvenance::key(attune_common::key_access::key_origin(&key));
     let secrets = prepare_secret_values(
         vec![SecretValueInput {
@@ -1449,6 +1493,18 @@ async fn object_s3_terminal_before_publication_reports_incomplete_without_data()
         .execute(harness.database.pool())
         .await?;
     let client = reqwest::Client::new();
+    assert_eq!(
+        client
+            .get(format!(
+                "{}/api/v1/executions/{}/logs/stdout/stream",
+                harness.replicas[1].url, fixture.execution_id
+            ))
+            .bearer_auth(&fixture.execution_token)
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
     let mut reader =
         Box::pin(open_log_stream(&client, &harness.replicas[1], &fixture, None).await?);
     let event = next_event(&mut reader, "error", Duration::from_secs(8)).await?;
