@@ -486,7 +486,9 @@ impl DelegatedExecutionRepository {
     pub fn require_queue_target_ready(
         snapshot: &crate::models::ExecutionExecutableSnapshot,
     ) -> Result<()> {
-        if snapshot.executable.action.is_workflow {
+        if snapshot.executable.action.workflow_def.is_some()
+            || snapshot.executable.workflow_definition.is_some()
+        {
             return Err(Error::validation(
                 "Workflow queue dispatch requires coordinated native completion readiness",
             ));
