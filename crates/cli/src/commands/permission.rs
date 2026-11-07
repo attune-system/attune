@@ -207,7 +207,7 @@ pub async fn handle_permission_command(
     format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
     run(&mut client, command, format).await
 }
 

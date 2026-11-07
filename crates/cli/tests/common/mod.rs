@@ -41,7 +41,19 @@ impl TestFixture {
 
     /// Write a test config file with the mock server URL
     pub fn write_config(&self, content: &str) {
-        std::fs::write(&self.config_path, content).expect("Failed to write config");
+        // Existing domain tests intentionally use the explicit plaintext mode.
+        // Encryption/migration are exercised by credential_storage_tests.
+        let mut value: serde_json::Value = serde_yaml_ng::from_str(content).expect("fixture YAML");
+        if let Some(profiles) = value["profiles"].as_object_mut() {
+            for profile in profiles.values_mut() {
+                profile["credential_encryption"] = json!(false);
+                if profile.get("auth_token").is_some() || profile.get("refresh_token").is_some() {
+                    profile["credentials_endpoint"] = profile["api_url"].clone();
+                }
+            }
+        }
+        std::fs::write(&self.config_path, serde_yaml_ng::to_string(&value).unwrap())
+            .expect("Failed to write config");
     }
 
     /// Write a default config with the mock server

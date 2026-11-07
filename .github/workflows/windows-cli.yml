@@ -39,6 +39,13 @@ jobs:
         run: cargo test --locked --package attune-common --lib repositories::native_generation_origin::tests -- --test-threads=4
       - name: Build CLI binaries
         run: cargo build --locked --package attune-cli --bins
+      - name: Test CLI credential storage
+        env:
+          ATTUNE_TEST_RUN_ID: wincredentials
+        run: |
+          cargo test --locked --package attune-common --lib crypto::tests -- --test-threads=4
+          cargo test --locked --package attune-cli --lib credential -- --test-threads=4
+          cargo test --locked --package attune-cli --test credential_storage_tests -- --test-threads=4
       - name: Verify CLI binaries start
         run: |
           python scripts/test_cli_startup.py --bin-dir target/debug

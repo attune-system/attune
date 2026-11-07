@@ -1,9 +1,11 @@
+use crate::credentials::{self, storage, Envelope, Tokens};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::output::OutputFormat;
 
@@ -27,6 +29,25 @@ pub struct CliConfig {
         alias = "default_output_format"
     )]
     pub format: String,
+    #[serde(skip)]
+    snapshot: RefCell<Option<Snapshot>>,
+    #[serde(skip)]
+    source_path: Option<PathBuf>,
+    #[serde(skip)]
+    pub ephemeral_auth: bool,
+    #[serde(skip)]
+    preserve_selection: bool,
+}
+
+#[derive(Clone)]
+struct Snapshot(serde_json::Value);
+impl std::fmt::Debug for Snapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+fn encryption_default() -> bool {
+    true
 }
 
 fn default_profile_name() -> String {
@@ -38,15 +59,21 @@ fn default_format() -> String {
 }
 
 /// A named profile for connecting to an Attune server
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Profile {
+    #[serde(default = "encryption_default")]
+    pub credential_encryption: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<Envelope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_endpoint: Option<String>,
     /// API endpoint URL
     pub api_url: String,
     /// Authentication token
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing)]
     pub auth_token: Option<String>,
     /// Refresh token
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing)]
     pub refresh_token: Option<String>,
     /// Output format override for this profile (deprecated — ignored, kept for deserialization compat)
     #[serde(skip_serializing)]
@@ -63,12 +90,50 @@ pub struct Profile {
     pub username: Option<String>,
 }
 
+impl std::fmt::Debug for Profile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Profile")
+            .field("credential_encryption", &self.credential_encryption)
+            .field("tokens", &"[redacted]")
+            .finish_non_exhaustive()
+    }
+}
+impl Profile {
+    pub fn clear_credentials(&mut self) {
+        self.auth_token = None;
+        self.refresh_token = None;
+        self.credentials = None;
+        self.credentials_endpoint = None;
+    }
+    pub fn has_credentials(&self) -> bool {
+        self.credentials.is_some() || self.auth_token.is_some() || self.refresh_token.is_some()
+    }
+    pub fn redacted(&self) -> serde_json::Value {
+        let mut value = serde_json::to_value(self).expect("Profile serialization");
+        value.as_object_mut().unwrap().remove("credentials");
+        value["auth_token"] = serde_json::json!(if self.has_credentials() {
+            "***"
+        } else {
+            "(not set)"
+        });
+        value["refresh_token"] = serde_json::json!(if self.has_credentials() {
+            "***"
+        } else {
+            "(not set)"
+        });
+        value
+    }
+}
+
 impl Default for CliConfig {
     fn default() -> Self {
         let mut profiles = HashMap::new();
         profiles.insert(
             "default".to_string(),
             Profile {
+                credential_encryption: true,
+                credentials: None,
+                credentials_endpoint: None,
                 api_url: "http://localhost:8080".to_string(),
                 auth_token: None,
                 refresh_token: None,
@@ -83,6 +148,10 @@ impl Default for CliConfig {
             current_profile: "default".to_string(),
             profiles,
             format: default_format(),
+            snapshot: RefCell::new(None),
+            source_path: None,
+            ephemeral_auth: false,
+            preserve_selection: false,
         }
     }
 }
@@ -103,40 +172,97 @@ impl CliConfig {
         Ok(attune_config_dir.join("config.yaml"))
     }
 
-    /// Load configuration from file, or create default if not exists
+    /// Load metadata without unlocking credentials. This keeps login, logout,
+    /// profile management and completion usable after identifier changes.
     pub fn load() -> Result<Self> {
-        let path = Self::config_path()?;
+        Self::load_at(&Self::config_path()?)
+    }
 
+    pub(crate) fn load_at(path: &Path) -> Result<Self> {
+        let _lock = storage::lock(path)?;
         if !path.exists() {
-            let config = Self::default();
-            config.save()?;
+            let config = Self {
+                source_path: Some(path.to_owned()),
+                ..Self::default()
+            };
+            let value = config.disk_value()?;
+            storage::write(path, serde_yaml_ng::to_string(&value)?.as_bytes())?;
+            *config.snapshot.borrow_mut() = Some(Snapshot(value));
             return Ok(config);
         }
-
-        let content = fs::read_to_string(&path).context("Failed to read config file")?;
-
-        let config: Self =
-            serde_yaml_ng::from_str(&content).context("Failed to parse config file")?;
-
+        storage::private(path)?;
+        let (value, migrated) = Self::read_disk(path)?;
+        if migrated {
+            storage::write(path, serde_yaml_ng::to_string(&value)?.as_bytes())?;
+            eprintln!("Removed legacy plaintext Attune credentials; log in again.");
+        }
+        let mut config: Self = serde_json::from_value(value.clone())
+            .map_err(|_| anyhow::anyhow!("Invalid CLI configuration"))?;
+        config.source_path = Some(path.to_owned());
+        *config.snapshot.borrow_mut() = Some(Snapshot(value));
         Ok(config)
     }
 
-    /// Load existing configuration without creating a default file. Shell
-    /// completion must not mutate user configuration merely from pressing Tab.
+    fn read_disk(path: &Path) -> Result<(serde_json::Value, bool)> {
+        storage::reject_link(path)?;
+        let content = fs::read_to_string(path).context("Failed to read config file")?;
+        // Never include parser diagnostics: they may contain token-bearing input.
+        let mut value: serde_json::Value = serde_yaml_ng::from_str(&content)
+            .map_err(|_| anyhow::anyhow!("Invalid CLI configuration"))?;
+        let mut migrated = false;
+        if let Some(profiles) = value.get_mut("profiles").and_then(|v| v.as_object_mut()) {
+            for profile in profiles.values_mut() {
+                if profile
+                    .get("credential_encryption")
+                    .and_then(|v| v.as_bool())
+                    != Some(false)
+                {
+                    for field in ["auth_token", "refresh_token"] {
+                        if profile
+                            .as_object_mut()
+                            .context("Invalid profile")?
+                            .remove(field)
+                            .is_some()
+                        {
+                            migrated = true;
+                        }
+                    }
+                }
+            }
+        }
+        let config: Self = serde_json::from_value(value)
+            .map_err(|_| anyhow::anyhow!("Invalid CLI configuration"))?;
+        // Normalize aliases/defaults before capturing a comparison snapshot.
+        let mut normalized = serde_json::to_value(&config)?;
+        for (name, profile) in &config.profiles {
+            if !profile.credential_encryption {
+                if profile.credentials.is_some() {
+                    anyhow::bail!("Encrypted credentials require credential_encryption: true; change the setting with attune config set");
+                }
+                normalized["profiles"][name]["auth_token"] = serde_json::json!(profile.auth_token);
+                normalized["profiles"][name]["refresh_token"] =
+                    serde_json::json!(profile.refresh_token);
+            }
+        }
+        Ok((normalized, migrated))
+    }
+
+    /// Completion reads do not mutate or migrate the configuration.
     pub fn load_existing() -> Result<Option<Self>> {
-        let config_dir = if let Ok(xdg_config) = env::var("XDG_CONFIG_HOME") {
-            PathBuf::from(xdg_config)
-        } else {
-            dirs::config_dir().context("Failed to determine config directory")?
-        };
-        let path = config_dir.join("attune").join("config.yaml");
+        let config_dir = env::var("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .ok()
+            .or_else(dirs::config_dir)
+            .context("Cannot determine config directory")?;
+        let path = config_dir.join("attune/config.yaml");
         if !path.exists() {
             return Ok(None);
         }
-        let content = fs::read_to_string(&path).context("Failed to read config file")?;
-        Ok(Some(
-            serde_yaml_ng::from_str(&content).context("Failed to parse config file")?,
-        ))
+        let (value, _) = Self::read_disk(&path)?;
+        let mut config: Self = serde_json::from_value(value.clone())?;
+        config.source_path = Some(path);
+        *config.snapshot.borrow_mut() = Some(Snapshot(value));
+        Ok(Some(config))
     }
 
     pub fn load_existing_with_profile(profile_name: Option<&str>) -> Result<Option<Self>> {
@@ -148,19 +274,158 @@ impl CliConfig {
                 anyhow::bail!("Profile '{}' does not exist", name);
             }
             config.current_profile = name.to_string();
+            config.preserve_selection = true;
         }
         Ok(Some(config))
     }
 
-    /// Save configuration to file
-    pub fn save(&self) -> Result<()> {
-        let path = Self::config_path()?;
-
-        let content = serde_yaml_ng::to_string(self).context("Failed to serialize config")?;
-
-        fs::write(&path, content).context("Failed to write config file")?;
-
+    pub(crate) fn is_persisted(&self) -> bool {
+        self.source_path.is_some()
+    }
+    pub(crate) fn select_profile(&mut self, name: &str) -> Result<()> {
+        if !self.profiles.contains_key(name) {
+            anyhow::bail!("Profile does not exist");
+        }
+        self.current_profile = name.to_owned();
+        self.preserve_selection = true;
         Ok(())
+    }
+
+    pub(crate) fn path(&self) -> Result<PathBuf> {
+        self.source_path
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(Self::config_path)
+    }
+
+    fn disk_value(&self) -> Result<serde_json::Value> {
+        let mut value = serde_json::to_value(self)?;
+        for (name, profile) in &self.profiles {
+            if profile.auth_token.is_some() || profile.refresh_token.is_some() {
+                let url = credentials::endpoint(&profile.api_url)?;
+                if !profile.credential_encryption
+                    && profile
+                        .credentials_endpoint
+                        .as_ref()
+                        .is_some_and(|stored| stored != &url)
+                {
+                    anyhow::bail!(
+                        "Stored credentials belong to a different endpoint; log in again"
+                    );
+                }
+                value["profiles"][name]["credentials_endpoint"] = serde_json::json!(url);
+                if profile.credential_encryption {
+                    let tokens = Tokens {
+                        access_token: profile.auth_token.clone(),
+                        refresh_token: profile.refresh_token.clone(),
+                    };
+                    value["profiles"][name]["credentials"] =
+                        serde_json::to_value(match &profile.credentials {
+                            Some(existing) => existing.replace(&tokens, name, &profile.api_url)?,
+                            None => Envelope::seal(&tokens, name, &profile.api_url)?,
+                        })?;
+                } else {
+                    value["profiles"][name]["auth_token"] = serde_json::json!(profile.auth_token);
+                    value["profiles"][name]["refresh_token"] =
+                        serde_json::json!(profile.refresh_token);
+                }
+            } else if !profile.credential_encryption {
+                value["profiles"][name]["auth_token"] = serde_json::Value::Null;
+                value["profiles"][name]["refresh_token"] = serde_json::Value::Null;
+            }
+        }
+        Ok(value)
+    }
+
+    /// Merge independent profile edits under a cross-process lock. Reject stale
+    /// edits to the same profile instead of overwriting rotated credentials.
+    pub fn save(&self) -> Result<()> {
+        if self.ephemeral_auth {
+            anyhow::bail!("Runtime credentials cannot be persisted");
+        }
+        let path = self.path()?;
+        let _lock = storage::lock(&path)?;
+        let desired = self.disk_value()?;
+        let mut latest = if path.exists() {
+            Self::read_disk(&path)?.0
+        } else {
+            serde_json::to_value(Self::default())?
+        };
+        if let Some(Snapshot(base)) = self.snapshot.borrow().as_ref() {
+            let before = base["profiles"].as_object().context("Invalid profiles")?;
+            let after = desired["profiles"]
+                .as_object()
+                .context("Invalid profiles")?;
+            let current = latest["profiles"]
+                .as_object_mut()
+                .context("Invalid profiles")?;
+            let names: std::collections::HashSet<_> = before.keys().chain(after.keys()).collect();
+            for name in names {
+                if before.get(name) != after.get(name) {
+                    if before.get(name) != current.get(name) {
+                        anyhow::bail!("Profile changed in another process; retry the operation");
+                    }
+                    match after.get(name) {
+                        Some(v) => {
+                            current.insert(name.clone(), v.clone());
+                        }
+                        None => {
+                            current.remove(name);
+                        }
+                    }
+                }
+            }
+            for key in ["profile", "format"] {
+                if key == "profile" && self.preserve_selection {
+                    continue;
+                }
+                if desired[key] != base[key] {
+                    if latest[key] != base[key] {
+                        anyhow::bail!("Configuration changed in another process; retry");
+                    }
+                    latest[key] = desired[key].clone();
+                }
+            }
+        } else {
+            latest = desired;
+        }
+        storage::write(&path, serde_yaml_ng::to_string(&latest)?.as_bytes())?;
+        *self.snapshot.borrow_mut() = Some(Snapshot(latest));
+        Ok(())
+    }
+
+    pub fn tokens(&self) -> Result<Tokens> {
+        let profile = self.current_profile()?;
+        if let Some(envelope) = &profile.credentials {
+            if profile.auth_token.is_none() && profile.refresh_token.is_none() {
+                return envelope.open(&self.current_profile, &profile.api_url);
+            }
+        }
+        if !self.ephemeral_auth
+            && !profile.credential_encryption
+            && profile.has_credentials()
+            && profile.credentials_endpoint.as_deref()
+                != Some(credentials::endpoint(&profile.api_url)?.as_str())
+        {
+            anyhow::bail!("Stored credentials belong to a different endpoint; log in again");
+        }
+        Ok(Tokens {
+            access_token: profile.auth_token.clone(),
+            refresh_token: profile.refresh_token.clone(),
+        })
+    }
+
+    pub fn set_encryption(&mut self, enabled: bool) -> Result<()> {
+        if self.current_profile()?.credential_encryption == enabled {
+            return Ok(());
+        }
+        let tokens = self.tokens()?;
+        let profile = self.current_profile_mut()?;
+        profile.credential_encryption = enabled;
+        profile.credentials = None;
+        profile.auth_token = tokens.access_token;
+        profile.refresh_token = tokens.refresh_token;
+        self.save()
     }
 
     /// Get the current active profile
@@ -189,6 +454,7 @@ impl CliConfig {
             anyhow::bail!("Profile '{}' does not exist", name);
         }
         self.current_profile = name;
+        self.preserve_selection = false;
         self.save()
     }
 
@@ -223,6 +489,7 @@ impl CliConfig {
     #[allow(dead_code)]
     pub fn set_api_url(&mut self, url: String) -> Result<()> {
         let profile = self.current_profile_mut()?;
+        profile.clear_credentials();
         profile.api_url = url;
         self.save()
     }
@@ -238,8 +505,7 @@ impl CliConfig {
     /// Clear authentication tokens for the current profile
     pub fn clear_auth(&mut self) -> Result<()> {
         let profile = self.current_profile_mut()?;
-        profile.auth_token = None;
-        profile.refresh_token = None;
+        profile.clear_credentials();
         self.save()
     }
 
@@ -269,8 +535,12 @@ impl CliConfig {
     /// Set a configuration value by key
     pub fn set_value(&mut self, key: &str, value: String) -> Result<()> {
         match key {
+            "credential_encryption" => {
+                return self.set_encryption(value.parse().context("Expected true or false")?)
+            }
             "api_url" => {
                 let profile = self.current_profile_mut()?;
+                profile.clear_credentials();
                 profile.api_url = value;
             }
             "format" | "output_format" | "default_output_format" => {
@@ -296,6 +566,9 @@ impl CliConfig {
     /// Get a configuration value by key
     pub fn get_value(&self, key: &str) -> Result<String> {
         match key {
+            "credential_encryption" => {
+                Ok(self.current_profile()?.credential_encryption.to_string())
+            }
             "api_url" => {
                 let profile = self.current_profile()?;
                 Ok(profile.api_url.clone())
@@ -304,21 +577,21 @@ impl CliConfig {
             "profile" | "current_profile" => Ok(self.current_profile.clone()),
             "auth_token" => {
                 let profile = self.current_profile()?;
-                Ok(profile
-                    .auth_token
-                    .as_ref()
-                    .map(|_| "***")
-                    .unwrap_or("(not set)")
-                    .to_string())
+                Ok((if profile.has_credentials() {
+                    "***"
+                } else {
+                    "(not set)"
+                })
+                .to_string())
             }
             "refresh_token" => {
                 let profile = self.current_profile()?;
-                Ok(profile
-                    .refresh_token
-                    .as_ref()
-                    .map(|_| "***")
-                    .unwrap_or("(not set)")
-                    .to_string())
+                Ok((if profile.has_credentials() {
+                    "***"
+                } else {
+                    "(not set)"
+                })
+                .to_string())
             }
             _ => anyhow::bail!("Unknown config key: {}", key),
         }
@@ -336,22 +609,26 @@ impl CliConfig {
             ("format".to_string(), self.format.clone()),
             ("api_url".to_string(), profile.api_url.clone()),
             (
+                "credential_encryption".to_string(),
+                profile.credential_encryption.to_string(),
+            ),
+            (
                 "auth_token".to_string(),
-                profile
-                    .auth_token
-                    .as_ref()
-                    .map(|_| "***")
-                    .unwrap_or("(not set)")
-                    .to_string(),
+                (if profile.has_credentials() {
+                    "***"
+                } else {
+                    "(not set)"
+                })
+                .to_string(),
             ),
             (
                 "refresh_token".to_string(),
-                profile
-                    .refresh_token
-                    .as_ref()
-                    .map(|_| "***")
-                    .unwrap_or("(not set)")
-                    .to_string(),
+                (if profile.has_credentials() {
+                    "***"
+                } else {
+                    "(not set)"
+                })
+                .to_string(),
             ),
         ]
     }
@@ -368,6 +645,7 @@ impl CliConfig {
                 anyhow::bail!("Profile '{}' does not exist", name);
             }
             config.current_profile = name.to_string();
+            config.preserve_selection = true;
         }
 
         Ok(config)
@@ -395,14 +673,12 @@ impl CliConfig {
 
     /// Get auth token for current profile
     pub fn auth_token(&self) -> Result<Option<String>> {
-        let profile = self.current_profile()?;
-        Ok(profile.auth_token.clone())
+        Ok(self.tokens()?.access_token)
     }
 
     /// Get refresh token for current profile
     pub fn refresh_token(&self) -> Result<Option<String>> {
-        let profile = self.current_profile()?;
-        Ok(profile.refresh_token.clone())
+        Ok(self.tokens()?.refresh_token)
     }
 }
 
@@ -518,6 +794,9 @@ mod tests {
 
         // Add a new profile
         let staging_profile = Profile {
+            credential_encryption: true,
+            credentials: None,
+            credentials_endpoint: None,
             api_url: "https://staging.example.com".to_string(),
             auth_token: None,
             refresh_token: None,
@@ -557,6 +836,9 @@ mod tests {
         let mut config = CliConfig::default();
 
         let test_profile = Profile {
+            credential_encryption: true,
+            credentials: None,
+            credentials_endpoint: None,
             api_url: "http://test.com".to_string(),
             auth_token: None,
             refresh_token: None,
@@ -641,5 +923,155 @@ profiles:
 "#;
         let config: CliConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(config.format, "json");
+    }
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_tokens_are_removed_without_unlocking_or_losing_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(&path, "profile: default\nprofiles:\n  default:\n    api_url: https://example.com\n    auth_token: old-access\n    refresh_token: old-refresh\n    description: keep\n").unwrap();
+        let config = CliConfig::load_at(&path).unwrap();
+        assert_eq!(
+            config.current_profile().unwrap().description.as_deref(),
+            Some("keep")
+        );
+        assert_eq!(config.tokens().unwrap(), Tokens::default());
+        let disk = fs::read_to_string(&path).unwrap();
+        assert!(!disk.contains("old-access"));
+        assert!(!disk.contains("old-refresh"));
+        assert!(config.current_profile().unwrap().credential_encryption);
+    }
+
+    #[test]
+    fn encrypted_roundtrip_optout_and_unreadable_profile_management() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let mut config = CliConfig::load_at(&path).unwrap();
+        config
+            .set_auth("access-secret".into(), "refresh-secret".into())
+            .unwrap();
+        let disk = fs::read_to_string(&path).unwrap();
+        assert!(!disk.contains("access-secret"));
+        assert!(!disk.contains("refresh-secret"));
+        let mut loaded = CliConfig::load_at(&path).unwrap();
+        let tokens = loaded.tokens().unwrap();
+        assert_eq!(tokens.access_token.as_deref(), Some("access-secret"));
+        assert!(!format!("{loaded:?}").contains("access-secret"));
+        assert!(!loaded
+            .current_profile()
+            .unwrap()
+            .redacted()
+            .to_string()
+            .contains("access-secret"));
+        let before = loaded
+            .current_profile()
+            .unwrap()
+            .credentials
+            .clone()
+            .unwrap();
+        loaded
+            .set_auth("new-access".into(), "new-refresh".into())
+            .unwrap();
+        let mut loaded = CliConfig::load_at(&path).unwrap();
+        let after = loaded
+            .current_profile()
+            .unwrap()
+            .credentials
+            .clone()
+            .unwrap();
+        assert_eq!(before.profile_id, after.profile_id);
+        assert_eq!(before.salt, after.salt);
+        assert_eq!(before.sources, after.sources);
+        assert_ne!(before.nonce, after.nonce);
+        loaded.set_encryption(false).unwrap();
+        let disk = fs::read_to_string(&path).unwrap();
+        assert!(disk.contains("new-access"));
+        let mut loaded = CliConfig::load_at(&path).unwrap();
+        assert_eq!(loaded.auth_token().unwrap().as_deref(), Some("new-access"));
+        assert!(!format!("{loaded:?}").contains("new-access"));
+        loaded.set_encryption(true).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("new-access"));
+        let mut loaded = CliConfig::load_at(&path).unwrap();
+        loaded
+            .current_profile_mut()
+            .unwrap()
+            .credentials
+            .as_mut()
+            .unwrap()
+            .ciphertext = "invalid".into();
+        loaded.save().unwrap();
+        let mut loaded = CliConfig::load_at(&path).unwrap();
+        assert!(loaded.tokens().is_err());
+        assert!(loaded.set_encryption(false).is_err());
+        loaded.clear_auth().unwrap(); // recovery doesn't require the old key
+        loaded.set_encryption(false).unwrap();
+        assert!(!loaded.current_profile().unwrap().has_credentials());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn independent_edits_merge_and_stale_profile_edits_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let mut initial = CliConfig::load_at(&path).unwrap();
+        let profile = initial.current_profile().unwrap().clone();
+        initial.set_profile("other".into(), profile).unwrap();
+        let mut a = CliConfig::load_at(&path).unwrap();
+        let mut b = CliConfig::load_at(&path).unwrap();
+        a.current_profile_mut().unwrap().description = Some("from-a".into());
+        a.save().unwrap();
+        b.select_profile("other").unwrap();
+        b.current_profile_mut().unwrap().description = Some("from-b".into());
+        b.save().unwrap();
+        let all = CliConfig::load_at(&path).unwrap();
+        assert_eq!(
+            all.profiles["default"].description.as_deref(),
+            Some("from-a")
+        );
+        assert_eq!(all.profiles["other"].description.as_deref(), Some("from-b"));
+        assert_eq!(all.current_profile, "default");
+        let mut stale = CliConfig::load_at(&path).unwrap();
+        let mut fresh = CliConfig::load_at(&path).unwrap();
+        fresh.clear_auth().unwrap();
+        fresh.current_profile_mut().unwrap().description = Some("changed".into());
+        fresh.save().unwrap();
+        stale.current_profile_mut().unwrap().description = Some("stale".into());
+        assert!(stale.save().is_err());
+    }
+
+    #[test]
+    fn runtime_overrides_cannot_be_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let mut config = CliConfig::load_at(&path).unwrap();
+        let before = fs::read(&path).unwrap();
+        config.ephemeral_auth = true;
+        config.current_profile_mut().unwrap().auth_token = Some("runtime-secret".into());
+        assert!(config.save().is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn plaintext_credentials_are_also_bound_to_the_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let mut config = CliConfig::load_at(&path).unwrap();
+        config.set_encryption(false).unwrap();
+        config.set_auth("access".into(), "refresh".into()).unwrap();
+        let mut config = CliConfig::load_at(&path).unwrap();
+        config.current_profile_mut().unwrap().api_url = "https://other.example".into();
+        assert!(config.tokens().is_err());
     }
 }

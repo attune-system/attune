@@ -178,7 +178,7 @@ async fn handle_list(
     } = args;
 
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let mut q = vec![format!("page={}", page), format!("per_page={}", per_page)];
     let mut push = |k: &str, v: Option<String>| {
@@ -272,7 +272,7 @@ async fn handle_show(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let path = format!("/audit-events/{}", id);
     let event: AuditEventResponse = client.get(&path).await?;
@@ -287,7 +287,7 @@ async fn handle_chain(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let path = format!(
         "/audit-events/by-request/{}",

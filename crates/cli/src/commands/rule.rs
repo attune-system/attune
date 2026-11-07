@@ -269,7 +269,7 @@ async fn handle_list(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let mut query_params = Vec::new();
     if let Some(pack_name) = pack {
@@ -327,7 +327,7 @@ async fn handle_show(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let path = format!("/rules/{}", rule_ref);
     let rule: RuleDetail = client.get(&path).await?;
@@ -401,7 +401,7 @@ async fn handle_update(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     // Check that at least one field is provided
     if label.is_none()
@@ -511,7 +511,7 @@ async fn handle_toggle(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let request = UpdateRuleRequest { enabled };
     let path = format!("/rules/{}", rule_ref);
@@ -545,7 +545,7 @@ async fn handle_create(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let criteria_value = if let Some(criteria_str) = criteria {
         Some(serde_json::from_str(&criteria_str)?)
@@ -588,7 +588,7 @@ async fn handle_delete(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     // Confirm deletion unless --yes is provided
     if !yes && matches!(output_format, OutputFormat::Table) {

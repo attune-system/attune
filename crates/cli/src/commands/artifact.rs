@@ -469,7 +469,7 @@ async fn handle_retry_workflow_log(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
     let path = format!("/artifacts/workflow-log-outbox/{outbox_id}/retry");
     let response: JsonValue = client.post(&path, &serde_json::json!({})).await?;
     match output_format {
@@ -576,7 +576,7 @@ async fn handle_list(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let mut query_params = vec![format!("per_page={}", per_page)];
 
@@ -664,7 +664,7 @@ async fn handle_show(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     // Try to parse as i64 (ID), otherwise treat as ref
     let path = if let Ok(id) = artifact.parse::<i64>() {
@@ -750,7 +750,7 @@ async fn handle_create(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let request = CreateArtifactBody {
         r#ref: artifact_ref,
@@ -818,7 +818,7 @@ async fn handle_delete(
     }
 
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let path = format!("/artifacts/{}", id);
     client.delete_no_response(&path).await?;
@@ -873,7 +873,7 @@ async fn handle_upload(
     }
 
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     if output_format == OutputFormat::Table {
         output::print_info(&format!(
@@ -941,7 +941,7 @@ async fn handle_download(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let path = match version {
         Some(v) => format!("/artifacts/{}/versions/{}/download", id, v),
@@ -995,7 +995,7 @@ async fn handle_version_list(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let versions = fetch_all_version_summaries(&mut client, artifact_id).await?;
 
@@ -1103,7 +1103,7 @@ async fn handle_version_show(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let path = format!("/artifacts/{}/versions/{}", artifact_id, version);
     let ver: VersionResponse = client.get(&path).await?;
@@ -1171,7 +1171,7 @@ async fn handle_version_create_json(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let content_json: JsonValue = serde_json::from_str(&content)
         .map_err(|e| anyhow::anyhow!("Invalid JSON content: {}", e))?;
@@ -1243,7 +1243,7 @@ async fn handle_version_delete(
     }
 
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let path = format!("/artifacts/{}/versions/{}", artifact_id, version);
     client.delete_no_response(&path).await?;

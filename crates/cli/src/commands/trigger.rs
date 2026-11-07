@@ -198,7 +198,7 @@ async fn handle_list(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let path = if let Some(pack_name) = pack {
         format!("/triggers?pack={}", pack_name)
@@ -257,7 +257,7 @@ async fn handle_show(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let path = format!("/triggers/{}", trigger_ref);
     let trigger: TriggerDetail = client.get(&path).await?;
@@ -342,7 +342,7 @@ async fn handle_update(
         reference_allowed_pack_refs,
     } = args;
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     // Check that at least one field is provided
     if label.is_none()
@@ -433,7 +433,7 @@ async fn handle_toggle(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let path = format!(
         "/triggers/{}/{}",
@@ -471,7 +471,7 @@ async fn handle_delete(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     // Confirm deletion unless --yes is provided
     if !yes && matches!(output_format, OutputFormat::Table) {

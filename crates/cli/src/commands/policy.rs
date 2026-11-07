@@ -353,7 +353,7 @@ async fn handle_list(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
     let mut query = Vec::new();
     if let Some(scope) = args.scope {
         query.push(format!("scope={}", scope_query(scope)));
@@ -386,7 +386,7 @@ async fn handle_show(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
     let policy: Policy = client.get(&format!("/policies/{policy_ref}")).await?;
     print_policy(&policy, output_format, None)
 }
@@ -398,7 +398,7 @@ async fn handle_create(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
     let request = CreatePolicyRequest {
         policy_ref: args.policy_ref,
         name: args.name,
@@ -426,7 +426,7 @@ async fn handle_update(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
     let mut request = UpdatePolicyRequest {
         name: args.name,
         description: args.description.map(
@@ -489,7 +489,7 @@ async fn handle_toggle(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
     let request = UpdatePolicyRequest {
         enabled: Some(enabled),
         ..Default::default()
@@ -516,7 +516,7 @@ async fn handle_delete(
         bail!("Deletion not confirmed");
     }
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
     let _: serde_json::Value = client.delete(&format!("/policies/{policy_ref}")).await?;
     if output_format == OutputFormat::Table {
         output::print_success(&format!("Policy {policy_ref} deleted"));

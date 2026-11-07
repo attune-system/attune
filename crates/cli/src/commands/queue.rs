@@ -442,7 +442,7 @@ async fn handle_list(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
     let base_path = match args.pack.as_deref() {
         Some(pack_ref) => format!("/packs/{}/queues", encode_path_segment(pack_ref)),
         None => "/queues".to_string(),
@@ -475,7 +475,7 @@ async fn handle_enqueue(
 ) -> Result<()> {
     let request = read_enqueue_request(args.request_json, args.request_file)?;
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
     let path = format!("/queues/{}/items", encode_path_segment(&args.queue_ref));
     let item: QueueItemSummary = client.post(&path, &request).await?;
     print_queue_item(&item, output_format)
@@ -488,7 +488,7 @@ async fn handle_show(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let path = format!("/queues/{}", encode_path_segment(&queue_ref));
     let queue: QueueDetail = client.get(&path).await?;
@@ -503,7 +503,7 @@ async fn handle_toggle(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let path = format!("/queues/{}", encode_path_segment(&queue_ref));
     let queue: QueueDetail = client
@@ -530,7 +530,7 @@ async fn handle_update(
     }
 
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
     let path = format!("/queues/{}", encode_path_segment(&queue_ref));
     let queue_config = match requester_grouping {
         None => None,
@@ -691,7 +691,7 @@ async fn handle_items(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     match command {
         QueueItemCommands::List(args) => {

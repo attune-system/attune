@@ -228,7 +228,7 @@ pub async fn handle(
     let endpoint = owner.path(&reference)?;
     if !dry_run {
         let config = CliConfig::load_with_profile(profile.as_deref())?;
-        let mut client = ApiClient::from_config(&config, api_url);
+        let mut client = ApiClient::from_config(&config, api_url)?;
         let _: Value = client
             .put(&endpoint, &body)
             .await

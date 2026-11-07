@@ -149,7 +149,7 @@ pub async fn handle(
     attune_common::schema::RefValidator::validate_component_ref(&reference)
         .map_err(|_| anyhow!("Invalid rollout trigger reference"))?;
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
     let path = format!("/triggers/{reference}");
     if preflight {
         let impact: Impact = client
