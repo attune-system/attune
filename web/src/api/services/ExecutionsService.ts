@@ -176,7 +176,9 @@ export class ExecutionsService {
       mediaType: "application/json",
       errors: {
         400: `Invalid request`,
+        403: `Caller cannot execute or cover the selected grants`,
         404: `Action not found`,
+        501: `Execution sponsorship or protected output services are not ready`,
       },
     });
   }
@@ -635,6 +637,7 @@ export class ExecutionsService {
       errors: {
         404: `Execution not found`,
         409: `Execution is not eligible for reschedule`,
+        501: `Recorded execution scheduling requires coordinated runtime readiness`,
       },
     });
   }

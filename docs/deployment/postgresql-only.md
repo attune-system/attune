@@ -242,3 +242,21 @@ passed count checks but failed some latency and ingestion-overhead targets; see
 the [workload evidence](../research/postgresql-native-maintenance-workload.md).
 Those measurements predate the fresh migration baseline and are not performance
 certification for it.
+
+## Execution authority cutover
+
+The execution-authority selection migration is a coordinated service upgrade.
+Stop admission and drain unrecorded executions, created enforcements and queued
+or leased items using the previous binaries before applying it. The migration
+locks these tables and aborts atomically if any such active work remains. It does
+not cancel work, rewrite migration history, or infer a grant from a missing
+admission. Resume admission only after all services run the new contract.
+
+Retained recorded admissions, including revoked admissions and their approval
+dependencies, keep recorded authority. Historical rows without an admission are
+marked unavailable for execution authority; historical metadata and ordinary
+terminal output remain governed by their existing disclosure checks. Retrying or
+rescheduling those historical rows requires a newly authorized invocation rather
+than converting the historical row. Missing evidence never grants delegation.
+New executions receive a server-owned delegated selection only during their
+creation transaction, after the attributable active owner covers the selection.

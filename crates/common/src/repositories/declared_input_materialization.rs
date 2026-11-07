@@ -275,13 +275,9 @@ impl DeclaredInputMaterializationRepository {
     ) -> Result<()> {
         use super::{
             execution::ExecutionRepository,
-            execution_runtime_admission::ExecutionAdmissionRepository,
-            runtime_authority::RuntimeOwner, FindById,
+            execution_runtime_admission::ExecutionAdmissionRepository, FindById,
         };
-        if ExecutionAdmissionRepository::find(conn, RuntimeOwner::Execution(child))
-            .await?
-            .is_none()
-        {
+        if !ExecutionAdmissionRepository::is_recorded(conn, child).await? {
             return Ok(());
         }
         let execution = ExecutionRepository::find_by_id(&mut *conn, child)

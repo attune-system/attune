@@ -713,6 +713,7 @@ dependencies = [
  "regex",
  "reqwest",
  "serde",
+ "serde_jcs",
  "serde_json",
  "serde_yaml_bw",
  "sha2 0.11.0",

@@ -1592,6 +1592,22 @@ pub const VERSION_SUMMARY_SELECT_COLUMNS: &str =
     "id, version, execution, content_type, size_bytes, file_path, body_state, object_key, provider_version, sha256, created_by, created";
 
 impl ArtifactVersionRepository {
+    /// Mark process logs before any encrypted bytes can be emitted.
+    pub async fn protect_delegated_logs(
+        connection: &mut sqlx::PgConnection,
+        execution: i64,
+        versions: &[i64],
+    ) -> Result<()> {
+        let changed=sqlx::query("UPDATE artifact_version SET meta=COALESCE(meta,'{}'::jsonb) || jsonb_build_object('log_encoding',$3::text) WHERE id=ANY($1) AND execution=$2 AND EXISTS(SELECT 1 FROM execution_authority_selection WHERE execution=$2 AND mode='delegated' AND explicit)")
+            .bind(versions).bind(execution).bind(crate::runtime_read_log::ENCODING).execute(connection).await?;
+        if changed.rows_affected() != versions.len() as u64 {
+            return Err(crate::Error::PermissionDenied(
+                "Delegated log binding mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Keep the recorded history consumer's existing whole-artifact bound
     /// without materializing bodies or calculating an exact historical count.
     pub async fn exceeds_recorded_history_bound<'e, E>(executor: E, artifact: i64) -> Result<bool>

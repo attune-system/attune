@@ -17,9 +17,9 @@ use attune_common::artifact_transport::{
     resolve_checked_path, sync_local_file_to_transport, ArtifactFileTransport,
     ValidatedRelativePath,
 };
-use attune_common::auth::jwt::{
-    generate_execution_token_with_permission_sets_and_standard_access, JwtConfig,
-};
+#[cfg(test)]
+use attune_common::auth::jwt::generate_execution_token_with_permission_sets_and_standard_access;
+use attune_common::auth::jwt::JwtConfig;
 use attune_common::error::{Error, Result};
 use attune_common::metadata_cache::MetadataCache;
 use attune_common::models::runtime::RuntimeExecutionConfig;
@@ -137,6 +137,7 @@ fn resolve_execution_identity(executor: Option<i64>, execution_id: i64) -> Resul
     })
 }
 
+#[cfg(test)]
 fn generate_runtime_api_token(
     identity_id: i64,
     execution_id: i64,
@@ -478,14 +479,28 @@ impl ActionExecutor {
     }
 
     pub(crate) async fn start_execution(&self, execution_id: i64) -> Result<ExecutionTransition> {
-        ExecutionRepository::transition_worker(
-            &self.pool,
+        let worker = self.worker_id.load(Ordering::Acquire);
+        let mut tx = self.pool.begin().await?;
+        let authority = attune_common::repositories::execution_runtime_admission::ExecutionAdmissionRepository::existing_authority(&mut tx, execution_id).await?;
+        if authority == attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Recorded {
+            self.recorded_readiness.require_ready()?;
+        } else {
+            // Claim and attempt registration commit together. A duplicate or
+            // stale delivery cannot establish another credential authority.
+            ExecutionRepository::find_by_id_for_update(&mut tx, execution_id).await?
+                .ok_or_else(|| Error::PermissionDenied("Execution unavailable".into()))?;
+            attune_common::repositories::delegated_execution::DelegatedExecutionRepository::start(&mut tx, execution_id, worker).await?;
+        }
+        let transition = ExecutionRepository::transition_worker(
+            &mut *tx,
             execution_id,
-            Some(self.worker_id.load(Ordering::Acquire)).filter(|id| *id > 0),
+            Some(worker).filter(|id| *id > 0),
             ExecutionStatus::Running,
             None,
         )
-        .await
+        .await?;
+        tx.commit().await?;
+        Ok(transition)
     }
 
     #[tracing::instrument(skip_all, fields(execution_id = execution.id))]
@@ -677,6 +692,22 @@ impl ActionExecutor {
             }
         );
 
+        let mut result = result;
+        let mut conn = self.pool.acquire().await?;
+        if attune_common::repositories::delegated_execution::DelegatedExecutionRepository::find(
+            &mut conn,
+            execution_id,
+        )
+        .await?
+        .explicit
+        {
+            result.stdout.clear();
+            result.stderr.clear();
+            result.result = None;
+            if result.error.is_some() {
+                result.error = Some("Execution failed; inspect protected result".into());
+            }
+        }
         Ok(ExecutionOutcome {
             transition,
             result: Ok(result),
@@ -910,6 +941,15 @@ impl ActionExecutor {
             execution.id
         );
 
+        let mut authority_connection = self.pool.acquire().await?;
+        let authority = attune_common::repositories::execution_runtime_admission::ExecutionAdmissionRepository::existing_authority(
+            &mut authority_connection, execution.id,
+        ).await?;
+        drop(authority_connection);
+        if authority == attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Recorded {
+            self.recorded_readiness.require_ready()?;
+        }
+
         // Extract parameters from execution config.
         // Config is always stored in flat format: the config object itself
         // is the parameters map (e.g. {"url": "...", "method": "GET"}).
@@ -984,7 +1024,7 @@ impl ActionExecutor {
         // Generate execution-scoped API token.
         //
         // Recorded admissions use the system sponsor, never the attributed
-        // requester. Unconverted executions retain explicit human delegation.
+        // requester. Explicit delegated selections retain their active human owner.
         // There is no fallback from an admitted execution to mutable human IAM.
         if execution.permission_set_refs.is_empty() {
             debug!(
@@ -1005,9 +1045,9 @@ impl ActionExecutor {
                         "Execution credential source is missing, terminal or mismatched".into(),
                     )
                 })?;
-            let recorded = attune_common::repositories::runtime_authority::RuntimeAuthorityRepository::execution_admission(
+            let recorded = attune_common::repositories::execution_runtime_admission::ExecutionAdmissionRepository::existing_authority(
                 &mut admission_tx, execution.id,
-            ).await?.is_some();
+            ).await? == attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Recorded;
             admission_tx.commit().await?;
             if recorded {
                 let token = crate::recorded_credentials::mint_recorded_execution_token(
@@ -1027,32 +1067,24 @@ impl ActionExecutor {
                 })?;
                 env.insert("ATTUNE_API_TOKEN".to_string(), token);
             } else {
-                if self.recorded_readiness.require_ready().is_ok() {
-                    return Err(Error::PermissionDenied(
-                        "Recorded issuance cannot fall back from a missing admission".into(),
-                    ));
-                }
-                let identity_id = resolve_execution_identity(persisted.executor, execution.id)?;
-                let token_ttl = execution_timeout as i64;
-                let standard_access_action_refs = self.standard_access_action_refs(execution).await;
-                match generate_runtime_api_token(
-                    identity_id,
-                    execution.id,
-                    &execution.action_ref,
-                    &self.jwt_config,
-                    token_ttl,
-                    &execution.permission_set_refs,
-                    &standard_access_action_refs,
-                ) {
-                    Ok(Some(token)) => {
-                        env.insert("ATTUNE_API_TOKEN".to_string(), token);
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        return Err(Error::PermissionDenied(format!(
-                            "Unable to issue required execution credential: {e}"
-                        )));
-                    }
+                attune_common::repositories::delegated_execution::DelegatedExecutionRepository::validate(&mut *self.pool.acquire().await?,execution.id).await?;
+                {
+                    let attempt = attune_common::repositories::delegated_execution::DelegatedExecutionRepository::current_attempt(&mut *self.pool.acquire().await?,execution.id).await?;
+                    let standard = self.standard_access_action_refs(execution).await;
+                    let token = attune_common::auth::jwt::generate_delegated_execution_token(
+                        resolve_execution_identity(persisted.executor, execution.id)?,
+                        execution.id,
+                        &execution.action_ref,
+                        &self.jwt_config,
+                        execution_timeout as i64,
+                        &execution.permission_set_refs,
+                        &standard,
+                        attempt,
+                    )
+                    .map_err(|_| {
+                        Error::PermissionDenied("Delegated credential issuance failed".into())
+                    })?;
+                    env.insert("ATTUNE_API_TOKEN".into(), token);
                 }
             }
         }
@@ -1546,6 +1578,17 @@ impl ActionExecutor {
     ) -> Result<()> {
         debug!("Storing artifacts for execution: {}", execution_id);
 
+        let mut conn = self.pool.acquire().await?;
+        let protected =
+            attune_common::repositories::delegated_execution::DelegatedExecutionRepository::find(
+                &mut conn,
+                execution_id,
+            )
+            .await?
+            .explicit;
+        if protected {
+            return Ok(());
+        }
         // Store result if available
         if let Some(result_data) = &result.result {
             self.artifact_manager
@@ -1575,7 +1618,16 @@ impl ActionExecutor {
             self.worker_instance,
         )
         .await?;
-        let log_encryption_key = if delivery.is_some() {
+        let mut connection = self.pool.acquire().await?;
+        let protected_delegation =
+            attune_common::repositories::delegated_execution::DelegatedExecutionRepository::find(
+                &mut connection,
+                execution.id,
+            )
+            .await?
+            .explicit;
+        drop(connection);
+        let log_encryption_key = if delivery.is_some() || protected_delegation {
             Some(
                 self.secret_manager
                     .encryption_key()
@@ -1593,7 +1645,8 @@ impl ActionExecutor {
                     Error::Validation(format!("Invalid stored input contract: {error}"))
                 })?
                 .declares_secrets()
-                || delivery.is_some();
+                || delivery.is_some()
+                || protected_delegation;
         let (stdout_mirror, stderr_mirror) =
             attune_common::runtime_log_mirror::select_mirror_sources(
                 attune_common::runtime_log_mirror::RuntimeLogSource::Execution {
@@ -1807,6 +1860,20 @@ impl ActionExecutor {
             retention.flush_interval_ms,
         )
         .await?;
+        if attune_common::repositories::delegated_execution::DelegatedExecutionRepository::find(
+            &mut transaction,
+            execution.id,
+        )
+        .await?
+        .explicit
+        {
+            ArtifactVersionRepository::protect_delegated_logs(
+                &mut transaction,
+                execution.id,
+                &[version.id],
+            )
+            .await?;
+        }
         transaction.commit().await?;
 
         info!(
@@ -1855,14 +1922,8 @@ impl ActionExecutor {
         };
         let mut conn = self.pool.acquire().await?;
         let recorded =
-            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
-                &mut conn,
-                attune_common::repositories::runtime_authority::RuntimeOwner::Execution(
-                    execution_id,
-                ),
-            )
-            .await?
-            .is_some();
+            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut conn, execution_id,)
+            .await?;
         drop(conn);
         let artifact_ref = if recorded {
             crate::completion::log_reference(&execution, stream.as_str())?
@@ -1926,8 +1987,17 @@ impl ActionExecutor {
             };
 
             let mut conn = self.pool.acquire().await?;
-            let recorded = attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
-                &mut conn, attune_common::repositories::runtime_authority::RuntimeOwner::Execution(execution_id)).await?.is_some();
+            // Ordinary file metadata outlives execution retention. This path
+            // grants no runtime or disclosure authority; an absent owner only
+            // permits finalizing the already allocated storage metadata.
+            let recorded = if ExecutionRepository::find_by_id(&mut *conn, execution_id)
+                .await?
+                .is_some()
+            {
+                attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut conn, execution_id).await?
+            } else {
+                false
+            };
             drop(conn);
             let transport = if recorded {
                 crate::completion::CompletionTransport::for_version(
@@ -2148,6 +2218,7 @@ impl ActionExecutor {
                 execution_id,
             )
             .await?;
+        if let Some(origin)=attune_common::repositories::delegated_execution::DelegatedExecutionRepository::output_origin(&mut origin_tx,execution_id).await? { runtime_reads.push(origin); }
         origin_tx.commit().await?;
         let loaded_paths;
         let paths = match preparation.and_then(|context| context.parameter_secret_paths.as_deref())

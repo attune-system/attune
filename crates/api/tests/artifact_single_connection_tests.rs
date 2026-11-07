@@ -1,5 +1,6 @@
 //! Selected human reads must never acquire a second connection while retaining
 //! their receipt transaction. Exercise the real download route and response body.
+use helpers::delegated;
 mod helpers;
 // The shared admitted-pack fixture also contains sensor-only builders.
 #[allow(dead_code)]
@@ -36,11 +37,19 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 async fn admitted_execution(ctx: &TestContext, action: &str) -> Result<i64> {
+    admitted_execution_with_refs(ctx, action, &[]).await
+}
+
+async fn admitted_execution_with_refs(
+    ctx: &TestContext,
+    action: &str,
+    refs: &[String],
+) -> Result<i64> {
     let response = ctx
         .post(
             "/api/v1/executions/execute",
             json!({
-                "action_ref": action, "parameters": {}, "permission_set_refs": []
+                "action_ref": action, "parameters": {}, "permission_set_refs": refs
             }),
             ctx.token(),
         )
@@ -249,14 +258,20 @@ async fn legacy_runtime_and_sensor_downloads_reuse_their_one_retained_connection
     )
     .await?;
     let action = managed_fixture::action_pack(&ctx).await?;
-    let execution = admitted_execution(&ctx, &action).await?;
-    let token = attune_common::auth::jwt::generate_execution_token_with_permission_sets(
+    let refs = std::slice::from_ref(&permission.r#ref);
+    let execution = admitted_execution_with_refs(&ctx, &action, refs).await?;
+    let mut tx = ctx.pool.begin().await?;
+    let attempt = delegated::start(&mut tx, execution).await?;
+    tx.commit().await?;
+    let token = attune_common::auth::jwt::generate_delegated_execution_token(
         identity,
         execution,
         &action,
         &ctx.state.jwt_config,
-        Some(300),
-        std::slice::from_ref(&permission.r#ref),
+        300,
+        refs,
+        &[],
+        attempt,
     )?;
     let runtime = ArtifactRepository::create(
         &ctx.pool,

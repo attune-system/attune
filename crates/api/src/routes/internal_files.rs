@@ -2067,11 +2067,17 @@ async fn seal_log_stream(
     // Shared append uses source -> artifact advisory -> version -> stream ->
     // flock. Sealing must acquire the same locks before taking its file snapshot.
     let trace = SharedGraphTransactionTrace::new("api.log_stream_seal");
-    let operation = async {
+    let operation = Box::pin(async {
         let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
         trace.begun();
         trace.stage("version_authorization");
-        let effect = authorize_version_mutation(&state, &mut transaction, &user, &version).await?;
+        let effect = Box::pin(authorize_version_mutation(
+            &state,
+            &mut transaction,
+            &user,
+            &version,
+        ))
+        .await?;
         trace.stage("version_and_stream_locks");
         let version =
             ArtifactVersionRepository::find_by_id_for_update(&mut transaction, artifact_version)
@@ -2087,7 +2093,7 @@ async fn seal_log_stream(
             .await
             .map_err(map_repository_error)?;
         trace.stage("encrypted_seal_proof");
-        let proof = encrypted_log_seal_proof(
+        let proof = Box::pin(encrypted_log_seal_proof(
             &mut transaction,
             &state,
             &user,
@@ -2095,7 +2101,7 @@ async fn seal_log_stream(
             &stream,
             &headers,
             &effect,
-        )
+        ))
         .await?;
         let mut verifier = proof.as_ref().map(|proof| {
             attune_common::runtime_log_completion::FrameVerifier::new(
@@ -2105,13 +2111,10 @@ async fn seal_log_stream(
                     .encryption_key
                     .as_deref()
                     .expect("validated encryption key"),
-                proof.context.execution,
+                proof.execution,
                 version.id,
-                proof
-                    .permit
-                    .max_plaintext_bytes
-                    .expect("validated plaintext cap") as u64,
-                proof.permit.max_bytes as u64,
+                proof.plaintext_cap,
+                proof.ciphertext_cap,
             )
         });
         trace.stage("shared_file_snapshot");
@@ -2137,7 +2140,9 @@ async fn seal_log_stream(
                     .inspect_log_file(file_path, Some(permit.max_bytes as u64))
                     .await
             } else {
-                transport.inspect_log_file(file_path, None).await
+                transport
+                    .inspect_log_file(file_path, proof.as_ref().map(|proof| proof.ciphertext_cap))
+                    .await
             };
             Some(snapshot.map_err(map_transport_error)?)
         } else {
@@ -2275,8 +2280,11 @@ async fn seal_log_stream(
                 .ensure_fresh_on(&mut transaction)
                 .await
                 .map_err(map_api_error)?;
-            attune_common::repositories::runtime_log_completion::RuntimeLogCompletionRepository::record(
-            &mut transaction,&proof.context,&proof.permit,&proof.manifest,&proof.authenticated,query.truncated).await.map_err(map_transport_error)?;
+            if let Some((context, permit)) = &proof.recorded {
+                attune_common::repositories::runtime_log_completion::RuntimeLogCompletionRepository::record(
+                &mut transaction,context,permit,&proof.manifest,&proof.authenticated,query.truncated).await.map_err(map_transport_error)?;
+            }
+
             ArtifactVersionRepository::set_encrypted_log_manifest(
                 &mut transaction,
                 version.id,
@@ -2352,8 +2360,7 @@ async fn seal_log_stream(
             ));
         }
         trace.stage("final_freshness_and_publication");
-        effect
-            .ensure_fresh_on(&mut transaction)
+        Box::pin(effect.ensure_fresh_on(&mut transaction))
             .await
             .map_err(map_api_error)?;
         if let Some((snapshot, _, _)) = &shared_snapshot {
@@ -2401,8 +2408,7 @@ async fn seal_log_stream(
                 "Log artifact could not be marked ready".to_string(),
             ));
         }
-        effect
-            .ensure_fresh_on(&mut transaction)
+        Box::pin(effect.ensure_fresh_on(&mut transaction))
             .await
             .map_err(map_api_error)?;
         trace.stage("commit");
@@ -2423,7 +2429,7 @@ async fn seal_log_stream(
             "Sealed runtime log stream"
         );
         Ok(StatusCode::OK)
-    };
+    });
     let result = trace.observe(operation).await;
     trace.operation_result(match &result {
         Ok(_) => "success",
@@ -2442,8 +2448,13 @@ fn log_stream_seal_is_complete(
 }
 
 struct EncryptedLogSeal {
-    context: attune_common::repositories::worker_delivery::DeliveryContext,
-    permit: attune_common::repositories::worker_delivery::DeliveryPermit,
+    recorded: Option<(
+        attune_common::repositories::worker_delivery::DeliveryContext,
+        attune_common::repositories::worker_delivery::DeliveryPermit,
+    )>,
+    execution: i64,
+    plaintext_cap: u64,
+    ciphertext_cap: u64,
     manifest: attune_common::runtime_log_completion::FinalLogManifest,
     authenticated: String,
 }
@@ -2489,6 +2500,63 @@ async fn encrypted_log_seal_proof(
     if encoding != Some(attune_common::runtime_read_log::ENCODING) {
         return Err(denied());
     }
+    if permit.is_none() && user.claims.token_type == TokenType::Worker {
+        let execution = version.execution.ok_or_else(denied)?;
+        let worker = pack_candidate_worker_id(user)?;
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::require_completion(tx,execution,worker).await.map_err(map_transport_error)?;
+        let authenticated = headers
+            .get("x-attune-log-final-manifest")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(denied)?
+            .to_owned();
+        let key = state
+            .config
+            .security
+            .encryption_key
+            .as_deref()
+            .ok_or_else(denied)?;
+        let manifest =
+            attune_common::runtime_log_completion::FinalLogManifest::open(key, &authenticated)
+                .map_err(map_transport_error)?;
+        let stream_name = version
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("stream"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(denied)?;
+        let plaintext_cap = match stream_name {
+            "stdout" => state
+                .config
+                .worker
+                .as_ref()
+                .map(|w| w.max_stdout_bytes)
+                .unwrap_or(10 * 1024 * 1024) as u64,
+            "stderr" => state
+                .config
+                .worker
+                .as_ref()
+                .map(|w| w.max_stderr_bytes)
+                .unwrap_or(10 * 1024 * 1024) as u64,
+            _ => return Err(denied()),
+        };
+        let ciphertext_cap = attune_common::runtime_read_log::maximum_encoded_bytes(plaintext_cap)
+            .map_err(map_transport_error)?;
+        if manifest.execution != execution
+            || manifest.version != version.id
+            || manifest.plaintext_bytes > plaintext_cap
+            || manifest.ciphertext_bytes > ciphertext_cap
+        {
+            return Err(denied());
+        }
+        return Ok(Some(EncryptedLogSeal {
+            recorded: None,
+            execution,
+            plaintext_cap,
+            ciphertext_cap,
+            manifest,
+            authenticated,
+        }));
+    }
     let credential = attune_common::worker_delivery::credential(&user.claims)
         .map_err(map_transport_error)?
         .ok_or_else(denied)?;
@@ -2530,8 +2598,10 @@ async fn encrypted_log_seal_proof(
         return Err(denied());
     }
     Ok(Some(EncryptedLogSeal {
-        context,
-        permit,
+        execution: context.execution,
+        plaintext_cap: permit.max_plaintext_bytes.ok_or_else(denied)? as u64,
+        ciphertext_cap: permit.max_bytes as u64,
+        recorded: Some((context, permit)),
         manifest,
         authenticated,
     }))
@@ -4564,8 +4634,7 @@ async fn authorize_version_mutation(
             "Recorded file version execution mismatch".into(),
         ));
     }
-    let process = user
-        .validate_recorded_runtime_authority(tx)
+    let process = Box::pin(user.validate_recorded_runtime_authority(tx))
         .await
         .map_err(map_transport_error)?;
     let process_delivery = if let Some(authority) = &process {
@@ -4614,19 +4683,34 @@ async fn authorize_version_mutation(
         );
     } else if user.claims.token_type == TokenType::Worker {
         if let Some(execution) = version.execution {
-            if attune_common::repositories::runtime_authority::RuntimeAuthorityRepository::execution_admission(tx, execution)
-                .await.map_err(map_transport_error)?.is_some() {
-                return Err((StatusCode::FORBIDDEN, "Recorded file delivery requires a purpose-specific worker permit".into()));
+            let native = user.claims.sub == "0"
+                && user
+                    .claims
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("worker_id"))
+                    .and_then(|v| v.as_str())
+                    == Some("executor")
+                && version
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.get("kind"))
+                    .and_then(|v| v.as_str())
+                    == Some("workflow_log");
+            if native {
+                attune_common::repositories::delegated_execution::DelegatedExecutionRepository::require_native_log(tx,execution).await.map_err(map_transport_error)?;
+            } else {
+                attune_common::repositories::delegated_execution::DelegatedExecutionRepository::require_completion(tx,execution,pack_candidate_worker_id(user)?).await.map_err(map_transport_error)?;
             }
         }
     }
     let file_origin_budget = if process.is_some() || worker.is_some() {
-        crate::file_origins::prepare_existing(
+        Box::pin(crate::file_origins::prepare_existing(
             tx,
             process.as_ref(),
             version.id,
             state.config.security.encryption_key.as_deref(),
-        )
+        ))
         .await
         .map_err(map_api_error)?
     } else {
@@ -4639,12 +4723,12 @@ async fn authorize_version_mutation(
         worker,
         file_origin_budget,
     };
-    crate::recorded_files::authorize_publication(
+    Box::pin(crate::recorded_files::authorize_publication(
         tx,
         proof.process.as_ref(),
         version.id,
         version.artifact,
-    )
+    ))
     .await
     .map_err(map_api_error)?;
     // Even legacy writers acquire the advisory lock before version/stream rows.
@@ -4661,10 +4745,12 @@ async fn authorize_version_mutation(
         attune_common::repositories::worker_delivery::WorkerDeliveryRepository::require_owner_binding(
             tx, credential.permit, version.id).await.map_err(map_transport_error)?;
     }
-    crate::file_origins::require(tx, &proof, version.id)
+    Box::pin(crate::file_origins::require(tx, &proof, version.id))
         .await
         .map_err(map_api_error)?;
-    proof.ensure_fresh_on(tx).await.map_err(map_api_error)?;
+    Box::pin(proof.ensure_fresh_on(tx))
+        .await
+        .map_err(map_api_error)?;
     Ok(proof)
 }
 
@@ -5649,6 +5735,183 @@ mod tests {
         assert!(!abandoned.iter().any(|candidate| candidate.id == version.id));
     }
 
+    // A real managed executable with explicit tokenless delegated authority.
+    // Transport tests may not substitute a dangling execution ID for ownership.
+    async fn delegated_log_owner(
+        pool: &sqlx::PgPool,
+    ) -> attune_common::Result<(i64, i64, i64, i64, String)> {
+        use attune_common::{
+            models::{ExecutionStatus, WorkerStatus, WorkerType},
+            repositories::{
+                action::{ActionRepository, CreateActionInput},
+                component_lifecycle::PackProjectionIds,
+                delegated_execution::DelegatedExecutionRepository as Delegated,
+                executable_snapshot::ExecutableSnapshotRepository,
+                execution::{CreateExecutionInput, ExecutionRepository, UpdateExecutionInput},
+                identity::{CreateIdentityInput, IdentityRepository},
+                pack::{CreatePackInput, PackRepository},
+                pack_release::{CreatePackReleaseInput, PackReleaseRepository},
+                runtime::{CreateWorkerInput, WorkerRepository},
+                schema_contract::{BindingOwner, SchemaContractRepository},
+                Update,
+            },
+        };
+        let mut tx = pool.begin().await?;
+        let owner = IdentityRepository::create(
+            &mut *tx,
+            CreateIdentityInput {
+                login: "shared-log-owner".into(),
+                display_name: None,
+                attributes: serde_json::json!({}),
+                password_hash: None,
+            },
+        )
+        .await?;
+        let pack = PackRepository::create(
+            &mut *tx,
+            CreatePackInput {
+                r#ref: "log_binding".into(),
+                label: "Log binding".into(),
+                description: None,
+                version: "1.0.0".into(),
+                conf_schema: serde_json::json!({}),
+                config: serde_json::json!({}),
+                meta: serde_json::json!({}),
+                tags: vec![],
+                runtime_deps: vec![],
+                dependencies: vec![],
+                is_standard: false,
+                installers: serde_json::json!({}),
+            },
+        )
+        .await?;
+        let action = ActionRepository::create(
+            &mut *tx,
+            CreateActionInput {
+                r#ref: "log_binding.echo".into(),
+                pack: pack.id,
+                pack_ref: pack.r#ref.clone(),
+                label: "Echo".into(),
+                description: None,
+                entrypoint: "echo".into(),
+                runtime: None,
+                enabled: true,
+                runtime_version_constraint: None,
+                required_worker_runtimes: serde_json::json!({}),
+                worker_selector: serde_json::json!({}),
+                worker_tolerations: serde_json::json!([]),
+                worker_affinity: serde_json::json!({}),
+                param_schema: None,
+                out_schema: None,
+                is_adhoc: false,
+                accesses_mcp: false,
+                default_execution_permission_set_refs: vec![],
+                reference_visibility: Default::default(),
+                reference_allowed_pack_refs: vec![],
+                log_retention_policy: None,
+                log_retention_limit: None,
+                artifact_retention_policy: None,
+                artifact_retention_limit: None,
+                timeout_seconds: None,
+            },
+        )
+        .await?;
+        let release = PackReleaseRepository::create_or_get(
+            &mut tx,
+            CreatePackReleaseInput {
+                pack: pack.id,
+                pack_ref: pack.r#ref.clone(),
+                version: pack.version.clone(),
+                digest: "1".repeat(64),
+                object_key: "packs/blobs/log-binding.tar.gz".into(),
+                provider_version: "e:fixture".into(),
+                content_path: "/packs/.releases/log_binding".into(),
+                archive_size: 1,
+                manifest: serde_json::json!({}),
+            },
+        )
+        .await?;
+        PackReleaseRepository::activate_projected(
+            &mut tx,
+            pack.id,
+            release.id,
+            &PackProjectionIds {
+                actions: vec![action.id],
+                ..Default::default()
+            },
+        )
+        .await?;
+        let snapshot =
+            ExecutableSnapshotRepository::resolve_for_action(&mut *tx, action.id).await?;
+        let binding = SchemaContractRepository::materialize_action(&mut tx, &snapshot).await?;
+        let execution = ExecutionRepository::create_pinned(
+            &mut *tx,
+            CreateExecutionInput {
+                action: Some(action.id),
+                action_ref: action.r#ref.clone(),
+                executor: Some(owner.id),
+                status: ExecutionStatus::Requested,
+                ..Default::default()
+            },
+            &snapshot,
+        )
+        .await?;
+        SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, execution.id, &binding)
+            .await?;
+        Delegated::select(&mut tx, execution.id, None).await?;
+        ExecutionRepository::initialize_config_with_conn(
+            &mut tx,
+            execution.id,
+            None,
+            &snapshot,
+            Some(serde_json::json!({})),
+            &[],
+        )
+        .await?;
+        let mut workers = Vec::new();
+        for name in ["log-assigned", "log-foreign"] {
+            workers.push(
+                WorkerRepository::create(
+                    &mut *tx,
+                    CreateWorkerInput {
+                        name: name.into(),
+                        worker_type: WorkerType::Local,
+                        runtime: None,
+                        host: None,
+                        port: None,
+                        status: Some(WorkerStatus::Active),
+                        capabilities: None,
+                        meta: None,
+                    },
+                )
+                .await?
+                .id,
+            );
+        }
+        ExecutionRepository::update(
+            &mut *tx,
+            execution.id,
+            UpdateExecutionInput {
+                worker: Some(workers[0]),
+                status: Some(ExecutionStatus::Scheduled),
+                ..Default::default()
+            },
+        )
+        .await?;
+        Delegated::start(&mut tx, execution.id, workers[0]).await?;
+        ExecutionRepository::update(
+            &mut *tx,
+            execution.id,
+            UpdateExecutionInput {
+                status: Some(ExecutionStatus::Running),
+                ..Default::default()
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok((owner.id, execution.id, workers[0], workers[1], action.r#ref))
+    }
+
     #[tokio::test]
     async fn shared_log_seal_stats_hashes_and_reads_the_authoritative_file() {
         let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
@@ -5669,12 +5932,31 @@ mod tests {
             root: directory.path().join("objects"),
         };
         let state = Arc::new(AppState::new(database.pool().clone(), config));
+        let (worker_identity, execution, assigned_worker, foreign_worker, action_ref) =
+            delegated_log_owner(&state.db)
+                .await
+                .expect("delegated log owner");
+        attune_common::auth::install_crypto_provider();
+        let scoped_worker = |worker: i64| {
+            use attune_common::auth::jwt::{generate_worker_token, validate_token, JwtConfig};
+            let config = JwtConfig {
+                secret: state.config.security.jwt_secret.clone().unwrap(),
+                access_token_expiration: 3600,
+                refresh_token_expiration: 86400,
+            };
+            let token =
+                generate_worker_token(worker_identity, &worker.to_string(), &config, Some(60))
+                    .expect("worker credential");
+            AuthenticatedUser {
+                claims: validate_token(&token, &config).expect("validated worker credential"),
+            }
+        };
         let artifact = ArtifactRepository::create(
             &state.db,
             CreateArtifactInput {
-                r#ref: "core.echo.stdout.log".to_string(),
+                r#ref: format!("{action_ref}.stdout.log"),
                 scope: OwnerType::Action,
-                owner: "core.echo".to_string(),
+                owner: action_ref,
                 r#type: ArtifactType::FileText,
                 visibility: ArtifactVisibility::Private,
                 classification: ArtifactClassification::RuntimeLog,
@@ -5694,7 +5976,7 @@ mod tests {
             &artifact.r#ref,
             LogStreamBackend::SharedFile,
             "text/plain".to_string(),
-            Some(42),
+            Some(execution),
             None,
             Some("worker".to_string()),
         )
@@ -5723,9 +6005,30 @@ mod tests {
         );
         assert!(!stream.sealed);
 
+        for denied in [user(TokenType::Worker, None), scoped_worker(foreign_worker)] {
+            assert_status_error(
+                seal_log_stream(
+                    State(state.clone()),
+                    RequireAuth(denied),
+                    Path(version.id),
+                    Query(SealLogQuery { truncated: true }),
+                    HeaderMap::new(),
+                )
+                .await,
+                StatusCode::FORBIDDEN,
+            );
+        }
+        assert!(
+            !LogStreamRepository::find_by_artifact_version(&state.db, version.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .sealed
+        );
+
         let response = seal_log_stream(
             State(state.clone()),
-            RequireAuth(user(TokenType::Worker, None)),
+            RequireAuth(scoped_worker(assigned_worker)),
             Path(version.id),
             Query(SealLogQuery { truncated: true }),
             HeaderMap::new(),
@@ -5764,5 +6067,26 @@ mod tests {
             bytes.extend_from_slice(&chunk.expect("chunk"));
         }
         assert_eq!(bytes, b"3456");
+        let mut tx = state.db.begin().await.unwrap();
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::close(
+            &mut tx, execution,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_status_error(
+            seal_log_stream(
+                State(state.clone()),
+                RequireAuth(scoped_worker(assigned_worker)),
+                Path(version.id),
+                Query(SealLogQuery { truncated: true }),
+                HeaderMap::new(),
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+        );
+        drop(reader);
+        drop(state);
+        database.cleanup().await.expect("owned database cleanup");
     }
 }

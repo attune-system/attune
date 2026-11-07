@@ -11,7 +11,6 @@ use attune_common::{
         execution::ExecutionRepository,
         execution_admission::ExecutionAdmissionRepository,
         log_stream::LogStreamRepository,
-        runtime_authority::RuntimeOwner,
         worker_delivery::{
             DeliveryContext, DeliveryOperation, DeliveryPermit, WorkerDeliveryRepository,
         },
@@ -30,9 +29,8 @@ pub async fn register(
     instance: Uuid,
 ) -> Result<Option<DeliveryContext>> {
     let mut tx = pool.begin().await?;
-    if ExecutionAdmissionRepository::find(&mut tx, RuntimeOwner::Execution(execution.id))
-        .await?
-        .is_none()
+    if ExecutionAdmissionRepository::existing_authority(&mut tx, execution.id).await?
+        == attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Delegated
     {
         return Ok(None);
     }

@@ -260,6 +260,58 @@ Verify snapshot hashes against the worktree, retain run evidence, and remove onl
 that snapshot and its owned test resources. Do not change Docker preferences
 automatically. A startup mount failure is not a test failure or a passing run.
 
+## Delegated execution authority acceptance
+
+Build production service binaries, then run the owned system-Key scenario:
+
+```bash
+cargo build -p attune-api -p attune-executor -p attune-worker \
+  --bin attune-api --bin attune-executor --bin attune-worker
+python3 scripts/test-execution-authority.py \
+  --output .scratch/attune-authority-acceptance-unique
+```
+
+The output directory must not exist. Docker, OpenSSL, Python `requests` and PyYAML are
+required. The runner owns PostgreSQL 18, RabbitMQ, random host ports, filesystem
+roots and production API/executor/worker processes, and awaits their teardown.
+It records source/binary hashes and the check inventory in the output directory.
+By default the runner leaves `RUST_MIN_STACK` unset, exercising the service
+runtime defaults. `--runtime-stack-bytes` is an explicit diagnostic override,
+recorded in the result; a configured run alone does not certify the defaults.
+Repeat with release binaries using `cargo build --release` and
+`--bin-dir target/release` to cover the production build profile. Keep binary
+snapshots and other large artifacts under `.scratch/`, outside `/tmp` tmpfs.
+
+For a container runtime check, supply compatible Linux release binaries with
+`--bin-dir <directory> --service-image python:3.12-bookworm`. The runner pins
+and records the image ID, mounts its owned evidence directory and supplied
+binaries, and starts the services on an owned Docker network. Pack, runtime,
+artifact and blob data use run-owned named volumes, matching production. The runner
+exports completed artifact logs for its plaintext checks and removes the volumes
+after stopping the services. Virtualized host bind shares can reject copying
+read-only release files with `EXDEV`/`EACCES`; they are not the data-volume lane. To exercise the
+production injected agent, place a symlink named `attune-worker` to the built
+`attune-agent` in that directory; the resolved binary path and hash are recorded.
+Match the production targets: API/executor use GNU/glibc binaries compatible with
+the runtime image (Bookworm provides glibc 2.36), and the injected agent uses musl.
+The image must not override `RUST_MIN_STACK` for a default-stack run.
+
+The action reads an encrypted **system-owned** Key through a pack-defined,
+explicitly selected narrow grant covered by the requester. Negative cases cover
+an unrelated system Key, missing selection, read without decrypt, use without
+plaintext, execute-only callers, terminal credentials, closed attempts during
+status lag and incompatible workers.
+An approved use-only signing case remains separate from raw read/decrypt.
+Assertions include encrypted logs/results and disclosure denials, workflow retry,
+native workflow `output_map` queues with public and protected acknowledgements,
+ad hoc execution, attributed queue dispatch, rejection of recorded-only queue
+sponsorship, and tokenless stdin/completion. Recorded readiness stays disabled.
+The focused `execution_admission_tests` filter `authority_` additionally exercises
+persisted selection, missing/revoked admission, stale attempts, child ceilings,
+disclosure/closure fencing and the coordinated populated-database cutover described
+in [PostgreSQL deployment](../deployment/postgresql-only.md#execution-authority-cutover).
+These scoped tests do not replace the broader authorization/service CI gate.
+
 ## Concurrency policy
 
 - Default database/service integration concurrency is **4**. The Make, Docker, benchmark, and CI entry points reject lower values.

@@ -17,10 +17,7 @@ use async_trait::async_trait;
 use attune_api::{postgres_listener, AppState, Server};
 use attune_common::{
     artifact_transport::{ApiTransport, ArtifactFileTransport},
-    auth::jwt::{
-        generate_access_token, generate_execution_token_with_permission_sets,
-        generate_worker_token, JwtConfig,
-    },
+    auth::jwt::{generate_access_token, generate_worker_token, JwtConfig},
     blob_store::{
         BlobBody, BlobReader, BlobStore, BlobStoreError, ByteRange, DirectUploadAuthorization,
         DirectUploadSpec, ObjectKey, ProviderVersion, S3BlobStore, StoredObject,
@@ -263,7 +260,9 @@ struct Harness {
     controls: Vec<Arc<StoreControl>>,
     _root: tempfile::TempDir,
     worker_token: String,
+    worker_id: i64,
     execution_identity: i64,
+    execution_refs: Vec<String>,
     jwt: JwtConfig,
 }
 
@@ -301,7 +300,6 @@ impl Harness {
             access_token_expiration: 300,
             refresh_token_expiration: 3600,
         };
-        let worker_token = generate_worker_token(1, "replica-test", &jwt, None)?;
         let execution_identity = IdentityRepository::create(
             database.pool(),
             CreateIdentityInput {
@@ -313,6 +311,26 @@ impl Harness {
         )
         .await?
         .id;
+        use attune_common::{
+            models::{WorkerStatus, WorkerType},
+            repositories::runtime::{CreateWorkerInput, WorkerRepository},
+        };
+        let worker = WorkerRepository::create(
+            database.pool(),
+            CreateWorkerInput {
+                name: format!("replica-{}", uuid::Uuid::new_v4()),
+                worker_type: WorkerType::Local,
+                runtime: None,
+                host: None,
+                port: None,
+                status: Some(WorkerStatus::Active),
+                capabilities: None,
+                meta: None,
+            },
+        )
+        .await?;
+        let worker_token =
+            generate_worker_token(execution_identity, &worker.id.to_string(), &jwt, None)?;
         let mut replicas = Vec::new();
         let mut controls = Vec::new();
         for listen_for_notifications in notification_listeners {
@@ -360,7 +378,9 @@ impl Harness {
             controls,
             _root: root,
             worker_token,
+            worker_id: worker.id,
             execution_identity,
+            execution_refs: vec!["standard".into()],
             jwt,
         })
     }
@@ -456,7 +476,7 @@ impl Harness {
                 parent: None,
                 enforcement: None,
                 executor: Some(self.execution_identity),
-                permission_set_refs: vec!["standard".into()],
+                permission_set_refs: self.execution_refs.clone(),
                 artifact_retention_policy: None,
                 artifact_retention_limit: None,
                 worker_selector: None,
@@ -474,6 +494,37 @@ impl Harness {
         .await?;
         SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, execution.id, &binding)
             .await?;
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::select(
+            &mut tx,
+            execution.id,
+            None,
+        )
+        .await?;
+        use attune_common::repositories::{execution::UpdateExecutionInput, Update};
+        ExecutionRepository::update(
+            &mut *tx,
+            execution.id,
+            UpdateExecutionInput {
+                worker: Some(self.worker_id),
+                status: Some(ExecutionStatus::Scheduled),
+                ..Default::default()
+            },
+        )
+        .await?;
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::start(
+            &mut tx,
+            execution.id,
+            self.worker_id,
+        )
+        .await?;
+        ExecutionRepository::transition_worker(
+            &mut *tx,
+            execution.id,
+            Some(self.worker_id),
+            ExecutionStatus::Running,
+            None,
+        )
+        .await?;
         tx.commit().await?;
         Ok(execution)
     }
@@ -505,14 +556,52 @@ impl Harness {
             100,
         )
         .await?;
-        let execution_token = generate_execution_token_with_permission_sets(
+        let mut tx = self.database.pool().begin().await?;
+        let attempt = attune_common::repositories::delegated_execution::DelegatedExecutionRepository::current_attempt(&mut tx, execution_id).await?;
+        tx.commit().await?;
+        let execution_token = attune_common::auth::jwt::generate_delegated_execution_token(
             self.execution_identity,
             execution_id,
             action_ref,
             &self.jwt,
-            None,
-            &["standard".into()],
+            600,
+            &self.execution_refs,
+            &[action_ref.to_string()],
+            attempt,
         )?;
+        // Transport readers must survive terminal execution transitions. Give
+        // a separate human this execution and its frozen output audience.
+        let reader = IdentityRepository::create(
+            self.database.pool(),
+            CreateIdentityInput {
+                login: format!("log-reader-{}", uuid::Uuid::new_v4()),
+                display_name: None,
+                password_hash: None,
+                attributes: serde_json::json!({}),
+            },
+        )
+        .await?;
+        let permissions = PermissionSetRepository::create(
+            self.database.pool(),
+            CreatePermissionSetInput {
+                r#ref: format!("fixture.reader_{}", uuid::Uuid::new_v4().simple()),
+                pack: None,
+                pack_ref: None,
+                label: None,
+                description: None,
+                grants: log_reader_grants(execution_id, action_ref),
+            },
+        )
+        .await?;
+        PermissionAssignmentRepository::create(
+            self.database.pool(),
+            CreatePermissionAssignmentInput {
+                identity: reader.id,
+                permset: permissions.id,
+            },
+        )
+        .await?;
+        let reader_token = generate_access_token(reader.id, &reader.login, &self.jwt)?;
         Ok(LogFixture {
             execution_id,
             artifact_id,
@@ -522,6 +611,7 @@ impl Harness {
             action_ref: action_ref.to_string(),
             artifact_ref: artifact_ref.to_string(),
             execution_token,
+            reader_token,
         })
     }
 
@@ -534,6 +624,20 @@ impl Harness {
     }
 }
 
+// Opaque workload output requires the complete frozen read ceiling, even
+// before any Key is fetched. Limit this audience to the producing action/pack
+// and execution read/decrypt to the single row.
+fn log_reader_grants(execution: i64, action: &str) -> serde_json::Value {
+    let pack = action.split_once('.').unwrap().0;
+    serde_json::json!([
+        {"resource":"executions","actions":["read","decrypt"],"constraints":{"ids":[execution]}},
+        {"resource":"keys","actions":["read","decrypt"],"constraints":{"owner_types":["pack","action"],"owner_refs":[pack,action]}},
+        {"resource":"artifacts","actions":["read"],"constraints":{"owner_types":["pack","action"],"owner_refs":[pack,action]}},
+        {"resource":"caches","actions":["read"],"constraints":{"owner_types":["pack"],"owner_refs":[pack]}},
+        {"resource":"caches","actions":["read"],"constraints":{"owner_types":["action"],"owner_refs":[action]}}
+    ])
+}
+
 struct LogFixture {
     execution_id: i64,
     artifact_id: i64,
@@ -543,6 +647,7 @@ struct LogFixture {
     action_ref: String,
     artifact_ref: String,
     execution_token: String,
+    reader_token: String,
 }
 
 async fn open_log_stream(
@@ -558,7 +663,7 @@ async fn open_log_stream(
             "{}/api/v1/executions/{}/logs/stdout/stream",
             replica.url, fixture.execution_id
         ))
-        .bearer_auth(&fixture.execution_token);
+        .bearer_auth(&fixture.reader_token);
     if let Some(offset) = offset {
         request = request.header("Last-Event-ID", offset);
     }
@@ -856,11 +961,7 @@ async fn artifact_preview_streams_object_segment_logs() -> Result<()> {
             pack_ref: None,
             label: None,
             description: None,
-            grants: serde_json::json!([{
-                "resource": "artifacts",
-                "actions": ["read"],
-                "constraints": {"ids": [fixture.artifact_id]},
-            }]),
+            grants: log_reader_grants(fixture.execution_id, &fixture.action_ref),
         },
     )
     .await?;
@@ -942,8 +1043,7 @@ async fn object_artifact_stream_rechecks_recorded_key_authority_between_frames()
         secret_provenance::SecretProvenance,
         secret_values::{prepare_secret_values, SecretValueInput, ENTITY_EXECUTION_CONFIG},
     };
-    let harness = Harness::start(&[true, true]).await?;
-    let fixture = harness.fixture(LogStreamBackend::ObjectSegments).await?;
+    let mut harness = Harness::start(&[true, true]).await?;
     let encryption = harness.replicas[0]
         .state
         .config
@@ -971,6 +1071,20 @@ async fn object_artifact_stream_rechecks_recorded_key_authority_between_frames()
         encryption,
     )
     .await?;
+    let origin_grant = PermissionSetRepository::create(harness.database.pool(), CreatePermissionSetInput {
+        r#ref: "fixture.selected_origin".into(), pack: None, pack_ref: None, label: None, description: None,
+        grants: serde_json::json!([{ "resource":"keys", "actions":["read","decrypt"], "constraints":{"refs":[key.r#ref]} }]),
+    }).await?;
+    PermissionAssignmentRepository::create(
+        harness.database.pool(),
+        CreatePermissionAssignmentInput {
+            identity: harness.execution_identity,
+            permset: origin_grant.id,
+        },
+    )
+    .await?;
+    harness.execution_refs.push(origin_grant.r#ref);
+    let fixture = harness.fixture(LogStreamBackend::ObjectSegments).await?;
     let provenance = SecretProvenance::key(attune_common::key_access::key_origin(&key));
     let secrets = prepare_secret_values(
         vec![SecretValueInput {
@@ -998,10 +1112,10 @@ async fn object_artifact_stream_rechecks_recorded_key_authority_between_frames()
         },
     )
     .await?;
-    let base = vec![
-        serde_json::json!({"resource":"artifacts","actions":["read"],"constraints":{"ids":[fixture.artifact_id]}}),
-        serde_json::json!({"resource":"executions","actions":["read","decrypt"],"constraints":{"ids":[fixture.execution_id]}}),
-    ];
+    let base = log_reader_grants(fixture.execution_id, &fixture.action_ref)
+        .as_array()
+        .unwrap()
+        .clone();
     let mut allowed = base.clone();
     allowed.push(serde_json::json!({"resource":"keys","actions":["read","decrypt"],"constraints":{"refs":[key.r#ref]}}));
     let permissions = PermissionSetRepository::create(
@@ -1395,6 +1509,18 @@ async fn object_s3_terminal_before_publication_reports_incomplete_without_data()
         .execute(harness.database.pool())
         .await?;
     let client = reqwest::Client::new();
+    assert_eq!(
+        client
+            .get(format!(
+                "{}/api/v1/executions/{}/logs/stdout/stream",
+                harness.replicas[1].url, fixture.execution_id
+            ))
+            .bearer_auth(&fixture.execution_token)
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
     let mut reader =
         Box::pin(open_log_stream(&client, &harness.replicas[1], &fixture, None).await?);
     let event = next_event(&mut reader, "error", Duration::from_secs(8)).await?;

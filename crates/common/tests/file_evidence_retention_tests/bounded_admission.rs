@@ -1022,12 +1022,19 @@ async fn deletion_admission_deferral_and_cancelled_claim_do_not_record_failed_vi
         Objects::claim_deletions_bounded(db.pool(), Utc::now(), 256, &budget, deadline(), &cancel),
         cancellation,
     );
-    assert_eq!(
-        report.outcome,
-        MaintenanceOutcome::DeadlineDeferred,
-        "{report:?}"
-    );
-    assert!(report.rollback_acknowledged, "{report:?}");
+    // Cancellation drops the query future while PostgreSQL is still sleeping.
+    // Draining its statement timeout and acknowledging ROLLBACK share one
+    // statement budget. If that budget expires, the owner must report failure
+    // and dispose the socket, never claim that rollback was acknowledged.
+    let expected_end = match (&report.outcome, report.rollback_acknowledged) {
+        (MaintenanceOutcome::DeadlineDeferred, true) => true,
+        (MaintenanceOutcome::Failed, false) => matches!(
+            &report.error,
+            Some(attune_common::Error::InvalidState(message))
+                if message == "Metadata maintenance rollback unconfirmed; owned socket disposed"
+        ),
+        _ => false,
+    };
     assert_eq!(report.changed, 0);
     assert!(report.value.is_none());
     await_backend_exit(db.pool(), pid).await;
@@ -1052,6 +1059,7 @@ async fn deletion_admission_deferral_and_cancelled_claim_do_not_record_failed_vi
     assert_claim_progress_untouched(db.pool()).await;
     assert_reader_admitted(db.pool()).await;
     db.cleanup().await.unwrap();
+    assert!(expected_end, "unexpected cancellation cleanup: {report:?}");
 }
 
 #[tokio::test]

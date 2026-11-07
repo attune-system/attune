@@ -12,7 +12,7 @@ use attune_common::{
         pack_release::{CreatePackReleaseInput, PackReleaseRepository},
         rule_authority::RuleAuthorityRepository,
         runtime_authority::{RuntimeAuthorityRepository as Authority, RuntimeOwner},
-        Create, Update,
+        Create, FindById, Update,
     },
     runtime_authority::{
         HumanAttribution, InvocationBinding, InvocationPolicy, PermissionSetDefinition,
@@ -113,6 +113,20 @@ async fn fixture_with_native_variant(
     i64,
 ) {
     let db = create_test_pool().await.unwrap();
+    fixture_on_database(db, authored_defaults, empty_workflow, staged).await
+}
+
+async fn fixture_on_database(
+    db: TestDatabase,
+    authored_defaults: bool,
+    empty_workflow: bool,
+    staged: Option<native_staged_completion::Case>,
+) -> (
+    TestDatabase,
+    ExecutionExecutableSnapshot,
+    RuntimePolicy,
+    i64,
+) {
     let mut pack_fixture = PackFixture::new_unique("exec_admission");
     if authored_defaults {
         pack_fixture.conf_schema =
@@ -1059,18 +1073,51 @@ async fn accepted_mixed_requester_queue_keeps_policy_and_attribution_after_human
         )
         .await
         .unwrap();
-        Admission::admit_queue_item(
+        let actor = Some(HumanAttribution {
+            identity_id: identity,
+            login: format!("historical-{identity}"),
+        });
+        let denied = Admission::admit_queue_item(&mut tx, &queue, &item, actor.clone(), &snapshot)
+            .await
+            .unwrap_err();
+        assert!(denied.to_string().contains("coordinated admission"));
+        let written: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM work_queue_item_runtime_admission WHERE item=$1",
+        )
+        .bind(item.id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(written, 0, "disabled admission must not write authority");
+
+        // Model a genuinely pre-admitted item for this retention consumer test.
+        // The selector still validates policy, executable, targets and approvals;
+        // only this fixture-owned historical table write bypasses new admission.
+        let admitted = Admission::select(
             &mut tx,
-            &queue,
-            &item,
-            Some(HumanAttribution {
-                identity_id: identity,
-                login: format!("historical-{identity}"),
-            }),
+            policy.owner.pack_id,
+            InvocationBinding::Queue {
+                queue_ref: queue.r#ref.clone(),
+                action_ref: snapshot.executable.action.r#ref.clone(),
+            },
             &snapshot,
+            queue.permission_set_refs.as_ref().unwrap(),
+            RequestAttribution::QueueBatch {
+                queue_ref: queue.r#ref.clone(),
+                items: std::collections::BTreeMap::from([(item.id, actor)]),
+            },
+            attune_common::repositories::runtime_target::RuntimeTarget::Component(
+                attune_common::repositories::runtime_target::ComponentTarget::Queue,
+                queue.id,
+            ),
         )
         .await
         .unwrap();
+        let authority = admitted.authority();
+        sqlx::query("INSERT INTO work_queue_item_runtime_admission(item,policy_revision,authority,authority_digest) VALUES($1,$2,$3,$4)")
+            .bind(item.id).bind(authority.policy_id).bind(sqlx::types::Json(authority))
+            .bind(fixture_digest(authority)).execute(&mut *tx).await.unwrap();
+        admitted.ensure_fresh_on(&mut tx).await.unwrap();
         items.push(item);
     }
     let old = Admission::queue_batch(&mut tx, &queue, &items, &snapshot)
@@ -3310,5 +3357,1209 @@ async fn initial_input_projection_is_once_only_same_transaction_and_digest_only_
         .config
         .is_none());
     later.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+/// A missing admission must not select human IAM, even for tokenless work.
+#[tokio::test]
+async fn authority_consistency_rejects_missing_managed_admission_with_or_without_refs() {
+    let (db, snapshot, policy, human) = fixture().await;
+    let mut tx = db.begin().await.unwrap();
+    for refs in [vec![], vec!["standard".to_string()]] {
+        let execution = ExecutionRepository::create_pinned(
+            &mut *tx,
+            CreateExecutionInput {
+                action: Some(snapshot.executable.action.id),
+                action_ref: snapshot.executable.action.r#ref.clone(),
+                executor: Some(human),
+                permission_set_refs: refs,
+                ..Default::default()
+            },
+            &snapshot,
+        )
+        .await
+        .unwrap();
+        assert!(Admission::existing_authority(&mut tx, execution.id)
+            .await
+            .is_err());
+        assert!(
+            Admission::is_recorded(&mut tx, execution.id).await.unwrap(),
+            "a missing recorded proof cannot change the persisted mode"
+        );
+        assert!(
+            Admission::input_authority(&mut tx, execution.id, Some(human))
+                .await
+                .is_err()
+        );
+    }
+    let refs = vec![format!("{}.effects", policy.owner.pack_ref)];
+    let admission = Admission::select(
+        &mut tx,
+        policy.owner.pack_id,
+        policy.invocations[0].binding.clone(),
+        &snapshot,
+        &refs,
+        RequestAttribution::Human {
+            actor: HumanAttribution {
+                identity_id: human,
+                login: "requester".into(),
+            },
+        },
+        attune_common::repositories::runtime_target::RuntimeTarget::Component(
+            attune_common::repositories::runtime_target::ComponentTarget::Action,
+            snapshot.executable.action.id,
+        ),
+    )
+    .await
+    .unwrap();
+    let execution = ExecutionRepository::create_pinned(
+        &mut *tx,
+        CreateExecutionInput {
+            action: Some(snapshot.executable.action.id),
+            action_ref: snapshot.executable.action.r#ref.clone(),
+            executor: Some(human),
+            permission_set_refs: refs,
+            ..Default::default()
+        },
+        &snapshot,
+    )
+    .await
+    .unwrap();
+    let record = admission
+        .attach(&mut tx, RuntimeOwner::Execution(execution.id))
+        .await
+        .unwrap();
+    assert_eq!(Admission::existing_authority(&mut tx, execution.id).await.unwrap(),
+        attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Recorded);
+    Authority::revoke_admission(&mut tx, record.id)
+        .await
+        .unwrap();
+    assert!(Admission::existing_authority(&mut tx, execution.id)
+        .await
+        .is_err());
+    tx.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+async fn delegated_fixture_execution(
+    conn: &mut sqlx::PgConnection,
+    snapshot: &ExecutionExecutableSnapshot,
+    owner: i64,
+    refs: Vec<String>,
+    parent: Option<i64>,
+) -> attune_common::models::Execution {
+    use attune_common::repositories::schema_contract::{BindingOwner, SchemaContractRepository};
+    let execution = ExecutionRepository::create_pinned(
+        &mut *conn,
+        CreateExecutionInput {
+            action: Some(snapshot.executable.action.id),
+            action_ref: snapshot.executable.action.r#ref.clone(),
+            executor: Some(owner),
+            permission_set_refs: refs,
+            parent,
+            ..Default::default()
+        },
+        snapshot,
+    )
+    .await
+    .unwrap();
+    let binding = SchemaContractRepository::materialize_action(conn, snapshot)
+        .await
+        .unwrap();
+    SchemaContractRepository::attach(conn, BindingOwner::Execution, execution.id, &binding)
+        .await
+        .unwrap();
+    execution
+}
+
+#[tokio::test]
+async fn delegated_authority_is_explicit_immutable_and_attempt_fenced() {
+    attune_common::auth::crypto_provider::install();
+    use attune_common::{
+        auth::jwt::{generate_delegated_execution_token, validate_token, JwtConfig},
+        models::{OwnerType, WorkerType},
+        repositories::{
+            delegated_execution::DelegatedExecutionRepository as Delegated,
+            execution::UpdateExecutionInput,
+            runtime::{CreateWorkerInput, WorkerRepository},
+        },
+    };
+    let (db, mut snapshot, _, human) = fixture().await;
+    // This test exercises worker credentials; use the actual pinned worker
+    // executable rather than the fixture's native workflow producer.
+    snapshot.executable = snapshot
+        .pack_executables
+        .values()
+        .find(|pinned| pinned.executable.action.workflow_def.is_none())
+        .expect("worker executable in fixture release")
+        .executable
+        .clone();
+    let mut tx = db.begin().await.unwrap();
+    let execution =
+        delegated_fixture_execution(&mut tx, &snapshot, human, vec!["standard".into()], None).await;
+    assert!(Admission::existing_authority(&mut tx, execution.id)
+        .await
+        .is_err());
+    Delegated::select(&mut tx, execution.id, None)
+        .await
+        .unwrap();
+    assert!(
+        Delegated::select(&mut tx, execution.id, None)
+            .await
+            .is_err(),
+        "selection is one-shot even inside the creation transaction"
+    );
+    assert_eq!(
+        Delegated::validate(&mut tx, execution.id)
+            .await
+            .unwrap()
+            .mode,
+        "delegated"
+    );
+    let worker = WorkerRepository::create(
+        &mut *tx,
+        CreateWorkerInput {
+            name: "authority-test".into(),
+            worker_type: WorkerType::Local,
+            runtime: None,
+            host: None,
+            port: None,
+            status: Some(attune_common::models::WorkerStatus::Active),
+            capabilities: None,
+            meta: None,
+        },
+    )
+    .await
+    .unwrap();
+    ExecutionRepository::update(
+        &mut *tx,
+        execution.id,
+        UpdateExecutionInput {
+            worker: Some(worker.id),
+            status: Some(ExecutionStatus::Scheduled),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let attempt = Delegated::start(&mut tx, execution.id, worker.id)
+        .await
+        .unwrap();
+    assert!(Delegated::start(&mut tx, execution.id, worker.id)
+        .await
+        .is_err());
+    ExecutionRepository::update(
+        &mut *tx,
+        execution.id,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Running),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    Delegated::require_completion(&mut tx, execution.id, worker.id)
+        .await
+        .unwrap();
+    assert!(
+        Delegated::require_completion(&mut tx, execution.id, worker.id + 1)
+            .await
+            .is_err()
+    );
+    let jwt = JwtConfig {
+        secret: "authority-test-only".into(),
+        access_token_expiration: 60,
+        refresh_token_expiration: 60,
+    };
+    let token = generate_delegated_execution_token(
+        human,
+        execution.id,
+        &execution.action_ref,
+        &jwt,
+        60,
+        &["standard".into()],
+        std::slice::from_ref(&execution.action_ref),
+        attempt,
+    )
+    .unwrap();
+    let claims = validate_token(&token, &jwt).unwrap();
+    assert!(Delegated::validate_claims(&mut tx, &claims)
+        .await
+        .unwrap()
+        .is_some());
+    Delegated::retain_claims(&mut tx, &claims).await.unwrap();
+    let mut stale = claims.clone();
+    stale.metadata.as_mut().unwrap()["delegated_attempt"] = json!(uuid::Uuid::new_v4());
+    assert!(Delegated::validate_claims(&mut tx, &stale).await.is_err());
+    let origin = attune_common::secret_provenance::KeyOrigin {
+        key_id: 999,
+        key_ref: "system.authority_fixture".into(),
+        owner_type: OwnerType::System,
+        owner_identity: None,
+        owner_ref: None,
+        encrypted: true,
+    };
+    Delegated::record_key(&mut tx, &claims, &origin)
+        .await
+        .unwrap();
+    let origins=attune_common::repositories::execution_key_read::ExecutionKeyReadRepository::origins_for_executions(&mut *tx,&[execution.id]).await.unwrap();
+    assert_eq!(origins[&execution.id], vec![origin]);
+    tx.commit().await.unwrap();
+    let mut tx = db.begin().await.unwrap();
+    Delegated::retain_claims(&mut tx, &claims).await.unwrap();
+    // A successful disclosure retains the open attempt through its commit.
+    // Completion cannot close it and publish a terminal result concurrently.
+    let mut closer = db.begin().await.unwrap();
+    sqlx::query("SET LOCAL lock_timeout='100ms'")
+        .execute(&mut *closer)
+        .await
+        .unwrap();
+    let close_error = Delegated::close(&mut closer, execution.id)
+        .await
+        .unwrap_err();
+    assert!(
+        close_error.to_string().contains("lock timeout"),
+        "{close_error}"
+    );
+    closer.rollback().await.unwrap();
+    tx.commit().await.unwrap();
+    let mut tx = db.begin().await.unwrap();
+    assert!(Delegated::require_closed_output(&mut tx, execution.id)
+        .await
+        .is_err());
+    Delegated::close(&mut tx, execution.id).await.unwrap();
+    assert!(
+        Delegated::require_closed_output(&mut tx, execution.id)
+            .await
+            .is_err(),
+        "closing a running attempt does not publish terminal output"
+    );
+    ExecutionRepository::update(
+        &mut *tx,
+        execution.id,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Completed),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        Delegated::require_closed_output(&mut tx, execution.id)
+            .await
+            .unwrap()
+            .owner,
+        Some(human)
+    );
+    sqlx::query("UPDATE execution SET worker=NULL WHERE id=$1")
+        .bind(execution.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    assert!(
+        Delegated::require_closed_output(&mut tx, execution.id)
+            .await
+            .is_err(),
+        "a closed output must retain its assigned worker"
+    );
+    ExecutionRepository::update(
+        &mut *tx,
+        execution.id,
+        UpdateExecutionInput {
+            worker: Some(worker.id),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    // Native controls retain scoped standard without granting the human owner
+    // the private body or copying freeform details to ordinary queue columns.
+    let output_origin = Delegated::output_origin(&mut tx, execution.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let provenance = attune_common::secret_provenance::SecretProvenance {
+        origins: vec![output_origin],
+        templates: vec![],
+    };
+    let key = "owned-native-queue-control-test-encryption-key";
+    ExecutionRepository::update(&mut *tx, execution.id, UpdateExecutionInput {
+        result:Some(json!({"queue_ack":{"version":1,"items":[{"id":10,"status":"completed","summary":{"value":"private"}}]}})),
+        ..Default::default()
+    }).await.unwrap();
+    assert!(
+        matches!(
+            Delegated::protected_queue_ack_controls(&mut tx, execution.id, &[10], 1, Some(key))
+                .await
+                .unwrap(),
+            attune_common::repositories::delegated_execution::ProtectedQueueAck::Invalid
+        ),
+        "missing encrypted output evidence cannot authorize public acknowledgement details"
+    );
+    let prepared = attune_common::secret_values::prepare_secret_values(vec![attune_common::secret_values::SecretValueInput {
+        json_path:"/queue_ack".into(),
+        value:json!({"version":1,"items":[{"id":10,"status":"completed","summary":{"value":"private"},"error":{"value":"private"}}]}),
+        source_kind:"provenance".into(), source_ref:Some(serde_json::to_string(&provenance).unwrap()),
+    }], key).unwrap();
+    attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::upsert_many_with_conn(&mut tx, attune_common::secret_values::ENTITY_EXECUTION_RESULT, execution.id, &prepared).await.unwrap();
+    ExecutionRepository::update(
+        &mut *tx,
+        execution.id,
+        UpdateExecutionInput {
+            result: Some(json!({"queue_ack":attune_common::secret_values::redaction_marker()})),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let stored = attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::find_stored_by_entity(&mut *tx, attune_common::secret_values::ENTITY_EXECUTION_RESULT, execution.id).await.unwrap();
+    assert!(
+        attune_common::key_access::authorize_parameter_key_origins_with_conn(
+            &mut tx,
+            Some(human),
+            &stored
+        )
+        .await
+        .is_err(),
+        "control consumption must not grant human body disclosure"
+    );
+    let attune_common::repositories::delegated_execution::ProtectedQueueAck::Controls(controls) =
+        Delegated::protected_queue_ack_controls(&mut tx, execution.id, &[10], 1, Some(key))
+            .await
+            .unwrap()
+    else {
+        panic!("closed standard controls rejected")
+    };
+    assert!(controls.items[0].summary.is_none() && controls.items[0].error.is_none());
+    assert!(Delegated::retain_claims(&mut tx, &claims).await.is_err());
+
+    assert!(Delegated::validate_claims(&mut tx, &claims).await.is_err());
+    assert!(
+        Delegated::require_completion(&mut tx, execution.id, worker.id)
+            .await
+            .is_err()
+    );
+    tx.commit().await.unwrap();
+    let mut tx = db.begin().await.unwrap();
+    assert!(Delegated::select(&mut tx, execution.id, None)
+        .await
+        .is_err());
+    tx.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_workflow_authority_fences_children_and_private_controls() {
+    attune_common::auth::crypto_provider::install();
+    use attune_common::{
+        auth::jwt::{generate_delegated_execution_token, validate_token, JwtConfig},
+        repositories::{
+            delegated_execution::{DelegatedExecutionRepository as Delegated, ProtectedQueueAck},
+            execution::UpdateExecutionInput,
+            native_failure_materialization::NativeFailureMaterializationRepository as Native,
+            workflow::{CreateWorkflowExecutionInput, WorkflowExecutionRepository},
+        },
+    };
+    let (db, snapshot, _, human) = fixture().await;
+    let mut tx = db.begin().await.unwrap();
+    let root =
+        delegated_fixture_execution(&mut tx, &snapshot, human, vec!["standard".into()], None).await;
+    Delegated::select(&mut tx, root.id, None).await.unwrap();
+    let (attempt, kind, worker, closed): (uuid::Uuid, String, Option<i64>, bool) = sqlx::query_as(
+        "SELECT attempt,producer_kind,worker,closed FROM delegated_execution_attempt WHERE execution=$1",
+    ).bind(root.id).fetch_one(&mut *tx).await.unwrap();
+    assert_eq!(kind, "workflow");
+    assert!(worker.is_none() && !closed);
+    ExecutionRepository::update(
+        &mut *tx,
+        root.id,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Running),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let jwt = JwtConfig {
+        secret: "native-negative-token-test-only".into(),
+        access_token_expiration: 60,
+        refresh_token_expiration: 60,
+    };
+    // A native producer nonce must never authorize an action bearer or worker completion.
+    let token = generate_delegated_execution_token(
+        human,
+        root.id,
+        &root.action_ref,
+        &jwt,
+        60,
+        &["standard".into()],
+        std::slice::from_ref(&root.action_ref),
+        attempt,
+    )
+    .unwrap();
+    let claims = validate_token(&token, &jwt).unwrap();
+    assert!(Delegated::validate_claims(&mut tx, &claims).await.is_err());
+    assert!(Delegated::current_attempt(&mut tx, root.id).await.is_err());
+    assert!(Delegated::require_completion(&mut tx, root.id, 123)
+        .await
+        .is_err());
+    let workflow = WorkflowExecutionRepository::create(
+        &mut *tx,
+        CreateWorkflowExecutionInput {
+            execution: root.id,
+            workflow_def: snapshot.executable.workflow_definition.as_ref().unwrap().id,
+            task_graph: json!({}),
+            variables: json!({}),
+            status: ExecutionStatus::Running,
+        },
+    )
+    .await
+    .unwrap();
+    let mut leaf = snapshot.clone();
+    leaf.executable = snapshot
+        .pack_executables
+        .values()
+        .find(|p| p.executable.action.workflow_def.is_none())
+        .unwrap()
+        .executable
+        .clone();
+    let child = delegated_fixture_execution(&mut tx, &leaf, human, vec![], Some(root.id)).await;
+    Delegated::select(&mut tx, child.id, Some(root.id))
+        .await
+        .unwrap();
+    let task = serde_json::from_value(json!({"workflow_execution":workflow.id,"task_name":"next","retry_count":0,"max_retries":0,"timed_out":false})).unwrap();
+    ExecutionRepository::update(
+        &mut *tx,
+        child.id,
+        UpdateExecutionInput {
+            workflow_task: Some(task),
+            status: Some(ExecutionStatus::Completed),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        Native::prepare_for_completion(&mut tx, child.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "managed delegated callbacks must use explicit selected mode, not ownership"
+    );
+    let original = snapshot.executable.workflow_definition.as_ref().unwrap();
+    let other = attune_common::repositories::workflow::WorkflowDefinitionRepository::create(
+        &mut *tx,
+        attune_common::repositories::workflow::CreateWorkflowDefinitionInput {
+            r#ref: format!("{}.other_native_binding", original.pack_ref),
+            pack: original.pack,
+            pack_ref: original.pack_ref.clone(),
+            label: "Different binding".into(),
+            description: None,
+            version: "1.0.0".into(),
+            param_schema: None,
+            out_schema: None,
+            definition: original.definition.clone(),
+            tags: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE workflow_execution SET workflow_def=$1 WHERE id=$2")
+        .bind(other.id)
+        .bind(workflow.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    assert!(
+        Native::prepare_for_completion(&mut tx, child.id)
+            .await
+            .is_err(),
+        "delegated callbacks retain their immutable workflow definition binding"
+    );
+    sqlx::query("UPDATE workflow_execution SET workflow_def=$1 WHERE id=$2")
+        .bind(original.id)
+        .bind(workflow.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    Delegated::close(&mut tx, root.id).await.unwrap();
+    assert!(
+        Native::prepare_for_completion(&mut tx, child.id)
+            .await
+            .is_err(),
+        "a closed native producer cannot process callbacks during status lag"
+    );
+    let late = delegated_fixture_execution(&mut tx, &leaf, human, vec![], Some(root.id)).await;
+    assert!(Delegated::select(&mut tx, late.id, Some(root.id))
+        .await
+        .is_err());
+    assert!(Delegated::require_closed_output(&mut tx, root.id)
+        .await
+        .is_err());
+    ExecutionRepository::update(
+        &mut *tx,
+        root.id,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Completed),
+            result: Some(
+                json!({"queue_ack":{"version":1,"items":[{"id":10,"status":"completed"}]}}),
+            ),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    Delegated::require_closed_output(&mut tx, root.id)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            Delegated::protected_queue_ack_controls(&mut tx, root.id, &[10], 1, None)
+                .await
+                .unwrap(),
+            ProtectedQueueAck::Unprotected
+        ),
+        "native public literals do not acquire opaque worker provenance"
+    );
+    let provenance = attune_common::secret_provenance::SecretProvenance {
+        origins: vec![Delegated::output_origin(&mut tx, root.id)
+            .await
+            .unwrap()
+            .unwrap()],
+        templates: vec![],
+    };
+    let key = "owned-native-root-ack-test-encryption-key";
+    let prepared = attune_common::secret_values::prepare_secret_values(vec![attune_common::secret_values::SecretValueInput {
+        json_path: "".into(), value: json!({"queue_ack":{"version":1,"items":[{"id":10,"status":"completed","summary":{"value":"private"},"error":{"value":"private"}}]}}),
+        source_kind: "provenance".into(), source_ref: Some(serde_json::to_string(&provenance).unwrap()),
+    }], key).unwrap();
+    attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::upsert_many_with_conn(
+        &mut tx, attune_common::secret_values::ENTITY_EXECUTION_RESULT, root.id, &prepared).await.unwrap();
+    ExecutionRepository::update(
+        &mut *tx,
+        root.id,
+        UpdateExecutionInput {
+            result: Some(attune_common::secret_values::redaction_marker()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let ProtectedQueueAck::Controls(controls) =
+        Delegated::protected_queue_ack_controls(&mut tx, root.id, &[10], 1, Some(key))
+            .await
+            .unwrap()
+    else {
+        panic!("native root ciphertext controls rejected")
+    };
+    assert!(controls.items[0].summary.is_none() && controls.items[0].error.is_none());
+    // Absence of recorded proof cannot select the delegated callback path.
+    let recorded = delegated_fixture_execution(&mut tx, &snapshot, human, vec![], None).await;
+    ExecutionRepository::update(
+        &mut *tx,
+        recorded.id,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Running),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let recorded_workflow = WorkflowExecutionRepository::create(
+        &mut *tx,
+        CreateWorkflowExecutionInput {
+            execution: recorded.id,
+            workflow_def: snapshot.executable.workflow_definition.as_ref().unwrap().id,
+            task_graph: json!({}),
+            variables: json!({}),
+            status: ExecutionStatus::Running,
+        },
+    )
+    .await
+    .unwrap();
+    let unproven =
+        delegated_fixture_execution(&mut tx, &leaf, human, vec![], Some(recorded.id)).await;
+    ExecutionRepository::update(&mut *tx, unproven.id, UpdateExecutionInput {
+        workflow_task: Some(serde_json::from_value(json!({"workflow_execution":recorded_workflow.id,"task_name":"next","retry_count":0,"max_retries":0,"timed_out":false})).unwrap()),
+        status: Some(ExecutionStatus::Completed), ..Default::default()
+    }).await.unwrap();
+    assert!(Native::prepare_for_completion(&mut tx, unproven.id)
+        .await
+        .is_err());
+    assert_eq!(
+        Delegated::find(&mut tx, recorded.id).await.unwrap().mode,
+        "recorded"
+    );
+    let cancelled = delegated_fixture_execution(&mut tx, &snapshot, human, vec![], None).await;
+    Delegated::select(&mut tx, cancelled.id, None)
+        .await
+        .unwrap();
+    ExecutionRepository::update(
+        &mut *tx,
+        cancelled.id,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Cancelled),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let closed: bool =
+        sqlx::query_scalar("SELECT closed FROM delegated_execution_attempt WHERE execution=$1")
+            .bind(cancelled.id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert!(
+        closed,
+        "terminal cancellation atomically closes the native producer"
+    );
+    Delegated::require_closed_output(&mut tx, cancelled.id)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let mut tx = db.begin().await.unwrap();
+    assert!(
+        sqlx::query("UPDATE delegated_execution_attempt SET closed=FALSE WHERE execution=$1")
+            .bind(root.id)
+            .execute(&mut *tx)
+            .await
+            .is_err()
+    );
+    tx.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn delegated_authority_checks_grants_and_child_ceiling() {
+    use attune_common::repositories::delegated_execution::DelegatedExecutionRepository as Delegated;
+    let (db, snapshot, policy, human) = fixture().await;
+    let mut tx = db.begin().await.unwrap();
+    // Deployment admits this set to the pack, never to the requesting human.
+    let uncovered = delegated_fixture_execution(
+        &mut tx,
+        &snapshot,
+        human,
+        vec![format!("{}.effects", policy.owner.pack_ref)],
+        None,
+    )
+    .await;
+    assert!(Delegated::select(&mut tx, uncovered.id, None)
+        .await
+        .is_err());
+    let parent = delegated_fixture_execution(&mut tx, &snapshot, human, vec![], None).await;
+    Delegated::select(&mut tx, parent.id, None).await.unwrap();
+    ExecutionRepository::update(
+        &mut *tx,
+        parent.id,
+        attune_common::repositories::execution::UpdateExecutionInput {
+            status: Some(ExecutionStatus::Running),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let child = delegated_fixture_execution(
+        &mut tx,
+        &snapshot,
+        human,
+        vec!["standard".into()],
+        Some(parent.id),
+    )
+    .await;
+    assert!(Delegated::select(&mut tx, child.id, Some(parent.id))
+        .await
+        .is_err());
+    let tokenless =
+        delegated_fixture_execution(&mut tx, &snapshot, human, vec![], Some(parent.id)).await;
+    Delegated::select(&mut tx, tokenless.id, Some(parent.id))
+        .await
+        .unwrap();
+    ExecutionRepository::update(
+        &mut *tx,
+        parent.id,
+        attune_common::repositories::execution::UpdateExecutionInput {
+            status: Some(ExecutionStatus::Completed),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let late =
+        delegated_fixture_execution(&mut tx, &snapshot, human, vec![], Some(parent.id)).await;
+    assert!(
+        Delegated::select(&mut tx, late.id, Some(parent.id))
+            .await
+            .is_err(),
+        "a terminal parent cannot create a new delegated child"
+    );
+    tx.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn enforcement_authority_tombstone_does_not_fall_back() {
+    use attune_common::{
+        models::{EnforcementCondition, EnforcementStatus},
+        repositories::event::{CreateEnforcementInput, EnforcementRepository},
+    };
+    let (db, _, _, _) = fixture().await;
+    let mut tx = db.begin().await.unwrap();
+    let enforcement = EnforcementRepository::create(
+        &mut *tx,
+        CreateEnforcementInput {
+            rule: None,
+            rule_ref: "fixture.rule".into(),
+            trigger_ref: "fixture.trigger".into(),
+            config: None,
+            event: None,
+            status: EnforcementStatus::Created,
+            payload: json!({}),
+            condition: EnforcementCondition::All,
+            conditions: json!([]),
+        },
+    )
+    .await
+    .unwrap();
+    // Inject the retained marker of an independently missing admission.
+    sqlx::query("INSERT INTO enforcement_recorded_authority(enforcement,admission) VALUES($1,$2)")
+        .bind(enforcement.id)
+        .bind(999i64)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    assert!(Admission::enforcement_is_recorded(&mut tx, enforcement.id)
+        .await
+        .unwrap());
+    assert!(
+        Admission::require(&mut tx, RuntimeOwner::Enforcement(enforcement.id))
+            .await
+            .is_err()
+    );
+    tx.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn delegated_authority_retains_use_only_output_provenance() {
+    use attune_common::{
+        delegation::DelegationAuthority,
+        repositories::delegated_execution::DelegatedExecutionRepository as Delegated,
+        secret_provenance::SecretOrigin,
+    };
+    let (db, snapshot, _, human) = fixture().await;
+    let use_grants = json!([{"resource":"keys","actions":["use"],"constraints":{"refs":["system.authority_signer"],"owner_types":["system"]}}]);
+    assign_input_grants(&db, human, "output_use", use_grants.clone()).await;
+    let mut tx = db.begin().await.unwrap();
+    let execution = delegated_fixture_execution(
+        &mut tx,
+        &snapshot,
+        human,
+        vec!["fixture.output_use".into()],
+        None,
+    )
+    .await;
+    Delegated::select(&mut tx, execution.id, None)
+        .await
+        .unwrap();
+    let Some(SecretOrigin::Local { source_ref, .. }) =
+        Delegated::output_origin(&mut tx, execution.id)
+            .await
+            .unwrap()
+    else {
+        panic!("API-capable output must retain its disclosure authority")
+    };
+    for grants in [
+        json!([]),
+        json!([{"resource":"keys","actions":["read","decrypt"],"constraints":{"refs":["system.authority_signer"],"owner_types":["system"]}}]),
+    ] {
+        let viewer = DelegationAuthority::new(
+            human,
+            Default::default(),
+            serde_json::from_value(grants).unwrap(),
+        );
+        assert!(
+            !Delegated::output_allowed(&mut tx, source_ref.as_deref(), &viewer)
+                .await
+                .unwrap()
+        );
+    }
+    let viewer = DelegationAuthority::new(
+        human,
+        Default::default(),
+        serde_json::from_value(use_grants).unwrap(),
+    );
+    assert!(
+        Delegated::output_allowed(&mut tx, source_ref.as_deref(), &viewer)
+            .await
+            .unwrap()
+    );
+    tx.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn authority_upgrade_drains_old_delegation_and_preserves_recorded_bindings() {
+    use attune_common::{config::Config, repositories::execution::UpdateExecutionInput};
+    let db = TestDatabase::create_before(
+        &Config::load().unwrap().database,
+        "20261107000001_execution_authority_selection.sql",
+    )
+    .await
+    .unwrap();
+    let (db, snapshot, policy, human) = fixture_on_database(db, false, false, None).await;
+    let migration =
+        include_str!("../../../migrations/20261107000001_execution_authority_selection.sql");
+    // Both ad hoc ownership and a missing managed admission are insufficient
+    // authority evidence. Running/queued old work must drain without mutation.
+    let mut old_snapshot = snapshot.clone();
+    old_snapshot.executable.action.is_adhoc = true;
+    let mut old = Vec::new();
+    for status in [
+        ExecutionStatus::Requested,
+        ExecutionStatus::Scheduled,
+        ExecutionStatus::Running,
+        ExecutionStatus::Completed,
+    ] {
+        let execution = ExecutionRepository::create_pinned(
+            db.pool(),
+            CreateExecutionInput {
+                action: Some(snapshot.executable.action.id),
+                action_ref: snapshot.executable.action.r#ref.clone(),
+                executor: Some(human),
+                status,
+                ..Default::default()
+            },
+            &old_snapshot,
+        )
+        .await
+        .unwrap();
+        old.push(execution);
+    }
+    // A managed terminal row with independently missing recorded evidence is
+    // retained as unavailable, never reconstructed from its human attribution.
+    old.push(
+        ExecutionRepository::create_pinned(
+            db.pool(),
+            CreateExecutionInput {
+                action: Some(snapshot.executable.action.id),
+                action_ref: snapshot.executable.action.r#ref.clone(),
+                executor: Some(human),
+                status: ExecutionStatus::Completed,
+                permission_set_refs: vec!["standard".into()],
+                result: Some(json!({"data":"retained historical output"})),
+                ..Default::default()
+            },
+            &snapshot,
+        )
+        .await
+        .unwrap(),
+    );
+    let mut tx = db.begin().await.unwrap();
+    let admission = Admission::select(
+        &mut tx,
+        policy.owner.pack_id,
+        policy.invocations[0].binding.clone(),
+        &snapshot,
+        &[format!("{}.effects", policy.owner.pack_ref)],
+        RequestAttribution::Human {
+            actor: HumanAttribution {
+                identity_id: human,
+                login: "requester".into(),
+            },
+        },
+        attune_common::repositories::runtime_target::RuntimeTarget::Component(
+            attune_common::repositories::runtime_target::ComponentTarget::Action,
+            snapshot.executable.action.id,
+        ),
+    )
+    .await
+    .unwrap();
+    let recorded = ExecutionRepository::create_pinned(
+        &mut *tx,
+        CreateExecutionInput {
+            action: Some(snapshot.executable.action.id),
+            action_ref: snapshot.executable.action.r#ref.clone(),
+            executor: Some(human),
+            permission_set_refs: vec![format!("{}.effects", policy.owner.pack_ref)],
+            ..Default::default()
+        },
+        &snapshot,
+    )
+    .await
+    .unwrap();
+    let record = admission
+        .attach(&mut tx, RuntimeOwner::Execution(recorded.id))
+        .await
+        .unwrap();
+    Authority::revoke_admission(&mut tx, record.id)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    use attune_common::{
+        models::{EnforcementCondition, EnforcementStatus, WorkQueueItemStatus},
+        repositories::{
+            event::{CreateEnforcementInput, EnforcementRepository, UpdateEnforcementInput},
+            work_queue::{UpdateWorkQueueItemInput, WorkQueueItemRepository},
+        },
+    };
+    let enforcement = EnforcementRepository::create(
+        db.pool(),
+        CreateEnforcementInput {
+            rule: None,
+            rule_ref: "historical.ad_hoc".into(),
+            trigger_ref: "historical.trigger".into(),
+            config: None,
+            event: None,
+            status: EnforcementStatus::Created,
+            payload: json!({}),
+            condition: EnforcementCondition::All,
+            conditions: json!([]),
+        },
+    )
+    .await
+    .unwrap();
+    let item = pending_literal(&db, &snapshot, human).await;
+    let mut failed = db.begin().await.unwrap();
+    let error = sqlx::raw_sql(migration)
+        .execute(&mut *failed)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("requires draining"), "{error}");
+    failed.rollback().await.unwrap();
+    for execution in &old {
+        assert_eq!(
+            ExecutionRepository::find_by_id(db.pool(), execution.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            execution.status,
+            "migration must not interrupt prior work"
+        );
+        if execution.status != ExecutionStatus::Completed {
+            ExecutionRepository::update(
+                db.pool(),
+                execution.id,
+                UpdateExecutionInput {
+                    status: Some(ExecutionStatus::Completed),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+    }
+    // Draining executions alone cannot cut over a pending event or queue item.
+    for drain_enforcement in [true, false] {
+        let mut failed = db.begin().await.unwrap();
+        let error = sqlx::raw_sql(migration)
+            .execute(&mut *failed)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("requires draining"), "{error}");
+        failed.rollback().await.unwrap();
+        if drain_enforcement {
+            assert_eq!(
+                EnforcementRepository::find_by_id(db.pool(), enforcement.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                EnforcementStatus::Created
+            );
+            EnforcementRepository::update(
+                db.pool(),
+                enforcement.id,
+                UpdateEnforcementInput {
+                    status: Some(EnforcementStatus::Processed),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        } else {
+            assert_eq!(
+                WorkQueueItemRepository::find_by_id(db.pool(), item.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                WorkQueueItemStatus::Queued
+            );
+            WorkQueueItemRepository::update(
+                db.pool(),
+                item.id,
+                UpdateWorkQueueItemInput {
+                    status: Some(WorkQueueItemStatus::Completed),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let mut tx = db.begin().await.unwrap();
+    sqlx::raw_sql(migration).execute(&mut *tx).await.unwrap();
+    for execution in &old {
+        let selection =
+            attune_common::repositories::delegated_execution::DelegatedExecutionRepository::find(
+                &mut tx,
+                execution.id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(selection.mode, "unavailable");
+        assert!(!selection.explicit);
+        assert_eq!(
+            ExecutionRepository::find_by_id(&mut *tx, execution.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .result,
+            execution.result
+        );
+        assert!(Admission::existing_authority(&mut tx, execution.id)
+            .await
+            .is_err());
+    }
+    let selection =
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::find(
+            &mut tx,
+            recorded.id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(selection.mode, "recorded");
+    assert_eq!(selection.admission, Some(record.id));
+    assert!(
+        Admission::enforcement_is_recorded(&mut tx, enforcement.id)
+            .await
+            .unwrap(),
+        "historical enforcement cannot acquire human authority after cutover"
+    );
+    assert!(
+        Admission::existing_authority(&mut tx, recorded.id)
+            .await
+            .is_err(),
+        "revocation survives upgrade"
+    );
+    tx.commit().await.unwrap();
+    // Historical recorded work cannot acquire a human selection, even when
+    // its admission has been revoked.
+    let mut tx = db.begin().await.unwrap();
+    assert!(
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::select(
+            &mut tx,
+            recorded.id,
+            None
+        )
+        .await
+        .is_err()
+    );
+    tx.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn delegated_authority_enforcement_selection_retains_match_time_owner_and_grants() {
+    use attune_common::{
+        models::{EnforcementCondition, EnforcementStatus},
+        repositories::{
+            delegated_execution::DelegatedExecutionRepository as Delegated,
+            event::{CreateEnforcementInput, EnforcementRepository},
+            schema_contract::{BindingOwner, SchemaContractRepository},
+        },
+    };
+    let (db, snapshot, _, owner) = fixture().await;
+    assign_input_grants(
+        &db,
+        owner,
+        "matched_rule",
+        json!([{"resource":"workers","actions":["read"]}]),
+    )
+    .await;
+    let mut tx = db.begin().await.unwrap();
+    let enforcement = EnforcementRepository::create_or_get_by_rule_event_pinned(
+        &mut tx,
+        CreateEnforcementInput {
+            rule: None,
+            rule_ref: "fixture.mutable_rule".into(),
+            trigger_ref: "fixture.trigger".into(),
+            config: Some(json!({})),
+            event: None,
+            status: EnforcementStatus::Created,
+            payload: json!({}),
+            condition: EnforcementCondition::All,
+            conditions: json!([]),
+        },
+        &snapshot,
+    )
+    .await
+    .unwrap()
+    .enforcement;
+    let binding = SchemaContractRepository::materialize_action(&mut tx, &snapshot)
+        .await
+        .unwrap();
+    SchemaContractRepository::attach(&mut tx, BindingOwner::Enforcement, enforcement.id, &binding)
+        .await
+        .unwrap();
+    assert!(
+        Delegated::enforcement_selection(&mut tx, &enforcement)
+            .await
+            .is_err(),
+        "absence is not human admission"
+    );
+    assert!(Delegated::accept_enforcement(
+        &mut tx,
+        &enforcement,
+        owner,
+        &["fixture.not_covered".into()]
+    )
+    .await
+    .is_err());
+    let refs = vec!["fixture.matched_rule".into()];
+    Delegated::accept_enforcement(&mut tx, &enforcement, owner, &refs)
+        .await
+        .unwrap();
+    assert_eq!(
+        Delegated::enforcement_selection(&mut tx, &enforcement)
+            .await
+            .unwrap(),
+        (owner, refs.clone())
+    );
+    let mut changed = enforcement.clone();
+    changed.executable_snapshot.as_mut().unwrap()["release"]["digest"] =
+        json!("changed-after-match");
+    assert!(Delegated::enforcement_selection(&mut tx, &changed)
+        .await
+        .is_err());
+    // The persisted choice cannot be edited into another human or grant list.
+    let mut edit = sqlx::Connection::begin(&mut *tx).await.unwrap();
+    assert!(sqlx::query(
+        "UPDATE delegated_enforcement_selection SET selected_refs='{}' WHERE enforcement=$1"
+    )
+    .bind(enforcement.id)
+    .execute(&mut *edit)
+    .await
+    .is_err());
+    edit.rollback().await.unwrap();
+    IdentityRepository::update(
+        &mut *tx,
+        owner,
+        UpdateIdentityInput {
+            frozen: Some(true),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        Delegated::enforcement_selection(&mut tx, &enforcement)
+            .await
+            .is_err(),
+        "the original owner must remain active"
+    );
+    tx.rollback().await.unwrap();
     db.cleanup().await.unwrap();
 }

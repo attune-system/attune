@@ -867,3 +867,13 @@ macro_rules! assert_json_contains {
         );
     };
 }
+
+// Shared across separately compiled integration targets; each uses only a subset.
+#[allow(dead_code)]
+#[path = "helpers/delegated_source.rs"]
+pub mod delegated_source;
+
+// A shared fixture is compiled into targets that need different subsets.
+#[allow(dead_code)]
+#[path = "helpers/delegated.rs"]
+pub mod delegated;

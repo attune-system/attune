@@ -268,6 +268,11 @@ impl axum::extract::FromRequestParts<crate::state::SharedState> for RequireAuth<
             return Err(AuthError::InvalidToken);
         }
 
+        if claims.token_type == TokenType::Execution {
+            let mut conn = state.db.acquire().await.map_err(|_| AuthError::Internal)?;
+            attune_common::repositories::delegated_execution::DelegatedExecutionRepository::validate_claims(&mut conn,&claims)
+                .await.map_err(|_|AuthError::InvalidToken)?;
+        }
         if claims.token_type == TokenType::Sensor {
             let fence = claims
                 .sensor_workload_fence()

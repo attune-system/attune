@@ -100,6 +100,8 @@ const LOG_STREAM_READ_CHUNK_SIZE: usize = 1024 * 1024;
         (status = 201, description = "Execution created and queued", body = ExecutionResponse),
         (status = 404, description = "Action not found"),
         (status = 400, description = "Invalid request"),
+        (status = 403, description = "Caller cannot execute or cover the selected grants"),
+        (status = 501, description = "Execution sponsorship or protected output services are not ready"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -238,10 +240,18 @@ pub async fn create_execution(
             let identity_id = user
                 .identity_id()
                 .map_err(|_| ApiError::Unauthorized("Invalid user identity".into()))?;
-            let mut context = AuthorizationContext::new(identity_id);
-            context.target_id = Some(action.id);
-            context.target_ref = Some(action.r#ref.clone());
-            context.pack_ref = Some(action.pack_ref.clone());
+            let target =
+                attune_common::repositories::runtime_target::RuntimeTargetRepository::resolve(
+                    &mut tx,
+                    attune_common::repositories::runtime_target::RuntimeTarget::Component(
+                        attune_common::repositories::runtime_target::ComponentTarget::Action,
+                        action.id,
+                    ),
+                    identity_id,
+                )
+                .await?
+                .ok_or_else(|| ApiError::NotFound("Action is unavailable".into()))?;
+            let context = target.context().clone();
             authz.authorize_with_snapshot(
                 &user,
                 authz_snapshot.as_ref(),
@@ -252,8 +262,16 @@ pub async fn create_execution(
                 },
             )?;
         }
+        if recorded_credential.is_some() {
+            return Err(ApiError::NotImplemented("Recorded execution sponsorship is unavailable until coordinated consumer readiness".into()));
+        }
+        if state.config.security.encryption_key.is_none() {
+            return Err(ApiError::NotImplemented(
+                "Delegated execution output encryption is unavailable".into(),
+            ));
+        }
         trace.stage("snapshot_and_contract");
-        let snapshot = if !action.is_adhoc || recorded_credential.is_some() {
+        let snapshot = if recorded_credential.is_some() {
             attune_common::repositories::execution_admission::ExecutionAdmissionRepository::resolve_current_snapshot(
             &mut tx, action.pack,
             attune_common::repositories::runtime_target::RuntimeTarget::Component(attune_common::repositories::runtime_target::ComponentTarget::Action, action.id),
@@ -263,7 +281,7 @@ pub async fn create_execution(
             ExecutableSnapshotRepository::resolve_for_action(&mut *tx, action.id).await?
         };
         let action = &snapshot.executable.action;
-        let binding = if !action.is_adhoc || recorded_credential.is_some() {
+        let binding = if recorded_credential.is_some() {
             attune_common::repositories::schema_contract::SchemaContractRepository::materialize_action_pair(&mut tx, &snapshot).await?
         } else {
             attune_common::repositories::schema_contract::SchemaContractRepository::materialize_action(
@@ -278,12 +296,8 @@ pub async fn create_execution(
             .clone()
             .unwrap_or_else(|| action.default_execution_permission_set_refs.clone());
         let recorded_parent = if let Some(parent) = parent_from_token {
-            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
-                &mut tx,
-                attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent),
-            )
+            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut tx, parent)
             .await?
-            .is_some()
         } else {
             false
         };
@@ -294,10 +308,7 @@ pub async fn create_execution(
                 ));
             }
             if !recorded_parent {
-                let adhoc = parent
-                    .executable_snapshot
-                    .as_ref()
-                    .is_some_and(|snapshot| snapshot.executable.action.is_adhoc);
+                let delegated = attune_common::repositories::delegated_execution::DelegatedExecutionRepository::validate(&mut tx,parent.id).await?;
                 let claimed_action = user
                     .claims
                     .metadata
@@ -320,7 +331,7 @@ pub async fn create_execution(
                     .iter()
                     .map(String::as_str)
                     .collect::<std::collections::BTreeSet<_>>();
-                if !adhoc
+                if delegated.mode != "delegated"
                     || parent.executor != user.identity_id().ok()
                     || claimed_action != Some(parent.action_ref.as_str())
                     || selected_refs.is_empty()
@@ -334,7 +345,7 @@ pub async fn create_execution(
             }
         }
         trace.stage("execution_admission");
-        let admission = if !action.is_adhoc || recorded_parent {
+        let admission = if recorded_parent {
             use attune_common::{
                 repositories::execution_admission::ExecutionAdmissionRepository,
                 runtime_authority::{HumanAttribution, InvocationBinding, RequestAttribution},
@@ -504,6 +515,14 @@ pub async fn create_execution(
             &binding,
         )
         .await?;
+        if admission.is_none() {
+            attune_common::repositories::delegated_execution::DelegatedExecutionRepository::select(
+                &mut tx,
+                created_execution.id,
+                parent_from_token,
+            )
+            .await?;
+        }
         trace.stage("input_materialization");
         let supplied = request
             .parameters
@@ -2051,6 +2070,7 @@ pub async fn cancel_execution(
         (status = 200, description = "Execution request republished", body = inline(ApiResponse<ExecutionRescheduleResponse>)),
         (status = 404, description = "Execution not found"),
         (status = 409, description = "Execution is not eligible for reschedule"),
+        (status = 501, description = "Recorded execution scheduling requires coordinated runtime readiness"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -2060,6 +2080,13 @@ pub async fn reschedule_execution(
     Path(id): Path<i64>,
 ) -> ApiResult<impl IntoResponse> {
     if recorded::active(&user)? {
+        attune_common::execution_authority::RecordedConsumerReadiness::default()
+            .require_ready()
+            .map_err(|_| {
+                ApiError::NotImplemented(
+                    "Recorded execution rescheduling requires coordinated runtime readiness".into(),
+                )
+            })?;
         return Ok((
             StatusCode::OK,
             Json(ApiResponse::new(
@@ -2089,6 +2116,12 @@ pub async fn reschedule_execution(
         )));
     }
 
+    let mut authority_conn = state.db.acquire().await?;
+    let authority=attune_common::repositories::execution_runtime_admission::ExecutionAdmissionRepository::existing_authority(&mut authority_conn,id).await?;
+    if authority==attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Recorded {
+        return Err(ApiError::NotImplemented("Recorded execution scheduling requires coordinated readiness".into()));
+    }
+    drop(authority_conn);
     let Some(publisher) = state.get_publisher().await else {
         return Err(ApiError::InternalServerError(
             "Message queue publisher is unavailable; execution was not republished".to_string(),

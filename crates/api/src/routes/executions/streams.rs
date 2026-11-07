@@ -12,6 +12,9 @@ async fn human_live(state: &Arc<AppState>, user: &AuthenticatedUser) -> ApiResul
     if chrono::Utc::now().timestamp() >= user.claims.exp {
         return Err(ApiError::Unauthorized("Stream credential expired".into()));
     }
+    if user.claims.token_type == TokenType::Execution {
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::validate_claims(&mut *state.db.acquire().await?,&user.claims).await.map_err(|_|ApiError::Unauthorized("Delegated stream authority is unavailable".into()))?;
+    }
     let identity = user
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Stream identity unavailable".into()))?;

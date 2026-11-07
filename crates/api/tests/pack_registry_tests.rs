@@ -283,14 +283,12 @@ async fn owner_roles_use_current_membership_previous_deployment_policy_and_prese
         response.text().await?
     );
     let sets = PermissionSetRepository::find_by_identity(&ctx.pool, component_id).await?;
-    let execution_token = attune_common::auth::jwt::generate_execution_token_with_permission_sets(
+    let execution_token = helpers::delegated_source::token(
+        &ctx,
         component_id,
-        1234,
-        "owner_roles_team.run",
-        &jwt,
-        Some(300),
         &sets.iter().map(|set| set.r#ref.clone()).collect::<Vec<_>>(),
-    )?;
+    )
+    .await?;
     let execution_user = attune_api::auth::middleware::AuthenticatedUser {
         claims: validate_token(&execution_token, &jwt)?,
     };

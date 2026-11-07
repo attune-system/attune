@@ -235,7 +235,8 @@ pub struct NativeFailureMaterializationRepository;
 impl NativeFailureMaterializationRepository {
     /// Owning transaction, BEFORE outer workflow advisory/target locks. IDs refer
     /// to real persisted tasks. None is only a non-native or out-of-scope graph;
-    /// missing admission/schema/original source for a managed graph is an error.
+    /// Explicit delegation uses the caller-covered path. Missing recorded
+    /// admission/schema/original source remains an error, regardless of ownership.
     pub async fn prepare_for_completion(
         conn: &mut PgConnection,
         completed: Id,
@@ -266,34 +267,12 @@ impl NativeFailureMaterializationRepository {
         if actual.parent != Some(parent.id) {
             return Err(changed());
         }
-        let Some(admission) = Authority::execution_admission(conn, parent.id).await? else {
-            if parent
-                .executable_snapshot
-                .as_ref()
-                .is_some_and(|snapshot| !snapshot.executable.action.is_adhoc)
-            {
-                return Err(changed());
-            }
-            return Ok(None);
-        };
         if terminal(parent.status)
             || matches!(
                 parent.status,
                 ExecutionStatus::Canceling | ExecutionStatus::Cancelled
             )
         {
-            return Ok(None);
-        }
-        let graph = &parent
-            .executable_snapshot
-            .as_ref()
-            .ok_or_else(changed)?
-            .executable
-            .workflow_definition
-            .as_ref()
-            .ok_or_else(changed)?
-            .definition;
-        if !ordinary_terminal_graph(graph)? {
             return Ok(None);
         }
         if workflow.workflow_def
@@ -308,6 +287,33 @@ impl NativeFailureMaterializationRepository {
                 .id
         {
             return Err(changed());
+        }
+        if super::execution_admission::ExecutionAdmissionRepository::existing_authority(
+            conn, parent.id,
+        )
+        .await?
+            == super::execution_runtime_admission::ExistingExecutionAuthority::Delegated
+        {
+            super::delegated_execution::DelegatedExecutionRepository::validate_child(
+                conn, parent.id, actual.id,
+            )
+            .await?;
+            return Ok(None);
+        }
+        let admission = Authority::execution_admission(conn, parent.id)
+            .await?
+            .ok_or_else(changed)?;
+        let graph = &parent
+            .executable_snapshot
+            .as_ref()
+            .ok_or_else(changed)?
+            .executable
+            .workflow_definition
+            .as_ref()
+            .ok_or_else(changed)?
+            .definition;
+        if !ordinary_terminal_graph(graph)? {
+            return Ok(None);
         }
         let output_contract = original_contract(conn, &parent).await?;
         let mut fences = vec![Authority::retained_admission_fence(conn, admission.id).await?];

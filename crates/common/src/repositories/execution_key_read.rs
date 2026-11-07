@@ -16,7 +16,8 @@ impl ExecutionKeyReadRepository {
             "SELECT a.owner_id, o.origin, o.origin_digest FROM execution_key_read_origin o \
                 JOIN runtime_authority_admission a ON a.id = o.admission \
                 WHERE a.owner_kind = 'execution' AND a.owner_id = ANY($1) \
-                ORDER BY a.owner_id, o.origin_digest",
+                UNION ALL SELECT execution,origin,origin_digest FROM delegated_execution_key_origin WHERE execution = ANY($1) \
+                ORDER BY 1,3",
         )
         .bind(executions)
         .fetch_all(executor)

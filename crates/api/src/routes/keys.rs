@@ -168,6 +168,45 @@ async fn delegated_key_grants(
     }
 }
 
+// Reacquire delegated credentials and IAM on the effect connection. The
+// attempt/owner/grant locks survive through the response's disclosure commit.
+async fn retain_delegated_key_grants(
+    connection: &mut sqlx::PgConnection,
+    user: &RequireAuth,
+    previous: Option<(i64, Vec<Grant>)>,
+) -> ApiResult<Option<(i64, Vec<Grant>)>> {
+    if user.0.claims.token_type != TokenType::Execution
+        || user
+            .0
+            .claims
+            .admitted_execution_credential()
+            .map_err(|_| ApiError::Unauthorized("Invalid recorded execution credential".into()))?
+            .is_some()
+    {
+        return Ok(previous);
+    }
+    let (snapshot, _) =
+        AuthorizationService::retain_legacy_execution_snapshot_on(connection, &user.0).await?;
+    let grants = snapshot
+        .grants
+        .into_iter()
+        .filter_map(|mut grant| {
+            if let Some(scope) = &mut grant.constraints {
+                if scope.attributes.as_ref().is_some_and(|attributes| {
+                    attributes.iter().any(|(name, expected)| {
+                        snapshot.identity_attributes.get(name) != Some(expected)
+                    })
+                }) {
+                    return None;
+                }
+                scope.attributes = None;
+            }
+            Some(grant)
+        })
+        .collect();
+    Ok(Some((snapshot.identity_id, grants)))
+}
+
 fn missing_key_authority() -> ApiError {
     ApiError::Unauthorized("Key authority is unavailable".into())
 }
@@ -200,6 +239,12 @@ pub async fn list_keys(
     let delegated = delegated_key_grants(&state, &user).await?;
     let mut transaction = state.db.begin().await?;
     let recorded = user.0.recorded_runtime_authority(&mut transaction).await?;
+    let delegated = Box::pin(retain_delegated_key_grants(
+        &mut transaction,
+        &user,
+        delegated,
+    ))
+    .await?;
     let (identity_id, filters) = if let Some(authority) = &recorded {
         (
             authority.authority().owner.sponsor_identity_id,
@@ -485,6 +530,18 @@ pub async fn sign_key_jwt(
         Some(transaction) => transaction,
         None => state.db.begin().await?,
     };
+    let grants = if recorded.is_none() && user.0.claims.token_type == TokenType::Execution {
+        Box::pin(retain_delegated_key_grants(
+            &mut fence_transaction,
+            &user,
+            None,
+        ))
+        .await?
+        .ok_or_else(missing_key_authority)?
+        .1
+    } else {
+        grants
+    };
     let key = KeyRepository::find_by_ref_for_share(&mut fence_transaction, &key_ref)
         .await?
         .filter(|key| key.owner_type == OwnerType::System && key.encrypted)
@@ -577,6 +634,12 @@ pub async fn get_key(
     let mut transaction = state.db.begin().await?;
     SchemaTypeRepository::lock_selection(&mut transaction).await?;
     let recorded = user.0.recorded_runtime_authority(&mut transaction).await?;
+    let delegated = Box::pin(retain_delegated_key_grants(
+        &mut transaction,
+        &user,
+        delegated,
+    ))
+    .await?;
     let (identity_id, grants) = match &recorded {
         Some(authority) => (authority.authority().owner.sponsor_identity_id, Vec::new()),
         None => delegated.ok_or_else(missing_key_authority)?,
@@ -622,6 +685,15 @@ pub async fn get_key(
             )
             .await?;
         }
+    }
+
+    if can_decrypt && user.0.claims.token_type == TokenType::Execution && recorded.is_none() {
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::record_key(
+            &mut transaction,
+            &user.0.claims,
+            &attune_common::key_access::key_origin(&key),
+        )
+        .await?;
     }
 
     if can_decrypt && user.0.claims.token_type == TokenType::Sensor {
@@ -757,6 +829,12 @@ pub async fn create_key(
     let mut transaction = state.db.begin().await?;
     SchemaTypeRepository::lock_selection(&mut transaction).await?;
     let recorded = user.0.recorded_runtime_authority(&mut transaction).await?;
+    let delegated = Box::pin(retain_delegated_key_grants(
+        &mut transaction,
+        &user,
+        delegated,
+    ))
+    .await?;
     let authorization = if recorded.is_none()
         && matches!(
             user.0.claims.token_type,
@@ -923,6 +1001,15 @@ pub async fn create_key(
         KeyRepository::create(&mut *transaction, key_input).await?
     };
     KeySchemaRepository::set(&mut transaction, key.id, assignment.as_ref()).await?;
+    if recorded.is_none() && user.0.claims.token_type == TokenType::Execution {
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::record_key(
+            &mut transaction,
+            &user.0.claims,
+            &attune_common::key_access::key_origin(&key),
+        )
+        .await?;
+    }
+
     if let Some(authority) = &recorded {
         authority.ensure_fresh_on(&mut transaction).await?;
     }
@@ -998,6 +1085,12 @@ pub async fn update_key(
     let mut transaction = state.db.begin().await?;
     SchemaTypeRepository::lock_selection(&mut transaction).await?;
     let recorded = user.0.recorded_runtime_authority(&mut transaction).await?;
+    let delegated = Box::pin(retain_delegated_key_grants(
+        &mut transaction,
+        &user,
+        delegated,
+    ))
+    .await?;
     let existing = KeyRepository::find_by_ref_for_update(&mut transaction, &key_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Key '{}' not found", key_ref)))?;
@@ -1212,6 +1305,18 @@ pub async fn update_key(
             .await?;
         }
     }
+    if can_read
+        && (!updated_key.encrypted || can_decrypt)
+        && recorded.is_none()
+        && user.0.claims.token_type == TokenType::Execution
+    {
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::record_key(
+            &mut transaction,
+            &user.0.claims,
+            &attune_common::key_access::key_origin(&updated_key),
+        )
+        .await?;
+    }
     if !can_read || updated_key.encrypted && !can_decrypt {
         updated_key.value = serde_json::Value::Null;
     } else if updated_key.encrypted {
@@ -1295,6 +1400,12 @@ pub async fn delete_key(
     let mut transaction = state.db.begin().await?;
     SchemaTypeRepository::lock_selection(&mut transaction).await?;
     let recorded = user.0.recorded_runtime_authority(&mut transaction).await?;
+    let delegated = Box::pin(retain_delegated_key_grants(
+        &mut transaction,
+        &user,
+        delegated,
+    ))
+    .await?;
     // Verify key exists
     let key = KeyRepository::find_by_ref_for_update(&mut transaction, &key_ref)
         .await?

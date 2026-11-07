@@ -307,15 +307,13 @@ impl RetryManager {
         )
         .await?
         .ok_or_else(|| Error::validation("Retry source is missing its schema binding"))?;
-        let admission = if !snapshot.executable.action.is_adhoc
-            || attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
-                &mut transaction,
-                attune_common::repositories::runtime_authority::RuntimeOwner::Execution(
-                    original.id,
-                ),
-            )
-            .await?
-            .is_some()
+        let authority = attune_common::repositories::execution_runtime_admission::ExecutionAdmissionRepository::existing_authority(
+            &mut transaction, original.id,
+        ).await?;
+        if authority==attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Recorded {
+            attune_common::execution_authority::RecordedConsumerReadiness::default().require_ready()?;
+        }
+        let admission = if authority == attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Recorded
         {
             Some(attune_common::repositories::execution_admission::ExecutionAdmissionRepository::inherit(&mut transaction, attune_common::repositories::runtime_authority::RuntimeOwner::Execution(original.id), snapshot).await?)
         } else {
@@ -348,6 +346,10 @@ impl RetryManager {
             &binding,
         )
         .await?;
+        if authority == attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Delegated {
+            attune_common::repositories::delegated_execution::DelegatedExecutionRepository::select(&mut transaction,created.id,Some(original.id)).await?;
+        }
+
         attune_common::repositories::rule_authority::RuleAuthorityRepository::copy_execution(
             &mut transaction,
             original.id,

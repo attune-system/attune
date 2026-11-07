@@ -94,6 +94,8 @@ use crate::workflow::task_wait::{
     execution_resolution, work_queue_item_resolution, TargetResolution,
 };
 
+type RestoredWorkflowVariables = (JsonValue, Vec<(JsonPointer, SecretSource)>);
+
 #[derive(Debug, Clone)]
 struct EffectiveWorkerPlacement {
     constraints: Vec<WorkerPlacement>,
@@ -1175,8 +1177,10 @@ impl ExecutionScheduler {
                     let metadata_caches = metadata_caches.clone();
                     let workflow_log_transport = workflow_log_transport.clone();
 
-                    async move {
-                        if let Err(e) = Self::process_execution_requested(
+                    // Keep native workflow scheduling state off the consumer's
+                    // stack, including when the broker has not delivered work.
+                    Box::pin(async move {
+                        if let Err(e) = Box::pin(Self::process_execution_requested(
                             &pool,
                             &publisher,
                             &policy_enforcer,
@@ -1188,7 +1192,7 @@ impl ExecutionScheduler {
                             workflow_log_flush_interval_ms,
                             &metadata_caches,
                             &envelope,
-                        )
+                        ))
                         .await
                         {
                             error!("Error scheduling execution: {}", e);
@@ -1199,7 +1203,7 @@ impl ExecutionScheduler {
                             return Err(format!("Failed to schedule execution: {}", e).into());
                         }
                         Ok(())
-                    }
+                    })
                 },
             )
             .await?;
@@ -1281,14 +1285,14 @@ impl ExecutionScheduler {
                     workflow_log_segment_max_bytes,
                     workflow_log_flush_interval_ms,
                 };
-                return Self::process_claimed_execution(
+                return Box::pin(Self::process_claimed_execution(
                     pool,
                     publisher,
                     policy_enforcer,
                     &request_context,
                     execution,
                     metadata_caches,
-                )
+                ))
                 .await;
             }
 
@@ -1300,6 +1304,30 @@ impl ExecutionScheduler {
         }
 
         if execution.status != ExecutionStatus::Requested {
+            if matches!(
+                execution.status,
+                ExecutionStatus::Completed
+                    | ExecutionStatus::Failed
+                    | ExecutionStatus::Cancelled
+                    | ExecutionStatus::Timeout
+                    | ExecutionStatus::Abandoned
+            ) && execution
+                .executable_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.executable.workflow_definition.is_some())
+            {
+                // Recover immediate native completion after a failed post-commit
+                // broker publication. The consumer validates current authority
+                // and lease generation before applying any result controls.
+                let mut connection = pool.acquire().await?;
+                let pending =
+                    Self::workflow_completion_publication(&mut connection, &execution).await?;
+                drop(connection);
+                if let Some(pending) = pending {
+                    Self::publish_execution_completed_payload(publisher, pending).await?;
+                }
+            }
+
             debug!(
                 "Skipping execution {} with status {:?}; only Requested executions are schedulable",
                 execution_id, execution.status
@@ -1334,14 +1362,14 @@ impl ExecutionScheduler {
                 }
             };
 
-        Self::process_claimed_execution(
+        Box::pin(Self::process_claimed_execution(
             pool,
             publisher,
             policy_enforcer,
             &request_context,
             execution,
             metadata_caches,
-        )
+        ))
         .await
     }
 
@@ -1358,22 +1386,14 @@ impl ExecutionScheduler {
         // Fetch action to determine runtime requirements
         let action = Self::get_action_for_execution(pool, metadata_caches, &execution).await?;
         let mut tx = pool.begin().await?;
-        let recorded =
-            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
-                &mut tx,
-                attune_common::repositories::runtime_authority::RuntimeOwner::Execution(
-                    execution.id,
-                ),
-            )
-            .await?
-            .is_some();
-        if recorded || !action.is_adhoc {
-            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::require(
-                &mut tx, attune_common::repositories::runtime_authority::RuntimeOwner::Execution(execution.id),
-            ).await?;
+        let authority = attune_common::repositories::execution_runtime_admission::ExecutionAdmissionRepository::existing_authority(&mut tx,execution.id).await?;
+        let recorded = authority == attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Recorded;
+        if recorded {
+            attune_common::execution_authority::RecordedConsumerReadiness::default()
+                .require_ready()?;
         }
         tx.commit().await?;
-        if !recorded && action.is_adhoc && (!action.enabled || action.retired_at.is_some()) {
+        if !recorded && (!action.enabled || action.retired_at.is_some()) {
             Self::fail_unschedulable_execution(
                 pool,
                 publisher,
@@ -1504,7 +1524,7 @@ impl ExecutionScheduler {
         // A workflow holds a shared slot only when its own action participates.
         // Child actions use their normal, independent scheduling admissions.
         if action.workflow_def.is_some() {
-            let result = Self::process_workflow_execution(
+            let result = Box::pin(Self::process_workflow_execution(
                 pool,
                 publisher,
                 request_context.round_robin_counter,
@@ -1516,7 +1536,7 @@ impl ExecutionScheduler {
                 &execution,
                 &action,
                 metadata_caches,
-            )
+            ))
             .await;
             if result.is_err() {
                 Self::revert_scheduling_claim(pool, execution_id).await?;
@@ -1527,12 +1547,12 @@ impl ExecutionScheduler {
         // Regular action: select appropriate worker only after policy
         // readiness is confirmed, so queued executions don't reserve stale
         // workers while they wait.
-        let worker = match Self::select_worker_for_action_execution(
+        let worker = match Box::pin(Self::select_worker_for_action_execution(
             pool,
             &action,
             Some(&execution),
             request_context.round_robin_counter,
-        )
+        ))
         .await
         {
             Ok(worker) => worker,
@@ -1701,14 +1721,14 @@ impl ExecutionScheduler {
                         "Recovered stale scheduling claim for execution {} after failed initial claim",
                         execution_id
                     );
-                    return Self::process_claimed_execution(
+                    return Box::pin(Self::process_claimed_execution(
                         pool,
                         publisher,
                         policy_enforcer,
                         request_context,
                         execution,
                         metadata_caches,
-                    )
+                    ))
                     .await;
                 }
 
@@ -1739,274 +1759,277 @@ impl ExecutionScheduler {
     /// Handle a workflow execution by loading its definition, creating a
     /// `workflow_execution` record, and dispatching the entry-point tasks as
     /// child executions that workers *can* handle.
+    ///
+    /// Orchestration boundaries return boxed futures at construction. Boxing
+    /// only at an await site still reserves large constructor temporaries in
+    /// the caller's debug poll frame, exhausting the default service stack.
     #[allow(clippy::too_many_arguments)] // Explicit workflow dependencies keep orchestration inputs clear.
-    async fn process_workflow_execution(
-        pool: &PgPool,
-        publisher: &Publisher,
-        round_robin_counter: &AtomicUsize,
-        _artifacts_dir: &str,
-        _workflow_log_transport: &Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
+    fn process_workflow_execution<'a>(
+        pool: &'a PgPool,
+        publisher: &'a Publisher,
+        round_robin_counter: &'a AtomicUsize,
+        _artifacts_dir: &'a str,
+        _workflow_log_transport: &'a Arc<
+            dyn attune_common::artifact_transport::ArtifactFileTransport,
+        >,
         workflow_log_segment_max_bytes: usize,
         _workflow_log_flush_interval_ms: u64,
-        encryption_key: Option<&str>,
-        execution: &Execution,
-        action: &Action,
-        metadata_caches: &SchedulerMetadataCaches,
-    ) -> Result<()> {
-        let workflow_def_id = action
-            .workflow_def
-            .ok_or_else(|| anyhow::anyhow!("Action '{}' has no workflow_def", action.r#ref))?;
+        encryption_key: Option<&'a str>,
+        execution: &'a Execution,
+        action: &'a Action,
+        metadata_caches: &'a SchedulerMetadataCaches,
+    ) -> futures::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let workflow_def_id = action
+                .workflow_def
+                .ok_or_else(|| anyhow::anyhow!("Action '{}' has no workflow_def", action.r#ref))?;
 
-        // Load workflow definition
-        let workflow_def = if let Some(snapshot) = execution.executable_snapshot.as_ref() {
-            snapshot
-                .executable
-                .workflow_definition
-                .clone()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Pinned workflow definition missing for '{}'", action.r#ref)
-                })?
-        } else if let Some(cached) = metadata_caches
-            .cached_workflow_definition_by_id(workflow_def_id)
-            .await
-        {
-            cached
-        } else {
-            let workflow_def =
-                WorkflowDefinitionRepository::find_by_id_including_retired(pool, workflow_def_id)
-                    .await?
+            // Load workflow definition
+            let workflow_def = if let Some(snapshot) = execution.executable_snapshot.as_ref() {
+                snapshot
+                    .executable
+                    .workflow_definition
+                    .clone()
                     .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Workflow definition {} not found for action '{}'",
-                            workflow_def_id,
-                            action.r#ref
-                        )
-                    })?;
-            metadata_caches
-                .cache_workflow_definition(&workflow_def)
-                .await;
-            workflow_def
-        };
+                        anyhow::anyhow!("Pinned workflow definition missing for '{}'", action.r#ref)
+                    })?
+            } else if let Some(cached) = metadata_caches
+                .cached_workflow_definition_by_id(workflow_def_id)
+                .await
+            {
+                cached
+            } else {
+                let workflow_def = WorkflowDefinitionRepository::find_by_id_including_retired(
+                    pool,
+                    workflow_def_id,
+                )
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Workflow definition {} not found for action '{}'",
+                        workflow_def_id,
+                        action.r#ref
+                    )
+                })?;
+                metadata_caches
+                    .cache_workflow_definition(&workflow_def)
+                    .await;
+                workflow_def
+            };
 
-        // Parse workflow definition JSON into the strongly-typed struct
-        let definition: WorkflowDefinition =
-            serde_json::from_value(workflow_def.definition.clone()).map_err(|e| {
+            // Parse workflow definition JSON into the strongly-typed struct
+            let definition: WorkflowDefinition =
+                serde_json::from_value(workflow_def.definition.clone()).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Invalid workflow definition for '{}': {}",
+                        workflow_def.r#ref,
+                        e
+                    )
+                })?;
+
+            // Build the task graph to determine entry points and transitions
+            let graph = TaskGraph::from_workflow(&definition).map_err(|e| {
                 anyhow::anyhow!(
-                    "Invalid workflow definition for '{}': {}",
+                    "Failed to build task graph for workflow '{}': {}",
                     workflow_def.r#ref,
                     e
                 )
             })?;
 
-        // Build the task graph to determine entry points and transitions
-        let graph = TaskGraph::from_workflow(&definition).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to build task graph for workflow '{}': {}",
-                workflow_def.r#ref,
-                e
-            )
-        })?;
+            let task_graph_json: JsonValue = serde_json::to_value(&graph).unwrap_or_default();
 
-        let task_graph_json: JsonValue = serde_json::to_value(&graph).unwrap_or_default();
+            // Gather initial variables from the definition
+            let initial_vars: JsonValue =
+                serde_json::to_value(&definition.vars).unwrap_or_else(|_| serde_json::json!({}));
 
-        // Gather initial variables from the definition
-        let initial_vars: JsonValue =
-            serde_json::to_value(&definition.vars).unwrap_or_else(|_| serde_json::json!({}));
-
-        let mut initialization = pool.begin().await?;
-        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
-            &mut initialization,
-        )
-        .await?;
-        let recorded_initialization =
-            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
+            let mut initialization = pool.begin().await?;
+            attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
                 &mut initialization,
-                attune_common::repositories::runtime_authority::RuntimeOwner::Execution(
-                    execution.id,
-                ),
             )
-            .await?
-            .is_some();
-        let initialization_closure = if recorded_initialization {
-            Some(attune_common::repositories::native_input_origin::NativeInputOriginRepository::capture_with_key(&mut initialization,execution.id,&[],encryption_key).await?)
-        } else {
-            None
-        };
-        let existing_state =
-            WorkflowExecutionRepository::find_by_execution(&mut *initialization, execution.id)
+            .await?;
+            let recorded_initialization =
+            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut initialization, execution.id,)
+            .await?;
+            let initialization_closure = if recorded_initialization {
+                Some(attune_common::repositories::native_input_origin::NativeInputOriginRepository::capture_with_key(&mut initialization,execution.id,&[],encryption_key).await?)
+            } else {
+                None
+            };
+            let existing_state =
+                WorkflowExecutionRepository::find_by_execution(&mut *initialization, execution.id)
+                    .await?;
+            if existing_state.as_ref().is_some_and(|state| {
+                matches!(
+                    state.status,
+                    ExecutionStatus::Canceling
+                        | ExecutionStatus::Cancelled
+                        | ExecutionStatus::Completed
+                        | ExecutionStatus::Failed
+                        | ExecutionStatus::Timeout
+                        | ExecutionStatus::Abandoned
+                )
+            }) {
+                if let Some(closure) = &initialization_closure {
+                    closure.ensure_fresh_on(&mut initialization).await?;
+                }
+                initialization.commit().await?;
+                if let Some(closure) = &initialization_closure {
+                    closure.ensure_fresh()?;
+                }
+                return Ok(());
+            }
+            let prepared_initial = if recorded_initialization && existing_state.is_none() {
+                Some(attune_common::repositories::native_workflow_materialization::NativeWorkflowMaterializationRepository::prepare_initial_variables(
+                &mut initialization, execution.id,
+                encryption_key.ok_or_else(|| anyhow::anyhow!("Workflow receipt encryption is unavailable"))?,
+            ).await?)
+            } else {
+                None
+            };
+            let mut workflow_execution_result =
+                WorkflowExecutionRepository::create_or_get_by_execution_with_conn(
+                    &mut initialization,
+                    CreateWorkflowExecutionInput {
+                        execution: execution.id,
+                        workflow_def: workflow_def.id,
+                        task_graph: task_graph_json,
+                        variables: prepared_initial
+                            .as_ref()
+                            .map(|prepared| prepared.variables().clone())
+                            .unwrap_or(initial_vars),
+                        status: ExecutionStatus::Running,
+                    },
+                )
                 .await?;
-        if existing_state.as_ref().is_some_and(|state| {
-            matches!(
-                state.status,
-                ExecutionStatus::Canceling
-                    | ExecutionStatus::Cancelled
-                    | ExecutionStatus::Completed
-                    | ExecutionStatus::Failed
-                    | ExecutionStatus::Timeout
-                    | ExecutionStatus::Abandoned
-            )
-        }) {
+            if workflow_execution_result.created {
+                // Publish actual canonical entry-task state before any child source
+                // factory captures its original workflow. Resumes must keep their
+                // persisted state rather than resetting to the entry points.
+                workflow_execution_result.workflow_execution = WorkflowExecutionRepository::update(
+                    &mut *initialization,
+                    workflow_execution_result.workflow_execution.id,
+                    attune_common::repositories::workflow::UpdateWorkflowExecutionInput {
+                        current_tasks: Some(graph.entry_points.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            }
+            if let Some(prepared) = &prepared_initial {
+                if !workflow_execution_result.created {
+                    // Do not commit the loser's proposed receipts or reinterpret
+                    // existing variables. Parent protection should serialize this;
+                    // any unexpected collision rolls the complete preparation back.
+                    return Err(anyhow::anyhow!(
+                        "Workflow initialization changed during preparation"
+                    ));
+                }
+                ExecutionSecretValueRepository::replace_entity_with_conn(
+                    &mut initialization,
+                    attune_common::secret_values::ENTITY_WORKFLOW_VARIABLES,
+                    execution.id,
+                    prepared.secrets(),
+                )
+                .await?;
+                prepared.ensure_fresh_on(&mut initialization).await?;
+            }
             if let Some(closure) = &initialization_closure {
                 closure.ensure_fresh_on(&mut initialization).await?;
             }
             initialization.commit().await?;
+            if let Some(prepared) = &prepared_initial {
+                prepared.ensure_fresh()?;
+            }
             if let Some(closure) = &initialization_closure {
                 closure.ensure_fresh()?;
             }
-            return Ok(());
-        }
-        let prepared_initial = if recorded_initialization && existing_state.is_none() {
-            Some(attune_common::repositories::native_workflow_materialization::NativeWorkflowMaterializationRepository::prepare_initial_variables(
-                &mut initialization, execution.id,
-                encryption_key.ok_or_else(|| anyhow::anyhow!("Workflow receipt encryption is unavailable"))?,
-            ).await?)
-        } else {
-            None
-        };
-        let mut workflow_execution_result =
-            WorkflowExecutionRepository::create_or_get_by_execution_with_conn(
-                &mut initialization,
-                CreateWorkflowExecutionInput {
-                    execution: execution.id,
-                    workflow_def: workflow_def.id,
-                    task_graph: task_graph_json,
-                    variables: prepared_initial
-                        .as_ref()
-                        .map(|prepared| prepared.variables().clone())
-                        .unwrap_or(initial_vars),
-                    status: ExecutionStatus::Running,
-                },
-            )
-            .await?;
-        if workflow_execution_result.created {
-            // Publish actual canonical entry-task state before any child source
-            // factory captures its original workflow. Resumes must keep their
-            // persisted state rather than resetting to the entry points.
-            workflow_execution_result.workflow_execution = WorkflowExecutionRepository::update(
-                &mut *initialization,
-                workflow_execution_result.workflow_execution.id,
-                attune_common::repositories::workflow::UpdateWorkflowExecutionInput {
-                    current_tasks: Some(graph.entry_points.clone()),
-                    ..Default::default()
-                },
-            )
-            .await?;
-        }
-        if let Some(prepared) = &prepared_initial {
-            if !workflow_execution_result.created {
-                // Do not commit the loser's proposed receipts or reinterpret
-                // existing variables. Parent protection should serialize this;
-                // any unexpected collision rolls the complete preparation back.
-                return Err(anyhow::anyhow!(
-                    "Workflow initialization changed during preparation"
-                ));
-            }
-            ExecutionSecretValueRepository::replace_entity_with_conn(
-                &mut initialization,
-                attune_common::secret_values::ENTITY_WORKFLOW_VARIABLES,
-                execution.id,
-                prepared.secrets(),
-            )
-            .await?;
-            prepared.ensure_fresh_on(&mut initialization).await?;
-        }
-        if let Some(closure) = &initialization_closure {
-            closure.ensure_fresh_on(&mut initialization).await?;
-        }
-        initialization.commit().await?;
-        if let Some(prepared) = &prepared_initial {
-            prepared.ensure_fresh()?;
-        }
-        if let Some(closure) = &initialization_closure {
-            closure.ensure_fresh()?;
-        }
-        let workflow_execution = workflow_execution_result.workflow_execution;
-        let logger = WorkflowLogger::new(workflow_execution.id, workflow_log_segment_max_bytes);
+            let workflow_execution = workflow_execution_result.workflow_execution;
+            let logger = WorkflowLogger::new(workflow_execution.id, workflow_log_segment_max_bytes);
 
-        if workflow_execution_result.created {
-            info!(
-                "Created workflow_execution {} for workflow '{}' (parent execution {})",
-                workflow_execution.id, workflow_def.r#ref, execution.id
-            );
-            logger
-                .info(
-                    pool,
-                    format!(
-                        "Workflow '{}' started (workflow_execution {})",
-                        workflow_def.r#ref, workflow_execution.id
-                    ),
-                )
-                .await?;
-        } else {
-            info!(
+            if workflow_execution_result.created {
+                info!(
+                    "Created workflow_execution {} for workflow '{}' (parent execution {})",
+                    workflow_execution.id, workflow_def.r#ref, execution.id
+                );
+                logger
+                    .info(
+                        pool,
+                        format!(
+                            "Workflow '{}' started (workflow_execution {})",
+                            workflow_def.r#ref, workflow_execution.id
+                        ),
+                    )
+                    .await?;
+            } else {
+                info!(
                 "Reusing existing workflow_execution {} for workflow '{}' (parent execution {})",
                 workflow_execution.id, workflow_def.r#ref, execution.id
             );
-            logger
-                .info(
-                    pool,
-                    format!(
-                        "Workflow '{}' resumed (workflow_execution {})",
-                        workflow_def.r#ref, workflow_execution.id
-                    ),
+                logger
+                    .info(
+                        pool,
+                        format!(
+                            "Workflow '{}' resumed (workflow_execution {})",
+                            workflow_def.r#ref, workflow_execution.id
+                        ),
+                    )
+                    .await?;
+            }
+
+            if graph.entry_points.is_empty() {
+                warn!(
+                    "Workflow '{}' has no entry-point tasks, completing immediately",
+                    workflow_def.r#ref
+                );
+                let mut transaction = pool.begin().await?;
+                CacheEntryRepository::protect_transaction(
+                    &mut transaction,
+                    CacheTransactionMode::PinMutation,
                 )
                 .await?;
-        }
-
-        if graph.entry_points.is_empty() {
-            warn!(
-                "Workflow '{}' has no entry-point tasks, completing immediately",
-                workflow_def.r#ref
-            );
-            let mut transaction = pool.begin().await?;
-            CacheEntryRepository::protect_transaction(
-                &mut transaction,
-                CacheTransactionMode::PinMutation,
-            )
-            .await?;
-            attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
-                &mut transaction,
-            )
-            .await?;
-            let empty_output = if let Some(key) = encryption_key {
-                attune_common::repositories::native_transition_materialization::NativeTransitionMaterializationRepository::prepare_empty_workflow_output(
+                attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
+                    &mut transaction,
+                )
+                .await?;
+                let empty_output = if let Some(key) = encryption_key {
+                    attune_common::repositories::native_transition_materialization::NativeTransitionMaterializationRepository::prepare_empty_workflow_output(
                     &mut transaction, execution.id, key,
                 ).await?
-            } else {
-                None
-            };
-            if let Some(plan) = empty_output {
-                // All declaration/source/output authority is already prepared.
-                // Capture and the OUTER workflow locks follow, never precede it.
-                let sources = attune_common::repositories::native_input_origin::NativeInputOriginRepository::capture_workflow_with_key(
+                } else {
+                    None
+                };
+                if let Some(plan) = empty_output {
+                    // All declaration/source/output authority is already prepared.
+                    // Capture and the OUTER workflow locks follow, never precede it.
+                    let sources = attune_common::repositories::native_input_origin::NativeInputOriginRepository::capture_workflow_with_key(
                     &mut transaction, execution.id, encryption_key,
                 ).await?;
-                let parent = ExecutionRepository::find_by_id(&mut *transaction, execution.id)
+                    let parent = ExecutionRepository::find_by_id(&mut *transaction, execution.id)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("Empty workflow parent disappeared"))?;
+                    if !matches!(
+                        parent.status,
+                        ExecutionStatus::Requested
+                            | ExecutionStatus::Scheduling
+                            | ExecutionStatus::Scheduled
+                            | ExecutionStatus::Running
+                    ) {
+                        return Err(anyhow::anyhow!(
+                            "Empty workflow parent no longer permits completion"
+                        ));
+                    }
+                    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                        .bind(workflow_execution.id)
+                        .execute(&mut *transaction)
+                        .await?;
+                    let current = WorkflowExecutionRepository::find_by_id_for_update(
+                        &mut *transaction,
+                        workflow_execution.id,
+                    )
                     .await?
-                    .ok_or_else(|| anyhow::anyhow!("Empty workflow parent disappeared"))?;
-                if !matches!(
-                    parent.status,
-                    ExecutionStatus::Requested
-                        | ExecutionStatus::Scheduling
-                        | ExecutionStatus::Scheduled
-                        | ExecutionStatus::Running
-                ) {
-                    return Err(anyhow::anyhow!(
-                        "Empty workflow parent no longer permits completion"
-                    ));
-                }
-                sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                    .bind(workflow_execution.id)
-                    .execute(&mut *transaction)
-                    .await?;
-                let current = WorkflowExecutionRepository::find_by_id_for_update(
-                    &mut *transaction,
-                    workflow_execution.id,
-                )
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("Empty workflow state disappeared"))?;
-                plan.require_current(&current)?;
-                let binding =
+                    .ok_or_else(|| anyhow::anyhow!("Empty workflow state disappeared"))?;
+                    plan.require_current(&current)?;
+                    let binding =
                     attune_common::repositories::schema_contract::SchemaContractRepository::find(
                         &mut transaction,
                         attune_common::repositories::schema_contract::BindingOwner::Execution,
@@ -2014,276 +2037,305 @@ impl ExecutionScheduler {
                     )
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("Empty workflow output contract unavailable"))?;
-                let key = encryption_key.ok_or_else(|| {
-                    anyhow::anyhow!("Empty workflow output encryption is unavailable")
-                })?;
-                let (output, secrets) = prepare_receipted_workflow_output(
+                    let key = encryption_key.ok_or_else(|| {
+                        anyhow::anyhow!("Empty workflow output encryption is unavailable")
+                    })?;
+                    let (output, secrets) = prepare_receipted_workflow_output(
+                        &mut transaction,
+                        &plan,
+                        binding.output.as_ref(),
+                        plan.output()
+                            .ok_or_else(|| anyhow::anyhow!("Empty workflow output plan is absent"))?
+                            .clone(),
+                        key,
+                    )
+                    .await?;
+                    let prepared = prepare_secret_values(secrets, key)?;
+                    if serde_json::to_vec(&prepared)?.len() > 1024 * 1024 {
+                        return Err(anyhow::anyhow!(
+                            "Empty workflow output ciphertext exceeds its byte bound"
+                        ));
+                    }
+                    attune_common::repositories::runtime_read::RuntimeReadRepository::close_execution(
                     &mut transaction,
-                    &plan,
-                    binding.output.as_ref(),
-                    plan.output()
-                        .ok_or_else(|| anyhow::anyhow!("Empty workflow output plan is absent"))?
-                        .clone(),
-                    key,
+                    execution.id,
                 )
                 .await?;
-                let prepared = prepare_secret_values(secrets, key)?;
-                if serde_json::to_vec(&prepared)?.len() > 1024 * 1024 {
-                    return Err(anyhow::anyhow!(
-                        "Empty workflow output ciphertext exceeds its byte bound"
-                    ));
+                    ExecutionSecretValueRepository::replace_entity_with_conn(
+                        &mut transaction,
+                        ENTITY_EXECUTION_RESULT,
+                        execution.id,
+                        &prepared,
+                    )
+                    .await?;
+                    logger
+                        .log_with_conn(
+                            &mut transaction,
+                            LogLevel::Warn,
+                            "Workflow has no entry-point tasks; completing immediately",
+                        )
+                        .await?;
+                    let completed = Self::complete_workflow_with_conn(
+                        &mut transaction,
+                        execution.id,
+                        workflow_execution.id,
+                        true,
+                        None,
+                        Some(output),
+                    )
+                    .await?;
+                    let pending =
+                        Self::workflow_completion_publication(&mut transaction, &completed).await?;
+                    logger
+                        .log_with_conn(&mut transaction, LogLevel::Info, "Workflow completed")
+                        .await?;
+                    logger.seal_with_conn(&mut transaction).await?;
+                    plan.ensure_fresh_on(&mut transaction).await?;
+                    sources.ensure_fresh_on(&mut transaction).await?;
+                    transaction.commit().await?;
+                    plan.ensure_fresh()?;
+                    sources.ensure_fresh()?;
+                    if let Some(pending) = pending {
+                        Self::publish_execution_completed_payload(publisher, pending).await?;
+                        plan.ensure_fresh()?;
+                        sources.ensure_fresh()?;
+                    }
+                    return Ok(());
                 }
-                attune_common::repositories::runtime_read::RuntimeReadRepository::close_execution(
-                    &mut transaction,
-                    execution.id,
-                )
-                .await?;
-                ExecutionSecretValueRepository::replace_entity_with_conn(
-                    &mut transaction,
-                    ENTITY_EXECUTION_RESULT,
-                    execution.id,
-                    &prepared,
-                )
-                .await?;
                 logger
                     .log_with_conn(
                         &mut transaction,
-                        LogLevel::Warn,
+                        crate::workflow::log::LogLevel::Warn,
                         "Workflow has no entry-point tasks; completing immediately",
                     )
                     .await?;
-                Self::complete_workflow_with_conn(
+                let completed = Self::complete_workflow_with_conn(
                     &mut transaction,
                     execution.id,
                     workflow_execution.id,
                     true,
                     None,
-                    Some(output),
+                    None,
                 )
                 .await?;
+                let pending =
+                    Self::workflow_completion_publication(&mut transaction, &completed).await?;
                 logger
-                    .log_with_conn(&mut transaction, LogLevel::Info, "Workflow completed")
+                    .log_with_conn(
+                        &mut transaction,
+                        crate::workflow::log::LogLevel::Info,
+                        "Workflow completed",
+                    )
                     .await?;
                 logger.seal_with_conn(&mut transaction).await?;
-                plan.ensure_fresh_on(&mut transaction).await?;
-                sources.ensure_fresh_on(&mut transaction).await?;
                 transaction.commit().await?;
-                plan.ensure_fresh()?;
-                sources.ensure_fresh()?;
+                if let Some(pending) = pending {
+                    Self::publish_execution_completed_payload(publisher, pending).await?;
+                }
                 return Ok(());
             }
-            logger
-                .log_with_conn(
-                    &mut transaction,
-                    crate::workflow::log::LogLevel::Warn,
-                    "Workflow has no entry-point tasks; completing immediately",
-                )
-                .await?;
-            Self::complete_workflow_with_conn(
-                &mut transaction,
+
+            if ExecutionRepository::update_if_status(
+                pool,
                 execution.id,
-                workflow_execution.id,
-                true,
-                None,
-                None,
+                ExecutionStatus::Scheduling,
+                UpdateExecutionInput {
+                    status: Some(ExecutionStatus::Running),
+                    ..Default::default()
+                },
             )
-            .await?;
-            logger
-                .log_with_conn(
-                    &mut transaction,
-                    crate::workflow::log::LogLevel::Info,
-                    "Workflow completed",
-                )
-                .await?;
-            logger.seal_with_conn(&mut transaction).await?;
-            transaction.commit().await?;
-            return Ok(());
-        }
-
-        if ExecutionRepository::update_if_status(
-            pool,
-            execution.id,
-            ExecutionStatus::Scheduling,
-            UpdateExecutionInput {
-                status: Some(ExecutionStatus::Running),
-                ..Default::default()
-            },
-        )
-        .await?
-        .is_none()
-        {
-            let current = ExecutionRepository::find_by_id(pool, execution.id).await?;
-            if !matches!(
-                current.as_ref().map(|execution| execution.status),
-                Some(
-                    ExecutionStatus::Running | ExecutionStatus::Completed | ExecutionStatus::Failed
-                )
-            ) {
-                return Err(anyhow::anyhow!(
-                    "Workflow parent execution {} left Scheduling before entry dispatch",
-                    execution.id
-                ));
-            }
-        }
-
-        // Ordinary committed-input iteration owns source preparation before the
-        // legacy WorkflowContext/config restoration below. In particular, do not
-        // rerender authored vars or materialize sibling history for broker retry.
-        let mut native_iteration_entries = std::collections::BTreeSet::new();
-        for name in &graph.entry_points {
-            if let Some(node) = graph.get_task(name) {
-                if node.with_items.is_some()
-                    && node.iterate_cache.is_none()
-                    && node.wait_for.is_none()
-                    && Self::dispatch_native_iteration(
-                        pool,
-                        publisher,
-                        execution,
-                        &node.name,
-                        None,
-                        encryption_key,
-                        None,
+            .await?
+            .is_none()
+            {
+                let current = ExecutionRepository::find_by_id(pool, execution.id).await?;
+                if !matches!(
+                    current.as_ref().map(|execution| execution.status),
+                    Some(
+                        ExecutionStatus::Running
+                            | ExecutionStatus::Completed
+                            | ExecutionStatus::Failed
                     )
-                    .await?
-                {
-                    native_iteration_entries.insert(name.clone());
+                ) {
+                    return Err(anyhow::anyhow!(
+                        "Workflow parent execution {} left Scheduling before entry dispatch",
+                        execution.id
+                    ));
                 }
             }
-        }
-        if native_iteration_entries.len() == graph.entry_points.len() {
-            return Ok(());
-        }
 
-        // Build initial workflow context from execution parameters and
-        // workflow-level vars so that entry-point task inputs are rendered.
-        // Apply defaults from the workflow's param_schema for any parameters
-        // that were not supplied by the caller.
-        let restored_execution_config = Self::restore_secret_entity_from_pool(
-            pool,
-            encryption_key,
-            ENTITY_EXECUTION_CONFIG,
-            execution.id,
-            execution.config.clone().unwrap_or(JsonValue::Null),
-            execution.id,
-        )
-        .await?;
-        let workflow_params = extract_workflow_params(&Some(restored_execution_config));
-        let workflow_params = workflow_parameters_for_execution(
-            pool,
-            execution.id,
-            workflow_params,
-            &workflow_def.param_schema,
-        )
-        .await?;
-        let mut wf_ctx = WorkflowContext::new(
-            workflow_params,
-            definition
-                .vars
-                .iter()
-                .map(|(k, v)| {
-                    let jv: JsonValue =
-                        serde_json::to_value(v).unwrap_or(JsonValue::String(v.to_string()));
-                    (k.clone(), jv)
-                })
-                .collect(),
-        );
-        Self::mark_workflow_parameter_secret_sources(&wf_ctx, execution);
-        wf_ctx.set_template_origin("workflow", &execution.action_ref);
-        Self::populate_workflow_pack_config(
-            &mut *pool.acquire().await?,
-            execution,
-            &mut wf_ctx,
-            encryption_key,
-        )
-        .await?;
-
-        // For each entry-point task, create a child execution and dispatch it
-        for entry_task_name in &graph.entry_points {
-            if native_iteration_entries.contains(entry_task_name) {
-                continue;
+            // Ordinary committed-input iteration owns source preparation before the
+            // legacy WorkflowContext/config restoration below. In particular, do not
+            // rerender authored vars or materialize sibling history for broker retry.
+            let mut native_iteration_entries = std::collections::BTreeSet::new();
+            for name in &graph.entry_points {
+                if let Some(node) = graph.get_task(name) {
+                    if node.with_items.is_some()
+                        && node.iterate_cache.is_none()
+                        && node.wait_for.is_none()
+                        && Self::dispatch_native_iteration(
+                            pool,
+                            publisher,
+                            execution,
+                            &node.name,
+                            None,
+                            encryption_key,
+                            None,
+                        )
+                        .await?
+                    {
+                        native_iteration_entries.insert(name.clone());
+                    }
+                }
             }
-            if let Some(task_node) = graph.get_task(entry_task_name) {
-                logger
-                    .info(
+            if native_iteration_entries.len() == graph.entry_points.len() {
+                return Ok(());
+            }
+
+            // Build initial workflow context from execution parameters and
+            // workflow-level vars so that entry-point task inputs are rendered.
+            // Apply defaults from the workflow's param_schema for any parameters
+            // that were not supplied by the caller.
+            let restored_execution_config = Self::restore_secret_entity_from_pool(
+                pool,
+                encryption_key,
+                ENTITY_EXECUTION_CONFIG,
+                execution.id,
+                execution.config.clone().unwrap_or(JsonValue::Null),
+                execution.id,
+            )
+            .await?;
+            let workflow_params = extract_workflow_params(&Some(restored_execution_config));
+            let workflow_params = workflow_parameters_for_execution(
+                pool,
+                execution.id,
+                workflow_params,
+                &workflow_def.param_schema,
+            )
+            .await?;
+            let mut wf_ctx = WorkflowContext::new(
+                workflow_params,
+                definition
+                    .vars
+                    .iter()
+                    .map(|(k, v)| {
+                        let jv: JsonValue =
+                            serde_json::to_value(v).unwrap_or(JsonValue::String(v.to_string()));
+                        (k.clone(), jv)
+                    })
+                    .collect(),
+            );
+            Self::mark_workflow_parameter_secret_sources(&wf_ctx, execution);
+            wf_ctx.set_template_origin("workflow", &execution.action_ref);
+            Self::populate_workflow_pack_config(
+                &mut *pool.acquire().await?,
+                execution,
+                &mut wf_ctx,
+                encryption_key,
+            )
+            .await?;
+
+            // For each entry-point task, create a child execution and dispatch it
+            for entry_task_name in &graph.entry_points {
+                if native_iteration_entries.contains(entry_task_name) {
+                    continue;
+                }
+                if let Some(task_node) = graph.get_task(entry_task_name) {
+                    logger
+                        .info(
+                            pool,
+                            format!(
+                                "Dispatching entry task '{}' (action '{}')",
+                                task_node.name,
+                                task_node.action.as_deref().unwrap_or("(none)")
+                            ),
+                        )
+                        .await?;
+                    Self::dispatch_or_resume_entry_workflow_task(
                         pool,
-                        format!(
-                            "Dispatching entry task '{}' (action '{}')",
-                            task_node.name,
-                            task_node.action.as_deref().unwrap_or("(none)")
-                        ),
+                        publisher,
+                        round_robin_counter,
+                        execution,
+                        &workflow_execution.id,
+                        task_node,
+                        &wf_ctx,
+                        encryption_key,
+                        None, // entry-point task — no predecessor
                     )
                     .await?;
-                Self::dispatch_or_resume_entry_workflow_task(
-                    pool,
-                    publisher,
-                    round_robin_counter,
-                    execution,
-                    &workflow_execution.id,
-                    task_node,
-                    &wf_ctx,
-                    encryption_key,
-                    None, // entry-point task — no predecessor
-                )
-                .await?;
-            } else {
-                warn!(
-                    "Entry-point task '{}' not found in graph for workflow '{}'",
-                    entry_task_name, workflow_def.r#ref
-                );
-                logger
-                    .warn(
-                        pool,
-                        format!(
-                            "Entry-point task '{}' not found in workflow graph",
-                            entry_task_name
-                        ),
-                    )
-                    .await?;
+                } else {
+                    warn!(
+                        "Entry-point task '{}' not found in graph for workflow '{}'",
+                        entry_task_name, workflow_def.r#ref
+                    );
+                    logger
+                        .warn(
+                            pool,
+                            format!(
+                                "Entry-point task '{}' not found in workflow graph",
+                                entry_task_name
+                            ),
+                        )
+                        .await?;
+                }
             }
-        }
 
-        Ok(())
+            Ok(())
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn dispatch_or_resume_entry_workflow_task(
-        pool: &PgPool,
-        publisher: &Publisher,
-        round_robin_counter: &AtomicUsize,
-        parent_execution: &Execution,
-        workflow_execution_id: &i64,
-        task_node: &crate::workflow::graph::TaskNode,
-        wf_ctx: &WorkflowContext,
-        encryption_key: Option<&str>,
-        triggered_by: Option<&str>,
-    ) -> Result<()> {
-        if Self::checkpoint_native_cache(
-            pool,
-            publisher,
-            parent_execution,
-            &task_node.name,
-            encryption_key,
-            None,
-        )
-        .await?
-        {
-            return Ok(());
-        }
-        let existing_children: Vec<(i64, Option<i64>, ExecutionStatus)> = sqlx::query_as(
-            "SELECT id, action, status \
+    fn dispatch_or_resume_entry_workflow_task<'a>(
+        pool: &'a PgPool,
+        publisher: &'a Publisher,
+        round_robin_counter: &'a AtomicUsize,
+        parent_execution: &'a Execution,
+        workflow_execution_id: &'a i64,
+        task_node: &'a crate::workflow::graph::TaskNode,
+        wf_ctx: &'a WorkflowContext,
+        encryption_key: Option<&'a str>,
+        triggered_by: Option<&'a str>,
+    ) -> futures::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if Self::checkpoint_native_cache(
+                pool,
+                publisher,
+                parent_execution,
+                &task_node.name,
+                encryption_key,
+                None,
+            )
+            .await?
+            {
+                return Ok(());
+            }
+            let existing_children: Vec<(i64, Option<i64>, ExecutionStatus)> = sqlx::query_as(
+                "SELECT id, action, status \
              FROM execution \
              WHERE workflow_task->>'workflow_execution' = $1::text \
                AND workflow_task->>'task_name' = $2 \
              ORDER BY created ASC",
-        )
-        .bind(workflow_execution_id.to_string())
-        .bind(task_node.name.as_str())
-        .fetch_all(pool)
-        .await?;
+            )
+            .bind(workflow_execution_id.to_string())
+            .bind(task_node.name.as_str())
+            .fetch_all(pool)
+            .await?;
 
-        if existing_children.is_empty() {
-            if task_node.wait_for.is_some() {
-                return Self::activate_entry_workflow_task(
+            if existing_children.is_empty() {
+                if task_node.wait_for.is_some() {
+                    return Self::activate_entry_workflow_task(
+                        pool,
+                        publisher,
+                        round_robin_counter,
+                        parent_execution,
+                        workflow_execution_id,
+                        task_node,
+                        wf_ctx,
+                        encryption_key,
+                        triggered_by,
+                    )
+                    .await;
+                }
+                return Self::dispatch_workflow_task(
                     pool,
                     publisher,
                     round_robin_counter,
@@ -2296,201 +2348,192 @@ impl ExecutionScheduler {
                 )
                 .await;
             }
-            return Self::dispatch_workflow_task(
-                pool,
-                publisher,
-                round_robin_counter,
-                parent_execution,
-                workflow_execution_id,
-                task_node,
-                wf_ctx,
-                encryption_key,
-                triggered_by,
-            )
-            .await;
-        }
 
-        if task_node.with_items.is_some() || task_node.iterate_cache.is_some() {
-            return Self::dispatch_workflow_task(
-                pool,
-                publisher,
-                round_robin_counter,
-                parent_execution,
-                workflow_execution_id,
-                task_node,
-                wf_ctx,
-                encryption_key,
-                triggered_by,
-            )
-            .await;
-        }
-
-        for (child_id, action_id, status) in existing_children {
-            if status == ExecutionStatus::Requested {
-                let action_id = action_id.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Workflow child execution {} has no action id while resuming task '{}'",
-                        child_id,
-                        task_node.name
-                    )
-                })?;
-                let child = ExecutionRepository::find_by_id(pool, child_id)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("Execution {} not found", child_id))?;
-
-                Self::publish_execution_requested(
+            if task_node.with_items.is_some() || task_node.iterate_cache.is_some() {
+                return Self::dispatch_workflow_task(
                     pool,
                     publisher,
-                    child_id,
-                    action_id,
-                    &child.action_ref,
+                    round_robin_counter,
                     parent_execution,
+                    workflow_execution_id,
+                    task_node,
+                    wf_ctx,
                     encryption_key,
+                    triggered_by,
                 )
-                .await?;
+                .await;
             }
-        }
 
-        Ok(())
+            for (child_id, action_id, status) in existing_children {
+                if status == ExecutionStatus::Requested {
+                    let action_id = action_id.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Workflow child execution {} has no action id while resuming task '{}'",
+                            child_id,
+                            task_node.name
+                        )
+                    })?;
+                    let child = ExecutionRepository::find_by_id(pool, child_id)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("Execution {} not found", child_id))?;
+
+                    Self::publish_execution_requested(
+                        pool,
+                        publisher,
+                        child_id,
+                        action_id,
+                        &child.action_ref,
+                        parent_execution,
+                        encryption_key,
+                    )
+                    .await?;
+                }
+            }
+
+            Ok(())
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn activate_entry_workflow_task(
-        pool: &PgPool,
-        publisher: &Publisher,
-        round_robin_counter: &AtomicUsize,
-        parent_execution: &Execution,
-        workflow_execution_id: &i64,
-        task_node: &crate::workflow::graph::TaskNode,
-        wf_ctx: &WorkflowContext,
-        encryption_key: Option<&str>,
-        triggered_by: Option<&str>,
-    ) -> Result<()> {
-        if task_node.wait_for.is_some()
-            && Self::checkpoint_initial_native_wait(
+    fn activate_entry_workflow_task<'a>(
+        pool: &'a PgPool,
+        publisher: &'a Publisher,
+        round_robin_counter: &'a AtomicUsize,
+        parent_execution: &'a Execution,
+        workflow_execution_id: &'a i64,
+        task_node: &'a crate::workflow::graph::TaskNode,
+        wf_ctx: &'a WorkflowContext,
+        encryption_key: Option<&'a str>,
+        triggered_by: Option<&'a str>,
+    ) -> futures::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if task_node.wait_for.is_some()
+                && Self::checkpoint_initial_native_wait(
+                    pool,
+                    publisher,
+                    parent_execution,
+                    *workflow_execution_id,
+                    &task_node.name,
+                    encryption_key,
+                    triggered_by,
+                )
+                .await?
+            {
+                return Ok(());
+            }
+            // Select the authenticated cache frontier before legacy target locks.
+            if Self::checkpoint_native_cache(
                 pool,
                 publisher,
                 parent_execution,
-                *workflow_execution_id,
                 &task_node.name,
                 encryption_key,
-                triggered_by,
+                None,
             )
             .await?
-        {
-            return Ok(());
-        }
-        // Initial activation must produce the same authenticated frontier that
-        // subsequent source-first checkpoints require for completion. Select
-        // this owner before acquiring legacy workflow/target locks.
-        if Self::checkpoint_native_cache(
-            pool,
-            publisher,
-            parent_execution,
-            &task_node.name,
-            encryption_key,
-            None,
-        )
-        .await?
-        {
-            return Ok(());
-        }
-        let mut transaction = pool.begin().await?;
-        CacheEntryRepository::protect_transaction(
-            &mut transaction,
-            CacheTransactionMode::PinMutation,
-        )
-        .await?;
-        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
-            &mut transaction,
-        )
-        .await?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(*workflow_execution_id)
-            .execute(&mut *transaction)
+            {
+                return Ok(());
+            }
+            let mut transaction = pool.begin().await?;
+            CacheEntryRepository::protect_transaction(
+                &mut transaction,
+                CacheTransactionMode::PinMutation,
+            )
             .await?;
-        WorkflowExecutionRepository::find_by_id_for_update(
-            &mut *transaction,
-            *workflow_execution_id,
-        )
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("Workflow execution {workflow_execution_id} not found"))?;
-
-        let mut pending_messages = WorkflowPublications::default();
-        let mut pending_completions = Vec::new();
-        let activation = Self::activate_workflow_task_with_conn(
-            &mut transaction,
-            round_robin_counter,
-            parent_execution,
-            workflow_execution_id,
-            task_node,
-            wf_ctx,
-            encryption_key,
-            triggered_by,
-            &mut pending_messages,
-            &mut pending_completions,
-        )
-        .await;
-        if let Err(error) = activation {
-            let Some(prerequisite_error) = error.downcast_ref::<TaskWaitPrerequisiteError>() else {
-                return Err(error);
-            };
-            let logical_outcome = Self::task_wait_prerequisite_failure_execution(
-                parent_execution,
+            attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
+                &mut transaction,
+            )
+            .await?;
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(*workflow_execution_id)
+                .execute(&mut *transaction)
+                .await?;
+            WorkflowExecutionRepository::find_by_id_for_update(
+                &mut *transaction,
                 *workflow_execution_id,
-                prerequisite_error,
-                triggered_by.map(str::to_string),
-            );
-            let outcome = Self::advance_workflow_serialized(
+            )
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("Workflow execution {workflow_execution_id} not found")
+            })?;
+
+            let mut pending_messages = WorkflowPublications::default();
+            let mut pending_completions = Vec::new();
+            let activation = Self::activate_workflow_task_with_conn(
+                &mut transaction,
+                round_robin_counter,
+                parent_execution,
+                workflow_execution_id,
+                task_node,
+                wf_ctx,
+                encryption_key,
+                triggered_by,
+                &mut pending_messages,
+                &mut pending_completions,
+            )
+            .await;
+            if let Err(error) = activation {
+                let Some(prerequisite_error) = error.downcast_ref::<TaskWaitPrerequisiteError>()
+                else {
+                    return Err(error);
+                };
+                let logical_outcome = Self::task_wait_prerequisite_failure_execution(
+                    parent_execution,
+                    *workflow_execution_id,
+                    prerequisite_error,
+                    triggered_by.map(str::to_string),
+                );
+                let outcome = Self::advance_workflow_serialized(
+                    &mut transaction,
+                    round_robin_counter,
+                    encryption_key,
+                    &logical_outcome,
+                    &SchedulerMetadataCaches::new(),
+                )
+                .await?;
+                pending_messages.extend(outcome.execution_requests);
+                pending_completions.extend(outcome.completed_children);
+                pending_completions.extend(outcome.completed_execution);
+            }
+            let outcome = Self::advance_resolved_task_wait_with_conn(
                 &mut transaction,
                 round_robin_counter,
                 encryption_key,
-                &logical_outcome,
-                &SchedulerMetadataCaches::new(),
+                parent_execution,
+                *workflow_execution_id,
+                &task_node.name,
+                None,
             )
             .await?;
             pending_messages.extend(outcome.execution_requests);
             pending_completions.extend(outcome.completed_children);
             pending_completions.extend(outcome.completed_execution);
-        }
-        let outcome = Self::advance_resolved_task_wait_with_conn(
-            &mut transaction,
-            round_robin_counter,
-            encryption_key,
-            parent_execution,
-            *workflow_execution_id,
-            &task_node.name,
-            None,
-        )
-        .await?;
-        pending_messages.extend(outcome.execution_requests);
-        pending_completions.extend(outcome.completed_children);
-        pending_completions.extend(outcome.completed_execution);
-        let input_publications = PreparedWorkflowInputPublications::prepare(
-            &mut transaction,
-            &pending_messages,
-            encryption_key,
-        )
-        .await?;
-        input_publications.ensure_fresh_on(&mut transaction).await?;
-        transaction.commit().await?;
-        input_publications.ensure_fresh()?;
-
-        for pending in pending_messages.into_messages_after_preparation() {
-            input_publications.ensure_child_fresh(pending.execution_id)?;
-            let execution = pending.execution_id;
-            Self::publish_execution_requested_payload_guarded(
-                publisher,
-                pending,
-                input_publications.publication_wait_deadline(execution)?,
-                &|| input_publications.ensure_child_fresh(execution),
+            let input_publications = PreparedWorkflowInputPublications::prepare(
+                &mut transaction,
+                &pending_messages,
+                encryption_key,
             )
             .await?;
-        }
-        for pending in pending_completions {
-            Self::publish_execution_completed_payload(publisher, pending).await?;
-        }
-        Ok(())
+            input_publications.ensure_fresh_on(&mut transaction).await?;
+            transaction.commit().await?;
+            input_publications.ensure_fresh()?;
+
+            for pending in pending_messages.into_messages_after_preparation() {
+                input_publications.ensure_child_fresh(pending.execution_id)?;
+                let execution = pending.execution_id;
+                Self::publish_execution_requested_payload_guarded(
+                    publisher,
+                    pending,
+                    input_publications.publication_wait_deadline(execution)?,
+                    &|| input_publications.ensure_child_fresh(execution),
+                )
+                .await?;
+            }
+            for pending in pending_completions {
+                Self::publish_execution_completed_payload(publisher, pending).await?;
+            }
+            Ok(())
+        })
     }
 
     fn mark_workflow_parameter_secret_sources(wf_ctx: &WorkflowContext, execution: &Execution) {
@@ -2556,6 +2599,7 @@ impl ExecutionScheduler {
         task_node: &crate::workflow::graph::TaskNode,
         binding: &attune_common::repositories::schema_contract::ActionSchemaBinding,
         wf_ctx: &WorkflowContext,
+        deferred_defaults: bool,
     ) -> Result<RenderedWorkflowTaskInput> {
         let rendered =
             if task_node.input.is_object() && !task_node.input.as_object().unwrap().is_empty() {
@@ -2601,10 +2645,6 @@ impl ExecutionScheduler {
             .collect::<Vec<_>>();
         let contract = attune_common::value_schema::CompiledContract::new(&binding.input)?;
         let supplied = rendered_value.clone();
-        let deferred_defaults = parent_execution
-            .executable_snapshot
-            .as_ref()
-            .is_some_and(|snapshot| !snapshot.executable.action.is_adhoc);
         let rendered_value = if deferred_defaults {
             rendered_value
         } else {
@@ -2659,6 +2699,7 @@ impl ExecutionScheduler {
         supplied: &JsonValue,
         secret_inputs: Vec<SecretValueInput>,
     ) -> Result<PreparedExecutionInputs> {
+        attune_common::repositories::execution_admission::ExecutionAdmissionRepository::existing_authority(conn, child_execution_id).await?;
         let recorded =
             attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
                 conn,
@@ -2751,28 +2792,25 @@ impl ExecutionScheduler {
         ))
     }
 
-    /// Transaction callers always use their actual connection. Keeping this
-    /// future concrete avoids higher-ranked Acquire requirements propagating
-    /// through the scheduler's Send MQ/spawn futures.
-    async fn restore_secret_entity(
-        connection: &mut PgConnection,
-        encryption_key: Option<&str>,
-        entity_type: &str,
+    /// Transaction callers use a concrete PgConnection to avoid higher-ranked
+    /// Acquire requirements in Send MQ/spawn futures. The returned future is
+    /// heap-owned to bound the orchestration poll frames.
+    fn restore_secret_entity<'a>(
+        connection: &'a mut PgConnection,
+        encryption_key: Option<&'a str>,
+        entity_type: &'a str,
         entity_id: i64,
         redacted_value: JsonValue,
         consumer: i64,
-    ) -> Result<JsonValue> {
-        let mut transaction = sqlx::Connection::begin(connection).await?;
-        let closure = if matches!(
-            entity_type,
-            ENTITY_EXECUTION_CONFIG | ENTITY_EXECUTION_RESULT
-        ) {
-            if attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
-                &mut transaction,
-                attune_common::repositories::runtime_authority::RuntimeOwner::Execution(consumer),
-            )
+    ) -> futures::future::BoxFuture<'a, Result<JsonValue>> {
+        Box::pin(async move {
+            let mut transaction = sqlx::Connection::begin(connection).await?;
+            let closure = if matches!(
+                entity_type,
+                ENTITY_EXECUTION_CONFIG | ENTITY_EXECUTION_RESULT
+            ) {
+                if attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut transaction, consumer)
             .await?
-            .is_some()
             {
                 // The root config is already prepared by capture_with_key. Its
                 // external sources must remain strict descendants, never the root.
@@ -2787,81 +2825,81 @@ impl ExecutionScheduler {
             } else {
                 None
             }
-        } else {
-            None
-        };
-        if let Some(closure) = closure {
-            let restored = closure
-                .restore_prepared(
-                    &mut transaction,
-                    entity_type,
-                    entity_id,
-                    redacted_value,
-                    encryption_key,
-                )
-                .await?;
-            closure.ensure_fresh_on(&mut transaction).await?;
-            transaction.commit().await?;
-            return Ok(restored);
-        }
-        let secrets = ExecutionSecretValueRepository::find_stored_by_entity(
-            &mut *transaction,
-            entity_type,
-            entity_id,
-        )
-        .await?;
-        if secrets.is_empty() {
-            transaction.commit().await?;
-            return Ok(redacted_value);
-        }
-
-        let encryption_key = encryption_key.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Cannot restore secret {} {} without security.encryption_key",
+            } else {
+                None
+            };
+            if let Some(closure) = closure {
+                let restored = closure
+                    .restore_prepared(
+                        &mut transaction,
+                        entity_type,
+                        entity_id,
+                        redacted_value,
+                        encryption_key,
+                    )
+                    .await?;
+                closure.ensure_fresh_on(&mut transaction).await?;
+                transaction.commit().await?;
+                return Ok(restored);
+            }
+            let secrets = ExecutionSecretValueRepository::find_stored_by_entity(
+                &mut *transaction,
                 entity_type,
-                entity_id
+                entity_id,
             )
-        })?;
-        let restored = restore_secret_values(redacted_value, &secrets, encryption_key)?;
-        transaction.commit().await?;
-        Ok(restored)
+            .await?;
+            if secrets.is_empty() {
+                transaction.commit().await?;
+                return Ok(redacted_value);
+            }
+
+            let encryption_key = encryption_key.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cannot restore secret {} {} without security.encryption_key",
+                    entity_type,
+                    entity_id
+                )
+            })?;
+            let restored = restore_secret_values(redacted_value, &secrets, encryption_key)?;
+            transaction.commit().await?;
+            Ok(restored)
+        })
     }
 
     /// Only standalone scheduler entry points acquire a pooled connection.
     /// Native effect paths must call the concrete-connection helper above.
-    async fn restore_secret_entity_from_pool(
-        pool: &PgPool,
-        encryption_key: Option<&str>,
-        entity_type: &str,
+    fn restore_secret_entity_from_pool<'a>(
+        pool: &'a PgPool,
+        encryption_key: Option<&'a str>,
+        entity_type: &'a str,
         entity_id: i64,
         redacted_value: JsonValue,
         consumer: i64,
-    ) -> Result<JsonValue> {
-        let mut connection = pool.acquire().await?;
-        Self::restore_secret_entity(
-            &mut connection,
-            encryption_key,
-            entity_type,
-            entity_id,
-            redacted_value,
-            consumer,
-        )
-        .await
+    ) -> futures::future::BoxFuture<'a, Result<JsonValue>> {
+        Box::pin(async move {
+            let mut connection = pool.acquire().await?;
+            Self::restore_secret_entity(
+                &mut connection,
+                encryption_key,
+                entity_type,
+                entity_id,
+                redacted_value,
+                consumer,
+            )
+            .await
+        })
     }
 
-    async fn restore_workflow_variables(
-        conn: &mut PgConnection,
-        encryption_key: Option<&str>,
-        parent: &Execution,
-        variables: &JsonValue,
-    ) -> Result<(JsonValue, Vec<(JsonPointer, SecretSource)>)> {
-        let prepared =
-            if attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
-                conn,
-                attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent.id),
-            )
+    fn restore_workflow_variables<'a>(
+        conn: &'a mut PgConnection,
+        encryption_key: Option<&'a str>,
+        parent: &'a Execution,
+        variables: &'a JsonValue,
+    ) -> futures::future::BoxFuture<'a, Result<RestoredWorkflowVariables>> {
+        Box::pin(async move {
+            let prepared =
+            if attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(conn, parent.id)
             .await?
-            .is_some()
             {
                 Some(attune_common::repositories::native_input_origin::NativeInputOriginRepository::capture_with_key(
                 conn, parent.id, &[], encryption_key,
@@ -2869,77 +2907,79 @@ impl ExecutionScheduler {
             } else {
                 None
             };
-        let mut secrets = ExecutionSecretValueRepository::find_stored_by_entity(
-            &mut *conn,
-            attune_common::secret_values::ENTITY_WORKFLOW_VARIABLES,
-            parent.id,
-        )
-        .await?;
-        secrets.retain(|secret| {
-            variables
-                .pointer(&secret.json_path)
-                .is_some_and(attune_common::secret_values::is_redaction_marker)
-        });
-        if secrets.is_empty() {
+            let mut secrets = ExecutionSecretValueRepository::find_stored_by_entity(
+                &mut *conn,
+                attune_common::secret_values::ENTITY_WORKFLOW_VARIABLES,
+                parent.id,
+            )
+            .await?;
+            secrets.retain(|secret| {
+                variables
+                    .pointer(&secret.json_path)
+                    .is_some_and(attune_common::secret_values::is_redaction_marker)
+            });
+            if secrets.is_empty() {
+                if let Some(prepared) = &prepared {
+                    prepared.ensure_fresh_on(conn).await?;
+                }
+                return Ok((variables.clone(), Vec::new()));
+            }
+            let key = encryption_key
+                .ok_or_else(|| anyhow::anyhow!("Workflow variable decryption is not configured"))?;
+            let restored = if let Some(prepared) = &prepared {
+                prepared
+                    .restore_prepared(
+                        conn,
+                        attune_common::secret_values::ENTITY_WORKFLOW_VARIABLES,
+                        parent.id,
+                        variables.clone(),
+                        Some(key),
+                    )
+                    .await?
+            } else {
+                restore_secret_values(variables.clone(), &secrets, key)?
+            };
+            let sources = secrets
+                .into_iter()
+                .map(|secret| {
+                    let provenance = if secret.source_kind == "provenance" {
+                        secret
+                            .source_ref
+                            .as_deref()
+                            .and_then(|reference| serde_json::from_str(reference).ok())
+                            .unwrap_or_default()
+                    } else {
+                        attune_common::secret_provenance::SecretProvenance::default()
+                    };
+                    (secret.json_path, SecretSource::Bound(provenance))
+                })
+                .collect();
             if let Some(prepared) = &prepared {
                 prepared.ensure_fresh_on(conn).await?;
             }
-            return Ok((variables.clone(), Vec::new()));
-        }
-        let key = encryption_key
-            .ok_or_else(|| anyhow::anyhow!("Workflow variable decryption is not configured"))?;
-        let restored = if let Some(prepared) = &prepared {
-            prepared
-                .restore_prepared(
-                    conn,
-                    attune_common::secret_values::ENTITY_WORKFLOW_VARIABLES,
-                    parent.id,
-                    variables.clone(),
-                    Some(key),
-                )
-                .await?
-        } else {
-            restore_secret_values(variables.clone(), &secrets, key)?
-        };
-        let sources = secrets
-            .into_iter()
-            .map(|secret| {
-                let provenance = if secret.source_kind == "provenance" {
-                    secret
-                        .source_ref
-                        .as_deref()
-                        .and_then(|reference| serde_json::from_str(reference).ok())
-                        .unwrap_or_default()
-                } else {
-                    attune_common::secret_provenance::SecretProvenance::default()
-                };
-                (secret.json_path, SecretSource::Bound(provenance))
-            })
-            .collect();
-        if let Some(prepared) = &prepared {
-            prepared.ensure_fresh_on(conn).await?;
-        }
-        Ok((restored, sources))
+            Ok((restored, sources))
+        })
     }
 
-    async fn bind_native_workflow_closure(
-        conn: &mut PgConnection,
+    fn bind_native_workflow_closure<'a>(
+        conn: &'a mut PgConnection,
         parent: i64,
-        context: &WorkflowContext,
-        encryption_key: Option<&str>,
-    ) -> Result<Option<attune_common::repositories::native_input_origin::NativeInputClosure>> {
-        if attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
-            conn,
-            attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent),
-        )
+        context: &'a WorkflowContext,
+        encryption_key: Option<&'a str>,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<Option<attune_common::repositories::native_input_origin::NativeInputClosure>>,
+    > {
+        Box::pin(async move {
+            if !attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(conn, parent)
         .await?
-        .is_none()
         {
             return Ok(None);
         }
-        let closure = attune_common::repositories::native_input_origin::NativeInputOriginRepository::capture_workflow_with_key(conn, parent, encryption_key).await?;
-        context.bind_native_input_closure(&closure);
-        Ok(Some(closure))
+            let closure = attune_common::repositories::native_input_origin::NativeInputOriginRepository::capture_workflow_with_key(conn, parent, encryption_key).await?;
+            context.bind_native_input_closure(&closure);
+            Ok(Some(closure))
+        })
     }
 
     async fn resolve_child_task_input(
@@ -2970,7 +3010,15 @@ impl ExecutionScheduler {
         let context =
             Self::bind_workflow_task_keys(&mut *conn, parent, task, context, encryption_key)
                 .await?;
-        let rendered = Self::render_workflow_task_input(parent, &config, task, &binding, &context)?;
+        let rendered = Self::render_workflow_task_input(
+            parent,
+            &config,
+            task,
+            &binding,
+            &context,
+            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut *conn, parent.id)
+            .await?,
+        )?;
         Ok((binding, rendered))
     }
 
@@ -2989,12 +3037,9 @@ impl ExecutionScheduler {
         use attune_common::repositories::{
             declared_input::DeclaredInputRepository,
             declared_input_materialization::DeclaredInputMaterializationRepository,
-            execution_admission::ExecutionAdmissionRepository, runtime_authority::RuntimeOwner,
+            execution_admission::ExecutionAdmissionRepository,
         };
-        if ExecutionAdmissionRepository::find(conn, RuntimeOwner::Execution(parent.id))
-            .await?
-            .is_some()
-        {
+        if ExecutionAdmissionRepository::is_recorded(conn, parent.id).await? {
             let native_closure = attune_common::repositories::native_input_origin::NativeInputOriginRepository::capture_workflow(conn, parent.id).await?;
             context.bind_native_input_closure(&native_closure);
             let action_ref = workflow_action_ref(
@@ -3074,35 +3119,37 @@ impl ExecutionScheduler {
         Ok(context)
     }
 
-    async fn populate_workflow_pack_config(
-        conn: &mut PgConnection,
-        parent: &Execution,
-        context: &mut WorkflowContext,
-        encryption_key: Option<&str>,
-    ) -> Result<()> {
-        if let Some(action) = parent
-            .executable_snapshot
-            .as_ref()
-            .map(|snapshot| &snapshot.executable.action)
-        {
-            if let Some(pack) = attune_common::repositories::pack::PackRepository::find_by_id(
-                &mut *conn,
-                action.pack,
-            )
-            .await?
+    fn populate_workflow_pack_config<'a>(
+        conn: &'a mut PgConnection,
+        parent: &'a Execution,
+        context: &'a mut WorkflowContext,
+        encryption_key: Option<&'a str>,
+    ) -> futures::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if let Some(action) = parent
+                .executable_snapshot
+                .as_ref()
+                .map(|snapshot| &snapshot.executable.action)
             {
-                let authorities = attune_common::repositories::execution_admission::ExecutionAdmissionRepository::input_authorities(
+                if let Some(pack) = attune_common::repositories::pack::PackRepository::find_by_id(
+                    &mut *conn,
+                    action.pack,
+                )
+                .await?
+                {
+                    let authorities = attune_common::repositories::execution_admission::ExecutionAdmissionRepository::input_authorities(
                     &mut *conn, parent.id, parent.executor).await?;
-                let (values, paths, revision) = attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::pack_template_values(
+                    let (values, paths, revision) = attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::pack_template_values(
                     conn, &pack, &authorities, encryption_key).await?;
-                if let Some(revision) = revision {
-                    context.set_bound_pack_config(values, revision, &paths);
-                } else {
-                    context.set_pack_config(values);
+                    if let Some(revision) = revision {
+                        context.set_bound_pack_config(values, revision, &paths);
+                    } else {
+                        context.set_pack_config(values);
+                    }
                 }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn workflow_task_permission_set_refs(
@@ -3297,7 +3344,9 @@ impl ExecutionScheduler {
                         CacheIterationInitializationFailure::OwnerResolution,
                     ));
                 }
-                let recorded = attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(conn, attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent_execution.id)).await.map_err(CacheIterationInitializationError::infrastructure)?;
+                let recorded = if attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(conn, parent_execution.id).await.map_err(CacheIterationInitializationError::infrastructure)? {
+                    Some(attune_common::repositories::execution_admission::ExecutionAdmissionRepository::require(conn, attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent_execution.id)).await.map_err(CacheIterationInitializationError::infrastructure)?)
+                } else { None };
                 let identity_id = recorded
                     .map(|record| record.authority.owner.sponsor_identity_id)
                     .or(parent_execution.executor)
@@ -3567,25 +3616,18 @@ impl ExecutionScheduler {
         task: &str,
     ) -> Result<ExecutionExecutableSnapshot> {
         let mut connection = pool.acquire().await?;
-        if attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
-            &mut connection,
-            attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent.id),
-        )
+        if attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut connection, parent.id)
         .await?
-        .is_some()
         {
             return attune_common::repositories::execution_admission::ExecutionAdmissionRepository::resolve_workflow_snapshot(&mut connection, parent.id, task, action_ref).await.map_err(Into::into);
         }
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::validate(
+            &mut connection,
+            parent.id,
+        )
+        .await?;
         drop(connection);
-        if parent
-            .executable_snapshot
-            .as_ref()
-            .is_some_and(|snapshot| !snapshot.executable.action.is_adhoc)
-        {
-            return Err(anyhow::anyhow!(
-                "Managed workflow snapshot requires its retained admission"
-            ));
-        }
+
         if let Some(binding) = attune_common::repositories::schema_contract::SchemaContractRepository::find_with_executor(
             pool, attune_common::repositories::schema_contract::BindingOwner::Execution, parent.id,
         ).await? {
@@ -3610,24 +3652,16 @@ impl ExecutionScheduler {
         action_ref: &str,
         task: &str,
     ) -> Result<ExecutionExecutableSnapshot> {
-        if attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
-            conn,
-            attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent.id),
-        )
+        if attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(conn, parent.id)
         .await?
-        .is_some()
         {
             return attune_common::repositories::execution_admission::ExecutionAdmissionRepository::resolve_workflow_snapshot(conn, parent.id, task, action_ref).await.map_err(Into::into);
         }
-        if parent
-            .executable_snapshot
-            .as_ref()
-            .is_some_and(|snapshot| !snapshot.executable.action.is_adhoc)
-        {
-            return Err(anyhow::anyhow!(
-                "Managed workflow snapshot requires its retained admission"
-            ));
-        }
+
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::validate(
+            conn, parent.id,
+        )
+        .await?;
         if let Some(binding) = attune_common::repositories::schema_contract::SchemaContractRepository::find_with_executor(
             &mut *conn, attune_common::repositories::schema_contract::BindingOwner::Execution, parent.id,
         ).await? {
@@ -3654,140 +3688,141 @@ impl ExecutionScheduler {
     /// caused this task to be scheduled.  Pass `None` for entry-point tasks
     /// dispatched at workflow start.
     #[allow(clippy::too_many_arguments)]
-    async fn dispatch_workflow_task(
-        pool: &PgPool,
-        publisher: &Publisher,
-        _round_robin_counter: &AtomicUsize,
-        parent_execution: &Execution,
-        workflow_execution_id: &i64,
-        task_node: &crate::workflow::graph::TaskNode,
-        wf_ctx: &WorkflowContext,
-        encryption_key: Option<&str>,
-        triggered_by: Option<&str>,
-    ) -> Result<()> {
-        if task_node.with_items.is_some()
-            && task_node.iterate_cache.is_none()
-            && Self::dispatch_native_iteration(
-                pool,
-                publisher,
-                parent_execution,
-                &task_node.name,
-                triggered_by,
-                encryption_key,
-                None,
-            )
-            .await?
-        {
-            return Ok(());
-        }
-        let action_ref: String = match &task_node.action {
-            Some(a) => workflow_action_ref(a, wf_ctx)?,
-            None => {
-                warn!(
-                    "Workflow task '{}' has no action reference, skipping",
-                    task_node.name
-                );
+    fn dispatch_workflow_task<'a>(
+        pool: &'a PgPool,
+        publisher: &'a Publisher,
+        _round_robin_counter: &'a AtomicUsize,
+        parent_execution: &'a Execution,
+        workflow_execution_id: &'a i64,
+        task_node: &'a crate::workflow::graph::TaskNode,
+        wf_ctx: &'a WorkflowContext,
+        encryption_key: Option<&'a str>,
+        triggered_by: Option<&'a str>,
+    ) -> futures::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if task_node.with_items.is_some()
+                && task_node.iterate_cache.is_none()
+                && Self::dispatch_native_iteration(
+                    pool,
+                    publisher,
+                    parent_execution,
+                    &task_node.name,
+                    triggered_by,
+                    encryption_key,
+                    None,
+                )
+                .await?
+            {
                 return Ok(());
             }
-        };
+            let action_ref: String = match &task_node.action {
+                Some(a) => workflow_action_ref(a, wf_ctx)?,
+                None => {
+                    warn!(
+                        "Workflow task '{}' has no action reference, skipping",
+                        task_node.name
+                    );
+                    return Ok(());
+                }
+            };
 
-        let task_snapshot =
-            Self::workflow_task_snapshot(pool, parent_execution, &action_ref, &task_node.name)
-                .await?;
-        let task_action = task_snapshot.executable.action.clone();
+            let task_snapshot =
+                Self::workflow_task_snapshot(pool, parent_execution, &action_ref, &task_node.name)
+                    .await?;
+            let task_action = task_snapshot.executable.action.clone();
 
-        if task_node.iterate_cache.is_some() {
-            return Self::dispatch_cache_iteration_task(
-                pool,
-                publisher,
+            if task_node.iterate_cache.is_some() {
+                return Self::dispatch_cache_iteration_task(
+                    pool,
+                    publisher,
+                    parent_execution,
+                    workflow_execution_id,
+                    task_node,
+                    &task_action,
+                    &task_snapshot,
+                    &action_ref,
+                    wf_ctx,
+                    encryption_key,
+                    triggered_by,
+                )
+                .await;
+            }
+
+            // -----------------------------------------------------------------
+            // with_items expansion: if the task declares `with_items`, resolve
+            // the list expression and create one child execution per item (up
+            // to `concurrency` in parallel — though concurrency limiting is
+            // left for a future enhancement; we fan out all items now).
+            // -----------------------------------------------------------------
+            if let Some(ref with_items_expr) = task_node.with_items {
+                return Self::dispatch_with_items_task(
+                    pool,
+                    publisher,
+                    parent_execution,
+                    workflow_execution_id,
+                    task_node,
+                    &task_action,
+                    &task_snapshot,
+                    &action_ref,
+                    with_items_expr,
+                    wf_ctx,
+                    encryption_key,
+                    triggered_by,
+                )
+                .await;
+            }
+
+            // -----------------------------------------------------------------
+            // Render task input templates through the WorkflowContext
+            // -----------------------------------------------------------------
+            let mut child_transaction = pool.begin().await?;
+            let (child_binding, rendered_input) = Self::resolve_child_task_input(
+                &mut child_transaction,
                 parent_execution,
-                workflow_execution_id,
                 task_node,
-                &task_action,
                 &task_snapshot,
-                &action_ref,
                 wf_ctx,
                 encryption_key,
-                triggered_by,
             )
-            .await;
-        }
+            .await?;
+            let task_config = if rendered_input.value.is_object()
+                && !rendered_input.value.as_object().unwrap().is_empty()
+            {
+                Some(rendered_input.value.clone())
+            } else {
+                parent_execution.config.clone()
+            };
 
-        // -----------------------------------------------------------------
-        // with_items expansion: if the task declares `with_items`, resolve
-        // the list expression and create one child execution per item (up
-        // to `concurrency` in parallel — though concurrency limiting is
-        // left for a future enhancement; we fan out all items now).
-        // -----------------------------------------------------------------
-        if let Some(ref with_items_expr) = task_node.with_items {
-            return Self::dispatch_with_items_task(
-                pool,
-                publisher,
-                parent_execution,
-                workflow_execution_id,
-                task_node,
-                &task_action,
-                &task_snapshot,
-                &action_ref,
-                with_items_expr,
-                wf_ctx,
-                encryption_key,
-                triggered_by,
-            )
-            .await;
-        }
+            let permission_set_refs =
+                Self::workflow_task_permission_set_refs(task_node, &task_action, wf_ctx)?;
+            let (worker_selector, worker_tolerations, worker_affinity) =
+                Self::workflow_task_placement_overrides(task_node, wf_ctx)?;
+            let task_timeout_seconds = Self::resolve_workflow_task_timeout(task_node, wf_ctx)?;
 
-        // -----------------------------------------------------------------
-        // Render task input templates through the WorkflowContext
-        // -----------------------------------------------------------------
-        let mut child_transaction = pool.begin().await?;
-        let (child_binding, rendered_input) = Self::resolve_child_task_input(
-            &mut child_transaction,
-            parent_execution,
-            task_node,
-            &task_snapshot,
-            wf_ctx,
-            encryption_key,
-        )
-        .await?;
-        let task_config = if rendered_input.value.is_object()
-            && !rendered_input.value.as_object().unwrap().is_empty()
-        {
-            Some(rendered_input.value.clone())
-        } else {
-            parent_execution.config.clone()
-        };
+            // Build workflow task metadata
+            let workflow_task = WorkflowTaskMetadata {
+                workflow_execution: *workflow_execution_id,
+                task_name: task_node.name.clone(),
+                triggered_by: triggered_by.map(String::from),
+                task_index: None,
+                task_batch: None,
+                retry_count: 0,
+                max_retries: task_node
+                    .retry
+                    .as_ref()
+                    .map(|r| r.count as i32)
+                    .unwrap_or(0),
+                next_retry_at: None,
+                timeout_seconds: task_timeout_seconds.map(|seconds| seconds as i32),
+                timed_out: false,
+                duration_ms: None,
+                started_at: None,
+                completed_at: None,
+            };
 
-        let permission_set_refs =
-            Self::workflow_task_permission_set_refs(task_node, &task_action, wf_ctx)?;
-        let (worker_selector, worker_tolerations, worker_affinity) =
-            Self::workflow_task_placement_overrides(task_node, wf_ctx)?;
-        let task_timeout_seconds = Self::resolve_workflow_task_timeout(task_node, wf_ctx)?;
-
-        // Build workflow task metadata
-        let workflow_task = WorkflowTaskMetadata {
-            workflow_execution: *workflow_execution_id,
-            task_name: task_node.name.clone(),
-            triggered_by: triggered_by.map(String::from),
-            task_index: None,
-            task_batch: None,
-            retry_count: 0,
-            max_retries: task_node
-                .retry
-                .as_ref()
-                .map(|r| r.count as i32)
-                .unwrap_or(0),
-            next_retry_at: None,
-            timeout_seconds: task_timeout_seconds.map(|seconds| seconds as i32),
-            timed_out: false,
-            duration_ms: None,
-            started_at: None,
-            completed_at: None,
-        };
-
-        // Create child execution record, or reuse an existing one if another
-        // scheduler/advance path already dispatched this workflow task.
-        let child_execution_result =
+            // Create child execution record, or reuse an existing one if another
+            // scheduler/advance path already dispatched this workflow task.
+            let child_execution_result =
             attune_common::repositories::execution_admission::ExecutionAdmissionRepository::create_workflow_task_if_absent_pinned_with_conn(
                 &mut child_transaction,
                 CreateExecutionInput {
@@ -3829,279 +3864,255 @@ impl ExecutionScheduler {
                 None,
             )
             .await?;
-        let mut child_execution = child_execution_result.execution;
-        let mut input_receipts = TransactionInputReceipts::default();
-        if child_execution_result.created {
-            attune_common::repositories::schema_contract::SchemaContractRepository::attach(
-                &mut child_transaction,
-                attune_common::repositories::schema_contract::BindingOwner::Execution,
-                child_execution.id,
-                &child_binding,
-            )
-            .await?;
-            let prepared = Self::persist_prepared_execution_inputs_with_conn(
-                &mut child_transaction,
-                encryption_key,
-                child_execution.id,
-                &rendered_input.supplied,
-                rendered_input.secret_inputs,
-            )
-            .await?;
-            child_execution = input_receipts.retain(prepared);
-        } else if child_execution.status == ExecutionStatus::Requested {
-            input_receipts
-                .retain_existing(&mut child_transaction, &child_execution, encryption_key)
+            let mut child_execution = child_execution_result.execution;
+            let mut input_receipts = TransactionInputReceipts::default();
+            if child_execution_result.created {
+                attune_common::repositories::schema_contract::SchemaContractRepository::attach(
+                    &mut child_transaction,
+                    attune_common::repositories::schema_contract::BindingOwner::Execution,
+                    child_execution.id,
+                    &child_binding,
+                )
                 .await?;
-        }
-        input_receipts
-            .ensure_fresh_on(&mut child_transaction)
-            .await?;
-        child_transaction.commit().await?;
-        input_receipts.ensure_fresh()?;
+                let prepared = Self::persist_prepared_execution_inputs_with_conn(
+                    &mut child_transaction,
+                    encryption_key,
+                    child_execution.id,
+                    &rendered_input.supplied,
+                    rendered_input.secret_inputs,
+                )
+                .await?;
+                child_execution = input_receipts.retain(prepared);
+            } else if child_execution.status == ExecutionStatus::Requested {
+                input_receipts
+                    .retain_existing(&mut child_transaction, &child_execution, encryption_key)
+                    .await?;
+            }
+            input_receipts
+                .ensure_fresh_on(&mut child_transaction)
+                .await?;
+            child_transaction.commit().await?;
+            input_receipts.ensure_fresh()?;
 
-        if child_execution_result.created {
-            info!(
+            if child_execution_result.created {
+                info!(
                 "Created child execution {} for workflow task '{}' (action '{}', workflow_execution {})",
                 child_execution.id, task_node.name, action_ref, workflow_execution_id
             );
-        } else {
-            debug!(
-                "Reusing child execution {} for workflow task '{}' (workflow_execution {})",
-                child_execution.id, task_node.name, workflow_execution_id
-            );
-        }
+            } else {
+                debug!(
+                    "Reusing child execution {} for workflow task '{}' (workflow_execution {})",
+                    child_execution.id, task_node.name, workflow_execution_id
+                );
+            }
 
-        if child_execution.status == ExecutionStatus::Requested {
-            // If the task's action is itself a workflow, the recursive
-            // `process_execution_requested` call will detect that and orchestrate
-            // it in turn. For regular actions it will be dispatched to a worker.
-            let payload = ExecutionRequestedPayload {
-                execution_id: child_execution.id,
-                action_id: Some(task_action.id),
-                action_ref: action_ref.clone(),
-                parent_id: Some(parent_execution.id),
-                enforcement_id: parent_execution.enforcement,
-                config: child_execution.config.clone(),
-                release_id: child_execution.pack_release,
-                release_digest: child_execution.pack_release_digest.clone(),
-            };
+            if child_execution.status == ExecutionStatus::Requested {
+                // If the task's action is itself a workflow, the recursive
+                // `process_execution_requested` call will detect that and orchestrate
+                // it in turn. For regular actions it will be dispatched to a worker.
+                let payload = ExecutionRequestedPayload {
+                    execution_id: child_execution.id,
+                    action_id: Some(task_action.id),
+                    action_ref: action_ref.clone(),
+                    parent_id: Some(parent_execution.id),
+                    enforcement_id: parent_execution.enforcement,
+                    config: child_execution.config.clone(),
+                    release_id: child_execution.pack_release,
+                    release_digest: child_execution.pack_release_digest.clone(),
+                };
 
-            let envelope = MessageEnvelope::new(MessageType::ExecutionRequested, payload)
-                .with_source("executor-scheduler");
+                let envelope = MessageEnvelope::new(MessageType::ExecutionRequested, payload)
+                    .with_source("executor-scheduler");
 
-            input_receipts.ensure_execution_fresh(child_execution.id)?;
-            Self::publish_input_envelope_guarded(
-                publisher,
-                &envelope,
-                input_receipts.publication_wait_deadline(child_execution.id)?,
-                &|| input_receipts.ensure_execution_fresh(child_execution.id),
-            )
-            .await?;
+                input_receipts.ensure_execution_fresh(child_execution.id)?;
+                Self::publish_input_envelope_guarded(
+                    publisher,
+                    &envelope,
+                    input_receipts.publication_wait_deadline(child_execution.id)?,
+                    &|| input_receipts.ensure_execution_fresh(child_execution.id),
+                )
+                .await?;
 
-            info!(
-                "Published ExecutionRequested for child execution {} (task '{}')",
-                child_execution.id, task_node.name
-            );
-        }
+                info!(
+                    "Published ExecutionRequested for child execution {} (task '{}')",
+                    child_execution.id, task_node.name
+                );
+            }
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// If a failed workflow child has retry attempts remaining, create and
     /// publish the next attempt and leave workflow advancement paused until that
     /// retry reaches a terminal state.
-    pub async fn maybe_retry_workflow_task(
-        pool: &PgPool,
-        publisher: &Publisher,
-        execution: &Execution,
-        encryption_key: Option<&str>,
-    ) -> Result<bool> {
-        use attune_common::repositories::native_retry_materialization::NativeRetryMaterializationRepository as RetryInputs;
+    pub fn maybe_retry_workflow_task<'a>(
+        pool: &'a PgPool,
+        publisher: &'a Publisher,
+        execution: &'a Execution,
+        encryption_key: Option<&'a str>,
+    ) -> futures::future::BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            use attune_common::repositories::native_retry_materialization::NativeRetryMaterializationRepository as RetryInputs;
 
-        if !matches!(
-            execution.status,
-            ExecutionStatus::Failed | ExecutionStatus::Timeout
-        ) {
-            return Ok(false);
-        }
+            if !matches!(
+                execution.status,
+                ExecutionStatus::Failed | ExecutionStatus::Timeout
+            ) {
+                return Ok(false);
+            }
 
-        let Some(workflow_task) = execution.workflow_task.as_ref() else {
-            return Ok(false);
-        };
+            let Some(workflow_task) = execution.workflow_task.as_ref() else {
+                return Ok(false);
+            };
 
-        if workflow_task.retry_count >= workflow_task.max_retries {
-            return Ok(false);
-        }
+            if workflow_task.retry_count >= workflow_task.max_retries {
+                return Ok(false);
+            }
 
-        let workflow_execution =
-            WorkflowExecutionRepository::find_by_id(pool, workflow_task.workflow_execution)
-                .await?
-                .ok_or_else(|| {
+            let workflow_execution =
+                WorkflowExecutionRepository::find_by_id(pool, workflow_task.workflow_execution)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Workflow execution {} not found for retry of execution {}",
+                            workflow_task.workflow_execution,
+                            execution.id
+                        )
+                    })?;
+
+            let graph: TaskGraph = serde_json::from_value(workflow_execution.task_graph.clone())
+                .map_err(|e| {
                     anyhow::anyhow!(
-                        "Workflow execution {} not found for retry of execution {}",
+                        "Failed to deserialize task graph for workflow_execution {}: {}",
                         workflow_task.workflow_execution,
-                        execution.id
+                        e
                     )
                 })?;
 
-        let graph: TaskGraph = serde_json::from_value(workflow_execution.task_graph.clone())
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to deserialize task graph for workflow_execution {}: {}",
-                    workflow_task.workflow_execution,
-                    e
-                )
-            })?;
-
-        let Some(task_node) = graph.nodes.get(&workflow_task.task_name) else {
-            warn!(
+            let Some(task_node) = graph.nodes.get(&workflow_task.task_name) else {
+                warn!(
                 "Workflow task '{}' not found in workflow_execution {}, cannot retry execution {}",
                 workflow_task.task_name, workflow_task.workflow_execution, execution.id
             );
-            return Ok(false);
-        };
+                return Ok(false);
+            };
 
-        let Some(retry_config) = task_node.retry.as_ref() else {
-            return Ok(false);
-        };
+            let Some(retry_config) = task_node.retry.as_ref() else {
+                return Ok(false);
+            };
 
-        let next_retry_count = workflow_task.retry_count + 1;
-        if next_retry_count > retry_config.count as i32 {
-            return Ok(false);
-        }
-
-        let base_delay = retry_config.delay;
-        let mut delay_seconds = match retry_config.backoff {
-            BackoffStrategy::Constant => base_delay,
-            BackoffStrategy::Linear => base_delay.saturating_mul(next_retry_count as u32),
-            BackoffStrategy::Exponential => {
-                base_delay.saturating_mul(2_u32.saturating_pow((next_retry_count - 1) as u32))
+            let next_retry_count = workflow_task.retry_count + 1;
+            if next_retry_count > retry_config.count as i32 {
+                return Ok(false);
             }
-        };
-        if let Some(max_delay) = retry_config.max_delay {
-            delay_seconds = delay_seconds.min(max_delay);
-        }
 
-        let mut retry_metadata = workflow_task.clone();
-        retry_metadata.retry_count = next_retry_count;
-        retry_metadata.max_retries = retry_config.count as i32;
-        retry_metadata.next_retry_at =
-            Some(Utc::now() + chrono::Duration::seconds(delay_seconds as i64));
-        retry_metadata.started_at = None;
-        retry_metadata.completed_at = None;
-        retry_metadata.duration_ms = None;
-        retry_metadata.timed_out = false;
+            let base_delay = retry_config.delay;
+            let mut delay_seconds = match retry_config.backoff {
+                BackoffStrategy::Constant => base_delay,
+                BackoffStrategy::Linear => base_delay.saturating_mul(next_retry_count as u32),
+                BackoffStrategy::Exponential => {
+                    base_delay.saturating_mul(2_u32.saturating_pow((next_retry_count - 1) as u32))
+                }
+            };
+            if let Some(max_delay) = retry_config.max_delay {
+                delay_seconds = delay_seconds.min(max_delay);
+            }
 
-        let mut retry_transaction = pool.begin().await?;
-        let key = encryption_key
-            .ok_or_else(|| anyhow::anyhow!("Retry input encryption is unavailable"))?;
-        let prepared =
-            RetryInputs::prepare(&mut retry_transaction, execution, &workflow_execution, key)
-                .await?;
-        let retry_execution = prepared
-            .materialize(&mut retry_transaction, retry_metadata)
+            let mut retry_metadata = workflow_task.clone();
+            retry_metadata.retry_count = next_retry_count;
+            retry_metadata.max_retries = retry_config.count as i32;
+            retry_metadata.next_retry_at =
+                Some(Utc::now() + chrono::Duration::seconds(delay_seconds as i64));
+            retry_metadata.started_at = None;
+            retry_metadata.completed_at = None;
+            retry_metadata.duration_ms = None;
+            retry_metadata.timed_out = false;
+
+            let mut retry_transaction = pool.begin().await?;
+            let key = encryption_key
+                .ok_or_else(|| anyhow::anyhow!("Retry input encryption is unavailable"))?;
+            let prepared = Box::pin(async {
+                RetryInputs::prepare(&mut retry_transaction, execution, &workflow_execution, key)
+                    .await
+            })
             .await?;
-        prepared.ensure_fresh_on(&mut retry_transaction).await?;
-        retry_transaction.commit().await?;
-        let Some(retry_execution) = retry_execution else {
-            // Another completion already committed this task/index's successor.
-            return Ok(true);
-        };
+            let retry_execution = Box::pin(async {
+                prepared
+                    .materialize(&mut retry_transaction, retry_metadata)
+                    .await
+            })
+            .await?;
+            prepared.ensure_fresh_on(&mut retry_transaction).await?;
+            retry_transaction.commit().await?;
+            let Some(retry_execution) = retry_execution else {
+                // Another completion already committed this task/index's successor.
+                return Ok(true);
+            };
 
-        info!(
-            "Scheduled retry execution {} for workflow task '{}' after {}s ({}/{})",
-            retry_execution.id,
-            workflow_task.task_name,
-            delay_seconds,
-            next_retry_count,
-            retry_config.count
-        );
+            info!(
+                "Scheduled retry execution {} for workflow task '{}' after {}s ({}/{})",
+                retry_execution.id,
+                workflow_task.task_name,
+                delay_seconds,
+                next_retry_count,
+                retry_config.count
+            );
 
-        if let Some(deadline) = retry_execution
-            .workflow_task
-            .as_ref()
-            .and_then(|task| task.next_retry_at.as_ref())
-        {
-            let delay = (*deadline - Utc::now()).to_std().unwrap_or_default();
-            if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
+            if let Some(deadline) = retry_execution
+                .workflow_task
+                .as_ref()
+                .and_then(|task| task.next_retry_at.as_ref())
+            {
+                let delay = (*deadline - Utc::now()).to_std().unwrap_or_default();
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
             }
-        }
 
-        let mut publication = pool.begin().await?;
-        let prepared_publication =
-            RetryInputs::prepare_publication(&mut publication, &retry_execution, execution.id, key)
-                .await?;
-        prepared_publication.lock_target(&mut publication).await?;
-        let payload = ExecutionRequestedPayload {
-            execution_id: retry_execution.id,
-            action_id: retry_execution.action,
-            action_ref: retry_execution.action_ref.clone(),
-            parent_id: retry_execution.parent,
-            enforcement_id: retry_execution.enforcement,
-            config: retry_execution.config.clone(),
-            release_id: retry_execution.pack_release,
-            release_digest: retry_execution.pack_release_digest.clone(),
-        };
-        let envelope = MessageEnvelope::new(MessageType::ExecutionRequested, payload)
-            .with_source("executor-scheduler");
-        if let Err(error) = prepared_publication
-            .publish_bounded(&mut publication, publisher.publish_envelope(&envelope))
-            .await
-        {
-            publication.rollback().await?;
-            return Err(error.into());
-        }
-        publication.commit().await?;
+            let mut publication = pool.begin().await?;
+            let prepared_publication = attune_common::repositories::requested_execution_publication::RequestedExecutionPublicationRepository::prepare(&mut publication,&retry_execution,key).await?.ok_or_else(||anyhow::anyhow!("Retry publication is no longer eligible"))?;
+            prepared_publication.lock_target(&mut publication).await?;
+            let payload = ExecutionRequestedPayload {
+                execution_id: retry_execution.id,
+                action_id: retry_execution.action,
+                action_ref: retry_execution.action_ref.clone(),
+                parent_id: retry_execution.parent,
+                enforcement_id: retry_execution.enforcement,
+                config: retry_execution.config.clone(),
+                release_id: retry_execution.pack_release,
+                release_digest: retry_execution.pack_release_digest.clone(),
+            };
+            let envelope = MessageEnvelope::new(MessageType::ExecutionRequested, payload)
+                .with_source("executor-scheduler");
+            if let Err(error) = prepared_publication
+                .publish_bounded(&mut publication, publisher.publish_envelope(&envelope))
+                .await
+            {
+                publication.rollback().await?;
+                return Err(error.into());
+            }
+            publication.commit().await?;
 
-        Ok(true)
+            Ok(true)
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn activate_workflow_task_with_conn(
-        conn: &mut PgConnection,
-        round_robin_counter: &AtomicUsize,
-        parent_execution: &Execution,
-        workflow_execution_id: &i64,
-        task_node: &crate::workflow::graph::TaskNode,
-        wf_ctx: &WorkflowContext,
-        encryption_key: Option<&str>,
-        triggered_by: Option<&str>,
-        pending_messages: &mut WorkflowPublications,
-        pending_completions: &mut Vec<PendingExecutionCompleted>,
-    ) -> Result<()> {
-        Self::activate_workflow_task_with_input_plan(
-            conn,
-            round_robin_counter,
-            parent_execution,
-            workflow_execution_id,
-            task_node,
-            wf_ctx,
-            encryption_key,
-            triggered_by,
-            pending_messages,
-            pending_completions,
-            None,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn activate_workflow_task_with_input_plan(
-        conn: &mut PgConnection,
-        round_robin_counter: &AtomicUsize,
-        parent_execution: &Execution,
-        workflow_execution_id: &i64,
-        task_node: &crate::workflow::graph::TaskNode,
-        wf_ctx: &WorkflowContext,
-        encryption_key: Option<&str>,
-        triggered_by: Option<&str>,
-        pending_messages: &mut WorkflowPublications,
-        pending_completions: &mut Vec<PendingExecutionCompleted>,
-        input_plan: Option<&attune_common::repositories::native_transition_materialization::PreparedNativeTransitions>,
-    ) -> Result<()> {
-        let Some(wait_for) = &task_node.wait_for else {
-            return Self::dispatch_workflow_task_with_input_plan(
+    fn activate_workflow_task_with_conn<'a>(
+        conn: &'a mut PgConnection,
+        round_robin_counter: &'a AtomicUsize,
+        parent_execution: &'a Execution,
+        workflow_execution_id: &'a i64,
+        task_node: &'a crate::workflow::graph::TaskNode,
+        wf_ctx: &'a WorkflowContext,
+        encryption_key: Option<&'a str>,
+        triggered_by: Option<&'a str>,
+        pending_messages: &'a mut WorkflowPublications,
+        pending_completions: &'a mut Vec<PendingExecutionCompleted>,
+    ) -> futures::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            Self::activate_workflow_task_with_input_plan(
                 conn,
                 round_robin_counter,
                 parent_execution,
@@ -4112,167 +4123,170 @@ impl ExecutionScheduler {
                 triggered_by,
                 pending_messages,
                 pending_completions,
-                input_plan,
+                None,
             )
-            .await;
-        };
+            .await
+        })
+    }
 
-        let invalid_prerequisite = |detail: String| {
-            anyhow::Error::new(TaskWaitPrerequisiteError {
-                task_name: task_node.name.clone(),
-                detail,
-            })
-        };
-        let (target_name, target_template) = wait_for.target();
-        let rendered = wf_ctx.render_json(target_template).map_err(|error| {
-            invalid_prerequisite(format!(
-                "failed to render {target_name} prerequisite for task '{}': {error}",
-                task_node.name
-            ))
-        })?;
-        let target_id = rendered.as_i64().filter(|id| *id > 0).ok_or_else(|| {
-            invalid_prerequisite(format!(
-                "{target_name} prerequisite for task '{}' must resolve to a positive integer",
-                task_node.name
-            ))
-        })?;
-        let target = match wait_for {
-            TaskWaitFor::Inquiry(_) => WorkflowTaskWaitTarget::Inquiry(target_id),
-            TaskWaitFor::Execution(_) => WorkflowTaskWaitTarget::Execution(target_id),
-            TaskWaitFor::WorkQueueItem(_) => WorkflowTaskWaitTarget::WorkQueueItem(target_id),
-        };
+    #[allow(clippy::too_many_arguments)]
+    fn activate_workflow_task_with_input_plan<'a>(
+        conn: &'a mut PgConnection,
+        round_robin_counter: &'a AtomicUsize,
+        parent_execution: &'a Execution,
+        workflow_execution_id: &'a i64,
+        task_node: &'a crate::workflow::graph::TaskNode,
+        wf_ctx: &'a WorkflowContext,
+        encryption_key: Option<&'a str>,
+        triggered_by: Option<&'a str>,
+        pending_messages: &'a mut WorkflowPublications,
+        pending_completions: &'a mut Vec<PendingExecutionCompleted>,
+        input_plan: Option<&'a attune_common::repositories::native_transition_materialization::PreparedNativeTransitions>,
+    ) -> futures::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let Some(wait_for) = &task_node.wait_for else {
+                return Self::dispatch_workflow_task_with_input_plan(
+                    conn,
+                    round_robin_counter,
+                    parent_execution,
+                    workflow_execution_id,
+                    task_node,
+                    wf_ctx,
+                    encryption_key,
+                    triggered_by,
+                    pending_messages,
+                    pending_completions,
+                    input_plan,
+                )
+                .await;
+            };
 
-        if let Some(existing) = WorkflowTaskWaitRepository::find_by_workflow_task(
-            &mut *conn,
-            *workflow_execution_id,
-            &task_node.name,
-        )
-        .await?
-        {
-            if existing.target()? != target {
-                return Err(invalid_prerequisite(format!(
-                    "task '{}' already waits on an unrelated target",
+            let invalid_prerequisite = |detail: String| {
+                anyhow::Error::new(TaskWaitPrerequisiteError {
+                    task_name: task_node.name.clone(),
+                    detail,
+                })
+            };
+            let (target_name, target_template) = wait_for.target();
+            let rendered = wf_ctx.render_json(target_template).map_err(|error| {
+                invalid_prerequisite(format!(
+                    "failed to render {target_name} prerequisite for task '{}': {error}",
                     task_node.name
-                )));
-            }
-            match existing.state {
-                WorkflowTaskWaitState::Released => {
-                    let mut target_context = wf_ctx.clone();
-                    if let Some(snapshot) = existing.result {
-                        Self::set_task_wait_context(
-                            &mut target_context,
-                            target,
-                            &task_node.name,
-                            snapshot,
-                        );
-                        Self::restore_inquiry_wait_context(
-                            &mut *conn,
-                            &mut target_context,
-                            target,
-                            &task_node.name,
-                            parent_execution.executor,
-                            encryption_key,
-                        )
-                        .await?;
-                    }
-                    return Self::dispatch_workflow_task_with_input_plan(
-                        conn,
-                        round_robin_counter,
-                        parent_execution,
-                        workflow_execution_id,
-                        task_node,
-                        &target_context,
-                        encryption_key,
-                        triggered_by,
-                        pending_messages,
-                        pending_completions,
-                        input_plan,
-                    )
-                    .await;
-                }
-                WorkflowTaskWaitState::Waiting => {}
-                WorkflowTaskWaitState::TimedOut
-                | WorkflowTaskWaitState::Cancelled
-                | WorkflowTaskWaitState::Failed => return Ok(()),
-            }
-        }
+                ))
+            })?;
+            let target_id = rendered.as_i64().filter(|id| *id > 0).ok_or_else(|| {
+                invalid_prerequisite(format!(
+                    "{target_name} prerequisite for task '{}' must resolve to a positive integer",
+                    task_node.name
+                ))
+            })?;
+            let target = match wait_for {
+                TaskWaitFor::Inquiry(_) => WorkflowTaskWaitTarget::Inquiry(target_id),
+                TaskWaitFor::Execution(_) => WorkflowTaskWaitTarget::Execution(target_id),
+                TaskWaitFor::WorkQueueItem(_) => WorkflowTaskWaitTarget::WorkQueueItem(target_id),
+            };
 
-        let resolution = Self::resolve_task_wait_target(
-            conn,
-            parent_execution.id,
-            *workflow_execution_id,
-            target,
-            &task_node.name,
-        )
-        .await?;
-
-        let wait = WorkflowTaskWaitRepository::create_or_get(
-            conn,
-            CreateWorkflowTaskWaitInput {
-                workflow_execution: *workflow_execution_id,
-                task_name: task_node.name.clone(),
-                target,
-            },
-        )
-        .await?;
-
-        if !matches!(
-            wait.state,
-            WorkflowTaskWaitState::Waiting | WorkflowTaskWaitState::Released
-        ) {
-            return Ok(());
-        }
-
-        if wait.state == WorkflowTaskWaitState::Released {
-            let mut target_context = wf_ctx.clone();
-            if let Some(snapshot) = wait.result {
-                Self::set_task_wait_context(&mut target_context, target, &task_node.name, snapshot);
-                Self::restore_inquiry_wait_context(
-                    &mut *conn,
-                    &mut target_context,
-                    target,
-                    &task_node.name,
-                    parent_execution.executor,
-                    encryption_key,
-                )
-                .await?;
-            }
-            return Self::dispatch_workflow_task_with_input_plan(
-                conn,
-                round_robin_counter,
-                parent_execution,
-                workflow_execution_id,
-                task_node,
-                &target_context,
-                encryption_key,
-                triggered_by,
-                pending_messages,
-                pending_completions,
-                input_plan,
+            if let Some(existing) = WorkflowTaskWaitRepository::find_by_workflow_task(
+                &mut *conn,
+                *workflow_execution_id,
+                &task_node.name,
             )
-            .await;
-        }
+            .await?
+            {
+                if existing.target()? != target {
+                    return Err(invalid_prerequisite(format!(
+                        "task '{}' already waits on an unrelated target",
+                        task_node.name
+                    )));
+                }
+                match existing.state {
+                    WorkflowTaskWaitState::Released => {
+                        let mut target_context = wf_ctx.clone();
+                        if let Some(snapshot) = existing.result {
+                            Self::set_task_wait_context(
+                                &mut target_context,
+                                target,
+                                &task_node.name,
+                                snapshot,
+                            );
+                            Self::restore_inquiry_wait_context(
+                                &mut *conn,
+                                &mut target_context,
+                                target,
+                                &task_node.name,
+                                parent_execution.executor,
+                                encryption_key,
+                            )
+                            .await?;
+                        }
+                        return Self::dispatch_workflow_task_with_input_plan(
+                            conn,
+                            round_robin_counter,
+                            parent_execution,
+                            workflow_execution_id,
+                            task_node,
+                            &target_context,
+                            encryption_key,
+                            triggered_by,
+                            pending_messages,
+                            pending_completions,
+                            input_plan,
+                        )
+                        .await;
+                    }
+                    WorkflowTaskWaitState::Waiting => {}
+                    WorkflowTaskWaitState::TimedOut
+                    | WorkflowTaskWaitState::Cancelled
+                    | WorkflowTaskWaitState::Failed => return Ok(()),
+                }
+            }
 
-        match resolution {
-            TargetResolution::Waiting => Ok(()),
-            TargetResolution::Released(snapshot) => {
+            let resolution = Self::resolve_task_wait_target(
+                conn,
+                parent_execution.id,
+                *workflow_execution_id,
+                target,
+                &task_node.name,
+            )
+            .await?;
+
+            let wait = WorkflowTaskWaitRepository::create_or_get(
+                conn,
+                CreateWorkflowTaskWaitInput {
+                    workflow_execution: *workflow_execution_id,
+                    task_name: task_node.name.clone(),
+                    target,
+                },
+            )
+            .await?;
+
+            if !matches!(
+                wait.state,
+                WorkflowTaskWaitState::Waiting | WorkflowTaskWaitState::Released
+            ) {
+                return Ok(());
+            }
+
+            if wait.state == WorkflowTaskWaitState::Released {
                 let mut target_context = wf_ctx.clone();
-                Self::set_task_wait_context(
-                    &mut target_context,
-                    target,
-                    &task_node.name,
-                    snapshot.clone(),
-                );
-                Self::restore_inquiry_wait_context(
-                    &mut *conn,
-                    &mut target_context,
-                    target,
-                    &task_node.name,
-                    parent_execution.executor,
-                    encryption_key,
-                )
-                .await?;
-                Self::dispatch_workflow_task_with_input_plan(
+                if let Some(snapshot) = wait.result {
+                    Self::set_task_wait_context(
+                        &mut target_context,
+                        target,
+                        &task_node.name,
+                        snapshot,
+                    );
+                    Self::restore_inquiry_wait_context(
+                        &mut *conn,
+                        &mut target_context,
+                        target,
+                        &task_node.name,
+                        parent_execution.executor,
+                        encryption_key,
+                    )
+                    .await?;
+                }
+                return Self::dispatch_workflow_task_with_input_plan(
                     conn,
                     round_robin_counter,
                     parent_execution,
@@ -4285,37 +4299,73 @@ impl ExecutionScheduler {
                     pending_completions,
                     input_plan,
                 )
-                .await?;
-                WorkflowTaskWaitRepository::transition_waiting(
-                    conn,
-                    wait.id,
-                    WorkflowTaskWaitState::Released,
-                    Some(snapshot),
-                )
-                .await?;
-                Ok(())
+                .await;
             }
-            TargetResolution::Failed(snapshot) => {
-                WorkflowTaskWaitRepository::transition_waiting(
-                    conn,
-                    wait.id,
-                    WorkflowTaskWaitState::Failed,
-                    Some(snapshot),
-                )
-                .await?;
-                Ok(())
+
+            match resolution {
+                TargetResolution::Waiting => Ok(()),
+                TargetResolution::Released(snapshot) => {
+                    let mut target_context = wf_ctx.clone();
+                    Self::set_task_wait_context(
+                        &mut target_context,
+                        target,
+                        &task_node.name,
+                        snapshot.clone(),
+                    );
+                    Self::restore_inquiry_wait_context(
+                        &mut *conn,
+                        &mut target_context,
+                        target,
+                        &task_node.name,
+                        parent_execution.executor,
+                        encryption_key,
+                    )
+                    .await?;
+                    Self::dispatch_workflow_task_with_input_plan(
+                        conn,
+                        round_robin_counter,
+                        parent_execution,
+                        workflow_execution_id,
+                        task_node,
+                        &target_context,
+                        encryption_key,
+                        triggered_by,
+                        pending_messages,
+                        pending_completions,
+                        input_plan,
+                    )
+                    .await?;
+                    WorkflowTaskWaitRepository::transition_waiting(
+                        conn,
+                        wait.id,
+                        WorkflowTaskWaitState::Released,
+                        Some(snapshot),
+                    )
+                    .await?;
+                    Ok(())
+                }
+                TargetResolution::Failed(snapshot) => {
+                    WorkflowTaskWaitRepository::transition_waiting(
+                        conn,
+                        wait.id,
+                        WorkflowTaskWaitState::Failed,
+                        Some(snapshot),
+                    )
+                    .await?;
+                    Ok(())
+                }
+                TargetResolution::TimedOut(snapshot) => {
+                    WorkflowTaskWaitRepository::transition_waiting(
+                        conn,
+                        wait.id,
+                        WorkflowTaskWaitState::TimedOut,
+                        Some(snapshot),
+                    )
+                    .await?;
+                    Ok(())
+                }
             }
-            TargetResolution::TimedOut(snapshot) => {
-                WorkflowTaskWaitRepository::transition_waiting(
-                    conn,
-                    wait.id,
-                    WorkflowTaskWaitState::TimedOut,
-                    Some(snapshot),
-                )
-                .await?;
-                Ok(())
-            }
-        }
+        })
     }
 
     async fn resolve_task_wait_target(
@@ -4838,7 +4888,8 @@ impl ExecutionScheduler {
                 task_node,
                 &child_binding,
                 &task_context,
-            )?)
+attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut *conn, parent_execution.id).await?,
+)?)
         };
         let task_config = rendered_input.as_ref().and_then(|rendered| {
             if rendered.value.is_object() && !rendered.value.as_object().unwrap().is_empty() {
@@ -5055,66 +5106,114 @@ impl ExecutionScheduler {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn dispatch_cache_iteration_task_with_conn(
-        conn: &mut PgConnection,
-        parent_execution: &Execution,
-        workflow_execution_id: &i64,
-        task_node: &crate::workflow::graph::TaskNode,
-        task_action: &Action,
-        task_snapshot: &ExecutionExecutableSnapshot,
-        action_ref: &str,
-        wf_ctx: &WorkflowContext,
-        encryption_key: Option<&str>,
-        triggered_by: Option<&str>,
-        pending_messages: &mut WorkflowPublications,
-        pending_completions: &mut Vec<PendingExecutionCompleted>,
-    ) -> Result<()> {
-        let config = task_node.iterate_cache.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("cache iteration dispatch requires iterate_cache configuration")
-        })?;
-        let task_timeout_seconds = Self::resolve_workflow_task_timeout(task_node, wf_ctx)?;
-        let existing = WorkflowCacheIterationRepository::find_by_workflow_task_for_update(
-            &mut *conn,
-            *workflow_execution_id,
-            &task_node.name,
-        )
-        .await?;
-        let initialized = match Self::initialize_cache_iteration_with_conn(
-            conn,
-            parent_execution,
-            task_node,
-            task_action,
-            task_snapshot,
-            wf_ctx,
-            config,
-            existing,
-        )
-        .await
-        {
-            Ok(initialized) => initialized,
-            Err(CacheIterationInitializationError::Infrastructure(error)) => return Err(error),
-            Err(CacheIterationInitializationError::Logical(failure)) => {
-                let existing = WorkflowCacheIterationRepository::find_by_workflow_task_for_update(
-                    &mut *conn,
-                    *workflow_execution_id,
-                    &task_node.name,
-                )
-                .await?;
-                if let Some(iteration) = existing.as_ref() {
-                    if iteration.state == WorkflowCacheIterationState::Scanning {
-                        WorkflowCacheIterationRepository::mark_terminal(
+    fn dispatch_cache_iteration_task_with_conn<'a>(
+        conn: &'a mut PgConnection,
+        parent_execution: &'a Execution,
+        workflow_execution_id: &'a i64,
+        task_node: &'a crate::workflow::graph::TaskNode,
+        task_action: &'a Action,
+        task_snapshot: &'a ExecutionExecutableSnapshot,
+        action_ref: &'a str,
+        wf_ctx: &'a WorkflowContext,
+        encryption_key: Option<&'a str>,
+        triggered_by: Option<&'a str>,
+        pending_messages: &'a mut WorkflowPublications,
+        pending_completions: &'a mut Vec<PendingExecutionCompleted>,
+    ) -> futures::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let config = task_node.iterate_cache.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("cache iteration dispatch requires iterate_cache configuration")
+            })?;
+            let task_timeout_seconds = Self::resolve_workflow_task_timeout(task_node, wf_ctx)?;
+            let existing = WorkflowCacheIterationRepository::find_by_workflow_task_for_update(
+                &mut *conn,
+                *workflow_execution_id,
+                &task_node.name,
+            )
+            .await?;
+            let initialized = match Self::initialize_cache_iteration_with_conn(
+                conn,
+                parent_execution,
+                task_node,
+                task_action,
+                task_snapshot,
+                wf_ctx,
+                config,
+                existing,
+            )
+            .await
+            {
+                Ok(initialized) => initialized,
+                Err(CacheIterationInitializationError::Infrastructure(error)) => return Err(error),
+                Err(CacheIterationInitializationError::Logical(failure)) => {
+                    let existing =
+                        WorkflowCacheIterationRepository::find_by_workflow_task_for_update(
                             &mut *conn,
-                            iteration.id,
+                            *workflow_execution_id,
+                            &task_node.name,
+                        )
+                        .await?;
+                    if let Some(iteration) = existing.as_ref() {
+                        if iteration.state == WorkflowCacheIterationState::Scanning {
+                            WorkflowCacheIterationRepository::mark_terminal(
+                                &mut *conn,
+                                iteration.id,
+                                WorkflowCacheIterationState::Failed,
+                                Some("cache iteration initialization failed"),
+                            )
+                            .await?;
+                        }
+                    }
+                    if existing
+                        .as_ref()
+                        .is_none_or(|iteration| iteration.dispatched_count == 0)
+                    {
+                        Self::create_cache_iteration_terminal_child_with_conn(
+                            conn,
+                            parent_execution,
+                            task_node,
+                            task_action,
+                            task_snapshot,
+                            action_ref,
+                            *workflow_execution_id,
+                            triggered_by,
+                            task_timeout_seconds,
                             WorkflowCacheIterationState::Failed,
-                            Some("cache iteration initialization failed"),
+                            pending_completions,
                         )
                         .await?;
                     }
+                    warn!(
+                        "Cache iteration initialization failed for workflow task '{}' ({})",
+                        task_node.name,
+                        failure.code()
+                    );
+                    return Ok(());
                 }
-                if existing
-                    .as_ref()
-                    .is_none_or(|iteration| iteration.dispatched_count == 0)
-                {
+            };
+
+            let iteration = if let Some(iteration) = initialized.existing {
+                iteration
+            } else {
+                WorkflowCacheIterationRepository::create_or_find_for_update(
+                    conn,
+                    CreateWorkflowCacheIterationInput {
+                        workflow_execution: *workflow_execution_id,
+                        task_name: task_node.name.clone(),
+                        namespace: initialized.namespace_id,
+                        generation: initialized.generation_id,
+                        page_size: i32::try_from(config.page_size)?,
+                        batch_size: i32::try_from(task_node.batch_size.unwrap_or(1))?,
+                        concurrency: i32::try_from(task_node.concurrency.unwrap_or(1))?,
+                    },
+                )
+                .await?
+            };
+            if let Some(fence) = &initialized.effect_fence {
+                fence.ensure_fresh_on(conn).await?;
+            }
+            if iteration.state != WorkflowCacheIterationState::Scanning {
+                if iteration.dispatched_count == 0 {
                     Self::create_cache_iteration_terminal_child_with_conn(
                         conn,
                         parent_execution,
@@ -5122,7 +5221,58 @@ impl ExecutionScheduler {
                         task_action,
                         task_snapshot,
                         action_ref,
-                        *workflow_execution_id,
+                        iteration.workflow_execution,
+                        triggered_by,
+                        task_timeout_seconds,
+                        iteration.state,
+                        pending_completions,
+                    )
+                    .await?;
+                }
+                return Ok(());
+            }
+
+            let iteration_id = iteration.id;
+            let refill_result = Self::refill_cache_iteration_with_conn(
+                conn,
+                initialized.effect_fence.as_ref(),
+                parent_execution,
+                task_node,
+                task_action,
+                task_snapshot,
+                action_ref,
+                wf_ctx,
+                encryption_key,
+                triggered_by,
+                iteration,
+                pending_messages,
+                pending_completions,
+            )
+            .await;
+            if let Some(fence) = &initialized.effect_fence {
+                fence.ensure_fresh_on(conn).await?;
+            }
+            if let Err(error) = refill_result {
+                WorkflowCacheIterationRepository::mark_terminal(
+                    &mut *conn,
+                    iteration_id,
+                    WorkflowCacheIterationState::Failed,
+                    Some("cache iteration materialization failed"),
+                )
+                .await?;
+                let iteration =
+                    WorkflowCacheIterationRepository::find_by_id(&mut *conn, iteration_id)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("Cache iteration state is missing"))?;
+                if iteration.dispatched_count == 0 {
+                    Self::create_cache_iteration_terminal_child_with_conn(
+                        conn,
+                        parent_execution,
+                        task_node,
+                        task_action,
+                        task_snapshot,
+                        action_ref,
+                        iteration.workflow_execution,
                         triggered_by,
                         task_timeout_seconds,
                         WorkflowCacheIterationState::Failed,
@@ -5131,107 +5281,12 @@ impl ExecutionScheduler {
                     .await?;
                 }
                 warn!(
-                    "Cache iteration initialization failed for workflow task '{}' ({})",
-                    task_node.name,
-                    failure.code()
+                    "Cache iteration for workflow task '{}' failed: {}",
+                    task_node.name, error
                 );
-                return Ok(());
             }
-        };
-
-        let iteration = if let Some(iteration) = initialized.existing {
-            iteration
-        } else {
-            WorkflowCacheIterationRepository::create_or_find_for_update(
-                conn,
-                CreateWorkflowCacheIterationInput {
-                    workflow_execution: *workflow_execution_id,
-                    task_name: task_node.name.clone(),
-                    namespace: initialized.namespace_id,
-                    generation: initialized.generation_id,
-                    page_size: i32::try_from(config.page_size)?,
-                    batch_size: i32::try_from(task_node.batch_size.unwrap_or(1))?,
-                    concurrency: i32::try_from(task_node.concurrency.unwrap_or(1))?,
-                },
-            )
-            .await?
-        };
-        if let Some(fence) = &initialized.effect_fence {
-            fence.ensure_fresh_on(conn).await?;
-        }
-        if iteration.state != WorkflowCacheIterationState::Scanning {
-            if iteration.dispatched_count == 0 {
-                Self::create_cache_iteration_terminal_child_with_conn(
-                    conn,
-                    parent_execution,
-                    task_node,
-                    task_action,
-                    task_snapshot,
-                    action_ref,
-                    iteration.workflow_execution,
-                    triggered_by,
-                    task_timeout_seconds,
-                    iteration.state,
-                    pending_completions,
-                )
-                .await?;
-            }
-            return Ok(());
-        }
-
-        let iteration_id = iteration.id;
-        let refill_result = Self::refill_cache_iteration_with_conn(
-            conn,
-            initialized.effect_fence.as_ref(),
-            parent_execution,
-            task_node,
-            task_action,
-            task_snapshot,
-            action_ref,
-            wf_ctx,
-            encryption_key,
-            triggered_by,
-            iteration,
-            pending_messages,
-            pending_completions,
-        )
-        .await;
-        if let Some(fence) = &initialized.effect_fence {
-            fence.ensure_fresh_on(conn).await?;
-        }
-        if let Err(error) = refill_result {
-            WorkflowCacheIterationRepository::mark_terminal(
-                &mut *conn,
-                iteration_id,
-                WorkflowCacheIterationState::Failed,
-                Some("cache iteration materialization failed"),
-            )
-            .await?;
-            let iteration = WorkflowCacheIterationRepository::find_by_id(&mut *conn, iteration_id)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("Cache iteration state is missing"))?;
-            if iteration.dispatched_count == 0 {
-                Self::create_cache_iteration_terminal_child_with_conn(
-                    conn,
-                    parent_execution,
-                    task_node,
-                    task_action,
-                    task_snapshot,
-                    action_ref,
-                    iteration.workflow_execution,
-                    triggered_by,
-                    task_timeout_seconds,
-                    WorkflowCacheIterationState::Failed,
-                    pending_completions,
-                )
-                .await?;
-            }
-            warn!(
-                "Cache iteration for workflow task '{}' failed: {}",
-                task_node.name, error
-            );
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5256,11 +5311,7 @@ impl ExecutionScheduler {
                     )
                 },
             )?;
-        let recorded = parent_execution
-            .executable_snapshot
-            .as_ref()
-            .is_some_and(|snapshot| !snapshot.executable.action.is_adhoc)
-            || attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(conn, attune_common::repositories::runtime_authority::RuntimeOwner::Execution(parent_execution.id)).await.map_err(CacheIterationInitializationError::infrastructure)?.is_some();
+        let recorded=attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(conn,parent_execution.id).await.map_err(CacheIterationInitializationError::infrastructure)?;
         if !recorded
             && !named_cache_permission_refs_are_delegated(
                 &permission_set_refs,
@@ -5625,7 +5676,8 @@ impl ExecutionScheduler {
                 task_node,
                 &child_binding,
                 &item_ctx,
-            )?;
+attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut *conn, parent_execution.id).await?,
+)?;
             let task_config = if rendered_input.value.is_object()
                 && !rendered_input
                     .value
@@ -5924,7 +5976,8 @@ impl ExecutionScheduler {
                 task_node,
                 &child_binding,
                 &item_ctx,
-            )?;
+attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut *pool.acquire().await?, parent_execution.id).await?,
+)?;
 
             // Store as flat parameters (consistent with manual and rule-triggered
             // executions) — no {"parameters": ...} wrapper.
@@ -6221,7 +6274,8 @@ impl ExecutionScheduler {
                 task_node,
                 &child_binding,
                 &item_ctx,
-            )?;
+attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut *conn, parent_execution.id).await?,
+)?;
 
             let task_config: Option<JsonValue> = if rendered_input.value.is_object()
                 && !rendered_input.value.as_object().unwrap().is_empty()
@@ -6501,6 +6555,41 @@ impl ExecutionScheduler {
         );
 
         Ok(())
+    }
+
+    /// Queued root workflows need the same fenced acknowledgement consumer as
+    /// workers. Ordinary roots keep their existing notification behavior.
+    fn workflow_completion_publication<'a>(
+        conn: &'a mut PgConnection,
+        execution: &'a Execution,
+    ) -> futures::future::BoxFuture<'a, Result<Option<PendingExecutionCompleted>>> {
+        Box::pin(async move {
+            if execution.parent.is_none() {
+                let Some(dispatch) = attune_common::repositories::work_queue::WorkQueueDispatchRepository::find_by_execution(
+                    &mut *conn, execution.id,
+                ).await? else { return Ok(None) };
+                if !matches!(
+                    dispatch.status,
+                    attune_common::models::WorkQueueDispatchStatus::Leased
+                        | attune_common::models::WorkQueueDispatchStatus::Dispatched
+                ) {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(PendingExecutionCompleted {
+                execution_id: execution.id,
+                action_id: execution.action.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Completed workflow execution {} has no action id",
+                        execution.id,
+                    )
+                })?,
+                action_ref: execution.action_ref.clone(),
+                status: execution.status,
+                result: execution.result.clone(),
+                completed_at: execution.updated,
+            }))
+        })
     }
 
     async fn publish_execution_completed_payload(
@@ -7203,271 +7292,276 @@ impl ExecutionScheduler {
 
     /// The real predecessor is prepared before outer targets. A selected Wait
     /// never enters legacy synthetic-failure advancement.
-    async fn checkpoint_native_wait_successor(
-        pool: &PgPool,
-        publisher: &Publisher,
-        completed: &Execution,
-        key: Option<&str>,
-    ) -> Result<bool> {
-        use attune_common::repositories::{
-            native_transition_materialization::NativeTransitionMaterializationRepository as Transitions,
-            native_wait_materialization::{
-                InitialWaitApply, NativeInitialWaitMaterializationRepository as Initial,
-            },
-        };
-        let Some(key) = key else { return Ok(false) };
-        let mut tx = pool.begin().await?;
-        CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
-            .await?;
-        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
-            .await?;
-        let Some(predecessor) =
-            Transitions::prepare_wait_successor(&mut tx, completed, key).await?
-        else {
-            tx.rollback().await?;
-            return Ok(false);
-        };
-        let mut plan = Initial::prepare_successor(&mut tx, predecessor.clone(), key).await?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(plan.workflow())
-            .execute(&mut *tx)
-            .await?;
-        predecessor.publish(&mut tx, key).await?;
-        let children = match plan.apply(&mut tx, key).await? {
-            InitialWaitApply::Existing => {
-                tx.rollback().await?;
-                return Ok(true);
-            }
-            InitialWaitApply::Registered(child) => child.into_iter().collect(),
-            InitialWaitApply::Recovered(children) => children,
-        };
-        predecessor.ensure_fresh_on(&mut tx).await?;
-        plan.ensure_fresh_on(&mut tx).await?;
-        tx.commit().await?;
-        predecessor.ensure_fresh()?;
-        plan.ensure_fresh()?;
-        for child in children {
-            predecessor.ensure_fresh()?;
-            plan.ensure_fresh()?;
-            Self::publish_execution_requested_payload(
-                publisher,
-                PendingExecutionRequested {
-                    execution_id: child.id,
-                    action_id: child
-                        .action
-                        .ok_or_else(|| anyhow::anyhow!("Wait successor action is absent"))?,
-                    action_ref: child.action_ref,
-                    parent_id: child
-                        .parent
-                        .ok_or_else(|| anyhow::anyhow!("Wait successor parent is absent"))?,
-                    enforcement_id: child.enforcement,
-                    config: child.config,
-                    release_id: child.pack_release,
-                    release_digest: child.pack_release_digest,
+    fn checkpoint_native_wait_successor<'a>(
+        pool: &'a PgPool,
+        publisher: &'a Publisher,
+        completed: &'a Execution,
+        key: Option<&'a str>,
+    ) -> futures::future::BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            use attune_common::repositories::{
+                native_transition_materialization::NativeTransitionMaterializationRepository as Transitions,
+                native_wait_materialization::{
+                    InitialWaitApply, NativeInitialWaitMaterializationRepository as Initial,
                 },
-            )
-            .await?;
-            predecessor.ensure_fresh()?;
-            plan.ensure_fresh()?;
-        }
-        for completed in plan.completions() {
-            predecessor.ensure_fresh()?;
-            plan.ensure_fresh()?;
-            Self::publish_execution_completed_payload(
-                publisher,
-                PendingExecutionCompleted {
-                    execution_id: completed.id,
-                    action_id: completed
-                        .action
-                        .ok_or_else(|| anyhow::anyhow!("Wait completion action is absent"))?,
-                    action_ref: completed.action_ref.clone(),
-                    status: completed.status,
-                    result: completed.result.clone(),
-                    completed_at: completed.updated,
-                },
-            )
-            .await?;
-            predecessor.ensure_fresh()?;
-            plan.ensure_fresh()?;
-        }
-        Ok(true)
-    }
-
-    /// Native initial registration must precede the legacy workflow/FK locks.
-    async fn checkpoint_initial_native_wait(
-        pool: &PgPool,
-        publisher: &Publisher,
-        parent: &Execution,
-        workflow: i64,
-        task: &str,
-        key: Option<&str>,
-        triggered_by: Option<&str>,
-    ) -> Result<bool> {
-        use attune_common::repositories::{
-            execution_runtime_admission::ExecutionAdmissionRepository as Admissions,
-            native_wait_materialization::{
-                InitialWaitApply, NativeInitialWaitMaterializationRepository as Initial,
-            },
-            runtime_authority::RuntimeOwner,
-        };
-        let native = {
-            let mut conn = pool.acquire().await?;
-            Admissions::find(&mut conn, RuntimeOwner::Execution(parent.id))
-                .await?
-                .is_some()
-        };
-        if !native {
-            return Ok(false);
-        }
-        if let Some(wait) =
-            WorkflowTaskWaitRepository::find_by_workflow_task(pool, workflow, task).await?
-        {
-            Self::checkpoint_native_wait(pool, publisher, &wait, key).await?;
-            return Ok(true);
-        }
-        let mut conn = attune_common::db::SessionLease::acquire(pool).await?;
-        let mut prepared = None;
-        let mut locked = false;
-        let mut committed = false;
-        let result = async {
-            conn.begin_transaction().await?;
-            CacheEntryRepository::protect_transaction(&mut conn, CacheTransactionMode::PinMutation)
-                .await?;
-            attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
-                &mut conn,
-            )
-            .await?;
-            prepared = Initial::prepare(&mut conn, workflow, task, key, triggered_by).await?;
-            let Some(plan) = prepared.as_mut() else {
-                conn.rollback_transaction().await?;
-                return Ok::<_, anyhow::Error>(false);
             };
-            let key = key
-                .ok_or_else(|| anyhow::anyhow!("Native initial wait encryption is unavailable"))?;
-            sqlx::query("SELECT pg_advisory_lock($1)")
-                .bind(plan.workflow())
-                .execute(&mut *conn)
+            let Some(key) = key else { return Ok(false) };
+            let mut tx = pool.begin().await?;
+            CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
                 .await?;
-            locked = true;
-            let children = match plan.apply(&mut conn, key).await? {
+            attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
+                .await?;
+            let Some(predecessor) =
+                Transitions::prepare_wait_successor(&mut tx, completed, key).await?
+            else {
+                tx.rollback().await?;
+                return Ok(false);
+            };
+            let mut plan = Initial::prepare_successor(&mut tx, predecessor.clone(), key).await?;
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(plan.workflow())
+                .execute(&mut *tx)
+                .await?;
+            predecessor.publish(&mut tx, key).await?;
+            let children = match plan.apply(&mut tx, key).await? {
                 InitialWaitApply::Existing => {
-                    // Do not commit a losing factory's source-phase child or
-                    // snapshot. The winner already registered atomically.
-                    conn.rollback_transaction().await?;
+                    tx.rollback().await?;
                     return Ok(true);
                 }
                 InitialWaitApply::Registered(child) => child.into_iter().collect(),
                 InitialWaitApply::Recovered(children) => children,
             };
-            plan.ensure_fresh_on(&mut conn).await?;
-            conn.commit_transaction().await?;
-            committed = true;
+            predecessor.ensure_fresh_on(&mut tx).await?;
+            plan.ensure_fresh_on(&mut tx).await?;
+            tx.commit().await?;
+            predecessor.ensure_fresh()?;
             plan.ensure_fresh()?;
             for child in children {
-                let pending = PendingExecutionRequested {
-                    execution_id: child.id,
-                    action_id: child.action.ok_or_else(|| {
-                        anyhow::anyhow!("Native initial wait child action is absent")
-                    })?,
-                    action_ref: child.action_ref,
-                    parent_id: child
-                        .parent
-                        .ok_or_else(|| anyhow::anyhow!("Native initial wait parent is absent"))?,
-                    enforcement_id: child.enforcement,
-                    config: child.config,
-                    release_id: child.pack_release,
-                    release_digest: child.pack_release_digest,
-                };
+                predecessor.ensure_fresh()?;
                 plan.ensure_fresh()?;
-                Self::publish_execution_requested_payload(publisher, pending).await?;
+                Self::publish_execution_requested_payload(
+                    publisher,
+                    PendingExecutionRequested {
+                        execution_id: child.id,
+                        action_id: child
+                            .action
+                            .ok_or_else(|| anyhow::anyhow!("Wait successor action is absent"))?,
+                        action_ref: child.action_ref,
+                        parent_id: child
+                            .parent
+                            .ok_or_else(|| anyhow::anyhow!("Wait successor parent is absent"))?,
+                        enforcement_id: child.enforcement,
+                        config: child.config,
+                        release_id: child.pack_release,
+                        release_digest: child.pack_release_digest,
+                    },
+                )
+                .await?;
+                predecessor.ensure_fresh()?;
                 plan.ensure_fresh()?;
             }
             for completed in plan.completions() {
-                let pending = PendingExecutionCompleted {
-                    execution_id: completed.id,
-                    action_id: completed.action.ok_or_else(|| {
-                        anyhow::anyhow!("Native initial wait completion action is absent")
-                    })?,
-                    action_ref: completed.action_ref.clone(),
-                    status: completed.status,
-                    result: completed.result.clone(),
-                    completed_at: Utc::now(),
-                };
+                predecessor.ensure_fresh()?;
                 plan.ensure_fresh()?;
-                Self::publish_execution_completed_payload(publisher, pending).await?;
-                plan.ensure_fresh()?;
-            }
-            if let Some(wait) = plan.terminal_wait() {
-                plan.ensure_fresh()?;
-                WorkflowTaskWaitRepository::mark_terminal_delivery_complete(&mut *conn, wait)
-                    .await?;
+                Self::publish_execution_completed_payload(
+                    publisher,
+                    PendingExecutionCompleted {
+                        execution_id: completed.id,
+                        action_id: completed
+                            .action
+                            .ok_or_else(|| anyhow::anyhow!("Wait completion action is absent"))?,
+                        action_ref: completed.action_ref.clone(),
+                        status: completed.status,
+                        result: completed.result.clone(),
+                        completed_at: completed.updated,
+                    },
+                )
+                .await?;
+                predecessor.ensure_fresh()?;
                 plan.ensure_fresh()?;
             }
             Ok(true)
-        }
-        .await;
-        if result.is_err() {
-            let _ = conn.rollback_transaction().await;
-        }
-        let unlock = if locked {
-            sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
-                .bind(prepared.as_ref().expect("locked initial wait").workflow())
-                .fetch_one(&mut *conn)
-                .await
-                .and_then(|unlocked| {
-                    if unlocked {
-                        Ok(())
-                    } else {
-                        Err(sqlx::Error::Protocol("session lock was not owned".into()))
+        })
+    }
+
+    /// Native initial registration must precede the legacy workflow/FK locks.
+    fn checkpoint_initial_native_wait<'a>(
+        pool: &'a PgPool,
+        publisher: &'a Publisher,
+        parent: &'a Execution,
+        workflow: i64,
+        task: &'a str,
+        key: Option<&'a str>,
+        triggered_by: Option<&'a str>,
+    ) -> futures::future::BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            use attune_common::repositories::{
+                execution_runtime_admission::ExecutionAdmissionRepository as Admissions,
+                native_wait_materialization::{
+                    InitialWaitApply, NativeInitialWaitMaterializationRepository as Initial,
+                },
+            };
+            let native = {
+                let mut conn = pool.acquire().await?;
+                Admissions::is_recorded(&mut conn, parent.id).await?
+            };
+            if !native {
+                return Ok(false);
+            }
+            if let Some(wait) =
+                WorkflowTaskWaitRepository::find_by_workflow_task(pool, workflow, task).await?
+            {
+                Self::checkpoint_native_wait(pool, publisher, &wait, key).await?;
+                return Ok(true);
+            }
+            let mut conn = attune_common::db::SessionLease::acquire(pool).await?;
+            let mut prepared = None;
+            let mut locked = false;
+            let mut committed = false;
+            let result = async {
+                conn.begin_transaction().await?;
+                CacheEntryRepository::protect_transaction(
+                    &mut conn,
+                    CacheTransactionMode::PinMutation,
+                )
+                .await?;
+                attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
+                    &mut conn,
+                )
+                .await?;
+                prepared = Initial::prepare(&mut conn, workflow, task, key, triggered_by).await?;
+                let Some(plan) = prepared.as_mut() else {
+                    conn.rollback_transaction().await?;
+                    return Ok::<_, anyhow::Error>(false);
+                };
+                let key = key.ok_or_else(|| {
+                    anyhow::anyhow!("Native initial wait encryption is unavailable")
+                })?;
+                sqlx::query("SELECT pg_advisory_lock($1)")
+                    .bind(plan.workflow())
+                    .execute(&mut *conn)
+                    .await?;
+                locked = true;
+                let children = match plan.apply(&mut conn, key).await? {
+                    InitialWaitApply::Existing => {
+                        // Do not commit a losing factory's source-phase child or
+                        // snapshot. The winner already registered atomically.
+                        conn.rollback_transaction().await?;
+                        return Ok(true);
                     }
-                })
-        } else {
-            Ok(())
-        };
-        if committed {
-            prepared
-                .as_ref()
-                .expect("committed initial wait")
-                .ensure_fresh()?;
-        }
-        let handled = result?;
-        unlock?;
-        conn.release_clean();
-        Ok(handled)
+                    InitialWaitApply::Registered(child) => child.into_iter().collect(),
+                    InitialWaitApply::Recovered(children) => children,
+                };
+                plan.ensure_fresh_on(&mut conn).await?;
+                conn.commit_transaction().await?;
+                committed = true;
+                plan.ensure_fresh()?;
+                for child in children {
+                    let pending = PendingExecutionRequested {
+                        execution_id: child.id,
+                        action_id: child.action.ok_or_else(|| {
+                            anyhow::anyhow!("Native initial wait child action is absent")
+                        })?,
+                        action_ref: child.action_ref,
+                        parent_id: child.parent.ok_or_else(|| {
+                            anyhow::anyhow!("Native initial wait parent is absent")
+                        })?,
+                        enforcement_id: child.enforcement,
+                        config: child.config,
+                        release_id: child.pack_release,
+                        release_digest: child.pack_release_digest,
+                    };
+                    plan.ensure_fresh()?;
+                    Self::publish_execution_requested_payload(publisher, pending).await?;
+                    plan.ensure_fresh()?;
+                }
+                for completed in plan.completions() {
+                    let pending = PendingExecutionCompleted {
+                        execution_id: completed.id,
+                        action_id: completed.action.ok_or_else(|| {
+                            anyhow::anyhow!("Native initial wait completion action is absent")
+                        })?,
+                        action_ref: completed.action_ref.clone(),
+                        status: completed.status,
+                        result: completed.result.clone(),
+                        completed_at: Utc::now(),
+                    };
+                    plan.ensure_fresh()?;
+                    Self::publish_execution_completed_payload(publisher, pending).await?;
+                    plan.ensure_fresh()?;
+                }
+                if let Some(wait) = plan.terminal_wait() {
+                    plan.ensure_fresh()?;
+                    WorkflowTaskWaitRepository::mark_terminal_delivery_complete(&mut *conn, wait)
+                        .await?;
+                    plan.ensure_fresh()?;
+                }
+                Ok(true)
+            }
+            .await;
+            if result.is_err() {
+                let _ = conn.rollback_transaction().await;
+            }
+            let unlock = if locked {
+                sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
+                    .bind(prepared.as_ref().expect("locked initial wait").workflow())
+                    .fetch_one(&mut *conn)
+                    .await
+                    .and_then(|unlocked| {
+                        if unlocked {
+                            Ok(())
+                        } else {
+                            Err(sqlx::Error::Protocol("session lock was not owned".into()))
+                        }
+                    })
+            } else {
+                Ok(())
+            };
+            if committed {
+                prepared
+                    .as_ref()
+                    .expect("committed initial wait")
+                    .ensure_fresh()?;
+            }
+            let handled = result?;
+            unlock?;
+            conn.release_clean();
+            Ok(handled)
+        })
     }
 
     /// This path starts its own source-first transaction. Never invoke it from
     /// an already target-locked activation/advance transaction.
-    async fn checkpoint_native_cache(
-        pool: &PgPool,
-        publisher: &Publisher,
-        parent: &Execution,
-        task: &str,
-        encryption_key: Option<&str>,
-        completed: Option<&Execution>,
-    ) -> Result<bool> {
-        use attune_common::repositories::native_cache_materialization::NativeCacheMaterializationRepository as Cache;
-        if !Cache::supports_work(parent, task, completed) {
-            return Ok(false);
-        }
-        let activation = !Cache::supports(parent, task);
-        let Some(key) = encryption_key else {
-            return Err(anyhow::anyhow!(
-                "Native cache checkpoint requires encryption"
-            ));
-        };
-        let mut conn = attune_common::db::SessionLease::acquire(pool).await?;
-        let mut locked = false;
-        let mut plan = None;
-        let mut sources = None;
-        let result = async {
+    fn checkpoint_native_cache<'a>(
+        pool: &'a PgPool,
+        publisher: &'a Publisher,
+        parent: &'a Execution,
+        task: &'a str,
+        encryption_key: Option<&'a str>,
+        completed: Option<&'a Execution>,
+    ) -> futures::future::BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            use attune_common::repositories::native_cache_materialization::NativeCacheMaterializationRepository as Cache;
+            if !Cache::supports_work(parent, task, completed) {
+                return Ok(false);
+            }
+            let activation = !Cache::supports(parent, task);
+            let Some(key) = encryption_key else {
+                return Err(anyhow::anyhow!(
+                    "Native cache checkpoint requires encryption"
+                ));
+            };
+            let mut conn = attune_common::db::SessionLease::acquire(pool).await?;
+            let mut locked = false;
+            let mut plan = None;
+            let mut sources = None;
+            let result = async {
             conn.begin_transaction().await?;
             CacheEntryRepository::protect_transaction(&mut conn, CacheTransactionMode::PinMutation).await?;
             attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut conn).await?;
             let actual = ExecutionRepository::find_by_id(&mut *conn, parent.id).await?
                 .ok_or_else(|| anyhow::anyhow!("Native cache parent disappeared"))?;
-            if attune_common::repositories::execution_runtime_admission::ExecutionAdmissionRepository::find(
-                &mut conn, attune_common::repositories::runtime_authority::RuntimeOwner::Execution(actual.id)).await?.is_none() {
+            if !attune_common::repositories::execution_runtime_admission::ExecutionAdmissionRepository::is_recorded(&mut conn, actual.id).await? {
                 conn.rollback_transaction().await?;
                 return Ok::<_, anyhow::Error>(false);
             }
@@ -7535,38 +7629,39 @@ impl ExecutionScheduler {
             sources.as_ref().expect("prepared native cache sources").ensure_fresh()?;
             Ok(true)
         }.await;
-        if result.is_err() {
-            let _ = conn.rollback_transaction().await;
-        }
-        let unlock = if locked {
-            sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
-                .bind(
-                    plan.as_ref()
-                        .expect("locked prepared cache checkpoint")
-                        .workflow(),
-                )
-                .fetch_one(&mut *conn)
-                .await
-                .and_then(|unlocked| {
-                    if unlocked {
-                        Ok(())
-                    } else {
-                        Err(sqlx::Error::Protocol("session lock was not owned".into()))
-                    }
-                })
-        } else {
-            Ok(())
-        };
-        let handled = result?;
-        unlock?;
-        conn.release_clean();
-        if let Some(plan) = &plan {
-            plan.ensure_fresh()?;
-        }
-        if let Some(sources) = &sources {
-            sources.ensure_fresh()?;
-        }
-        Ok(handled)
+            if result.is_err() {
+                let _ = conn.rollback_transaction().await;
+            }
+            let unlock = if locked {
+                sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
+                    .bind(
+                        plan.as_ref()
+                            .expect("locked prepared cache checkpoint")
+                            .workflow(),
+                    )
+                    .fetch_one(&mut *conn)
+                    .await
+                    .and_then(|unlocked| {
+                        if unlocked {
+                            Ok(())
+                        } else {
+                            Err(sqlx::Error::Protocol("session lock was not owned".into()))
+                        }
+                    })
+            } else {
+                Ok(())
+            };
+            let handled = result?;
+            unlock?;
+            conn.release_clean();
+            if let Some(plan) = &plan {
+                plan.ensure_fresh()?;
+            }
+            if let Some(sources) = &sources {
+                sources.ensure_fresh()?;
+            }
+            Ok(handled)
+        })
     }
 
     /// A registered wait starts a fresh source-first transaction, not a nested
@@ -7588,7 +7683,12 @@ impl ExecutionScheduler {
                 &mut conn,
             )
             .await?;
-            prepared = NativeWaitCheckpoint::prepare(&mut conn, wait, encryption_key).await?;
+            prepared = Box::pin(NativeWaitCheckpoint::prepare(
+                &mut conn,
+                wait,
+                encryption_key,
+            ))
+            .await?;
             let Some(plan) = prepared.as_mut() else {
                 conn.rollback_transaction().await?;
                 return Ok::<_, anyhow::Error>(false);
@@ -7678,186 +7778,193 @@ impl ExecutionScheduler {
     }
 
     #[allow(clippy::too_many_arguments)] // Workflow advancement requires the complete durable execution context.
-    pub(crate) async fn advance_workflow(
-        pool: &PgPool,
-        publisher: &Publisher,
-        round_robin_counter: &AtomicUsize,
-        _artifacts_dir: &str,
-        _workflow_log_transport: &Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
+    pub(crate) fn advance_workflow<'a>(
+        pool: &'a PgPool,
+        publisher: &'a Publisher,
+        round_robin_counter: &'a AtomicUsize,
+        _artifacts_dir: &'a str,
+        _workflow_log_transport: &'a Arc<
+            dyn attune_common::artifact_transport::ArtifactFileTransport,
+        >,
         workflow_log_segment_max_bytes: usize,
         _workflow_log_flush_interval_ms: u64,
-        encryption_key: Option<&str>,
-        execution: &Execution,
-        metadata_caches: &SchedulerMetadataCaches,
-    ) -> Result<()> {
-        Self::advance_workflow_owned(
-            pool,
-            publisher,
-            round_robin_counter,
-            _artifacts_dir,
-            _workflow_log_transport,
-            workflow_log_segment_max_bytes,
-            _workflow_log_flush_interval_ms,
-            encryption_key,
-            execution,
-            metadata_caches,
-            #[cfg(test)]
-            None,
-        )
-        .await
+        encryption_key: Option<&'a str>,
+        execution: &'a Execution,
+        metadata_caches: &'a SchedulerMetadataCaches,
+    ) -> futures::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            Self::advance_workflow_owned(
+                pool,
+                publisher,
+                round_robin_counter,
+                _artifacts_dir,
+                _workflow_log_transport,
+                workflow_log_segment_max_bytes,
+                _workflow_log_flush_interval_ms,
+                encryption_key,
+                execution,
+                metadata_caches,
+                #[cfg(test)]
+                None,
+            )
+            .await
+        })
     }
 
     // Both the normal entry and the regression invoke this SAME transaction
     // owner. The test does not reproduce a local subset of its commit logic.
     #[allow(clippy::too_many_arguments)]
-    async fn advance_workflow_owned(
-        pool: &PgPool,
-        publisher: &Publisher,
-        round_robin_counter: &AtomicUsize,
-        _artifacts_dir: &str,
-        _workflow_log_transport: &Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
+    fn advance_workflow_owned<'a>(
+        pool: &'a PgPool,
+        publisher: &'a Publisher,
+        round_robin_counter: &'a AtomicUsize,
+        _artifacts_dir: &'a str,
+        _workflow_log_transport: &'a Arc<
+            dyn attune_common::artifact_transport::ArtifactFileTransport,
+        >,
         workflow_log_segment_max_bytes: usize,
         _workflow_log_flush_interval_ms: u64,
-        encryption_key: Option<&str>,
-        execution: &Execution,
-        metadata_caches: &SchedulerMetadataCaches,
-        #[cfg(test)] observer: Option<&dyn WorkflowInputCommitObserver>,
-    ) -> Result<()> {
-        let workflow_task = match execution.workflow_task.as_ref() {
-            Some(workflow_task) => workflow_task.clone(),
-            None => return Ok(()),
-        };
-        let workflow_execution_id = workflow_task.workflow_execution;
-        if execution.id > 0
-            && workflow_task.task_index.is_none()
-            && execution.status == ExecutionStatus::Completed
-            && Self::activate_native_iteration_successors(
-                pool,
-                publisher,
-                execution,
-                encryption_key,
-            )
-            .await?
-        {
-            return Ok(());
-        }
-        if execution.id > 0
-            && workflow_task.task_index.is_some()
-            && matches!(
-                execution.status,
-                ExecutionStatus::Completed
-                    | ExecutionStatus::Failed
-                    | ExecutionStatus::Timeout
-                    | ExecutionStatus::Cancelled
-                    | ExecutionStatus::Abandoned
-            )
-        {
-            if let Some(parent) = ExecutionRepository::find_by_id(
-                pool,
-                execution
-                    .parent
-                    .ok_or_else(|| anyhow::anyhow!("Ordinary item parent is absent"))?,
-            )
-            .await?
-            {
-                if Self::dispatch_native_iteration(
+        encryption_key: Option<&'a str>,
+        execution: &'a Execution,
+        metadata_caches: &'a SchedulerMetadataCaches,
+        #[cfg(test)] observer: Option<&'a dyn WorkflowInputCommitObserver>,
+    ) -> futures::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let workflow_task = match execution.workflow_task.as_ref() {
+                Some(workflow_task) => workflow_task.clone(),
+                None => return Ok(()),
+            };
+            let workflow_execution_id = workflow_task.workflow_execution;
+            if execution.id > 0
+                && workflow_task.task_index.is_none()
+                && execution.status == ExecutionStatus::Completed
+                && Self::activate_native_iteration_successors(
                     pool,
                     publisher,
-                    &parent,
-                    &workflow_task.task_name,
-                    workflow_task.triggered_by.as_deref(),
+                    execution,
                     encryption_key,
-                    Some(execution),
+                )
+                .await?
+            {
+                return Ok(());
+            }
+            if execution.id > 0
+                && workflow_task.task_index.is_some()
+                && matches!(
+                    execution.status,
+                    ExecutionStatus::Completed
+                        | ExecutionStatus::Failed
+                        | ExecutionStatus::Timeout
+                        | ExecutionStatus::Cancelled
+                        | ExecutionStatus::Abandoned
+                )
+            {
+                if let Some(parent) = ExecutionRepository::find_by_id(
+                    pool,
+                    execution
+                        .parent
+                        .ok_or_else(|| anyhow::anyhow!("Ordinary item parent is absent"))?,
                 )
                 .await?
                 {
-                    return Ok(());
+                    if Self::dispatch_native_iteration(
+                        pool,
+                        publisher,
+                        &parent,
+                        &workflow_task.task_name,
+                        workflow_task.triggered_by.as_deref(),
+                        encryption_key,
+                        Some(execution),
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
                 }
             }
-        }
-        if execution.id > 0 && execution.status == ExecutionStatus::Completed {
-            if let Some(parent) = ExecutionRepository::find_by_id(
-                pool,
-                execution
-                    .parent
-                    .ok_or_else(|| anyhow::anyhow!("Cache batch parent is absent"))?,
-            )
-            .await?
-            {
-                if Self::checkpoint_native_cache(
+            if execution.id > 0 && execution.status == ExecutionStatus::Completed {
+                if let Some(parent) = ExecutionRepository::find_by_id(
                     pool,
-                    publisher,
-                    &parent,
-                    &workflow_task.task_name,
-                    encryption_key,
-                    Some(execution),
+                    execution
+                        .parent
+                        .ok_or_else(|| anyhow::anyhow!("Cache batch parent is absent"))?,
                 )
                 .await?
                 {
-                    return Ok(());
+                    if Self::checkpoint_native_cache(
+                        pool,
+                        publisher,
+                        &parent,
+                        &workflow_task.task_name,
+                        encryption_key,
+                        Some(execution),
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
                 }
             }
-        }
-        if Self::checkpoint_native_wait_successor(pool, publisher, execution, encryption_key)
-            .await?
-        {
-            return Ok(());
-        }
-        let logger = WorkflowLogger::new(workflow_execution_id, workflow_log_segment_max_bytes);
-
-        let task_outcome_label = match execution.status {
-            ExecutionStatus::Completed => "Succeeded",
-            ExecutionStatus::Timeout => "TimedOut",
-            ExecutionStatus::Cancelled => "Cancelled",
-            _ => "Failed",
-        };
-        let item_suffix = workflow_task
-            .task_index
-            .map(|index| format!(" (item {index})"))
-            .unwrap_or_default();
-
-        // Session advisory ownership outlives COMMIT and broker waits. Never
-        // return a cancelled/uncertain session, or one with a failed unlock, to
-        // the pool. Normal paths explicitly return it after awaited cleanup.
-        struct AdvanceSession(Option<sqlx::pool::PoolConnection<sqlx::Postgres>>);
-        impl std::ops::Deref for AdvanceSession {
-            type Target = PgConnection;
-            fn deref(&self) -> &Self::Target {
-                self.0.as_ref().expect("owned workflow advancement session")
+            if Self::checkpoint_native_wait_successor(pool, publisher, execution, encryption_key)
+                .await?
+            {
+                return Ok(());
             }
-        }
-        impl std::ops::DerefMut for AdvanceSession {
-            fn deref_mut(&mut self) -> &mut Self::Target {
-                self.0.as_mut().expect("owned workflow advancement session")
-            }
-        }
-        impl Drop for AdvanceSession {
-            fn drop(&mut self) {
-                if let Some(mut connection) = self.0.take() {
-                    // A dropped future cannot await cleanup. SQLx retains the
-                    // pool permit while its bounded close-on-drop task closes
-                    // this session, rather than detaching it or pooling locks.
-                    connection.close_on_drop();
-                    drop(connection);
+            let logger = WorkflowLogger::new(workflow_execution_id, workflow_log_segment_max_bytes);
+
+            let task_outcome_label = match execution.status {
+                ExecutionStatus::Completed => "Succeeded",
+                ExecutionStatus::Timeout => "TimedOut",
+                ExecutionStatus::Cancelled => "Cancelled",
+                _ => "Failed",
+            };
+            let item_suffix = workflow_task
+                .task_index
+                .map(|index| format!(" (item {index})"))
+                .unwrap_or_default();
+
+            // Session advisory ownership outlives COMMIT and broker waits. Never
+            // return a cancelled/uncertain session, or one with a failed unlock, to
+            // the pool. Normal paths explicitly return it after awaited cleanup.
+            struct AdvanceSession(Option<sqlx::pool::PoolConnection<sqlx::Postgres>>);
+            impl std::ops::Deref for AdvanceSession {
+                type Target = PgConnection;
+                fn deref(&self) -> &Self::Target {
+                    self.0.as_ref().expect("owned workflow advancement session")
                 }
             }
-        }
-        let mut lock_conn = AdvanceSession(Some(pool.acquire().await?));
-        let mut workflow_locked = false;
-        // Stable ownership lets H borrow the genuine B plan through commit and
-        // broker/unlock, without copying a plan or preparing it again at targets.
-        let native_transitions = std::sync::OnceLock::new();
-        let mut native_success_output = None;
-        let mut native_sources = None;
-        let mut native_failure = None;
-        let mut native_failure_output = None;
+            impl std::ops::DerefMut for AdvanceSession {
+                fn deref_mut(&mut self) -> &mut Self::Target {
+                    self.0.as_mut().expect("owned workflow advancement session")
+                }
+            }
+            impl Drop for AdvanceSession {
+                fn drop(&mut self) {
+                    if let Some(mut connection) = self.0.take() {
+                        // A dropped future cannot await cleanup. SQLx retains the
+                        // pool permit while its bounded close-on-drop task closes
+                        // this session, rather than detaching it or pooling locks.
+                        connection.close_on_drop();
+                        drop(connection);
+                    }
+                }
+            }
+            let mut lock_conn = AdvanceSession(Some(pool.acquire().await?));
+            let mut workflow_locked = false;
+            // Stable ownership lets H borrow the genuine B plan through commit and
+            // broker/unlock, without copying a plan or preparing it again at targets.
+            let native_transitions = std::sync::OnceLock::new();
+            let mut native_success_output = None;
+            let mut native_sources = None;
+            let mut native_failure = None;
+            let mut native_failure_output = None;
 
-        // A managed root keeps nested repository transactions at savepoint
-        // depth. The PoolConnection remains the same physical advisory session.
-        let mut transaction = Some(sqlx::Connection::begin(&mut *lock_conn).await?);
-        let mut commit_attempted = false;
-        let mut committed = false;
-        let result = async {
+            // A managed root keeps nested repository transactions at savepoint
+            // depth. The PoolConnection remains the same physical advisory session.
+            let mut transaction = Some(sqlx::Connection::begin(&mut *lock_conn).await?);
+            let mut commit_attempted = false;
+            let mut committed = false;
+            let result = async {
             let lock_conn = &mut **transaction.as_mut()
                 .ok_or_else(|| anyhow::anyhow!("Workflow advancement transaction unavailable"))?;
             CacheEntryRepository::protect_transaction(
@@ -8118,361 +8225,154 @@ impl ExecutionScheduler {
             }
         }
         .await;
-        let mut rollback_succeeded = true;
-        if let Some(pending) = transaction.take() {
-            if let Err(rollback_error) = pending.rollback().await {
-                rollback_succeeded = false;
-                error!(
-                    "Failed to roll back workflow_execution {} advancement transaction: {}",
-                    workflow_execution_id, rollback_error
-                );
+            let mut rollback_succeeded = true;
+            if let Some(pending) = transaction.take() {
+                if let Err(rollback_error) = pending.rollback().await {
+                    rollback_succeeded = false;
+                    error!(
+                        "Failed to roll back workflow_execution {} advancement transaction: {}",
+                        workflow_execution_id, rollback_error
+                    );
+                }
             }
-        }
-        // End the borrow before unlocking the same physical session. Publication
-        // errors after a confirmed commit have no live root to roll back.
-        drop(transaction);
-        let unlock_result = if workflow_locked {
-            sqlx::query("SELECT pg_advisory_unlock($1)")
-                .bind(workflow_execution_id)
-                .execute(&mut *lock_conn)
-                .await
-                .map(|_| ())
-        } else {
-            Ok(())
-        };
+            // End the borrow before unlocking the same physical session. Publication
+            // errors after a confirmed commit have no live root to roll back.
+            drop(transaction);
+            let unlock_result = if workflow_locked {
+                sqlx::query("SELECT pg_advisory_unlock($1)")
+                    .bind(workflow_execution_id)
+                    .execute(&mut *lock_conn)
+                    .await
+                    .map(|_| ())
+            } else {
+                Ok(())
+            };
 
-        if rollback_succeeded && unlock_result.is_ok() && (!commit_attempted || committed) {
-            // Disarm only after transaction resolution and session unlock. Any
-            // uncertain commit/cleanup/cancellation path discards the socket.
-            drop(lock_conn.0.take());
-        } else if let Some(mut connection) = lock_conn.0.take() {
-            // The owned close future retains the pool permit. If interrupted
-            // before its first poll, its connection must still never be pooled.
-            connection.close_on_drop();
-            // Bound only this new cleanup wait. Dropping a pending owned close
-            // discards its socket; an uncertain COMMIT is never retried.
-            match tokio::time::timeout(std::time::Duration::from_secs(5), connection.close()).await {
+            if rollback_succeeded && unlock_result.is_ok() && (!commit_attempted || committed) {
+                // Disarm only after transaction resolution and session unlock. Any
+                // uncertain commit/cleanup/cancellation path discards the socket.
+                drop(lock_conn.0.take());
+            } else if let Some(mut connection) = lock_conn.0.take() {
+                // The owned close future retains the pool permit. If interrupted
+                // before its first poll, its connection must still never be pooled.
+                connection.close_on_drop();
+                // Bound only this new cleanup wait. Dropping a pending owned close
+                // discards its socket; an uncertain COMMIT is never retried.
+                match tokio::time::timeout(std::time::Duration::from_secs(5), connection.close()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => error!("Failed to close workflow_execution {} advancement session after uncertain cleanup", workflow_execution_id),
                 Err(_) => error!("Timed out closing workflow_execution {} advancement session after uncertain cleanup", workflow_execution_id),
             }
-        }
-        result?;
-        unlock_result?;
-        if let Some(plan) = native_transitions.get().and_then(Option::as_ref) {
-            plan.ensure_fresh()?;
-        }
-        if let Some(sources) = &native_sources {
-            sources.ensure_fresh()?;
-        }
-        if let Some(plan) = &native_failure {
-            plan.ensure_fresh()?;
-        }
-        if let Some(output) = &native_failure_output {
-            output.ensure_fresh()?;
-        }
-        if let Some(output) = &native_success_output {
-            output.ensure_fresh()?;
-        }
-        Ok(())
+            }
+            result?;
+            unlock_result?;
+            if let Some(plan) = native_transitions.get().and_then(Option::as_ref) {
+                plan.ensure_fresh()?;
+            }
+            if let Some(sources) = &native_sources {
+                sources.ensure_fresh()?;
+            }
+            if let Some(plan) = &native_failure {
+                plan.ensure_fresh()?;
+            }
+            if let Some(output) = &native_failure_output {
+                output.ensure_fresh()?;
+            }
+            if let Some(output) = &native_success_output {
+                output.ensure_fresh()?;
+            }
+            Ok(())
+        })
     }
 
-    async fn advance_workflow_serialized(
-        conn: &mut PgConnection,
-        round_robin_counter: &AtomicUsize,
-        encryption_key: Option<&str>,
-        execution: &Execution,
-        metadata_caches: &SchedulerMetadataCaches,
-    ) -> Result<WorkflowAdvanceOutcome> {
-        Self::advance_workflow_prepared(
-            conn,
-            round_robin_counter,
-            encryption_key,
-            execution,
-            metadata_caches,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
+    fn advance_workflow_serialized<'a>(
+        conn: &'a mut PgConnection,
+        round_robin_counter: &'a AtomicUsize,
+        encryption_key: Option<&'a str>,
+        execution: &'a Execution,
+        metadata_caches: &'a SchedulerMetadataCaches,
+    ) -> futures::future::BoxFuture<'a, Result<WorkflowAdvanceOutcome>> {
+        Box::pin(async move {
+            Self::advance_workflow_prepared(
+                conn,
+                round_robin_counter,
+                encryption_key,
+                execution,
+                metadata_caches,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn advance_workflow_prepared(
-        conn: &mut PgConnection,
-        round_robin_counter: &AtomicUsize,
-        encryption_key: Option<&str>,
-        execution: &Execution,
-        metadata_caches: &SchedulerMetadataCaches,
-        prepared_transitions: Option<&attune_common::repositories::native_transition_materialization::PreparedNativeTransitions>,
+    fn advance_workflow_prepared<'a>(
+        conn: &'a mut PgConnection,
+        round_robin_counter: &'a AtomicUsize,
+        encryption_key: Option<&'a str>,
+        execution: &'a Execution,
+        metadata_caches: &'a SchedulerMetadataCaches,
+        prepared_transitions: Option<&'a attune_common::repositories::native_transition_materialization::PreparedNativeTransitions>,
         prepared_sources: Option<
-            &attune_common::repositories::native_input_origin::NativeInputClosure,
+            &'a attune_common::repositories::native_input_origin::NativeInputClosure,
         >,
-        prepared_context: Option<&WorkflowContext>,
+        prepared_context: Option<&'a WorkflowContext>,
         prepared_failure: Option<
-            &attune_common::repositories::native_failure_materialization::PreparedNativeFailure,
+            &'a attune_common::repositories::native_failure_materialization::PreparedNativeFailure,
         >,
         prepared_failure_output: Option<
-            &attune_common::repositories::native_failure_materialization::PreparedNativeFailureOutput,
+            &'a attune_common::repositories::native_failure_materialization::PreparedNativeFailureOutput,
         >,
         prepared_success_output: Option<
-            &attune_common::repositories::native_failure_materialization::PreparedNativeSuccessOutput<'_>,
+            &'a attune_common::repositories::native_failure_materialization::PreparedNativeSuccessOutput<'_>,
         >,
-    ) -> Result<WorkflowAdvanceOutcome> {
-        let workflow_task = match &execution.workflow_task {
-            Some(wt) => wt,
-            None => return Ok(WorkflowAdvanceOutcome::default()), // Not a workflow task, nothing to do
-        };
+    ) -> futures::future::BoxFuture<'a, Result<WorkflowAdvanceOutcome>> {
+        Box::pin(async move {
+            let workflow_task = match &execution.workflow_task {
+                Some(wt) => wt,
+                None => return Ok(WorkflowAdvanceOutcome::default()), // Not a workflow task, nothing to do
+            };
 
-        let workflow_execution_id = workflow_task.workflow_execution;
-        let task_name = &workflow_task.task_name;
-        let mut task_succeeded = execution.status == ExecutionStatus::Completed;
-        let mut task_timed_out = execution.status == ExecutionStatus::Timeout;
+            let workflow_execution_id = workflow_task.workflow_execution;
+            let task_name = &workflow_task.task_name;
+            let mut task_succeeded = execution.status == ExecutionStatus::Completed;
+            let mut task_timed_out = execution.status == ExecutionStatus::Timeout;
 
-        let mut task_outcome = if task_succeeded {
-            TaskOutcome::Succeeded
-        } else if task_timed_out {
-            TaskOutcome::TimedOut
-        } else if execution.status == ExecutionStatus::Cancelled {
-            TaskOutcome::Cancelled
-        } else {
-            TaskOutcome::Failed
-        };
+            let mut task_outcome = if task_succeeded {
+                TaskOutcome::Succeeded
+            } else if task_timed_out {
+                TaskOutcome::TimedOut
+            } else if execution.status == ExecutionStatus::Cancelled {
+                TaskOutcome::Cancelled
+            } else {
+                TaskOutcome::Failed
+            };
 
-        info!(
-            "Advancing workflow_execution {} after task '{}' {:?} (execution {})",
-            workflow_execution_id, task_name, task_outcome, execution.id,
-        );
-
-        // Load the workflow execution record
-        let workflow_execution =
-            WorkflowExecutionRepository::find_by_id_for_update(&mut *conn, workflow_execution_id)
-                .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Workflow execution {} not found", workflow_execution_id)
-                })?;
-
-        if let Some(plan) = prepared_transitions {
-            plan.require_current(&workflow_execution)?;
-        }
-
-        // Already fully terminal (Completed / Failed) — nothing to do
-        if matches!(
-            workflow_execution.status,
-            ExecutionStatus::Completed | ExecutionStatus::Failed
-        ) {
-            debug!(
-                "Workflow execution {} already in terminal state {:?}, skipping advance",
-                workflow_execution_id, workflow_execution.status
+            info!(
+                "Advancing workflow_execution {} after task '{}' {:?} (execution {})",
+                workflow_execution_id, task_name, task_outcome, execution.id,
             );
-            return Ok(WorkflowAdvanceOutcome::default());
-        }
 
-        let mut pending_messages = WorkflowPublications::default();
-        let mut pending_completed_children = Vec::new();
-        let mut pending_completed_execution = None;
-
-        let parent_execution =
-            ExecutionRepository::find_by_id(&mut *conn, workflow_execution.execution)
-                .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Parent execution {} not found for workflow_execution {}",
-                        workflow_execution.execution,
-                        workflow_execution_id
-                    )
-                })?;
-
-        if let Some(plan) = prepared_failure {
-            plan.require_completed_execution(execution)?;
-            plan.require_current_rows(&parent_execution, &workflow_execution)?;
-        }
-        if let Some(output) = prepared_failure_output {
-            output.require_original_rows(&parent_execution, &workflow_execution)?;
-        }
-        if let Some(output) = prepared_success_output {
-            output.require_completed_execution(execution)?;
-            output.require_original_rows(&parent_execution, &workflow_execution)?;
-        }
-
-        let child_cancelled = execution.id >= 0
-            && matches!(
-                execution.status,
-                ExecutionStatus::Canceling | ExecutionStatus::Cancelled
-            );
-        if child_cancelled
-            && !matches!(
-                workflow_execution.status,
-                ExecutionStatus::Canceling | ExecutionStatus::Cancelled
-            )
-            && !matches!(
-                parent_execution.status,
-                ExecutionStatus::Canceling | ExecutionStatus::Cancelled
-            )
-        {
-            let reason = format!("Workflow task '{}' was cancelled", task_name);
-            WorkflowExecutionRepository::cancel_with_prerequisites_with_conn(
+            // Load the workflow execution record
+            let workflow_execution = WorkflowExecutionRepository::find_by_id_for_update(
                 &mut *conn,
                 workflow_execution_id,
-                &reason,
-                Some((
-                    ExecutionStatus::Canceling,
-                    Some(serde_json::json!({
-                        "error": reason,
-                        "succeeded": false,
-                    })),
-                )),
-            )
-            .await?;
-        }
-
-        // Cancellation must be a hard stop for workflow orchestration. Once
-        // either the workflow record, the parent execution, or the completed
-        // child itself is in a cancellation state, do not evaluate transitions,
-        // release more with_items siblings, or dispatch any successor tasks.
-        if Self::should_halt_workflow_advancement(
-            workflow_execution.status,
-            parent_execution.status,
-            execution.status,
-            execution.id < 0,
-        ) {
-            if let Some(iteration) =
-                WorkflowCacheIterationRepository::find_by_workflow_task_for_update(
-                    &mut *conn,
-                    workflow_execution_id,
-                    task_name,
-                )
-                .await?
-            {
-                if iteration.state == WorkflowCacheIterationState::Scanning {
-                    WorkflowCacheIterationRepository::mark_terminal(
-                        &mut *conn,
-                        iteration.id,
-                        WorkflowCacheIterationState::Cancelled,
-                        Some("workflow cancellation stopped cache iteration"),
-                    )
-                    .await?;
-                }
-            }
-            if workflow_execution.status == ExecutionStatus::Cancelled || child_cancelled {
-                let running = Self::count_running_workflow_children_with_conn(
-                    &mut *conn,
-                    workflow_execution_id,
-                    &workflow_execution.completed_tasks,
-                    &workflow_execution.failed_tasks,
-                )
-                .await?;
-
-                if running == 0 {
-                    info!(
-                        "Cancelled workflow_execution {} has no more running children, \
-                         finalizing parent execution {} as Cancelled",
-                        workflow_execution_id, workflow_execution.execution
-                    );
-                    let completed_execution = Self::finalize_cancelled_workflow_with_conn(
-                        &mut *conn,
-                        workflow_execution.execution,
-                        workflow_execution_id,
-                    )
-                    .await?;
-                    if let Some(completed_execution) = completed_execution {
-                        if completed_execution.parent.is_some() {
-                            let action_id = completed_execution.action.ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "Cancelled nested workflow execution {} has no action id",
-                                    completed_execution.id
-                                )
-                            })?;
-                            pending_completed_execution = Some(PendingExecutionCompleted {
-                                execution_id: completed_execution.id,
-                                action_id,
-                                action_ref: completed_execution.action_ref.clone(),
-                                status: completed_execution.status,
-                                result: completed_execution.result.clone(),
-                                completed_at: Utc::now(),
-                            });
-                        }
-                    }
-                } else {
-                    debug!(
-                        "Workflow_execution {} is cancelling/cancelled with {} running children, \
-                         skipping advancement",
-                        workflow_execution_id, running
-                    );
-                }
-            } else {
-                debug!(
-                    "Workflow_execution {} advancement halted due to cancellation state \
-                     (workflow: {:?}, parent: {:?}, child: {:?})",
-                    workflow_execution_id,
-                    workflow_execution.status,
-                    parent_execution.status,
-                    execution.status
-                );
-            }
-
-            return Ok(WorkflowAdvanceOutcome {
-                execution_requests: pending_messages,
-                completed_children: pending_completed_children,
-                completed_execution: pending_completed_execution,
-            });
-        }
-
-        // Load the workflow definition so we can apply param_schema defaults
-        let workflow_def = if let Some(cached) = metadata_caches
-            .cached_workflow_definition_by_id(workflow_execution.workflow_def)
-            .await
-        {
-            cached
-        } else {
-            let workflow_def = WorkflowDefinitionRepository::find_by_id_including_retired(
-                &mut *conn,
-                workflow_execution.workflow_def,
             )
             .await?
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Workflow definition {} not found for workflow_execution {}",
-                    workflow_execution.workflow_def,
-                    workflow_execution_id
-                )
-            })?;
-            metadata_caches
-                .cache_workflow_definition(&workflow_def)
-                .await;
-            workflow_def
-        };
-
-        // Rebuild the task graph from the stored JSON
-        let graph: TaskGraph = serde_json::from_value(workflow_execution.task_graph.clone())
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to deserialize task graph for workflow_execution {}: {}",
-                    workflow_execution_id,
-                    e
-                )
+                anyhow::anyhow!("Workflow execution {} not found", workflow_execution_id)
             })?;
 
-        // Update completed/failed task lists
-        let mut completed_tasks: Vec<String> = workflow_execution.completed_tasks.clone();
-        let mut failed_tasks: Vec<String> = workflow_execution.failed_tasks.clone();
+            if let Some(plan) = prepared_transitions {
+                plan.require_current(&workflow_execution)?;
+            }
 
-        // For with_items tasks, only mark completed/failed when ALL items
-        // for this task are done (no more running children with the same
-        // task_name).
-        let is_cache_iteration = graph
-            .get_task(task_name)
-            .is_some_and(|node| node.iterate_cache.is_some());
-        let is_with_items = workflow_task.task_index.is_some() && !is_cache_iteration;
-        if is_with_items {
-            // ---------------------------------------------------------
-            // Concurrency: publish next Requested-status sibling(s) to
-            // fill the slot freed by this completion.
-            // ---------------------------------------------------------
-            let parent_for_pending =
+            let parent_execution =
                 ExecutionRepository::find_by_id(&mut *conn, workflow_execution.execution)
                     .await?
                     .ok_or_else(|| {
@@ -8483,959 +8383,1254 @@ impl ExecutionScheduler {
                         )
                     })?;
 
-            // Count siblings that are actively in-flight (Scheduling,
-            // Scheduled, or Running — NOT Requested, which means "created
-            // but not yet published to MQ").
-            let in_flight_count: (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) \
+            // Replay the stored, redacted completion after a broker failure.
+            // Queue controls remain fenced and idempotent at their consumer.
+            if matches!(
+                workflow_execution.status,
+                ExecutionStatus::Completed | ExecutionStatus::Failed
+            ) || (workflow_execution.status == ExecutionStatus::Cancelled
+                && parent_execution.status == ExecutionStatus::Cancelled)
+            {
+                debug!(
+                    "Workflow execution {} already in terminal state {:?}, skipping advance",
+                    workflow_execution_id, workflow_execution.status
+                );
+                return Ok(WorkflowAdvanceOutcome {
+                    completed_execution: Self::workflow_completion_publication(
+                        conn,
+                        &parent_execution,
+                    )
+                    .await?,
+                    ..Default::default()
+                });
+            }
+
+            let mut pending_messages = WorkflowPublications::default();
+            let mut pending_completed_children = Vec::new();
+            let mut pending_completed_execution = None;
+
+            if let Some(plan) = prepared_failure {
+                plan.require_completed_execution(execution)?;
+                plan.require_current_rows(&parent_execution, &workflow_execution)?;
+            }
+            if let Some(output) = prepared_failure_output {
+                output.require_original_rows(&parent_execution, &workflow_execution)?;
+            }
+            if let Some(output) = prepared_success_output {
+                output.require_completed_execution(execution)?;
+                output.require_original_rows(&parent_execution, &workflow_execution)?;
+            }
+
+            let child_cancelled = execution.id >= 0
+                && matches!(
+                    execution.status,
+                    ExecutionStatus::Canceling | ExecutionStatus::Cancelled
+                );
+            if child_cancelled
+                && !matches!(
+                    workflow_execution.status,
+                    ExecutionStatus::Canceling | ExecutionStatus::Cancelled
+                )
+                && !matches!(
+                    parent_execution.status,
+                    ExecutionStatus::Canceling | ExecutionStatus::Cancelled
+                )
+            {
+                let reason = format!("Workflow task '{}' was cancelled", task_name);
+                WorkflowExecutionRepository::cancel_with_prerequisites_with_conn(
+                    &mut *conn,
+                    workflow_execution_id,
+                    &reason,
+                    Some((
+                        ExecutionStatus::Canceling,
+                        Some(serde_json::json!({
+                            "error": reason,
+                            "succeeded": false,
+                        })),
+                    )),
+                )
+                .await?;
+            }
+
+            // Cancellation must be a hard stop for workflow orchestration. Once
+            // either the workflow record, the parent execution, or the completed
+            // child itself is in a cancellation state, do not evaluate transitions,
+            // release more with_items siblings, or dispatch any successor tasks.
+            if Self::should_halt_workflow_advancement(
+                workflow_execution.status,
+                parent_execution.status,
+                execution.status,
+                execution.id < 0,
+            ) {
+                if let Some(iteration) =
+                    WorkflowCacheIterationRepository::find_by_workflow_task_for_update(
+                        &mut *conn,
+                        workflow_execution_id,
+                        task_name,
+                    )
+                    .await?
+                {
+                    if iteration.state == WorkflowCacheIterationState::Scanning {
+                        WorkflowCacheIterationRepository::mark_terminal(
+                            &mut *conn,
+                            iteration.id,
+                            WorkflowCacheIterationState::Cancelled,
+                            Some("workflow cancellation stopped cache iteration"),
+                        )
+                        .await?;
+                    }
+                }
+                if workflow_execution.status == ExecutionStatus::Cancelled || child_cancelled {
+                    let running = Self::count_running_workflow_children_with_conn(
+                        &mut *conn,
+                        workflow_execution_id,
+                        &workflow_execution.completed_tasks,
+                        &workflow_execution.failed_tasks,
+                    )
+                    .await?;
+
+                    if running == 0 {
+                        info!(
+                            "Cancelled workflow_execution {} has no more running children, \
+                         finalizing parent execution {} as Cancelled",
+                            workflow_execution_id, workflow_execution.execution
+                        );
+                        let completed_execution = Self::finalize_cancelled_workflow_with_conn(
+                            &mut *conn,
+                            workflow_execution.execution,
+                            workflow_execution_id,
+                        )
+                        .await?;
+                        if let Some(completed_execution) = completed_execution {
+                            pending_completed_execution =
+                                Self::workflow_completion_publication(conn, &completed_execution)
+                                    .await?;
+                        }
+                    } else {
+                        debug!(
+                        "Workflow_execution {} is cancelling/cancelled with {} running children, \
+                         skipping advancement",
+                        workflow_execution_id, running
+                    );
+                    }
+                } else {
+                    debug!(
+                        "Workflow_execution {} advancement halted due to cancellation state \
+                     (workflow: {:?}, parent: {:?}, child: {:?})",
+                        workflow_execution_id,
+                        workflow_execution.status,
+                        parent_execution.status,
+                        execution.status
+                    );
+                }
+
+                return Ok(WorkflowAdvanceOutcome {
+                    execution_requests: pending_messages,
+                    completed_children: pending_completed_children,
+                    completed_execution: pending_completed_execution,
+                });
+            }
+
+            // Load the workflow definition so we can apply param_schema defaults
+            let workflow_def = if let Some(cached) = metadata_caches
+                .cached_workflow_definition_by_id(workflow_execution.workflow_def)
+                .await
+            {
+                cached
+            } else {
+                let workflow_def = WorkflowDefinitionRepository::find_by_id_including_retired(
+                    &mut *conn,
+                    workflow_execution.workflow_def,
+                )
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Workflow definition {} not found for workflow_execution {}",
+                        workflow_execution.workflow_def,
+                        workflow_execution_id
+                    )
+                })?;
+                metadata_caches
+                    .cache_workflow_definition(&workflow_def)
+                    .await;
+                workflow_def
+            };
+
+            // Rebuild the task graph from the stored JSON
+            let graph: TaskGraph = serde_json::from_value(workflow_execution.task_graph.clone())
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to deserialize task graph for workflow_execution {}: {}",
+                        workflow_execution_id,
+                        e
+                    )
+                })?;
+
+            // Update completed/failed task lists
+            let mut completed_tasks: Vec<String> = workflow_execution.completed_tasks.clone();
+            let mut failed_tasks: Vec<String> = workflow_execution.failed_tasks.clone();
+
+            // For with_items tasks, only mark completed/failed when ALL items
+            // for this task are done (no more running children with the same
+            // task_name).
+            let is_cache_iteration = graph
+                .get_task(task_name)
+                .is_some_and(|node| node.iterate_cache.is_some());
+            let is_with_items = workflow_task.task_index.is_some() && !is_cache_iteration;
+            if is_with_items {
+                // ---------------------------------------------------------
+                // Concurrency: publish next Requested-status sibling(s) to
+                // fill the slot freed by this completion.
+                // ---------------------------------------------------------
+                let parent_for_pending =
+                    ExecutionRepository::find_by_id(&mut *conn, workflow_execution.execution)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Parent execution {} not found for workflow_execution {}",
+                                workflow_execution.execution,
+                                workflow_execution_id
+                            )
+                        })?;
+
+                // Count siblings that are actively in-flight (Scheduling,
+                // Scheduled, or Running — NOT Requested, which means "created
+                // but not yet published to MQ").
+                let in_flight_count: (i64,) = sqlx::query_as(
+                    "SELECT COUNT(*) \
                  FROM execution \
                  WHERE workflow_task->>'workflow_execution' = $1::text \
                    AND workflow_task->>'task_name' = $2 \
                    AND status IN ('scheduling', 'scheduled', 'running') \
                    AND id != $3",
-            )
-            .bind(workflow_execution_id.to_string())
-            .bind(task_name)
-            .bind(execution.id)
-            .fetch_one(&mut *conn)
-            .await?;
-
-            // Determine the concurrency limit from the task graph
-            let concurrency_limit = graph
-                .get_task(task_name)
-                .and_then(|n| n.concurrency)
-                .unwrap_or(1);
-
-            let free_slots = concurrency_limit
-                .saturating_sub(in_flight_count.0 as usize)
-                .min(1);
-
-            if free_slots > 0 {
-                if let Err(e) = Self::publish_pending_with_items_children_with_conn(
-                    &mut *conn,
-                    &parent_for_pending,
-                    workflow_execution_id,
-                    task_name,
-                    free_slots,
-                    &mut pending_messages,
                 )
-                .await
-                {
-                    error!(
-                        "Failed to publish pending with_items for task '{}': {}",
-                        task_name, e
-                    );
-                }
-            }
+                .bind(workflow_execution_id.to_string())
+                .bind(task_name)
+                .bind(execution.id)
+                .fetch_one(&mut *conn)
+                .await?;
 
-            // Count how many siblings are NOT in a terminal state
-            // (Requested items are pending, in-flight items are working).
-            let siblings_remaining: Vec<(String,)> = sqlx::query_as(
-                "SELECT workflow_task->>'task_name' as task_name \
+                // Determine the concurrency limit from the task graph
+                let concurrency_limit = graph
+                    .get_task(task_name)
+                    .and_then(|n| n.concurrency)
+                    .unwrap_or(1);
+
+                let free_slots = concurrency_limit
+                    .saturating_sub(in_flight_count.0 as usize)
+                    .min(1);
+
+                if free_slots > 0 {
+                    if let Err(e) = Self::publish_pending_with_items_children_with_conn(
+                        &mut *conn,
+                        &parent_for_pending,
+                        workflow_execution_id,
+                        task_name,
+                        free_slots,
+                        &mut pending_messages,
+                    )
+                    .await
+                    {
+                        error!(
+                            "Failed to publish pending with_items for task '{}': {}",
+                            task_name, e
+                        );
+                    }
+                }
+
+                // Count how many siblings are NOT in a terminal state
+                // (Requested items are pending, in-flight items are working).
+                let siblings_remaining: Vec<(String,)> = sqlx::query_as(
+                    "SELECT workflow_task->>'task_name' as task_name \
                  FROM execution \
                  WHERE workflow_task->>'workflow_execution' = $1::text \
                    AND workflow_task->>'task_name' = $2 \
                    AND status NOT IN ('completed', 'failed', 'timeout', 'cancelled') \
                    AND id != $3",
-            )
-            .bind(workflow_execution_id.to_string())
-            .bind(task_name)
-            .bind(execution.id)
-            .fetch_all(&mut *conn)
-            .await?;
+                )
+                .bind(workflow_execution_id.to_string())
+                .bind(task_name)
+                .bind(execution.id)
+                .fetch_all(&mut *conn)
+                .await?;
 
-            if !siblings_remaining.is_empty() {
-                debug!(
-                    "with_items task '{}' item {} done, but {} siblings remaining — \
+                if !siblings_remaining.is_empty() {
+                    debug!(
+                        "with_items task '{}' item {} done, but {} siblings remaining — \
                      not advancing yet",
-                    task_name,
-                    workflow_task.task_index.unwrap_or(-1),
-                    siblings_remaining.len(),
-                );
-                return Ok(WorkflowAdvanceOutcome {
-                    execution_requests: pending_messages,
-                    completed_children: pending_completed_children,
-                    completed_execution: None,
-                });
-            }
+                        task_name,
+                        workflow_task.task_index.unwrap_or(-1),
+                        siblings_remaining.len(),
+                    );
+                    return Ok(WorkflowAdvanceOutcome {
+                        execution_requests: pending_messages,
+                        completed_children: pending_completed_children,
+                        completed_execution: None,
+                    });
+                }
 
-            // ---------------------------------------------------------
-            // Race-condition guard: when multiple with_items children
-            // complete nearly simultaneously, the worker updates their
-            // DB status to Completed *before* the completion MQ message
-            // is processed.  This means several advance_workflow calls
-            // (processed sequentially by the completion listener) can
-            // each see "0 siblings remaining" and fall through to
-            // transition evaluation, dispatching successor tasks
-            // multiple times.
-            //
-            // To prevent this we re-check the *persisted*
-            // completed/failed task lists that were loaded from the
-            // workflow_execution record at the top of this function.
-            // If `task_name` is already present, a previous
-            // advance_workflow invocation already handled the final
-            // completion of this with_items task and dispatched its
-            // successors — we can safely return.
-            // ---------------------------------------------------------
-            if workflow_execution
-                .completed_tasks
-                .contains(&task_name.to_string())
-                || workflow_execution
-                    .failed_tasks
+                // ---------------------------------------------------------
+                // Race-condition guard: when multiple with_items children
+                // complete nearly simultaneously, the worker updates their
+                // DB status to Completed *before* the completion MQ message
+                // is processed.  This means several advance_workflow calls
+                // (processed sequentially by the completion listener) can
+                // each see "0 siblings remaining" and fall through to
+                // transition evaluation, dispatching successor tasks
+                // multiple times.
+                //
+                // To prevent this we re-check the *persisted*
+                // completed/failed task lists that were loaded from the
+                // workflow_execution record at the top of this function.
+                // If `task_name` is already present, a previous
+                // advance_workflow invocation already handled the final
+                // completion of this with_items task and dispatched its
+                // successors — we can safely return.
+                // ---------------------------------------------------------
+                if workflow_execution
+                    .completed_tasks
                     .contains(&task_name.to_string())
-            {
-                debug!(
-                    "with_items task '{}' already in persisted completed/failed list — \
+                    || workflow_execution
+                        .failed_tasks
+                        .contains(&task_name.to_string())
+                {
+                    debug!(
+                        "with_items task '{}' already in persisted completed/failed list — \
                      another advance_workflow call already handled final completion, skipping",
-                    task_name,
-                );
-                return Ok(WorkflowAdvanceOutcome {
-                    execution_requests: pending_messages,
-                    completed_children: pending_completed_children,
-                    completed_execution: None,
-                });
-            }
+                        task_name,
+                    );
+                    return Ok(WorkflowAdvanceOutcome {
+                        execution_requests: pending_messages,
+                        completed_children: pending_completed_children,
+                        completed_execution: None,
+                    });
+                }
 
-            // All items done — check if any failed
-            let any_failed: Vec<(i64,)> = sqlx::query_as(
-                "SELECT id \
+                // All items done — check if any failed
+                let any_failed: Vec<(i64,)> = sqlx::query_as(
+                    "SELECT id \
                  FROM execution \
                  WHERE workflow_task->>'workflow_execution' = $1::text \
                    AND workflow_task->>'task_name' = $2 \
                    AND status IN ('failed', 'timeout') \
                  LIMIT 1",
-            )
-            .bind(workflow_execution_id.to_string())
-            .bind(task_name)
-            .fetch_all(&mut *conn)
-            .await?;
+                )
+                .bind(workflow_execution_id.to_string())
+                .bind(task_name)
+                .fetch_all(&mut *conn)
+                .await?;
 
-            if any_failed.is_empty() {
-                if !completed_tasks.contains(task_name) {
-                    completed_tasks.push(task_name.clone());
+                if any_failed.is_empty() {
+                    if !completed_tasks.contains(task_name) {
+                        completed_tasks.push(task_name.clone());
+                    }
+                } else if !failed_tasks.contains(task_name) {
+                    failed_tasks.push(task_name.clone());
                 }
-            } else if !failed_tasks.contains(task_name) {
-                failed_tasks.push(task_name.clone());
-            }
-        } else {
-            // Normal (non-with_items) task
-            if task_succeeded {
-                if !completed_tasks.contains(task_name) {
-                    completed_tasks.push(task_name.clone());
+            } else {
+                // Normal (non-with_items) task
+                if task_succeeded {
+                    if !completed_tasks.contains(task_name) {
+                        completed_tasks.push(task_name.clone());
+                    }
+                } else if !failed_tasks.contains(task_name) {
+                    failed_tasks.push(task_name.clone());
                 }
-            } else if !failed_tasks.contains(task_name) {
-                failed_tasks.push(task_name.clone());
             }
-        }
 
-        let restored_parent_config = if let Some(sources) = prepared_sources {
-            sources
-                .restore_prepared(
-                    conn,
+            let restored_parent_config = if let Some(sources) = prepared_sources {
+                sources
+                    .restore_prepared(
+                        conn,
+                        ENTITY_EXECUTION_CONFIG,
+                        parent_execution.id,
+                        parent_execution.config.clone().unwrap_or(JsonValue::Null),
+                        encryption_key,
+                    )
+                    .await?
+            } else {
+                Self::restore_secret_entity(
+                    &mut *conn,
+                    encryption_key,
                     ENTITY_EXECUTION_CONFIG,
                     parent_execution.id,
                     parent_execution.config.clone().unwrap_or(JsonValue::Null),
-                    encryption_key,
-                )
-                .await?
-        } else {
-            Self::restore_secret_entity(
-                &mut *conn,
-                encryption_key,
-                ENTITY_EXECUTION_CONFIG,
-                parent_execution.id,
-                parent_execution.config.clone().unwrap_or(JsonValue::Null),
-                parent_execution.id,
-            )
-            .await?
-        };
-        let child_executions = if is_cache_iteration {
-            ExecutionRepository::find_by_parent_excluding_workflow_task(
-                &mut *conn,
-                parent_execution.id,
-                workflow_execution_id,
-                task_name,
-            )
-            .await?
-        } else {
-            ExecutionRepository::find_by_parent(&mut *conn, parent_execution.id).await?
-        };
-        let mut task_results_map: HashMap<String, JsonValue> = HashMap::new();
-        for child in &child_executions {
-            if let Some(ref wt) = child.workflow_task {
-                if wt.workflow_execution == workflow_execution_id
-                    && matches!(
-                        child.status,
-                        ExecutionStatus::Completed
-                            | ExecutionStatus::Failed
-                            | ExecutionStatus::Timeout
-                    )
-                {
-                    let result_val = if let Some(sources) = prepared_sources {
-                        sources
-                            .restore_prepared(
-                                conn,
-                                ENTITY_EXECUTION_RESULT,
-                                child.id,
-                                child.result.clone().unwrap_or(serde_json::json!({})),
-                                encryption_key,
-                            )
-                            .await?
-                    } else {
-                        Self::restore_secret_entity(
-                            &mut *conn,
-                            encryption_key,
-                            ENTITY_EXECUTION_RESULT,
-                            child.id,
-                            child.result.clone().unwrap_or(serde_json::json!({})),
-                            parent_execution.id,
-                        )
-                        .await?
-                    };
-                    task_results_map
-                        .insert(wt.task_name.clone(), workflow_result_view(&result_val));
-                }
-            }
-        }
-
-        reconcile_authoritative_task_statuses(
-            &mut completed_tasks,
-            &mut failed_tasks,
-            child_executions.iter().filter_map(|child| {
-                child.workflow_task.as_ref().and_then(|wt| {
-                    (wt.workflow_execution == workflow_execution_id).then(|| {
-                        (
-                            wt.task_name.clone(),
-                            wt.task_index,
-                            child.status,
-                            wt.triggered_by.clone(),
-                            wt.retry_count,
-                        )
-                    })
-                })
-            }),
-        );
-
-        // -----------------------------------------------------------------
-        // Rebuild the WorkflowContext from persisted state + completed task
-        // results so that successor task inputs can be rendered.
-        // -----------------------------------------------------------------
-        let workflow_params = extract_workflow_params(&Some(restored_parent_config));
-        let workflow_params = workflow_parameters_for_execution(
-            &mut *conn,
-            parent_execution.id,
-            workflow_params,
-            &workflow_def.param_schema,
-        )
-        .await?;
-
-        let stored_variables =
-            if let (Some(sources), Some(plan)) = (prepared_sources, prepared_transitions) {
-                (
-                    sources
-                        .restore_prepared(
-                            conn,
-                            attune_common::secret_values::ENTITY_WORKFLOW_VARIABLES,
-                            parent_execution.id,
-                            workflow_execution.variables.clone(),
-                            encryption_key,
-                        )
-                        .await?,
-                    plan.variable_sources()?,
-                )
-            } else {
-                Self::restore_workflow_variables(
-                    &mut *conn,
-                    encryption_key,
-                    &parent_execution,
-                    &workflow_execution.variables,
+                    parent_execution.id,
                 )
                 .await?
             };
-        let mut wf_ctx = prepared_context.cloned().unwrap_or_else(|| {
-            WorkflowContext::rebuild(workflow_params, &stored_variables.0, task_results_map)
-        });
-        let local_native_closure = if prepared_sources.is_none() {
-            Self::bind_native_workflow_closure(
+            let child_executions = if is_cache_iteration {
+                ExecutionRepository::find_by_parent_excluding_workflow_task(
+                    &mut *conn,
+                    parent_execution.id,
+                    workflow_execution_id,
+                    task_name,
+                )
+                .await?
+            } else {
+                ExecutionRepository::find_by_parent(&mut *conn, parent_execution.id).await?
+            };
+            let mut task_results_map: HashMap<String, JsonValue> = HashMap::new();
+            for child in &child_executions {
+                if let Some(ref wt) = child.workflow_task {
+                    if wt.workflow_execution == workflow_execution_id
+                        && matches!(
+                            child.status,
+                            ExecutionStatus::Completed
+                                | ExecutionStatus::Failed
+                                | ExecutionStatus::Timeout
+                        )
+                    {
+                        let result_val = if let Some(sources) = prepared_sources {
+                            sources
+                                .restore_prepared(
+                                    conn,
+                                    ENTITY_EXECUTION_RESULT,
+                                    child.id,
+                                    child.result.clone().unwrap_or(serde_json::json!({})),
+                                    encryption_key,
+                                )
+                                .await?
+                        } else {
+                            Self::restore_secret_entity(
+                                &mut *conn,
+                                encryption_key,
+                                ENTITY_EXECUTION_RESULT,
+                                child.id,
+                                child.result.clone().unwrap_or(serde_json::json!({})),
+                                parent_execution.id,
+                            )
+                            .await?
+                        };
+                        task_results_map
+                            .insert(wt.task_name.clone(), workflow_result_view(&result_val));
+                    }
+                }
+            }
+
+            reconcile_authoritative_task_statuses(
+                &mut completed_tasks,
+                &mut failed_tasks,
+                child_executions.iter().filter_map(|child| {
+                    child.workflow_task.as_ref().and_then(|wt| {
+                        (wt.workflow_execution == workflow_execution_id).then(|| {
+                            (
+                                wt.task_name.clone(),
+                                wt.task_index,
+                                child.status,
+                                wt.triggered_by.clone(),
+                                wt.retry_count,
+                            )
+                        })
+                    })
+                }),
+            );
+
+            // -----------------------------------------------------------------
+            // Rebuild the WorkflowContext from persisted state + completed task
+            // results so that successor task inputs can be rendered.
+            // -----------------------------------------------------------------
+            let workflow_params = extract_workflow_params(&Some(restored_parent_config));
+            let workflow_params = workflow_parameters_for_execution(
                 &mut *conn,
                 parent_execution.id,
-                &wf_ctx,
-                encryption_key,
-            )
-            .await?
-        } else {
-            None
-        };
-        let native_closure = prepared_sources.or(local_native_closure.as_ref());
-        if let Some(sources) = prepared_sources {
-            wf_ctx.bind_native_input_closure(sources);
-        }
-        wf_ctx.set_template_origin("workflow", &parent_execution.action_ref);
-        if prepared_context.is_none() {
-            Self::populate_workflow_pack_config(
-                &mut *conn,
-                &parent_execution,
-                &mut wf_ctx,
-                encryption_key,
+                workflow_params,
+                &workflow_def.param_schema,
             )
             .await?;
-        }
-        for (path, source) in stored_variables.1 {
-            wf_ctx.mark_secret_pointer_paths("workflow", &[path], |_| source.clone());
-        }
-        wf_ctx.retain_namespace_control_sources("workflow");
-        if prepared_context.is_none() {
-            Self::populate_task_wait_context(
-                &mut *conn,
-                workflow_execution_id,
-                &mut wf_ctx,
-                parent_execution.executor,
-                encryption_key,
-            )
-            .await?;
-        }
-        Self::mark_workflow_parameter_secret_sources(&wf_ctx, &parent_execution);
-        Self::mark_workflow_task_result_secret_sources(
-            &wf_ctx,
-            &child_executions,
-            workflow_execution_id,
-        );
 
-        // Set the just-completed task's outcome so that `result()`,
-        // `succeeded()`, `failed()` resolve correctly for publish and
-        // transition conditions.
-        let native_result_view =
-            prepared_transitions.and_then(|plan| plan.native_result_view(execution.id));
-        let completed_result = if let Some(view) = native_result_view {
-            view.clone()
-        } else if let Some(sources) = prepared_sources {
-            sources
-                .restore_prepared(
-                    conn,
-                    ENTITY_EXECUTION_RESULT,
-                    execution.id,
-                    execution.result.clone().unwrap_or(serde_json::json!({})),
+            let stored_variables =
+                if let (Some(sources), Some(plan)) = (prepared_sources, prepared_transitions) {
+                    (
+                        sources
+                            .restore_prepared(
+                                conn,
+                                attune_common::secret_values::ENTITY_WORKFLOW_VARIABLES,
+                                parent_execution.id,
+                                workflow_execution.variables.clone(),
+                                encryption_key,
+                            )
+                            .await?,
+                        plan.variable_sources()?,
+                    )
+                } else {
+                    Self::restore_workflow_variables(
+                        &mut *conn,
+                        encryption_key,
+                        &parent_execution,
+                        &workflow_execution.variables,
+                    )
+                    .await?
+                };
+            let mut wf_ctx = prepared_context.cloned().unwrap_or_else(|| {
+                WorkflowContext::rebuild(workflow_params, &stored_variables.0, task_results_map)
+            });
+            let local_native_closure = if prepared_sources.is_none() {
+                Self::bind_native_workflow_closure(
+                    &mut *conn,
+                    parent_execution.id,
+                    &wf_ctx,
                     encryption_key,
                 )
                 .await?
-        } else {
-            Self::restore_secret_entity(
-                &mut *conn,
-                encryption_key,
-                ENTITY_EXECUTION_RESULT,
-                execution.id,
-                execution.result.clone().unwrap_or(serde_json::json!({})),
-                parent_execution.id,
-            )
-            .await?
-        };
-        let completed_result = if native_result_view.is_some() {
-            completed_result
-        } else {
-            workflow_result_view(&completed_result)
-        };
-        let completed_secret_paths = workflow_result_secret_paths(
-            &execution.result.clone().unwrap_or(serde_json::json!({})),
-        );
-        wf_ctx.set_last_task_outcome_with_secret_paths(
-            completed_result.clone(),
-            task_outcome,
-            &completed_secret_paths,
-            |path| SecretSource::ExecutionResult {
-                execution_id: execution.id,
-                path: if execution
-                    .result
-                    .as_ref()
-                    .and_then(|result| result.pointer(path))
-                    .is_some_and(attune_common::secret_values::is_redaction_marker)
-                {
-                    path.clone()
-                } else {
-                    format!("/data{path}")
-                },
-            },
-        );
+            } else {
+                None
+            };
+            let native_closure = prepared_sources.or(local_native_closure.as_ref());
+            if let Some(sources) = prepared_sources {
+                wf_ctx.bind_native_input_closure(sources);
+            }
+            wf_ctx.set_template_origin("workflow", &parent_execution.action_ref);
+            if prepared_context.is_none() {
+                Self::populate_workflow_pack_config(
+                    &mut *conn,
+                    &parent_execution,
+                    &mut wf_ctx,
+                    encryption_key,
+                )
+                .await?;
+            }
+            for (path, source) in stored_variables.1 {
+                wf_ctx.mark_secret_pointer_paths("workflow", &[path], |_| source.clone());
+            }
+            wf_ctx.retain_namespace_control_sources("workflow");
+            if prepared_context.is_none() {
+                Self::populate_task_wait_context(
+                    &mut *conn,
+                    workflow_execution_id,
+                    &mut wf_ctx,
+                    parent_execution.executor,
+                    encryption_key,
+                )
+                .await?;
+            }
+            Self::mark_workflow_parameter_secret_sources(&wf_ctx, &parent_execution);
+            Self::mark_workflow_task_result_secret_sources(
+                &wf_ctx,
+                &child_executions,
+                workflow_execution_id,
+            );
 
-        if is_cache_iteration {
-            if workflow_execution.completed_tasks.contains(task_name)
-                || workflow_execution.failed_tasks.contains(task_name)
-            {
+            // Set the just-completed task's outcome so that `result()`,
+            // `succeeded()`, `failed()` resolve correctly for publish and
+            // transition conditions.
+            let native_result_view =
+                prepared_transitions.and_then(|plan| plan.native_result_view(execution.id));
+            let completed_result = if let Some(view) = native_result_view {
+                view.clone()
+            } else if let Some(sources) = prepared_sources {
+                sources
+                    .restore_prepared(
+                        conn,
+                        ENTITY_EXECUTION_RESULT,
+                        execution.id,
+                        execution.result.clone().unwrap_or(serde_json::json!({})),
+                        encryption_key,
+                    )
+                    .await?
+            } else {
+                Self::restore_secret_entity(
+                    &mut *conn,
+                    encryption_key,
+                    ENTITY_EXECUTION_RESULT,
+                    execution.id,
+                    execution.result.clone().unwrap_or(serde_json::json!({})),
+                    parent_execution.id,
+                )
+                .await?
+            };
+            let completed_result = if native_result_view.is_some() {
+                completed_result
+            } else {
+                workflow_result_view(&completed_result)
+            };
+            let completed_secret_paths = workflow_result_secret_paths(
+                &execution.result.clone().unwrap_or(serde_json::json!({})),
+            );
+            wf_ctx.set_last_task_outcome_with_secret_paths(
+                completed_result.clone(),
+                task_outcome,
+                &completed_secret_paths,
+                |path| SecretSource::ExecutionResult {
+                    execution_id: execution.id,
+                    path: if execution
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.pointer(path))
+                        .is_some_and(attune_common::secret_values::is_redaction_marker)
+                    {
+                        path.clone()
+                    } else {
+                        format!("/data{path}")
+                    },
+                },
+            );
+
+            if is_cache_iteration {
+                if workflow_execution.completed_tasks.contains(task_name)
+                    || workflow_execution.failed_tasks.contains(task_name)
+                {
+                    if let Some(closure) = &native_closure {
+                        closure.ensure_fresh_on(conn).await?;
+                    }
+                    return Ok(WorkflowAdvanceOutcome {
+                        execution_requests: pending_messages,
+                        completed_children: pending_completed_children,
+                        completed_execution: None,
+                    });
+                }
+                let task_node = graph.get_task(task_name).ok_or_else(|| {
+                    anyhow::anyhow!("Cache iteration task '{}' not found", task_name)
+                })?;
+                let action_ref = task_node.action.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("Cache iteration task '{}' has no action", task_name)
+                })?;
+                let mut iteration =
+                    WorkflowCacheIterationRepository::find_by_workflow_task_for_update(
+                        &mut *conn,
+                        workflow_execution_id,
+                        task_name,
+                    )
+                    .await?;
+                if iteration.is_some() {
+                    let task_snapshot = Self::workflow_task_snapshot_with_conn(
+                        &mut *conn,
+                        &parent_execution,
+                        action_ref,
+                        task_name,
+                    )
+                    .await?;
+                    let task_action = task_snapshot.executable.action.clone();
+                    Self::dispatch_cache_iteration_task_with_conn(
+                        &mut *conn,
+                        &parent_execution,
+                        &workflow_execution_id,
+                        task_node,
+                        &task_action,
+                        &task_snapshot,
+                        action_ref,
+                        &wf_ctx,
+                        encryption_key,
+                        workflow_task.triggered_by.as_deref(),
+                        &mut pending_messages,
+                        &mut pending_completed_children,
+                    )
+                    .await?;
+                    iteration = WorkflowCacheIterationRepository::find_by_workflow_task_for_update(
+                        &mut *conn,
+                        workflow_execution_id,
+                        task_name,
+                    )
+                    .await?;
+                }
+
+                completed_tasks.retain(|name| name != task_name);
+                failed_tasks.retain(|name| name != task_name);
+                if let Some(iteration) = iteration {
+                    if iteration.state == WorkflowCacheIterationState::Scanning {
+                        if let Some(closure) = &native_closure {
+                            closure.ensure_fresh_on(conn).await?;
+                        }
+                        return Ok(WorkflowAdvanceOutcome {
+                            execution_requests: pending_messages,
+                            completed_children: pending_completed_children,
+                            completed_execution: None,
+                        });
+                    }
+                    let attempt_summary =
+                        ExecutionRepository::summarize_workflow_task_latest_attempts(
+                            &mut *conn,
+                            workflow_execution_id,
+                            task_name,
+                        )
+                        .await?;
+                    if attempt_summary.in_flight > 0 {
+                        if let Some(closure) = &native_closure {
+                            closure.ensure_fresh_on(conn).await?;
+                        }
+                        return Ok(WorkflowAdvanceOutcome {
+                            execution_requests: pending_messages,
+                            completed_children: pending_completed_children,
+                            completed_execution: None,
+                        });
+                    }
+
+                    match iteration.state {
+                        WorkflowCacheIterationState::Completed => {
+                            completed_tasks.push(task_name.clone());
+                            task_succeeded = true;
+                            task_timed_out = false;
+                            task_outcome = TaskOutcome::Succeeded;
+                        }
+                        WorkflowCacheIterationState::Failed
+                        | WorkflowCacheIterationState::Cancelled => {
+                            failed_tasks.push(task_name.clone());
+                            task_succeeded = false;
+                            task_timed_out = false;
+                            task_outcome = TaskOutcome::Failed;
+                        }
+                        WorkflowCacheIterationState::Scanning => unreachable!(),
+                    }
+                } else {
+                    // A synthetic failed child without an iteration row represents
+                    // a logical initialization failure and must drive failed().
+                    task_outcome = cache_iteration_outcome_without_state(execution.status)?;
+                    if !failed_tasks.contains(task_name) {
+                        failed_tasks.push(task_name.clone());
+                    }
+                    task_succeeded = false;
+                    task_timed_out = false;
+                }
+                wf_ctx.set_last_task_outcome(completed_result.clone(), task_outcome);
+            }
+
+            // -----------------------------------------------------------------
+            // Process transitions: evaluate conditions, process publish
+            // directives, collect successor tasks.
+            // -----------------------------------------------------------------
+            let mut tasks_to_schedule: Vec<String> = Vec::new();
+            let mut deferred_join_tasks: Vec<String> = Vec::new();
+
+            let recorded_transitions = if let Some(plan) = prepared_transitions {
+                plan.require_transitions(&serde_json::to_value(
+                    &graph
+                        .get_task(task_name)
+                        .ok_or_else(|| anyhow::anyhow!("Prepared transition task disappeared"))?
+                        .transitions,
+                )?)?;
+                let recorded = plan
+                    .record(
+                        conn,
+                        &workflow_execution,
+                        encryption_key.ok_or_else(|| {
+                            anyhow::anyhow!("Native transition encryption is unavailable")
+                        })?,
+                    )
+                    .await?;
+                ExecutionSecretValueRepository::replace_entity_with_conn(
+                    conn,
+                    attune_common::secret_values::ENTITY_WORKFLOW_VARIABLES,
+                    parent_execution.id,
+                    &recorded.secrets,
+                )
+                .await?;
+                WorkflowExecutionRepository::update(
+                    &mut *conn,
+                    workflow_execution_id,
+                    attune_common::repositories::workflow::UpdateWorkflowExecutionInput {
+                        variables: Some(recorded.variables.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                wf_ctx.retain_native_control_sources(&plan.control_sources());
+                Some(recorded)
+            } else {
+                None
+            };
+
+            if let Some(completed_task_node) = graph.get_task(task_name) {
+                for (transition_index, transition) in
+                    completed_task_node.transitions.iter().enumerate()
+                {
+                    let should_fire = if let Some(plan) = prepared_transitions {
+                        plan.fires(transition_index)?
+                    } else {
+                        match transition.kind() {
+                            crate::workflow::graph::TransitionKind::Succeeded => task_succeeded,
+                            crate::workflow::graph::TransitionKind::Failed => {
+                                task_outcome == TaskOutcome::Failed
+                            }
+                            crate::workflow::graph::TransitionKind::Always => true,
+                            crate::workflow::graph::TransitionKind::TimedOut => task_timed_out,
+                            crate::workflow::graph::TransitionKind::Custom => {
+                                // Try to evaluate via the workflow context
+                                if let Some(ref when_expr) = transition.when {
+                                    match wf_ctx.evaluate_condition(when_expr) {
+                                        Ok(val) => val,
+                                        Err(e) => {
+                                            warn!(
+                                                "Custom condition '{}' evaluation failed: {}. \
+                                         Defaulting to fire-on-success.",
+                                                when_expr, e
+                                            );
+                                            task_succeeded
+                                        }
+                                    }
+                                } else {
+                                    task_succeeded
+                                }
+                            }
+                        }
+                    };
+
+                    if should_fire {
+                        // Process publish directives from this transition
+                        if !transition.publish.is_empty() {
+                            if let Some(recorded) = &recorded_transitions {
+                                for (index, name, value, sources) in &recorded.publications {
+                                    if *index == transition_index {
+                                        wf_ctx.publish_rendered(
+                                            name,
+                                            RenderedJson {
+                                                value: value.clone(),
+                                                secret_paths: sources
+                                                    .iter()
+                                                    .map(|source| source.path.clone())
+                                                    .collect(),
+                                                sources: sources
+                                                    .iter()
+                                                    .map(|source| source.source.clone())
+                                                    .collect(),
+                                                secret_path_sources: sources.clone(),
+                                            },
+                                        );
+                                    }
+                                }
+                            } else {
+                                let publish_map: HashMap<String, JsonValue> = transition
+                                    .publish
+                                    .iter()
+                                    .map(|p| (p.name.clone(), p.value.clone()))
+                                    .collect();
+                                if let Err(e) = wf_ctx.publish_from_result(
+                                    &serde_json::json!({}),
+                                    &[],
+                                    Some(&publish_map),
+                                ) {
+                                    warn!(
+                                        "Failed to process publish for task '{}': {}",
+                                        task_name, e
+                                    );
+                                } else {
+                                    debug!(
+                                        "Published {} variables from task '{}' transition",
+                                        publish_map.len(),
+                                        task_name
+                                    );
+                                }
+                            }
+                        }
+
+                        for next_task_name in &transition.do_tasks {
+                            // Skip tasks that are already completed or failed
+                            if completed_tasks.contains(next_task_name)
+                                || failed_tasks.contains(next_task_name)
+                            {
+                                debug!(
+                                    "Skipping task '{}' — already completed or failed",
+                                    next_task_name
+                                );
+                                continue;
+                            }
+
+                            // Check join barrier: if the task has a `join` count,
+                            // only schedule it when enough predecessors are done.
+                            if let Some(next_node) = graph.get_task(next_task_name) {
+                                if let Some(join_count) = next_node.join {
+                                    let inbound_completed = next_node
+                                        .inbound_tasks
+                                        .iter()
+                                        .filter(|t| completed_tasks.contains(*t))
+                                        .count();
+                                    if inbound_completed < join_count {
+                                        debug!(
+                                        "Task '{}' join barrier not met ({}/{} predecessors done)",
+                                        next_task_name, inbound_completed, join_count
+                                    );
+                                        if !deferred_join_tasks.contains(next_task_name) {
+                                            deferred_join_tasks.push(next_task_name.clone());
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            if !tasks_to_schedule.contains(next_task_name) {
+                                tasks_to_schedule.push(next_task_name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !task_succeeded && !tasks_to_schedule.is_empty() {
+                failed_tasks.retain(|failed_task| failed_task != task_name);
+                if !completed_tasks.contains(task_name) {
+                    completed_tasks.push(task_name.clone());
+                }
+            }
+
+            // Check if any tasks are still running (children of this workflow
+            // that haven't completed yet). We query child executions that have
+            // workflow_task metadata pointing to our workflow_execution.
+            let running_children = Self::count_running_workflow_children_with_conn(
+                &mut *conn,
+                workflow_execution_id,
+                &completed_tasks,
+                &failed_tasks,
+            )
+            .await?;
+
+            // Dispatch successor tasks, passing the updated workflow context
+            let mut logical_prerequisite_failures = Vec::new();
+            let mut terminal_wait_tasks = Vec::new();
+            for next_task_name in &tasks_to_schedule {
+                if let Some(task_node) = graph.get_task(next_task_name) {
+                    if let Err(e) = Self::activate_workflow_task_with_input_plan(
+                        &mut *conn,
+                        round_robin_counter,
+                        &parent_execution,
+                        &workflow_execution_id,
+                        task_node,
+                        &wf_ctx,
+                        encryption_key,
+                        Some(task_name), // predecessor that triggered this task
+                        &mut pending_messages,
+                        &mut pending_completed_children,
+                        prepared_transitions,
+                    )
+                    .await
+                    {
+                        if let Some(prerequisite_error) =
+                            e.downcast_ref::<TaskWaitPrerequisiteError>()
+                        {
+                            logical_prerequisite_failures
+                                .push((prerequisite_error.clone(), Some(task_name.clone())));
+                            continue;
+                        }
+                        error!(
+                            "Failed to dispatch workflow task '{}': {}",
+                            next_task_name, e
+                        );
+                        return Err(e);
+                    }
+                    if WorkflowTaskWaitRepository::find_by_workflow_task(
+                        &mut *conn,
+                        workflow_execution_id,
+                        next_task_name,
+                    )
+                    .await?
+                    .is_some_and(|wait| {
+                        matches!(
+                            wait.state,
+                            WorkflowTaskWaitState::TimedOut
+                                | WorkflowTaskWaitState::Cancelled
+                                | WorkflowTaskWaitState::Failed
+                        )
+                    }) {
+                        terminal_wait_tasks.push(next_task_name.clone());
+                    }
+                }
+            }
+
+            // Determine current executing tasks (for the workflow_execution record)
+            let current_tasks: Vec<String> = tasks_to_schedule
+                .iter()
+                .filter(|task| {
+                    !logical_prerequisite_failures
+                        .iter()
+                        .any(|(error, _)| error.task_name == task.as_str())
+                        && !terminal_wait_tasks.contains(task)
+                })
+                .cloned()
+                .collect();
+
+            // Persist updated workflow variables (from publish directives) and
+            // completed/failed task lists.
+            let (updated_variables, secret_inputs) = if let Some(recorded) = &recorded_transitions {
+                (recorded.variables.clone(), Vec::new())
+            } else {
+                let rendered_variables = wf_ctx.export_variables_with_sensitivity()?;
+                attune_common::secret_values::redact_secret_path_sources(
+                    rendered_variables.value,
+                    &rendered_variables.secret_path_sources,
+                )
+            };
+            if recorded_transitions.is_none() {
+                ExecutionSecretValueRepository::delete_by_entity(
+                    &mut *conn,
+                    attune_common::secret_values::ENTITY_WORKFLOW_VARIABLES,
+                    parent_execution.id,
+                )
+                .await?;
+                if !secret_inputs.is_empty() {
+                    let key = encryption_key.ok_or_else(|| {
+                        anyhow::anyhow!("Workflow variable encryption is not configured")
+                    })?;
+                    ExecutionSecretValueRepository::upsert_many_with_conn(
+                        &mut *conn,
+                        attune_common::secret_values::ENTITY_WORKFLOW_VARIABLES,
+                        parent_execution.id,
+                        &prepare_secret_values(secret_inputs, key)?,
+                    )
+                    .await?;
+                }
+            }
+            WorkflowExecutionRepository::update(
+                &mut *conn,
+                workflow_execution_id,
+                attune_common::repositories::workflow::UpdateWorkflowExecutionInput {
+                    current_tasks: Some(current_tasks),
+                    completed_tasks: Some(completed_tasks.clone()),
+                    failed_tasks: Some(failed_tasks.clone()),
+                    skipped_tasks: None,
+                    variables: Some(updated_variables),
+                    status: None, // Updated below if terminal
+                    error_message: None,
+                    paused: None,
+                    pause_reason: None,
+                },
+            )
+            .await?;
+
+            let has_logical_wait_failures = !logical_prerequisite_failures.is_empty();
+            let has_terminal_waits = !terminal_wait_tasks.is_empty();
+            if has_logical_wait_failures || has_terminal_waits {
+                for (prerequisite_error, triggered_by) in logical_prerequisite_failures {
+                    let logical_outcome = Self::task_wait_prerequisite_failure_execution(
+                        &parent_execution,
+                        workflow_execution_id,
+                        &prerequisite_error,
+                        triggered_by,
+                    );
+                    let outcome = Box::pin(Self::advance_workflow_serialized(
+                        &mut *conn,
+                        round_robin_counter,
+                        encryption_key,
+                        &logical_outcome,
+                        metadata_caches,
+                    ))
+                    .await?;
+                    pending_messages.extend(outcome.execution_requests);
+                    pending_completed_children.extend(outcome.completed_children);
+                    if outcome.completed_execution.is_some() {
+                        pending_completed_execution = outcome.completed_execution;
+                    }
+                }
+                for terminal_task in terminal_wait_tasks {
+                    let outcome = Box::pin(Self::advance_resolved_task_wait_with_conn(
+                        &mut *conn,
+                        round_robin_counter,
+                        encryption_key,
+                        &parent_execution,
+                        workflow_execution_id,
+                        &terminal_task,
+                        None,
+                    ))
+                    .await?;
+                    pending_messages.extend(outcome.execution_requests);
+                    pending_completed_children.extend(outcome.completed_children);
+                    if outcome.completed_execution.is_some() {
+                        pending_completed_execution = outcome.completed_execution;
+                    }
+                }
                 if let Some(closure) = &native_closure {
                     closure.ensure_fresh_on(conn).await?;
                 }
                 return Ok(WorkflowAdvanceOutcome {
                     execution_requests: pending_messages,
                     completed_children: pending_completed_children,
-                    completed_execution: None,
+                    completed_execution: pending_completed_execution,
                 });
             }
-            let task_node = graph
-                .get_task(task_name)
-                .ok_or_else(|| anyhow::anyhow!("Cache iteration task '{}' not found", task_name))?;
-            let action_ref = task_node.action.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("Cache iteration task '{}' has no action", task_name)
-            })?;
-            let mut iteration = WorkflowCacheIterationRepository::find_by_workflow_task_for_update(
-                &mut *conn,
-                workflow_execution_id,
-                task_name,
-            )
-            .await?;
-            if iteration.is_some() {
-                let task_snapshot = Self::workflow_task_snapshot_with_conn(
-                    &mut *conn,
-                    &parent_execution,
-                    action_ref,
-                    task_name,
-                )
-                .await?;
-                let task_action = task_snapshot.executable.action.clone();
-                Self::dispatch_cache_iteration_task_with_conn(
-                    &mut *conn,
-                    &parent_execution,
-                    &workflow_execution_id,
-                    task_node,
-                    &task_action,
-                    &task_snapshot,
-                    action_ref,
-                    &wf_ctx,
-                    encryption_key,
-                    workflow_task.triggered_by.as_deref(),
-                    &mut pending_messages,
-                    &mut pending_completed_children,
-                )
-                .await?;
-                iteration = WorkflowCacheIterationRepository::find_by_workflow_task_for_update(
+
+            // Check if workflow is complete: no more tasks to schedule and no
+            // children still running (excluding the ones we just scheduled).
+            let all_done = tasks_to_schedule.is_empty()
+                && deferred_join_tasks.is_empty()
+                && running_children == 0
+                && WorkflowTaskWaitRepository::count_waiting(&mut *conn, workflow_execution_id)
+                    .await?
+                    == 0
+                && WorkflowTaskWaitRepository::count_pending_terminal_delivery(
                     &mut *conn,
                     workflow_execution_id,
-                    task_name,
-                )
-                .await?;
-            }
-
-            completed_tasks.retain(|name| name != task_name);
-            failed_tasks.retain(|name| name != task_name);
-            if let Some(iteration) = iteration {
-                if iteration.state == WorkflowCacheIterationState::Scanning {
-                    if let Some(closure) = &native_closure {
-                        closure.ensure_fresh_on(conn).await?;
-                    }
-                    return Ok(WorkflowAdvanceOutcome {
-                        execution_requests: pending_messages,
-                        completed_children: pending_completed_children,
-                        completed_execution: None,
-                    });
-                }
-                let attempt_summary = ExecutionRepository::summarize_workflow_task_latest_attempts(
-                    &mut *conn,
-                    workflow_execution_id,
-                    task_name,
-                )
-                .await?;
-                if attempt_summary.in_flight > 0 {
-                    if let Some(closure) = &native_closure {
-                        closure.ensure_fresh_on(conn).await?;
-                    }
-                    return Ok(WorkflowAdvanceOutcome {
-                        execution_requests: pending_messages,
-                        completed_children: pending_completed_children,
-                        completed_execution: None,
-                    });
-                }
-
-                match iteration.state {
-                    WorkflowCacheIterationState::Completed => {
-                        completed_tasks.push(task_name.clone());
-                        task_succeeded = true;
-                        task_timed_out = false;
-                        task_outcome = TaskOutcome::Succeeded;
-                    }
-                    WorkflowCacheIterationState::Failed
-                    | WorkflowCacheIterationState::Cancelled => {
-                        failed_tasks.push(task_name.clone());
-                        task_succeeded = false;
-                        task_timed_out = false;
-                        task_outcome = TaskOutcome::Failed;
-                    }
-                    WorkflowCacheIterationState::Scanning => unreachable!(),
-                }
-            } else {
-                // A synthetic failed child without an iteration row represents
-                // a logical initialization failure and must drive failed().
-                task_outcome = cache_iteration_outcome_without_state(execution.status)?;
-                if !failed_tasks.contains(task_name) {
-                    failed_tasks.push(task_name.clone());
-                }
-                task_succeeded = false;
-                task_timed_out = false;
-            }
-            wf_ctx.set_last_task_outcome(completed_result.clone(), task_outcome);
-        }
-
-        // -----------------------------------------------------------------
-        // Process transitions: evaluate conditions, process publish
-        // directives, collect successor tasks.
-        // -----------------------------------------------------------------
-        let mut tasks_to_schedule: Vec<String> = Vec::new();
-        let mut deferred_join_tasks: Vec<String> = Vec::new();
-
-        let recorded_transitions = if let Some(plan) = prepared_transitions {
-            plan.require_transitions(&serde_json::to_value(
-                &graph
-                    .get_task(task_name)
-                    .ok_or_else(|| anyhow::anyhow!("Prepared transition task disappeared"))?
-                    .transitions,
-            )?)?;
-            let recorded = plan
-                .record(
-                    conn,
-                    &workflow_execution,
-                    encryption_key.ok_or_else(|| {
-                        anyhow::anyhow!("Native transition encryption is unavailable")
-                    })?,
-                )
-                .await?;
-            ExecutionSecretValueRepository::replace_entity_with_conn(
-                conn,
-                attune_common::secret_values::ENTITY_WORKFLOW_VARIABLES,
-                parent_execution.id,
-                &recorded.secrets,
-            )
-            .await?;
-            WorkflowExecutionRepository::update(
-                &mut *conn,
-                workflow_execution_id,
-                attune_common::repositories::workflow::UpdateWorkflowExecutionInput {
-                    variables: Some(recorded.variables.clone()),
-                    ..Default::default()
-                },
-            )
-            .await?;
-            wf_ctx.retain_native_control_sources(&plan.control_sources());
-            Some(recorded)
-        } else {
-            None
-        };
-
-        if let Some(completed_task_node) = graph.get_task(task_name) {
-            for (transition_index, transition) in completed_task_node.transitions.iter().enumerate()
-            {
-                let should_fire = if let Some(plan) = prepared_transitions {
-                    plan.fires(transition_index)?
-                } else {
-                    match transition.kind() {
-                        crate::workflow::graph::TransitionKind::Succeeded => task_succeeded,
-                        crate::workflow::graph::TransitionKind::Failed => {
-                            task_outcome == TaskOutcome::Failed
-                        }
-                        crate::workflow::graph::TransitionKind::Always => true,
-                        crate::workflow::graph::TransitionKind::TimedOut => task_timed_out,
-                        crate::workflow::graph::TransitionKind::Custom => {
-                            // Try to evaluate via the workflow context
-                            if let Some(ref when_expr) = transition.when {
-                                match wf_ctx.evaluate_condition(when_expr) {
-                                    Ok(val) => val,
-                                    Err(e) => {
-                                        warn!(
-                                            "Custom condition '{}' evaluation failed: {}. \
-                                         Defaulting to fire-on-success.",
-                                            when_expr, e
-                                        );
-                                        task_succeeded
-                                    }
-                                }
-                            } else {
-                                task_succeeded
-                            }
-                        }
-                    }
-                };
-
-                if should_fire {
-                    // Process publish directives from this transition
-                    if !transition.publish.is_empty() {
-                        if let Some(recorded) = &recorded_transitions {
-                            for (index, name, value, sources) in &recorded.publications {
-                                if *index == transition_index {
-                                    wf_ctx.publish_rendered(
-                                        name,
-                                        RenderedJson {
-                                            value: value.clone(),
-                                            secret_paths: sources
-                                                .iter()
-                                                .map(|source| source.path.clone())
-                                                .collect(),
-                                            sources: sources
-                                                .iter()
-                                                .map(|source| source.source.clone())
-                                                .collect(),
-                                            secret_path_sources: sources.clone(),
-                                        },
-                                    );
-                                }
-                            }
-                        } else {
-                            let publish_map: HashMap<String, JsonValue> = transition
-                                .publish
-                                .iter()
-                                .map(|p| (p.name.clone(), p.value.clone()))
-                                .collect();
-                            if let Err(e) = wf_ctx.publish_from_result(
-                                &serde_json::json!({}),
-                                &[],
-                                Some(&publish_map),
-                            ) {
-                                warn!("Failed to process publish for task '{}': {}", task_name, e);
-                            } else {
-                                debug!(
-                                    "Published {} variables from task '{}' transition",
-                                    publish_map.len(),
-                                    task_name
-                                );
-                            }
-                        }
-                    }
-
-                    for next_task_name in &transition.do_tasks {
-                        // Skip tasks that are already completed or failed
-                        if completed_tasks.contains(next_task_name)
-                            || failed_tasks.contains(next_task_name)
-                        {
-                            debug!(
-                                "Skipping task '{}' — already completed or failed",
-                                next_task_name
-                            );
-                            continue;
-                        }
-
-                        // Check join barrier: if the task has a `join` count,
-                        // only schedule it when enough predecessors are done.
-                        if let Some(next_node) = graph.get_task(next_task_name) {
-                            if let Some(join_count) = next_node.join {
-                                let inbound_completed = next_node
-                                    .inbound_tasks
-                                    .iter()
-                                    .filter(|t| completed_tasks.contains(*t))
-                                    .count();
-                                if inbound_completed < join_count {
-                                    debug!(
-                                        "Task '{}' join barrier not met ({}/{} predecessors done)",
-                                        next_task_name, inbound_completed, join_count
-                                    );
-                                    if !deferred_join_tasks.contains(next_task_name) {
-                                        deferred_join_tasks.push(next_task_name.clone());
-                                    }
-                                    continue;
-                                }
-                            }
-                        }
-
-                        if !tasks_to_schedule.contains(next_task_name) {
-                            tasks_to_schedule.push(next_task_name.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        if !task_succeeded && !tasks_to_schedule.is_empty() {
-            failed_tasks.retain(|failed_task| failed_task != task_name);
-            if !completed_tasks.contains(task_name) {
-                completed_tasks.push(task_name.clone());
-            }
-        }
-
-        // Check if any tasks are still running (children of this workflow
-        // that haven't completed yet). We query child executions that have
-        // workflow_task metadata pointing to our workflow_execution.
-        let running_children = Self::count_running_workflow_children_with_conn(
-            &mut *conn,
-            workflow_execution_id,
-            &completed_tasks,
-            &failed_tasks,
-        )
-        .await?;
-
-        // Dispatch successor tasks, passing the updated workflow context
-        let mut logical_prerequisite_failures = Vec::new();
-        let mut terminal_wait_tasks = Vec::new();
-        for next_task_name in &tasks_to_schedule {
-            if let Some(task_node) = graph.get_task(next_task_name) {
-                if let Err(e) = Self::activate_workflow_task_with_input_plan(
-                    &mut *conn,
-                    round_robin_counter,
-                    &parent_execution,
-                    &workflow_execution_id,
-                    task_node,
-                    &wf_ctx,
-                    encryption_key,
-                    Some(task_name), // predecessor that triggered this task
-                    &mut pending_messages,
-                    &mut pending_completed_children,
-                    prepared_transitions,
-                )
-                .await
-                {
-                    if let Some(prerequisite_error) = e.downcast_ref::<TaskWaitPrerequisiteError>()
-                    {
-                        logical_prerequisite_failures
-                            .push((prerequisite_error.clone(), Some(task_name.clone())));
-                        continue;
-                    }
-                    error!(
-                        "Failed to dispatch workflow task '{}': {}",
-                        next_task_name, e
-                    );
-                    return Err(e);
-                }
-                if WorkflowTaskWaitRepository::find_by_workflow_task(
-                    &mut *conn,
-                    workflow_execution_id,
-                    next_task_name,
                 )
                 .await?
-                .is_some_and(|wait| {
-                    matches!(
-                        wait.state,
-                        WorkflowTaskWaitState::TimedOut
-                            | WorkflowTaskWaitState::Cancelled
-                            | WorkflowTaskWaitState::Failed
-                    )
-                }) {
-                    terminal_wait_tasks.push(next_task_name.clone());
-                }
-            }
-        }
+                    == 0;
 
-        // Determine current executing tasks (for the workflow_execution record)
-        let current_tasks: Vec<String> = tasks_to_schedule
-            .iter()
-            .filter(|task| {
-                !logical_prerequisite_failures
-                    .iter()
-                    .any(|(error, _)| error.task_name == task.as_str())
-                    && !terminal_wait_tasks.contains(task)
-            })
-            .cloned()
-            .collect();
-
-        // Persist updated workflow variables (from publish directives) and
-        // completed/failed task lists.
-        let (updated_variables, secret_inputs) = if let Some(recorded) = &recorded_transitions {
-            (recorded.variables.clone(), Vec::new())
-        } else {
-            let rendered_variables = wf_ctx.export_variables_with_sensitivity()?;
-            attune_common::secret_values::redact_secret_path_sources(
-                rendered_variables.value,
-                &rendered_variables.secret_path_sources,
-            )
-        };
-        if recorded_transitions.is_none() {
-            ExecutionSecretValueRepository::delete_by_entity(
-                &mut *conn,
-                attune_common::secret_values::ENTITY_WORKFLOW_VARIABLES,
-                parent_execution.id,
-            )
-            .await?;
-            if !secret_inputs.is_empty() {
-                let key = encryption_key.ok_or_else(|| {
-                    anyhow::anyhow!("Workflow variable encryption is not configured")
-                })?;
-                ExecutionSecretValueRepository::upsert_many_with_conn(
-                    &mut *conn,
-                    attune_common::secret_values::ENTITY_WORKFLOW_VARIABLES,
-                    parent_execution.id,
-                    &prepare_secret_values(secret_inputs, key)?,
-                )
-                .await?;
-            }
-        }
-        WorkflowExecutionRepository::update(
-            &mut *conn,
-            workflow_execution_id,
-            attune_common::repositories::workflow::UpdateWorkflowExecutionInput {
-                current_tasks: Some(current_tasks),
-                completed_tasks: Some(completed_tasks.clone()),
-                failed_tasks: Some(failed_tasks.clone()),
-                skipped_tasks: None,
-                variables: Some(updated_variables),
-                status: None, // Updated below if terminal
-                error_message: None,
-                paused: None,
-                pause_reason: None,
-            },
-        )
-        .await?;
-
-        let has_logical_wait_failures = !logical_prerequisite_failures.is_empty();
-        let has_terminal_waits = !terminal_wait_tasks.is_empty();
-        if has_logical_wait_failures || has_terminal_waits {
-            for (prerequisite_error, triggered_by) in logical_prerequisite_failures {
-                let logical_outcome = Self::task_wait_prerequisite_failure_execution(
-                    &parent_execution,
-                    workflow_execution_id,
-                    &prerequisite_error,
-                    triggered_by,
-                );
-                let outcome = Box::pin(Self::advance_workflow_serialized(
-                    &mut *conn,
-                    round_robin_counter,
-                    encryption_key,
-                    &logical_outcome,
-                    metadata_caches,
-                ))
-                .await?;
-                pending_messages.extend(outcome.execution_requests);
-                pending_completed_children.extend(outcome.completed_children);
-                if outcome.completed_execution.is_some() {
-                    pending_completed_execution = outcome.completed_execution;
-                }
-            }
-            for terminal_task in terminal_wait_tasks {
-                let outcome = Box::pin(Self::advance_resolved_task_wait_with_conn(
-                    &mut *conn,
-                    round_robin_counter,
-                    encryption_key,
-                    &parent_execution,
-                    workflow_execution_id,
-                    &terminal_task,
-                    None,
-                ))
-                .await?;
-                pending_messages.extend(outcome.execution_requests);
-                pending_completed_children.extend(outcome.completed_children);
-                if outcome.completed_execution.is_some() {
-                    pending_completed_execution = outcome.completed_execution;
-                }
-            }
-            if let Some(closure) = &native_closure {
-                closure.ensure_fresh_on(conn).await?;
-            }
-            return Ok(WorkflowAdvanceOutcome {
-                execution_requests: pending_messages,
-                completed_children: pending_completed_children,
-                completed_execution: pending_completed_execution,
-            });
-        }
-
-        // Check if workflow is complete: no more tasks to schedule and no
-        // children still running (excluding the ones we just scheduled).
-        let all_done = tasks_to_schedule.is_empty()
-            && deferred_join_tasks.is_empty()
-            && running_children == 0
-            && WorkflowTaskWaitRepository::count_waiting(&mut *conn, workflow_execution_id).await?
-                == 0
-            && WorkflowTaskWaitRepository::count_pending_terminal_delivery(
-                &mut *conn,
-                workflow_execution_id,
-            )
-            .await?
-                == 0;
-
-        if prepared_success_output.is_some() && !all_done {
-            return Err(anyhow::anyhow!(
-                "Finite native success did not reach its actual all-done state"
-            ));
-        }
-        if all_done {
-            if native_closure.is_some() && prepared_success_output.is_none() {
-                attune_common::repositories::runtime_read::RuntimeReadRepository::close_execution(
-                    &mut *conn,
-                    parent_execution.id,
-                )
-                .await?;
-            }
-            let has_failures = !failed_tasks.is_empty();
-            if has_failures && prepared_success_output.is_some() {
+            if prepared_success_output.is_some() && !all_done {
                 return Err(anyhow::anyhow!(
-                    "Finite native success acquired an unobserved failed task"
+                    "Finite native success did not reach its actual all-done state"
                 ));
             }
-            if !has_failures
-                && prepared_success_output.is_none()
-                && prepared_transitions.is_some_and(|plan| plan.needs_native_success_metadata())
-            {
-                return Err(anyhow::anyhow!("Native result projection completion requires an authored status output or a finite success metadata recipe"));
-            }
-            if let Some(plan) = prepared_failure {
-                // Equality only. The held H token, not this caller array, owns
-                // the source projection. A's final VALUE receipt remains separate.
-                plan.require_projected_failure(&failed_tasks)?;
-                plan.ensure_fresh_on(conn).await?;
-            }
-            let error_msg = if has_failures {
-                Some(format!(
-                    "Workflow failed: {} task(s) failed: {}",
-                    failed_tasks.len(),
-                    failed_tasks.join(", ")
-                ))
-            } else {
-                None
-            };
-
-            // Evaluate the workflow's `output_map` (if any) using the
-            // current WorkflowContext so the parent execution's `result`
-            // surfaces user-defined outputs (e.g., a markdown summary,
-            // structured fields composed from task results).
-            let prepared_output = prepared_transitions.filter(|plan| plan.output().is_some());
-            let output_map_result = if !has_failures && prepared_success_output.is_none() {
-                if let Some(value) = prepared_output.and_then(|plan| plan.output()) {
-                    Some(RenderedJson::plain(value.clone()))
-                } else {
-                    build_output_map_result(&workflow_def.definition, &wf_ctx)
-                }
-            } else {
-                None
-            };
-            let output_map_result = if let Some(output) = prepared_success_output {
-                let key = encryption_key.ok_or_else(|| {
-                    anyhow::anyhow!("Native success output encryption is unavailable")
-                })?;
-                let projected =
-                    WorkflowExecutionRepository::find_by_id(&mut *conn, workflow_execution_id)
-                        .await?
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("Native success projected workflow disappeared")
-                        })?;
-                // B's real frame and task lists are already published. A uses
-                // those SAME opaque renders and canonical leaf writer, not B's
-                // legacy record_output or a rerendered status/warning payload.
-                let (actual, sources) = output.record(conn, &projected, key).await?;
-                if actual.get("output_validation_warning").is_some() {
-                    warn!(execution_id = parent_execution.id, "Workflow output did not conform to its stored schema; successful status retained");
-                }
-                let (value, secrets) =
-                    attune_common::secret_values::redact_secret_path_sources(actual, &sources);
-                let fields = prepare_secret_values(secrets, key)?;
-                if serde_json::to_vec(&fields)?.len() > 1024 * 1024 {
-                    return Err(anyhow::anyhow!(
-                        "Native success ciphertext exceeds its byte bound"
-                    ));
-                }
-                ExecutionSecretValueRepository::replace_entity_with_conn(
+            if all_done {
+                if native_closure.is_some() && prepared_success_output.is_none() {
+                    attune_common::repositories::runtime_read::RuntimeReadRepository::close_execution(
                     &mut *conn,
-                    ENTITY_EXECUTION_RESULT,
                     parent_execution.id,
-                    &fields,
                 )
                 .await?;
-                output.ensure_fresh_on(conn).await?;
-                Some(value)
-            } else if !has_failures {
-                let binding = attune_common::repositories::schema_contract::SchemaContractRepository::find_with_executor(
+                }
+                let has_failures = !failed_tasks.is_empty();
+                if has_failures && prepared_success_output.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "Finite native success acquired an unobserved failed task"
+                    ));
+                }
+                if !has_failures
+                    && prepared_success_output.is_none()
+                    && prepared_transitions.is_some_and(|plan| plan.needs_native_success_metadata())
+                {
+                    return Err(anyhow::anyhow!("Native result projection completion requires an authored status output or a finite success metadata recipe"));
+                }
+                if let Some(plan) = prepared_failure {
+                    // Equality only. The held H token, not this caller array, owns
+                    // the source projection. A's final VALUE receipt remains separate.
+                    plan.require_projected_failure(&failed_tasks)?;
+                    plan.ensure_fresh_on(conn).await?;
+                }
+                let error_msg = if has_failures {
+                    Some(format!(
+                        "Workflow failed: {} task(s) failed: {}",
+                        failed_tasks.len(),
+                        failed_tasks.join(", ")
+                    ))
+                } else {
+                    None
+                };
+
+                // Evaluate the workflow's `output_map` (if any) using the
+                // current WorkflowContext so the parent execution's `result`
+                // surfaces user-defined outputs (e.g., a markdown summary,
+                // structured fields composed from task results).
+                let prepared_output = prepared_transitions.filter(|plan| plan.output().is_some());
+                let output_map_result = if !has_failures && prepared_success_output.is_none() {
+                    if let Some(value) = prepared_output.and_then(|plan| plan.output()) {
+                        Some(RenderedJson::plain(value.clone()))
+                    } else {
+                        build_output_map_result(&workflow_def.definition, &wf_ctx)
+                    }
+                } else {
+                    None
+                };
+                let output_map_result = if let Some(output) = prepared_success_output {
+                    let key = encryption_key.ok_or_else(|| {
+                        anyhow::anyhow!("Native success output encryption is unavailable")
+                    })?;
+                    let projected =
+                        WorkflowExecutionRepository::find_by_id(&mut *conn, workflow_execution_id)
+                            .await?
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("Native success projected workflow disappeared")
+                            })?;
+                    // B's real frame and task lists are already published. A uses
+                    // those SAME opaque renders and canonical leaf writer, not B's
+                    // legacy record_output or a rerendered status/warning payload.
+                    let (actual, sources) = output.record(conn, &projected, key).await?;
+                    if actual.get("output_validation_warning").is_some() {
+                        warn!(execution_id = parent_execution.id, "Workflow output did not conform to its stored schema; successful status retained");
+                    }
+                    let (value, secrets) =
+                        attune_common::secret_values::redact_secret_path_sources(actual, &sources);
+                    let fields = prepare_secret_values(secrets, key)?;
+                    if serde_json::to_vec(&fields)?.len() > 1024 * 1024 {
+                        return Err(anyhow::anyhow!(
+                            "Native success ciphertext exceeds its byte bound"
+                        ));
+                    }
+                    ExecutionSecretValueRepository::replace_entity_with_conn(
+                        &mut *conn,
+                        ENTITY_EXECUTION_RESULT,
+                        parent_execution.id,
+                        &fields,
+                    )
+                    .await?;
+                    output.ensure_fresh_on(conn).await?;
+                    Some(value)
+                } else if !has_failures {
+                    let binding = attune_common::repositories::schema_contract::SchemaContractRepository::find_with_executor(
                     &mut *conn, attune_common::repositories::schema_contract::BindingOwner::Execution, parent_execution.id,
                 ).await?.ok_or_else(|| anyhow::anyhow!("Workflow is missing its output schema binding"))?;
-                let mut rendered_output =
-                    output_map_result.unwrap_or_else(|| RenderedJson::plain(serde_json::json!({})));
-                if prepared_output.is_none() {
-                    rendered_output
-                        .secret_path_sources
-                        .extend(wf_ctx.native_control_sources());
-                    // Control flow can depend on a protected input even when the
-                    // output itself is literal. Retain the complete native closure.
+                    let mut rendered_output = output_map_result
+                        .unwrap_or_else(|| RenderedJson::plain(serde_json::json!({})));
+                    if prepared_output.is_none() {
+                        rendered_output
+                            .secret_path_sources
+                            .extend(wf_ctx.native_control_sources());
+                        // Control flow can depend on a protected input even when the
+                        // output itself is literal. Retain the complete native closure.
+                        if let Some(closure) = &native_closure {
+                            if !closure.origins().is_empty() {
+                                rendered_output.secret_path_sources.push(SecretPathSource {
+                                    path: String::new(),
+                                    source: SecretSource::Bound(
+                                        attune_common::secret_provenance::SecretProvenance {
+                                            origins: closure.origins().to_vec(),
+                                            templates: vec![],
+                                        },
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    let (value, secrets) = if let Some(plan) = prepared_output {
+                        prepare_receipted_workflow_output(
+                            conn,
+                            plan,
+                            binding.output.as_ref(),
+                            rendered_output.value,
+                            encryption_key.ok_or_else(|| {
+                                anyhow::anyhow!("Native output encryption is unavailable")
+                            })?,
+                        )
+                        .await?
+                    } else {
+                        prepare_bound_workflow_output(binding.output.as_ref(), rendered_output)?
+                    };
+                    if value.get("output_validation_warning").is_some() {
+                        warn!(execution_id = parent_execution.id, "Workflow output did not conform to its stored schema; successful status retained");
+                    }
+                    let prepared = if !secrets.is_empty() {
+                        let key = encryption_key.ok_or_else(|| {
+                            anyhow::anyhow!("Workflow output encryption is not configured")
+                        })?;
+                        prepare_secret_values(secrets, key)?
+                    } else {
+                        Vec::new()
+                    };
+                    if prepared_output.is_some()
+                        && serde_json::to_vec(&prepared)?.len() > 1024 * 1024
+                    {
+                        return Err(anyhow::anyhow!(
+                            "Native output ciphertext exceeds its byte bound"
+                        ));
+                    }
+                    ExecutionSecretValueRepository::replace_entity_with_conn(
+                        &mut *conn,
+                        ENTITY_EXECUTION_RESULT,
+                        parent_execution.id,
+                        &prepared,
+                    )
+                    .await?;
+                    Some(value)
+                } else if let Some(output) = prepared_failure_output {
+                    let key = encryption_key.ok_or_else(|| {
+                        anyhow::anyhow!("Native failure output encryption is unavailable")
+                    })?;
+                    let (actual, sources) = output.record(conn, &failed_tasks, key).await?;
+                    let (value, secrets) =
+                        attune_common::secret_values::redact_secret_path_sources(actual, &sources);
+                    let fields = prepare_secret_values(secrets, key)?;
+                    if serde_json::to_vec(&fields)?.len() > 1024 * 1024 {
+                        return Err(anyhow::anyhow!(
+                            "Native failure ciphertext exceeds its byte bound"
+                        ));
+                    }
+                    ExecutionSecretValueRepository::replace_entity_with_conn(
+                        &mut *conn,
+                        ENTITY_EXECUTION_RESULT,
+                        parent_execution.id,
+                        &fields,
+                    )
+                    .await?;
+                    Some(value)
+                } else {
+                    let mut controls = wf_ctx.native_control_sources();
                     if let Some(closure) = &native_closure {
                         if !closure.origins().is_empty() {
-                            rendered_output.secret_path_sources.push(SecretPathSource {
+                            controls.push(SecretPathSource {
                                 path: String::new(),
                                 source: SecretSource::Bound(
                                     attune_common::secret_provenance::SecretProvenance {
@@ -9446,146 +9641,59 @@ impl ExecutionScheduler {
                             });
                         }
                     }
-                }
-                let (value, secrets) = if let Some(plan) = prepared_output {
-                    prepare_receipted_workflow_output(
-                        conn,
-                        plan,
-                        binding.output.as_ref(),
-                        rendered_output.value,
-                        encryption_key.ok_or_else(|| {
-                            anyhow::anyhow!("Native output encryption is unavailable")
-                        })?,
-                    )
-                    .await?
-                } else {
-                    prepare_bound_workflow_output(binding.output.as_ref(), rendered_output)?
-                };
-                if value.get("output_validation_warning").is_some() {
-                    warn!(execution_id = parent_execution.id, "Workflow output did not conform to its stored schema; successful status retained");
-                }
-                let prepared = if !secrets.is_empty() {
-                    let key = encryption_key.ok_or_else(|| {
-                        anyhow::anyhow!("Workflow output encryption is not configured")
-                    })?;
-                    prepare_secret_values(secrets, key)?
-                } else {
-                    Vec::new()
-                };
-                if prepared_output.is_some() && serde_json::to_vec(&prepared)?.len() > 1024 * 1024 {
-                    return Err(anyhow::anyhow!(
-                        "Native output ciphertext exceeds its byte bound"
-                    ));
-                }
-                ExecutionSecretValueRepository::replace_entity_with_conn(
-                    &mut *conn,
-                    ENTITY_EXECUTION_RESULT,
-                    parent_execution.id,
-                    &prepared,
-                )
-                .await?;
-                Some(value)
-            } else if let Some(output) = prepared_failure_output {
-                let key = encryption_key.ok_or_else(|| {
-                    anyhow::anyhow!("Native failure output encryption is unavailable")
-                })?;
-                let (actual, sources) = output.record(conn, &failed_tasks, key).await?;
-                let (value, secrets) =
-                    attune_common::secret_values::redact_secret_path_sources(actual, &sources);
-                let fields = prepare_secret_values(secrets, key)?;
-                if serde_json::to_vec(&fields)?.len() > 1024 * 1024 {
-                    return Err(anyhow::anyhow!(
-                        "Native failure ciphertext exceeds its byte bound"
-                    ));
-                }
-                ExecutionSecretValueRepository::replace_entity_with_conn(
-                    &mut *conn,
-                    ENTITY_EXECUTION_RESULT,
-                    parent_execution.id,
-                    &fields,
-                )
-                .await?;
-                Some(value)
-            } else {
-                let mut controls = wf_ctx.native_control_sources();
-                if let Some(closure) = &native_closure {
-                    if !closure.origins().is_empty() {
-                        controls.push(SecretPathSource {
-                            path: String::new(),
-                            source: SecretSource::Bound(
-                                attune_common::secret_provenance::SecretProvenance {
-                                    origins: closure.origins().to_vec(),
-                                    templates: vec![],
-                                },
-                            ),
-                        });
+                    if !controls.is_empty() {
+                        let (value, secrets) =
+                            attune_common::secret_values::redact_secret_path_sources(
+                                build_workflow_result_payload(false, error_msg.as_deref(), None),
+                                &controls,
+                            );
+                        let key = encryption_key.ok_or_else(|| {
+                            anyhow::anyhow!("Workflow output encryption is not configured")
+                        })?;
+                        ExecutionSecretValueRepository::replace_entity_with_conn(
+                            &mut *conn,
+                            ENTITY_EXECUTION_RESULT,
+                            parent_execution.id,
+                            &prepare_secret_values(secrets, key)?,
+                        )
+                        .await?;
+                        Some(value)
+                    } else {
+                        None
                     }
-                }
-                if !controls.is_empty() {
-                    let (value, secrets) = attune_common::secret_values::redact_secret_path_sources(
-                        build_workflow_result_payload(false, error_msg.as_deref(), None),
-                        &controls,
-                    );
-                    let key = encryption_key.ok_or_else(|| {
-                        anyhow::anyhow!("Workflow output encryption is not configured")
-                    })?;
-                    ExecutionSecretValueRepository::replace_entity_with_conn(
-                        &mut *conn,
-                        ENTITY_EXECUTION_RESULT,
-                        parent_execution.id,
-                        &prepare_secret_values(secrets, key)?,
-                    )
-                    .await?;
-                    Some(value)
-                } else {
-                    None
-                }
-            };
+                };
 
-            if prepared_success_output.is_some() && native_closure.is_some() {
-                attune_common::repositories::runtime_read::RuntimeReadRepository::close_execution(
+                if prepared_success_output.is_some() && native_closure.is_some() {
+                    attune_common::repositories::runtime_read::RuntimeReadRepository::close_execution(
                     conn,
                     parent_execution.id,
                 )
                 .await?;
+                }
+                let completed_execution = Self::complete_workflow_with_conn(
+                    &mut *conn,
+                    parent_execution.id,
+                    workflow_execution_id,
+                    !has_failures,
+                    error_msg.as_deref(),
+                    output_map_result,
+                )
+                .await?;
+                pending_completed_execution =
+                    Self::workflow_completion_publication(conn, &completed_execution).await?;
             }
-            let completed_execution = Self::complete_workflow_with_conn(
-                &mut *conn,
-                parent_execution.id,
-                workflow_execution_id,
-                !has_failures,
-                error_msg.as_deref(),
-                output_map_result,
-            )
-            .await?;
-            if completed_execution.parent.is_some() {
-                let action_id = completed_execution.action.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Completed nested workflow execution {} has no action id",
-                        completed_execution.id
-                    )
-                })?;
-                pending_completed_execution = Some(PendingExecutionCompleted {
-                    execution_id: completed_execution.id,
-                    action_id,
-                    action_ref: completed_execution.action_ref.clone(),
-                    status: completed_execution.status,
-                    result: completed_execution.result.clone(),
-                    completed_at: Utc::now(),
-                });
-            }
-        }
 
-        if let Some(closure) = &native_closure {
-            closure.ensure_fresh_on(conn).await?;
-        }
-        if let Some(output) = prepared_success_output {
-            output.ensure_fresh_on(conn).await?;
-        }
-        Ok(WorkflowAdvanceOutcome {
-            execution_requests: pending_messages,
-            completed_children: pending_completed_children,
-            completed_execution: pending_completed_execution,
+            if let Some(closure) = &native_closure {
+                closure.ensure_fresh_on(conn).await?;
+            }
+            if let Some(output) = prepared_success_output {
+                output.ensure_fresh_on(conn).await?;
+            }
+            Ok(WorkflowAdvanceOutcome {
+                execution_requests: pending_messages,
+                completed_children: pending_completed_children,
+                completed_execution: pending_completed_execution,
+            })
         })
     }
 
@@ -9898,7 +10006,39 @@ impl ExecutionScheduler {
         };
 
         // Find available action workers (role = 'action')
-        let workers = WorkerRepository::find_action_workers(pool).await?;
+        let require_delegated = if let Some(execution) = execution {
+            attune_common::repositories::delegated_execution::DelegatedExecutionRepository::find(
+                &mut *pool.acquire().await?,
+                execution.id,
+            )
+            .await?
+            .mode
+                == "delegated"
+        } else {
+            false
+        };
+        let workers: Vec<_> = WorkerRepository::find_action_workers(pool)
+            .await?
+            .into_iter()
+            .filter(|worker| {
+                !require_delegated
+                    || worker
+                        .capabilities
+                        .as_ref()
+                        .and_then(|caps| {
+                            caps.get(
+                                attune_common::execution_authority::DELEGATED_EXECUTION_CAPABILITY,
+                            )
+                        })
+                        .and_then(JsonValue::as_bool)
+                        == Some(true)
+            })
+            .collect();
+        if require_delegated && workers.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No compatible workers found with delegated execution authority v1 completion readiness"
+            ));
+        }
 
         if workers.is_empty() {
             return Err(anyhow::anyhow!("No action workers available"));
@@ -11501,11 +11641,11 @@ tasks:
             .await
             .expect("load terminal wait")
             .expect("terminal wait exists");
-            let prepared = NativeWaitCheckpoint::prepare(
+            let prepared = Box::pin(NativeWaitCheckpoint::prepare(
                 &mut transaction,
                 &wait,
                 Some(INQUIRY_SCHEDULER_INPUT_KEY),
-            )
+            ))
             .await
             .expect("prepare terminal wait before workflow locks");
             let outcome = ExecutionScheduler::advance_resolved_task_wait_with_conn(
@@ -11577,7 +11717,8 @@ tasks:
                     task,
                     &binding,
                     &fixture.context,
-                )?;
+true,
+)?;
                 let expected = if explicit_null { JsonValue::Null } else { serde_json::json!({}) };
                 anyhow::ensure!(rendered.supplied == expected, "renderer must preserve absence versus explicit null");
                 anyhow::ensure!(rendered.value == expected, "managed rendering must defer schema acceptance");
@@ -11770,6 +11911,37 @@ tasks:
         )
         .await
         .expect("grant legitimate owner authority");
+        // Expanding the owner's IAM does not expand an already admitted source.
+        let mut unchanged = pool.begin().await.unwrap();
+        CacheEntryRepository::protect_transaction(
+            &mut unchanged,
+            CacheTransactionMode::PinMutation,
+        )
+        .await
+        .unwrap();
+        assert!(ExecutionScheduler::dispatch_workflow_task_with_conn(
+            &mut unchanged,
+            &AtomicUsize::new(0),
+            &parent,
+            &fixture.workflow_execution_id,
+            fixture.graph.get_task("permitted_single").unwrap(),
+            &context,
+            None,
+            None,
+            &mut WorkflowPublications::default(),
+            &mut Vec::new(),
+        )
+        .await
+        .is_err());
+        unchanged.rollback().await.unwrap();
+        fixture.cleanup().await.unwrap();
+        // A new invocation explicitly selects and covers the named ceiling.
+        let fixture = AdhocWorkflowDelegationFixture::create_with_selection(true)
+            .await
+            .unwrap();
+        let pool = fixture.database.pool();
+        let parent = fixture.parent.clone();
+        let context = fixture.context.clone();
         let task = fixture
             .graph
             .get_task("permitted_single")
@@ -11902,7 +12074,7 @@ tasks:
             .begin()
             .await
             .expect("begin workflow advancement");
-        ExecutionScheduler::advance_workflow_serialized(
+        let outcome = ExecutionScheduler::advance_workflow_serialized(
             &mut transaction,
             &AtomicUsize::new(0),
             Some(INQUIRY_SCHEDULER_INPUT_KEY),
@@ -11911,6 +12083,10 @@ tasks:
         )
         .await
         .expect("advance cancelled workflow child");
+        assert!(
+            outcome.completed_execution.is_none(),
+            "ordinary roots keep their notification behavior"
+        );
         transaction
             .commit()
             .await
@@ -11935,6 +12111,99 @@ tasks:
             .cleanup()
             .await
             .expect("clean test database");
+    }
+
+    #[tokio::test]
+    async fn queued_root_workflow_completion_is_published_and_replayable() {
+        use attune_common::repositories::work_queue::{
+            CreateWorkQueueDispatchInput, UpdateWorkQueueDispatchInput, WorkQueueDispatchRepository,
+        };
+        let fixture = InquirySchedulerFixture::create().await;
+        let queue = WorkQueueRepository::find_by_ref(
+            fixture.database.pool(),
+            "scheduler_inquiry_it.wait_targets",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let dispatch = WorkQueueDispatchRepository::create(
+            fixture.database.pool(),
+            CreateWorkQueueDispatchInput {
+                id: None,
+                queue: queue.id,
+                queue_ref: queue.r#ref,
+                execution: fixture.parent.id,
+                status: attune_common::models::WorkQueueDispatchStatus::Dispatched,
+                leased_item_count: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let child = ExecutionRepository::update(
+            fixture.database.pool(),
+            fixture.request.id,
+            UpdateExecutionInput {
+                status: Some(ExecutionStatus::Cancelled),
+                result: Some(serde_json::json!({"error":"cancelled"})),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for _ in 0..2 {
+            let mut tx = fixture.database.begin().await.unwrap();
+            let outcome = ExecutionScheduler::advance_workflow_serialized(
+                &mut tx,
+                &AtomicUsize::new(0),
+                Some(INQUIRY_SCHEDULER_INPUT_KEY),
+                &child,
+                &SchedulerMetadataCaches::new(),
+            )
+            .await
+            .unwrap();
+            let completed = outcome
+                .completed_execution
+                .expect("queued native root completion");
+            assert_eq!(completed.execution_id, fixture.parent.id);
+            assert_eq!(completed.status, ExecutionStatus::Cancelled);
+            // This owning inquiry fixture is recorded. Completion publication
+            // must preserve its selected mode rather than treating it as human
+            // delegation; delegated producer closure has separate boundary tests.
+            assert_eq!(
+                attune_common::repositories::execution_admission::ExecutionAdmissionRepository::selected_authority(
+                    &mut tx, fixture.parent.id).await.unwrap(),
+                attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Recorded,
+            );
+            assert!(attune_common::repositories::delegated_execution::DelegatedExecutionRepository::require_closed_output(
+                &mut tx, fixture.parent.id).await.is_err());
+            tx.commit().await.unwrap();
+        }
+        WorkQueueDispatchRepository::update(
+            fixture.database.pool(),
+            dispatch.id,
+            UpdateWorkQueueDispatchInput {
+                status: Some(attune_common::models::WorkQueueDispatchStatus::Cancelled),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut tx = fixture.database.begin().await.unwrap();
+        let outcome = ExecutionScheduler::advance_workflow_serialized(
+            &mut tx,
+            &AtomicUsize::new(0),
+            Some(INQUIRY_SCHEDULER_INPUT_KEY),
+            &child,
+            &SchedulerMetadataCaches::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            outcome.completed_execution.is_none(),
+            "consumed root controls are not republished"
+        );
+        tx.rollback().await.unwrap();
+        fixture.database.cleanup().await.unwrap();
     }
 
     #[tokio::test]
@@ -12063,11 +12332,11 @@ tasks:
         .await
         .expect("load timed-out wait")
         .expect("timed-out wait exists");
-        let prepared = NativeWaitCheckpoint::prepare(
+        let prepared = Box::pin(NativeWaitCheckpoint::prepare(
             &mut transaction,
             &wait,
             Some(INQUIRY_SCHEDULER_INPUT_KEY),
-        )
+        ))
         .await
         .expect("prepare timeout before workflow locks");
         let outcome = ExecutionScheduler::advance_resolved_task_wait_with_conn(
@@ -12454,11 +12723,11 @@ tasks:
         attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
             .await
             .expect("lock schema selection");
-        let mut first = NativeWaitCheckpoint::prepare(
+        let mut first = Box::pin(NativeWaitCheckpoint::prepare(
             &mut tx,
             &original_wait,
             Some(INQUIRY_SCHEDULER_INPUT_KEY),
-        )
+        ))
         .await
         .expect("prepare genuine wait progress")
         .expect("native progress plan");
@@ -12521,11 +12790,14 @@ tasks:
         attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
             .await
             .expect("lock replay schema selection");
-        let mut replay =
-            NativeWaitCheckpoint::prepare(&mut tx, &saved_wait, Some(INQUIRY_SCHEDULER_INPUT_KEY))
-                .await
-                .expect("authenticate committed progress")
-                .expect("native replay plan");
+        let mut replay = Box::pin(NativeWaitCheckpoint::prepare(
+            &mut tx,
+            &saved_wait,
+            Some(INQUIRY_SCHEDULER_INPUT_KEY),
+        ))
+        .await
+        .expect("authenticate committed progress")
+        .expect("native replay plan");
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(fixture.workflow_execution_id)
             .execute(&mut *tx)
@@ -12611,11 +12883,11 @@ tasks:
             .await
             .expect("lock terminal-root schema selection");
         let earlier_wait = fixture.wait("queue_skipped_guarded").await;
-        let mut terminal_replay = NativeWaitCheckpoint::prepare(
+        let mut terminal_replay = Box::pin(NativeWaitCheckpoint::prepare(
             &mut tx,
             &earlier_wait,
             Some(INQUIRY_SCHEDULER_INPUT_KEY),
-        )
+        ))
         .await
         .expect("authenticate final root and earlier own release")
         .expect("earlier progress acknowledgement");

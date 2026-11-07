@@ -448,6 +448,7 @@ impl AuthorizationService {
                 "Legacy execution authority required".into(),
             ));
         }
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::retain_claims(connection,&user.claims).await.map_err(|_|ApiError::Unauthorized("Delegated execution authority is unavailable".into()))?;
         let identity_id = user.identity_id().map_err(|_| {
             ApiError::Unauthorized("Invalid authentication subject in token".into())
         })?;
@@ -627,6 +628,10 @@ impl AuthorizationService {
         user: &AuthenticatedUser,
         permission_set_refs: &[String],
     ) -> Result<bool, ApiError> {
+        if user.claims.token_type == TokenType::Execution {
+            attune_common::repositories::delegated_execution::DelegatedExecutionRepository::validate_claims(conn, &user.claims)
+                .await.map_err(|_| ApiError::Unauthorized("Delegated execution authority is unavailable".into()))?;
+        }
         let permission_set_refs = named_execution_permission_set_refs(permission_set_refs);
         if permission_set_refs.is_empty() {
             return Ok(true);
@@ -862,6 +867,10 @@ impl AuthorizationService {
                 self.load_effective_grants(identity_id).await
             }
             TokenType::Execution => {
+                // Streaming transports refresh grants after initial middleware
+                // authentication; they must retain the same live attempt bound.
+                attune_common::repositories::delegated_execution::DelegatedExecutionRepository::validate_claims(&mut *self.db.acquire().await?,&user.claims).await.map_err(|_|ApiError::Unauthorized("Delegated execution authority is unavailable".into()))?;
+
                 let refs = execution_permission_set_refs(user);
                 let permission_sets =
                     PermissionSetRepository::find_by_refs(&self.db, &refs).await?;

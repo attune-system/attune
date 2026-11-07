@@ -14,11 +14,7 @@
 //!   (existing behavior).
 
 use attune_common::{
-    auth::jwt::{
-        generate_access_token, generate_execution_token,
-        generate_execution_token_with_permission_sets, generate_sensor_token_with_workload_fence,
-        JwtConfig,
-    },
+    auth::jwt::{generate_access_token, generate_sensor_token_with_workload_fence, JwtConfig},
     crypto::encrypt_json,
     inquiry_response_handle::issue_inquiry_response_handle,
     models::{enums::ExecutionStatus, *},
@@ -251,33 +247,43 @@ async fn create_owned_inquiry_execution(pool: &PgPool, action: &Action) -> TResu
     .await?)
 }
 
-async fn create_child_execution(
+// Token consumer fixtures retain the same action/lineage, with an attributable
+// owner and an admitted immutable source rather than invented token claims.
+async fn owned_execution(
     pool: &PgPool,
     action: &Action,
-    parent_id: i64,
+    owner: i64,
+    parent: Option<i64>,
+    refs: Vec<String>,
 ) -> TResult<Execution> {
-    Ok(ExecutionRepository::create(
+    if parent.is_none() {
+        let pack = PackRepository::find_by_id(pool, action.pack)
+            .await?
+            .unwrap();
+        let mut conn = pool.acquire().await?;
+        let published = attune_common::repositories::executable_snapshot::ExecutableSnapshotRepository::resolve_for_action_ref(&mut *conn, &action.r#ref).await.is_ok();
+        drop(conn);
+        if !published {
+            activate_test_pack_release_with_projections(
+                pool,
+                &pack,
+                &attune_common::repositories::component_lifecycle::PackProjectionIds {
+                    actions: vec![action.id],
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+    }
+    Ok(helpers::delegated_source::create(
         pool,
         CreateExecutionInput {
             action: Some(action.id),
             action_ref: action.r#ref.clone(),
-            config: None,
-            env_vars: None,
-            parent: Some(parent_id),
-            enforcement: None,
-            executor: None,
-            permission_set_refs: Vec::new(),
-            artifact_retention_policy: None,
-            artifact_retention_limit: None,
-            worker_selector: None,
-            worker_tolerations: None,
-            worker_affinity: None,
-            worker: None,
-            status: ExecutionStatus::Running,
-            trace_tag: None,
-            result: None,
-            workflow_task: None,
-            timeout_seconds: None,
+            executor: Some(owner),
+            parent,
+            permission_set_refs: refs,
+            ..Default::default()
         },
     )
     .await?)
@@ -289,7 +295,19 @@ async fn create_workflow_child_execution(
     identity_id: i64,
     permission_set_ref: &str,
 ) -> TResult<Execution> {
-    let parent = create_execution(pool, action).await?;
+    let admitted = permission_set_ref != "unused";
+    let parent = if admitted {
+        owned_execution(
+            pool,
+            action,
+            identity_id,
+            None,
+            vec![permission_set_ref.into()],
+        )
+        .await?
+    } else {
+        create_execution(pool, action).await?
+    };
     let definition = WorkflowDefinitionRepository::create(
         pool,
         CreateWorkflowDefinitionInput {
@@ -318,34 +336,35 @@ async fn create_workflow_child_execution(
     )
     .await?;
 
-    Ok(ExecutionRepository::create(
-        pool,
-        CreateExecutionInput {
-            action: Some(action.id),
-            action_ref: action.r#ref.clone(),
-            parent: Some(parent.id),
-            executor: Some(identity_id),
-            permission_set_refs: vec![permission_set_ref.to_string()],
-            status: ExecutionStatus::Running,
-            workflow_task: Some(WorkflowTaskMetadata {
-                workflow_execution: workflow.id,
-                task_name: "request_approval".to_string(),
-                triggered_by: None,
-                task_index: None,
-                task_batch: None,
-                retry_count: 0,
-                max_retries: 0,
-                next_retry_at: None,
-                timeout_seconds: None,
-                timed_out: false,
-                duration_ms: None,
-                started_at: Some(chrono::Utc::now()),
-                completed_at: None,
-            }),
-            ..Default::default()
-        },
-    )
-    .await?)
+    let input = CreateExecutionInput {
+        action: Some(action.id),
+        action_ref: action.r#ref.clone(),
+        parent: Some(parent.id),
+        executor: Some(identity_id),
+        permission_set_refs: vec![permission_set_ref.to_string()],
+        status: ExecutionStatus::Running,
+        workflow_task: Some(WorkflowTaskMetadata {
+            workflow_execution: workflow.id,
+            task_name: "request_approval".to_string(),
+            triggered_by: None,
+            task_index: None,
+            task_batch: None,
+            retry_count: 0,
+            max_retries: 0,
+            next_retry_at: None,
+            timeout_seconds: None,
+            timed_out: false,
+            duration_ms: None,
+            started_at: Some(chrono::Utc::now()),
+            completed_at: None,
+        }),
+        ..Default::default()
+    };
+    if admitted {
+        Ok(helpers::delegated_source::create(pool, input).await?)
+    } else {
+        Ok(ExecutionRepository::create(pool, input).await?)
+    }
 }
 
 async fn create_inquiry(
@@ -611,14 +630,7 @@ async fn create_inquiry_returns_option_bound_handles_and_rejects_invalid_options
     let execution =
         create_workflow_child_execution(&ctx.pool, &action, identity.id, permission_set_ref)
             .await?;
-    let token = generate_execution_token_with_permission_sets(
-        identity.id,
-        execution.id,
-        &action.r#ref,
-        &jwt_config(),
-        Some(600),
-        &[permission_set_ref.to_string()],
-    )?;
+    let token = helpers::delegated_source::execution_token(&ctx, execution.id).await?;
 
     let response = ctx
         .post(
@@ -1473,16 +1485,22 @@ async fn execution_token_self_response_is_blocked() -> TResult<()> {
     // it using its own execution-scoped token, even if the triggering
     // identity happens to be the assignee.
     let ctx = TestContext::new().await?;
-    let cfg = jwt_config();
 
     let assignee = create_identity(&ctx.pool, "assignee_self").await?;
     let (_pack, action) = setup_pack_action(&ctx.pool, "self").await?;
-    let exec = create_execution(&ctx.pool, &action).await?;
+    let exec = owned_execution(
+        &ctx.pool,
+        &action,
+        assignee.id,
+        None,
+        vec!["standard".into()],
+    )
+    .await?;
     let inquiry = create_inquiry(&ctx.pool, exec.id, Some(assignee.id)).await?;
 
     // Execution token for the SAME execution that created the inquiry,
     // carrying the assignee identity in `sub`.
-    let token = generate_execution_token(assignee.id, exec.id, &action.r#ref, &cfg, None)?;
+    let token = helpers::delegated_source::execution_token(&ctx, exec.id).await?;
 
     let resp = ctx
         .post(
@@ -1509,15 +1527,21 @@ async fn execution_token_for_different_execution_can_respond_when_assignee() -> 
     // action handling the user's webhook reply) is allowed when its
     // identity matches the assignee.
     let ctx = TestContext::new().await?;
-    let cfg = jwt_config();
 
     let assignee = create_identity(&ctx.pool, "assignee_other_exec").await?;
     let (_pack, action) = setup_pack_action(&ctx.pool, "other_exec").await?;
     let creating_exec = create_execution(&ctx.pool, &action).await?;
-    let other_exec = create_execution(&ctx.pool, &action).await?;
+    let other_exec = owned_execution(
+        &ctx.pool,
+        &action,
+        assignee.id,
+        None,
+        vec!["standard".into()],
+    )
+    .await?;
     let inquiry = create_inquiry(&ctx.pool, creating_exec.id, Some(assignee.id)).await?;
 
-    let token = generate_execution_token(assignee.id, other_exec.id, &action.r#ref, &cfg, None)?;
+    let token = helpers::delegated_source::execution_token(&ctx, other_exec.id).await?;
 
     let resp = ctx
         .post(
@@ -1534,16 +1558,16 @@ async fn execution_token_for_different_execution_can_respond_when_assignee() -> 
 #[tokio::test]
 async fn execution_token_for_different_execution_blocked_when_not_assignee() -> TResult<()> {
     let ctx = TestContext::new().await?;
-    let cfg = jwt_config();
 
     let assignee = create_identity(&ctx.pool, "assignee_diff_id").await?;
     let other = create_identity(&ctx.pool, "non_assignee_id").await?;
     let (_pack, action) = setup_pack_action(&ctx.pool, "exec_non_assignee").await?;
     let creating_exec = create_execution(&ctx.pool, &action).await?;
-    let other_exec = create_execution(&ctx.pool, &action).await?;
+    let other_exec =
+        owned_execution(&ctx.pool, &action, other.id, None, vec!["standard".into()]).await?;
     let inquiry = create_inquiry(&ctx.pool, creating_exec.id, Some(assignee.id)).await?;
 
-    let token = generate_execution_token(other.id, other_exec.id, &action.r#ref, &cfg, None)?;
+    let token = helpers::delegated_source::execution_token(&ctx, other_exec.id).await?;
 
     let resp = ctx
         .post(
@@ -1560,14 +1584,13 @@ async fn execution_token_for_different_execution_blocked_when_not_assignee() -> 
 #[tokio::test]
 async fn unassigned_inquiry_accepts_any_authenticated_caller() -> TResult<()> {
     let ctx = TestContext::new().await?;
-    let cfg = jwt_config();
 
     let caller = create_identity(&ctx.pool, "any_caller").await?;
     let (_pack, action) = setup_pack_action(&ctx.pool, "unassigned").await?;
     let exec = create_execution(&ctx.pool, &action).await?;
     let inquiry = create_inquiry(&ctx.pool, exec.id, None).await?;
 
-    let token = generate_access_token(caller.id, &caller.login, &cfg)?;
+    let token = generate_access_token(caller.id, &caller.login, &jwt_config())?;
 
     let resp = ctx
         .post(
@@ -1588,17 +1611,30 @@ async fn nested_execution_token_self_response_is_blocked() -> TResult<()> {
     // loop in spirit (the workflow that created the inquiry can't approve
     // it via one of its own descendants).
     let ctx = TestContext::new().await?;
-    let cfg = jwt_config();
 
     let assignee = create_identity(&ctx.pool, "assignee_nested").await?;
     let (_pack, action) = setup_pack_action(&ctx.pool, "nested").await?;
-    let exec_a = create_execution(&ctx.pool, &action).await?;
-    let exec_b = create_child_execution(&ctx.pool, &action, exec_a.id).await?;
+    let exec_a = owned_execution(
+        &ctx.pool,
+        &action,
+        assignee.id,
+        None,
+        vec!["standard".into()],
+    )
+    .await?;
+    let exec_b = owned_execution(
+        &ctx.pool,
+        &action,
+        assignee.id,
+        Some(exec_a.id),
+        vec!["standard".into()],
+    )
+    .await?;
     let inquiry = create_inquiry(&ctx.pool, exec_a.id, Some(assignee.id)).await?;
 
     // Execution token scoped to the *child* execution B, carrying the
     // assignee identity.
-    let token = generate_execution_token(assignee.id, exec_b.id, &action.r#ref, &cfg, None)?;
+    let token = helpers::delegated_source::execution_token(&ctx, exec_b.id).await?;
 
     let resp = ctx
         .post(
@@ -1623,16 +1659,36 @@ async fn nested_execution_token_self_response_is_blocked() -> TResult<()> {
 async fn deeply_nested_execution_token_self_response_is_blocked() -> TResult<()> {
     // A → B → C: token scoped to C must not be able to respond to A's inquiry.
     let ctx = TestContext::new().await?;
-    let cfg = jwt_config();
 
     let assignee = create_identity(&ctx.pool, "assignee_deep").await?;
     let (_pack, action) = setup_pack_action(&ctx.pool, "deep").await?;
-    let exec_a = create_execution(&ctx.pool, &action).await?;
-    let exec_b = create_child_execution(&ctx.pool, &action, exec_a.id).await?;
-    let exec_c = create_child_execution(&ctx.pool, &action, exec_b.id).await?;
+    let exec_a = owned_execution(
+        &ctx.pool,
+        &action,
+        assignee.id,
+        None,
+        vec!["standard".into()],
+    )
+    .await?;
+    let exec_b = owned_execution(
+        &ctx.pool,
+        &action,
+        assignee.id,
+        Some(exec_a.id),
+        vec!["standard".into()],
+    )
+    .await?;
+    let exec_c = owned_execution(
+        &ctx.pool,
+        &action,
+        assignee.id,
+        Some(exec_b.id),
+        vec!["standard".into()],
+    )
+    .await?;
     let inquiry = create_inquiry(&ctx.pool, exec_a.id, Some(assignee.id)).await?;
 
-    let token = generate_execution_token(assignee.id, exec_c.id, &action.r#ref, &cfg, None)?;
+    let token = helpers::delegated_source::execution_token(&ctx, exec_c.id).await?;
 
     let resp = ctx
         .post(

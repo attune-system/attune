@@ -259,10 +259,7 @@ impl NativeWaitMaterializationRepository {
         let parent = Executions::find_by_id(&mut *conn, workflow.execution)
             .await?
             .ok_or_else(denied)?;
-        if Admissions::find(conn, RuntimeOwner::Execution(parent.id))
-            .await?
-            .is_none()
-        {
+        if !Admissions::is_recorded(conn, parent.id).await? {
             return Ok(None);
         }
         if parent.status != ExecutionStatus::Running || workflow.status != ExecutionStatus::Running
