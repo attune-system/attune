@@ -121,8 +121,11 @@ FOR EACH ROW EXECUTE FUNCTION retain_recorded_execution_authority();
 CREATE TABLE delegated_execution_attempt (
     execution BIGINT PRIMARY KEY REFERENCES execution(id) ON DELETE CASCADE,
     attempt UUID NOT NULL,
-    worker BIGINT NOT NULL,
-    closed BOOLEAN NOT NULL DEFAULT FALSE
+    producer_kind TEXT NOT NULL DEFAULT 'worker' CHECK (producer_kind IN ('worker','workflow')),
+    worker BIGINT,
+    closed BOOLEAN NOT NULL DEFAULT FALSE,
+    CHECK ((producer_kind='worker' AND worker IS NOT NULL)
+        OR (producer_kind='workflow' AND worker IS NULL))
 );
 CREATE TABLE delegated_execution_key_origin (
     execution BIGINT NOT NULL REFERENCES execution(id) ON DELETE CASCADE,
@@ -137,6 +140,7 @@ FOR EACH ROW EXECUTE FUNCTION guard_execution_runtime_read_origin();
 CREATE FUNCTION guard_delegated_execution_attempt() RETURNS TRIGGER AS $$
 BEGIN
     IF NEW.execution IS DISTINCT FROM OLD.execution OR NEW.attempt IS DISTINCT FROM OLD.attempt
+       OR NEW.producer_kind IS DISTINCT FROM OLD.producer_kind
        OR NEW.worker IS DISTINCT FROM OLD.worker OR OLD.closed AND NOT NEW.closed
     THEN RAISE EXCEPTION 'Delegated attempt identity and closure are immutable'; END IF;
     RETURN NEW;
@@ -144,6 +148,19 @@ END;
 $$ LANGUAGE plpgsql;
 CREATE TRIGGER guard_delegated_execution_attempt BEFORE UPDATE ON delegated_execution_attempt
 FOR EACH ROW EXECUTE FUNCTION guard_delegated_execution_attempt();
+
+-- Native workflows issue no worker/action credentials. Their producer fence is
+-- created at delegated admission and closes atomically with terminal state,
+-- including cancellation/timeout before orchestration has started.
+CREATE FUNCTION close_terminal_delegated_attempt() RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE delegated_execution_attempt SET closed=TRUE WHERE execution=NEW.id AND NOT closed;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER close_terminal_delegated_attempt AFTER UPDATE OF status ON execution
+FOR EACH ROW WHEN (NEW.status IN ('completed','failed','cancelled','timeout','abandoned') AND OLD.status IS DISTINCT FROM NEW.status)
+EXECUTE FUNCTION close_terminal_delegated_attempt();
 
 -- Queue contributors retain their own human selection; batching cannot pick a
 -- new permission list from mutable queue metadata or another contributor.

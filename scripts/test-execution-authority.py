@@ -256,6 +256,18 @@ def main():
         (pack / 'actions/tokenless.yaml').write_text(yaml.safe_dump({'ref':tokenless_ref,'label':'Tokenless','runner_type':pack_ref+'.python','entry_point':'tokenless.py','parameter_format':'json','output_format':'json','parameters':{'message':{'type':'string','required':True},'item_id':{'type':'integer'}}}))
         (pack / 'actions/tokenless.py').write_text("import json,os,sys\np=json.load(sys.stdin)\nr={'token_present':bool(os.environ.get('ATTUNE_API_TOKEN')),'message':p['message']}\nif 'item_id' in p: r['queue_ack']={'version':1,'items':[{'id':p['item_id'],'status':'completed'}]}\nprint(json.dumps(r))\n")
 
+        # Native workflows keep real managed definitions and separate producer
+        # fences; output_map exercises source restoration and private propagation.
+        for private in [False, True]:
+            name = 'private_ack_flow' if private else 'public_ack_flow'
+            params = ({'key':{'type':'string','required':True},'other':{'type':'string','required':True},'plaintext':{'type':'boolean','required':True},'item_id':{'type':'integer','required':True}}
+                      if private else {'message':{'type':'string','required':True},'item_id':{'type':'integer','required':True}})
+            (pack / ('actions/'+name+'.yaml')).write_text(yaml.safe_dump({'ref':pack_ref+'.'+name,'label':name,'workflow_file':'workflows/'+name+'.workflow.yaml','parameters':params}))
+            task = {'name':'emit','action':action_ref if private else tokenless_ref,
+                    'permission_set_refs':['standard',pack_ref+'.read_system'] if private else [],
+                    'input':{key:'{{ parameters.'+key+' }}' for key in params},'next':[]}
+            (pack / ('actions/workflows/'+name+'.workflow.yaml')).write_text(yaml.safe_dump({'version':'1.0.0','tasks':[task],'output_map':{'queue_ack':'{{ task.emit.queue_ack }}'}}))
+
         managed_queue_ref=pack_ref+'.sponsored_queue'
         (pack/'queues/sponsored_queue.yaml').write_text(yaml.safe_dump({'ref':managed_queue_ref,'label':'Recorded-only sponsored queue','dispatch_action':tokenless_ref,'permission_set_refs':[],'action_params':{'message':'sponsored'}}))
         for name, actions in [('read_system', ['read', 'decrypt']), ('use_system', ['use']), ('read_metadata', ['read'])]:
@@ -465,12 +477,29 @@ print(json.dumps({'assertion':result['assertion'],'raw_denied':True,'profile_den
             assert protected['items'][0]['summary']['value']==secret and protected['items'][0]['error']['value']==secret
         result['checks'] += ['API-capable system-Key queue consumes closed-attempt acknowledgement controls while freeform details remain encrypted', 'malformed protected acknowledgement fails without leaking parser input through queue errors']
 
-        native_queue_ref=pack_ref+'.native_queue'
-        api('POST','/queues',json={'ref':native_queue_ref,'pack_ref':pack_ref,'label':'Native queue readiness','dispatch_action_ref':flow_ref,'permission_set_refs':['standard',pack_ref+'.read_system'],'action_params':{'key':keys[0],'other':keys[1],'plaintext':True}})
-        native_rejected=admin.post(base+'/api/v1/queues/'+native_queue_ref+'/items',json={'payload':{}},timeout=20)
-        assert native_rejected.status_code==501 and 'native completion readiness' in native_rejected.text
-        assert psql("SELECT count(*) FROM work_queue_item WHERE queue_ref='"+native_queue_ref+"'")=='0'
-        result['checks'].append('unsupported native workflow queue target rejects with readiness before enqueue while direct workflows remain supported')
+        for private in [False, True]:
+            native_queue_ref = pack_ref + ('.native_private_queue' if private else '.native_public_queue')
+            params = ({'key':keys[0],'other':keys[1],'plaintext':True,'item_id':'{{ queue_item.id }}'}
+                      if private else {'message':'native public input','item_id':'{{ queue_item.id }}'})
+            api('POST','/queues',json={'ref':native_queue_ref,'pack_ref':pack_ref,'label':'Native workflow controls','dispatch_action_ref':pack_ref+('.private_ack_flow' if private else '.public_ack_flow'),'permission_set_refs':['standard',pack_ref+'.read_system'] if private else [],'action_params':params})
+            api('POST','/queues/'+native_queue_ref+'/items',json={'payload':{}})
+            def native_queue_terminal():
+                state=psql("SELECT status::text FROM work_queue_item WHERE queue_ref='"+native_queue_ref+"'")
+                return state if state in ('completed','failed','cancelled') else None
+            status=wait_for(native_queue_terminal,90,'native workflow queue acknowledgement')
+            assert status=='completed', 'native workflow queue failed: '+psql("SELECT coalesce(last_error::text,'') FROM work_queue_item WHERE queue_ref='"+native_queue_ref+"'")
+            native_execution=psql("SELECT execution FROM work_queue_dispatch WHERE queue_ref='"+native_queue_ref+"' ORDER BY id DESC LIMIT 1")
+            assert psql("SELECT a.producer_kind='workflow' AND a.closed AND a.worker IS NULL AND e.worker IS NULL AND e.status='completed' FROM execution e JOIN delegated_execution_attempt a ON a.execution=e.id WHERE e.id="+native_execution)=='t'
+            ordinary=psql("SELECT json_build_object('summary',ack_summary,'error',last_error)::text FROM work_queue_item WHERE queue_ref='"+native_queue_ref+"'")
+            assert secret not in ordinary
+            if private:
+                ordinary_result=api('GET','/executions/'+native_execution)
+                assert secret not in json.dumps(ordinary_result)
+                restored=api('GET','/executions/'+native_execution+'?include_secret_values=true')['result']['queue_ack']
+                assert restored['items'][0]['summary']['value']==secret and restored['items'][0]['error']['value']==secret
+                assert json.loads(ordinary)['summary']=={'status':'completed'}
+                assert int(psql("SELECT count(*) FROM execution_secret_value WHERE entity_type='execution_result' AND entity_id="+native_execution))>0
+            result['checks'] += ['native '+('protected system-Key' if private else 'tokenless public')+' workflow queue output_map completes with a closed noncredential producer fence']
 
         # A principal with only execute/observe rights cannot borrow pack sponsorship.
         login_name = run + '@example.test'

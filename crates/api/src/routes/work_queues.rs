@@ -1942,8 +1942,6 @@ async fn enqueue_queue_item_in_transaction(
             refs,
         )
         .await?;
-        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::require_queue_target_ready(&snapshot)
-            .map_err(|error| ApiError::NotImplemented(error.to_string()))?;
     }
     let current_actions =
         attune_common::repositories::action::ActionRepository::find_by_refs_for_share(

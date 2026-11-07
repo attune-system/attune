@@ -3451,7 +3451,16 @@ async fn delegated_authority_is_explicit_immutable_and_attempt_fenced() {
             runtime::{CreateWorkerInput, WorkerRepository},
         },
     };
-    let (db, snapshot, _, human) = fixture().await;
+    let (db, mut snapshot, _, human) = fixture().await;
+    // This test exercises worker credentials; use the actual pinned worker
+    // executable rather than the fixture's native workflow producer.
+    snapshot.executable = snapshot
+        .pack_executables
+        .values()
+        .find(|pinned| pinned.executable.action.workflow_def.is_none())
+        .expect("worker executable in fixture release")
+        .executable
+        .clone();
     let mut tx = db.begin().await.unwrap();
     let execution =
         delegated_fixture_execution(&mut tx, &snapshot, human, vec!["standard".into()], None).await;
@@ -3702,6 +3711,215 @@ async fn delegated_authority_is_explicit_immutable_and_attempt_fenced() {
     assert!(Delegated::select(&mut tx, execution.id, None)
         .await
         .is_err());
+    tx.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_workflow_authority_fences_children_and_private_controls() {
+    attune_common::auth::crypto_provider::install();
+    use attune_common::{
+        auth::jwt::{generate_delegated_execution_token, validate_token, JwtConfig},
+        repositories::{
+            delegated_execution::{DelegatedExecutionRepository as Delegated, ProtectedQueueAck},
+            execution::UpdateExecutionInput,
+            native_failure_materialization::NativeFailureMaterializationRepository as Native,
+            workflow::{CreateWorkflowExecutionInput, WorkflowExecutionRepository},
+        },
+    };
+    let (db, snapshot, _, human) = fixture().await;
+    let mut tx = db.begin().await.unwrap();
+    let root =
+        delegated_fixture_execution(&mut tx, &snapshot, human, vec!["standard".into()], None).await;
+    Delegated::select(&mut tx, root.id, None).await.unwrap();
+    let (attempt, kind, worker, closed): (uuid::Uuid, String, Option<i64>, bool) = sqlx::query_as(
+        "SELECT attempt,producer_kind,worker,closed FROM delegated_execution_attempt WHERE execution=$1",
+    ).bind(root.id).fetch_one(&mut *tx).await.unwrap();
+    assert_eq!(kind, "workflow");
+    assert!(worker.is_none() && !closed);
+    ExecutionRepository::update(
+        &mut *tx,
+        root.id,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Running),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let jwt = JwtConfig {
+        secret: "native-negative-token-test-only".into(),
+        access_token_expiration: 60,
+        refresh_token_expiration: 60,
+    };
+    // A native producer nonce must never authorize an action bearer or worker completion.
+    let token = generate_delegated_execution_token(
+        human,
+        root.id,
+        &root.action_ref,
+        &jwt,
+        60,
+        &["standard".into()],
+        std::slice::from_ref(&root.action_ref),
+        attempt,
+    )
+    .unwrap();
+    let claims = validate_token(&token, &jwt).unwrap();
+    assert!(Delegated::validate_claims(&mut tx, &claims).await.is_err());
+    assert!(Delegated::current_attempt(&mut tx, root.id).await.is_err());
+    assert!(Delegated::require_completion(&mut tx, root.id, 123)
+        .await
+        .is_err());
+    let workflow = WorkflowExecutionRepository::create(
+        &mut *tx,
+        CreateWorkflowExecutionInput {
+            execution: root.id,
+            workflow_def: snapshot.executable.workflow_definition.as_ref().unwrap().id,
+            task_graph: json!({}),
+            variables: json!({}),
+            status: ExecutionStatus::Running,
+        },
+    )
+    .await
+    .unwrap();
+    let mut leaf = snapshot.clone();
+    leaf.executable = snapshot
+        .pack_executables
+        .values()
+        .find(|p| p.executable.action.workflow_def.is_none())
+        .unwrap()
+        .executable
+        .clone();
+    let child = delegated_fixture_execution(&mut tx, &leaf, human, vec![], Some(root.id)).await;
+    Delegated::select(&mut tx, child.id, Some(root.id))
+        .await
+        .unwrap();
+    let task = serde_json::from_value(json!({"workflow_execution":workflow.id,"task_name":"next","retry_count":0,"max_retries":0,"timed_out":false})).unwrap();
+    ExecutionRepository::update(
+        &mut *tx,
+        child.id,
+        UpdateExecutionInput {
+            workflow_task: Some(task),
+            status: Some(ExecutionStatus::Completed),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        Native::prepare_for_completion(&mut tx, child.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "managed delegated callbacks must use explicit selected mode, not ownership"
+    );
+    Delegated::close(&mut tx, root.id).await.unwrap();
+    assert!(
+        Native::prepare_for_completion(&mut tx, child.id)
+            .await
+            .is_err(),
+        "a closed native producer cannot process callbacks during status lag"
+    );
+    let late = delegated_fixture_execution(&mut tx, &leaf, human, vec![], Some(root.id)).await;
+    assert!(Delegated::select(&mut tx, late.id, Some(root.id))
+        .await
+        .is_err());
+    assert!(Delegated::require_closed_output(&mut tx, root.id)
+        .await
+        .is_err());
+    ExecutionRepository::update(
+        &mut *tx,
+        root.id,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Completed),
+            result: Some(
+                json!({"queue_ack":{"version":1,"items":[{"id":10,"status":"completed"}]}}),
+            ),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    Delegated::require_closed_output(&mut tx, root.id)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            Delegated::protected_queue_ack_controls(&mut tx, root.id, &[10], 1, None)
+                .await
+                .unwrap(),
+            ProtectedQueueAck::Unprotected
+        ),
+        "native public literals do not acquire opaque worker provenance"
+    );
+    let provenance = attune_common::secret_provenance::SecretProvenance {
+        origins: vec![Delegated::output_origin(&mut tx, root.id)
+            .await
+            .unwrap()
+            .unwrap()],
+        templates: vec![],
+    };
+    let key = "owned-native-root-ack-test-encryption-key";
+    let prepared = attune_common::secret_values::prepare_secret_values(vec![attune_common::secret_values::SecretValueInput {
+        json_path: "".into(), value: json!({"queue_ack":{"version":1,"items":[{"id":10,"status":"completed","summary":{"value":"private"},"error":{"value":"private"}}]}}),
+        source_kind: "provenance".into(), source_ref: Some(serde_json::to_string(&provenance).unwrap()),
+    }], key).unwrap();
+    attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::upsert_many_with_conn(
+        &mut tx, attune_common::secret_values::ENTITY_EXECUTION_RESULT, root.id, &prepared).await.unwrap();
+    ExecutionRepository::update(
+        &mut *tx,
+        root.id,
+        UpdateExecutionInput {
+            result: Some(attune_common::secret_values::redaction_marker()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let ProtectedQueueAck::Controls(controls) =
+        Delegated::protected_queue_ack_controls(&mut tx, root.id, &[10], 1, Some(key))
+            .await
+            .unwrap()
+    else {
+        panic!("native root ciphertext controls rejected")
+    };
+    assert!(controls.items[0].summary.is_none() && controls.items[0].error.is_none());
+    let cancelled = delegated_fixture_execution(&mut tx, &snapshot, human, vec![], None).await;
+    Delegated::select(&mut tx, cancelled.id, None)
+        .await
+        .unwrap();
+    ExecutionRepository::update(
+        &mut *tx,
+        cancelled.id,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Cancelled),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let closed: bool =
+        sqlx::query_scalar("SELECT closed FROM delegated_execution_attempt WHERE execution=$1")
+            .bind(cancelled.id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert!(
+        closed,
+        "terminal cancellation atomically closes the native producer"
+    );
+    Delegated::require_closed_output(&mut tx, cancelled.id)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let mut tx = db.begin().await.unwrap();
+    assert!(
+        sqlx::query("UPDATE delegated_execution_attempt SET closed=FALSE WHERE execution=$1")
+            .bind(root.id)
+            .execute(&mut *tx)
+            .await
+            .is_err()
+    );
     tx.rollback().await.unwrap();
     db.cleanup().await.unwrap();
 }

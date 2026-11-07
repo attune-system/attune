@@ -235,7 +235,8 @@ pub struct NativeFailureMaterializationRepository;
 impl NativeFailureMaterializationRepository {
     /// Owning transaction, BEFORE outer workflow advisory/target locks. IDs refer
     /// to real persisted tasks. None is only a non-native or out-of-scope graph;
-    /// missing admission/schema/original source for a managed graph is an error.
+    /// Explicit delegation uses the caller-covered path. Missing recorded
+    /// admission/schema/original source remains an error, regardless of ownership.
     pub async fn prepare_for_completion(
         conn: &mut PgConnection,
         completed: Id,
@@ -266,16 +267,6 @@ impl NativeFailureMaterializationRepository {
         if actual.parent != Some(parent.id) {
             return Err(changed());
         }
-        let Some(admission) = Authority::execution_admission(conn, parent.id).await? else {
-            if parent
-                .executable_snapshot
-                .as_ref()
-                .is_some_and(|snapshot| !snapshot.executable.action.is_adhoc)
-            {
-                return Err(changed());
-            }
-            return Ok(None);
-        };
         if terminal(parent.status)
             || matches!(
                 parent.status,
@@ -284,6 +275,21 @@ impl NativeFailureMaterializationRepository {
         {
             return Ok(None);
         }
+        if super::execution_admission::ExecutionAdmissionRepository::existing_authority(
+            conn, parent.id,
+        )
+        .await?
+            == super::execution_runtime_admission::ExistingExecutionAuthority::Delegated
+        {
+            super::delegated_execution::DelegatedExecutionRepository::validate_child(
+                conn, parent.id, actual.id,
+            )
+            .await?;
+            return Ok(None);
+        }
+        let admission = Authority::execution_admission(conn, parent.id)
+            .await?
+            .ok_or_else(changed)?;
         let graph = &parent
             .executable_snapshot
             .as_ref()

@@ -178,7 +178,10 @@ Execution authority is persisted in `execution_authority_selection`, independent
 of managed/ad hoc ownership. Ordinary API requests select human delegation in the
 creation transaction after checking the active attributable owner and coverage of
 selected named sets. Executable and schema snapshots remain immutable. Tokens
-bind the assigned worker's persisted attempt; empty selections omit the API token
+bind the assigned worker's persisted attempt. Native workflows receive a separate
+server-owned producer fence in the admission transaction, with no worker assignment
+or bearer credential; terminal transitions close it atomically. Child creation and
+completion callbacks retain the open parent fence. Empty selections omit the API token
 but retain input, log and completion protections. Selected grant-definition edits
 invalidate a running delegated credential rather than leaving stale consumer
 snapshots effective. API grant refreshes revalidate the source attempt, and
@@ -214,7 +217,10 @@ later rule edits cannot reselect that pending enforcement's authority. Queue
 contributors likewise retain their accepted owner and selection.
 
 Protected queue acknowledgements are consumed under the original active owner's
-current admitted read scope and the closed assigned worker attempt. Scoped
+current admitted read scope and the closed worker or native workflow producer
+attempt. Native compiler-tracked public literals remain public; protected values,
+including a whole-result ciphertext, are decrypted only inside the repository to
+extract validated controls. Scoped
 `standard` applies to native controls, without granting the human owner private
 body disclosure. Completion retains
 the queue lease generation through commit and validates the acknowledgement's
@@ -222,9 +228,6 @@ version, item IDs and statuses. Only those protocol controls update ordinary que
 state. Freeform summary/error details remain in the encrypted execution result;
 they are not copied into queue item summaries or errors. Invalid protected
 acknowledgements produce a fixed diagnostic without echoing their private fields.
-Native workflows as queue dispatch targets require separate producer/completion
-readiness and are rejected before enqueue. Direct workflow execution, worker
-child fanout and retries remain supported by delegated authority.
 
 Worker startup advertises `delegated_execution_authority_v1` only for the protected
 input/token/log/completion implementation with output encryption configured.

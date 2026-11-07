@@ -80,11 +80,8 @@ impl DelegatedExecutionRepository {
             {
                 return Err(denied());
             }
-            if row.original_execution.is_none()
-                && row.parent == Some(source)
-                && source_row.status != crate::models::ExecutionStatus::Running
-            {
-                return Err(denied());
+            if row.original_execution.is_none() && row.parent == Some(source) {
+                require_open_parent(conn, &parent).await?;
             }
             if row.original_execution.is_some()
                 && (row.permission_set_refs != parent.selected_refs
@@ -210,6 +207,21 @@ impl DelegatedExecutionRepository {
         if changed.rows_affected() != 1 {
             return Err(denied());
         }
+        let snapshot = row.executable_snapshot.as_ref().ok_or_else(denied)?;
+        if snapshot.executable.action.workflow_def.is_some()
+            || snapshot.executable.workflow_definition.is_some()
+        {
+            let closed = matches!(
+                row.status,
+                crate::models::ExecutionStatus::Completed
+                    | crate::models::ExecutionStatus::Failed
+                    | crate::models::ExecutionStatus::Cancelled
+                    | crate::models::ExecutionStatus::Timeout
+                    | crate::models::ExecutionStatus::Abandoned
+            );
+            sqlx::query("INSERT INTO delegated_execution_attempt(execution,attempt,producer_kind,worker,closed) VALUES($1,$2,'workflow',NULL,$3)")
+                .bind(execution).bind(Uuid::new_v4()).bind(closed).execute(conn).await?;
+        }
         Ok(())
     }
     pub async fn validate(
@@ -273,15 +285,42 @@ impl DelegatedExecutionRepository {
         }
         Ok(selection)
     }
+    /// Callback/dataflow consumers retain the creation mode, owner and named-set
+    /// ceiling, including after the child has completed.
+    pub async fn validate_child(conn: &mut PgConnection, parent: Id, child: Id) -> Result<()> {
+        let source = Box::pin(Self::validate(conn, parent)).await?;
+        require_open_parent(conn, &source).await?;
+        let selected = Box::pin(Self::validate(conn, child)).await?;
+        let row = ExecutionRepository::find_by_id(&mut *conn, child)
+            .await?
+            .ok_or_else(denied)?;
+        if row.parent != Some(parent) || source.owner != selected.owner {
+            return Err(denied());
+        }
+        let ceiling = DelegationAuthority::new(
+            source.owner.ok_or_else(denied)?,
+            Default::default(),
+            Self::selected_grants(conn, &source.selected_refs).await?,
+        );
+        ceiling.require_grants(&Self::selected_grants(conn, &selected.selected_refs).await?)?;
+        if selected.selected_refs.iter().any(|r| r == "standard")
+            && !source.selected_refs.iter().any(|r| r == "standard")
+        {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
     /// Native consumers may read protected terminal output only from the closed
-    /// attempt that was assigned this execution. This never authorizes a token.
+    /// worker or native workflow producer. This never authorizes a token.
     pub async fn require_closed_output(
         conn: &mut PgConnection,
         execution: Id,
     ) -> Result<ExecutionAuthoritySelection> {
         let selection = Box::pin(Self::validate(conn, execution)).await?;
-        let closed: Option<Id> = sqlx::query_scalar("SELECT e.id FROM execution e JOIN delegated_execution_attempt a ON a.execution=e.id AND a.worker=e.worker WHERE e.id=$1 AND a.closed AND e.status IN ('completed','failed','cancelled','timeout','abandoned') FOR SHARE OF e,a")
-            .bind(execution).fetch_optional(conn).await?;
+        let kind = selection_producer(&selection)?;
+        let closed: Option<Id> = sqlx::query_scalar("SELECT e.id FROM execution e JOIN delegated_execution_attempt a ON a.execution=e.id WHERE e.id=$1 AND a.closed AND a.producer_kind=$2 AND ((a.producer_kind='worker' AND a.worker=e.worker) OR (a.producer_kind='workflow' AND a.worker IS NULL AND e.worker IS NULL)) AND e.status IN ('completed','failed','cancelled','timeout','abandoned') FOR SHARE OF e,a")
+            .bind(execution).bind(kind).fetch_optional(conn).await?;
         if !selection.explicit || closed.is_none() {
             return Err(denied());
         }
@@ -307,38 +346,48 @@ impl DelegatedExecutionRepository {
             )
             .await?;
         secrets.retain(|secret| {
-            secret.json_path == "/queue_ack" || secret.json_path.starts_with("/queue_ack/")
+            secret.json_path.is_empty()
+                || secret.json_path == "/queue_ack"
+                || secret.json_path.starts_with("/queue_ack/")
         });
         if secrets.is_empty() {
-            return Ok(if selected.selected_refs.is_empty() {
-                ProtectedQueueAck::Unprotected
-            } else {
-                // API-capable opaque output is protected even when provenance
-                // is missing; absence must never select public consumption.
-                ProtectedQueueAck::Invalid
-            });
+            return Ok(
+                if selected.selected_refs.is_empty() || selection_producer(&selected)? == "workflow"
+                {
+                    ProtectedQueueAck::Unprotected
+                } else {
+                    // API-capable opaque output is protected even when provenance
+                    // is missing; absence must never select public consumption.
+                    ProtectedQueueAck::Invalid
+                },
+            );
         }
         crate::key_access::authorize_execution_control_origins(conn, execution, &secrets).await?;
         let source = ExecutionRepository::find_by_id(&mut *conn, execution)
             .await?
             .ok_or_else(denied)?;
-        let Some(ack) = source
-            .result
-            .as_ref()
-            .and_then(|result| result.get("queue_ack"))
-        else {
+        let Some(result) = source.result else {
             return Ok(ProtectedQueueAck::Invalid);
         };
         let key = encryption_key.ok_or_else(|| {
             Error::validation("Protected queue acknowledgement encryption is unavailable")
         })?;
-        let restored = restore_secret_values(serde_json::json!({"queue_ack":ack}), &secrets, key)?;
+        let root = secrets.iter().any(|secret| secret.json_path.is_empty());
+        let value = if root {
+            result
+        } else {
+            let Some(ack) = result.get("queue_ack") else {
+                return Ok(ProtectedQueueAck::Invalid);
+            };
+            serde_json::json!({"queue_ack":ack})
+        };
+        let restored = restore_secret_values(value, &secrets, key)?;
         Ok(ProtectedQueueAck::validate(&restored, items, version))
     }
 
     pub async fn start(conn: &mut PgConnection, execution: Id, worker: Id) -> Result<Uuid> {
         let selection = Box::pin(Self::validate(conn, execution)).await?;
-        if !selection.explicit {
+        if !selection.explicit || selection_producer(&selection)? != "worker" {
             return Err(denied());
         }
         let assigned:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM execution WHERE id=$1 AND worker=$2 AND status='scheduled')").bind(execution).bind(worker).fetch_one(&mut *conn).await?;
@@ -393,7 +442,7 @@ impl DelegatedExecutionRepository {
         }
         let attempt: Uuid =
             serde_json::from_value(meta.get("delegated_attempt").cloned().ok_or_else(denied)?)?;
-        let open:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM delegated_execution_attempt WHERE execution=$1 AND attempt=$2 AND worker=$3 AND NOT closed)").bind(execution).bind(attempt).bind(row.worker).fetch_one(conn).await?;
+        let open:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM delegated_execution_attempt WHERE execution=$1 AND attempt=$2 AND producer_kind='worker' AND worker=$3 AND NOT closed)").bind(execution).bind(attempt).bind(row.worker).fetch_one(conn).await?;
         if !open {
             return Err(denied());
         }
@@ -406,7 +455,7 @@ impl DelegatedExecutionRepository {
         else {
             return Err(denied());
         };
-        let retained:Option<Id>=sqlx::query_scalar("SELECT execution FROM delegated_execution_attempt WHERE execution=$1 AND attempt=$2 AND NOT closed FOR SHARE")
+        let retained:Option<Id>=sqlx::query_scalar("SELECT execution FROM delegated_execution_attempt WHERE execution=$1 AND attempt=$2 AND producer_kind='worker' AND NOT closed FOR SHARE")
             .bind(execution).bind(attempt).fetch_optional(conn).await?;
         if retained.is_none() {
             return Err(denied());
@@ -481,21 +530,6 @@ impl DelegatedExecutionRepository {
         Ok((owner, refs))
     }
 
-    /// Workflow queue targets need a native producer/completion binding. Do not
-    /// accept them and discover that missing authority after the action runs.
-    pub fn require_queue_target_ready(
-        snapshot: &crate::models::ExecutionExecutableSnapshot,
-    ) -> Result<()> {
-        if snapshot.executable.action.workflow_def.is_some()
-            || snapshot.executable.workflow_definition.is_some()
-        {
-            return Err(Error::validation(
-                "Workflow queue dispatch requires coordinated native completion readiness",
-            ));
-        }
-        Ok(())
-    }
-
     pub async fn accept_queue_item(
         conn: &mut PgConnection,
         queue: &crate::models::WorkQueue,
@@ -513,7 +547,6 @@ impl DelegatedExecutionRepository {
             .await?
             .require_refs_for_share(conn, refs)
             .await?;
-        Self::require_queue_target_ready(snapshot)?;
         let grants = Self::selected_grants(conn, refs).await?;
         if let Some(source) = item.requested_by_execution {
             let parent = Box::pin(Self::validate(conn, source)).await?;
@@ -634,7 +667,7 @@ impl DelegatedExecutionRepository {
         worker: Id,
     ) -> Result<()> {
         Box::pin(Self::validate(conn, execution)).await?;
-        let allowed:Option<Id>=sqlx::query_scalar("SELECT e.id FROM execution e JOIN delegated_execution_attempt a ON a.execution=e.id AND a.worker=e.worker WHERE e.id=$1 AND e.worker=$2 AND e.status='running' AND NOT a.closed FOR SHARE OF e,a")
+        let allowed:Option<Id>=sqlx::query_scalar("SELECT e.id FROM execution e JOIN delegated_execution_attempt a ON a.execution=e.id AND a.worker=e.worker WHERE e.id=$1 AND e.worker=$2 AND a.producer_kind='worker' AND e.status='running' AND NOT a.closed FOR SHARE OF e,a")
             .bind(execution).bind(worker).fetch_optional(conn).await?;
         if allowed.is_none() {
             return Err(denied());
@@ -643,7 +676,7 @@ impl DelegatedExecutionRepository {
     }
     pub async fn current_attempt(conn: &mut PgConnection, execution: Id) -> Result<Uuid> {
         sqlx::query_scalar(
-            "SELECT attempt FROM delegated_execution_attempt WHERE execution=$1 AND NOT closed",
+            "SELECT attempt FROM delegated_execution_attempt WHERE execution=$1 AND producer_kind='worker' AND NOT closed",
         )
         .bind(execution)
         .fetch_optional(conn)
@@ -662,7 +695,7 @@ impl DelegatedExecutionRepository {
         // Hold closure out with a shared attempt lock. Serialize the bounded
         // origin budget independently, avoiding concurrent readers upgrading
         // their retained shared attempt locks to exclusive locks.
-        let open:Option<Id>=sqlx::query_scalar("SELECT execution FROM delegated_execution_attempt WHERE execution=$1 AND attempt=$2 AND NOT closed FOR SHARE").bind(execution).bind(attempt).fetch_optional(&mut *conn).await?;
+        let open:Option<Id>=sqlx::query_scalar("SELECT execution FROM delegated_execution_attempt WHERE execution=$1 AND attempt=$2 AND producer_kind='worker' AND NOT closed FOR SHARE").bind(execution).bind(attempt).fetch_optional(&mut *conn).await?;
         if open.is_none() {
             return Err(denied());
         }
@@ -685,6 +718,35 @@ impl DelegatedExecutionRepository {
         Ok(())
     }
 }
+async fn require_open_parent(
+    conn: &mut PgConnection,
+    source: &ExecutionAuthoritySelection,
+) -> Result<()> {
+    let kind = selection_producer(source)?;
+    let open: Option<Id> = sqlx::query_scalar("SELECT e.id FROM execution e JOIN delegated_execution_attempt a ON a.execution=e.id WHERE e.id=$1 AND e.status='running' AND NOT a.closed AND a.producer_kind=$2 AND ((a.producer_kind='worker' AND a.worker=e.worker) OR (a.producer_kind='workflow' AND a.worker IS NULL AND e.worker IS NULL)) FOR SHARE OF e,a")
+        .bind(source.execution).bind(kind).fetch_optional(conn).await?;
+    if open.is_none() {
+        return Err(denied());
+    }
+    Ok(())
+}
+
+fn selection_producer(selection: &ExecutionAuthoritySelection) -> Result<&'static str> {
+    let executable = selection
+        .executable_snapshot
+        .as_ref()
+        .and_then(|value| value.get("executable"))
+        .ok_or_else(denied)?;
+    let action = executable.get("action").ok_or_else(denied)?;
+    let binding = action.get("workflow_def").ok_or_else(denied)?;
+    let definition = executable.get("workflow_definition").ok_or_else(denied)?;
+    Ok(if !binding.is_null() || !definition.is_null() {
+        "workflow"
+    } else {
+        "worker"
+    })
+}
+
 fn denied() -> Error {
     Error::PermissionDenied(
         "Delegated execution authority is unavailable, stale or inconsistent".into(),
