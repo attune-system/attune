@@ -74,3 +74,32 @@ effect from client acknowledgement. When a relay holds BEGIN's response, the
 startup guard can queue and flush rollback, making the backend idle. The caller
 must still return the exact recovery deadline error if acknowledgement never
 arrives. The test retains the held gate, absolute grace and durable quota checks.
+
+## Explicit HTTP publication broker prerequisites
+
+The `recorded_queue_execution_consumers_tests::collections::requested_publication`
+cases in `recorded_execution_events_tests` require run-owned PostgreSQL and
+RabbitMQ. Set `ATTUNE_REQUESTED_PUBLICATION_MQ_URL` to the run's normal
+disposable vhost, and `ATTUNE_REQUESTED_PUBLICATION_FAILURE_MQ_URL` to a
+**separate empty** disposable vhost on the owned broker. Do not initialize common
+topology in the failure vhost or point either variable at a developer/service
+broker. The fixture initializes topology only in the normal vhost.
+
+Envelope publication selects its exchange from the message type, and a closed
+connection can reconnect successfully. The failure case therefore uses the
+missing execution exchange in the empty vhost to test a real publish error;
+both human and recorded callers must return an error and leave zero durable
+reschedule marks. The test does not disable recovery or enlarge deadlines.
+
+After provisioning these prerequisites, run all four explicitly:
+
+```bash
+ATTUNE_TEST_RUN_ID=requestpub1 \
+  cargo test --locked -p attune-api --test recorded_execution_events_tests \
+  recorded_queue_execution_consumers_tests::collections::requested_publication:: \
+  -- --ignored --nocapture --test-threads=4
+```
+
+Await fixture teardown and verify removal of both owned vhosts or the owning
+disposable broker and database. Default-suite ignored counts do not certify
+these four cases; record their explicit invocation separately.

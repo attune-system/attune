@@ -1,7 +1,7 @@
 # Database transaction reuse remediation
 
 Date: 2026-11-06; updated 2026-11-07
-Status: implementation and affected local validation complete; required CI/review pending
+Status: main integrated; affected validation complete; required final-head CI/review pending
 
 Attune must prevent cancelled transaction startup from leaking transaction
 ownership and independently reject dirty or uncertain sessions at pool reuse.
@@ -227,137 +227,120 @@ Validation: commands/results, tested revision and uncommitted changes, scope
 Gaps: remaining implementation, unavailable evidence, unrun/failed checks, CI
 ```
 
-## Implementation completion and validation (2026-11-07)
+## Main integration and validation (2026-11-07)
 
-Status: work in progress until required CI and review complete. PR:
-<https://github.com/attune-system/attune/pull/28>, branch `t3/cd751dc2`, based on
-`feat/mcp-access-policies` at `880b1b2a138a335eb549c08452f0d3440de68d41`.
-The user authorized implementation, commits, pushes and PR updates. Merging,
-deployment, releases and live mutations remain unauthorized.
+Status: work in progress until required CI/review on the final main-integrated head pass.
 
-The coordinator remained local. All source edits, compilation, tests and
-disposable services ran over SSH on `192.168.1.38` in
-`/home/david/attune-transaction-remote-5VcMrDI8/source`. This is a plain source
-snapshot, not a Git checkout. Finished source and sanitized evidence were
-synchronized to `/home/david/.t3/worktrees/attune/t3-cd751dc2` without target
-directories, dependency caches, credentials or database state.
+The PR targets **main**. A normal merge integrated main
+`d9da94122ff6fab725c212ac81a6a965a3bd2dbd` into the existing branch at
+`59912e63c17229fcc2f582ecdb1315d7f948f78e`, preserving main's version **0.10.3**.
+The four MCP conflicts were resolved by retaining main's complete latest files;
+their contents match main exactly. This preserves the tool-list policy refactor.
+No force push, additional PR, merge into main, deployment or live mutation was used.
 
-### Completed behavior
+Semantic review retained main's execution worker-transition guards, ad hoc/queue
+admission, retry recovery, supervisor cancellation-safe leader session, log
+wakeups/worker lifecycle changes and runner retention profiles. The remediation
+still uses tracked execution transactions, leases spanning scheduler lock
+acknowledgement through post-commit publication/unlock, and independent vendored
+driver clean-session checks. It retains owning-frame prospective CONTROL
+witnesses, bounded/deduplicated audit retries and failure-aware shutdown/flush,
+schema-admitted optional alerts and bounded persistent body discovery.
 
-- The vendored driver cleans up interrupted ordinary/custom BEGIN independently
-  of depth and quarantines uncertain nested startup/completion without adopting
-  or rolling back another caller's transaction. Pool checks after draining and
-  hooks independently require confirmed clean state. Healthy reuse remains
-  supported. Both provenance notes describe the maintained patch.
-- Execution wrappers use tracked transactions. Analytics retains its snapshot
-  and source-lock contracts. All three native scheduler wrappers retain session
-  leases through lock acquisition, acknowledgement, commit, publication and
-  unlock. Tests gate actual PostgreSQL acknowledgement and broker confirmation.
-- Initial native cache activation now creates the authenticated frontier used by
-  subsequent checkpoints, before legacy locks. This narrowly fixes the two
-  broker completion failures reproduced on the isolated application baseline;
-  source selectors, authority checks and admission/parent lock order remain.
-- Same-advance task input carries opaque, owning-frame CONTROL receipts and
-  their original prospective result/wait/empty witnesses. It rejects foreign,
-  reopened and wrong-kind receipts. VALUE binding, graph limits and freshness
-  checks remain separate. No deadline or watchdog was increased.
-- Audit retries retain stable partitioned identities, bound queue/batch/retry
-  work, expose failure-aware flush and loss counts, and drain/join at shutdown.
-  Optional alert fields are omitted and admitted through the actual internal
-  schema repository.
-- Body discovery reserves bounded primary-key windows with persistent
-  fixed-high-water sweeps; final eligibility, pins, identity and transaction
-  checks remain at claim/deletion. The migration supports that sweep state.
-  No new index or speculative performance claim is made.
-- The cleanup acknowledgement regression now expects the startup guard's
-  queued rollback to reach PostgreSQL while BEGIN acknowledgement remains held.
-  It still requires the exact unacknowledged-rollback error, original absolute
-  grace, live held gate and unchanged durable counters. Backend idleness alone
-  is never accepted as recovery acknowledgement.
-- Optional serial E2E image builds use separate foreground Compose calls.
-  The build-job argument covers bootstrap and application Cargo commands in
-  all relevant Rust Dockerfiles; private handoff/evidence directories are
-  excluded from Docker contexts.
+All substantive source edits, compilation, tests and owned Docker services ran over SSH on
+192.168.1.38 in `/home/david/attune-transaction-remote-5VcMrDI8/source`.
+The coordinator stayed local. Local actions were Git integration/publication,
+source synchronization and evidence reading/recording in
+`/home/david/.t3/worktrees/attune/t3-cd751dc2`, branch `t3/cd751dc2`.
+The remote source is a plain snapshot, not a manufactured Git checkout.
 
-### Validation
+The validated source is merge 59912e63 plus the separately tested fixture-only
+correction (local commit 8e64442b); per-command hashes identify exact contents.
+Later documentation edits do not invalidate those code results.
 
-The final application code starts from `357dbd3f152ee6b98e417cdc62de38f020c901f8`
-plus the follow-up implementation diff. Each result has exact command, unique
-run identity, source-file SHA-256 manifests, executable SHA-256 where applicable,
-exit status, count and cleanup evidence under `.handoff/resume-evidence/`.
-The assigned review worktree receives a sanitized copy under
-`.scratch/transaction-remediation-5VcMrDI8/`. Git-less build metadata uses the
-passed base SHA; it is not a claim that the uncommitted source equals that base.
+The former head's 14 green checks used the old base and do not certify this
+merge. The results below are fresh merged-source runs, with unique identities,
+source SHA256 manifests and unchanged binary hashes. Test executables and
+compilation ran sequentially with modest Cargo jobs and four DB-test threads.
+Owned native database networks avoided published-port latency without changing
+receipt consent windows or watchdogs.
 
-All application integration binaries used the repository's normal test profile,
-ran sequentially and used four test threads. The same host-built binaries ran
-inside each owned database's Docker network with read-only host ABI libraries.
-This avoids Docker Desktop published-port latency; the unchanged 20-second
-single-child receipt window passes without enlarging it. Recovery tests retain
-their existing 120-second window. No source proof, watchdog or assertion was
-disabled to obtain these results.
+`npm run generate:api` and `npm run check:api` passed remotely. Exported
+OpenAPI and generated client versions match workspace 0.10.3; no artificial
+version bump was made. Seven actual MCP policy smoke tests passed.
+The explicitly enabled HTTP broker suite exposed a fixture fault: a closed
+connection is recoverable, so its old fault injection could succeed. The test
+now uses a separate owned empty vhost with no declared execution exchange and still requires an HTTP server
+error and zero durable reschedule marks for both caller types. The failed diagnostics ne480e1db3c2f4d5 (recoverable closure) and
+n73ca1f2966d0492 (configuration exchange ignored by envelope routing) are
+retained as failures, never counted as passes.
 
-| Coverage | PostgreSQL 16.14 | PostgreSQL 18.6 |
+### Fresh integrated results
+
+| Suite / invocation | Result | Run ID |
 | --- | --- | --- |
-| Standalone driver session regressions | 19 passed | 19 passed |
-| Executor default library | 302 passed; 16 explicit prerequisite cases run below | same |
-| Actual checkpoint cancellation wrappers, each lock and post-commit modes | 3 passed | 3 passed |
-| Broker cache ordering/completion/replay | 6 passed | 6 passed |
-| Receipt-deadline commit/delivery/recovery suite | 6 passed | 6 passed |
-| Service-creation prerequisite case | 1 passed | 1 passed |
-| Runtime authority repository, including 21 native-wait and 14 native-cache cases | 269 passed | 269 passed |
-| Audit resilience, final batch ceiling | 5 passed | 5 passed |
-| Analytics / session leases / execution repository | 12 / 3 / 27 passed | 12 / 3 / 27 passed |
-| Actual event-schema binding / storage maintenance | 4 / 30 passed | 4 / 30 passed |
-| Dashboard API, including cross-request cancellation | 19 passed; 1 deferred | same |
-| Supervisor with Python cross-process fixture prerequisite | 53 passed | 53 passed |
-| Cache generation cleanup acknowledgement suite | 14 passed | 14 passed |
+| integrated-cli-policy | 7 passed; 0 failed; 0 ignored | z6e365d41c9f14d8 |
+| integrated-driver | 19 passed; 0 failed; 0 ignored | za8d3a86f2d224b4 |
+| integrated-pg16-analytics_repository_tests | 12 passed; 0 failed; 0 ignored | nf9d406282a4b48f |
+| integrated-pg16-audit_writer_resilience_tests | 5 passed; 0 failed; 0 ignored | n6562e47a4dca451 |
+| integrated-pg16-broker_cache_ | 6 passed; 0 failed; 0 ignored | ncd1f7428730c42d |
+| integrated-pg16-cache_generation_partition_tests | 14 passed; 0 failed; 0 ignored | nd4b57f05246f469 |
+| integrated-pg16-checkpoint_cancellation | 3 passed; 0 failed; 0 ignored | n10171d28a3514ab |
+| integrated-pg16-dashboard_acceptance_tests | 19 passed; 0 failed; 1 ignored | na1ffdf2b359347f |
+| integrated-pg16-event_schema_binding_tests | 4 passed; 0 failed; 0 ignored | n4f96c2e0ce504db |
+| integrated-pg16-execution_repository_tests | 27 passed; 0 failed; 0 ignored | n8bac32216a24426 |
+| integrated-pg16-executor-default | 313 passed; 0 failed; 16 ignored | n7771d5c791ee418 |
+| integrated-pg16-runtime_authority_repository_tests | 271 passed; 0 failed; 0 ignored | n6833d431811442f |
+| integrated-pg16-scheduler | 6 passed; 0 failed; 0 ignored | na57739e0de054c3 |
+| integrated-pg16-service | 1 passed; 0 failed; 0 ignored | n6246939b6be642b |
+| integrated-pg16-session_lease_tests | 3 passed; 0 failed; 0 ignored | n781171eac0ab4cf |
+| integrated-pg16-storage_maintenance_repository_tests | 30 passed; 0 failed; 0 ignored | n5c53ecbc3cfb4a1 |
+| integrated-pg16-supervisor | 58 passed; 0 failed; 0 ignored | nb1d4bf9bff8a464 |
+| integrated-pg16-work_queue_repository_tests | 11 passed; 0 failed; 0 ignored | ncf591decb6fd42b |
+| integrated-pg16-worker_execution_transition_tests | 2 passed; 0 failed; 0 ignored | n57a3d00b30d1442 |
+| integrated-pg18-analytics_repository_tests | 12 passed; 0 failed; 0 ignored | n5a08b28d15c74c4 |
+| integrated-pg18-audit_writer_resilience_tests | 5 passed; 0 failed; 0 ignored | nc48183351803495 |
+| integrated-pg18-broker_cache_ | 6 passed; 0 failed; 0 ignored | nf605d29d9ecc466 |
+| integrated-pg18-cache_generation_partition_tests | 14 passed; 0 failed; 0 ignored | nb4049d3b383147d |
+| integrated-pg18-checkpoint_cancellation | 3 passed; 0 failed; 0 ignored | n6d28703a6d75424 |
+| integrated-pg18-dashboard_acceptance_tests | 19 passed; 0 failed; 1 ignored | nabce644ca816466 |
+| integrated-pg18-event_schema_binding_tests | 4 passed; 0 failed; 0 ignored | n9f09dec480ea406 |
+| integrated-pg18-execution_log_stream_admission_api_tests0 | 8 passed; 0 failed; 0 ignored | nbf63cf16dd004c3 |
+| integrated-pg18-execution_repository_tests | 27 passed; 0 failed; 0 ignored | n751bb8b73d2e4f5 |
+| integrated-pg18-executor-default | 313 passed; 0 failed; 16 ignored | n0029527b92fb4b3 |
+| integrated-pg18-recorded-consumers-final | 46 passed; 0 failed; 4 ignored | n7b6b9a782c84416 |
+| integrated-pg18-recorded_execution_events_tests0 | 46 passed; 0 failed; 4 ignored | n37bd97ce12c94ed |
+| integrated-pg18-recorded_execution_events_tests1 | 12 passed; 0 failed; 0 ignored | n8d647dd7328c43f |
+| integrated-pg18-requested-publication-broker | 4 passed; 0 failed; 0 ignored | n9b5e596cdc8d48c |
+| integrated-pg18-runtime_authority_repository_tests | 271 passed; 0 failed; 0 ignored | n87cf0b6f542a463 |
+| integrated-pg18-scheduler | 6 passed; 0 failed; 0 ignored | nebfee97e3e924b0 |
+| integrated-pg18-service | 1 passed; 0 failed; 0 ignored | nb4f66fddcdca4d4 |
+| integrated-pg18-session_lease_tests | 3 passed; 0 failed; 0 ignored | naf2128db3054400 |
+| integrated-pg18-storage_maintenance_repository_tests | 30 passed; 0 failed; 0 ignored | ne71ed35d4d7f484 |
+| integrated-pg18-supervisor | 58 passed; 0 failed; 0 ignored | n0e72eb52791148d |
+| integrated-pg18-work_queue_api_tests0 | 10 passed; 0 failed; 0 ignored | n25557b907d9940c |
+| integrated-pg18-work_queue_repository_tests | 11 passed; 0 failed; 0 ignored | nc6553d3349f741a |
+| integrated-pg18-worker-restoration | 7 passed; 0 failed; 0 ignored | ndc5ce0648aab497 |
+| integrated-pg18-worker-streams-final | 12 passed; 0 failed; 0 ignored | n641ced1741ff456 |
+| integrated-pg18-worker_execution_transition_tests | 2 passed; 0 failed; 0 ignored | n6afa9e576a844f5 |
 
-All 318 distinct executor library cases ran on each version: the 16 ignored by
-the default invocation were explicitly run with owned broker prerequisites.
-Pure unit checks additionally passed inherited input (16), DB options (7), and
-audit emitter (5). Fresh migrations passed on both versions.
-`cargo sqlx prepare --workspace -- --all-targets` passed against owned
-PostgreSQL 18 and reported no compile-time queries requiring metadata artifacts.
+Full-stack tier 1, SSE, worker native-completion and log-stream-discovery selection: 42 passed; exact pytest summary and cleanup are retained with z1fe8a92a9d81422.
 
-Final workspace `cargo check --locked --workspace --all-targets`, Clippy with
-`-D warnings`, workspace formatting, standalone formatting and all six maintained
-driver/core file format checks passed. No new Rust warnings remain.
-The owned full-stack command `ATTUNE_E2E_SERIAL_BUILD=1 ATTUNE_E2E_CARGO_BUILD_JOBS=1 bash scripts/run-integration-tests.sh --tier 1 tests/e2e/api/test_sse_execution_stream.py -x` passed all 36 selected cases (tier 1 plus five SSE cases), with zero failures or skips on PostgreSQL 18.6. Run `zb58e461325c847a` took 7,148.55 seconds including serial release builds; pytest took 206.53 seconds. Bootstrap revocation completed and independent verification found zero remaining project containers, networks or volumes.
+Workspace check, workspace Clippy with `-D warnings`, workspace/standalone/vendor
+formatting and owned PostgreSQL-backed SQLx preparation are recorded in the
+command manifest. Fresh migrations passed on PostgreSQL 16.14 and 18.6.
+No new Rust warnings remain. API generation/check/version validation completed.
 
-Earlier deterministic baseline driver failures with a passing healthy control,
-and dense-pin plans on both versions, remain valid evidence: the driver and
-discovery code did not change during these follow-ups. The dense-pin workload
-has 4,097 bodies, 4,096 pinned and one eligible tail, processed in 17 materialized
-windows of at most 256 candidates. Repository tests additionally prove revisits
-of newly eligible older rows under continuous insertion. An isolated,
-separately-built application baseline reproduced exactly the two broker failures;
-the earlier attempt that reused an implementation target is excluded.
+Original driver defect/healthy-control baselines and dense-pin query plans are
+historical evidence, reused only for unchanged driver/discovery source. They are
+not substitutes for these merged-source consumer runs. Discovery's bounded
+primary-key windows retain final eligibility/pin/identity checks and eventual
+progress; no speculative index claim is made.
 
-The three scheduler fixture failures were resolved by using an actually
-responded registered-wait fixture and TCP_NODELAY on frame relays, together with
-the initial cache activation correction above. Receipt tests additionally needed
-the original opaque prospective witnesses and a low-latency owned network.
-Failed diagnostics, interrupted build attempts and the initial supervisor run
-without its Python prerequisite remain recorded as failures, not passes.
-
-### Gaps and delivery gate
-
-Required CI on the new PR head and review remain pending; the parent coordinator
-owns that gate. The former head's CI failure in cleanup acknowledgement was
-corrected and its full 14-case target rerun on both versions. Local scoped results
-do not replace the complete required CI suite.
-
-The existing dashboard timezone case is a setup-only placeholder for an
-unimplemented bucketing feature, so it remains deferred and is not counted as a
-pass. The six policy-deferred deployment cases retain their documented
-prerequisites/scope in `docs/testing/supported-deployment-scope.md`; they are
-never passing release evidence. The complete workspace test suite was not run
-locally; affected repositories, API, scheduler, audit, retention, drivers and
-the selected cross-service smoke were exercised explicitly.
-
-Owned fixture and Compose project containers, networks and anonymous volumes
-were removed and absence verified. Warm target/BuildKit caches were retained.
-No local test services or unowned remote databases were touched. The original
-incident's precise leaking request and live data loss remain unproven; this
-validation does not claim live incident forensics.
+Gaps: required CI and review on the pushed main-integrated head are the parent
+coordinator's gate. The complete workspace test suite was not run locally.
+The existing dashboard timezone setup-only placeholder and six documented
+policy-deferred deployment cases are excluded from passing coverage. No known
+task regression remains in the completed selected checks. Owned fixtures and
+Compose project resources were removed and absence verified; warm caches remain.
+The original leaking request and live data loss remain unproven.
