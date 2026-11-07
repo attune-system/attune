@@ -77,7 +77,7 @@ pub async fn handle(
             page_size,
         } => {
             let config = CliConfig::load_with_profile(profile.as_deref())?;
-            let mut client = ApiClient::from_config(&config, api_url);
+            let mut client = ApiClient::from_config(&config, api_url)?;
             output::print_output(
                 &input_approval::discover(&mut client, &pack_ref, policy_revision, page, page_size)
                     .await?,
@@ -102,7 +102,7 @@ pub async fn handle(
                 );
             }
             let config = CliConfig::load_with_profile(profile.as_deref())?;
-            let mut client = ApiClient::from_config(&config, api_url);
+            let mut client = ApiClient::from_config(&config, api_url)?;
             output::print_output(
                 &input_approval::issue(&mut client, &pack_ref, &body).await?,
                 format,
@@ -125,7 +125,7 @@ pub async fn handle(
                 bail!("Revocation stops input consent. Pass --yes or preview with --dry-run");
             }
             let config = CliConfig::load_with_profile(profile.as_deref())?;
-            let mut client = ApiClient::from_config(&config, api_url);
+            let mut client = ApiClient::from_config(&config, api_url)?;
             output::print_output(
                 &input_approval::revoke(&mut client, &pack_ref, id, yes).await?,
                 format,
@@ -134,14 +134,14 @@ pub async fn handle(
         InputApprovalCommands::List { pack_ref } => {
             input_approval::collection_path(&pack_ref)?;
             let config = CliConfig::load_with_profile(profile.as_deref())?;
-            let mut client = ApiClient::from_config(&config, api_url);
+            let mut client = ApiClient::from_config(&config, api_url)?;
             let records = input_approval::list(&mut client, &pack_ref).await?;
             output::print_output(&records, format)
         }
         InputApprovalCommands::Show { pack_ref, id } => {
             input_approval::record_path(&pack_ref, id)?;
             let config = CliConfig::load_with_profile(profile.as_deref())?;
-            let mut client = ApiClient::from_config(&config, api_url);
+            let mut client = ApiClient::from_config(&config, api_url)?;
             output::print_output(
                 &input_approval::get(&mut client, &pack_ref, id).await?,
                 format,

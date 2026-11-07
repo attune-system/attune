@@ -16,7 +16,7 @@ pub struct ApiClient {
     base_url: String,
     auth_token: Option<String>,
     refresh_token: Option<String>,
-    config_path: Option<PathBuf>,
+    credential_origin: Option<(PathBuf, String)>,
 }
 
 /// Standard API response wrapper
@@ -299,31 +299,55 @@ impl ApiClient {
         config: &CliConfig,
         api_url_override: &Option<String>,
         timeout: Duration,
-    ) -> Self {
-        let mut client = Self::from_config(config, api_url_override);
+    ) -> Result<Self> {
+        let mut client = Self::from_config(config, api_url_override)?;
         client.client = build_http_client(timeout);
-        client
+        Ok(client)
     }
 
-    /// Create a new API client from configuration
-    pub fn from_config(config: &CliConfig, api_url_override: &Option<String>) -> Self {
-        let base_url = config.effective_api_url(api_url_override);
-        let auth_token = env::var("ATTUNE_API_TOKEN")
+    /// Resolve an explicit runtime pair or unlock one persisted profile. Tokens
+    /// from different origins must never be combined.
+    pub fn from_config(config: &CliConfig, api_url_override: &Option<String>) -> Result<Self> {
+        let base_url = crate::credentials::endpoint(&config.effective_api_url(api_url_override))?;
+        let explicit_access = env::var("ATTUNE_API_TOKEN")
             .ok()
-            .or_else(|| env::var("ATTUNE_AUTH_TOKEN").ok())
-            .or_else(|| config.auth_token().ok().flatten());
-        let refresh_token = env::var("ATTUNE_REFRESH_TOKEN")
-            .ok()
-            .or_else(|| config.refresh_token().ok().flatten());
-        let config_path = CliConfig::config_path().ok();
-
-        Self {
+            .or_else(|| env::var("ATTUNE_AUTH_TOKEN").ok());
+        let explicit_refresh = env::var("ATTUNE_REFRESH_TOKEN").ok();
+        let runtime =
+            explicit_access.is_some() || explicit_refresh.is_some() || config.ephemeral_auth;
+        let tokens = if config.ephemeral_auth {
+            // MCP has already resolved argument/environment precedence, including
+            // execution tokens that must never acquire a refresh token.
+            let profile = config.current_profile()?;
+            crate::credentials::Tokens {
+                access_token: profile.auth_token.clone(),
+                refresh_token: profile.refresh_token.clone(),
+            }
+        } else if explicit_access.is_some() || explicit_refresh.is_some() {
+            crate::credentials::Tokens {
+                access_token: explicit_access,
+                refresh_token: explicit_refresh,
+            }
+        } else if crate::credentials::endpoint(&config.current_profile()?.api_url)? == base_url {
+            config.tokens()?
+        } else {
+            if config.current_profile()?.has_credentials() {
+                anyhow::bail!("Saved credentials belong to a different endpoint; supply credentials or log in to the new endpoint");
+            }
+            crate::credentials::Tokens::default()
+        };
+        let credential_origin = if !runtime && config.is_persisted() {
+            Some((config.path()?, config.current_profile.clone()))
+        } else {
+            None
+        };
+        Ok(Self {
             client: build_http_client(Duration::from_secs(300)),
             base_url,
-            auth_token,
-            refresh_token,
-            config_path,
-        }
+            auth_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            credential_origin,
+        })
     }
 
     /// Create a new API client
@@ -343,17 +367,20 @@ impl ApiClient {
             base_url,
             auth_token,
             refresh_token: None,
-            config_path: None,
+            credential_origin: None,
         }
     }
 
     /// Set the authentication token
     pub fn set_auth_token(&mut self, token: String) {
+        self.credential_origin = None;
+        self.refresh_token = None;
         self.auth_token = Some(token);
     }
 
     /// Replace both auth and refresh tokens (e.g. after re-login).
     pub fn set_tokens(&mut self, access_token: String, refresh_token: String) {
+        self.credential_origin = None;
         self.auth_token = Some(access_token);
         self.refresh_token = Some(refresh_token);
     }
@@ -368,7 +395,31 @@ impl ApiClient {
     ///
     /// Returns `Ok(true)` if refresh succeeded, `Ok(false)` if no refresh token
     /// is available or the server rejected it.
-    async fn refresh_auth_token(&mut self) -> Result<bool> {
+    pub async fn refresh_auth_token(&mut self) -> Result<bool> {
+        let mut persistence = None;
+        let _refresh_lock = if let Some((path, profile_name)) = self.credential_origin.clone() {
+            let lock_path = crate::credentials::storage::refresh_path(&path, &profile_name);
+            let guard =
+                tokio::task::spawn_blocking(move || crate::credentials::storage::lock(&lock_path))
+                    .await??;
+            let mut latest = CliConfig::load_at(&path)?;
+            latest.select_profile(&profile_name)?;
+            if crate::credentials::endpoint(&latest.current_profile()?.api_url)? != self.base_url {
+                anyhow::bail!("Profile endpoint changed; log in again");
+            }
+            let tokens = latest.tokens()?;
+            if tokens.access_token != self.auth_token || tokens.refresh_token != self.refresh_token
+            {
+                self.auth_token = tokens.access_token;
+                self.refresh_token = tokens.refresh_token;
+                // Another process refreshed (or logged out) while we waited.
+                return Ok(self.auth_token.is_some());
+            }
+            persistence = Some(latest);
+            Some(guard)
+        } else {
+            None
+        };
         let refresh_token = match &self.refresh_token {
             Some(token) => token.clone(),
             None => return Ok(false),
@@ -411,19 +462,18 @@ impl ApiClient {
             request_id.as_deref(),
         )?;
 
-        // Update in-memory tokens
-        self.auth_token = Some(api_response.data.access_token.clone());
-        self.refresh_token = Some(api_response.data.refresh_token.clone());
-
-        // Persist to config file
-        if self.config_path.is_some() {
-            if let Ok(mut config) = CliConfig::load() {
-                let _ = config.set_auth(
-                    api_response.data.access_token,
-                    api_response.data.refresh_token,
-                );
-            }
+        if let Some(mut config) = persistence {
+            config
+                .set_auth(
+                    api_response.data.access_token.clone(),
+                    api_response.data.refresh_token.clone(),
+                )
+                .context(
+                    "Token refresh succeeded but credentials could not be saved; log in again",
+                )?;
         }
+        self.auth_token = Some(api_response.data.access_token);
+        self.refresh_token = Some(api_response.data.refresh_token);
 
         Ok(true)
     }
@@ -1182,5 +1232,82 @@ mod tests {
 
         assert_eq!(response["generation_id"], 7);
         assert_eq!(response["chunk_index"], 0);
+    }
+}
+
+#[cfg(test)]
+mod credential_refresh_tests {
+    use super::*;
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    #[tokio::test]
+    async fn refresh_reports_persistence_failure_and_keeps_new_tokens_out_of_memory() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let mut config = CliConfig::load_at(&path).unwrap();
+        config.current_profile_mut().unwrap().api_url = server.uri();
+        config
+            .set_auth("old-access".into(), "old-refresh".into())
+            .unwrap();
+        let obstruct = path.clone();
+        Mock::given(method("POST")).and(wiremock::matchers::path("/auth/refresh"))
+            .respond_with(move |_: &wiremock::Request| {
+                // Own this path; invalidate the persistence target after the
+                // server receives the request, without timing-based coordination.
+                std::fs::remove_file(&obstruct).unwrap();
+                std::fs::create_dir(&obstruct).unwrap();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":{"access_token":"new-access","refresh_token":"new-refresh"}}))
+            }).expect(1).mount(&server).await;
+        let mut client = ApiClient {
+            client: build_http_client(Duration::from_secs(5)),
+            base_url: server.uri(),
+            auth_token: Some("old-access".into()),
+            refresh_token: Some("old-refresh".into()),
+            credential_origin: Some((path, "default".into())),
+        };
+        let error = client.refresh_auth_token().await.unwrap_err();
+        assert!(error.to_string().contains("could not be saved"));
+        assert_eq!(client.auth_token.as_deref(), Some("old-access"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_clients_refresh_once_and_preserve_the_active_profile() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let mut config = CliConfig::load_at(&config_path).unwrap();
+        let other = config.current_profile().unwrap().clone();
+        config.set_profile("other".into(), other).unwrap();
+        config.select_profile("other").unwrap();
+        config.current_profile_mut().unwrap().api_url = server.uri();
+        config
+            .set_auth("old-access".into(), "old-refresh".into())
+            .unwrap();
+        Mock::given(method("POST")).and(path("/auth/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":{"access_token":"new-access","refresh_token":"new-refresh"}})))
+            .expect(1).mount(&server).await;
+        let make = || ApiClient {
+            client: build_http_client(Duration::from_secs(5)),
+            base_url: server.uri(),
+            auth_token: Some("old-access".into()),
+            refresh_token: Some("old-refresh".into()),
+            credential_origin: Some((config_path.clone(), "other".into())),
+        };
+        let mut a = make();
+        let mut b = make();
+        let (a_result, b_result) = tokio::join!(a.refresh_auth_token(), b.refresh_auth_token());
+        assert!(a_result.unwrap());
+        assert!(b_result.unwrap());
+        assert_eq!(a.auth_token.as_deref(), Some("new-access"));
+        assert_eq!(b.auth_token.as_deref(), Some("new-access"));
+        let mut loaded = CliConfig::load_at(&config_path).unwrap();
+        assert_eq!(loaded.current_profile, "default");
+        assert!(loaded.tokens().unwrap().access_token.is_none());
+        loaded.select_profile("other").unwrap();
+        assert_eq!(loaded.auth_token().unwrap().as_deref(), Some("new-access"));
     }
 }

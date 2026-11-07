@@ -56,14 +56,14 @@ pub enum ConfigCommands {
 }
 
 pub async fn handle_config_command(
-    _profile: &Option<String>,
+    profile: &Option<String>,
     command: ConfigCommands,
     output_format: OutputFormat,
 ) -> Result<()> {
     match command {
-        ConfigCommands::List => handle_list(output_format).await,
-        ConfigCommands::Get { key } => handle_get(key, output_format).await,
-        ConfigCommands::Set { key, value } => handle_set(key, value, output_format).await,
+        ConfigCommands::List => handle_list(profile, output_format).await,
+        ConfigCommands::Get { key } => handle_get(profile, key, output_format).await,
+        ConfigCommands::Set { key, value } => handle_set(profile, key, value, output_format).await,
         ConfigCommands::Path => handle_path(output_format).await,
         ConfigCommands::Profiles => handle_profiles(output_format).await,
         ConfigCommands::Current => handle_current(output_format).await,
@@ -78,8 +78,8 @@ pub async fn handle_config_command(
     }
 }
 
-async fn handle_list(output_format: OutputFormat) -> Result<()> {
-    let config = CliConfig::load()?; // Config commands always use default profile
+async fn handle_list(profile: &Option<String>, output_format: OutputFormat) -> Result<()> {
+    let config = CliConfig::load_with_profile(profile.as_deref())?; // Config commands always use default profile
     let all_config = config.list_all();
 
     match output_format {
@@ -104,8 +104,12 @@ async fn handle_list(output_format: OutputFormat) -> Result<()> {
     Ok(())
 }
 
-async fn handle_get(key: String, output_format: OutputFormat) -> Result<()> {
-    let config = CliConfig::load()?; // Config commands always use default profile
+async fn handle_get(
+    profile: &Option<String>,
+    key: String,
+    output_format: OutputFormat,
+) -> Result<()> {
+    let config = CliConfig::load_with_profile(profile.as_deref())?; // Config commands always use default profile
     let value = config.get_value(&key)?;
 
     match output_format {
@@ -136,7 +140,8 @@ async fn handle_profiles(output_format: OutputFormat) -> Result<()> {
                 .map(|name| {
                     serde_json::json!({
                         "name": name,
-                        "current": name == current
+                        "current": name == current,
+                        "credential_encryption": config.profiles[name].credential_encryption
                     })
                 })
                 .collect();
@@ -148,7 +153,8 @@ async fn handle_profiles(output_format: OutputFormat) -> Result<()> {
                 .map(|name| {
                     serde_json::json!({
                         "name": name,
-                        "current": name == current
+                        "current": name == current,
+                        "credential_encryption": config.profiles[name].credential_encryption
                     })
                 })
                 .collect();
@@ -157,10 +163,19 @@ async fn handle_profiles(output_format: OutputFormat) -> Result<()> {
         OutputFormat::Table => {
             output::print_section("Profiles");
             for name in profiles {
-                if name == *current {
-                    println!("  • {} (active)", name.bright_green().bold());
+                let protection = if config.profiles[&name].credential_encryption {
+                    "encrypted"
                 } else {
-                    println!("  • {}", name);
+                    "ENCRYPTION DISABLED: plaintext"
+                };
+                if name == *current {
+                    println!(
+                        "  • {} (active) [{}]",
+                        name.bright_green().bold(),
+                        protection
+                    );
+                } else {
+                    println!("  • {} [{}]", name, protection);
                 }
             }
         }
@@ -218,6 +233,9 @@ async fn handle_add_profile(
     let mut config = CliConfig::load()?;
 
     let profile = Profile {
+        credential_encryption: true,
+        credentials: None,
+        credentials_endpoint: None,
         api_url: api_url.clone(),
         auth_token: None,
         refresh_token: None,
@@ -275,29 +293,38 @@ async fn handle_show_profile(name: String, output_format: OutputFormat) -> Resul
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {
-            output::print_output(&profile, output_format)?;
+            output::print_output(&profile.redacted(), output_format)?;
         }
         OutputFormat::Table => {
             output::print_section(&format!("Profile: {}", name));
             let mut pairs = vec![
                 ("API URL", profile.api_url.clone()),
                 (
+                    "Credential Encryption",
+                    if profile.credential_encryption {
+                        "enabled"
+                    } else {
+                        "DISABLED: plaintext"
+                    }
+                    .to_owned(),
+                ),
+                (
                     "Auth Token",
-                    profile
-                        .auth_token
-                        .as_ref()
-                        .map(|_| "***")
-                        .unwrap_or("(not set)")
-                        .to_string(),
+                    (if profile.has_credentials() {
+                        "***"
+                    } else {
+                        "(not set)"
+                    })
+                    .to_string(),
                 ),
                 (
                     "Refresh Token",
-                    profile
-                        .refresh_token
-                        .as_ref()
-                        .map(|_| "***")
-                        .unwrap_or("(not set)")
-                        .to_string(),
+                    (if profile.has_credentials() {
+                        "***"
+                    } else {
+                        "(not set)"
+                    })
+                    .to_string(),
                 ),
             ];
 
@@ -312,9 +339,17 @@ async fn handle_show_profile(name: String, output_format: OutputFormat) -> Resul
     Ok(())
 }
 
-async fn handle_set(key: String, value: String, output_format: OutputFormat) -> Result<()> {
-    let mut config = CliConfig::load()?;
+async fn handle_set(
+    profile: &Option<String>,
+    key: String,
+    value: String,
+    output_format: OutputFormat,
+) -> Result<()> {
+    let mut config = CliConfig::load_with_profile(profile.as_deref())?;
     config.set_value(&key, value.clone())?;
+    if key == "credential_encryption" && value == "false" {
+        eprintln!("Credential encryption is DISABLED for this profile; tokens will be stored in plaintext with owner-only file access.");
+    }
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {

@@ -1409,7 +1409,7 @@ async fn handle_refresh(
 
 fn configured_client(profile: &Option<String>, api_url: &Option<String>) -> Result<ApiClient> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    Ok(ApiClient::from_config(&config, api_url))
+    ApiClient::from_config(&config, api_url)
 }
 
 fn namespace_base_path(namespace: &str) -> String {

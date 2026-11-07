@@ -354,6 +354,9 @@ CLI usage rules:
 - Prefer `pack upload` for local-to-Docker installs; `pack register` only works for API-visible paths.
 - `workflow upload` expects an action YAML with `workflow_file` pointing at the companion graph file.
 - `attune-mcp` reuses CLI auth/profile state.
+- Persist CLI/MCP credentials through the shared credential store; encryption is
+  enabled by default, with explicit per-profile plaintext opt-out. See
+  `docs/cli/cli-profiles.md#token-storage` for identifier binding and recovery.
 
 ## File Placement Conventions
 

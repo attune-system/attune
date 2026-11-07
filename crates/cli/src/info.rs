@@ -101,7 +101,8 @@ pub async fn handle(
         return Ok(());
     }
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config_with_timeout(&config, api_url, Duration::from_secs(10));
+    let mut client =
+        ApiClient::from_config_with_timeout(&config, api_url, Duration::from_secs(10))?;
     let report = get_info("attune", &config.current_profile, &mut client).await;
     match format {
         OutputFormat::Table => {

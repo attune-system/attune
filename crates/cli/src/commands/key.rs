@@ -337,7 +337,7 @@ async fn handle_list(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let mut query = url::form_urlencoded::Serializer::new(String::new());
     query.append_pair("page", &page.to_string());
@@ -393,7 +393,7 @@ async fn handle_show(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let path = format!("/keys/{}", urlencoding::encode(&key_ref));
     let key: KeyResponse = client.get(&path).await?;
@@ -488,7 +488,7 @@ async fn handle_create(
     validate_owner_type(&owner_type)?;
 
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let json_value = parse_value_as_json(&value);
 
@@ -565,7 +565,7 @@ async fn handle_update(
     }
 
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let json_value = value.map(|v| parse_value_as_json(&v));
 
@@ -624,7 +624,7 @@ async fn handle_delete(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     // Confirm deletion unless --yes is provided
     if !yes && matches!(output_format, OutputFormat::Table) {

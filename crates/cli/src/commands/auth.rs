@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use attune_common::device_auth::{
     DeviceAuthorizationResponse, DevicePollResponse, DeviceWaitReason,
 };
@@ -142,7 +142,9 @@ struct TokenLoginRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct LoginResponse {
+    #[serde(skip_serializing)]
     access_token: String,
+    #[serde(skip_serializing)]
     refresh_token: String,
     expires_in: i64,
 }
@@ -265,7 +267,7 @@ async fn handle_sso_login(
     no_browser: bool,
     output_format: OutputFormat,
 ) -> Result<()> {
-    let config = CliConfig::load()?;
+    let mut config = CliConfig::load()?;
     let target_profile_name = profile
         .cloned()
         .unwrap_or_else(|| config.current_profile.clone());
@@ -282,12 +284,15 @@ async fn handle_sso_login(
     if timeout == Some(0) {
         anyhow::bail!("--timeout must be greater than zero");
     }
+    let mut anonymous_config = config.clone();
+    anonymous_config.current_profile_mut()?.clear_credentials();
+    anonymous_config.ephemeral_auth = true;
     let client = ApiClient::from_config_with_timeout(
-        &config,
+        &anonymous_config,
         &Some(base_api_url.clone()),
         // A successful poll can perform four sequential ten-second provider requests.
         Duration::from_secs(60),
-    );
+    )?;
     let authorization: DeviceAuthorizationResponse = client
         .post_anonymous("/auth/oidc/device/start", &serde_json::json!({}))
         .await?;
@@ -319,12 +324,15 @@ async fn handle_sso_login(
         _ = tokio::signal::ctrl_c() => anyhow::bail!("SSO device login cancelled"),
     };
 
-    // Persist tokens.
-    let mut config = CliConfig::load()?;
+    // Keep the pre-authentication snapshot so a concurrent profile change or
+    // deletion cannot rebind these tokens or recreate a deleted profile.
     let p = config
         .profiles
         .entry(target_profile_name.clone())
         .or_insert_with(|| crate::config::Profile {
+            credential_encryption: true,
+            credentials: None,
+            credentials_endpoint: None,
             api_url: base_api_url.clone(),
             auth_token: None,
             refresh_token: None,
@@ -334,6 +342,7 @@ async fn handle_sso_login(
             username: None,
         });
     p.api_url = base_api_url;
+    p.clear_credentials();
     p.auth_token = Some(tokens.access_token.clone());
     p.refresh_token = Some(tokens.refresh_token.clone());
     p.auth_method = Some("sso".to_string());
@@ -344,8 +353,8 @@ async fn handle_sso_login(
         OutputFormat::Json | OutputFormat::Yaml => {
             output::print_output(
                 &serde_json::json!({
-                    "access_token": tokens.access_token,
-                    "refresh_token": tokens.refresh_token,
+                    "access_token": "***",
+                    "refresh_token": "***",
                     "expires_in": tokens.expires_in,
                 }),
                 output_format,
@@ -498,6 +507,9 @@ async fn handle_login(
         config.set_profile(
             target_profile_name.clone(),
             Profile {
+                credential_encryption: true,
+                credentials: None,
+                credentials_endpoint: None,
                 api_url: url,
                 auth_token: None,
                 refresh_token: None,
@@ -509,12 +521,15 @@ async fn handle_login(
         )?;
     } else if let Some(url) = api_url {
         if let Some(p) = config.profiles.get_mut(&target_profile_name) {
+            p.clear_credentials();
             p.api_url = url.clone();
         }
         config.save()?;
     }
 
-    let mut login_config = CliConfig::load()?;
+    // The persistence owner retains the snapshot from before authentication.
+    // Only this clone is cleared for the anonymous login request.
+    let mut login_config = config.clone();
     login_config.current_profile = target_profile_name.clone();
 
     let password = match password {
@@ -524,7 +539,9 @@ async fn handle_login(
             .interact()?,
     };
 
-    let mut client = ApiClient::from_config(&login_config, api_url);
+    login_config.current_profile_mut()?.clear_credentials();
+    login_config.ephemeral_auth = true;
+    let mut client = ApiClient::from_config(&login_config, api_url)?;
 
     // Auto-detect: query /auth/settings to determine whether to use local or LDAP login.
     let login_path = match client.get::<serde_json::Value>("/auth/settings").await {
@@ -561,19 +578,21 @@ async fn handle_login(
 
     let response: LoginResponse = client.post(login_path, &login_req).await?;
 
-    let mut config = CliConfig::load()?;
-    if let Some(p) = config.profiles.get_mut(&target_profile_name) {
-        p.auth_token = Some(response.access_token.clone());
-        p.refresh_token = Some(response.refresh_token.clone());
-        p.auth_method = Some(auth_method.to_string());
-        p.username = Some(username);
-        config.save()?;
-    } else {
-        config.set_auth(
-            response.access_token.clone(),
-            response.refresh_token.clone(),
-        )?;
+    let p = config
+        .profiles
+        .get_mut(&target_profile_name)
+        .context("Login target profile is missing; retry login")?;
+    // Preserve the authenticated endpoint; save rejects a changed/deleted target
+    // against its original snapshot instead of falling back to the active profile.
+    if crate::credentials::endpoint(&p.api_url)? != client.base_url() {
+        anyhow::bail!("Login endpoint changed; retry login");
     }
+    p.clear_credentials();
+    p.auth_token = Some(response.access_token.clone());
+    p.refresh_token = Some(response.refresh_token.clone());
+    p.auth_method = Some(auth_method.to_string());
+    p.username = Some(username);
+    config.save()?;
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {
@@ -613,6 +632,9 @@ async fn handle_token_login(
         config.set_profile(
             target_profile_name.clone(),
             Profile {
+                credential_encryption: true,
+                credentials: None,
+                credentials_endpoint: None,
                 api_url: url,
                 auth_token: None,
                 refresh_token: None,
@@ -624,12 +646,15 @@ async fn handle_token_login(
         )?;
     } else if let Some(url) = api_url {
         if let Some(p) = config.profiles.get_mut(&target_profile_name) {
+            p.clear_credentials();
             p.api_url = url.clone();
         }
         config.save()?;
     }
 
-    let mut login_config = CliConfig::load()?;
+    // The persistence owner retains the snapshot from before authentication.
+    // Only this clone is cleared for the anonymous login request.
+    let mut login_config = config.clone();
     login_config.current_profile = target_profile_name.clone();
 
     let token = match token {
@@ -639,24 +664,28 @@ async fn handle_token_login(
             .interact()?,
     };
 
-    let mut client = ApiClient::from_config(&login_config, api_url);
+    login_config.current_profile_mut()?.clear_credentials();
+    login_config.ephemeral_auth = true;
+    let mut client = ApiClient::from_config(&login_config, api_url)?;
     let response: LoginResponse = client
         .post("/auth/token-login", &TokenLoginRequest { token })
         .await?;
 
-    let mut config = CliConfig::load()?;
-    if let Some(p) = config.profiles.get_mut(&target_profile_name) {
-        p.auth_token = Some(response.access_token.clone());
-        p.refresh_token = Some(response.refresh_token.clone());
-        p.auth_method = Some("token".to_string());
-        p.username = None;
-        config.save()?;
-    } else {
-        config.set_auth(
-            response.access_token.clone(),
-            response.refresh_token.clone(),
-        )?;
+    let p = config
+        .profiles
+        .get_mut(&target_profile_name)
+        .context("Login target profile is missing; retry login")?;
+    // Preserve the authenticated endpoint; save rejects a changed/deleted target
+    // against its original snapshot instead of falling back to the active profile.
+    if crate::credentials::endpoint(&p.api_url)? != client.base_url() {
+        anyhow::bail!("Login endpoint changed; retry login");
     }
+    p.clear_credentials();
+    p.auth_token = Some(response.access_token.clone());
+    p.refresh_token = Some(response.refresh_token.clone());
+    p.auth_method = Some("token".to_string());
+    p.username = None;
+    config.save()?;
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {
@@ -701,7 +730,7 @@ async fn handle_integration_token_command(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     match command {
         IntegrationTokenCommands::Create {
@@ -849,11 +878,10 @@ async fn handle_whoami(
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
 
-    if config.auth_token().ok().flatten().is_none() {
+    let mut client = ApiClient::from_config(&config, api_url)?;
+    if client.auth_token().is_none() {
         anyhow::bail!("Not logged in. Use 'attune auth login' to authenticate.");
     }
-
-    let mut client = ApiClient::from_config(&config, api_url);
 
     let identity: Identity = client.get("/auth/me").await?;
 
@@ -885,50 +913,24 @@ async fn handle_refresh(
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
 
-    // Check if we have a refresh token
-    let refresh_token = config
-        .refresh_token()
-        .ok()
-        .flatten()
-        .ok_or_else(|| anyhow::anyhow!("No refresh token found. Please log in again."))?;
-
-    let mut client = ApiClient::from_config(&config, api_url);
-
-    #[derive(Serialize)]
-    struct RefreshRequest {
-        refresh_token: String,
-    }
-
-    // Attempt the refresh
-    let refresh_result: Result<LoginResponse> = client
-        .post("/auth/refresh", &RefreshRequest { refresh_token })
-        .await;
-
-    match refresh_result {
-        Ok(response) => {
-            // Save new tokens to config
-            let mut config = CliConfig::load()?;
-            config.set_auth(
-                response.access_token.clone(),
-                response.refresh_token.clone(),
-            )?;
-
+    let mut client = ApiClient::from_config(&config, api_url)?;
+    match client.refresh_auth_token().await? {
+        true => {
             match output_format {
                 OutputFormat::Json | OutputFormat::Yaml => {
-                    output::print_output(&response, output_format)?;
+                    output::print_output(
+                        &serde_json::json!({"message": "Token refreshed successfully"}),
+                        output_format,
+                    )?;
                 }
                 OutputFormat::Table => {
                     output::print_success("Token refreshed successfully");
-                    output::print_info(&format!(
-                        "New token expires in {} seconds",
-                        response.expires_in
-                    ));
                 }
             }
 
             Ok(())
         }
-        Err(_) => {
+        false => {
             // Refresh failed (likely expired) — re-initiate authentication
             let current_profile = config.current_profile()?;
             let auth_method = current_profile.auth_method.clone();

@@ -300,7 +300,7 @@ async fn handle_upload(
 
     // ── 7. Send to API ──────────────────────────────────────────────────
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let workflow_ref = format!("{}.{}", pack_ref, workflow_name);
 
@@ -378,7 +378,7 @@ async fn handle_list(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let path = if let Some(ref pack_ref) = pack {
         format!("/packs/{}/workflows", pack_ref)
@@ -445,7 +445,7 @@ async fn handle_show(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let path = format!("/workflows/{}", workflow_ref);
     let workflow: WorkflowResponse = client.get(&path).await?;
@@ -555,7 +555,7 @@ async fn handle_delete(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     if !yes && output_format == OutputFormat::Table {
         let confirm = dialoguer::Confirm::new()

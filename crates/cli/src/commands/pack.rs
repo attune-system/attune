@@ -923,7 +923,7 @@ async fn handle_create(
 
     // ── Send request ────────────────────────────────────────────────
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let body = CreatePackBody {
         r#ref: pack_ref,
@@ -958,7 +958,7 @@ async fn handle_list(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let mut path = "/packs".to_string();
     if let Some(name_filter) = name {
@@ -1001,7 +1001,7 @@ async fn handle_show(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let path = format!("/packs/{}", pack_ref);
     let pack: PackDetail = client.get(&path).await?;
@@ -1077,7 +1077,7 @@ async fn handle_install(
         &config,
         api_url,
         std::time::Duration::from_secs(8 * 60 * 60),
-    );
+    )?;
 
     // Detect source type
     let source_type = detect_source_type(&source, ref_spec.as_deref(), no_registry);
@@ -1282,7 +1282,7 @@ async fn handle_uninstall(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     // Confirm deletion unless --yes is provided
     if !yes && matches!(output_format, OutputFormat::Table) {
@@ -1393,7 +1393,7 @@ async fn handle_upload(
         &config,
         api_url,
         std::time::Duration::from_secs(8 * 60 * 60),
-    );
+    )?;
 
     let mut extra_fields = Vec::new();
     if acknowledge_incompatible_rollout {
@@ -1545,7 +1545,7 @@ async fn handle_register(
         &config,
         api_url,
         std::time::Duration::from_secs(8 * 60 * 60),
-    );
+    )?;
 
     // Warn if the path looks like a local filesystem path that the API server
     // probably can't see (i.e. not a known container mount point).
@@ -1832,7 +1832,7 @@ async fn handle_registries(
 ) -> Result<()> {
     // The server is the single source of truth for configured registries.
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
     let registries: Vec<PackRegistryIndexResponse> = client.get("/pack-indices").await?;
 
     if registries.is_empty() {
@@ -1889,7 +1889,7 @@ async fn handle_index_api(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     match command {
         PackIndexApiCommands::List => {
@@ -2135,7 +2135,7 @@ async fn handle_search(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let registry_id = if let Some(reg_name) = &registry_name {
         // Search specific registry by name
@@ -2472,7 +2472,7 @@ async fn handle_update(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     // Check that at least one field is provided
     if label.is_none() && description.is_none() && version.is_none() {
