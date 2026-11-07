@@ -3884,6 +3884,43 @@ async fn native_workflow_authority_fences_children_and_private_controls() {
         panic!("native root ciphertext controls rejected")
     };
     assert!(controls.items[0].summary.is_none() && controls.items[0].error.is_none());
+    // Absence of recorded proof cannot select the delegated callback path.
+    let recorded = delegated_fixture_execution(&mut tx, &snapshot, human, vec![], None).await;
+    ExecutionRepository::update(
+        &mut *tx,
+        recorded.id,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Running),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let recorded_workflow = WorkflowExecutionRepository::create(
+        &mut *tx,
+        CreateWorkflowExecutionInput {
+            execution: recorded.id,
+            workflow_def: snapshot.executable.workflow_definition.as_ref().unwrap().id,
+            task_graph: json!({}),
+            variables: json!({}),
+            status: ExecutionStatus::Running,
+        },
+    )
+    .await
+    .unwrap();
+    let unproven =
+        delegated_fixture_execution(&mut tx, &leaf, human, vec![], Some(recorded.id)).await;
+    ExecutionRepository::update(&mut *tx, unproven.id, UpdateExecutionInput {
+        workflow_task: Some(serde_json::from_value(json!({"workflow_execution":recorded_workflow.id,"task_name":"next","retry_count":0,"max_retries":0,"timed_out":false})).unwrap()),
+        status: Some(ExecutionStatus::Completed), ..Default::default()
+    }).await.unwrap();
+    assert!(Native::prepare_for_completion(&mut tx, unproven.id)
+        .await
+        .is_err());
+    assert_eq!(
+        Delegated::find(&mut tx, recorded.id).await.unwrap().mode,
+        "recorded"
+    );
     let cancelled = delegated_fixture_execution(&mut tx, &snapshot, human, vec![], None).await;
     Delegated::select(&mut tx, cancelled.id, None)
         .await
