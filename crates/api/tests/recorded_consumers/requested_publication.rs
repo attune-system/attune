@@ -22,11 +22,15 @@ use attune_common::{
 struct Target {
     execution: Execution,
     key: i64,
-    admission: i64,
-    attempt: uuid::Uuid,
+    admission: Option<i64>,
+    attempt: Option<uuid::Uuid>,
 }
 
 async fn target(fixture: &Fixture, sealed: bool) -> Result<Target> {
+    target_with_mode(fixture, sealed, true).await
+}
+
+async fn target_with_mode(fixture: &Fixture, sealed: bool, recorded: bool) -> Result<Target> {
     let mut tx = fixture.ctx.pool.begin().await?;
     let policy = RuntimeAuthorityRepository::find_policy(&mut tx, fixture.policy_id)
         .await?
@@ -109,15 +113,28 @@ async fn target(fixture: &Fixture, sealed: bool) -> Result<Target> {
         &snapshot,
     )
     .await?;
-    let admission = RuntimeAuthorityRepository::record_admission(
-        &mut tx,
-        RuntimeOwner::Execution(execution.id),
-        &selected,
-    )
-    .await?;
     let schema = SchemaContractRepository::materialize_action_pair(&mut tx, &snapshot).await?;
     SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, execution.id, &schema)
         .await?;
+    let admission = if recorded {
+        Some(
+            RuntimeAuthorityRepository::record_admission(
+                &mut tx,
+                RuntimeOwner::Execution(execution.id),
+                &selected,
+            )
+            .await?
+            .id,
+        )
+    } else {
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::select(
+            &mut tx,
+            execution.id,
+            None,
+        )
+        .await?;
+        None
+    };
     Contributors::capture_human(&mut tx, "execution", execution.id, fixture.requester).await?;
     let fields = prepare_secret_values(
         vec![SecretValueInput {
@@ -137,15 +154,15 @@ async fn target(fixture: &Fixture, sealed: bool) -> Result<Target> {
         &fields,
     )
     .await?;
-    if sealed {
+    if sealed && recorded {
         Inputs::seal_execution_inputs(&mut tx, execution.id, encryption).await?;
     }
     tx.commit().await?;
     Ok(Target {
         execution,
         key: original.id,
-        admission: admission.id,
-        attempt: selected.attempt,
+        admission,
+        attempt: recorded.then_some(selected.attempt),
     })
 }
 
@@ -181,8 +198,8 @@ async fn marks(fixture: &Fixture, target: i64) -> Result<i64> {
 
 #[tokio::test]
 #[ignore = "requires run-owned PostgreSQL and disposable RabbitMQ vhost via ATTUNE_REQUESTED_PUBLICATION_MQ_URL"]
-async fn actual_human_and_recorded_reschedule_keep_targets_original_key_and_attempt() -> Result<()>
-{
+async fn delegated_reschedule_preserves_inputs_and_recorded_readiness_preserves_admission(
+) -> Result<()> {
     for recorded in [false, true] {
         let fixture = fixture_with_additional_grants(
             false,
@@ -192,7 +209,7 @@ async fn actual_human_and_recorded_reschedule_keep_targets_original_key_and_atte
             &[json!({"resource":"executions","actions":["cancel"]})],
         )
         .await?;
-        let target = target(&fixture, true).await?;
+        let target = target_with_mode(&fixture, true, recorded).await?;
         let connection = broker(&fixture).await?;
         let before = ExecutionSecretValueRepository::find_stored_by_entity(
             &fixture.ctx.pool,
@@ -237,9 +254,8 @@ async fn actual_human_and_recorded_reschedule_keep_targets_original_key_and_atte
         let status = response.status();
         let body: Value = response.json().await?;
         let mut tx = fixture.ctx.pool.begin().await?;
-        let after = RuntimeAuthorityRepository::execution_admission(&mut tx, target.execution.id)
-            .await?
-            .unwrap();
+        let after =
+            RuntimeAuthorityRepository::execution_admission(&mut tx, target.execution.id).await?;
         tx.rollback().await?;
         let fields = ExecutionSecretValueRepository::find_stored_by_entity(
             &fixture.ctx.pool,
@@ -251,11 +267,19 @@ async fn actual_human_and_recorded_reschedule_keep_targets_original_key_and_atte
         *fixture.ctx.state.publisher.write().await = None;
         connection.close().await?;
         fixture.ctx.cleanup().await?;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(after.id, target.admission);
-        assert_eq!(after.authority.attempt, target.attempt);
+        assert_eq!(
+            status,
+            if recorded {
+                StatusCode::NOT_IMPLEMENTED
+            } else {
+                StatusCode::OK
+            },
+            "{body}"
+        );
+        assert_eq!(after.as_ref().map(|a| a.id), target.admission);
+        assert_eq!(after.as_ref().map(|a| a.authority.attempt), target.attempt);
         assert_eq!(fields, before);
-        assert_eq!(count, 1);
+        assert_eq!(count, if recorded { 0 } else { 1 });
         assert!(!body.to_string().contains("original private input"));
     }
     Ok(())
@@ -322,7 +346,7 @@ async fn requested_reschedule_still_requires_authenticated_route_access() -> Res
 
 #[tokio::test]
 #[ignore = "requires run-owned PostgreSQL and disposable RabbitMQ vhost via ATTUNE_REQUESTED_PUBLICATION_MQ_URL"]
-async fn actual_human_and_recorded_routes_do_not_repair_missing_target_acceptance() -> Result<()> {
+async fn recorded_readiness_rejection_does_not_repair_missing_target_acceptance() -> Result<()> {
     for recorded in [false, true] {
         let fixture = fixture_with_additional_grants(
             false,
@@ -356,17 +380,32 @@ async fn actual_human_and_recorded_routes_do_not_repair_missing_target_acceptanc
                 .await?;
         *fixture.ctx.state.publisher.write().await = None;
         connection.close().await?;
-        fixture.ctx.cleanup().await?;
-        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        // The public readiness rejection cannot repair the original proof.
+        let mut tx = fixture.ctx.pool.begin().await?;
+        let encryption = fixture
+            .ctx
+            .state
+            .config
+            .security
+            .encryption_key
+            .as_deref()
+            .unwrap();
+        assert!(attune_common::repositories::requested_execution_publication::RequestedExecutionPublicationRepository::prepare(
+            &mut tx, &target.execution, encryption,
+        ).await.is_err());
+        tx.rollback().await?;
         assert_eq!(count, 0);
         assert_eq!(seals, 0);
+        fixture.ctx.cleanup().await?;
     }
     Ok(())
 }
 
 #[tokio::test]
 #[ignore = "requires run-owned PostgreSQL and a separate empty RabbitMQ vhost via ATTUNE_REQUESTED_PUBLICATION_FAILURE_MQ_URL"]
-async fn actual_human_and_recorded_publish_errors_roll_back_reschedule_marks() -> Result<()> {
+async fn delegated_publish_error_rolls_back_and_recorded_readiness_creates_no_marks() -> Result<()>
+{
     for recorded in [false, true] {
         let fixture = fixture_with_additional_grants(
             false,
@@ -376,7 +415,7 @@ async fn actual_human_and_recorded_publish_errors_roll_back_reschedule_marks() -
             &[json!({"resource":"executions","actions":["cancel"]})],
         )
         .await?;
-        let target = target(&fixture, true).await?;
+        let target = target_with_mode(&fixture, true, recorded).await?;
         // Envelope publication uses its message type's exchange, and closed
         // connections recover. This separate run-owned vhost deliberately has
         // no common topology, so the real execution exchange remains absent on
@@ -412,10 +451,11 @@ async fn actual_human_and_recorded_publish_errors_roll_back_reschedule_marks() -
         *fixture.ctx.state.publisher.write().await = None;
         connection.close().await?;
         fixture.ctx.cleanup().await?;
-        assert!(
-            status.is_server_error(),
-            "absent exchange must fail publication, not commit a mark: {status}"
-        );
+        assert_eq!(status, if recorded {
+            StatusCode::NOT_IMPLEMENTED
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }, "delegated publication must reach the missing exchange; recorded sponsorship stays unavailable");
         assert_eq!(count, 0);
     }
     Ok(())
@@ -429,11 +469,6 @@ async fn recorded_caller_expiry_after_real_mark_wait_rolls_back_even_when_target
         maintenance::MaintenanceRepository as Maintenance,
         requested_execution_publication::RequestedExecutionPublicationRepository as Requested,
     };
-    use axum::{
-        body::Body,
-        http::{header, Request},
-    };
-    use tower::Service;
     let fixture = fixture_with_approval_lifetime(
         false,
         false,
@@ -468,17 +503,86 @@ async fn recorded_caller_expiry_after_real_mark_wait_rolls_back_even_when_target
     .bind(target.execution.id)
     .fetch_one(&mut *blocker)
     .await?;
-    let mut app = fixture.ctx.app.clone();
-    let request = Request::builder()
-        .method("POST")
-        .uri(format!(
-            "/api/v1/executions/{}/reschedule",
-            target.execution.id
-        ))
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {}", fixture.token))
-        .body(Body::from("{}"))?;
-    let mut writer = tokio::spawn(async move { app.call(request).await.unwrap().status() });
+    // The route must reject new recorded scheduling before any mark wait.
+    let response = fixture
+        .ctx
+        .post(
+            &format!("/api/v1/executions/{}/reschedule", target.execution.id),
+            json!({}),
+            Some(&fixture.token),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let pool = fixture.ctx.pool.clone();
+    let credential = fixture.credential.clone();
+    let execution = target.execution.clone();
+    let publisher = fixture.ctx.state.get_publisher().await.unwrap();
+    let encryption = fixture
+        .ctx
+        .state
+        .config
+        .security
+        .encryption_key
+        .clone()
+        .unwrap();
+    // Consume authentic pre-admitted authority directly. This preserves the
+    // historical caller-expiry/mark-wait fence without enabling sponsorship.
+    let mut writer = tokio::spawn(async move {
+        let mut tx = pool.begin().await.unwrap();
+        let published: attune_common::Result<()> = async {
+            let authority =
+                RuntimeAuthorityRepository::validate_execution_credential(&mut tx, &credential)
+                    .await?;
+            use attune_common::repositories::runtime_target::{
+                RuntimeTarget, RuntimeTargetRepository,
+            };
+            let caller_target = RuntimeTargetRepository::resolve(
+                &mut tx,
+                RuntimeTarget::Execution(execution.id),
+                authority.credential_binding().sponsor_identity_id,
+            )
+            .await?
+            .unwrap();
+            assert!(authority.allows_target(&caller_target, attune_common::rbac::Action::Cancel));
+            let prepared = Requested::prepare(&mut tx, &execution, &encryption)
+                .await?
+                .unwrap();
+            prepared.lock_target(&mut tx).await?;
+            Maintenance::mark_execution_reschedule_attempt(
+                &mut *tx,
+                execution.id,
+                "test",
+                "historical recorded publication",
+                10,
+                0,
+                true,
+            )
+            .await?
+            .unwrap();
+            authority.ensure_fresh_on(&mut tx).await?;
+            let message = attune_common::mq::MessageEnvelope::new(
+                attune_common::mq::MessageType::ExecutionRequested,
+                attune_common::mq::ExecutionRequestedPayload {
+                    execution_id: execution.id,
+                    action_id: execution.action,
+                    action_ref: execution.action_ref.clone(),
+                    parent_id: execution.parent,
+                    enforcement_id: execution.enforcement,
+                    config: execution.config.clone(),
+                    release_id: execution.pack_release,
+                    release_digest: execution.pack_release_digest.clone(),
+                },
+            );
+            prepared
+                .publish_bounded(&mut tx, publisher.publish_envelope(&message))
+                .await?;
+            authority.ensure_fresh_on(&mut tx).await?;
+            Ok(())
+        }
+        .await;
+        tx.rollback().await.unwrap();
+        published.err().map(|error| error.to_string())
+    });
     let waited = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let blocked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)) AND query LIKE '%execution_reschedule_state%')")
@@ -506,7 +610,7 @@ async fn recorded_caller_expiry_after_real_mark_wait_rolls_back_even_when_target
     .is_ok();
     blocker.commit().await?;
     let status = match tokio::time::timeout(std::time::Duration::from_secs(5), &mut writer).await {
-        Ok(Ok(status)) => Some(status),
+        Ok(Ok(error)) => error,
         Ok(Err(_)) => None,
         Err(_) => {
             writer.abort();
@@ -538,7 +642,11 @@ async fn recorded_caller_expiry_after_real_mark_wait_rolls_back_even_when_target
     connection.close().await?;
     fixture.ctx.cleanup().await?;
     assert!(waited && expired);
-    assert_eq!(status, Some(StatusCode::FORBIDDEN));
+    assert!(
+        status.as_deref().is_some_and(|error| error
+            .contains("Validated external approval expired before effect or disclosure")),
+        "caller expiry must be the publication failure: {status:?}"
+    );
     assert_eq!(count, 1);
     assert!(
         target_valid,

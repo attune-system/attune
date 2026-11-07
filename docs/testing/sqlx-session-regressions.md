@@ -88,8 +88,11 @@ broker. The fixture initializes topology only in the normal vhost.
 Envelope publication selects its exchange from the message type, and a closed
 connection can reconnect successfully. The failure case therefore uses the
 missing execution exchange in the empty vhost to test a real publish error;
-both human and recorded callers must return an error and leave zero durable
-reschedule marks. The test does not disable recovery or enlarge deadlines.
+a supported delegated target must return exactly HTTP 500 and leave zero durable
+reschedule marks. Recorded callers and targets remain unavailable at the route
+boundary (HTTP 501, zero marks), independently of broker topology. The recorded
+caller-expiry race consumes authentic historical admission at the repository
+boundary; it does not certify currently disabled recorded HTTP publication. The test does not disable recovery or enlarge deadlines.
 
 After provisioning these prerequisites, run all four explicitly:
 
