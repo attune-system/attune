@@ -7,6 +7,7 @@ mod self_contained_deployment;
 use attune_common::{
     repositories::{
         action::ActionRepository,
+        delegated_execution::DelegatedExecutionRepository,
         execution::ExecutionRepository,
         identity::{IdentityRepository, PermissionSetRepository, UpdateIdentityInput},
         managed_executable::ManagedExecutableRepository,
@@ -504,12 +505,47 @@ async fn consented_upload(reverse: bool) -> Result<()> {
         json!(["consented_upload.events"])
     );
     assert_eq!(options["data"]["default_selection_available"], true);
+    // Capturing a deployment policy does not enable recorded runtime issuance.
+    // The execute-only caller cannot borrow the frozen installer's old consent.
+    let covered_invoker = actor(&ctx, json!([
+        {"resource":"actions","actions":["execute"],"constraints":{"refs":["consented_upload.emit","consented_upload.outer"]}},
+        {"resource":"events","actions":["create"],"constraints":{"refs":["consented_upload.tick"]}}
+    ])).await?;
     for target in ["emit", "outer"] {
-        let response = ctx.post(
-            "/api/v1/executions/execute",
-            json!({"action_ref":format!("consented_upload.{target}"),"parameters":{"message":"done"}}),
-            Some(&invoker.token),
-        ).await?;
+        let action_ref = format!("consented_upload.{target}");
+        let before: i64 = sqlx::query_scalar("SELECT count(*) FROM execution WHERE action_ref=$1")
+            .bind(&action_ref)
+            .fetch_one(&ctx.pool)
+            .await?;
+        let denied = ctx
+            .post(
+                "/api/v1/executions/execute",
+                json!({"action_ref":action_ref,"parameters":{"message":"done"}}),
+                Some(&invoker.token),
+            )
+            .await?;
+        let denied_status = denied.status();
+        let denied_body: Value = denied.json().await?;
+        assert_eq!(denied_status, StatusCode::FORBIDDEN, "{denied_body}");
+        assert_eq!(
+            denied_body["error"],
+            "Cannot execute action with permission sets beyond current access"
+        );
+        let after: i64 = sqlx::query_scalar("SELECT count(*) FROM execution WHERE action_ref=$1")
+            .bind(&action_ref)
+            .fetch_one(&ctx.pool)
+            .await?;
+        assert_eq!(
+            before, after,
+            "denied sponsorship must not create an execution"
+        );
+        let response = ctx
+            .post(
+                "/api/v1/executions/execute",
+                json!({"action_ref":action_ref,"parameters":{"message":"done"}}),
+                Some(&covered_invoker.token),
+            )
+            .await?;
         let status = response.status();
         let body: Value = response.json().await?;
         assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -525,10 +561,26 @@ async fn consented_upload(reverse: bool) -> Result<()> {
             vec!["consented_upload.events".to_owned()]
         );
         let mut tx = ctx.pool.begin().await?;
-        let admission = RuntimeAuthorityRepository::execution_admission(&mut tx, id)
+        assert!(RuntimeAuthorityRepository::execution_admission(&mut tx, id)
+            .await?
+            .is_none());
+        let selected = DelegatedExecutionRepository::validate(&mut tx, id).await?;
+        assert_eq!(selected.mode, "delegated");
+        assert!(selected.explicit);
+        assert_eq!(selected.owner, Some(covered_invoker.id));
+        assert_eq!(selected.selected_refs, execution.permission_set_refs);
+        assert_eq!(
+            execution.executable_snapshot.as_ref().unwrap().release.id,
+            policy.policy.release_id
+        );
+        let retained = RuntimeAuthorityRepository::current_policy(&mut tx, pack.id)
             .await?
             .unwrap();
-        assert_eq!(admission.policy_revision, policy.id);
+        assert_eq!(retained.id, policy.id);
+        assert_eq!(
+            serde_json::to_value(&retained.policy)?,
+            serde_json::to_value(&policy.policy)?
+        );
         tx.rollback().await?;
     }
     assert_eq!(
