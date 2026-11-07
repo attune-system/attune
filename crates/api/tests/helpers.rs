@@ -872,3 +872,8 @@ macro_rules! assert_json_contains {
 #[allow(dead_code)]
 #[path = "helpers/delegated_source.rs"]
 pub mod delegated_source;
+
+// A shared fixture is compiled into targets that need different subsets.
+#[allow(dead_code)]
+#[path = "helpers/delegated.rs"]
+pub mod delegated;

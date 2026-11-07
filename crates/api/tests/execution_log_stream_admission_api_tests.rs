@@ -1,5 +1,4 @@
-#[path = "helpers/delegated.rs"]
-mod delegated;
+use helpers::delegated;
 mod helpers;
 
 use std::time::Duration;

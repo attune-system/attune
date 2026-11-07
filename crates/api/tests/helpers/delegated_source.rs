@@ -7,8 +7,6 @@ use attune_common::{
     Result,
 };
 use uuid::Uuid;
-#[path = "delegated.rs"]
-mod attempt;
 
 /// Admit an immutable managed fixture with its owner's existing grants. This
 /// bypasses caller action-execute admission only to isolate token consumers.
@@ -30,7 +28,7 @@ pub async fn create(
     SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, execution.id, &binding)
         .await?;
     DelegatedExecutionRepository::select(&mut tx, execution.id, source).await?;
-    attempt::start(&mut tx, execution.id).await?;
+    super::delegated::start(&mut tx, execution.id).await?;
     tx.commit().await?;
     Ok(execution)
 }

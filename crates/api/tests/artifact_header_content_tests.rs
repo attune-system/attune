@@ -1,6 +1,5 @@
 //! Metadata visibility must never become a permit for protected content.
-#[path = "helpers/delegated.rs"]
-mod delegated;
+use helpers::delegated;
 mod helpers;
 // This action-only suite shares the admitted pack fixture with the sensor suite;
 // its retained-generation helper is intentionally unused in this executable.

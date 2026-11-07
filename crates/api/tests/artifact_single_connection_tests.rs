@@ -1,7 +1,6 @@
 //! Selected human reads must never acquire a second connection while retaining
 //! their receipt transaction. Exercise the real download route and response body.
-#[path = "helpers/delegated.rs"]
-mod delegated;
+use helpers::delegated;
 mod helpers;
 // The shared admitted-pack fixture also contains sensor-only builders.
 #[allow(dead_code)]
