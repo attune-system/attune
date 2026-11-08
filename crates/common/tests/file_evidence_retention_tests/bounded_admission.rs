@@ -15,6 +15,18 @@ fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(5)
 }
 
+// These tests exercise statement timeout followed by a progress-only commit.
+// That commit also gets one statement budget for connection setup, admission,
+// queries and COMMIT, so leave scheduling headroom on loaded CI runners. The
+// trigger sleeps must exceed this cap; the page must allow cheap later visits.
+fn failed_visit_budget() -> MaintenanceBudget {
+    MaintenanceBudget {
+        statement_timeout: Duration::from_millis(500),
+        page_timeout: Duration::from_secs(5),
+        ..Default::default()
+    }
+}
+
 fn deferred<T>(result: &MaintenanceResult<T>) {
     assert_eq!(result.outcome, MaintenanceOutcome::LockDeferred);
     assert!(result.candidates > 0);
@@ -513,13 +525,14 @@ async fn seed_pending_audits(pool: &sqlx::PgPool, base: i64, count: i64) {
 async fn audit_owner_commits_survive_a_later_page_deadline() {
     let db = database().await;
     seed_pending_audits(db.pool(), 99700, 5).await;
-    // Each owner is cheaper than a statement budget. Their combined cost is
-    // larger than the page budget. This is an elapsed-time contract, not a sleep
-    // used to order a race: prefix commits must survive the later deadline.
-    sqlx::raw_sql("CREATE FUNCTION owned_audit_delay() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.2); RETURN NEW; END; $$; CREATE TRIGGER owned_audit_delay BEFORE UPDATE OF evidence_state ON file_evidence_owner FOR EACH ROW WHEN (NEW.evidence_state='quarantined') EXECUTE FUNCTION owned_audit_delay()")
+    // Commit the cheap first owner, then exhaust the page inside later owner
+    // work. Equal per-owner delays can put COMMIT on the page boundary instead,
+    // legitimately producing CommitUnknown rather than acknowledged rollback.
+    sqlx::raw_sql("CREATE FUNCTION owned_audit_delay() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN IF NEW.version<>99701 THEN PERFORM pg_sleep(10); END IF; RETURN NEW; END; $$; CREATE TRIGGER owned_audit_delay BEFORE UPDATE OF evidence_state ON file_evidence_owner FOR EACH ROW WHEN (NEW.evidence_state='quarantined') EXECUTE FUNCTION owned_audit_delay()")
         .execute(db.pool()).await.unwrap();
     let budget = MaintenanceBudget {
-        page_timeout: Duration::from_millis(600),
+        statement_timeout: Duration::from_secs(3),
+        page_timeout: Duration::from_secs(2),
         ..Default::default()
     };
     let report = Evidence::audit_pending_bounded(
@@ -564,12 +577,9 @@ async fn audit_owner_commits_survive_a_later_page_deadline() {
 async fn over_budget_first_audit_owner_does_not_hide_cheap_owners_or_clear_failure_age() {
     let db = database().await;
     seed_pending_audits(db.pool(), 99800, 3).await;
-    sqlx::raw_sql("CREATE FUNCTION owned_audit_delay() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN IF NEW.version=99801 THEN PERFORM pg_sleep(0.3); END IF; RETURN NEW; END; $$; CREATE TRIGGER owned_audit_delay BEFORE UPDATE OF evidence_state ON file_evidence_owner FOR EACH ROW WHEN (NEW.evidence_state='quarantined') EXECUTE FUNCTION owned_audit_delay()")
+    sqlx::raw_sql("CREATE FUNCTION owned_audit_delay() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN IF NEW.version=99801 THEN PERFORM pg_sleep(10); END IF; RETURN NEW; END; $$; CREATE TRIGGER owned_audit_delay BEFORE UPDATE OF evidence_state ON file_evidence_owner FOR EACH ROW WHEN (NEW.evidence_state='quarantined') EXECUTE FUNCTION owned_audit_delay()")
         .execute(db.pool()).await.unwrap();
-    let budget = MaintenanceBudget {
-        statement_timeout: Duration::from_millis(50),
-        ..Default::default()
-    };
+    let budget = failed_visit_budget();
     let cancel = CancellationToken::new();
     let report = Evidence::audit_pending_bounded(db.pool(), 8, &budget, deadline(), &cancel).await;
     assert_eq!(
@@ -645,14 +655,9 @@ async fn over_budget_first_deletion_does_not_hide_the_257th_candidate() {
     // Sequences survive rollback: the second candidate times out once, then
     // becomes cheap on the next frozen pass. Reaching 257 alone must not end
     // the test before that deferred candidate has been revisited.
-    sqlx::raw_sql("CREATE SEQUENCE owned_claim_attempt; CREATE FUNCTION owned_claim_delay() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN IF OLD.object_key='bounded/fair/1' THEN PERFORM pg_sleep(1.5); ELSIF OLD.object_key='bounded/fair/2' AND nextval('owned_claim_attempt')=1 THEN PERFORM pg_sleep(1.5); END IF; RETURN NEW; END; $$; CREATE TRIGGER owned_claim_delay BEFORE UPDATE OF state ON object_maintenance_ledger FOR EACH ROW WHEN (NEW.state='deleting') EXECUTE FUNCTION owned_claim_delay()")
+    sqlx::raw_sql("CREATE SEQUENCE owned_claim_attempt; CREATE FUNCTION owned_claim_delay() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN IF OLD.object_key='bounded/fair/1' THEN PERFORM pg_sleep(10); ELSIF OLD.object_key='bounded/fair/2' AND nextval('owned_claim_attempt')=1 THEN PERFORM pg_sleep(10); END IF; RETURN NEW; END; $$; CREATE TRIGGER owned_claim_delay BEFORE UPDATE OF state ON object_maintenance_ledger FOR EACH ROW WHEN (NEW.state='deleting') EXECUTE FUNCTION owned_claim_delay()")
         .execute(db.pool()).await.unwrap();
-    // Use the deployment statement budget so incidental socket/commit latency
-    // is not the timeout source; the trigger remains six times over budget.
-    let budget = MaintenanceBudget {
-        statement_timeout: Duration::from_millis(250),
-        ..Default::default()
-    };
+    let budget = failed_visit_budget();
     let cancel = CancellationToken::new();
     let cutoff = Utc::now();
     let mut claimed = std::collections::HashSet::new();
@@ -937,10 +942,7 @@ async fn failed_singleton_deletion_stays_pending_after_cursor_wraps_to_zero() {
         .execute(db.pool())
         .await
         .unwrap();
-    let budget = MaintenanceBudget {
-        statement_timeout: Duration::from_millis(50),
-        ..Default::default()
-    };
+    let budget = failed_visit_budget();
     let cutoff = Utc::now();
     let cancel = CancellationToken::new();
     let mut oldest = None;
