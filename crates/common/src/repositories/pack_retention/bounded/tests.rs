@@ -970,7 +970,10 @@ async fn production_defaults_cross_ten_thousand_pins_and_persist_fast_continuati
         let progress = epoch_progress(db.pool()).await;
         if progress.pending {
             let delay = progress.next_attempt.unwrap() - progress.last_attempt.unwrap();
-            assert!(delay >= chrono::Duration::seconds(1) && delay < chrono::Duration::seconds(2));
+            assert!(
+                delay >= chrono::Duration::seconds(1) && delay < chrono::Duration::seconds(2),
+                "unexpected pending delay {delay:?}; progress={progress:?}; result={result:?}"
+            );
             assert!(result.backlog_pending() && !result.complete(), "{result:?}");
         }
         if epoch(&result).changed > 0 {
@@ -1864,5 +1867,69 @@ async fn release_json_pins_match_reference_and_recheck_discovered_identities() {
         [ids[..6].to_vec(), expected[2..].to_vec()].concat()
     );
     tx.commit().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn policy_revision_survivors_preserve_newest_release_and_optional_queue_pin() {
+    let db = database().await;
+    let releases = seed_inactive_releases(db.pool(), 3).await;
+    let mut tx = db.pool().begin().await.unwrap();
+    SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await
+        .unwrap();
+    let policies: Vec<i64> = sqlx::query_scalar(
+        "INSERT INTO pack_runtime_policy_revision(pack,release,policy,policy_digest)
+         SELECT pack,id,'{}',repeat('a',64) FROM pack_release ORDER BY id RETURNING id",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(policies.len(), releases.len());
+    let versions: Vec<String> =
+        sqlx::query_scalar("SELECT xmin::text FROM pack_runtime_policy_revision ORDER BY id")
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+    for queue_pin in [false, true] {
+        sqlx::query("SAVEPOINT policy_probe")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        if queue_pin {
+            let queue: i64 = sqlx::query_scalar("INSERT INTO work_queue(ref,label,dispatch_action_ref) VALUES('policy.pin','Policy pin','test.action') RETURNING id")
+                .fetch_one(&mut *tx).await.unwrap();
+            let item: i64 = sqlx::query_scalar("INSERT INTO work_queue_item(queue,queue_ref,payload,enqueue_source) VALUES($1,'policy.pin','{}','test') RETURNING id")
+                .bind(queue).fetch_one(&mut *tx).await.unwrap();
+            sqlx::query("INSERT INTO work_queue_item_runtime_admission(item,policy_revision,authority,authority_digest) VALUES($1,$2,'{}',repeat('b',64))")
+                .bind(item).bind(policies[1]).execute(&mut *tx).await.unwrap();
+        }
+        let removed =
+            sqlx::query(&GraphReclamationPhase::PolicyRevisions.delete_sql(false, queue_pin))
+                .bind(&policies)
+                .bind(&versions)
+                .bind(10_i64)
+                .bind(Utc::now())
+                .bind(1_i64)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!(removed.rows_affected(), if queue_pin { 1 } else { 2 });
+        let remaining: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM pack_runtime_policy_revision ORDER BY id")
+                .fetch_all(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!(remaining, policies[if queue_pin { 1 } else { 2 }..]);
+        sqlx::query("ROLLBACK TO SAVEPOINT policy_probe")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("RELEASE SAVEPOINT policy_probe")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+    tx.rollback().await.unwrap();
     db.cleanup().await.unwrap();
 }

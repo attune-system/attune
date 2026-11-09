@@ -310,6 +310,56 @@ and 58 dependency-policy violations retain the exact provenance recorded above;
 neither is labeled passing. No migration, SQLx macro metadata, or public contract
 changed, so schema-prepare and generated-client changes are not applicable.
 
+## Milestone 2 Astra follow-up
+
+Astra reviewed `0a495c55e53c73889056fb9c9d1e13abe076eee0` read-only and found
+no concrete runtime defect. Its P3 coverage finding was that the artifact matrix's
+evidence pin masked the only expiring shared-file version, and the selected
+limits did not distinguish whether NULL-state newer versions were counted.
+
+The follow-up adds an unpinned versions/limit=2 case and explicitly requires
+shared-file version 3 to expire because NULL-state version 12 and Ready version
+20 both count. Versions-policy limits now include both integer extremes; these
+extremes are not applied to interval policies. A separate positive policy-revision
+test exercises both optional-queue-pin modes and preserves the newest inactive
+release, closing coverage of that changed materialized path.
+
+The original continuation-delay assertion and production budgets remain unchanged.
+Its failure message now includes the observed delay, durable progress, and phase
+outcomes. A passing retry does not classify the earlier PG16 failures as baseline.
+Follow-up source evidence is `0a495c55` plus the two changed test files, saved
+as followup-test-source.diff in the root's owned temporary validation directory.
+SHA-256: `4af7cc0a0beeb12e0eb010b2673601075d8854b5bf194a99c7dcabf25dc090b9`.
+Production Rust source is unchanged by this follow-up.
+
+An owned PostgreSQL 16 container on an ephemeral loopback port was initialized
+with `make db-test-setup`, using explicit owned admin/test URLs and a temporary
+psql forwarding shim. An initial bootstrap raced temporary-server readiness and
+created split migration history; only that task-owned bootstrap was recreated
+before the successful clean setup. Those setup attempts are not passing tests.
+
+```bash
+ATTUNE_TEST_RUN_ID=lock-review-fix16 ATTUNE__DATABASE__URL=<owned-pg16-url> \
+  cargo test -p attune-common --lib --test storage_maintenance_repository_tests -- \
+  policy_revision_survivors expiration_prefilter_matches --nocapture --test-threads=4
+ATTUNE_TEST_RUN_ID=lock-review-fix16 ATTUNE__DATABASE__URL=<owned-pg16-url> \
+  cargo test -p attune-common --lib -- \
+  production_defaults_cross_ten_thousand_pins_and_persist_fast_continuation \
+  --nocapture --test-threads=4
+```
+
+Both targeted tests passed (policy-revision case 71.72s including template setup,
+artifact matrix 3.41s). The separate quiet continuation run passed in 11.52s;
+the prior failures remain unclassified. Each invocation used four libtest threads
+and reused only its own run-owned template after the previous command exited.
+Final `cargo clippy -p attune-common --all-targets -- -D warnings` passed in
+1m30s. Formatting, local links, and diff whitespace passed. After all commands
+exited, zero per-test database clones remained; the exact owned container and
+anonymous volumes were removed, along with the temporary forwarding shim.
+Validation logs and the source diff remain in /tmp/attune-lock-review-eade_5to.
+These focused results do not resolve the earlier timing failures or replace
+final-head CI and affected-consumer validation.
+
 ## Slice 1: cheaper bounded maintenance, with the same locking contract
 
 This is the strongest first implementation candidate: it reduces existing

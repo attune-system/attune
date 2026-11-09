@@ -1143,8 +1143,14 @@ async fn expiration_prefilter_matches_count_reference_and_claim_rechecks_policy(
     let pool = create_test_pool().await.unwrap();
     // Cross policies/limits with gapped versions and mixed body states. Ready
     // shared-file bodies and legacy NULL bodies count; pending bodies do not.
+    let mut shared_file_counting_null_newer = None;
     for policy in ["versions", "days", "hours", "minutes"] {
-        for limit in [-1, 0, 1, 3, 9] {
+        let limits = if policy == "versions" {
+            vec![i32::MIN, -1, 0, 1, 2, 3, 9, i32::MAX]
+        } else {
+            vec![-1, 0, 1, 3, 9]
+        };
+        for limit in limits {
             let artifact = ArtifactRepository::create(&pool, artifact_input("matrix"))
                 .await
                 .unwrap();
@@ -1162,6 +1168,9 @@ async fn expiration_prefilter_matches_count_reference_and_claim_rechecks_policy(
                       NOW()-make_interval(secs=>$4::double precision)) RETURNING id")
                     .bind(artifact.id).bind(version).bind(state).bind([172800,7200,60,0,-3600][index])
                     .fetch_one(&*pool).await.unwrap();
+                if policy == "versions" && limit == 2 && version == 3 {
+                    shared_file_counting_null_newer = Some(id);
+                }
                 if index == 0 || index == 1 {
                     sqlx::query("INSERT INTO log_stream(artifact_version,backend,max_unflushed_bytes,max_unflushed_milliseconds) VALUES($1,$2::text::log_stream_backend_enum,1024,1000)")
                         .bind(id).bind(if index==0 {"object_segments"} else {"shared_file"}).execute(&*pool).await.unwrap();
@@ -1200,9 +1209,18 @@ async fn expiration_prefilter_matches_count_reference_and_claim_rechecks_policy(
         !expected.contains(&pinned),
         "preexisting evidence pin must exclude discovery"
     );
+    let shared_file_counting_null_newer = shared_file_counting_null_newer.unwrap();
+    assert!(
+        expected.contains(&shared_file_counting_null_newer),
+        "unpinned shared-file version 3 expires at limit 2: NULL-state version 12 and Ready version 20 both count"
+    );
     let found = MaintenanceRepository::find_expired_artifact_versions(&pool, 1000)
         .await
         .unwrap();
+    assert!(
+        found.iter().any(|v| v.id == shared_file_counting_null_newer),
+        "production discovery must retain the shared-file exception and count NULL-state newer versions"
+    );
     assert_eq!(found.iter().map(|v| v.id).collect::<Vec<_>>(), expected);
     assert_eq!(
         MaintenanceRepository::expired_artifact_version_count(&pool)
