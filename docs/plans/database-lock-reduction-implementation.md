@@ -1,6 +1,6 @@
 # Database lock reduction: code-level implementation map
 
-Status: milestones 1 and 2 implemented for review; later slices remain proposals.
+Status: milestones 1–3 implemented for review; later slices remain proposals.
 Date: 2026-11-09 UTC.
 
 This expands the [lock audit](database-lock-scope-audit.md), with a separate
@@ -373,11 +373,13 @@ pass, and visits at most `clamp(batch_size,1,256)` raw rows before retention or
 evidence predicates. All eligible rows in the raw page are returned, including
 when fewer than the requested limit survive filtering. Progress includes empty
 filtered pages; completion wraps on the next call. Reporting count/find and their
-global oldest-first contracts are unchanged. Raw reservations commit before a separate bounded eligibility read, using one
+global oldest-first contracts are unchanged. Raw reservations commit before a
+separate bounded eligibility read, using one
 absolute page deadline and detached-session ownership. A repeatedly failing
 eligibility page therefore cannot trap later raw pages. Discovery results are
 released only after an acknowledged reservation and successful eligibility read;
-a failed or cancelled scan cannot expose a candidate page. Progress is advisory, so rows
+a failed or cancelled scan cannot expose a candidate page. Progress is advisory,
+so rows
 skipped by cancellation after a commit, late commits, changed policy/pins or
 metadata are revisited on later passes. This adds no deletion authority.
 
@@ -395,7 +397,8 @@ the complete frozen pass against the same independent global oracle. New cases
 cover prefilter bounds, empty pages, 550 pinned rows, competing progress writers,
 cancellation, disconnect during state commit, wrap/unpin, late older commits,
 new arrivals beyond the high-water mark, changed evidence and physical identity,
-and supervisor pending-page scheduling without hourly retention or hot loops.
+failed eligibility after a committed reservation, and supervisor pending-page
+scheduling without hourly retention or hot loops.
 The separate test-guard checkpoint corrects the SQL string inspected by the
 existing reporting-count failure fixture; it does not weaken its assertions.
 
@@ -407,6 +410,140 @@ Validation results and resource cleanup are appended after final runs below.
 Prior milestone results remain historical evidence only; the two earlier PG16
 continuation-delay failures remain unclassified. Docker runner relay omission,
 58 base-manifest policy violations, PR31 and final-head CI remain disclosed gaps.
+
+### Milestone 3 validation provenance
+
+Final runtime/test source: `4f1465cd115cdfe3065b7f925754c2ac1fa7bbe2`, clean
+when final runs began. A later fixture-only checkpoint enables panic cleanup for the new supervisor
+fixture; runtime source is unchanged. No earlier
+milestone performance measurement is claimed for this implementation.
+
+Owned disposable PostgreSQL containers (ephemeral loopback ports):
+
+- PG16 `attune-durable-ret16`, ID `6ef4fe392ae03936481fd9ba40d209acca2ec762630c7270da918fdf4415d2be`, port 43105.
+- PG18 `attune-durable-ret18`, ID `1d1164448b703061494596a65462c44b97b3d20e30d59532a5007167c9bcc26e`, port 45007.
+
+Each used `POSTGRES_USER=attune`, a test-only password, and `attune_test`; schema
+and database search path were initialized explicitly inside that owned server.
+No default cluster was used. With `DATABASE_URL` set to each owned URL,
+`cargo sqlx migrate run` passed fresh migration replay and a second no-op replay
+on both versions (logs `/tmp/attune-durable-{migrate,rerun}{16,18}.log`). The new
+migration has not changed since those runs; no applied migration was rewritten.
+
+```bash
+# Owned PG18 URL; includes workspace-wide all-target check.
+DATABASE_URL=<owned18> cargo sqlx prepare --workspace -- --all-targets
+cargo clippy -p attune-common -p attune-supervisor --all-targets -- -D warnings
+cargo fmt --all -- --check
+git diff --check
+
+# Final PG16 source; owned URL and ATTUNE_TEST_RUN_ID=durable16.
+cargo test -p attune-common -p attune-supervisor --bins \
+  --test maintenance_repository_tests --no-fail-fast -- \
+  bounded_metadata:: artifact_empty_raw_pages housekeeping_defers \
+  physical_cleanup_keeps --test-threads=4
+
+# Quiet final storage run, after ALL compiler invocations exited; cwd crates/common.
+../../target/debug/deps/storage_maintenance_repository_tests-1c806b184497e4a7 \
+  bounded_admission:: expiration_prefilter_matches --test-threads=4
+```
+
+Schema prepare passed (12m07s including build-lock wait); SQLx reported `no queries
+found`, so no offline metadata changed. All repository queries here are dynamic.
+Later changes to the private reservation helper/SQL have no query macros or
+schema/API changes; final common/supervisor all-target Clippy checks their types
+and affected consumers. Final Clippy passed with `-D warnings` (10m32s including
+wait), as did formatting and whitespace. Logs:
+`/tmp/attune-durable-{prepare,clippy-final,fmt-final}.log`.
+
+Final PG16 repository tests passed **11/11** (7.67s), including the deliberately
+failed eligibility-page progress/revisit case. Supervisor tests passed **3/3**
+(3.29s), including cancellation through the slow physical fence and independent
+scheduling. Log: `/tmp/attune-durable-reserved-final16.log`. The quiet storage run
+passed **17/17** (15.57s), retaining the shared-file/NULL-newer/extreme-limit
+positive predicates and pin/identity/unknown-commit cases. Log:
+`/tmp/attune-durable-storage-quiet16.log`.
+
+PG18 uses those exact final executables, sequentially from `crates/common`, with
+`ATTUNE_TEST_RUN_ID=durable18` and the owned PG18 URL: maintenance executable with
+`bounded_metadata::`, supervisor executable with `artifact_empty_raw_pages
+housekeeping_defers physical_cleanup_keeps`, then storage executable with
+`bounded_admission:: expiration_prefilter_matches`, all with `--test-threads=4`.
+PG18 passed **11/11** repository (8.05s), **3/3** supervisor (3.28s), and
+**17/17** storage (13.80s), with zero failed/ignored tests. Logs:
+`/tmp/attune-durable-{reserved-final18,supervisor-final18,storage-quiet18}.log`.
+Final executable SHA-256 values before the panic-cleanup-only fixture follow-up:
+
+- maintenance: `712caec5a8e2bf70a96514d61963b0822a88507cf6a85ff9a7d72e28f625bfa9`
+- supervisor: `083d457c2459547bbbc24771c248521ea26990b7059256a8bb50f5a6518cee22`
+- storage: `1a345869fea140dae5d5b571fe6de7fd0a48b6aae8ca04e9fdb8a24119f2ad40`
+
+A PG18 generic-plan probe copied the table/index layout into a session-local
+temporary fixture and inserted 10,000 equal-created rows. With
+`plan_cache_mode=force_generic_plan`, the production raw predicate selected two
+rows beyond cursor 9,000 using the composite index (two heap fetches, three local
+buffer hits). Log: `/tmp/attune-durable-keyset-populated18-corrected.log`. This
+supports the index/query shape, not production-scale latency or throughput claims.
+An empty-table plan could choose the old created-only index; index choice depends
+on statistics. The initial populated probe omitted required `body_updated` and
+failed setup; its log is retained and is not passing evidence.
+
+Earlier runs and corrections remain disclosed:
+
+- `/tmp/attune-durable-test16.log`: 6/8; `/tmp/attune-durable-test18-corrected.log`:
+  8/10. Two new fixtures tried direct pin deletion, correctly rejected by the
+  cleanup guard. `dd3b1b7f` fixes them using completed owner cleanup and exclusive
+  evidence admission, preserving pin protection.
+- `/tmp/attune-durable-test18.log`: direct-binary invocation from repository root
+  failed before setup (helpers require crate cwd); corrected runs use crate cwd.
+- `/tmp/attune-durable-supervisor16.log`: 1/3; `f777d7b1` corrects timestamp
+  precision and advances both independently persisted retry deadlines. The
+  physical fence passed even in this run. No production budget was weakened.
+- Initial Clippy reported tuple type complexity; `05d9e136` adds a type alias.
+- `/tmp/attune-durable-combined16.log`: 44 common tests and 8 repository tests
+  passed on the earlier single-transaction variant; storage 16/17, with
+  `combined_cleanup_rolls_back_version_triggers_when_parent_cleanup_fails`
+  reporting `CommitUnknown` at its deadline. `/tmp/attune-durable-storage-final16.log`
+  passed that case but was 16/17 due to an observed-lock timeout in
+  `combined_cleanup_rolls_back_when_artifact_lock_defers_and_retries_the_whole_unit`.
+  Both invocations overlapped compilation after Cargo released its build lock.
+  The quiet 17/17 retry does not establish either failure as baseline. They remain
+  unclassified, alongside the two earlier milestone-2 continuation-delay failures.
+
+The pre-teardown leak audit found zero clients on both servers, zero PG18 test
+clones, and one PG16 clone from the earlier failed new scheduler assertion:
+`attune_db_durable16_f1bdf66a53c844cab2f814ac3d2642a2`. Its artifact ref was
+`owned_housekeeping_followup_raw_prefix`, identifying that failed fixture.
+The fixture lacked `with_cleanup_on_drop`; the follow-up adds the standard panic
+recovery guard while preserving explicit awaited cleanup on success. The exact
+failed-run clone was then dropped on the owned PG16 server. This is disclosed
+failure recovery, not a claim that every initial run cleaned itself normally.
+
+The panic-recovery-only follow-up is
+`a4366fd5a858adad32ae70170ee2e724a6439e1a`. On that source, the same supervisor
+Cargo command passed **3/3** on PG16 (13.72s) and the rebuilt executable passed
+**3/3** on PG18 (3.47s). Supervisor all-target Clippy with `-D warnings` passed
+again (43.69s including wait). Logs:
+`/tmp/attune-durable-supervisor-cleanup{16,18}.log` and
+`/tmp/attune-durable-supervisor-cleanup-clippy.log`. The rebuilt supervisor
+SHA-256 is `e6ccd8e1187314b9773d5b8e353abd6ec11ee07f786c75a1ff3879ef526f321a`.
+Formatting and whitespace passed again (`/tmp/attune-durable-fmt-complete.log`).
+Common runtime and repository-test sources are identical to the final 4f1465cd
+runs, so their PG16/18 and common Clippy results remain valid for this fixture-only
+follow-up. Subsequent source changes are this documentation report only.
+
+After those final runs exited, both owned servers reported **zero test clones
+and zero clients**, before server teardown. Their one run-owned template each
+was expected cached infrastructure. The exact two container IDs above were then
+removed with `docker rm -f -v`, including their anonymous volumes/templates.
+No task-owned server, test process, or psql shim remains; no default cluster or
+neighbor resource was altered. Logs remain under `/tmp/attune-durable-*` for parent
+review. The shared worktree retains only committed task source and build cache.
+
+Status remains **work in progress for parent Astra review**, not merge readiness.
+Final-head CI, production-scale performance and the previously disclosed Docker
+relay fixture omission / 58 unchanged base-manifest dependency-policy violations
+remain gaps. PR31 and later seal/cleanup/sensor/cache protocols remain separate.
 
 ## Slice 1: cheaper bounded maintenance, with the same locking contract
 
