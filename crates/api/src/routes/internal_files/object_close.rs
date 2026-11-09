@@ -12,6 +12,18 @@ fn conflict() -> Failure {
     )
 }
 
+fn selection_error(error: attune_common::Error) -> Failure {
+    match error {
+        attune_common::Error::InvalidState(_) => conflict(),
+        attune_common::Error::Database(sqlx::Error::Database(ref db))
+            if db.code().as_deref() == Some("P0001") =>
+        {
+            conflict()
+        }
+        error => map_repository_error(error),
+    }
+}
+
 struct Prepared {
     selected: SelectedLogClose,
     history: HistoricalBinding,
@@ -56,7 +68,8 @@ async fn prepare(
     headers: &HeaderMap,
     truncated: bool,
 ) -> Result<Prepared, Failure> {
-    let mut connection = state.db.acquire().await.map_err(map_sqlx_error)?.detach();
+    let mut connection = state.db.acquire().await.map_err(map_sqlx_error)?;
+    connection.close_on_drop();
     let mut tx = connection.begin().await.map_err(map_sqlx_error)?;
     if let Err(error) = LogStreamRepository::configure_close_phase(&mut tx).await {
         tx.rollback().await.map_err(map_sqlx_error)?;
@@ -81,7 +94,16 @@ async fn prepare(
             chrono::Utc::now() + chrono::Duration::minutes(5),
         )
         .await
-        .map_err(map_repository_error)?;
+        .map_err(selection_error)?;
+        if selected.published()
+            && (!stream.sealed
+                || stream.truncated != truncated
+                || version.body_state != Some(ArtifactBodyState::Ready)
+                || version.size_bytes != Some(stream.total_bytes)
+                || version.sha256.is_none())
+        {
+            return Err(conflict());
+        }
         let segments = LogStreamRepository::segments_with_conn(source.transaction(), stream.id)
             .await
             .map_err(map_repository_error)?;
@@ -97,6 +119,10 @@ async fn prepare(
     match result {
         Ok(prepared) => {
             source.commit().await?;
+            if !prepared.selected.published() && prepared.selected.deadline() <= chrono::Utc::now()
+            {
+                return Err(conflict());
+            }
             Ok(prepared)
         }
         Err(error) => {
@@ -155,7 +181,8 @@ async fn finish(
     headers: &HeaderMap,
     verified: &Verified,
 ) -> Result<(), Failure> {
-    let mut connection = state.db.acquire().await.map_err(map_sqlx_error)?.detach();
+    let mut connection = state.db.acquire().await.map_err(map_sqlx_error)?;
+    connection.close_on_drop();
     let mut tx = connection.begin().await.map_err(map_sqlx_error)?;
     if let Err(error) = LogStreamRepository::configure_close_phase(&mut tx).await {
         tx.rollback().await.map_err(map_sqlx_error)?;
@@ -181,7 +208,7 @@ async fn finish(
             chrono::Utc::now() - chrono::Duration::seconds(1),
         )
         .await
-        .map_err(map_repository_error)?;
+        .map_err(selection_error)?;
         if selected.revision() != p.selected.revision()
             || selected.input() != p.selected.input()
             || selected.input_sha256() != p.selected.input_sha256()
@@ -210,7 +237,7 @@ async fn finish(
                 .await?;
             LogStreamRepository::publish_close(source.transaction(), stream.id, &selected)
                 .await
-                .map_err(map_repository_error)?;
+                .map_err(selection_error)?;
             ArtifactVersionRepository::mark_body_ready_in_transaction(
                 source.transaction(),
                 version.id,
@@ -222,11 +249,23 @@ async fn finish(
             .map_err(map_repository_error)?
             .ok_or_else(conflict)?;
         }
-        source.recheck().await
+        source.recheck().await?;
+        if !selected.published() && p.selected.deadline() <= chrono::Utc::now() {
+            return Err(conflict());
+        }
+        Ok(selected.published())
     }
     .await;
     match result {
-        Ok(()) => source.commit().await,
+        Ok(already_published) => {
+            source.commit().await?;
+            // Acknowledged commit followed by pure deadline failure is never
+            // relabeled CommitUnknown or blindly retried.
+            if !already_published && verified.prepared.selected.deadline() <= chrono::Utc::now() {
+                return Err(conflict());
+            }
+            Ok(())
+        }
         Err(error) => {
             source.rollback().await?;
             Err(error)
@@ -270,6 +309,11 @@ pub(super) async fn seal(
             }
             result => result?,
         };
+        // This phase freshly authorized and matched the exact durable input.
+        // A published retry uses the earlier verified publication, without GET.
+        if prepared.selected.published() {
+            return Ok(StatusCode::OK);
+        }
         let verified = verify(
             state.blob_store.as_ref(),
             prepared,

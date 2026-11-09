@@ -5995,21 +5995,33 @@ mod tests {
 
     #[tokio::test]
     async fn split_route_releases_database_during_get_and_rechecks_authority() {
-        split_route_case(false).await;
+        split_route_case(false, 0).await;
     }
 
     #[tokio::test]
     async fn split_route_revoked_source_during_get_cannot_publish() {
-        split_route_case(true).await;
+        split_route_case(true, 0).await;
     }
 
-    async fn split_route_case(revoke_during_get: bool) {
+    #[tokio::test]
+    async fn split_route_encrypted_success() {
+        split_route_case(false, 1).await;
+    }
+
+    #[tokio::test]
+    async fn split_route_authenticated_incomplete_manifest_cannot_publish() {
+        split_route_case(false, 2).await;
+    }
+
+    async fn split_route_case(revoke_during_get: bool, mode: u8) {
+        let encrypted = mode > 0;
         use attune_common::repositories::delegated_execution::DelegatedExecutionRepository as Delegated;
         let mut config = Config::load_from_file(&format!(
             "{}/../../config.test.yaml",
             env!("CARGO_MANIFEST_DIR")
         ))
         .unwrap();
+        config.security.encryption_key = Some("0123456789abcdef0123456789abcdef".into());
         config.database.max_connections = 1;
         config.database.min_connections = 0;
         let database = TestDatabase::create(&config.database)
@@ -6062,7 +6074,7 @@ mod tests {
             LogStreamBackend::ObjectSegments,
             "text/plain".into(),
             Some(execution),
-            None,
+            encrypted.then(||serde_json::json!({"log_encoding":attune_common::runtime_read_log::ENCODING,"stream":"stdout"})),
             Some("worker".into()),
         )
         .await
@@ -6096,24 +6108,50 @@ mod tests {
         };
         let user = credential(60);
 
+        let mut headers = HeaderMap::new();
+        let body = if encrypted {
+            let key = state.config.security.encryption_key.as_deref().unwrap();
+            let frame = attune_common::runtime_read_log::encode(
+                key,
+                execution,
+                version.id,
+                0,
+                b"accepted bytes",
+            )
+            .unwrap();
+            let mut totals = attune_common::runtime_log_completion::FrameTotals::default();
+            totals.record(&frame, 14).unwrap();
+            let mut manifest = totals.manifest(execution, version.id).unwrap();
+            if mode == 2 {
+                manifest.frame_count += 1;
+            }
+            headers.insert(
+                "x-attune-log-final-manifest",
+                manifest.authenticate(key).unwrap().parse().unwrap(),
+            );
+            frame
+        } else {
+            b"accepted bytes".to_vec()
+        };
         commit_log_segment(
             State(state.clone()),
             RequireAuth(user.clone()),
             Path((version.id, 0)),
-            Body::from("accepted bytes"),
+            Body::from(body),
         )
         .await
         .unwrap();
         let task = tokio::spawn({
             let state = state.clone();
             let user = user.clone();
+            let headers = headers.clone();
             async move {
                 seal_log_stream(
                     State(state),
                     RequireAuth(user),
                     Path(version.id),
                     Query(SealLogQuery { truncated: false }),
-                    HeaderMap::new(),
+                    headers.clone(),
                 )
                 .await
                 .map(|r| r.into_response().status())
@@ -6131,6 +6169,17 @@ mod tests {
             attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut tx).await.unwrap();
             tx.rollback().await.unwrap();
         }).await.expect("size-one pool query and both graph modes must finish while GET is paused");
+        assert_status_error(
+            seal_log_stream(
+                State(state.clone()),
+                RequireAuth(user.clone()),
+                Path(version.id),
+                Query(SealLogQuery { truncated: true }),
+                headers.clone(),
+            )
+            .await,
+            StatusCode::CONFLICT,
+        );
         if revoke_during_get {
             let mut tx = state.db.begin().await.unwrap();
             Delegated::close(&mut tx, execution).await.unwrap();
@@ -6138,7 +6187,7 @@ mod tests {
         }
         release.notify_one();
         let result = task.await.unwrap();
-        if revoke_during_get {
+        if revoke_during_get || mode == 2 {
             assert!(result.is_err());
             let current = ArtifactVersionRepository::find_by_id(&state.db, version.id)
                 .await
@@ -6150,6 +6199,27 @@ mod tests {
             return;
         }
         assert_eq!(result.unwrap(), StatusCode::OK);
+        release.notify_one();
+        let mut refreshed = user.clone();
+        refreshed.claims.exp += 60;
+        assert_eq!(
+            seal_log_stream(
+                State(state.clone()),
+                RequireAuth(refreshed),
+                Path(version.id),
+                Query(SealLogQuery { truncated: false }),
+                headers.clone()
+            )
+            .await
+            .unwrap()
+            .into_response()
+            .status(),
+            StatusCode::OK
+        );
+        assert!(
+            futures::FutureExt::now_or_never(entered.notified()).is_none(),
+            "published retry must not GET"
+        );
         // A published retry must authenticate current authority, not historical JSON.
         let mut tx = state.db.begin().await.unwrap();
         Delegated::close(&mut tx, execution).await.unwrap();
@@ -6159,7 +6229,7 @@ mod tests {
             RequireAuth(user),
             Path(version.id),
             Query(SealLogQuery { truncated: false }),
-            HeaderMap::new()
+            headers.clone()
         )
         .await
         .is_err());

@@ -32,7 +32,7 @@ cross-table constraints. No session bypass exists. Identical published retries
 repeat current authorization and compare the selected input and verified result.
 
 Each object request runs in an owned task so waiter cancellation cannot drop an
-active phase. Each database phase owns a detached socket, local statement/lock
+active phase. Each database phase owns a pool-accounted socket marked for disposal, local statement/lock
 limits and a 15-second outer budget; uncertain cancellation disposes that socket.
 Helper errors await rollback within the phase. Commit acknowledgement errors use
 503 and one fresh authorized reconciliation attempt. A successful commit followed

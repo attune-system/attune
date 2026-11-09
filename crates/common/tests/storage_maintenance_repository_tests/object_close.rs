@@ -516,3 +516,119 @@ async fn selected_snapshot_retry_is_independent_of_session_timezone() {
     tx.rollback().await.unwrap();
     pool.cleanup().await.unwrap();
 }
+
+#[tokio::test]
+async fn expired_pin_requires_qualified_recovery_and_fences_old_owner() {
+    use attune_common::repositories::maintenance_admission::MaintenanceBudget;
+    let (pool, artifact, version, stream) = fixture().await;
+    let mut tx = pool.begin().await.unwrap();
+    Evidence::lock_capture(&mut tx).await.unwrap();
+    LogStreamRepository::lock(&mut tx, stream).await.unwrap();
+    let selected = LogStreamRepository::select_close(
+        &mut tx,
+        stream,
+        0,
+        &json!({"kind":"native_test"}),
+        &json!({"encoding":"plain"}),
+        false,
+        Utc::now() + Duration::milliseconds(100),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let expired: bool = sqlx::query_scalar(
+                "SELECT close_deadline<=clock_timestamp() FROM log_stream WHERE id=$1",
+            )
+            .bind(stream)
+            .fetch_one(&*pool)
+            .await
+            .unwrap();
+            if expired {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // The clock fences publication, never cleanup protection.
+    for query in [
+        format!("DELETE FROM artifact WHERE id={artifact}"),
+        format!("DELETE FROM artifact_version WHERE id={version}"),
+    ] {
+        rejected(&pool, query).await;
+    }
+    let budget = MaintenanceBudget::default();
+    let recovered = LogStreamRepository::recover_expired_closes_bounded(
+        &pool,
+        1,
+        &budget,
+        tokio::time::Instant::now() + budget.page_timeout,
+        &Default::default(),
+    )
+    .await;
+    assert_eq!(recovered.changed, 1, "{recovered:?}");
+    let resumed = select(&pool, stream, 2).await.unwrap();
+    assert_eq!(resumed.revision(), 3);
+    assert_eq!(resumed.input(), selected.input());
+    let mut tx = pool.begin().await.unwrap();
+    Evidence::lock_capture(&mut tx).await.unwrap();
+    assert!(
+        !LogStreamRepository::abandon_close(&mut tx, stream, selected.revision())
+            .await
+            .unwrap()
+    );
+    assert!(
+        LogStreamRepository::publish_close(&mut tx, stream, &selected)
+            .await
+            .is_err()
+    );
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn selected_empty_verified_publication_is_atomic_and_immutable() {
+    let (pool, _, version, stream_id) = fixture().await;
+    let selected = select(&pool, stream_id, 0).await.unwrap();
+    let stream = LogStreamRepository::find_by_artifact_version(&pool, version)
+        .await
+        .unwrap()
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let store = attune_common::blob_store::FilesystemBlobStore::new(directory.path()).unwrap();
+    let verified = attune_common::object_log_verification::verify(&store, &stream, &[], None)
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    Evidence::lock_capture(&mut tx).await.unwrap();
+    LogStreamRepository::lock(&mut tx, stream_id).await.unwrap();
+    LogStreamRepository::publish_close(&mut tx, stream_id, &selected)
+        .await
+        .unwrap();
+    ArtifactVersionRepository::mark_body_ready_in_transaction(
+        &mut tx,
+        version,
+        "segments:0",
+        verified.size(),
+        verified.sha256(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tx.commit().await.unwrap();
+    let published = select(&pool, stream_id, 1).await.unwrap();
+    assert!(published.published());
+    assert_eq!(published.input(), selected.input());
+    rejected(
+        &pool,
+        format!("UPDATE artifact_version SET sha256=repeat('a',64) WHERE id={version}"),
+    )
+    .await;
+    rejected(
+        &pool,
+        format!("UPDATE log_stream SET sealed=false WHERE id={stream_id}"),
+    )
+    .await;
+}

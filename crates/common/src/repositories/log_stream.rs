@@ -10,11 +10,15 @@ use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 pub struct SelectedLogClose {
     revision: i64,
     phase: String,
+    deadline: chrono::DateTime<chrono::Utc>,
     input: serde_json::Value,
     input_sha256: String,
 }
 
 impl SelectedLogClose {
+    pub fn deadline(&self) -> chrono::DateTime<chrono::Utc> {
+        self.deadline
+    }
     pub fn published(&self) -> bool {
         self.phase == "published"
     }
@@ -32,7 +36,7 @@ impl SelectedLogClose {
 pub struct LogStreamRepository;
 
 impl LogStreamRepository {
-    /// Transaction-local limits; the route owns a detached socket so a timed-out
+    /// Transaction-local limits; the route owns a pool-accounted socket marked for disposal so a timed-out
     /// phase/rollback disposes the session instead of returning uncertain state.
     pub async fn configure_close_phase(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
         sqlx::query("SELECT set_config('statement_timeout','5s',true),set_config('lock_timeout','5s',true),set_config('jit','off',true)")
@@ -85,13 +89,13 @@ impl LogStreamRepository {
                close_deadline=$6 FROM input WHERE s.id=$1 AND s.close_revision=$2 \
                AND (s.close_phase IS NULL OR s.close_phase='abandoned' \
                     OR (s.close_phase='closing' AND s.close_deadline<=clock_timestamp())) \
-             RETURNING close_revision AS revision,close_phase AS phase,close_input AS input,close_input_sha256 AS input_sha256",
+             RETURNING close_revision AS revision,close_phase AS phase,close_deadline AS deadline,close_input AS input,close_input_sha256 AS input_sha256",
         ).bind(stream).bind(expected_revision).bind(producer).bind(proof).bind(truncated).bind(deadline)
         .fetch_optional(&mut **tx).await?;
         let row = match row {
             Some(row) => Some(row),
             None => sqlx::query_as(
-                "SELECT close_revision AS revision,close_phase AS phase,close_input AS input,close_input_sha256 AS input_sha256 \
+                "SELECT close_revision AS revision,close_phase AS phase,close_deadline AS deadline,close_input AS input,close_input_sha256 AS input_sha256 \
                  FROM log_stream WHERE id=$1 AND close_revision IN ($2,$2+1) AND close_phase IN ('closing','published') \
                  AND (close_phase='published' OR close_deadline>clock_timestamp()) AND close_input=jsonb_build_object( \
                    'snapshot',object_log_close_snapshot($1),'producer',$3::jsonb, \
