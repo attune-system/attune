@@ -294,9 +294,10 @@ pub(crate) async fn probe<T>(
 pub(crate) async fn discovery<T>(
     pool: &PgPool,
     budget: &MaintenanceBudget,
+    deadline: Instant,
     work: impl for<'c> FnOnce(&'c mut PgConnection) -> BoxFuture<'c, Result<T>>,
 ) -> Result<T> {
-    let end = Instant::now() + budget.page_timeout;
+    let end = deadline.min(Instant::now() + budget.page_timeout);
     let cancel = CancellationToken::new();
     let mut conn = limited(end, &cancel, async { Ok(pool.acquire().await?.detach()) }).await?;
     let mut tx = limited(end, &cancel, async { Ok(conn.begin().await?) }).await?;

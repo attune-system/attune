@@ -811,7 +811,10 @@ This work is independent of graph-admission lock ordering and reclamation budget
 frozen pass upper bound. The composite index supports oldest-first raw visits,
 including timestamp ties; this state does not reuse release-phase or object-body
 cursors. Each call visits at most the configured batch size, capped at 256,
-before retention/evidence predicates. It returns every eligible row from that
+before retention/evidence predicates. The raw reservation commits before a
+separate bounded eligibility read, sharing one absolute page deadline. A failed
+eligibility read cannot trap later pages; the skipped reservation is revisited
+on wrap. It returns every eligible row from that
 raw page, with no smaller output limit. Exact reporting count/find APIs retain
 their global candidate set and oldest-first ordering.
 

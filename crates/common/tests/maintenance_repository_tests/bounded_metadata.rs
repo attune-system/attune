@@ -512,7 +512,7 @@ async fn artifact_discovery_unconfirmed_state_commit_returns_no_candidates() {
     sqlx::query("INSERT INTO artifact_version(artifact,version,created) VALUES($1,1,NOW()-interval '2 days')")
         .bind(id).execute(db.pool()).await.unwrap();
     // Terminate this disposable fixture's scanning backend during COMMIT,
-    // after it has constructed a positive eligible page but before acknowledgment.
+    // after it has reserved a positive raw page but before acknowledgment.
     sqlx::raw_sql("CREATE FUNCTION owned_discovery_disconnect() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_terminate_backend(pg_backend_pid()); RETURN NEW; END $$;
         CREATE CONSTRAINT TRIGGER owned_discovery_disconnect AFTER UPDATE ON artifact_retention_discovery DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION owned_discovery_disconnect();")
         .execute(db.pool()).await.unwrap();
@@ -640,5 +640,53 @@ async fn artifact_discovery_does_not_authorize_changed_pin_or_physical_identity(
         "only freshly locked identity can be used for physical deletion"
     );
     tx.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn artifact_failed_eligibility_page_keeps_durable_raw_progress() {
+    let db = setup_db().await;
+    let id = artifact(db.pool()).await;
+    sqlx::query("UPDATE artifact SET retention_policy='days',retention_limit=1 WHERE id=$1")
+        .bind(id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO artifact_version(artifact,version,created) SELECT $1,n,NOW()-interval '2 days' FROM generate_series(1,4) n")
+        .bind(id).execute(db.pool()).await.unwrap();
+    sqlx::raw_sql("ALTER FUNCTION file_evidence_version_eligible(BIGINT) RENAME TO owned_real_eligibility;
+        CREATE FUNCTION file_evidence_version_eligible(v BIGINT) RETURNS BOOLEAN LANGUAGE plpgsql STABLE AS $$ BEGIN RAISE EXCEPTION 'owned eligibility failure'; END $$;")
+        .execute(db.pool()).await.unwrap();
+    assert!(MaintenanceRepository::expired_artifact_candidates_bounded(
+        db.pool(),
+        2,
+        &MaintenanceBudget::default()
+    )
+    .await
+    .is_err());
+    let last: i64 = sqlx::query_scalar("SELECT last_id FROM artifact_retention_discovery")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    sqlx::raw_sql("DROP FUNCTION file_evidence_version_eligible(BIGINT); ALTER FUNCTION owned_real_eligibility(BIGINT) RENAME TO file_evidence_version_eligible")
+        .execute(db.pool()).await.unwrap();
+    let page = MaintenanceRepository::expired_artifact_candidates_bounded(
+        db.pool(),
+        2,
+        &MaintenanceBudget::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.versions.len(), 2);
+    assert!(page.versions.iter().all(|v| v.id > last));
+    assert!(!page.pending);
+    let revisited = MaintenanceRepository::expired_artifact_candidates_bounded(
+        db.pool(),
+        2,
+        &MaintenanceBudget::default(),
+    )
+    .await
+    .unwrap();
+    assert!(revisited.versions.iter().all(|v| v.id <= last));
     db.cleanup().await.unwrap();
 }

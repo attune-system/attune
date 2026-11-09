@@ -373,9 +373,11 @@ pass, and visits at most `clamp(batch_size,1,256)` raw rows before retention or
 evidence predicates. All eligible rows in the raw page are returned, including
 when fewer than the requested limit survive filtering. Progress includes empty
 filtered pages; completion wraps on the next call. Reporting count/find and their
-global oldest-first contracts are unchanged. Discovery results are released only
-after an acknowledged bounded commit, using detached-session ownership; a failed
-or cancelled scan cannot expose a candidate page. Progress is advisory, so rows
+global oldest-first contracts are unchanged. Raw reservations commit before a separate bounded eligibility read, using one
+absolute page deadline and detached-session ownership. A repeatedly failing
+eligibility page therefore cannot trap later raw pages. Discovery results are
+released only after an acknowledged reservation and successful eligibility read;
+a failed or cancelled scan cannot expose a candidate page. Progress is advisory, so rows
 skipped by cancellation after a commit, late commits, changed policy/pins or
 metadata are revisited on later passes. This adds no deletion authority.
 

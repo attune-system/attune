@@ -232,7 +232,8 @@ impl MaintenanceRepository {
         limit: i64,
         budget: &MaintenanceBudget,
     ) -> Result<ArtifactDiscoveryPage> {
-        maintenance_admission::discovery(pool, budget, move |conn| Box::pin(async move {
+        let deadline = Instant::now() + budget.page_timeout;
+        let (ids, scanned, pending) = maintenance_admission::discovery(pool, budget, deadline, move |conn| Box::pin(async move {
             type Cursor = (DateTime<Utc>, i64);
             type ScanState = (Option<DateTime<Utc>>, Option<i64>, Option<DateTime<Utc>>, Option<i64>);
             let (mut last_created, mut last_id, mut high_created, mut high_id): ScanState =
@@ -254,6 +255,16 @@ impl MaintenanceRepository {
                 .bind(last_created).bind(last_id).bind(high_created).bind(high_id)
                 .bind(limit.clamp(1,256)).fetch_all(&mut *conn).await?;
             let ids: Vec<i64> = raw.iter().map(|v| v.1).collect();
+            let next = raw.last().copied();
+            let (next_created,next_id) = next.map(|v| (Some(v.0),Some(v.1))).unwrap_or((high_created,high_id));
+            sqlx::query("UPDATE artifact_retention_discovery SET last_created=$1,last_id=$2,high_created=$3,high_id=$4 WHERE singleton")
+                .bind(next_created).bind(next_id).bind(high_created).bind(high_id).execute(conn).await?;
+            Ok((ids, raw.len(), (next_created,next_id)!=(high_created,high_id)))
+        })).await?;
+        // Reserve before expensive predicates: a persistent eligibility timeout
+        // must not trap later raw pages. Reservations are advisory and revisited
+        // on wrap; only an acknowledged reservation can reach this read phase.
+        let versions = maintenance_admission::probe(pool, budget, deadline, &CancellationToken::new(), move |conn| Box::pin(async move {
             let versions = sqlx::query_as(&format!("WITH raw AS MATERIALIZED (
                     SELECT id,artifact,version,file_path,body_state,object_key,provider_version,created
                     FROM artifact_version WHERE id=ANY($1)),
@@ -262,12 +273,13 @@ impl MaintenanceRepository {
                 FROM expired av WHERE file_evidence_version_eligible(av.id) ORDER BY av.created,av.id",
                 expired_artifact_version_predicate()))
                 .bind(&ids).fetch_all(&mut *conn).await?;
-            let next = raw.last().copied();
-            let (next_created,next_id) = next.map(|v| (Some(v.0),Some(v.1))).unwrap_or((high_created,high_id));
-            sqlx::query("UPDATE artifact_retention_discovery SET last_created=$1,last_id=$2,high_created=$3,high_id=$4 WHERE singleton")
-                .bind(next_created).bind(next_id).bind(high_created).bind(high_id).execute(conn).await?;
-            Ok(ArtifactDiscoveryPage { versions, scanned: raw.len(), pending: (next_created,next_id)!=(high_created,high_id) })
-        })).await
+            Ok(versions)
+        })).await?;
+        Ok(ArtifactDiscoveryPage {
+            versions,
+            scanned,
+            pending,
+        })
     }
 
     /// The caller retains physical admission until both deletion and parent
