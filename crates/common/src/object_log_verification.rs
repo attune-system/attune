@@ -10,6 +10,8 @@ use sha2::{Digest, Sha256};
 pub enum VerificationError {
     #[error("Invalid accepted log frontier")]
     Frontier,
+    #[error("Encrypted log final bytes do not match the authenticated manifest")]
+    Manifest,
     #[error(transparent)]
     Storage(#[from] BlobStoreError),
     #[error(transparent)]
@@ -73,7 +75,7 @@ pub async fn verify(
         input.manifest.version != stream.artifact_version
             || input.manifest.ciphertext_bytes != frontier as u64
     }) {
-        return Err(VerificationError::Frontier);
+        return Err(VerificationError::Manifest);
     }
     let mut frames = encrypted.as_ref().map(|input| {
         FrameVerifier::new(
@@ -118,7 +120,7 @@ pub async fn verify(
     let sha256 = crate::blob_store::encode_digest(&total_hash.finalize().into());
     if let Some(input) = encrypted {
         if input.manifest.ciphertext_sha256 != sha256 {
-            return Err(BlobStoreError::DigestMismatch.into());
+            return Err(VerificationError::Manifest);
         }
         frames.expect("encrypted verifier").finish(input.manifest)?;
     }
@@ -296,6 +298,18 @@ mod tests {
             .await
             .unwrap();
         let mut wrong = manifest.clone();
+        wrong.ciphertext_sha256 = "0".repeat(64);
+        assert!(matches!(
+            verify(&store, &stream, &segments, Some(input(key, &wrong))).await,
+            Err(VerificationError::Manifest)
+        ));
+        wrong = manifest.clone();
+        wrong.ciphertext_bytes += 1;
+        assert!(matches!(
+            verify(&store, &stream, &segments, Some(input(key, &wrong))).await,
+            Err(VerificationError::Manifest)
+        ));
+        wrong = manifest.clone();
         wrong.frame_count += 1;
         assert!(verify(&store, &stream, &segments, Some(input(key, &wrong)))
             .await

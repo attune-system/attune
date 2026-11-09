@@ -107,3 +107,34 @@ a database generation alone cannot fence delayed unlink.
 PR31 `c067e88573529466f40849a7b58325a8e4aaa704` is a task-branch dependency,
 merged normally with authorship preserved. Its bounded writer retries, independent
 stdout/stderr draining/outcomes and verified EOF authorization/audit are retained.
+
+## Storage verifier continuation (still incomplete)
+
+`object_log_verification::verify` now supplies a storage-only full-byte primitive
+used by the existing object seal branch. Its arguments contain storage, a stream
+snapshot, ordered segment snapshots, and optional crypto-only inputs. No AppState,
+SQLx owner, pool or FileMutationProof enters that module. Private result fields
+are constructed only after exact-provider full reads reach successful EOF,
+per-segment size/digest checks, concatenated hashing, and encrypted frame/manifest
+completion. The result is byte evidence, **not a publication capability** and is
+not yet bound to a committed SelectedLogClose. Read routes and metrics are unchanged.
+The caller still retains the old transaction across the verifier: this change
+alone does not reduce the production lock scope.
+
+Forward migration `005` pins the existing snapshot function's TimeZone to UTC.
+It does not edit applied migrations or rewrite selected input/hash identities.
+Selections made before this migration with non-UTC segment timestamp projections
+can still conflict safely; no silent conversion or permanent-closure reset is
+provided. The cross-TimeZone test covers new selections with a real segment.
+
+Activation remains blocked by unimplemented fresh-source ownership and atomic
+final publication, rather than by provider verification. In particular, sensor
+fence validation in authentication middleware is not a final-transaction fence;
+`authorize_version_mutation` has no sensor-generation branch. Native workflow
+`require_native_log` checks workflow existence without locking that source row.
+Simply calling the existing helper again does not establish all requested source
+checks after target waits. These must be corrected and tested before introducing
+the finalizer or replacing the selected-close SQL publication vetoes. No claim is
+made that these gaps require a new authority format or retention FK. Typed actual
+producer projections, prepare/final commit reconciliation, publication consistency,
+revision/deadline recovery and the requested route races remain unimplemented.

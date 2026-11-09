@@ -251,3 +251,13 @@ Do not run only tests with lock in their filename: implicit triggers, caller
 transactions, broker delivery, and read authorization carry much of the safety
 contract. Report actual results separately from this predictive inventory. No
 test thresholds, assertions, fixtures, or skips were changed by this audit.
+
+## Storage verifier continuation
+
+The object seal route now calls a storage-only verifier while retaining its old
+transaction. Pure adversarial reader tests establish byte validation only; they
+must not be counted as proof of pool-size-one progress, admission release, fresh
+producer authority, committed close binding or publication/recovery races. The
+new database TimeZone retry case uses a nonempty stream, so timestamp rendering
+actually participates in the selected-input hash. Historical non-UTC selections
+are not rewritten. Selected-close publication remains disabled.

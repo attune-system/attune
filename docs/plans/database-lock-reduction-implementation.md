@@ -1075,3 +1075,107 @@ shims were removed. No production or unowned resource was changed.
 This does not complete the split sealing route, broader consumer execution,
 required final-head CI, or any previously disclosed validation gaps. Astra has
 not yet re-reviewed the expiry correction.
+
+#### Storage-only verifier continuation (incomplete requested milestone)
+
+Starting head: `b130aad5f38631c0a75129276d0e67804d7acdd4`; sole writer used
+only the existing task checkout. Checkpoint
+`307cd76421251a6de49ea81712c8aa10e6286444` adds the storage-only verifier,
+private byte-result construction, adversarial unit cases and forward migration
+005 with a nonempty cross-TimeZone close retry case. The subsequent route edit
+uses that verifier in the existing ObjectSegments branch. It removes duplicated
+frontier logic, checks segment stream identity and size/digest independently of
+provider adapters, consumes successful EOF even at the expected length, computes
+the concatenated SHA256, and completes encrypted frame/manifest verification.
+Read-route metrics and shared-file snapshot/flock behavior are unchanged.
+
+**The requested functional prepare/verify/finalize milestone is NOT complete.**
+The production caller still owns its transaction during GET/hash/frame work;
+there is no connection-free route guarantee. No publication transition was
+activated, no generic SQL bypass added, and no old fence removed. The result is
+byte evidence only, not a committed-close-bound publication capability. Typed
+actual producer projection, fresh final owner, atomic SQL publication consistency,
+unknown prepare/final COMMIT reconciliation and bounded recovery are unfinished.
+
+Concrete source gaps discovered while tracing fresh authorization:
+`authorize_version_mutation` has no sensor-generation branch; sensor current-fence
+validation occurs in authentication middleware before the handler. A generation
+can therefore change after that check and before a hypothetical split finalizer.
+`require_native_log` validates selection and does an unlocked workflow-existence
+read; this alone supplies neither a native producer/attempt projection nor the
+required source fence after target waits. Reusing old proof JSON or manufacturing
+a worker permit would not close either gap. They require actual source locking,
+after-wait freshness and negative race coverage before final publication is safe.
+These are implementation gaps, not a claim that new retention FKs, formats or
+physical PUT settlement are prerequisites. Existing selected-close vetoes remain
+coherent and fail closed.
+
+Migration 005 sets only the snapshot SQL function's TimeZone option to UTC.
+Applied migration bytes and old immutable selected input/hash values are untouched.
+New selections retry identically across session TimeZones. Historical selected
+non-UTC timestamps can still conflict safely; automatic conversion/resumption
+of those identities is not supplied. Never clear permanent closure to work around
+that conflict.
+
+Validation provenance: tested source is checkpoint 307cd764 plus the saved route
+and documentation patch at
+`/tmp/attune-verifier-validation-cpvfp9sf/tested-source.patch` (SHA256 sidecar and
+head file adjacent). Storage binaries were built from that snapshot. During the
+storage run, a verifier/API-only correction preserved the old forbidden response
+for authenticated final-manifest mismatches and added explicit error-variant
+assertions. That later patch is `final-source.patch` with a SHA256 sidecar in the
+same directory; schema/lint/API builds consume it. Storage repository tests do
+not call this verifier, and their Rust/SQL/fixture source remained unchanged,
+so those results are reused for the final verifier-only correction. The focused command `cargo test -p attune-common --lib object_log_verification::tests -- --test-threads=4`
+passed **4/4**, 1287 filtered, zero ignored; log
+`/tmp/attune-verifier-unit.log`. Initial compilation failed on an unavailable hex
+crate, ambiguous test conversion and a test closure lifetime; corrected by sharing
+the existing digest codec and using explicit test lifetimes. Those compilation
+failures are not quiet reruns or classifications of earlier timing failures.
+
+PG16/18 storage/API, schema and lint validation results and owned-resource cleanup
+are recorded below after the sequential runner finishes. Earlier disclosed
+CommitUnknown/timing failures, Docker relay packaging omission, base-manifest
+58 dependency-policy failures, successful-COMMIT/lost-ACK gap, mixed eligibility
+scheduling gap, broader consumers, final-head CI and Astra review remain open.
+Full physical PUT settlement, forgotten multipart staging, post-retention key
+recreation and native filesystem retirement remain explicitly outside A.
+
+Continuation validation results: owned host-fallback PG16/18 storage target
+**38/38 each**, zero ignored/filtered (97.17s / 67.21s). API
+`internal_files::tests::` **20/20 each**, zero ignored and 479 filtered per run
+(57.38s / 33.09s). The existing API one-connection concurrency test remains an
+old-transaction-path test, not proof of a paused GET releasing admission/pool.
+The added storage test proves selection/retry under Honolulu and Kathmandu session
+TimeZones with an actual accepted segment. No budgets or old expectations changed.
+
+Commands and timings are recorded exactly in
+`/tmp/attune-verifier-validation-state.json`, driver
+`/tmp/attune-verifier-validation.py`, logs
+`/tmp/attune-verifier-validation-cpvfp9sf`. Builds/tests ran sequentially. Both
+owned databases were bootstrapped with `make db-test-setup`; storage/API executables
+ran from their respective crate directories with unique run IDs (`verify16`,
+`verify18`, `verifyapi16`, `verifyapi18`) and `--nocapture --test-threads=4`.
+`DATABASE_URL=<owned-pg18> SQLX_OFFLINE=false cargo sqlx prepare --workspace -- --all-targets`
+passed (227.03s, no queries/offline metadata changes).
+`cargo clippy -p attune-common -p attune-api --all-targets -- -D warnings`
+passed (199.37s). API test build passed (740.80s); storage build passed (290.18s).
+The first formatting/diff checks passed before the small verifier-only error
+correction; final formatting/whitespace is repeated at the final checkpoint.
+These passing runs do not classify or erase any earlier reported failures.
+
+Cleanup is confirmed in the JSON: zero test clones after storage and again after
+API on each owned server. Containers `929b9710afda` (PG16) and `cd605d62cd15`
+(PG18), their anonymous volumes, and both temporary psql shims were removed.
+No production/unowned resource, original dirty checkout, PR, remote branch or
+external message was changed. No Astra review was requested by this writer.
+Final-head CI and the full functional milestone remain pending.
+
+Final verifier rerun after the manifest-error correction:
+`cargo test -p attune-common --lib object_log_verification::tests -- --test-threads=4`
+passed **4/4**, zero ignored, 1287 filtered, build 3m15s; log
+`/tmp/attune-verifier-final-unit.log`. It includes explicit typed rejection of
+manifest size/hash mismatches so the API preserves its prior forbidden response.
+Final code diff and SHA256 are `final-code.patch` / `final-code.patch.sha256`,
+with storage/API executable SHA256 in `executable-sha256.json`, under the same
+validation log directory. Only this documentation changed after the final rerun.

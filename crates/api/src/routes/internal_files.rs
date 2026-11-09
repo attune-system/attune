@@ -2251,18 +2251,41 @@ async fn seal_log_stream(
                 let segments = LogStreamRepository::segments_with_conn(&mut transaction, stream.id)
                     .await
                     .map_err(map_repository_error)?;
-                validate_log_snapshot(&stream, &segments)?;
-                let mut reader = stream_log_segments(&state, segments, None, false)
-                    .map_err(map_log_stream_read_error)?;
-                let mut hasher = Sha256::new();
-                while let Some(chunk) = futures::StreamExt::next(&mut reader).await {
-                    let chunk = chunk.map_err(map_blob_error)?;
-                    if let Some(verifier) = &mut verifier {
-                        verifier.update(&chunk).map_err(map_transport_error)?;
+                let verified = attune_common::object_log_verification::verify(
+                    state.blob_store.as_ref(),
+                    &stream,
+                    &segments,
+                    proof.as_ref().map(|proof| {
+                        attune_common::object_log_verification::EncryptedInput {
+                            key: state
+                                .config
+                                .security
+                                .encryption_key
+                                .as_deref()
+                                .expect("validated encryption key"),
+                            manifest: &proof.manifest,
+                            plaintext_cap: proof.plaintext_cap,
+                            ciphertext_cap: proof.ciphertext_cap,
+                        }
+                    }),
+                )
+                .await
+                .map_err(|error| match error {
+                    attune_common::object_log_verification::VerificationError::Storage(error) => {
+                        map_blob_error(error)
                     }
-                    hasher.update(&chunk);
-                }
-                (stream.total_bytes, hex_digest(&hasher.finalize().into()))
+                    attune_common::object_log_verification::VerificationError::Encrypted(error) => {
+                        map_transport_error(error)
+                    }
+                    error @ attune_common::object_log_verification::VerificationError::Manifest => {
+                        (StatusCode::FORBIDDEN, error.to_string())
+                    }
+                    error => (StatusCode::CONFLICT, error.to_string()),
+                })?;
+                // The storage-only verifier already consumed and authenticated
+                // encrypted frames. Shared-file retains its existing verifier.
+                verifier = None;
+                (verified.size(), verified.sha256().to_owned())
             }
             LogStreamBackend::SharedFile => {
                 let (_, size, digest) = shared_snapshot.as_ref().expect("shared snapshot");
@@ -2315,11 +2338,11 @@ async fn seal_log_stream(
                     "Encrypted log final bytes do not match the authenticated manifest".into(),
                 ));
             }
-            verifier
-                .take()
-                .expect("encrypted verifier")
-                .finish(&proof.manifest)
-                .map_err(map_transport_error)?;
+            if let Some(verifier) = verifier.take() {
+                verifier
+                    .finish(&proof.manifest)
+                    .map_err(map_transport_error)?;
+            }
             effect
                 .ensure_fresh_on(&mut transaction)
                 .await
@@ -2649,38 +2672,6 @@ async fn encrypted_log_seal_proof(
         manifest,
         authenticated,
     }))
-}
-
-fn validate_log_snapshot(
-    stream: &LogStream,
-    segments: &[LogSegment],
-) -> Result<(), (StatusCode, String)> {
-    let mut offset = 0_i64;
-    for (expected_sequence, segment) in segments.iter().enumerate() {
-        let expected_end = offset.checked_add(segment.size_bytes).ok_or_else(|| {
-            (
-                StatusCode::CONFLICT,
-                "Log segment offsets overflow".to_string(),
-            )
-        })?;
-        if segment.sequence != expected_sequence as i64
-            || segment.byte_start != offset
-            || segment.byte_end != expected_end
-        {
-            return Err((
-                StatusCode::CONFLICT,
-                "Log segments are not contiguous and ordered".to_string(),
-            ));
-        }
-        offset = segment.byte_end;
-    }
-    if stream.next_sequence != segments.len() as i64 || stream.total_bytes != offset {
-        return Err((
-            StatusCode::CONFLICT,
-            "Log stream metadata does not match its segments".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 /// Structural path validation is not an authority grant. Purpose-specific worker
