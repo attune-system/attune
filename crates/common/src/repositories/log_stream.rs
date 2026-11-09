@@ -252,11 +252,24 @@ impl LogStreamRepository {
                 "log flush limits must be greater than zero",
             ));
         }
+        let max_unflushed_bytes = i64::try_from(max_unflushed_bytes)
+            .map_err(|_| Error::validation("log byte limit is too large"))?;
+        let max_unflushed_milliseconds = i64::try_from(max_unflushed_milliseconds)
+            .map_err(|_| Error::validation("log time limit is too large"))?;
         let mut tx = pool.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtext('log_stream'), hashtext($1::text))")
             .bind(artifact_version)
             .execute(&mut *tx)
             .await?;
+        // A published stream is a valid retry, not a new initialization. Read it
+        // under the same per-version admission instead of firing INSERT guards
+        // (and creating a needless no-op UPDATE) on the existing Ready parent.
+        if let Some(stream) =
+            Self::find_by_artifact_version_with_conn(&mut tx, artifact_version).await?
+        {
+            tx.commit().await?;
+            return Ok(stream);
+        }
         let query = format!(
             "INSERT INTO log_stream (artifact_version, backend, max_unflushed_bytes, max_unflushed_milliseconds) \
              VALUES ($1, $2, $3, $4) ON CONFLICT (artifact_version) DO UPDATE \
@@ -265,14 +278,8 @@ impl LogStreamRepository {
         let stream = sqlx::query_as(&query)
             .bind(artifact_version)
             .bind(backend)
-            .bind(
-                i64::try_from(max_unflushed_bytes)
-                    .map_err(|_| Error::validation("log byte limit is too large"))?,
-            )
-            .bind(
-                i64::try_from(max_unflushed_milliseconds)
-                    .map_err(|_| Error::validation("log time limit is too large"))?,
-            )
+            .bind(max_unflushed_bytes)
+            .bind(max_unflushed_milliseconds)
             .fetch_one(&mut *tx)
             .await?;
         tx.commit().await?;

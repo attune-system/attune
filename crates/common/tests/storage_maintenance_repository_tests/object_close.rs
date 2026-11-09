@@ -621,6 +621,24 @@ async fn selected_empty_verified_publication_is_atomic_and_immutable() {
     let published = select(&pool, stream_id, 1).await.unwrap();
     assert!(published.published());
     assert_eq!(published.input(), selected.input());
+    // A lost seal response must not make workflow initialization fail on Ready.
+    let existing = LogStreamRepository::create(&pool, version, 2048, 1000)
+        .await
+        .unwrap();
+    assert_eq!(existing.id, stream_id);
+    assert!(existing.sealed);
+    assert_eq!(existing.max_unflushed_bytes, 1024);
+    assert_eq!(existing.max_unflushed_milliseconds, 500);
+    // Returning an existing stream must not skip the original input validation.
+    assert!(LogStreamRepository::create(&pool, version, 0, 500)
+        .await
+        .is_err());
+    assert!(LogStreamRepository::create(&pool, version, u64::MAX, 500)
+        .await
+        .is_err());
+    let after_retry = select(&pool, stream_id, 1).await.unwrap();
+    assert_eq!(after_retry.revision(), published.revision());
+    assert_eq!(after_retry.input_sha256(), published.input_sha256());
     rejected(
         &pool,
         format!("UPDATE artifact_version SET sha256=repeat('a',64) WHERE id={version}"),

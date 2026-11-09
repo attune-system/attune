@@ -319,3 +319,10 @@ not inferred from successful statements. Target contention/DB unavailability mus
 remain retryable503 through actual source-owner routes, while permission denial
 stays403. Synthetic SQL fixtures verify consistency shape only; they do not prove
 runtime authority or provider bytes.
+
+
+Published initialization is idempotent only through the pool-based get-or-create
+API: an existing Ready stream is returned under per-version admission, retaining
+its limits and lifecycle. Strict direct INSERT still requires Pending. Workflow
+lost-seal-response recovery must exercise get-or-create before the replayed seal;
+otherwise a valid idempotent endpoint alone does not establish delivery recovery.

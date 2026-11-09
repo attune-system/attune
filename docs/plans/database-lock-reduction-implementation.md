@@ -1502,3 +1502,50 @@ The two failed runs' owned containers/volumes/shims were removed. The current
 run's two disposable servers remain owned and active, with unconditional driver
 cleanup; do not report them removed until the driver records it. No production,
 unowned checkout, deployed service or external data was changed.
+
+
+## Published get-or-create retry correction (work in progress)
+
+Astra's read-only re-review of `e93566fa` confirms the four integrated-lifecycle
+findings addressed in source and finds no mutation-policy widening in object
+source discovery. It identifies one P2 regression: the strict INSERT initializer
+runs before ON CONFLICT, so the pool-based get-or-create cannot return an existing
+Ready/published stream. Workflow dispatch invokes that method on retries after a
+lost seal response or dispatcher restart, preventing recovery. The connection-
+scoped create method is a separate INSERT-only API; inspecting only that path
+missed the pool-based upsert when the initializer was added.
+
+The pool-based method now reads an existing stream under its existing per-version
+advisory lock and commits that read before returning. New streams still go through
+the strict initializer. Existing backend, limits, frontier, close identity and
+published state stay unchanged; no no-op UPDATE or lifecycle reset is needed.
+Zero/overflow limit validation is preserved before the early return. The existing
+verified-empty publication test now additionally asserts Ready-stream reuse,
+immutable configuration/revision/hash and invalid-limit rejection. These extra
+assertions and the workflow lost-seal-response scenario are not yet runtime passes.
+
+The preceding frozen `e93566fa` binaries completed the safety validation in
+`/tmp/attune-hardening-final-state.json`: PG16/18 close12/12 each, API/error31/31
+each and revised recorded contention1/1 each, four workers and zero ignored.
+Other31/473/165 tests were filtered, not passed. Process HTTP403 remains expected;
+the process Source helper returns503 under its blocked artifact target and the
+allowed worker-delivery HTTP route returns503 after both bounded attempts. The
+rest of that fixture subsequently seals and replays successfully once unblocked.
+This is not successful-COMMIT/lost-ACK fault injection.
+
+That runner's workspace SQLx prepare (229.44s) and common/API all-target Clippy
+with warnings denied (199.07s) passed, as did formatting/diff checks. Those static
+checks also consumed the uncommitted getter/test change after its application;
+the completed runtime cases above were compiled before that change and do NOT
+include the newly added getter assertions. No migration SQL changed during that
+run. Both exact owned servers/volumes/shims were removed after zero-clone checks.
+Earlier fixture failures remain in the prior records, and earlier unclassified
+performance/CommitUnknown failures remain unclassified.
+
+A new committed-source run will build the updated common repository target and
+executor lib, run all close cases plus the workflow log module (including
+lost_seal_response_is_replayed_safely) on fresh owned PG16/18 servers, and check
+schema/lint. Its driver is `/tmp/attune-getorcreate-validation.py`; results and
+resource ownership will be recorded before this correction is certified. No
+production changes, deployment or merge occurred. All other acceptance gaps,
+including real lost-ACK and actual finalizer-wait/producer coverage, remain open.
