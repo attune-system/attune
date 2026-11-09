@@ -1039,6 +1039,17 @@ async fn runtime_log_download_audit_requires_full_authorized_eof() -> Result<()>
     ctx.flush_audit().await?;
     assert_eq!(AuditRepository::search(&ctx.pool, &filters).await?.len(), 1);
 
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::RANGE,
+        axum::http::HeaderValue::from_static("bytes=999999-"),
+    );
+    let response = ctx.get_with_headers(&path, ctx.token(), headers).await?;
+    assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert!(!response.bytes().await?.is_empty());
+    ctx.flush_audit().await?;
+    assert_eq!(AuditRepository::search(&ctx.pool, &filters).await?.len(), 1);
+
     let response = ctx.get(&path, ctx.token()).await?;
     let mut body = response.into_response().into_body().into_data_stream();
     assert!(body.next().await.ok_or("missing log bytes")?.is_ok());

@@ -2200,8 +2200,9 @@ fn audit_log_download_eof(
     response: axum::response::Response,
 ) -> axum::response::Response {
     use futures::TryStreamExt;
-    // EOF of a range proves delivery of that range, not the complete log.
-    if response.status() == StatusCode::PARTIAL_CONTENT {
+    // Only a full successful response can prove delivery of the complete log.
+    // Range EOF and error-body EOF do not represent a full log download.
+    if response.status() != StatusCode::OK {
         return response;
     }
 
