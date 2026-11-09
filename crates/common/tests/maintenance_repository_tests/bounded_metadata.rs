@@ -350,7 +350,13 @@ async fn artifact_discovery_crosses_empty_pages_freezes_pass_and_wraps() {
     sqlx::query("INSERT INTO artifact_version(artifact,version,created) VALUES ($1,4,NOW()-interval '1 day')")
         .bind(id).execute(db.pool()).await.unwrap();
     let mut found = Vec::new();
-    for _ in 0..4 {
+    for arrival in 0..4 {
+        sqlx::query("INSERT INTO artifact_version(artifact,version,created) VALUES($1,$2,NOW())")
+            .bind(id)
+            .bind(5 + arrival)
+            .execute(db.pool())
+            .await
+            .unwrap();
         let page =
             MaintenanceRepository::expired_artifact_candidates_bounded(db.pool(), 2, &budget)
                 .await

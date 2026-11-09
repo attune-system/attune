@@ -234,8 +234,8 @@ impl MaintenanceRepository {
     ) -> Result<ArtifactDiscoveryPage> {
         maintenance_admission::discovery(pool, budget, move |conn| Box::pin(async move {
             type Cursor = (DateTime<Utc>, i64);
-            let (mut last_created, mut last_id, mut high_created, mut high_id):
-                (Option<DateTime<Utc>>, Option<i64>, Option<DateTime<Utc>>, Option<i64>) =
+            type ScanState = (Option<DateTime<Utc>>, Option<i64>, Option<DateTime<Utc>>, Option<i64>);
+            let (mut last_created, mut last_id, mut high_created, mut high_id): ScanState =
                 sqlx::query_as("SELECT last_created,last_id,high_created,high_id FROM artifact_retention_discovery WHERE singleton FOR UPDATE")
                     .fetch_one(&mut *conn).await?;
             if high_id.is_none() || (last_created,last_id) == (high_created,high_id) {
