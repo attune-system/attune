@@ -143,7 +143,11 @@ impl<DB: Database> PoolConnection<DB> {
 
         async move {
             let returned_to_pool = if let Some(floating) = floating {
-                floating.return_to_pool().await
+                // Includes hooks and protocol drain. Cancellation drops the owned
+                // socket and permit; uncertain cleanup cannot occupy the pool forever.
+                crate::rt::timeout(CLOSE_ON_DROP_TIMEOUT, floating.return_to_pool())
+                    .await
+                    .unwrap_or(false)
             } else {
                 false
             };
@@ -311,7 +315,12 @@ impl<DB: Database> Floating<DB, Live<DB>> {
         // returned to the pool; also of course, if it was dropped due to an error
         // this is simply a band-aid as SQLx-next connections should be able
         // to recover from cancellations
-        if let Err(error) = self.raw.ping().await {
+        if let Err(error) = async {
+            self.raw.ping().await?;
+            self.raw.prepare_for_pool().await
+        }
+        .await
+        {
             tracing::warn!(
                 %error,
                 "error occurred while testing the connection on-release",

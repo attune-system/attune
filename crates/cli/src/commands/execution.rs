@@ -441,7 +441,7 @@ async fn handle_list(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
     let executions = fetch_matching_executions(&mut client, &filters).await?;
 
     match output_format {
@@ -468,13 +468,12 @@ async fn handle_watch_list(
 
     let config = CliConfig::load_with_profile(profile.as_deref())?;
     let base_url = config.effective_api_url(api_url);
-    let auth_token = config.auth_token()?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let initial = fetch_matching_executions(&mut client, &filters).await?;
     render_watch_table(&initial, &filters)?;
 
-    match open_execution_stream(&base_url, auth_token.as_deref()).await {
+    match open_execution_stream(&base_url, client.auth_token()).await {
         Ok(mut event_source) => {
             let mut executions: HashMap<i64, ExecutionSummaryRow> = initial
                 .into_iter()
@@ -557,7 +556,7 @@ async fn handle_watch_execution(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     if output_format == OutputFormat::Table {
         output::print_info(&format!("Observing execution {}...", execution_id));
@@ -571,7 +570,7 @@ async fn handle_watch_execution(
             notifier_ws_url: notifier_url,
             verbose: false,
         },
-        ApiClient::from_config(&config, api_url),
+        ApiClient::from_config(&config, api_url)?,
     )
     .await?
     {
@@ -672,7 +671,7 @@ async fn handle_rerun(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let original: ExecutionDetail = client
         .get(&format!("/executions/{}", execution_id))
@@ -767,7 +766,7 @@ async fn handle_rerun(
             notifier_ws_url: notifier_url,
             verbose: false,
         },
-        ApiClient::from_config(&config, api_url),
+        ApiClient::from_config(&config, api_url)?,
     )
     .await?
     {
@@ -807,7 +806,7 @@ async fn handle_show(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let path = format!("/executions/{}", execution_id);
     let execution: ExecutionDetail = client.get(&path).await?;
@@ -882,7 +881,7 @@ async fn handle_trace_report(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
     let path = format!("/traces/{}", urlencoding::encode(&trace_tag));
     let response: serde_json::Value = client.get(&path).await?;
     let report = response.get("data").cloned().unwrap_or(response);
@@ -982,7 +981,7 @@ async fn handle_logs(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let path = format!("/executions/{}/logs", execution_id);
 
@@ -1058,7 +1057,7 @@ async fn handle_result(
     api_url: &Option<String>,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let path = format!("/executions/{}", execution_id);
     let execution: ExecutionDetail = client.get(&path).await?;
@@ -1087,7 +1086,7 @@ async fn handle_cancel(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     if !yes && matches!(output_format, OutputFormat::Table) {
         let confirm = dialoguer::Confirm::new()

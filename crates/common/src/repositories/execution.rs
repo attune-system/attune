@@ -300,7 +300,11 @@ impl ExecutionRepository {
             (Some(expected), Some(actual)) if expected == actual.id => Some(
                 RuntimeAuthorityRepository::retained_admission_fence(connection, actual.id).await?,
             ),
-            (None, None) if snapshot.executable.action.is_adhoc => None,
+            (None, None) => {
+                super::delegated_execution::DelegatedExecutionRepository::validate(connection, id)
+                    .await?;
+                None
+            }
             _ => {
                 return Err(Error::PermissionDenied(
                     "Initial input admission does not match the new execution".into(),
@@ -1091,8 +1095,7 @@ impl ExecutionRepository {
         task_name: &str,
         task_index: Option<i32>,
     ) -> Result<WorkflowTaskExecutionCreateOrGetResult> {
-        let mut conn = pool.acquire().await?;
-        sqlx::query("BEGIN").execute(&mut *conn).await?;
+        let mut conn = pool.begin().await?;
 
         let result = Self::create_workflow_task_if_absent_in_conn(
             &mut conn,
@@ -1106,11 +1109,11 @@ impl ExecutionRepository {
 
         match result {
             Ok(result) => {
-                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                conn.commit().await?;
                 Ok(result)
             }
             Err(err) => {
-                sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+                conn.rollback().await?;
                 Err(err)
             }
         }
@@ -1124,8 +1127,7 @@ impl ExecutionRepository {
         task_name: &str,
         task_index: Option<i32>,
     ) -> Result<WorkflowTaskExecutionCreateOrGetResult> {
-        let mut conn = pool.acquire().await?;
-        sqlx::query("BEGIN").execute(&mut *conn).await?;
+        let mut conn = pool.begin().await?;
         let result = Self::create_workflow_task_if_absent_in_conn(
             &mut conn,
             input,
@@ -1137,11 +1139,11 @@ impl ExecutionRepository {
         .await;
         match result {
             Ok(result) => {
-                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                conn.commit().await?;
                 Ok(result)
             }
             Err(err) => {
-                sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+                conn.rollback().await?;
                 Err(err)
             }
         }

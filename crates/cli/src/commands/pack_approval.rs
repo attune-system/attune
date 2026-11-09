@@ -131,7 +131,7 @@ pub async fn handle(
     format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
     match command {
         ApprovalCommands::List { pack_ref } => {
             let records: Vec<Value> = client.get_paginated(&path(&pack_ref, None)?).await?;

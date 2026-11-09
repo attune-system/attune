@@ -307,7 +307,7 @@ async fn handle_list(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     // Use pack-specific endpoint if pack filter is specified
     let path = if let Some(pack_ref) = pack {
@@ -385,7 +385,7 @@ async fn handle_search(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let mut params: Vec<(&str, String)> = Vec::new();
     if let Some(q) = query.as_ref().map(|q| q.trim()).filter(|q| !q.is_empty()) {
@@ -445,7 +445,7 @@ async fn handle_show(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     let path = format!("/actions/{}", action_ref);
     let action: ActionDetail = client.get(&path).await?;
@@ -506,7 +506,7 @@ async fn handle_update(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     // Build the optional timeout patch ({"op":"set","value":N} or {"op":"clear"}).
     let timeout_patch = if clear_timeout {
@@ -605,7 +605,7 @@ async fn handle_delete(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     // Confirm deletion unless --yes is provided
     if !yes && matches!(output_format, OutputFormat::Table) {
@@ -653,7 +653,7 @@ async fn handle_execute(
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
-    let mut client = ApiClient::from_config(&config, api_url);
+    let mut client = ApiClient::from_config(&config, api_url)?;
 
     // Parse parameters
     let parameters = if let Some(json_str) = params_json {
@@ -718,7 +718,7 @@ async fn handle_execute(
             notifier_ws_url: notifier_url,
             verbose: false,
         },
-        ApiClient::from_config(&config, api_url),
+        ApiClient::from_config(&config, api_url)?,
     )
     .await?
     {

@@ -95,16 +95,23 @@ another target is stated. No expected rejection was changed to an arbitrary 4xx.
 
 ## Added supported coverage
 
-* `packs_only_installer_cannot_publish_tick_runtime_policy` expects the exact
-  located registrar denial and no rows. Pack install never becomes policy consent.
+* `packs_only_installer_can_publish_tick_runtime_policy_without_personal_event_grants`
+  checks trusted publication without assigning event grants to the installer.
+  Its direct event submission stays forbidden; publication does not enable
+  recorded runtime issuance.
 * `exact_consent_upload_captures_defaults_before_consent_removal_and_installer_freeze`
   and `reversed_exact_consent_upload_captures_defaults_before_consent_removal_and_installer_freeze`
   install with only Events/Create on `consented_upload.tick` in addition to exact
   Packs rights. They check ten pinned invocations and captured defaults, remove
   the fixture actor's runtime consent, verify direct event creation is forbidden,
-  freeze the installer, then create action/workflow executions through a distinct
-  execute-only invoker using the captured defaults. These are admission and
-  execution-creation checks, not worker dispatch or event-emission E2E evidence.
+  freeze the installer, and verify the captured policy/defaults remain unchanged.
+  An execute-only invoker is rejected with 403 before creating an execution:
+  publication does not enable the disabled recorded-sponsorship rollout. A
+  separate invoker with exact Execute and tick Events/Create grants can create
+  action/workflow executions using the defaults through explicit delegation,
+  retaining its own active ownership and the immutable release. These are
+  admission and execution-creation checks, not worker dispatch, requester-
+  independent runtime authority, or event-emission E2E evidence.
   The active pack read primes the grant cache before freeze; both warm-cache
   and post-invalidation reads must return 403 afterward. Access-token grant
   loading freshly checks the human identity, without changing recorded runtime

@@ -1,19 +1,7 @@
 async fn ad_hoc_retry_fixture() -> (AdhocWorkflowDelegationFixture, Execution) {
-    use attune_common::repositories::{
-        identity::{CreatePermissionAssignmentInput, PermissionAssignmentRepository},
-        workflow::UpdateWorkflowExecutionInput,
-    };
-    let fixture = AdhocWorkflowDelegationFixture::create().await.unwrap();
+    use attune_common::repositories::workflow::UpdateWorkflowExecutionInput;
+    let fixture = AdhocWorkflowDelegationFixture::create_with_selection(true).await.unwrap();
     let pool = fixture.database.pool();
-    PermissionAssignmentRepository::create(
-        pool,
-        CreatePermissionAssignmentInput {
-            identity: fixture.identity_id,
-            permset: fixture.permission_set_id,
-        },
-    )
-    .await
-    .unwrap();
     let mut tx = pool.begin().await.unwrap();
     CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
         .await

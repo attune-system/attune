@@ -34,6 +34,8 @@ Attune is a pre-production, event-driven automation/orchestration platform built
 15. When adding mutable `execution` or `worker` columns, update the history trigger with `IS DISTINCT FROM` checks; for large JSONB values, store digest summaries with `_jsonb_digest_summary()` instead of raw payloads.
 16. Clear inherited environments for pack-controlled processes, including setup and verification commands, using `ChildProcessEnvironment` before explicit context. For allowlists and precedence, read `docs/deployment/child-process-environments.md`.
 17. Bind delegated execution grants to an explicit active owner and secret disclosure to recorded origins. For registration, token consumers, key delivery, or signing changes, read `docs/permissions/delegation-and-secret-disclosure.md`.
+18. Select execution authority through `execution_authority_selection`, independently of managed/ad hoc ownership. Missing or revoked recorded admissions never authorize delegation. Delegated runtime Key reads and opaque outputs retain attempt-fenced provenance; see `docs/permissions/delegation-and-secret-disclosure.md`.
+19. Own transaction boundaries with SQLx transactions or an explicit cancellation-safe session owner. Session advisory locks spanning commits require cancellation-safe ownership (such as `SessionLease`) before acquisition through publication and acknowledged unlock; uncertain cleanup must dispose the session. Preserve the vendored SQLx clean-session pool checks. See `docs/testing/sqlx-session-regressions.md`.
 
 ## Core Stack
 
@@ -352,6 +354,9 @@ CLI usage rules:
 - Prefer `pack upload` for local-to-Docker installs; `pack register` only works for API-visible paths.
 - `workflow upload` expects an action YAML with `workflow_file` pointing at the companion graph file.
 - `attune-mcp` reuses CLI auth/profile state.
+- Persist CLI/MCP credentials through the shared credential store; encryption is
+  enabled by default, with explicit per-profile plaintext opt-out. See
+  `docs/cli/cli-profiles.md#token-storage` for identifier binding and recovery.
 
 ## File Placement Conventions
 

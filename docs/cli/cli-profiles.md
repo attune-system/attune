@@ -24,13 +24,13 @@ profiles:
     description: Default local server
   staging:
     api_url: https://staging.example.com
-    auth_token: eyJhbGc...  # (stored securely)
-    refresh_token: eyJhbGc...
+    credential_encryption: true
+    # credentials: <encrypted envelope written by attune auth login>
     description: Staging environment
   production:
     api_url: https://api.example.com
-    auth_token: eyJhbGc...
-    refresh_token: eyJhbGc...
+    credential_encryption: true
+    # credentials: <encrypted envelope written by attune auth login>
     output_format: json
     description: Production environment
 default_output_format: table
@@ -412,13 +412,83 @@ attune execution list
 
 ### Token Storage
 
-Authentication tokens are stored in plaintext in the config file. Ensure proper file permissions:
+CLI and MCP share the same profile credential store. Credential encryption is
+**enabled by default**. Access and refresh tokens are encrypted together using
+AES-256-GCM and a key derived with HKDF-SHA256 from local system identifiers and
+a random per-profile salt. Each write uses a fresh encryption nonce. Refreshes
+preserve the profile ID, salt, and enrolled identifier sources.
+
+This reduces the usefulness of copying `config.yaml` alone. Identifiers are not
+secret: this does not protect against captured identifiers, a clone with the
+same identifiers, or access to the original user account. There is no OS keyring
+or separate secret-key file in this mode.
+
+The minimum binding is OS account identity, hostname, and machine identity.
+Available CPU and system-volume identifiers are added when logging in. Only the
+source names are saved; raw identifier values and keys are never saved or logged.
+Sources are fixed for that login: later missing or changed sources require login
+again; newly available optional sources do not change an existing binding.
+
+- Linux/headless/WSL use the effective UID and OS username, hostname, and
+  `/etc/machine-id`, with DMI product UUID as the explicit fallback source.
+  CPU vendor/model and the root filesystem UUID are included when readable.
+- Docker uses the same Linux provider. A persistent, instance-specific machine
+  ID (or exposed DMI UUID), stable hostname, and stable account identity are
+  required to persist encrypted credentials. Container recreation can require
+  login again. Never bake a shared machine ID and credentials into an image.
+- macOS uses UID/username, hostname, IOPlatformUUID, available CPU model, and
+  root-volume UUID.
+- Windows uses account SID/username, hostname, MachineGuid, available CPU model,
+  and system-volume GUID.
+
+Disk device paths, CPU frequency, load, and core counts are not key inputs.
+Replacing hardware with identical reported identifiers is not detectable.
+
+If credentials cannot be unlocked, log in again. Profile listings, login,
+logout, and configuration management remain available without unlocking tokens.
+Existing plaintext credentials without an explicit opt-out are removed at the
+first normal configuration load; log in again after upgrading. Completion-only
+reads do not rewrite the file. Attune creates no plaintext migration backup.
+
+To explicitly opt a profile out if identifiers are unavailable or unstable:
 
 ```bash
-chmod 600 ~/.config/attune/config.yaml
+# If its old encrypted credentials cannot be unlocked, clear them first.
+attune --profile staging auth logout
+attune --profile staging config set credential_encryption false
+attune --profile staging auth login --username alice
 ```
 
-**Future Enhancement**: OS keyring integration for secure token storage.
+The opt-out stores new tokens in **plaintext**, with owner-only file access.
+Profile listings and configuration output identify encryption as disabled. If
+the current encrypted credentials can be unlocked, disabling encryption preserves
+them and rewrites them as plaintext. To enable encryption again:
+
+```bash
+attune --profile staging config set credential_encryption true
+```
+
+Enabling encryption immediately encrypts existing plaintext credentials. Failure
+to obtain identifiers leaves the existing configuration intact; there is no
+automatic fallback to plaintext. Make encryption-mode changes through the CLI,
+not by manually changing YAML around an existing credential envelope.
+
+Configuration writes use a cross-process lock and atomic replacement. Unix files
+use mode `0600`; Windows files use a protected DACL granting the owner access.
+Independent profile edits merge; conflicting changes to one profile fail with a
+retry message. CLI and MCP serialize refreshes for the same profile, and token
+rotation is saved back to its originating profile without changing the active
+profile. Login retains its pre-authentication profile snapshot: a concurrent
+change or deletion rejects the returned credentials rather than rebinding them
+or falling back to another profile. A successful refresh whose persistence fails
+reports an error.
+
+Saved tokens are bound to the configured API endpoint. Changing the profile URL
+clears its credentials; a different `--api-url` cannot reuse them. Supply runtime
+credentials or log in to that endpoint. Explicit environment/argument credentials
+are kept in memory, do not borrow a saved refresh token, and are not persisted
+after refresh. Profile display output and login/refresh responses redact or omit
+tokens, including JSON/YAML formats.
 
 ### Production Profiles
 
@@ -488,34 +558,11 @@ attune config get api_url
 attune config use correct-profile
 ```
 
-## Migration from Old Config
+## Upgrading Existing Credentials
 
-If you have an old single-server config, it will be migrated to a `default` profile on first run with the new version.
-
-Old format:
-```yaml
-api_url: http://localhost:8080
-auth_token: ...
-refresh_token: ...
-output_format: table
-```
-
-New format:
-```yaml
-current_profile: default
-profiles:
-  default:
-    api_url: http://localhost:8080
-    auth_token: ...
-    refresh_token: ...
-default_output_format: table
-```
-
-**Note**: Manual migration may be required. Back up your config before upgrading:
-
-```bash
-cp ~/.config/attune/config.yaml ~/.config/attune/config.yaml.backup
-```
+Existing plaintext sessions require a fresh login after upgrading. Connection
+URLs, descriptions, and other profile settings are retained. See
+[Token Storage](#token-storage) for encryption behavior and explicit opt-out.
 
 ## Examples
 

@@ -389,6 +389,14 @@ pub(crate) async fn runtime_key_read_provenance(
     executions: &[i64],
 ) -> ApiResult<Vec<SecretProvenanceRow>> {
     let mut rows = Vec::new();
+    let mut conn = pool.acquire().await?;
+    for execution in executions {
+        if let Some(origin)=attune_common::repositories::delegated_execution::DelegatedExecutionRepository::output_origin(&mut conn,*execution).await? {
+            rows.push(SecretProvenanceRow{entity_type:"execution_runtime_authority".into(),entity_id:*execution,json_path:"/authority".into(),source_kind:"provenance".into(),source_ref:Some(serde_json::to_string(&attune_common::secret_provenance::SecretProvenance{origins:vec![origin],templates:vec![]}).map_err(|_|ApiError::InternalServerError("Invalid delegated output provenance".into()))?)});
+        }
+    }
+    drop(conn);
+
     for (execution, origins) in attune_common::repositories::execution_key_read::ExecutionKeyReadRepository::origins_for_executions(pool, executions).await? {
         for (index, origin) in origins.into_iter().enumerate() {
             rows.push(SecretProvenanceRow {
@@ -2232,7 +2240,21 @@ impl OriginAuthorization<'_> {
                         }
                         visited.remove(&(entity_type, entity_id, path));
                     }
-                    SecretOrigin::Local { source_kind, .. } => {
+                    SecretOrigin::Local {
+                        source_kind,
+                        source_ref,
+                    } => {
+                        if source_kind == "delegated_execution_output" {
+                            let authority = attune_common::delegation::DelegationAuthority::new(
+                                caller.identity_id,
+                                caller.identity_attributes.clone(),
+                                grants.to_vec(),
+                            );
+                            let mut conn = state.db.acquire().await?;
+                            if !attune_common::repositories::delegated_execution::DelegatedExecutionRepository::output_allowed(&mut conn,source_ref.as_deref(),&authority).await? {return Ok(false);}
+                            continue;
+                        }
+
                         if visited.iter().any(|(kind, _, _)| {
                             kind == attune_common::repositories::runtime_read::ENTITY_RUNTIME_READ
                         }) && !crate::recorded_disclosure::local_origin_allowed(

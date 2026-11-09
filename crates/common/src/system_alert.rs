@@ -20,13 +20,17 @@ pub struct SystemAlert {
     pub category: String,
     pub failure_type: String,
     pub component_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub component_id: Option<Id>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub component_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_role: Option<String>,
     pub observed_at: DateTime<Utc>,
     pub summary: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "JsonValue::is_null")]
     pub details: JsonValue,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
 }
 

@@ -1,4 +1,5 @@
 //! Metadata visibility must never become a permit for protected content.
+use helpers::delegated;
 mod helpers;
 // This action-only suite shares the admitted pack fixture with the sensor suite;
 // its retained-generation helper is intentionally unused in this executable.
@@ -105,11 +106,15 @@ async fn artifact(
 }
 
 async fn execution(ctx: &TestContext, action_ref: &str) -> Result<i64> {
+    execution_with_refs(ctx, action_ref, &[]).await
+}
+
+async fn execution_with_refs(ctx: &TestContext, action_ref: &str, refs: &[String]) -> Result<i64> {
     let response = ctx
         .post(
             "/api/v1/executions/execute",
             json!({
-                "action_ref":action_ref, "parameters":{}, "permission_set_refs":[]
+                "action_ref":action_ref, "parameters":{}, "permission_set_refs":refs
             }),
             ctx.token(),
         )
@@ -360,14 +365,52 @@ async fn ordinary_artifact_content_preserves_nonrecorded_execution_credentials()
     )
     .await?;
     let selected = version(&ctx, id, None, "ordinary body").await?;
-    let token = attune_common::auth::jwt::generate_execution_token_with_permission_sets(
+    let action_ref = managed_fixture::action_pack(&ctx).await?;
+    let execution = execution_with_refs(&ctx, &action_ref, &["fixture.headers".into()]).await?;
+    let mut tx = ctx.pool.begin().await?;
+    let attempt = delegated::start(&mut tx, execution).await?;
+    tx.commit().await?;
+    let token = attune_common::auth::jwt::generate_delegated_execution_token(
         ctx.user.as_ref().ok_or("fixture identity missing")?.id,
-        1234,
-        "artifact_perf.run",
+        execution,
+        &action_ref,
         &ctx.state.jwt_config,
-        Some(300),
+        300,
         &["fixture.headers".into()],
+        &[],
+        attempt,
     )?;
+    // Bound the handler's stored branch state independently of Tokio test
+    // stack settings; the production acceptance also exercises actual polling.
+    let user = attune_api::auth::middleware::AuthenticatedUser {
+        claims: attune_common::auth::jwt::validate_token(&token, &ctx.state.jwt_config)?,
+    };
+    let numbered = attune_api::routes::artifacts::download_version(
+        attune_api::auth::middleware::RequireAuth(user.clone()),
+        axum::extract::State(ctx.state.clone()),
+        axum::extract::Path((id, 1)),
+        axum::extract::Query(Default::default()),
+        axum::http::HeaderMap::new(),
+    );
+    assert!(
+        std::mem::size_of_val(&numbered) <= 128 * 1024,
+        "numbered download future uses {} bytes",
+        std::mem::size_of_val(&numbered)
+    );
+    drop(numbered);
+    let latest = attune_api::routes::artifacts::download_latest(
+        attune_api::auth::middleware::RequireAuth(user),
+        axum::extract::State(ctx.state.clone()),
+        axum::extract::Path(id),
+        axum::extract::Query(Default::default()),
+        axum::http::HeaderMap::new(),
+    );
+    assert!(
+        std::mem::size_of_val(&latest) <= 128 * 1024,
+        "latest download future uses {} bytes",
+        std::mem::size_of_val(&latest)
+    );
+    drop(latest);
     for suffix in [
         "versions/1",
         "versions/latest",
@@ -392,7 +435,7 @@ async fn nonsensitive_runtime_log_preserves_legacy_execution_reads_through_chunk
         .await?;
     grant_artifacts(&ctx).await?;
     let action_ref = managed_fixture::action_pack(&ctx).await?;
-    let producer = execution(&ctx, &action_ref).await?;
+    let producer = execution_with_refs(&ctx, &action_ref, &["fixture.headers".into()]).await?;
     let id = artifact(
         &ctx,
         "fixture.log",
@@ -418,13 +461,18 @@ async fn nonsensitive_runtime_log_preserves_legacy_execution_reads_through_chunk
         },
     )
     .await?;
-    let token = attune_common::auth::jwt::generate_execution_token_with_permission_sets(
+    let mut tx = ctx.pool.begin().await?;
+    let attempt = delegated::start(&mut tx, producer).await?;
+    tx.commit().await?;
+    let token = attune_common::auth::jwt::generate_delegated_execution_token(
         ctx.user.as_ref().ok_or("fixture identity missing")?.id,
         producer,
         &action_ref,
         &ctx.state.jwt_config,
-        Some(300),
+        300,
         &["fixture.headers".into()],
+        &[],
+        attempt,
     )?;
     for suffix in [
         "versions/1",
@@ -671,6 +719,171 @@ async fn ordinary_progress_detail_keeps_its_protected_data_projection() -> Resul
     assert_eq!(body["data"]["description"], "protected description");
     assert_eq!(body["data"]["data"], json!({"progress":"protected data"}));
     ctx.cleanup().await
+}
+
+#[tokio::test]
+async fn running_delegated_logs_enforce_frozen_use_ceiling_before_result_materialization(
+) -> Result<()> {
+    use attune_common::{
+        auth::jwt::generate_access_token,
+        models::ExecutionStatus,
+        repositories::{
+            execution::ExecutionRepository,
+            identity::{CreateIdentityInput, IdentityRepository},
+            FindById, FindByRef,
+        },
+        secret_values::ENTITY_EXECUTION_RESULT,
+    };
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
+    grant_artifacts(&ctx).await?;
+    let owner = ctx.user.as_ref().ok_or("owner missing")?.id;
+    let signer = PermissionSetRepository::create(&ctx.pool, CreatePermissionSetInput {
+        r#ref: "fixture.live_signer".into(), pack: None, pack_ref: None, label: None, description: None,
+        grants: json!([{"resource":"keys","actions":["use"],"constraints":{"owner_types":["system"],"refs":["system.live_signer"]}}]),
+    }).await?;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: owner,
+            permset: signer.id,
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(owner).await;
+    let action = managed_fixture::action_pack(&ctx).await?;
+    let producer = execution_with_refs(&ctx, &action, &[signer.r#ref]).await?;
+    let mut tx = ctx.pool.begin().await?;
+    delegated::start(&mut tx, producer).await?;
+    tx.commit().await?;
+    let source = ExecutionRepository::find_by_id(&ctx.pool, producer)
+        .await?
+        .ok_or("source missing")?;
+    assert_eq!(source.status, ExecutionStatus::Running);
+    assert!(source.result.is_none());
+    assert!(ExecutionSecretValueRepository::find_stored_by_entity(
+        &ctx.pool,
+        ENTITY_EXECUTION_RESULT,
+        producer
+    )
+    .await?
+    .is_empty());
+    assert!(attune_common::repositories::execution_key_read::ExecutionKeyReadRepository::origins_for_executions(&ctx.pool, &[producer]).await?.is_empty());
+    let log = artifact(
+        &ctx,
+        "fixture.log",
+        ArtifactClassification::RuntimeLog,
+        ArtifactType::FileText,
+    )
+    .await?;
+    let selected = version(
+        &ctx,
+        log,
+        Some(producer),
+        "early-approved-operation-assertion",
+    )
+    .await?;
+    let viewer = IdentityRepository::create(
+        &ctx.pool,
+        CreateIdentityInput {
+            login: "live-log-viewer".into(),
+            display_name: None,
+            attributes: json!({}),
+            password_hash: None,
+        },
+    )
+    .await?;
+    let headers = PermissionSetRepository::find_by_ref(&ctx.pool, "fixture.headers")
+        .await?
+        .ok_or("header permissions missing")?;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: viewer.id,
+            permset: headers.id,
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(viewer.id).await;
+    let token = generate_access_token(viewer.id, &viewer.login, &ctx.state.jwt_config)?;
+    let paths = [
+        format!(
+            "/api/v1/artifacts/{log}/versions/{}/download",
+            selected.version
+        ),
+        format!("/api/v1/artifacts/{log}/download"),
+    ];
+    for path in &paths {
+        assert_eq!(
+            ctx.get(path, ctx.token()).await?.status(),
+            StatusCode::OK,
+            "the covered producer can read its early output"
+        );
+        let denied = ctx.get(path, Some(&token)).await?;
+        assert_eq!(denied.status(), StatusCode::NOT_FOUND, "log read/decrypt alone cannot disclose an API-capable producer's output before result provenance exists");
+    }
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: viewer.id,
+            permset: signer.id,
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(viewer.id).await;
+    for path in &paths {
+        let covered = ctx.get(path, Some(&token)).await?;
+        assert_eq!(
+            covered.status(),
+            StatusCode::OK,
+            "use coverage allows approved-operation output without private-key read/decrypt"
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&covered.bytes().await?)?,
+            json!({"body":"early-approved-operation-assertion"})
+        );
+    }
+    // Opaque API-capable output requires execution decrypt even before any
+    // result or runtime Key origin has been materialized.
+    let read_only = IdentityRepository::create(
+        &ctx.pool,
+        CreateIdentityInput {
+            login: "live-log-read-only".into(),
+            display_name: None,
+            attributes: json!({}),
+            password_hash: None,
+        },
+    )
+    .await?;
+    let read_set = PermissionSetRepository::create(&ctx.pool, CreatePermissionSetInput {
+        r#ref: "fixture.live_read_only".into(), pack: None, pack_ref: None, label: None, description: None,
+        grants: json!([
+            {"resource":"artifacts","actions":["read"],"constraints":{"refs":["fixture.log"]}},
+            {"resource":"executions","actions":["read"]},
+            {"resource":"keys","actions":["use"],"constraints":{"owner_types":["system"],"refs":["system.live_signer"]}}
+        ]),
+    }).await?;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: read_only.id,
+            permset: read_set.id,
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(read_only.id).await;
+    let read_token = generate_access_token(read_only.id, &read_only.login, &ctx.state.jwt_config)?;
+    for path in &paths {
+        assert_eq!(
+            ctx.get(path, Some(&read_token)).await?.status(),
+            StatusCode::NOT_FOUND,
+            "approved-operation coverage alone cannot replace execution decrypt for opaque logs"
+        );
+    }
+    ctx.cleanup().await?;
+    Ok(())
 }
 
 /// Diagnostics follow full content authorization and remain bound to one version.

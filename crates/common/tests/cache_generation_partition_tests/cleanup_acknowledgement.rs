@@ -626,8 +626,17 @@ async fn boundary_case(mode: GateMode, exhaust: bool) {
             ensure!(elapsed >= Duration::from_millis(800), "recovery did not consume its absolute grace");
             ensure!(matches!(returned.as_ref().err().and_then(|error| error.downcast_ref::<attune_common::Error>()),
                 Some(attune_common::Error::InvalidState(message)) if message == "cache cleanup rollback acknowledgement exceeded its completion deadline"), "wrong grace-exhaustion outcome");
-            // This accepted BEGIN is still unacknowledged, not backend-gone.
-            ensure!(state.as_deref() == Some("idle in transaction"), "exhausted gate lost its owned transaction");
+            // BEGIN's acknowledgement is still held. The startup guard has
+            // queued ROLLBACK, and recovery flushes it before waiting for those
+            // responses. The proxy retains the upstream socket after client
+            // drop, so the actual backend is alive and idle even though the
+            // caller MUST report the original unacknowledged-rollback error.
+            // Server effect/depth/idleness cannot substitute for acknowledgement.
+            ensure!(proxy.release.is_some()
+                && proxy.task.as_ref().is_some_and(|task| !task.is_finished()),
+                "exhausted acknowledgement gate ended before observation");
+            ensure!(state.as_deref() == Some("idle"),
+                "queued driver rollback must reach the held backend; observed {state:?}");
         } else {
             ensure!(elapsed >= Duration::from_millis(400), "selected response was not awaited");
             match mode {

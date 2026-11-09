@@ -75,6 +75,27 @@ impl DelegationAuthority {
         can_delegate_grants(&self.grants, grants, &self.context)
     }
 
+    /// Native protocol controls consume their producer's own output, without
+    /// disclosing its private fields. Retain the active owner's input rights and
+    /// the immutable execution read/use ceiling, including scoped `standard`.
+    /// This authority must never be used for human/API body disclosure.
+    pub(crate) async fn for_closed_execution_controls(
+        conn: &mut PgConnection,
+        execution: Id,
+    ) -> Result<Self> {
+        let selected = Box::pin(crate::repositories::delegated_execution::DelegatedExecutionRepository::require_closed_output(conn, execution)).await?;
+        let owner = selected
+            .owner
+            .ok_or_else(|| Error::PermissionDenied("Native control owner is unavailable".into()))?;
+        let mut authority = Self::load_for_share(conn, owner).await?;
+        let ceiling: Vec<Grant> =
+            serde_json::from_value(selected.output_grants.ok_or_else(|| {
+                Error::PermissionDenied("Native control output ceiling is unavailable".into())
+            })?)?;
+        authority.grants.extend(ceiling);
+        Ok(authority)
+    }
+
     pub fn allows(
         &self,
         resource: Resource,

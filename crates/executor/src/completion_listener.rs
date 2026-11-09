@@ -30,7 +30,7 @@ use attune_common::{
     },
 };
 use serde_json::{json, Value as JsonValue};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -40,6 +40,8 @@ use crate::{
     scheduler::{ExecutionScheduler, SchedulerMetadataCaches},
     work_queue_events,
 };
+
+type QueueAckValidation = std::result::Result<WorkQueueAck, (&'static str, String)>;
 
 /// Completion listener that handles execution completion messages
 pub struct CompletionListener {
@@ -148,7 +150,7 @@ impl CompletionListener {
                     let workflow_log_transport = workflow_log_transport.clone();
 
                     async move {
-                        if let Err(e) = Self::process_execution_completed(
+                        if let Err(e) = Box::pin(Self::process_execution_completed(
                             &pool,
                             &publisher,
                             &queue_manager,
@@ -160,7 +162,7 @@ impl CompletionListener {
                             encryption_key.as_deref(),
                             &metadata_caches,
                             &envelope,
-                        )
+                        ))
                         .await
                         {
                             error!("Error processing execution completion: {}", e);
@@ -183,20 +185,23 @@ impl CompletionListener {
 
     /// Process an execution completed message
     #[allow(clippy::too_many_arguments)] // Explicit service dependencies keep handler ownership clear.
-    async fn process_execution_completed(
-        pool: &PgPool,
-        publisher: &Publisher,
-        queue_manager: &ExecutionQueueManager,
-        round_robin_counter: &AtomicUsize,
-        artifacts_dir: &str,
-        workflow_log_transport: &Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
+    fn process_execution_completed<'a>(
+        pool: &'a PgPool,
+        publisher: &'a Publisher,
+        queue_manager: &'a ExecutionQueueManager,
+        round_robin_counter: &'a AtomicUsize,
+        artifacts_dir: &'a str,
+        workflow_log_transport: &'a Arc<
+            dyn attune_common::artifact_transport::ArtifactFileTransport,
+        >,
         workflow_log_segment_max_bytes: usize,
         workflow_log_flush_interval_ms: u64,
-        encryption_key: Option<&str>,
-        metadata_caches: &SchedulerMetadataCaches,
-        envelope: &MessageEnvelope<ExecutionCompletedPayload>,
-    ) -> Result<()> {
-        debug!(
+        encryption_key: Option<&'a str>,
+        metadata_caches: &'a SchedulerMetadataCaches,
+        envelope: &'a MessageEnvelope<ExecutionCompletedPayload>,
+    ) -> futures::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            debug!(
             "Processing MQ message (type: {:?}, message_id: {}, correlation_id: {}, execution_id: {}, action_id: {})",
             envelope.message_type,
             envelope.message_id,
@@ -205,171 +210,172 @@ impl CompletionListener {
             envelope.payload.action_id,
         );
 
-        let execution_id = envelope.payload.execution_id;
-        let action_id = envelope.payload.action_id;
+            let execution_id = envelope.payload.execution_id;
+            let action_id = envelope.payload.action_id;
 
-        info!(
-            "Processing completion for execution: {} (action: {})",
-            execution_id, action_id
-        );
-
-        // Verify execution exists in database
-        let mut execution = ExecutionRepository::find_by_id(pool, execution_id).await?;
-
-        if let Some(ref exec) = execution.clone() {
-            execution = Some(
-                Self::handle_queue_dispatch_completion(pool, publisher, exec, encryption_key)
-                    .await?,
-            );
-        }
-
-        if let Some(ref exec) = execution {
-            debug!(
-                "Execution {} found with status: {:?}",
-                execution_id, exec.status
+            info!(
+                "Processing completion for execution: {} (action: {})",
+                execution_id, action_id
             );
 
-            ExecutionScheduler::release_target_waits(
-                pool,
-                publisher,
-                WorkflowTaskWaitTarget::Execution(exec.id),
-                encryption_key,
-            )
-            .await?;
+            // Verify execution exists in database
+            let mut execution = ExecutionRepository::find_by_id(pool, execution_id).await?;
 
-            // Check if this execution is a workflow child task and advance the
-            // workflow orchestration (schedule successor tasks or complete the
-            // workflow).
-            if exec.workflow_task.is_some() {
-                info!(
-                    "Execution {} is a workflow task, advancing workflow",
-                    execution_id
+            if let Some(ref exec) = execution.clone() {
+                execution = Some(
+                    Self::handle_queue_dispatch_completion(pool, publisher, exec, encryption_key)
+                        .await?,
                 );
-                match ExecutionScheduler::maybe_retry_workflow_task(
+            }
+
+            if let Some(ref exec) = execution {
+                debug!(
+                    "Execution {} found with status: {:?}",
+                    execution_id, exec.status
+                );
+
+                Box::pin(ExecutionScheduler::release_target_waits(
                     pool,
                     publisher,
-                    exec,
+                    WorkflowTaskWaitTarget::Execution(exec.id),
                     encryption_key,
-                )
-                .await
-                {
-                    Ok(true) => {
-                        info!(
+                ))
+                .await?;
+
+                // Check if this execution is a workflow child task and advance the
+                // workflow orchestration (schedule successor tasks or complete the
+                // workflow).
+                if exec.workflow_task.is_some() {
+                    info!(
+                        "Execution {} is a workflow task, advancing workflow",
+                        execution_id
+                    );
+                    match ExecutionScheduler::maybe_retry_workflow_task(
+                        pool,
+                        publisher,
+                        exec,
+                        encryption_key,
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            info!(
                             "Execution {} scheduled a workflow retry; delaying workflow advancement",
                             execution_id
                         );
-                        return Ok(());
+                            return Ok(());
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            error!(
+                                "Failed to schedule workflow retry for execution {}: {}",
+                                execution_id, e
+                            );
+                            if let Some(mq_err) = Self::retryable_mq_error(&e) {
+                                return Err(mq_err.into());
+                            }
+                            // A refused/contended retry must not become ordinary
+                            // workflow advancement. Requeue the completion instead.
+                            return Err(e);
+                        }
                     }
-                    Ok(false) => {}
-                    Err(e) => {
+                    if let Err(e) = ExecutionScheduler::advance_workflow(
+                        pool,
+                        publisher,
+                        round_robin_counter,
+                        artifacts_dir,
+                        workflow_log_transport,
+                        workflow_log_segment_max_bytes,
+                        workflow_log_flush_interval_ms,
+                        encryption_key,
+                        exec,
+                        metadata_caches,
+                    )
+                    .await
+                    {
                         error!(
-                            "Failed to schedule workflow retry for execution {}: {}",
+                            "Failed to advance workflow for execution {}: {}",
                             execution_id, e
                         );
                         if let Some(mq_err) = Self::retryable_mq_error(&e) {
                             return Err(mq_err.into());
                         }
-                        // A refused/contended retry must not become ordinary
-                        // workflow advancement. Requeue the completion instead.
-                        return Err(e);
+                        // Non-retryable workflow advancement errors are logged but
+                        // do not fail the entire completion processing path.
                     }
                 }
-                if let Err(e) = ExecutionScheduler::advance_workflow(
-                    pool,
-                    publisher,
-                    round_robin_counter,
-                    artifacts_dir,
-                    workflow_log_transport,
-                    workflow_log_segment_max_bytes,
-                    workflow_log_flush_interval_ms,
-                    encryption_key,
-                    exec,
-                    metadata_caches,
-                )
-                .await
-                {
-                    error!(
-                        "Failed to advance workflow for execution {}: {}",
-                        execution_id, e
-                    );
-                    if let Some(mq_err) = Self::retryable_mq_error(&e) {
-                        return Err(mq_err.into());
-                    }
-                    // Non-retryable workflow advancement errors are logged but
-                    // do not fail the entire completion processing path.
-                }
+            } else {
+                warn!(
+                    "Execution {} not found in database, but still releasing queue slot",
+                    execution_id
+                );
             }
-        } else {
-            warn!(
-                "Execution {} not found in database, but still releasing queue slot",
-                execution_id
+
+            // Release queue slot for this action
+            info!(
+                "Releasing queue slot for action {} (execution {} completed)",
+                action_id, execution_id
             );
-        }
 
-        // Release queue slot for this action
-        info!(
-            "Releasing queue slot for action {} (execution {} completed)",
-            action_id, execution_id
-        );
-
-        match queue_manager.release_active_slot(execution_id).await {
-            Ok(release) => {
-                if let Some(release) = release {
-                    if let Some(next_execution_id) = release.next_execution_id {
-                        info!(
-                            "Queue slot released for action {}, next execution {} can proceed",
-                            action_id, next_execution_id
-                        );
-                        if let Err(republish_err) = Self::publish_execution_requested(
-                            pool,
-                            publisher,
-                            action_id,
-                            next_execution_id,
-                            encryption_key,
-                        )
-                        .await
-                        {
-                            queue_manager
-                                .restore_active_slot(execution_id, &release)
-                                .await?;
-                            return Err(republish_err);
+            match queue_manager.release_active_slot(execution_id).await {
+                Ok(release) => {
+                    if let Some(release) = release {
+                        if let Some(next_execution_id) = release.next_execution_id {
+                            info!(
+                                "Queue slot released for action {}, next execution {} can proceed",
+                                action_id, next_execution_id
+                            );
+                            if let Err(republish_err) = Self::publish_execution_requested(
+                                pool,
+                                publisher,
+                                action_id,
+                                next_execution_id,
+                                encryption_key,
+                            )
+                            .await
+                            {
+                                queue_manager
+                                    .restore_active_slot(execution_id, &release)
+                                    .await?;
+                                return Err(republish_err);
+                            }
+                        } else {
+                            debug!(
+                                "Queue slot released for action {}, no executions waiting",
+                                action_id
+                            );
                         }
                     } else {
                         debug!(
-                            "Queue slot released for action {}, no executions waiting",
-                            action_id
+                            "Execution {} had no active queue slot to release",
+                            execution_id
                         );
                     }
-                } else {
-                    debug!(
-                        "Execution {} had no active queue slot to release",
-                        execution_id
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to release queue slot for action {}: {}",
+                        action_id, e
                     );
+                    return Err(e);
                 }
             }
-            Err(e) => {
-                error!(
-                    "Failed to release queue slot for action {}: {}",
-                    action_id, e
+
+            // Get queue statistics for logging
+            if let Some(stats) = queue_manager.get_queue_stats(action_id).await {
+                debug!(
+                    "Queue stats for action {}: {} active, {} queued, {} total completed",
+                    action_id, stats.active_count, stats.queue_length, stats.total_completed
                 );
-                return Err(e);
             }
-        }
 
-        // Get queue statistics for logging
-        if let Some(stats) = queue_manager.get_queue_stats(action_id).await {
-            debug!(
-                "Queue stats for action {}: {} active, {} queued, {} total completed",
-                action_id, stats.active_count, stats.queue_length, stats.total_completed
+            info!(
+                "Successfully processed completion for execution: {} (action: {})",
+                execution_id, action_id
             );
-        }
 
-        info!(
-            "Successfully processed completion for execution: {} (action: {})",
-            execution_id, action_id
-        );
-
-        Ok(())
+            Ok(())
+        })
     }
 
     async fn handle_queue_dispatch_completion(
@@ -457,13 +463,20 @@ impl CompletionListener {
         }
 
         let expected_item_ids: Vec<_> = leased_items.iter().map(|item| item.id).collect();
-        let queue_ack = match Self::validated_queue_ack_for_execution(
+        let mut tx = pool.begin().await?;
+        Self::lock_queue_completion_items(&mut tx, execution.id, &leased_items).await?;
+        let queue_ack = match Self::queue_ack_for_completion(
+            &mut tx,
             execution,
             &expected_item_ids,
             expected_ack_version,
-        ) {
+            encryption_key,
+        )
+        .await?
+        {
             Ok(queue_ack) => queue_ack,
             Err((error_code, message)) => {
+                tx.rollback().await?;
                 return Self::fail_queue_dispatch_completion(
                     pool,
                     execution,
@@ -480,7 +493,6 @@ impl CompletionListener {
             }
         };
 
-        let mut tx = pool.begin().await?;
         for leased_item in &leased_items {
             let ack_item = queue_ack
                 .item_for(leased_item.id)
@@ -531,12 +543,12 @@ impl CompletionListener {
         tx.commit().await?;
 
         for item in &leased_items {
-            if let Err(error) = ExecutionScheduler::release_target_waits(
+            if let Err(error) = Box::pin(ExecutionScheduler::release_target_waits(
                 pool,
                 publisher,
                 WorkflowTaskWaitTarget::WorkQueueItem(item.id),
                 encryption_key,
-            )
+            ))
             .await
             {
                 warn!(
@@ -584,6 +596,8 @@ impl CompletionListener {
         publisher: &Publisher,
     ) -> Result<Execution> {
         let mut tx = pool.begin().await?;
+        Self::lock_queue_completion_items(&mut tx, execution.id, leased_items).await?;
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::require_closed_output(&mut tx, execution.id).await?;
         let retry_error = json!({
             "code": failure.error_code,
             "message": failure.error_message,
@@ -705,11 +719,69 @@ impl CompletionListener {
             .unwrap_or(0)
     }
 
+    async fn lock_queue_completion_items(
+        conn: &mut PgConnection,
+        execution: i64,
+        items: &[WorkQueueItem],
+    ) -> Result<()> {
+        let mut ordered = items.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|item| item.id);
+        for expected in ordered {
+            let current = WorkQueueItemRepository::find_by_id_for_update(conn, expected.id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Queue completion lease is unavailable"))?;
+            if current.status != WorkQueueItemStatus::Leased
+                || current.leased_execution != Some(execution)
+                || current.lease_token.is_none()
+                || current.lease_token != expected.lease_token
+                || current.attempt_count != expected.attempt_count
+                || current.queue != expected.queue
+            {
+                anyhow::bail!("Queue completion lease changed");
+            }
+        }
+        Ok(())
+    }
+
+    async fn queue_ack_for_completion(
+        conn: &mut PgConnection,
+        execution: &Execution,
+        expected_item_ids: &[i64],
+        expected_ack_version: i32,
+        encryption_key: Option<&str>,
+    ) -> Result<QueueAckValidation> {
+        use attune_common::repositories::delegated_execution::{
+            DelegatedExecutionRepository, ProtectedQueueAck,
+        };
+        Ok(
+            match DelegatedExecutionRepository::protected_queue_ack_controls(
+                conn,
+                execution.id,
+                expected_item_ids,
+                expected_ack_version,
+                encryption_key,
+            )
+            .await?
+            {
+                ProtectedQueueAck::Unprotected => Self::validated_queue_ack_for_execution(
+                    execution,
+                    expected_item_ids,
+                    expected_ack_version,
+                ),
+                ProtectedQueueAck::Controls(ack) => Ok(ack),
+                ProtectedQueueAck::Invalid => Err((
+                    "queue_ack_invalid",
+                    "Protected queue acknowledgement is invalid".into(),
+                )),
+            },
+        )
+    }
+
     fn validated_queue_ack_for_execution(
         execution: &Execution,
         expected_item_ids: &[i64],
         expected_ack_version: i32,
-    ) -> std::result::Result<WorkQueueAck, (&'static str, String)> {
+    ) -> QueueAckValidation {
         if !Self::can_honor_queue_ack_for_status(execution.status) {
             return Err((
                 "queue_dispatch_execution_failed",
@@ -1268,6 +1340,150 @@ mod tests {
         let result = queue_manager.release_active_slot(execution_id).await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn queue_completion_retains_lease_lock_and_denies_reassigned_generation() -> Result<()> {
+        use attune_common::{
+            config::Config,
+            models::{ActionReferenceVisibility, WorkQueueBatchMode, WorkQueueUpdateStrategy},
+            repositories::{
+                work_queue::{CreateWorkQueueInput, CreateWorkQueueItemInput},
+                Create,
+            },
+            test_database::TestDatabase,
+        };
+        let config = Config::load_from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config.test.yaml"
+        ))?;
+        let db = TestDatabase::create(&config.database).await?;
+        let queue = WorkQueueRepository::create(
+            db.pool(),
+            CreateWorkQueueInput {
+                r#ref: "fixture.completion".into(),
+                pack: None,
+                pack_ref: None,
+                is_adhoc: true,
+                label: "Completion fence".into(),
+                description: None,
+                enabled: true,
+                accepting_new_items: true,
+                dispatch_action: None,
+                dispatch_action_ref: "fixture.run".into(),
+                default_priority: 0,
+                allow_pending_update: false,
+                update_strategy: WorkQueueUpdateStrategy::MergePatch,
+                batch_mode: WorkQueueBatchMode::Single,
+                item_schema: json!({}),
+                action_params: json!({}),
+                trace_tag_template: None,
+                permission_set_refs: Some(vec![]),
+                config: json!({}),
+                reference_visibility: ActionReferenceVisibility::Public,
+                reference_allowed_pack_refs: vec![],
+            },
+        )
+        .await?;
+        let token = uuid::Uuid::new_v4();
+        let item = WorkQueueItemRepository::create(
+            db.pool(),
+            CreateWorkQueueItemInput {
+                queue: queue.id,
+                queue_ref: queue.r#ref,
+                item_key: None,
+                priority: 0,
+                status: WorkQueueItemStatus::Leased,
+                payload: json!({}),
+                metadata: json!({}),
+                trace_tag: None,
+                enqueue_source: "fixture".into(),
+                requested_by_identity: None,
+                requested_by_execution: None,
+                requested_by_enforcement: None,
+                leased_execution: Some(42),
+                lease_token: Some(token),
+                lease_expires_at: Some(Utc::now() + chrono::Duration::minutes(5)),
+                attempt_count: 1,
+                last_error: None,
+                ack_summary: None,
+            },
+        )
+        .await?;
+        let mut held = db.begin().await?;
+        CompletionListener::lock_queue_completion_items(&mut held, 42, std::slice::from_ref(&item))
+            .await?;
+        let mut writer_connection = db.pool().acquire().await?;
+        let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *writer_connection)
+            .await?;
+        let next_token = uuid::Uuid::new_v4();
+        let item_id = item.id;
+        let writer = tokio::spawn(async move {
+            WorkQueueItemRepository::update_if_statuses(
+                &mut *writer_connection,
+                item_id,
+                &[WorkQueueItemStatus::Leased],
+                UpdateWorkQueueItemInput {
+                    leased_execution: Some(Patch::Set(42)),
+                    lease_token: Some(Patch::Set(next_token)),
+                    attempt_count: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+        });
+        let blocked = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let blocked: bool =
+                    sqlx::query_scalar("SELECT cardinality(pg_blocking_pids($1)) > 0")
+                        .bind(writer_pid)
+                        .fetch_one(db.pool())
+                        .await?;
+                if blocked {
+                    return Ok::<_, sqlx::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        held.commit().await?;
+        let renewed = writer
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("renewed lease missing"))?;
+        blocked??;
+        let mut stale = db.begin().await?;
+        assert!(
+            CompletionListener::lock_queue_completion_items(
+                &mut stale,
+                42,
+                std::slice::from_ref(&item)
+            )
+            .await
+            .is_err(),
+            "same execution ID cannot reuse a prior lease generation"
+        );
+        stale.rollback().await?;
+        let mut current = db.begin().await?;
+        CompletionListener::lock_queue_completion_items(
+            &mut current,
+            42,
+            std::slice::from_ref(&renewed),
+        )
+        .await?;
+        assert!(
+            CompletionListener::lock_queue_completion_items(
+                &mut current,
+                43,
+                std::slice::from_ref(&renewed)
+            )
+            .await
+            .is_err(),
+            "another execution cannot acknowledge this lease"
+        );
+        current.rollback().await?;
+        db.cleanup().await?;
+        Ok(())
     }
 
     #[test]

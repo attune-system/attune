@@ -7,10 +7,7 @@ use attune_api::{
     middleware::ApiError,
 };
 use attune_common::{
-    auth::jwt::{
-        generate_execution_token_with_permission_sets, generate_sensor_token,
-        generate_worker_token, validate_token,
-    },
+    auth::jwt::{generate_sensor_token, generate_worker_token, validate_token},
     repositories::{
         identity::{
             CreateIdentityRoleAssignmentInput, CreatePermissionAssignmentInput,
@@ -103,16 +100,14 @@ async fn membership(ctx: &TestContext, identity: i64) -> Result<i64> {
     .id)
 }
 
-fn nonaccess_tokens(ctx: &TestContext, actor: &Actor) -> Result<Vec<String>> {
+async fn nonaccess_tokens(ctx: &TestContext, actor: &Actor) -> Result<Vec<String>> {
     Ok(vec![
-        generate_execution_token_with_permission_sets(
+        helpers::delegated_source::token(
+            ctx,
             actor.identity,
-            1234,
-            "role_sensor.source",
-            &ctx.state.jwt_config,
-            Some(300),
             std::slice::from_ref(&actor.permission_ref),
-        )?,
+        )
+        .await?,
         generate_worker_token(
             actor.identity,
             "role-control-worker",
@@ -220,7 +215,7 @@ async fn managed_sensor_owner_roles_authorize_update_and_revocation_only_for_cur
     ));
     for token in [outsider.token.clone(), scoped_elsewhere.token.clone()]
         .into_iter()
-        .chain(nonaccess_tokens(&ctx, &member)?)
+        .chain(nonaccess_tokens(&ctx, &member).await?)
     {
         assert_eq!(
             ctx.put(path, json!({"label":"Denied"}), Some(&token))
@@ -313,7 +308,9 @@ async fn approval_owner_role_access(selector: &str) -> Result<()> {
         .await,
         Err(ApiError::Forbidden(_))
     ));
-    for token in std::iter::once(outsider.token.clone()).chain(nonaccess_tokens(&ctx, &member)?) {
+    for token in
+        std::iter::once(outsider.token.clone()).chain(nonaccess_tokens(&ctx, &member).await?)
+    {
         assert_eq!(
             ctx.get(path, Some(&token)).await?.status(),
             StatusCode::FORBIDDEN

@@ -2744,10 +2744,19 @@ fn build_config(cli: &Cli) -> Result<CliConfig> {
         CliConfig::load_with_profile(cli.profile.as_deref())?
     } else {
         // No profile override — fall back to defaults on a fresh install.
-        CliConfig::load_with_profile(None).unwrap_or_default()
+        CliConfig::load_with_profile(None)?
     };
     ensure_current_profile_exists(&mut config);
 
+    if cli.auth_token.is_some()
+        || cli.refresh_token.is_some()
+        || cli.execution_token.is_some()
+        || cli.login.is_some()
+        || cli.password.is_some()
+    {
+        config.current_profile_mut()?.clear_credentials();
+        config.ephemeral_auth = true;
+    }
     if let Some(auth_token) = &cli.auth_token {
         config.current_profile_mut()?.auth_token = Some(auth_token.clone());
     }
@@ -2877,7 +2886,7 @@ async fn build_server(cli: &Cli) -> Result<McpServer> {
     };
 
     let mut server = McpServer::new(
-        ApiClient::from_config(&config, &cli.api_url),
+        ApiClient::from_config(&config, &cli.api_url)?,
         config.current_profile.clone(),
         credentials,
         packs_check_access,
@@ -2965,7 +2974,7 @@ async fn main() -> Result<()> {
             &config,
             &cli.api_url,
             std::time::Duration::from_secs(10),
-        );
+        )?;
         let report =
             attune_cli::info::get_info("attune-mcp", &config.current_profile, &mut client).await;
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -3774,7 +3783,7 @@ mod tests {
             .expect("default profile")
             .api_url = api_url;
         let mut server = McpServer::new(
-            ApiClient::from_config(&config, &None),
+            ApiClient::from_config(&config, &None).unwrap(),
             config.current_profile.clone(),
             None,
             packs_check_access,
@@ -3818,7 +3827,7 @@ mod tests {
     fn initialize_uses_requested_protocol_version() {
         let config = CliConfig::default();
         let mut server = McpServer::new(
-            ApiClient::from_config(&config, &None),
+            ApiClient::from_config(&config, &None).unwrap(),
             config.current_profile.clone(),
             None,
             PacksCheckAccess::Unrestricted,
@@ -5084,11 +5093,9 @@ mod tests {
 
     #[test]
     fn ensure_current_profile_exists_inserts_missing_profile() {
-        let mut config = CliConfig {
-            current_profile: "missing".to_string(),
-            ..CliConfig::default()
-        };
+        let mut config = CliConfig::default();
         config.profiles.clear();
+        config.current_profile = "missing".to_owned();
 
         ensure_current_profile_exists(&mut config);
 

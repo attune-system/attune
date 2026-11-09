@@ -34,10 +34,7 @@ impl NativeWaitCompletionReplayRepository {
         if workflow.status != ExecutionStatus::Failed {
             return Ok(None);
         }
-        if Admissions::find(conn, RuntimeOwner::Execution(workflow.execution))
-            .await?
-            .is_none()
-        {
+        if !Admissions::is_recorded(conn, workflow.execution).await? {
             return Ok(None);
         }
         let key = key.ok_or_else(denied)?;

@@ -12,3 +12,5 @@ pub mod output;
 pub mod wait;
 
 pub use cli::{Cli, Commands, CompletionShell};
+
+pub mod credentials;

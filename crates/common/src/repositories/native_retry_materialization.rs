@@ -57,101 +57,115 @@ impl NativeRetryMaterializationRepository {
     /// Re-publish an already accepted FIRST workflow task attempt. This only
     /// replays retained proof; it never invokes cache/wait/iteration rendering,
     /// materialization, pin acquisition or child creation.
-    pub(crate) async fn prepare_existing_workflow(
-        conn: &mut PgConnection,
-        child: &Execution,
-        key: &str,
-    ) -> Result<PreparedRetryPublication> {
-        let task = child.workflow_task.as_ref().ok_or_else(denied)?;
-        if child.status != ExecutionStatus::Requested
-            || child.retry_count != 0
-            || task.retry_count != 0
-            || child.original_execution.is_some()
-        {
-            return Err(denied());
-        }
-        let admission =
-            ExecutionAdmissionRepository::require(conn, RuntimeOwner::Execution(child.id)).await?;
-        let (_, binding) = ExecutionAdmissionRepository::workflow_invocation(
-            conn,
-            child.parent.ok_or_else(denied)?,
-            &task.task_name,
-            &child.action_ref,
-        )
-        .await?;
-        if admission.authority.binding != binding {
-            return Err(denied());
-        }
-        let fence =
-            RuntimeAuthorityRepository::retained_admission_fence(conn, admission.id).await?;
-        let schema = SchemaContractRepository::find(conn, BindingOwner::Execution, child.id)
-            .await?
-            .ok_or_else(denied)?;
-        schema.validate()?;
-        let (fields, receipts) = prepare_observation(conn, child, &schema, key).await?;
-        let cache = super::requested_execution_publication::prepare_cache_publication(
-            conn,
-            child,
-            &admission.authority.binding,
-            key,
-        )
-        .await?;
-        let prepared = PreparedRetryPublication {
-            retry: child.clone(),
-            workflow: task.workflow_execution,
-            source: PublicationSource::InitialTask,
-            fence: Some(fence),
-            receipts,
-            schema,
-            fields,
-            cache,
-        };
-        prepared.ensure_fresh_on(conn).await?;
-        Ok(prepared)
+    pub(crate) fn prepare_existing_workflow<'a>(
+        conn: &'a mut PgConnection,
+        child: &'a Execution,
+        key: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<PreparedRetryPublication>> {
+        Box::pin(async move {
+            let task = child.workflow_task.as_ref().ok_or_else(denied)?;
+            if child.status != ExecutionStatus::Requested
+                || child.retry_count != 0
+                || task.retry_count != 0
+                || child.original_execution.is_some()
+            {
+                return Err(denied());
+            }
+            if is_delegated(conn, child).await? {
+                return prepare_delegated_publication(
+                    conn,
+                    child,
+                    PublicationSource::InitialTask,
+                    key,
+                )
+                .await;
+            }
+            let admission =
+                ExecutionAdmissionRepository::require(conn, RuntimeOwner::Execution(child.id))
+                    .await?;
+            let (_, binding) = ExecutionAdmissionRepository::workflow_invocation(
+                conn,
+                child.parent.ok_or_else(denied)?,
+                &task.task_name,
+                &child.action_ref,
+            )
+            .await?;
+            if admission.authority.binding != binding {
+                return Err(denied());
+            }
+            let fence =
+                RuntimeAuthorityRepository::retained_admission_fence(conn, admission.id).await?;
+            let schema = SchemaContractRepository::find(conn, BindingOwner::Execution, child.id)
+                .await?
+                .ok_or_else(denied)?;
+            schema.validate()?;
+            let (fields, receipts) = prepare_observation(conn, child, &schema, key).await?;
+            let cache = super::requested_execution_publication::prepare_cache_publication(
+                conn,
+                child,
+                &admission.authority.binding,
+                key,
+            )
+            .await?;
+            let prepared = PreparedRetryPublication {
+                retry: child.clone(),
+                workflow: task.workflow_execution,
+                source: PublicationSource::InitialTask,
+                fence: Some(fence),
+                receipts,
+                schema,
+                fields,
+                cache,
+            };
+            prepared.ensure_fresh_on(conn).await?;
+            Ok(prepared)
+        })
     }
     /// Existing Requested recovery uses the committed retry edge, not an
     /// ephemeral completion payload or a caller-selected original execution.
-    pub async fn prepare_requested_recovery(
-        conn: &mut PgConnection,
-        retry: &Execution,
-        key: &str,
-    ) -> Result<Option<PreparedRetryPublication>> {
-        let task = retry.workflow_task.as_ref().ok_or_else(denied)?;
-        if retry.status != ExecutionStatus::Requested {
-            return Ok(None);
-        }
-        if retry.retry_count <= 0 || task.retry_count != retry.retry_count {
-            return Err(denied());
-        }
-        let due: bool = sqlx::query_scalar("SELECT $1::TIMESTAMPTZ <= clock_timestamp()")
-            .bind(task.next_retry_at.ok_or_else(denied)?)
-            .fetch_one(&mut *conn)
-            .await?;
-        if !due {
-            return Ok(None);
-        }
-        if is_unrecorded_ad_hoc(conn, retry).await? {
-            let sources: Vec<Id> = sqlx::query_scalar("SELECT id FROM execution WHERE parent=$1 AND ((retry_count=0 AND id=$2) OR original_execution=$2) AND retry_count=$3 AND workflow_task->>'workflow_execution'=$4 AND workflow_task->>'task_name'=$5 AND (workflow_task->'task_index') IS NOT DISTINCT FROM $6::JSONB AND (workflow_task->'task_batch') IS NOT DISTINCT FROM $7::JSONB ORDER BY id LIMIT 2")
+    pub fn prepare_requested_recovery<'a>(
+        conn: &'a mut PgConnection,
+        retry: &'a Execution,
+        key: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<Option<PreparedRetryPublication>>> {
+        Box::pin(async move {
+            let task = retry.workflow_task.as_ref().ok_or_else(denied)?;
+            if retry.status != ExecutionStatus::Requested {
+                return Ok(None);
+            }
+            if retry.retry_count <= 0 || task.retry_count != retry.retry_count {
+                return Err(denied());
+            }
+            let due: bool = sqlx::query_scalar("SELECT $1::TIMESTAMPTZ <= clock_timestamp()")
+                .bind(task.next_retry_at.ok_or_else(denied)?)
+                .fetch_one(&mut *conn)
+                .await?;
+            if !due {
+                return Ok(None);
+            }
+            if is_delegated(conn, retry).await? {
+                let sources: Vec<Id> = sqlx::query_scalar("SELECT id FROM execution WHERE parent=$1 AND ((retry_count=0 AND id=$2) OR original_execution=$2) AND retry_count=$3 AND workflow_task->>'workflow_execution'=$4 AND workflow_task->>'task_name'=$5 AND (workflow_task->'task_index') IS NOT DISTINCT FROM $6::JSONB AND (workflow_task->'task_batch') IS NOT DISTINCT FROM $7::JSONB ORDER BY id LIMIT 2")
                 .bind(retry.parent).bind(retry.original_execution.ok_or_else(denied)?)
                 .bind(retry.retry_count - 1).bind(task.workflow_execution.to_string()).bind(&task.task_name)
                 .bind(serde_json::to_value(task)?.get("task_index").cloned())
                 .bind(serde_json::to_value(task)?.get("task_batch").cloned())
                 .fetch_all(&mut *conn).await?;
+                let [source] = sources.as_slice() else {
+                    return Err(denied());
+                };
+                return Self::prepare_publication(conn, retry, *source, key)
+                    .await
+                    .map(Some);
+            }
+            let sources: Vec<Id> = sqlx::query_scalar("SELECT original.owner_id FROM runtime_admission_dependency edge JOIN runtime_authority_admission target ON target.id=edge.admission JOIN runtime_authority_admission original ON original.id=edge.dependency WHERE target.owner_kind='execution' AND target.owner_id=$1 AND edge.dependency_kind='retry' AND original.owner_kind='execution' ORDER BY original.owner_id LIMIT 2")
+            .bind(retry.id).fetch_all(&mut *conn).await?;
             let [source] = sources.as_slice() else {
                 return Err(denied());
             };
-            return Self::prepare_publication(conn, retry, *source, key)
+            Self::prepare_publication(conn, retry, *source, key)
                 .await
-                .map(Some);
-        }
-        let sources: Vec<Id> = sqlx::query_scalar("SELECT original.owner_id FROM runtime_admission_dependency edge JOIN runtime_authority_admission target ON target.id=edge.admission JOIN runtime_authority_admission original ON original.id=edge.dependency WHERE target.owner_kind='execution' AND target.owner_id=$1 AND edge.dependency_kind='retry' AND original.owner_kind='execution' ORDER BY original.owner_id LIMIT 2")
-            .bind(retry.id).fetch_all(&mut *conn).await?;
-        let [source] = sources.as_slice() else {
-            return Err(denied());
-        };
-        Self::prepare_publication(conn, retry, *source, key)
-            .await
-            .map(Some)
+                .map(Some)
+        })
     }
 
     pub async fn prepare(
@@ -181,10 +195,7 @@ impl NativeRetryMaterializationRepository {
             .ok_or_else(denied)?;
         same_execution(expected, &actual)?;
         let snapshot = actual.executable_snapshot.as_ref().ok_or_else(denied)?;
-        let admission = if is_unrecorded_ad_hoc(conn, &actual).await? {
-            validate_ad_hoc(conn, &actual).await?;
-            None
-        } else {
+        let admission = if ExecutionAdmissionRepository::is_recorded(conn, actual.id).await? {
             Some(
                 ExecutionAdmissionRepository::inherit(
                     conn,
@@ -193,6 +204,8 @@ impl NativeRetryMaterializationRepository {
                 )
                 .await?,
             )
+        } else {
+            None
         };
         let schema = SchemaContractRepository::find(conn, BindingOwner::Execution, actual.id)
             .await?
@@ -201,7 +214,10 @@ impl NativeRetryMaterializationRepository {
         let (fields, receipts) = if admission.is_some() {
             prepare_observation(conn, &actual, &schema, key).await?
         } else {
-            (ad_hoc_fields(conn, &actual).await?, Vec::new())
+            super::accepted_execution_source::prepare_delegated_observation(
+                conn, &actual, &schema, key,
+            )
+            .await?
         };
         let prepared = PreparedNativeRetry {
             source: actual,
@@ -218,48 +234,57 @@ impl NativeRetryMaterializationRepository {
 
     /// Backoff ends the creation transaction. Authenticate the SAME accepted
     /// retry, without resealing it or inheriting another attempt UUID.
-    pub async fn prepare_publication(
-        conn: &mut PgConnection,
-        retry: &Execution,
+    pub fn prepare_publication<'a>(
+        conn: &'a mut PgConnection,
+        retry: &'a Execution,
         source: Id,
-        key: &str,
-    ) -> Result<PreparedRetryPublication> {
-        let task = retry.workflow_task.as_ref().ok_or_else(denied)?;
-        if is_unrecorded_ad_hoc(conn, retry).await? {
-            return prepare_ad_hoc_publication(conn, retry, PublicationSource::Retry(source)).await;
-        }
-        let admission =
-            ExecutionAdmissionRepository::require(conn, RuntimeOwner::Execution(retry.id)).await?;
-        let fence =
-            RuntimeAuthorityRepository::retained_admission_fence(conn, admission.id).await?;
-        let inherited: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM runtime_admission_dependency edge JOIN runtime_authority_admission original ON original.id=edge.dependency WHERE edge.admission=$1 AND edge.dependency_kind='retry' AND original.owner_kind='execution' AND original.owner_id=$2)")
+        key: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<PreparedRetryPublication>> {
+        Box::pin(async move {
+            let task = retry.workflow_task.as_ref().ok_or_else(denied)?;
+            if is_delegated(conn, retry).await? {
+                return prepare_delegated_publication(
+                    conn,
+                    retry,
+                    PublicationSource::Retry(source),
+                    key,
+                )
+                .await;
+            }
+            let admission =
+                ExecutionAdmissionRepository::require(conn, RuntimeOwner::Execution(retry.id))
+                    .await?;
+            let fence =
+                RuntimeAuthorityRepository::retained_admission_fence(conn, admission.id).await?;
+            let inherited: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM runtime_admission_dependency edge JOIN runtime_authority_admission original ON original.id=edge.dependency WHERE edge.admission=$1 AND edge.dependency_kind='retry' AND original.owner_kind='execution' AND original.owner_id=$2)")
             .bind(admission.id).bind(source).fetch_one(&mut *conn).await?;
-        if !inherited {
-            return Err(denied());
-        }
-        let schema = SchemaContractRepository::find(conn, BindingOwner::Execution, retry.id)
-            .await?
-            .ok_or_else(denied)?;
-        let (fields, receipts) = prepare_observation(conn, retry, &schema, key).await?;
-        let cache = super::requested_execution_publication::prepare_cache_publication(
-            conn,
-            retry,
-            &admission.authority.binding,
-            key,
-        )
-        .await?;
-        let prepared = PreparedRetryPublication {
-            retry: retry.clone(),
-            workflow: task.workflow_execution,
-            source: PublicationSource::Retry(source),
-            fence: Some(fence),
-            receipts,
-            schema,
-            fields,
-            cache,
-        };
-        prepared.ensure_fresh_on(conn).await?;
-        Ok(prepared)
+            if !inherited {
+                return Err(denied());
+            }
+            let schema = SchemaContractRepository::find(conn, BindingOwner::Execution, retry.id)
+                .await?
+                .ok_or_else(denied)?;
+            let (fields, receipts) = prepare_observation(conn, retry, &schema, key).await?;
+            let cache = super::requested_execution_publication::prepare_cache_publication(
+                conn,
+                retry,
+                &admission.authority.binding,
+                key,
+            )
+            .await?;
+            let prepared = PreparedRetryPublication {
+                retry: retry.clone(),
+                workflow: task.workflow_execution,
+                source: PublicationSource::Retry(source),
+                fence: Some(fence),
+                receipts,
+                schema,
+                fields,
+                cache,
+            };
+            prepared.ensure_fresh_on(conn).await?;
+            Ok(prepared)
+        })
     }
 }
 
@@ -268,8 +293,12 @@ impl PreparedNativeRetry {
         if let Some(admission) = &self.admission {
             admission.ensure_fresh_on(conn).await?;
         } else {
-            validate_ad_hoc(conn, &self.source).await?;
-            if ad_hoc_fields(conn, &self.source).await? != self.fields {
+            super::delegated_execution::DelegatedExecutionRepository::validate(
+                conn,
+                self.source.id,
+            )
+            .await?;
+            if delegated_fields(conn, &self.source).await? != self.fields {
                 return Err(denied());
             }
         }
@@ -413,7 +442,15 @@ impl PreparedNativeRetry {
             retry.id,
         )
         .await?;
-        // Only this newly created retry may receive its first acceptance seal.
+        if self.admission.is_none() {
+            super::delegated_execution::DelegatedExecutionRepository::select(
+                conn,
+                retry.id,
+                Some(actual.id),
+            )
+            .await?;
+        }
+        // Recorded acceptance seals are never manufactured for delegation.
         let receipts = if self.admission.is_some() {
             Materialization::seal_execution_inputs(conn, retry.id, &self.key).await?
         } else {
@@ -519,8 +556,8 @@ impl PreparedRetryPublication {
         if let Some(fence) = &self.fence {
             fence.ensure_fresh_on(conn).await?;
         } else {
-            validate_ad_hoc(conn, &self.retry).await?;
-            if ad_hoc_fields(conn, &self.retry).await? != self.fields {
+            validate_delegated(conn, &self.retry).await?;
+            if delegated_fields(conn, &self.retry).await? != self.fields {
                 return Err(denied());
             }
         }
@@ -534,32 +571,22 @@ impl PreparedRetryPublication {
     }
 }
 
-// Ad-hoc workflows retain human delegation and ordinary secret origins. They
-// never acquire a pack policy merely by sharing a pack ref. Both parent and task
-// must be ad hoc, and recorded evidence must never fall back to this path.
-async fn is_unrecorded_ad_hoc(conn: &mut PgConnection, execution: &Execution) -> Result<bool> {
-    Ok(execution
-        .executable_snapshot
-        .as_ref()
-        .is_some_and(|snapshot| snapshot.executable.action.is_adhoc)
-        && ExecutionAdmissionRepository::find(conn, RuntimeOwner::Execution(execution.id))
-            .await?
-            .is_none())
+// Persisted authority controls retry recovery independently of action ownership.
+async fn is_delegated(conn: &mut PgConnection, execution: &Execution) -> Result<bool> {
+    Ok(!ExecutionAdmissionRepository::is_recorded(conn, execution.id).await?)
 }
 
-async fn validate_ad_hoc(conn: &mut PgConnection, execution: &Execution) -> Result<()> {
+async fn validate_delegated(conn: &mut PgConnection, execution: &Execution) -> Result<()> {
     let actual = ExecutionRepository::find_by_id(&mut *conn, execution.id)
         .await?
         .ok_or_else(denied)?;
     same_execution(execution, &actual)?;
-    if !is_unrecorded_ad_hoc(conn, execution).await? {
-        return Err(denied());
-    }
+    super::delegated_execution::DelegatedExecutionRepository::validate(conn, execution.id).await?;
     let parent = ExecutionRepository::find_by_id(&mut *conn, execution.parent.ok_or_else(denied)?)
         .await?
         .ok_or_else(denied)?;
-    if !is_unrecorded_ad_hoc(conn, &parent).await?
-        || execution.executor.is_none()
+    super::delegated_execution::DelegatedExecutionRepository::validate(conn, parent.id).await?;
+    if execution.executor.is_none()
         || parent.executor != execution.executor
         || !active(parent.status)
     {
@@ -582,7 +609,7 @@ async fn validate_ad_hoc(conn: &mut PgConnection, execution: &Execution) -> Resu
     .await
 }
 
-async fn ad_hoc_fields(
+async fn delegated_fields(
     conn: &mut PgConnection,
     execution: &Execution,
 ) -> Result<Vec<StoredSecretValue>> {
@@ -598,64 +625,70 @@ async fn ad_hoc_fields(
     Ok(fields)
 }
 
-async fn prepare_ad_hoc_publication(
-    conn: &mut PgConnection,
-    retry: &Execution,
+fn prepare_delegated_publication<'a>(
+    conn: &'a mut PgConnection,
+    retry: &'a Execution,
     source: PublicationSource,
-) -> Result<PreparedRetryPublication> {
-    if retry.status != ExecutionStatus::Requested || retry.worker.is_some() {
-        return Err(denied());
-    }
-    validate_ad_hoc(conn, retry).await?;
-    let task = retry.workflow_task.as_ref().ok_or_else(denied)?;
-    let schema = SchemaContractRepository::find(conn, BindingOwner::Execution, retry.id)
-        .await?
-        .ok_or_else(denied)?;
-    schema.validate()?;
-    let fields = ad_hoc_fields(conn, retry).await?;
-    if let PublicationSource::Retry(id) = source {
-        let original = ExecutionRepository::find_by_id(&mut *conn, id)
-            .await?
-            .ok_or_else(denied)?;
-        validate_ad_hoc(conn, &original).await?;
-        let previous = original.workflow_task.as_ref().ok_or_else(denied)?;
-        if !matches!(
-            original.status,
-            ExecutionStatus::Failed | ExecutionStatus::Timeout
-        ) || original.parent != retry.parent
-            || original.executor != retry.executor
-            || original.config != retry.config
-            || original.env_vars != retry.env_vars
-            || original.permission_set_refs != retry.permission_set_refs
-            || serde_json::to_value(&original.executable_snapshot)?
-                != serde_json::to_value(&retry.executable_snapshot)?
-            || original.original_execution.unwrap_or(original.id)
-                != retry.original_execution.ok_or_else(denied)?
-            || original.retry_count.checked_add(1) != Some(retry.retry_count)
-            || previous.retry_count != original.retry_count
-            || task.retry_count != retry.retry_count
-            || previous.workflow_execution != task.workflow_execution
-            || previous.task_name != task.task_name
-            || previous.task_index != task.task_index
-            || previous.task_batch != task.task_batch
-            || SchemaContractRepository::find(conn, BindingOwner::Execution, id)
-                .await?
-                .as_ref()
-                != Some(&schema)
-            || ad_hoc_fields(conn, &original).await? != fields
-        {
+    key: &'a str,
+) -> futures::future::BoxFuture<'a, Result<PreparedRetryPublication>> {
+    Box::pin(async move {
+        if retry.status != ExecutionStatus::Requested || retry.worker.is_some() {
             return Err(denied());
         }
-    }
-    Ok(PreparedRetryPublication {
-        retry: retry.clone(),
-        workflow: task.workflow_execution,
-        source,
-        fence: None,
-        receipts: Vec::new(),
-        schema,
-        fields,
-        cache: None,
+        validate_delegated(conn, retry).await?;
+        let task = retry.workflow_task.as_ref().ok_or_else(denied)?;
+        let schema = SchemaContractRepository::find(conn, BindingOwner::Execution, retry.id)
+            .await?
+            .ok_or_else(denied)?;
+        schema.validate()?;
+        let (fields, receipts) = super::accepted_execution_source::prepare_delegated_observation(
+            conn, retry, &schema, key,
+        )
+        .await?;
+        if let PublicationSource::Retry(id) = source {
+            let original = ExecutionRepository::find_by_id(&mut *conn, id)
+                .await?
+                .ok_or_else(denied)?;
+            validate_delegated(conn, &original).await?;
+            let previous = original.workflow_task.as_ref().ok_or_else(denied)?;
+            if !matches!(
+                original.status,
+                ExecutionStatus::Failed | ExecutionStatus::Timeout
+            ) || original.parent != retry.parent
+                || original.executor != retry.executor
+                || original.config != retry.config
+                || original.env_vars != retry.env_vars
+                || original.permission_set_refs != retry.permission_set_refs
+                || serde_json::to_value(&original.executable_snapshot)?
+                    != serde_json::to_value(&retry.executable_snapshot)?
+                || original.original_execution.unwrap_or(original.id)
+                    != retry.original_execution.ok_or_else(denied)?
+                || original.retry_count.checked_add(1) != Some(retry.retry_count)
+                || previous.retry_count != original.retry_count
+                || task.retry_count != retry.retry_count
+                || previous.workflow_execution != task.workflow_execution
+                || previous.task_name != task.task_name
+                || previous.task_index != task.task_index
+                || previous.task_batch != task.task_batch
+                || SchemaContractRepository::find(conn, BindingOwner::Execution, id)
+                    .await?
+                    .as_ref()
+                    != Some(&schema)
+                || delegated_fields(conn, &original).await? != fields
+            {
+                return Err(denied());
+            }
+        }
+        Ok(PreparedRetryPublication {
+            retry: retry.clone(),
+            workflow: task.workflow_execution,
+            source,
+            fence: None,
+            receipts,
+            schema,
+            fields,
+            cache: None,
+        })
     })
 }
 

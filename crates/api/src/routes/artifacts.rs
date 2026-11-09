@@ -276,13 +276,13 @@ pub async fn get_artifact(
     Path(id): Path<i64>,
 ) -> ApiResult<impl IntoResponse> {
     if crate::recorded_consumers::is_recorded(&user)? {
-        let artifact = crate::recorded_reads::artifact(
+        let artifact = Box::pin(crate::recorded_reads::artifact(
             &state.db,
             &user,
             id,
             None,
             state.config.security.encryption_key.as_deref(),
-        )
+        ))
         .await
         .map_err(|error| {
             crate::artifact_reads::mask_detail_denial(
@@ -359,13 +359,13 @@ pub async fn get_artifact_by_ref(
         .ok_or_else(|| ApiError::NotFound(format!("Artifact '{}' not found", artifact_ref)))?;
 
     if crate::recorded_consumers::is_recorded(&user)? {
-        let artifact = crate::recorded_reads::artifact(
+        let artifact = Box::pin(crate::recorded_reads::artifact(
             &state.db,
             &user,
             header.id,
             Some(&artifact_ref),
             state.config.security.encryption_key.as_deref(),
-        )
+        ))
         .await
         .map_err(|error| {
             crate::artifact_reads::mask_detail_denial(
@@ -1808,43 +1808,49 @@ fn verified_body_sse(response: axum::response::Response) -> axum::response::Resp
     Sse::new(stream).into_response()
 }
 
-async fn authorize_selected_artifact_version(
-    state: &Arc<AppState>,
-    user: &AuthenticatedUser,
-    artifact: &attune_common::models::artifact::Artifact,
-    selected: &attune_common::models::ArtifactVersion,
-) -> ApiResult<()> {
-    // Only human Access reads adopt the selected-runtime-log policy. Recorded
-    // credentials use their typed handlers; other legacy credentials retain
-    // their existing aggregate/sensor-specific disclosure contract.
-    let result = if crate::recorded_consumers::is_recorded(user)? {
-        Err(ApiError::Forbidden(
-            "Recorded content requires its typed reader".into(),
-        ))
-    } else if user.claims.token_type != TokenType::Access {
-        async {
-            let guard =
-                authorize_artifact_delivery_with_receipts(state, user, artifact, selected).await?;
-            crate::receipt_disclosure::HumanReceiptGuard::finish_shared(guard)
-                .await?
-                .ensure_fresh()?;
-            if user.claims.exp <= chrono::Utc::now().timestamp() {
-                return Err(ApiError::Unauthorized("Artifact credential expired".into()));
+fn authorize_selected_artifact_version<'a>(
+    state: &'a Arc<AppState>,
+    user: &'a AuthenticatedUser,
+    artifact: &'a attune_common::models::artifact::Artifact,
+    selected: &'a attune_common::models::ArtifactVersion,
+) -> futures::future::BoxFuture<'a, ApiResult<()>> {
+    // This boundary is shared by the download handlers. Keeping its disclosure
+    // branches on the heap prevents their debug poll frames from accumulating
+    // on the service runtime's default worker stack.
+    Box::pin(async move {
+        // Only human Access reads adopt the selected-runtime-log policy. Recorded
+        // credentials use their typed handlers; other legacy credentials retain
+        // their existing aggregate/sensor-specific disclosure contract.
+        let result = if crate::recorded_consumers::is_recorded(user)? {
+            Err(ApiError::Forbidden(
+                "Recorded content requires its typed reader".into(),
+            ))
+        } else if user.claims.token_type != TokenType::Access {
+            async {
+                let guard =
+                    authorize_artifact_delivery_with_receipts(state, user, artifact, selected)
+                        .await?;
+                crate::receipt_disclosure::HumanReceiptGuard::finish_shared(guard)
+                    .await?
+                    .ensure_fresh()?;
+                if user.claims.exp <= chrono::Utc::now().timestamp() {
+                    return Err(ApiError::Unauthorized("Artifact credential expired".into()));
+                }
+                Ok(())
             }
-            Ok(())
-        }
-        .await
-    } else {
-        crate::artifact_reads::ArtifactReads::authorize_selected_version(
-            state, user, artifact, selected,
-        )
-        .await
-    };
-    result.map_err(|error| {
-        crate::artifact_reads::mask_detail_denial(
-            error,
-            format!("Artifact with ID {} not found", artifact.id),
-        )
+            .await
+        } else {
+            crate::artifact_reads::ArtifactReads::authorize_selected_version(
+                state, user, artifact, selected,
+            )
+            .await
+        };
+        result.map_err(|error| {
+            crate::artifact_reads::mask_detail_denial(
+                error,
+                format!("Artifact with ID {} not found", artifact.id),
+            )
+        })
     })
 }
 
@@ -2223,201 +2229,213 @@ fn audit_log_download_eof(
     axum::response::Response::from_parts(parts, axum::body::Body::from_stream(stream))
 }
 
-async fn download_human_encrypted_log(
+fn download_human_encrypted_log(
     state: Arc<AppState>,
     user: AuthenticatedUser,
     artifact: attune_common::models::artifact::Artifact,
     selected: attune_common::models::artifact_version::ArtifactVersion,
-) -> ApiResult<axum::response::Response> {
-    use attune_common::repositories::{
-        runtime_read::RuntimeReadOwner,
-        runtime_target::{RuntimeTarget, RuntimeTargetRepository},
-    };
-    let denied = || ApiError::NotFound("Protected log is unavailable".into());
-    if user.claims.token_type != TokenType::Access
-        || artifact.classification != ArtifactClassification::RuntimeLog
-    {
-        return Err(denied());
-    }
-    let identity = user.identity_id().map_err(|_| denied())?;
-    let mut tx = state.db.begin().await?;
-    let target =
-        RuntimeTargetRepository::resolve(&mut tx, RuntimeTarget::Artifact(artifact.id), identity)
-            .await?
-            .ok_or_else(denied)?;
-    let owner = RuntimeReadOwner::of(&target);
-    tx.commit().await?;
-    let audit = (
-        state.clone(),
-        user.clone(),
-        artifact.clone(),
-        selected.clone(),
-    );
-    let response = crate::recorded_reads::sealed_log_response(&state, &selected).await?;
-    let (parts, body) = response.into_parts();
-    let authorize = move || {
-        let (state, user, artifact, selected, owner) = (
+) -> futures::future::BoxFuture<'static, ApiResult<axum::response::Response>> {
+    Box::pin(async move {
+        use attune_common::repositories::{
+            runtime_read::RuntimeReadOwner,
+            runtime_target::{RuntimeTarget, RuntimeTargetRepository},
+        };
+        let denied = || ApiError::NotFound("Protected log is unavailable".into());
+        if user.claims.token_type != TokenType::Access
+            || artifact.classification != ArtifactClassification::RuntimeLog
+        {
+            return Err(denied());
+        }
+        let identity = user.identity_id().map_err(|_| denied())?;
+        let mut tx = state.db.begin().await?;
+        let target = RuntimeTargetRepository::resolve(
+            &mut tx,
+            RuntimeTarget::Artifact(artifact.id),
+            identity,
+        )
+        .await?
+        .ok_or_else(denied)?;
+        let owner = RuntimeReadOwner::of(&target);
+        tx.commit().await?;
+        let audit = (
             state.clone(),
             user.clone(),
             artifact.clone(),
             selected.clone(),
-            owner.clone(),
         );
-        async move {
-            let check = async {
-                if chrono::Utc::now().timestamp() >= user.claims.exp {
-                    return Err(denied());
-                }
-                let active = attune_common::repositories::identity::IdentityRepository::find_by_id(
-                    &state.db, identity,
-                )
-                .await?
-                .is_some_and(|identity| !identity.frozen);
-                if !active {
-                    return Err(denied());
-                }
-                let current = ArtifactRepository::find_by_id(&state.db, artifact.id)
-                    .await?
-                    .ok_or_else(denied)?;
-                if current.classification != ArtifactClassification::RuntimeLog {
-                    return Err(denied());
-                }
-                let receipts =
+        let response = crate::recorded_reads::sealed_log_response(&state, &selected).await?;
+        let (parts, body) = response.into_parts();
+        let authorize = move || {
+            let (state, user, artifact, selected, owner) = (
+                state.clone(),
+                user.clone(),
+                artifact.clone(),
+                selected.clone(),
+                owner.clone(),
+            );
+            async move {
+                let check = async {
+                    if chrono::Utc::now().timestamp() >= user.claims.exp {
+                        return Err(denied());
+                    }
+                    let active =
+                        attune_common::repositories::identity::IdentityRepository::find_by_id(
+                            &state.db, identity,
+                        )
+                        .await?
+                        .is_some_and(|identity| !identity.frozen);
+                    if !active {
+                        return Err(denied());
+                    }
+                    let current = ArtifactRepository::find_by_id(&state.db, artifact.id)
+                        .await?
+                        .ok_or_else(denied)?;
+                    if current.classification != ArtifactClassification::RuntimeLog {
+                        return Err(denied());
+                    }
+                    let receipts =
                     crate::artifact_reads::ArtifactReads::authorize_selected_version_with_receipts(
                         &state, &user, &current, &selected,
                     )
                     .await?;
-                let mut held = receipts.lock().await;
-                let conn = held.connection();
-                let target = RuntimeTargetRepository::resolve(
-                    conn,
-                    RuntimeTarget::Artifact(artifact.id),
-                    identity,
-                )
-                .await?
-                .ok_or_else(denied)?;
-                let pinned = ArtifactVersionRepository::find_pinned_for_share(conn, selected.id)
+                    let mut held = receipts.lock().await;
+                    let conn = held.connection();
+                    let target = RuntimeTargetRepository::resolve(
+                        conn,
+                        RuntimeTarget::Artifact(artifact.id),
+                        identity,
+                    )
                     .await?
                     .ok_or_else(denied)?;
-                if RuntimeReadOwner::of(&target) != owner
-                    || pinned.artifact != artifact.id
-                    || pinned.execution != selected.execution
-                    || pinned.body_state != Some(ArtifactBodyState::Ready)
-                    || pinned.sha256 != selected.sha256
-                    || pinned.size_bytes != selected.size_bytes
-                    || crate::recorded_reads::encrypted_manifest(&pinned)
-                        != crate::recorded_reads::encrypted_manifest(&selected)
-                    || !ArtifactVersionRepository::log_is_sealed(conn, selected.id).await?
-                {
-                    return Err(denied());
-                }
-                let active = attune_common::repositories::identity::IdentityRepository::find_by_id(
-                    &mut *conn, identity,
-                )
-                .await?
-                .is_some_and(|identity| !identity.frozen);
-                if !active || chrono::Utc::now().timestamp() >= user.claims.exp {
-                    return Err(denied());
-                }
-                drop(held);
-                let receipts =
-                    crate::receipt_disclosure::HumanReceiptGuard::finish_shared(receipts).await?;
-                receipts.ensure_fresh()?;
-                if chrono::Utc::now().timestamp() >= user.claims.exp {
-                    return Err(denied());
-                }
-                Ok::<_, ApiError>(())
-            };
-            check
-                .await
-                .map_err(|_| std::io::Error::other("Protected log authority is no longer valid"))
-        }
-    };
-    // A HEAD response is authorized here even when Hyper never polls its body.
-    authorize().await.map_err(|_| denied())?;
-    let stream = crate::recorded_reads::guarded_chunks(body.into_data_stream(), authorize);
-    Ok(audit_log_download_eof(
-        audit,
-        axum::response::Response::from_parts(parts, axum::body::Body::from_stream(stream)),
-    ))
+                    let pinned =
+                        ArtifactVersionRepository::find_pinned_for_share(conn, selected.id)
+                            .await?
+                            .ok_or_else(denied)?;
+                    if RuntimeReadOwner::of(&target) != owner
+                        || pinned.artifact != artifact.id
+                        || pinned.execution != selected.execution
+                        || pinned.body_state != Some(ArtifactBodyState::Ready)
+                        || pinned.sha256 != selected.sha256
+                        || pinned.size_bytes != selected.size_bytes
+                        || crate::recorded_reads::encrypted_manifest(&pinned)
+                            != crate::recorded_reads::encrypted_manifest(&selected)
+                        || !ArtifactVersionRepository::log_is_sealed(conn, selected.id).await?
+                    {
+                        return Err(denied());
+                    }
+                    let active =
+                        attune_common::repositories::identity::IdentityRepository::find_by_id(
+                            &mut *conn, identity,
+                        )
+                        .await?
+                        .is_some_and(|identity| !identity.frozen);
+                    if !active || chrono::Utc::now().timestamp() >= user.claims.exp {
+                        return Err(denied());
+                    }
+                    drop(held);
+                    let receipts =
+                        crate::receipt_disclosure::HumanReceiptGuard::finish_shared(receipts)
+                            .await?;
+                    receipts.ensure_fresh()?;
+                    if chrono::Utc::now().timestamp() >= user.claims.exp {
+                        return Err(denied());
+                    }
+                    Ok::<_, ApiError>(())
+                };
+                check.await.map_err(|_| {
+                    std::io::Error::other("Protected log authority is no longer valid")
+                })
+            }
+        };
+        // A HEAD response is authorized here even when Hyper never polls its body.
+        authorize().await.map_err(|_| denied())?;
+        let stream = crate::recorded_reads::guarded_chunks(body.into_data_stream(), authorize);
+        Ok(audit_log_download_eof(
+            audit,
+            axum::response::Response::from_parts(parts, axum::body::Body::from_stream(stream)),
+        ))
+    })
 }
 
-async fn download_recorded_version(
+fn download_recorded_version(
     state: Arc<AppState>,
     user: AuthenticatedUser,
     id: i64,
     number: Option<i32>,
     selector: ArtifactContentSelector,
     headers: HeaderMap,
-) -> ApiResult<axum::response::Response> {
-    let (artifact, selected, captured) = crate::recorded_reads::version_with_id(
-        &state.db,
-        &user,
-        id,
-        number,
-        selector.version_id,
-        state.config.security.encryption_key.as_deref(),
-    )
-    .await?;
-    ensure_selected_version_id(&selector, &selected)?;
-    if let Some(response) = protected_file_response(&state, &user, &selected, &headers).await? {
-        return Ok(response);
-    }
-    let response = if crate::recorded_reads::encrypted_manifest(&selected).is_some() {
-        crate::recorded_reads::sealed_log_response(&state, &selected).await?
-    } else if selected.body_state == Some(ArtifactBodyState::Ready) {
-        serve_object_body(&state, &selected, &artifact.r#ref, &headers).await?
-    } else {
-        serve_db_content(&artifact.r#ref, selected.version, &selected, &headers)?
-    };
-    crate::recorded_reads::guard_download(state, user, captured, response).await
+) -> futures::future::BoxFuture<'static, ApiResult<axum::response::Response>> {
+    Box::pin(async move {
+        let (artifact, selected, captured) = crate::recorded_reads::version_with_id(
+            &state.db,
+            &user,
+            id,
+            number,
+            selector.version_id,
+            state.config.security.encryption_key.as_deref(),
+        )
+        .await?;
+        ensure_selected_version_id(&selector, &selected)?;
+        if let Some(response) = protected_file_response(&state, &user, &selected, &headers).await? {
+            return Ok(response);
+        }
+        let response = if crate::recorded_reads::encrypted_manifest(&selected).is_some() {
+            crate::recorded_reads::sealed_log_response(&state, &selected).await?
+        } else if selected.body_state == Some(ArtifactBodyState::Ready) {
+            serve_object_body(&state, &selected, &artifact.r#ref, &headers).await?
+        } else {
+            serve_db_content(&artifact.r#ref, selected.version, &selected, &headers)?
+        };
+        crate::recorded_reads::guard_download(state, user, captured, response).await
+    })
 }
 
 /// The only plaintext opener for origin-bound files. Raw blob readers return
 /// ciphertext; every route, including internal shared-path downloads, enters here.
-pub(crate) async fn protected_file_response(
-    state: &Arc<AppState>,
-    user: &AuthenticatedUser,
-    version: &attune_common::models::artifact_version::ArtifactVersion,
-    headers: &HeaderMap,
-) -> ApiResult<Option<axum::response::Response>> {
-    use attune_common::repositories::file_origin::FileOriginRepository;
-    use futures::TryStreamExt;
-    let source = {
-        let mut conn = state.db.acquire().await?;
-        FileOriginRepository::find(&mut conn, version.id).await?
-    };
-    let Some(source) = source else {
-        // Proof deletion cascades with the version. A handler may still hold
-        // an older model after blob I/O; it must not turn that into raw serving.
-        let current = ArtifactVersionRepository::find_by_id(&state.db, version.id)
-            .await?
-            .ok_or_else(|| ApiError::Forbidden("Selected file version disappeared".into()))?;
-        if current.artifact != version.artifact
-            || current.execution != version.execution
-            || current.body_state != version.body_state
-            || current.object_key != version.object_key
-            || current.provider_version != version.provider_version
-            || current.sha256 != version.sha256
-            || current.file_path != version.file_path
-        {
-            return Err(ApiError::Forbidden(
-                "Selected file storage binding changed".into(),
-            ));
-        }
-        if let Some(path) = &version.file_path {
+pub(crate) fn protected_file_response<'a>(
+    state: &'a Arc<AppState>,
+    user: &'a AuthenticatedUser,
+    version: &'a attune_common::models::artifact_version::ArtifactVersion,
+    headers: &'a HeaderMap,
+) -> futures::future::BoxFuture<'a, ApiResult<Option<axum::response::Response>>> {
+    Box::pin(async move {
+        use attune_common::repositories::file_origin::FileOriginRepository;
+        use futures::TryStreamExt;
+        let source = {
             let mut conn = state.db.acquire().await?;
-            if FileOriginRepository::guarded_path(&mut conn, path).await? {
+            FileOriginRepository::find(&mut conn, version.id).await?
+        };
+        let Some(source) = source else {
+            // Proof deletion cascades with the version. A handler may still hold
+            // an older model after blob I/O; it must not turn that into raw serving.
+            let current = ArtifactVersionRepository::find_by_id(&state.db, version.id)
+                .await?
+                .ok_or_else(|| ApiError::Forbidden("Selected file version disappeared".into()))?;
+            if current.artifact != version.artifact
+                || current.execution != version.execution
+                || current.body_state != version.body_state
+                || current.object_key != version.object_key
+                || current.provider_version != version.provider_version
+                || current.sha256 != version.sha256
+                || current.file_path != version.file_path
+            {
                 return Err(ApiError::Forbidden(
-                    "Origin-bound staging has no live file proof".into(),
+                    "Selected file storage binding changed".into(),
                 ));
             }
-        }
-        // Do not interpret an older admitted file without a proof as public
-        // plaintext. It needs a separately admitted migration, not read fallback.
-        if let Some(execution) = version.execution {
-            let mut conn = state.db.acquire().await?;
-            if attune_common::repositories::runtime_authority::RuntimeAuthorityRepository::execution_admission(&mut conn,execution).await?.is_some() {
+            if let Some(path) = &version.file_path {
+                let mut conn = state.db.acquire().await?;
+                if FileOriginRepository::guarded_path(&mut conn, path).await? {
+                    return Err(ApiError::Forbidden(
+                        "Origin-bound staging has no live file proof".into(),
+                    ));
+                }
+            }
+            // Do not interpret an older admitted file without a proof as public
+            // plaintext. It needs a separately admitted migration, not read fallback.
+            if let Some(execution) = version.execution {
+                let mut conn = state.db.acquire().await?;
+                if attune_common::repositories::runtime_authority::RuntimeAuthorityRepository::execution_admission(&mut conn,execution).await?.is_some() {
                 let artifact=ArtifactRepository::find_by_id(&mut *conn,version.artifact).await?
                     .ok_or_else(||ApiError::Forbidden("File owner unavailable".into()))?;
                 if artifact.classification!=ArtifactClassification::RuntimeLog &&
@@ -2425,161 +2443,167 @@ pub(crate) async fn protected_file_response(
                     return Err(ApiError::Forbidden("Admitted file is missing its retained body proof".into()));
                 }
             }
+            }
+            return Ok(None);
+        };
+        if version.body_state != Some(ArtifactBodyState::Ready) {
+            return Err(ApiError::Forbidden("Protected file is not Ready".into()));
         }
-        return Ok(None);
-    };
-    if version.body_state != Some(ArtifactBodyState::Ready) {
-        return Err(ApiError::Forbidden("Protected file is not Ready".into()));
-    }
-    let recorded = crate::recorded_consumers::is_recorded(user)?;
-    let (artifact, captured) = if recorded {
-        let (artifact, selected, captured) = crate::recorded_reads::version_with_id(
-            &state.db,
-            user,
-            version.artifact,
-            Some(version.version),
-            Some(version.id),
-            state.config.security.encryption_key.as_deref(),
-        )
-        .await?;
-        if selected.id != version.id
-            || selected.sha256 != version.sha256
-            || selected.provider_version != version.provider_version
-        {
-            return Err(ApiError::Forbidden("Selected file body changed".into()));
-        }
-        (artifact, Some(captured))
-    } else {
-        let artifact = ArtifactRepository::find_by_id(&state.db, version.artifact)
+        let recorded = crate::recorded_consumers::is_recorded(user)?;
+        let (artifact, captured) = if recorded {
+            let (artifact, selected, captured) = crate::recorded_reads::version_with_id(
+                &state.db,
+                user,
+                version.artifact,
+                Some(version.version),
+                Some(version.id),
+                state.config.security.encryption_key.as_deref(),
+            )
+            .await?;
+            if selected.id != version.id
+                || selected.sha256 != version.sha256
+                || selected.provider_version != version.provider_version
+            {
+                return Err(ApiError::Forbidden("Selected file body changed".into()));
+            }
+            (artifact, Some(captured))
+        } else {
+            let artifact = ArtifactRepository::find_by_id(&state.db, version.artifact)
+                .await?
+                .ok_or_else(|| ApiError::Forbidden("File owner unavailable".into()))?;
+            for action in [Action::Read, Action::Decrypt] {
+                authorize_artifact_action(state, user, action, &artifact).await?;
+            }
+            crate::secret_disclosure::authorize_file_origin(state, user, source.origin_read)
+                .await?;
+            (artifact, None)
+        };
+        let proof = FileOriginRepository::body(&state.db, version.id)
             .await?
-            .ok_or_else(|| ApiError::Forbidden("File owner unavailable".into()))?;
-        for action in [Action::Read, Action::Decrypt] {
-            authorize_artifact_action(state, user, action, &artifact).await?;
-        }
-        crate::secret_disclosure::authorize_file_origin(state, user, source.origin_read).await?;
-        (artifact, None)
-    };
-    let proof = FileOriginRepository::body(&state.db, version.id)
-        .await?
-        .ok_or_else(|| ApiError::Forbidden("File body proof unavailable".into()))?;
-    if source.origin_read != proof.origin_read
-        || version.size_bytes != Some(proof.ciphertext_bytes)
-        || version.sha256.as_deref() != Some(proof.ciphertext_sha256.as_str())
-        || proof.plaintext_bytes < 0
-    {
-        return Err(ApiError::Forbidden("File body binding mismatch".into()));
-    }
-    if proof.plaintext_bytes > source.max_plaintext_bytes {
-        return Err(ApiError::Forbidden(
-            "File body exceeds its captured cap".into(),
-        ));
-    }
-    let memory = state
-        .file_transfers
-        .reader(proof.plaintext_bytes as u64)
-        .map_err(ApiError::TooManyRequests)?;
-    let mut stream = crate::routes::internal_files::stream_object_body(state, version, None)
-        .await
-        .map_err(|_| ApiError::Forbidden("Encrypted file body unavailable".into()))?;
-    let mut ciphertext = Vec::new();
-    while let Some(chunk) = stream
-        .try_next()
-        .await
-        .map_err(|_| ApiError::Forbidden("Encrypted file body unavailable".into()))?
-    {
-        if (ciphertext.len() as u64)
-            .checked_add(chunk.len() as u64)
-            .is_none_or(|n| n > proof.ciphertext_bytes as u64)
+            .ok_or_else(|| ApiError::Forbidden("File body proof unavailable".into()))?;
+        if source.origin_read != proof.origin_read
+            || version.size_bytes != Some(proof.ciphertext_bytes)
+            || version.sha256.as_deref() != Some(proof.ciphertext_sha256.as_str())
+            || proof.plaintext_bytes < 0
         {
+            return Err(ApiError::Forbidden("File body binding mismatch".into()));
+        }
+        if proof.plaintext_bytes > source.max_plaintext_bytes {
             return Err(ApiError::Forbidden(
-                "Encrypted file body exceeds its proof".into(),
+                "File body exceeds its captured cap".into(),
             ));
         }
-        ciphertext.extend_from_slice(&chunk);
-    }
-    let plaintext = attune_common::runtime_file_body::open(
-        &ciphertext,
-        &proof.manifest(),
-        &proof.authenticated_manifest,
-        state
-            .config
-            .security
-            .encryption_key
-            .as_deref()
-            .ok_or_else(|| ApiError::Forbidden("File encryption key unavailable".into()))?,
-    )
-    .map_err(|_| ApiError::Forbidden("Encrypted file body authentication failed".into()))?;
-    authorize_file_chunk(state, user, captured.as_ref(), version, &proof).await?;
-    let response = serve_bytes(
-        plaintext,
-        version
-            .content_type
-            .clone()
-            .unwrap_or_else(|| "application/octet-stream".into()),
-        format!("{}_v{}", artifact.r#ref.replace('.', "_"), version.version),
-        headers,
-    )?;
-    // A whole-file authenticated body must still yield bounded transport chunks,
-    // otherwise a large Bytes frame permits only one authority check.
-    let (mut parts, body) = response.into_parts();
-    // Force the transport to poll verified EOF. A fixed length could complete
-    // HTTP delivery on the last data frame without polling the final guard.
-    parts.headers.remove(header::CONTENT_LENGTH);
-    parts
-        .headers
-        .insert(header::CACHE_CONTROL, "private, no-store".parse().unwrap());
-    let chunks = futures::stream::try_unfold(
-        (body.into_data_stream(), None::<axum::body::Bytes>, memory),
-        |(mut body, mut pending, memory)| async move {
-            loop {
-                if let Some(mut bytes) = pending.take() {
-                    if !bytes.is_empty() {
-                        let mut length = bytes.len().min(64 * 1024);
-                        // Finite text SSE converts each data frame separately.
-                        // Do not introduce a split inside a valid UTF-8 scalar.
-                        if let Err(error) = std::str::from_utf8(&bytes[..length]) {
-                            if error.error_len().is_none() && error.valid_up_to() > 0 {
-                                length = error.valid_up_to();
+        let memory = state
+            .file_transfers
+            .reader(proof.plaintext_bytes as u64)
+            .map_err(ApiError::TooManyRequests)?;
+        let mut stream = crate::routes::internal_files::stream_object_body(state, version, None)
+            .await
+            .map_err(|_| ApiError::Forbidden("Encrypted file body unavailable".into()))?;
+        let mut ciphertext = Vec::new();
+        while let Some(chunk) = stream
+            .try_next()
+            .await
+            .map_err(|_| ApiError::Forbidden("Encrypted file body unavailable".into()))?
+        {
+            if (ciphertext.len() as u64)
+                .checked_add(chunk.len() as u64)
+                .is_none_or(|n| n > proof.ciphertext_bytes as u64)
+            {
+                return Err(ApiError::Forbidden(
+                    "Encrypted file body exceeds its proof".into(),
+                ));
+            }
+            ciphertext.extend_from_slice(&chunk);
+        }
+        let plaintext = attune_common::runtime_file_body::open(
+            &ciphertext,
+            &proof.manifest(),
+            &proof.authenticated_manifest,
+            state
+                .config
+                .security
+                .encryption_key
+                .as_deref()
+                .ok_or_else(|| ApiError::Forbidden("File encryption key unavailable".into()))?,
+        )
+        .map_err(|_| ApiError::Forbidden("Encrypted file body authentication failed".into()))?;
+        authorize_file_chunk(state, user, captured.as_ref(), version, &proof).await?;
+        let response = serve_bytes(
+            plaintext,
+            version
+                .content_type
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".into()),
+            format!("{}_v{}", artifact.r#ref.replace('.', "_"), version.version),
+            headers,
+        )?;
+        // A whole-file authenticated body must still yield bounded transport chunks,
+        // otherwise a large Bytes frame permits only one authority check.
+        let (mut parts, body) = response.into_parts();
+        // Force the transport to poll verified EOF. A fixed length could complete
+        // HTTP delivery on the last data frame without polling the final guard.
+        parts.headers.remove(header::CONTENT_LENGTH);
+        parts
+            .headers
+            .insert(header::CACHE_CONTROL, "private, no-store".parse().unwrap());
+        let chunks = futures::stream::try_unfold(
+            (body.into_data_stream(), None::<axum::body::Bytes>, memory),
+            |(mut body, mut pending, memory)| async move {
+                loop {
+                    if let Some(mut bytes) = pending.take() {
+                        if !bytes.is_empty() {
+                            let mut length = bytes.len().min(64 * 1024);
+                            // Finite text SSE converts each data frame separately.
+                            // Do not introduce a split inside a valid UTF-8 scalar.
+                            if let Err(error) = std::str::from_utf8(&bytes[..length]) {
+                                if error.error_len().is_none() && error.valid_up_to() > 0 {
+                                    length = error.valid_up_to();
+                                }
                             }
+                            let chunk = bytes.split_to(length);
+                            return Ok::<_, std::io::Error>(Some((
+                                chunk,
+                                (body, Some(bytes), memory),
+                            )));
                         }
-                        let chunk = bytes.split_to(length);
-                        return Ok::<_, std::io::Error>(Some((chunk, (body, Some(bytes), memory))));
+                    }
+                    pending = body
+                        .try_next()
+                        .await
+                        .map_err(|_| std::io::Error::other("File delivery interrupted"))?;
+                    if pending.is_none() {
+                        return Ok(None);
                     }
                 }
-                pending = body
-                    .try_next()
-                    .await
-                    .map_err(|_| std::io::Error::other("File delivery interrupted"))?;
-                if pending.is_none() {
-                    return Ok(None);
-                }
-            }
-        },
-    );
-    let response = axum::response::Response::from_parts(parts, Body::from_stream(chunks));
-    let response = {
-        let (parts, body) = response.into_parts();
-        let state = state.clone();
-        let user = user.clone();
-        let version = version.clone();
-        // C owns the post-source-wait chunk AND successful EOF boundary.
-        let guarded = crate::recorded_reads::guarded_chunks(body.into_data_stream(), move || {
-            let (state, user, version, proof, captured) = (
-                state.clone(),
-                user.clone(),
-                version.clone(),
-                proof.clone(),
-                captured.clone(),
-            );
-            async move {
-                authorize_file_chunk(&state, &user, captured.as_ref(), &version, &proof)
-                    .await
-                    .map_err(|_| std::io::Error::other("File source authority unavailable"))
-            }
-        });
-        axum::response::Response::from_parts(parts, Body::from_stream(guarded))
-    };
-    Ok(Some(response))
+            },
+        );
+        let response = axum::response::Response::from_parts(parts, Body::from_stream(chunks));
+        let response = {
+            let (parts, body) = response.into_parts();
+            let state = state.clone();
+            let user = user.clone();
+            let version = version.clone();
+            // C owns the post-source-wait chunk AND successful EOF boundary.
+            let guarded =
+                crate::recorded_reads::guarded_chunks(body.into_data_stream(), move || {
+                    let (state, user, version, proof, captured) = (
+                        state.clone(),
+                        user.clone(),
+                        version.clone(),
+                        proof.clone(),
+                        captured.clone(),
+                    );
+                    async move {
+                        authorize_file_chunk(&state, &user, captured.as_ref(), &version, &proof)
+                            .await
+                            .map_err(|_| std::io::Error::other("File source authority unavailable"))
+                    }
+                });
+            axum::response::Response::from_parts(parts, Body::from_stream(guarded))
+        };
+        Ok(Some(response))
+    })
 }
 
 async fn authorize_file_chunk(
@@ -2621,84 +2645,91 @@ async fn authorize_file_chunk(
     Ok(())
 }
 
-async fn guard_selected_log_download(
-    state: &Arc<AppState>,
-    user: &AuthenticatedUser,
-    artifact: &attune_common::models::artifact::Artifact,
-    selected: &attune_common::models::ArtifactVersion,
+fn guard_selected_log_download<'a>(
+    state: &'a Arc<AppState>,
+    user: &'a AuthenticatedUser,
+    artifact: &'a attune_common::models::artifact::Artifact,
+    selected: &'a attune_common::models::ArtifactVersion,
     response: axum::response::Response,
-) -> ApiResult<axum::response::Response> {
-    use attune_common::repositories::sensor_schema::SensorSchemaRepository;
-    if artifact.classification != ArtifactClassification::RuntimeLog
-        && sensor_log_artifact_parts(&artifact.r#ref).is_none()
-        && SensorSchemaRepository::find_log_generation(&state.db, selected.id)
-            .await?
-            .is_none()
-    {
-        return Ok(response);
-    }
-    let audit = (
-        state.clone(),
-        user.clone(),
-        artifact.clone(),
-        selected.clone(),
-    );
-    let selected = selected.clone();
-    let state = state.clone();
-    let user = user.clone();
-    let artifact_id = artifact.id;
-    let classification = artifact.classification;
-    let (parts, body) = response.into_parts();
-    let authorize = move || {
+) -> futures::future::BoxFuture<'a, ApiResult<axum::response::Response>> {
+    Box::pin(async move {
+        use attune_common::repositories::sensor_schema::SensorSchemaRepository;
+        if artifact.classification != ArtifactClassification::RuntimeLog
+            && sensor_log_artifact_parts(&artifact.r#ref).is_none()
+            && SensorSchemaRepository::find_log_generation(&state.db, selected.id)
+                .await?
+                .is_none()
+        {
+            return Ok(response);
+        }
+        let audit = (
+            state.clone(),
+            user.clone(),
+            artifact.clone(),
+            selected.clone(),
+        );
+        let selected = selected.clone();
         let state = state.clone();
         let user = user.clone();
-        let selected = selected.clone();
-        async move {
-            let allowed = async {
-                if user.claims.exp <= chrono::Utc::now().timestamp() {
-                    return Err(ApiError::Forbidden(
-                        "Log stream credentials have expired".into(),
-                    ));
+        let artifact_id = artifact.id;
+        let classification = artifact.classification;
+        let (parts, body) = response.into_parts();
+        let authorize = move || {
+            let state = state.clone();
+            let user = user.clone();
+            let selected = selected.clone();
+            async move {
+                let allowed = async {
+                    if user.claims.exp <= chrono::Utc::now().timestamp() {
+                        return Err(ApiError::Forbidden(
+                            "Log stream credentials have expired".into(),
+                        ));
+                    }
+                    let artifact = ArtifactRepository::find_by_id(&state.db, artifact_id)
+                        .await?
+                        .ok_or_else(|| {
+                            ApiError::Forbidden("Artifact source is unavailable".into())
+                        })?;
+                    if artifact.classification != classification {
+                        return Err(ApiError::Forbidden(
+                            "Runtime log classification changed".into(),
+                        ));
+                    }
+                    let receipts = authorize_artifact_delivery_with_receipts(
+                        &state, &user, &artifact, &selected,
+                    )
+                    .await?;
+                    Ok::<_, ApiError>(receipts)
                 }
-                let artifact = ArtifactRepository::find_by_id(&state.db, artifact_id)
-                    .await?
-                    .ok_or_else(|| ApiError::Forbidden("Artifact source is unavailable".into()))?;
-                if artifact.classification != classification {
-                    return Err(ApiError::Forbidden(
-                        "Runtime log classification changed".into(),
-                    ));
+                .await;
+                let receipts = allowed.map_err(|_| {
+                    std::io::Error::other("Log disclosure authority is unavailable")
+                })?;
+                if user.claims.exp <= chrono::Utc::now().timestamp() {
+                    return Err(std::io::Error::other("Log credential expired"));
                 }
                 let receipts =
-                    authorize_artifact_delivery_with_receipts(&state, &user, &artifact, &selected)
-                        .await?;
-                Ok::<_, ApiError>(receipts)
+                    crate::receipt_disclosure::HumanReceiptGuard::finish_shared(receipts)
+                        .await
+                        .map_err(|_| std::io::Error::other("Log receipt expired"))?;
+                receipts
+                    .ensure_fresh()
+                    .map_err(|_| std::io::Error::other("Log receipt expired"))?;
+                if user.claims.exp <= chrono::Utc::now().timestamp() {
+                    return Err(std::io::Error::other("Log credential expired"));
+                }
+                Ok(())
             }
-            .await;
-            let receipts = allowed
-                .map_err(|_| std::io::Error::other("Log disclosure authority is unavailable"))?;
-            if user.claims.exp <= chrono::Utc::now().timestamp() {
-                return Err(std::io::Error::other("Log credential expired"));
-            }
-            let receipts = crate::receipt_disclosure::HumanReceiptGuard::finish_shared(receipts)
-                .await
-                .map_err(|_| std::io::Error::other("Log receipt expired"))?;
-            receipts
-                .ensure_fresh()
-                .map_err(|_| std::io::Error::other("Log receipt expired"))?;
-            if user.claims.exp <= chrono::Utc::now().timestamp() {
-                return Err(std::io::Error::other("Log credential expired"));
-            }
-            Ok(())
-        }
-    };
-    authorize()
-        .await
-        .map_err(|_| ApiError::NotFound("Log disclosure authority is unavailable".into()))?;
-    let stream = crate::recorded_reads::guarded_chunks(body.into_data_stream(), authorize);
-    Ok(audit_log_download_eof(
-        audit,
-        axum::response::Response::from_parts(parts, Body::from_stream(stream)),
-    ))
+        };
+        authorize()
+            .await
+            .map_err(|_| ApiError::NotFound("Log disclosure authority is unavailable".into()))?;
+        let stream = crate::recorded_reads::guarded_chunks(body.into_data_stream(), authorize);
+        Ok(audit_log_download_eof(
+            audit,
+            axum::response::Response::from_parts(parts, Body::from_stream(stream)),
+        ))
+    })
 }
 
 /// Delete a specific version by version number (including disk file if file-backed)
@@ -3586,7 +3617,12 @@ async fn authorize_artifact_action(
 ) -> Result<(), ApiError> {
     if crate::recorded_consumers::is_recorded(user)? {
         if action == Action::Read {
-            return crate::recorded_consumers::artifact_read(&state.db, user, artifact.id).await;
+            return Box::pin(crate::recorded_consumers::artifact_read(
+                &state.db,
+                user,
+                artifact.id,
+            ))
+            .await;
         }
         return Err(ApiError::Forbidden(
             "Recorded artifact writes require their effect transaction".into(),
@@ -3618,7 +3654,10 @@ async fn authorize_artifact_action(
     };
 
     if action == Action::Read {
-        return crate::artifact_reads::ArtifactReads::authorize_detail(state, user, artifact).await;
+        return Box::pin(crate::artifact_reads::ArtifactReads::authorize_detail(
+            state, user, artifact,
+        ))
+        .await;
     }
 
     let ctx = artifact_authorization_context(identity_id, artifact);

@@ -239,18 +239,45 @@ async fn fixture(second_can_decrypt: bool) -> Fixture {
         )
         .await
         .unwrap();
-        Admission::admit_queue_item(
+        // This consumer fixture represents an item accepted before rollout.
+        // New managed-item admission stays gated. Select authentic policy/source
+        // authority, then persist only the fixture-owned historical item row.
+        let admitted = Admission::select(
             &mut tx,
-            &queue,
-            &item,
-            Some(HumanAttribution {
-                identity_id: human.id,
-                login: human.login.clone(),
-            }),
+            snapshot.executable.action.pack,
+            InvocationBinding::Queue {
+                queue_ref: queue.r#ref.clone(),
+                action_ref: snapshot.executable.action.r#ref.clone(),
+            },
             &snapshot,
+            queue.permission_set_refs.as_ref().unwrap(),
+            attune_common::runtime_authority::RequestAttribution::QueueBatch {
+                queue_ref: queue.r#ref.clone(),
+                items: BTreeMap::from([(
+                    item.id,
+                    Some(HumanAttribution {
+                        identity_id: human.id,
+                        login: human.login.clone(),
+                    }),
+                )]),
+            },
+            attune_common::repositories::runtime_target::RuntimeTarget::Component(
+                attune_common::repositories::runtime_target::ComponentTarget::Queue,
+                queue.id,
+            ),
         )
         .await
         .unwrap();
+        let authority = admitted.authority();
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(serde_jcs::to_vec(authority).unwrap())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        sqlx::query("INSERT INTO work_queue_item_runtime_admission(item,policy_revision,authority,authority_digest) VALUES($1,$2,$3,$4)")
+            .bind(item.id).bind(authority.policy_id).bind(sqlx::types::Json(authority))
+            .bind(digest).execute(&mut *tx).await.unwrap();
+        admitted.ensure_fresh_on(&mut tx).await.unwrap();
         RecordedInputAuthorityRepository::capture_human(&mut tx, "queue_item", item.id, human.id)
             .await
             .unwrap();
@@ -441,7 +468,7 @@ async fn existing_authority_validation_never_replays_admission_or_attempt_insert
 }
 
 #[tokio::test]
-async fn missing_action_or_binding_persists_a_safe_failure_before_launch() {
+async fn missing_action_or_binding_without_admission_is_rejected_before_worker_claim() {
     use attune_common::{
         artifact_transport::VolumeTransport, auth::jwt::JwtConfig, log_stream::SegmentedLogConfig,
         repositories::FindById,
@@ -506,20 +533,27 @@ async fn missing_action_or_binding_persists_a_safe_failure_before_launch() {
     )
     .await
     .unwrap();
-    for (execution, diagnostic) in [
-        (missing_action, "Failed to load pinned action"),
-        (missing_binding, "Execution schema binding unavailable"),
-    ] {
-        assert!(executor.execute(execution.id).await.is_err());
+    for execution in [missing_action, missing_binding] {
+        // Neither incomplete row was admitted or assigned to this worker. The
+        // production authority check must reject before claiming it, rather
+        // than manufacturing authority to reach preparation-failure handling.
+        let error = executor.execute(execution.id).await.unwrap_err();
+        assert!(matches!(error, attune_common::Error::PermissionDenied(_)));
         let stored = ExecutionRepository::find_by_id(&fixture.db, execution.id)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stored.status, ExecutionStatus::Failed);
-        assert_eq!(
-            stored.result,
-            Some(json!({"succeeded":false,"error":diagnostic}))
-        );
+        assert_eq!(stored.status, ExecutionStatus::Requested);
+        assert!(stored.worker.is_none() && stored.started_at.is_none());
+        assert!(stored.result.is_none());
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM delegated_execution_attempt WHERE execution=$1",
+        )
+        .bind(execution.id)
+        .fetch_one(&fixture.db)
+        .await
+        .unwrap();
+        assert_eq!(attempts, 0);
         assert!(attune_common::repositories::artifact::ArtifactVersionRepository::find_file_versions_by_execution(
             &fixture.db, execution.id).await.unwrap().is_empty());
     }

@@ -136,7 +136,13 @@ impl ExecutionManager {
                 if status == ExecutionStatus::Cancelled {
                     Self::handle_workflow_cancellation(pool, publisher, &execution).await?;
                 }
-                Self::handle_completion(pool, publisher, &execution, encryption_key).await?;
+                Box::pin(Self::handle_completion(
+                    pool,
+                    publisher,
+                    &execution,
+                    encryption_key,
+                ))
+                .await?;
             }
             ExecutionStatus::Canceling => {
                 debug!(
@@ -391,13 +397,13 @@ impl ExecutionManager {
         if let Some(child_actions) = Self::get_child_actions(execution).await? {
             // Only trigger children on completion
             if execution.status == ExecutionStatus::Completed {
-                Self::trigger_child_executions(
+                Box::pin(Self::trigger_child_executions(
                     pool,
                     publisher,
                     execution,
                     &child_actions,
                     encryption_key,
-                )
+                ))
                 .await?;
             } else {
                 warn!(
@@ -567,6 +573,12 @@ impl ExecutionManager {
                 BindingOwner::Execution,
                 child_execution.id,
                 &binding,
+            )
+            .await?;
+            attune_common::repositories::delegated_execution::DelegatedExecutionRepository::select(
+                &mut transaction,
+                child_execution.id,
+                Some(parent.id),
             )
             .await?;
             ExecutionSecretValueRepository::upsert_many_with_conn(

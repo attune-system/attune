@@ -24,7 +24,8 @@ fn parse(body: &Value) -> anyhow::Result<InputApprovalRequest> {
 
 fn mock_client(api: &MockServer) -> ApiClient {
     let mut client =
-        ApiClient::from_config(&attune_cli::config::CliConfig::default(), &Some(api.uri()));
+        ApiClient::from_config(&attune_cli::config::CliConfig::default(), &Some(api.uri()))
+            .unwrap();
     client.set_tokens("mock-access-token".into(), "mock-refresh-token".into());
     client
 }
@@ -261,7 +262,7 @@ async fn cli_stdin_uses_profile_auth_and_dry_run_never_sends_or_echoes_expressio
     let config = tempfile::TempDir::new().unwrap();
     std::fs::create_dir(config.path().join("attune")).unwrap();
     std::fs::write(config.path().join("attune/config.yaml"), format!(
-        "current_profile: staging\ndefault_output_format: json\nprofiles:\n  staging:\n    api_url: {}\n    auth_token: mock-profile-access\n", api.uri()
+        "current_profile: staging\ndefault_output_format: json\nprofiles:\n  staging:\n    api_url: {0}\n    credential_encryption: false\n    credentials_endpoint: {0}\n    auth_token: mock-profile-access\n", api.uri()
     )).unwrap();
     let body = policy_request();
     Mock::given(method("POST"))

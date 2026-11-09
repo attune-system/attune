@@ -45,3 +45,4 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 
 [dev-dependencies]
 futures = { workspace = true }
+serde_jcs = "=0.2.0"

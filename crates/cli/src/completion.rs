@@ -314,7 +314,8 @@ fn execution_context(words: &[String]) -> Option<(usize, &str)> {
 }
 async fn complete_actions(prefix: &str, words: &[String]) -> Result<Vec<String>> {
     let (config, api_url) = completion_config(words)?;
-    let mut client = ApiClient::from_config_with_timeout(&config, &api_url, COMPLETION_API_TIMEOUT);
+    let mut client =
+        ApiClient::from_config_with_timeout(&config, &api_url, COMPLETION_API_TIMEOUT)?;
     let actions: Vec<ActionSearchHit> = client
         .get_paginated(&format!(
             "/actions/search?q={}&page_size=100",
@@ -329,7 +330,8 @@ async fn complete_actions(prefix: &str, words: &[String]) -> Result<Vec<String>>
 }
 async fn complete_packs(words: &[String]) -> Result<Vec<String>> {
     let (config, api_url) = completion_config(words)?;
-    let mut client = ApiClient::from_config_with_timeout(&config, &api_url, COMPLETION_API_TIMEOUT);
+    let mut client =
+        ApiClient::from_config_with_timeout(&config, &api_url, COMPLETION_API_TIMEOUT)?;
     let packs: Vec<PackSummary> = client.get_paginated("/packs?page_size=100").await?;
     Ok(packs
         .into_iter()
@@ -342,7 +344,8 @@ async fn complete_parameter(
     words: &[String],
 ) -> Result<Vec<String>> {
     let (config, api_url) = completion_config(words)?;
-    let mut client = ApiClient::from_config_with_timeout(&config, &api_url, COMPLETION_API_TIMEOUT);
+    let mut client =
+        ApiClient::from_config_with_timeout(&config, &api_url, COMPLETION_API_TIMEOUT)?;
     let action: ActionDetail = client
         .get(&format!("/actions/{}", urlencoding::encode(action_ref)))
         .await?;

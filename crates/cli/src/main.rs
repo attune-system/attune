@@ -107,8 +107,13 @@ async fn main() {
     let cli_override = cli_override
         .filter(|format| *format != CliOutputFormat::Ndjson)
         .map(output::OutputFormat::from);
-    let config_for_format =
-        config::CliConfig::load_with_profile(cli.profile.as_deref()).unwrap_or_default();
+    let config_for_format = match config::CliConfig::load() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            process::exit(1);
+        }
+    };
     let output_format = config_for_format.effective_format(cli_override);
 
     let result = match cli.command {

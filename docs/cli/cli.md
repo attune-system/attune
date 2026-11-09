@@ -36,11 +36,19 @@ The CLI stores configuration in `~/.config/attune/config.yaml` (respects `$XDG_C
 ### Configuration Structure
 
 ```yaml
-api_url: http://localhost:8080
-auth_token: <jwt-access-token>
-refresh_token: <jwt-refresh-token>
-output_format: table
+profile: default
+format: table
+profiles:
+  default:
+    api_url: http://localhost:8080
+    credential_encryption: true
+    # credentials: <encrypted envelope written by attune auth login>
 ```
+
+Access and refresh tokens are encrypted by default using system-bound keys shared
+by CLI and MCP. Identifier changes require login again. See
+[profile credential storage](cli-profiles.md#token-storage) for the threat model,
+platform requirements, upgrade behavior, and explicit plaintext opt-out.
 
 ### Environment Variables
 

@@ -893,7 +893,8 @@ pub async fn get_queue_item(
         (status = 400, description = "Validation error"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Queue not found"),
-        (status = 409, description = "Pending item conflict")
+        (status = 409, description = "Pending item conflict"),
+        (status = 501, description = "Queue sponsorship or protected delegated output is not ready"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -958,7 +959,8 @@ pub async fn enqueue_queue_item(
         (status = 400, description = "Validation error or configured bulk enqueue limit exceeded"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Queue not found"),
-        (status = 409, description = "Queue is not accepting items or pending item conflict")
+        (status = 409, description = "Queue is not accepting items or pending item conflict"),
+        (status = 501, description = "Queue sponsorship or protected delegated output is not ready"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1955,6 +1957,11 @@ async fn enqueue_queue_item_in_transaction(
             "Dispatch action is unavailable for new queue admission".into(),
         ));
     }
+    if queue.is_adhoc && state.config.security.encryption_key.is_none() {
+        return Err(ApiError::NotImplemented(
+            "Delegated queue execution output encryption is unavailable".into(),
+        ));
+    }
     let item = WorkQueueItemRepository::create_bound_pinned(
         &mut *connection,
         CreateWorkQueueItemInput {
@@ -1981,19 +1988,16 @@ async fn enqueue_queue_item_in_transaction(
         &binding,
     )
     .await?;
-    if recorded_ad_hoc || human_ad_hoc {
+    if recorded_ad_hoc || !queue.is_adhoc {
+        return Err(ApiError::NotImplemented(
+            "Recorded queue sponsorship requires coordinated runtime readiness".into(),
+        ));
+    }
+    if recorded_ad_hoc {
         use attune_common::repositories::ad_hoc_queue_admission::AdHocQueueSource;
-        let source = if recorded_ad_hoc {
-            AdHocQueueSource::Execution(requested_by_execution.ok_or_else(|| {
-                ApiError::Forbidden("Recorded item source execution unavailable".into())
-            })?)
-        } else {
-            AdHocQueueSource::Human(attune_common::runtime_authority::HumanAttribution {
-                identity_id: requested_by_identity
-                    .ok_or_else(|| ApiError::Unauthorized("Item requester unavailable".into()))?,
-                login: user.login().to_string(),
-            })
-        };
+        let source = AdHocQueueSource::Execution(requested_by_execution.ok_or_else(|| {
+            ApiError::Forbidden("Recorded item source execution unavailable".into())
+        })?);
         attune_common::repositories::ad_hoc_queue_admission::AdHocQueueAdmissionRepository::accept(
             connection, queue, &item, source, &snapshot,
         )
@@ -2018,6 +2022,8 @@ async fn enqueue_queue_item_in_transaction(
         } else if let Some(parent) = requested_by_execution {
             attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::copy(connection, "execution", parent, "queue_item", item.id).await?;
         }
+    } else {
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::accept_queue_item(connection,queue,&item,&snapshot).await?;
     }
     attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::replace_entity_with_conn(
         &mut *connection, attune_common::secret_values::ENTITY_QUEUE_ITEM_PAYLOAD, item.id, &secrets,
