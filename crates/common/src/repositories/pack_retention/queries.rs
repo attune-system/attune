@@ -100,18 +100,39 @@ impl Phase {
         } else {
             ""
         };
-        format!("WITH raw AS MATERIALIZED (
-                    SELECT candidate.id,candidate.version FROM unnest($1::bigint[],$2::text[]) AS candidate(id,version)
-                 ), settings AS (SELECT $3::bigint AS delete_limit,$4::timestamptz AS cutoff,$5::bigint AS newest),
-                 coarse AS MATERIALIZED (
+        // Pin predicates must refer to the materialized survivors themselves.
+        // Joining the base table before filtering would let the planner push
+        // expensive predicates below that join and visit protected releases.
+        let (stages, source, final_predicates) = if retention.is_empty() {
+            (
+                String::new(),
+                "raw",
+                format!("{predicates} {accepted_pin} {queue_pin}"),
+            )
+        } else {
+            (
+                format!(
+                    "coarse AS MATERIALIZED (
                     SELECT raw.id,raw.version FROM raw
                     JOIN {table} {alias} ON {alias}.{id}=raw.id AND {alias}.xmin::text=raw.version
                     {joins} WHERE TRUE {retention}
-                 ),
+                 ), unpinned AS MATERIALIZED (
+                    SELECT {alias}.id,{alias}.version FROM coarse {alias}
+                    WHERE {predicates} {queue_pin}
+                 ),"
+                ),
+                "unpinned",
+                "TRUE".to_string(),
+            )
+        };
+        format!("WITH raw AS MATERIALIZED (
+                    SELECT candidate.id,candidate.version FROM unnest($1::bigint[],$2::text[]) AS candidate(id,version)
+                 ), settings AS (SELECT $3::bigint AS delete_limit,$4::timestamptz AS cutoff,$5::bigint AS newest),
+                 {stages}
                  dormant AS (
-                    SELECT {alias}.{id} AS id FROM coarse raw
+                    SELECT {alias}.{id} AS id FROM {source} raw
                     JOIN {table} {alias} ON {alias}.{id}=raw.id AND {alias}.xmin::text=raw.version
-                    {joins} WHERE {predicates} {accepted_pin} {queue_pin}
+                    {joins} WHERE {final_predicates}
                     ORDER BY {alias}.{id} LIMIT $3 FOR UPDATE OF {alias} SKIP LOCKED
                  ) DELETE FROM {table} target USING dormant WHERE target.{id}=dormant.id {returning}")
     }
