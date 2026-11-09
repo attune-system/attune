@@ -1,4 +1,4 @@
-//! Staged source owner for short prepare/final transactions. No route activation.
+//! Source owner for short prepare/final transactions.
 use super::*;
 use attune_common::repositories::{
     delegated_execution::{DelegatedExecutionRepository, LogProducerBinding},
@@ -95,11 +95,40 @@ pub async fn acquire<'db>(
     user: &AuthenticatedUser,
     version: &attune_common::models::artifact_version::ArtifactVersion,
 ) -> Result<Source<'db>, (StatusCode, String)> {
+    let result = acquire_binding(state, &mut tx, user, version).await;
+    let (producer, effect) = match result {
+        Ok(binding) => binding,
+        Err(error) => {
+            tx.rollback().await.map_err(map_sqlx_error)?;
+            return Err(error);
+        }
+    };
+    let mut source = Source {
+        version: version.id,
+        artifact: version.artifact,
+        execution: version.execution,
+        tx,
+        producer,
+        effect,
+    };
+    if let Err(error) = source.recheck().await {
+        source.rollback().await?;
+        return Err(error);
+    }
+    Ok(source)
+}
+
+async fn acquire_binding(
+    state: &AppState,
+    mut tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user: &AuthenticatedUser,
+    version: &attune_common::models::artifact_version::ArtifactVersion,
+) -> Result<(Producer, crate::recorded_files::FileMutationProof), (StatusCode, String)> {
     attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_capture(&mut tx)
         .await.map_err(map_transport_error)?;
     let sensor = if user.claims.token_type == TokenType::Sensor {
         let reference = scoped_metadata_value(user, "sensor_ref", "Sensor")?;
-        let row = SensorRepository::find_by_ref(&mut *tx, reference)
+        let row = SensorRepository::find_by_ref(&mut **tx, reference)
             .await
             .map_err(map_transport_error)?
             .ok_or_else(denied)?;
@@ -119,7 +148,7 @@ pub async fn acquire<'db>(
             return Err(denied());
         }
         let path = version.file_path.as_deref().ok_or_else(denied)?;
-        if !ArtifactVersionRepository::file_path_owned_by_sensor(&mut *tx, path, reference)
+        if !ArtifactVersionRepository::file_path_owned_by_sensor(&mut **tx, path, reference)
             .await
             .map_err(map_transport_error)?
         {
@@ -137,7 +166,7 @@ pub async fn acquire<'db>(
             &mut tx, fence.workload_id, fence.generation).await.map_err(map_transport_error)?;
         let schema_binding =
             attune_common::repositories::sensor_schema::SensorSchemaRepository::find(
-                &mut *tx,
+                &mut **tx,
                 fence.workload_id,
                 fence.generation,
             )
@@ -147,7 +176,7 @@ pub async fn acquire<'db>(
             .transpose()
             .map_err(map_transport_error)?;
         let log_generation = attune_common::repositories::sensor_schema::SensorSchemaRepository::find_log_generation(
-            &mut *tx, version.id).await.map_err(map_transport_error)?;
+            &mut **tx, version.id).await.map_err(map_transport_error)?;
         if log_generation
             .as_ref()
             .is_some_and(|log| Some(log) != schema_binding.as_ref())
@@ -204,7 +233,7 @@ pub async fn acquire<'db>(
         if version.execution != Some(execution) {
             return Err(denied());
         }
-        let row = ExecutionRepository::find_by_id(&mut *tx, execution)
+        let row = ExecutionRepository::find_by_id(&mut **tx, execution)
             .await
             .map_err(map_transport_error)?
             .ok_or_else(denied)?;
@@ -251,23 +280,65 @@ pub async fn acquire<'db>(
     } else {
         sensor.or(delegated).ok_or_else(denied)?
     };
-    let mut source = Source {
-        version: version.id,
-        artifact: version.artifact,
-        execution: version.execution,
-        tx,
-        producer,
-        effect,
-    };
-    source.recheck().await?;
-    Ok(source)
+    Ok((producer, effect))
 }
 
 impl<'db> Source<'db> {
     /// Complete this short phase and repeat pure freshness after commit waits.
     pub async fn commit(mut self) -> Result<(), (StatusCode, String)> {
+        if let Err(error) = self.recheck().await {
+            self.rollback().await?;
+            return Err(error);
+        }
+        // Unknown acknowledgement is distinct from acknowledged commit followed
+        // by a pure freshness failure. Only the former may be reconciled.
+        self.tx.commit().await.map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Log close commit acknowledgement uncertain; retry same input".into(),
+            )
+        })?;
+        self.effect.ensure_fresh().map_err(map_api_error)
+    }
+
+    pub async fn rollback(self) -> Result<(), (StatusCode, String)> {
+        self.tx.rollback().await.map_err(map_sqlx_error)
+    }
+
+    pub(super) async fn publish_evidence(
+        &mut self,
+        state: &AppState,
+        user: &AuthenticatedUser,
+        version: &attune_common::models::artifact_version::ArtifactVersion,
+        stream: &LogStream,
+        headers: &HeaderMap,
+        truncated: bool,
+    ) -> Result<(), (StatusCode, String)> {
+        let proof = encrypted_log_seal_proof(
+            &mut self.tx,
+            state,
+            user,
+            version,
+            stream,
+            headers,
+            &self.effect,
+        )
+        .await?;
         self.recheck().await?;
-        self.effect.commit(self.tx).await.map_err(map_api_error)
+        if let Some(proof) = proof {
+            if let Some((context, permit)) = &proof.recorded {
+                attune_common::repositories::runtime_log_completion::RuntimeLogCompletionRepository::record(
+                    &mut self.tx, context, permit, &proof.manifest, &proof.authenticated, truncated).await.map_err(map_transport_error)?;
+            }
+            ArtifactVersionRepository::set_encrypted_log_manifest(
+                &mut self.tx,
+                version.id,
+                &proof.authenticated,
+            )
+            .await
+            .map_err(map_transport_error)?;
+        }
+        Ok(())
     }
 
     /// Access only this phase's transaction for target row locks/reloads.

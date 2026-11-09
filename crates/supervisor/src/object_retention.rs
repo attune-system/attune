@@ -82,6 +82,11 @@ pub async fn run_cycle_with_budget(
         ..Default::default()
     };
     let _ = metadata_value(
+        &mut metrics, "object_log_close_recovery",
+        attune_common::repositories::log_stream::LogStreamRepository::recover_expired_closes_bounded(
+            pool, limit, budget, metadata_deadline(), &cancellation).await,
+    );
+    let _ = metadata_value(
         &mut metrics,
         "file_evidence_audit",
         Evidence::audit_pending_bounded(

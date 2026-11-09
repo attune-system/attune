@@ -9,11 +9,15 @@ use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 #[derive(Debug, sqlx::FromRow)]
 pub struct SelectedLogClose {
     revision: i64,
+    phase: String,
     input: serde_json::Value,
     input_sha256: String,
 }
 
 impl SelectedLogClose {
+    pub fn published(&self) -> bool {
+        self.phase == "published"
+    }
     pub fn revision(&self) -> i64 {
         self.revision
     }
@@ -28,6 +32,37 @@ impl SelectedLogClose {
 pub struct LogStreamRepository;
 
 impl LogStreamRepository {
+    /// Transaction-local limits; the route owns a detached socket so a timed-out
+    /// phase/rollback disposes the session instead of returning uncertain state.
+    pub async fn configure_close_phase(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+        sqlx::query("SELECT set_config('statement_timeout','5s',true),set_config('lock_timeout','5s',true),set_config('jit','off',true)")
+            .execute(&mut **tx).await?;
+        Ok(())
+    }
+
+    pub async fn recover_expired_closes_bounded(
+        pool: &PgPool,
+        limit: i64,
+        budget: &super::maintenance_admission::MaintenanceBudget,
+        deadline: tokio::time::Instant,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> super::maintenance_admission::MaintenanceResult<()> {
+        super::maintenance_admission::run(pool, budget, deadline, cancel,
+            move |conn| Box::pin(async move {
+                Ok(sqlx::query_as::<_, (i64,i64,chrono::DateTime<chrono::Utc>)>(
+                    "SELECT id,close_revision,close_deadline FROM log_stream WHERE close_phase='closing' AND close_deadline<=clock_timestamp() ORDER BY close_deadline,id LIMIT $1")
+                    .bind(limit.clamp(1,256)).fetch_all(conn).await?)
+            }),
+            |conn, candidates| Box::pin(async move {
+                let mut changed=0;
+                for (id, revision, deadline) in candidates {
+                    changed += sqlx::query("UPDATE log_stream SET close_phase='abandoned',close_revision=close_revision+1 WHERE id=$1 AND close_phase='closing' AND close_revision=$2 AND close_deadline=$3 AND close_deadline<=clock_timestamp()")
+                        .bind(id).bind(revision).bind(deadline).execute(&mut *conn).await?.rows_affected();
+                }
+                Ok(((),changed))
+            })).await
+    }
+
     /// Caller owns graph/source/artifact/version/stream locking and fresh producer
     /// authorization. Binding values are authenticated server projections, never
     /// client claims. This selects bytes only; it grants no publication authority.
@@ -50,21 +85,45 @@ impl LogStreamRepository {
                close_deadline=$6 FROM input WHERE s.id=$1 AND s.close_revision=$2 \
                AND (s.close_phase IS NULL OR s.close_phase='abandoned' \
                     OR (s.close_phase='closing' AND s.close_deadline<=clock_timestamp())) \
-             RETURNING close_revision AS revision,close_input AS input,close_input_sha256 AS input_sha256",
+             RETURNING close_revision AS revision,close_phase AS phase,close_input AS input,close_input_sha256 AS input_sha256",
         ).bind(stream).bind(expected_revision).bind(producer).bind(proof).bind(truncated).bind(deadline)
         .fetch_optional(&mut **tx).await?;
         let row = match row {
             Some(row) => Some(row),
             None => sqlx::query_as(
-                "SELECT close_revision AS revision,close_input AS input,close_input_sha256 AS input_sha256 \
-                 FROM log_stream WHERE id=$1 AND close_revision=$2+1 AND close_phase='closing' \
-                 AND close_deadline>clock_timestamp() AND close_input=jsonb_build_object( \
+                "SELECT close_revision AS revision,close_phase AS phase,close_input AS input,close_input_sha256 AS input_sha256 \
+                 FROM log_stream WHERE id=$1 AND close_revision IN ($2,$2+1) AND close_phase IN ('closing','published') \
+                 AND (close_phase='published' OR close_deadline>clock_timestamp()) AND close_input=jsonb_build_object( \
                    'snapshot',object_log_close_snapshot($1),'producer',$3::jsonb, \
                    'proof',$4::jsonb,'truncated',$5::boolean)",
             ).bind(stream).bind(expected_revision).bind(producer).bind(proof).bind(truncated)
             .fetch_optional(&mut **tx).await?,
         };
         row.ok_or_else(|| Error::invalid_state("close revision changed or input conflicts"))
+    }
+
+    pub async fn close_revision(tx: &mut Transaction<'_, Postgres>, stream: i64) -> Result<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT close_revision FROM log_stream WHERE id=$1")
+                .bind(stream)
+                .fetch_one(&mut **tx)
+                .await?,
+        )
+    }
+
+    /// Called only with privately verified bytes by the API's selected-close owner.
+    pub async fn publish_close(
+        tx: &mut Transaction<'_, Postgres>,
+        stream: i64,
+        selected: &SelectedLogClose,
+    ) -> Result<()> {
+        let changed = sqlx::query("UPDATE log_stream SET close_phase='published',sealed=true,sealed_at=clock_timestamp(),truncated=(close_input->>'truncated')::boolean WHERE id=$1 AND close_revision=$2 AND close_input=$3 AND close_input_sha256=$4 AND close_phase='closing' AND close_deadline>clock_timestamp()")
+            .bind(stream).bind(selected.revision()).bind(selected.input()).bind(selected.input_sha256())
+            .execute(&mut **tx).await?.rows_affected();
+        if changed != 1 {
+            return Err(Error::invalid_state("Selected close expired or changed"));
+        }
+        Ok(())
     }
 
     /// Release only the verification pin; identity and admission closure survive.

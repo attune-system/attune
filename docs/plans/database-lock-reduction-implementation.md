@@ -1,3 +1,13 @@
+> Current object-close checkpoint: the production object seal route now selects
+> durable input, awaits prepare commit, verifies outside database ownership, and
+> freshly authorizes atomic publication. Migration 006 provides deferred shape
+> constraints; bounded object housekeeping abandons expired matching revisions.
+> This is work in progress. Earlier statements below describing publication as
+> disabled or the route as unsplit are historical checkpoint evidence, superseded
+> by [the current protocol](object-log-seal-claims.md). New acceptance tests and
+> source-specific validation must pass before lock-removal/certification claims.
+> No full PUT settlement or filesystem fence removal is claimed.
+
 # Database lock reduction: code-level implementation map
 
 Status: milestones 1–3 implemented for review; later slices remain proposals.

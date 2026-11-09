@@ -656,8 +656,9 @@ See [Template-cloned test databases](schema-per-test.md) and [Test concurrency r
 ## Staged object-log source fencing
 
 The source prerequisite is documented in
-[the durable close protocol](../plans/object-log-seal-claims.md). It does not
-activate selected-close publication or shorten the existing production route.
+[the durable close protocol](../plans/object-log-seal-claims.md). The object route now integrates prepare/verify/finalize; historical source-only
+results below do not certify that integration. Run the new `split_route_` API
+unit cases and storage `object_close::` cases on PG16 and PG18 as well.
 On separately owned PG16 and PG18 servers initialized with the explicit owned
 `make db-test-setup` URLs, run these targets with unique `ATTUNE_TEST_RUN_ID`
 values and `ATTUNE__DATABASE__URL` pointing at that server:

@@ -2108,6 +2108,9 @@ async fn seal_log_stream(
         .await
         .map_err(map_repository_error)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Log stream not found".to_string()))?;
+    if stream.backend == LogStreamBackend::ObjectSegments {
+        return object_close::seal(state, user, version, stream.id, headers, query.truncated).await;
+    }
     // Shared append uses source -> artifact advisory -> version -> stream ->
     // flock. Sealing must acquire the same locks before taking its file snapshot.
     let trace = SharedGraphTransactionTrace::new("api.log_stream_seal");
@@ -4655,10 +4658,9 @@ fn map_api_error(error: crate::middleware::ApiError) -> (StatusCode, String) {
     (StatusCode::FORBIDDEN, error.to_string())
 }
 
-// Staged split helpers have no production caller until the durable finalizer lands.
-#[allow(dead_code)]
 #[doc(hidden)]
 pub mod log_source;
+mod object_close;
 
 async fn authorize_version_mutation(
     state: &AppState,
@@ -4896,6 +4898,7 @@ mod tests {
 
     struct DirectUploadTestStore {
         inner: FilesystemBlobStore,
+        pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     }
 
     impl std::fmt::Debug for DirectUploadTestStore {
@@ -4950,6 +4953,10 @@ mod tests {
             object_sha256: [u8; 32],
             range: Option<ByteRange>,
         ) -> Result<BlobReader, BlobStoreError> {
+            if let Some((entered, release)) = &self.pause {
+                entered.notify_one();
+                release.notified().await;
+            }
             self.inner
                 .get_pinned(key, version, object_size, object_sha256, range)
                 .await
@@ -5144,15 +5151,17 @@ mod tests {
         };
         let state = Arc::new(AppState::new(database.pool().clone(), config));
 
+        let (identity, execution, worker_id, _, action) =
+            delegated_log_owner(&state.db).await.unwrap();
         let artifact = ArtifactRepository::create(
             &state.db,
             CreateArtifactInput {
-                r#ref: "test.concurrent_log".to_string(),
-                scope: OwnerType::System,
-                owner: "test".to_string(),
+                r#ref: format!("{action}.stdout.log"),
+                scope: OwnerType::Action,
+                owner: action,
                 r#type: ArtifactType::FileText,
                 visibility: ArtifactVisibility::Private,
-                classification: ArtifactClassification::General,
+                classification: ArtifactClassification::RuntimeLog,
                 retention_policy: RetentionPolicyType::Versions,
                 retention_limit: 1,
                 name: None,
@@ -5163,12 +5172,13 @@ mod tests {
         )
         .await
         .expect("artifact");
-        let version = ArtifactVersionRepository::create_file_backed(
+        let version = ArtifactVersionRepository::create_log_pending(
             &state.db,
             artifact.id,
             &artifact.r#ref,
+            LogStreamBackend::ObjectSegments,
             "text/plain".to_string(),
-            None,
+            Some(execution),
             None,
             Some("test".to_string()),
         )
@@ -5177,7 +5187,17 @@ mod tests {
         let stream = LogStreamRepository::create(&state.db, version.id, 1024, 500)
             .await
             .expect("log stream");
-        let worker = user(TokenType::Worker, None);
+        let worker = AuthenticatedUser {
+            claims: Claims {
+                sub: identity.to_string(),
+                login: "worker".into(),
+                iat: 0,
+                exp: i64::MAX,
+                token_type: TokenType::Worker,
+                scope: None,
+                metadata: Some(serde_json::json!({"worker_id":worker_id.to_string()})),
+            },
+        };
 
         let out_of_order = commit_log_segment(
             State(state.clone()),
@@ -5512,6 +5532,7 @@ mod tests {
             root: directory.path().join("objects"),
         };
         let store = Arc::new(DirectUploadTestStore {
+            pause: None,
             inner: FilesystemBlobStore::new(directory.path().join("objects")).unwrap(),
         });
         let state = Arc::new(AppState::new_with_audit_and_blob_store(
@@ -5970,6 +5991,180 @@ mod tests {
         .await?;
         tx.commit().await?;
         Ok((owner.id, execution.id, workers[0], workers[1], action.r#ref))
+    }
+
+    #[tokio::test]
+    async fn split_route_releases_database_during_get_and_rechecks_authority() {
+        split_route_case(false).await;
+    }
+
+    #[tokio::test]
+    async fn split_route_revoked_source_during_get_cannot_publish() {
+        split_route_case(true).await;
+    }
+
+    async fn split_route_case(revoke_during_get: bool) {
+        use attune_common::repositories::delegated_execution::DelegatedExecutionRepository as Delegated;
+        let mut config = Config::load_from_file(&format!(
+            "{}/../../config.test.yaml",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        config.database.max_connections = 1;
+        config.database.min_connections = 0;
+        let database = TestDatabase::create(&config.database)
+            .await
+            .unwrap()
+            .with_cleanup_on_drop();
+        let directory = tempfile::tempdir().unwrap();
+        config.artifacts_dir = directory
+            .path()
+            .join("staging")
+            .to_string_lossy()
+            .into_owned();
+        config.storage = BlobStorageConfig::Filesystem {
+            root: directory.path().join("objects"),
+        };
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let store = Arc::new(DirectUploadTestStore {
+            inner: FilesystemBlobStore::new(directory.path().join("objects")).unwrap(),
+            pause: Some((entered.clone(), release.clone())),
+        });
+        let mut state = AppState::new(database.pool().clone(), config);
+        state.blob_store = store;
+        let state = Arc::new(state);
+        let (identity, execution, worker, _, action) =
+            delegated_log_owner(&state.db).await.unwrap();
+        let artifact = ArtifactRepository::create(
+            &state.db,
+            CreateArtifactInput {
+                r#ref: format!("{action}.stdout.log"),
+                scope: OwnerType::Action,
+                owner: action,
+                r#type: ArtifactType::FileText,
+                visibility: ArtifactVisibility::Private,
+                classification: ArtifactClassification::RuntimeLog,
+                retention_policy: RetentionPolicyType::Versions,
+                retention_limit: 1,
+                name: None,
+                description: None,
+                content_type: None,
+                data: None,
+            },
+        )
+        .await
+        .unwrap();
+        let version = ArtifactVersionRepository::create_log_pending(
+            &state.db,
+            artifact.id,
+            &artifact.r#ref,
+            LogStreamBackend::ObjectSegments,
+            "text/plain".into(),
+            Some(execution),
+            None,
+            Some("worker".into()),
+        )
+        .await
+        .unwrap();
+        let _stream = LogStreamRepository::create_with_backend(
+            &state.db,
+            version.id,
+            LogStreamBackend::ObjectSegments,
+            1024,
+            500,
+        )
+        .await
+        .unwrap();
+        attune_common::auth::install_crypto_provider();
+        let jwt = attune_common::auth::jwt::JwtConfig {
+            secret: state.config.security.jwt_secret.clone().unwrap(),
+            access_token_expiration: 3600,
+            refresh_token_expiration: 86400,
+        };
+        let credential = |ttl| {
+            let token = attune_common::auth::jwt::generate_worker_token(
+                identity,
+                &worker.to_string(),
+                &jwt,
+                Some(ttl),
+            )
+            .unwrap();
+            AuthenticatedUser {
+                claims: attune_common::auth::jwt::validate_token(&token, &jwt).unwrap(),
+            }
+        };
+        let user = credential(60);
+
+        commit_log_segment(
+            State(state.clone()),
+            RequireAuth(user.clone()),
+            Path((version.id, 0)),
+            Body::from("accepted bytes"),
+        )
+        .await
+        .unwrap();
+        let task = tokio::spawn({
+            let state = state.clone();
+            let user = user.clone();
+            async move {
+                seal_log_stream(
+                    State(state),
+                    RequireAuth(user),
+                    Path(version.id),
+                    Query(SealLogQuery { truncated: false }),
+                    HeaderMap::new(),
+                )
+                .await
+                .map(|r| r.into_response().status())
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("actual route must enter GET");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let _:i64=sqlx::query_scalar("SELECT 1::bigint").fetch_one(&state.db).await.unwrap();
+            let mut tx=state.db.begin().await.unwrap();
+            attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_capture(&mut tx).await.unwrap();
+            tx.rollback().await.unwrap();
+            let mut tx=state.db.begin().await.unwrap();
+            attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut tx).await.unwrap();
+            tx.rollback().await.unwrap();
+        }).await.expect("size-one pool query and both graph modes must finish while GET is paused");
+        if revoke_during_get {
+            let mut tx = state.db.begin().await.unwrap();
+            Delegated::close(&mut tx, execution).await.unwrap();
+            tx.commit().await.unwrap();
+        }
+        release.notify_one();
+        let result = task.await.unwrap();
+        if revoke_during_get {
+            assert!(result.is_err());
+            let current = ArtifactVersionRepository::find_by_id(&state.db, version.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.body_state, Some(ArtifactBodyState::Pending));
+            drop(state);
+            database.cleanup().await.unwrap();
+            return;
+        }
+        assert_eq!(result.unwrap(), StatusCode::OK);
+        // A published retry must authenticate current authority, not historical JSON.
+        let mut tx = state.db.begin().await.unwrap();
+        Delegated::close(&mut tx, execution).await.unwrap();
+        tx.commit().await.unwrap();
+        assert!(seal_log_stream(
+            State(state.clone()),
+            RequireAuth(user),
+            Path(version.id),
+            Query(SealLogQuery { truncated: false }),
+            HeaderMap::new()
+        )
+        .await
+        .is_err());
+        drop(state);
+        database.cleanup().await.unwrap();
     }
 
     #[tokio::test]

@@ -211,7 +211,14 @@ async fn select(
 async fn rejected(pool: &sqlx::PgPool, query: String) {
     let mut tx = pool.begin().await.unwrap();
     Evidence::lock_reclamation(&mut tx).await.unwrap();
-    let result = sqlx::query(&query).execute(&mut *tx).await;
+    let result = match sqlx::query(&query).execute(&mut *tx).await {
+        Ok(_) => {
+            sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+                .execute(&mut *tx)
+                .await
+        }
+        Err(error) => Err(error),
+    };
     assert!(result.is_err(), "unexpected accepted mutation: {query}");
     tx.rollback().await.unwrap();
 }
