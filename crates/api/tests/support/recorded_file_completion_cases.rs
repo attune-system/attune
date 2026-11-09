@@ -680,7 +680,35 @@ async fn terminal_log_delivery_keeps_caps_retries_and_sealing_operation_specific
         &effect,
     )
     .await?;
+    let source_context = WorkerDeliveryRepository::lock_log_context(&mut tx, &context).await?;
+    let source_permit = WorkerDeliveryRepository::lock_log_permit(&mut tx, &permit).await?;
+    assert!(source_context > 0 && source_permit > 0);
     tx.commit().await?;
+    let mut fresh = fixture.ctx.pool.begin().await?;
+    WorkerDeliveryRepository::require(
+        &mut fresh,
+        permit.id,
+        context.worker,
+        context.worker_instance,
+        version.id,
+    )
+    .await?;
+    assert_eq!(
+        WorkerDeliveryRepository::lock_log_context(&mut fresh, &context).await?,
+        source_context
+    );
+    assert_eq!(
+        WorkerDeliveryRepository::lock_log_permit(&mut fresh, &permit).await?,
+        source_permit
+    );
+    let mut replaced = context.clone();
+    replaced.worker_instance = Uuid::new_v4();
+    assert!(
+        WorkerDeliveryRepository::lock_log_context(&mut fresh, &replaced)
+            .await
+            .is_err()
+    );
+    fresh.commit().await?;
     let token =
         attune_common::worker_delivery::mint(&context, &permit, &fixture.ctx.state.jwt_config)?;
     ExecutionRepository::update(

@@ -4655,7 +4655,22 @@ fn map_api_error(error: crate::middleware::ApiError) -> (StatusCode, String) {
     (StatusCode::FORBIDDEN, error.to_string())
 }
 
+// Staged split helpers have no production caller until the durable finalizer lands.
+#[allow(dead_code)]
+pub(crate) mod log_source;
+
 async fn authorize_version_mutation(
+    state: &AppState,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user: &AuthenticatedUser,
+    version: &attune_common::models::artifact_version::ArtifactVersion,
+) -> Result<crate::recorded_files::FileMutationProof, (StatusCode, String)> {
+    let proof = authorize_version_mutation_source(state, tx, user, version).await?;
+    authorize_version_mutation_target(tx, user, version, &proof).await?;
+    Ok(proof)
+}
+
+async fn authorize_version_mutation_source(
     state: &AppState,
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     user: &AuthenticatedUser,
@@ -4758,6 +4773,15 @@ async fn authorize_version_mutation(
         worker,
         file_origin_budget,
     };
+    Ok(proof)
+}
+
+async fn authorize_version_mutation_target(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user: &AuthenticatedUser,
+    version: &attune_common::models::artifact_version::ArtifactVersion,
+    proof: &crate::recorded_files::FileMutationProof,
+) -> Result<(), (StatusCode, String)> {
     Box::pin(crate::recorded_files::authorize_publication(
         tx,
         proof.process.as_ref(),
@@ -4780,13 +4804,13 @@ async fn authorize_version_mutation(
         attune_common::repositories::worker_delivery::WorkerDeliveryRepository::require_owner_binding(
             tx, credential.permit, version.id).await.map_err(map_transport_error)?;
     }
-    Box::pin(crate::file_origins::require(tx, &proof, version.id))
+    Box::pin(crate::file_origins::require(tx, proof, version.id))
         .await
         .map_err(map_api_error)?;
     Box::pin(proof.ensure_fresh_on(tx))
         .await
         .map_err(map_api_error)?;
-    Ok(proof)
+    Ok(())
 }
 
 async fn check_delivery_bounds(
@@ -5945,6 +5969,179 @@ mod tests {
         .await?;
         tx.commit().await?;
         Ok((owner.id, execution.id, workers[0], workers[1], action.r#ref))
+    }
+
+    #[tokio::test]
+    async fn staged_log_source_fresh_transactions_and_revocation() {
+        use attune_common::repositories::delegated_execution::DelegatedExecutionRepository as Delegated;
+        let mut config = Config::load_from_file(&format!(
+            "{}/../../config.test.yaml",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let database = TestDatabase::create(&config.database)
+            .await
+            .unwrap()
+            .with_cleanup_on_drop();
+        let directory = tempfile::tempdir().unwrap();
+        config.artifacts_dir = directory
+            .path()
+            .join("staging")
+            .to_string_lossy()
+            .into_owned();
+        config.storage = BlobStorageConfig::Filesystem {
+            root: directory.path().join("objects"),
+        };
+        let state = AppState::new(database.pool().clone(), config);
+        let (identity, execution, worker, _, action) =
+            delegated_log_owner(&state.db).await.unwrap();
+        let artifact = ArtifactRepository::create(
+            &state.db,
+            CreateArtifactInput {
+                r#ref: format!("{action}.stdout.log"),
+                scope: OwnerType::Action,
+                owner: action,
+                r#type: ArtifactType::FileText,
+                visibility: ArtifactVisibility::Private,
+                classification: ArtifactClassification::RuntimeLog,
+                retention_policy: RetentionPolicyType::Versions,
+                retention_limit: 1,
+                name: None,
+                description: None,
+                content_type: None,
+                data: None,
+            },
+        )
+        .await
+        .unwrap();
+        let version = ArtifactVersionRepository::create_log_pending(
+            &state.db,
+            artifact.id,
+            &artifact.r#ref,
+            LogStreamBackend::ObjectSegments,
+            "text/plain".into(),
+            Some(execution),
+            None,
+            Some("worker".into()),
+        )
+        .await
+        .unwrap();
+        let stream = LogStreamRepository::create_with_backend(
+            &state.db,
+            version.id,
+            LogStreamBackend::ObjectSegments,
+            1024,
+            500,
+        )
+        .await
+        .unwrap();
+        attune_common::auth::install_crypto_provider();
+        let jwt = attune_common::auth::jwt::JwtConfig {
+            secret: state.config.security.jwt_secret.clone().unwrap(),
+            access_token_expiration: 3600,
+            refresh_token_expiration: 86400,
+        };
+        let credential = || {
+            let token = attune_common::auth::jwt::generate_worker_token(
+                identity,
+                &worker.to_string(),
+                &jwt,
+                Some(60),
+            )
+            .unwrap();
+            AuthenticatedUser {
+                claims: attune_common::auth::jwt::validate_token(&token, &jwt).unwrap(),
+            }
+        };
+        let user = credential();
+        let tx = state.db.begin().await.unwrap();
+        let mut source = log_source::acquire(&state, tx, &user, &version)
+            .await
+            .unwrap();
+        source.authorize_target(&user, &version).await.unwrap();
+        let historical = source
+            .bind(&state, &user, &version, &stream, &HeaderMap::new(), None)
+            .await
+            .unwrap();
+        source.commit().await.unwrap();
+        let encoded = serde_json::to_value(&historical).unwrap();
+        assert!(!encoded.to_string().contains("credential_deadline"));
+        let historical = serde_json::from_value(encoded).unwrap();
+        // A fresh credential for the same producer preserves the historical identity.
+        let renewed = credential();
+        let tx = state.db.begin().await.unwrap();
+        let mut source = log_source::acquire(&state, tx, &renewed, &version)
+            .await
+            .unwrap();
+        source.authorize_target(&renewed, &version).await.unwrap();
+        assert_eq!(
+            source
+                .bind(
+                    &state,
+                    &renewed,
+                    &version,
+                    &stream,
+                    &HeaderMap::new(),
+                    Some(&historical)
+                )
+                .await
+                .unwrap(),
+            historical
+        );
+        let mut changed = serde_json::to_value(&historical).unwrap();
+        changed["producer"]["binding"]["attempt"] = serde_json::json!(uuid::Uuid::new_v4());
+        let changed = serde_json::from_value(changed).unwrap();
+        assert_eq!(
+            source
+                .bind(
+                    &state,
+                    &renewed,
+                    &version,
+                    &stream,
+                    &HeaderMap::new(),
+                    Some(&changed)
+                )
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+        source.commit().await.unwrap();
+        let mut expired = credential();
+        expired.claims.exp = 0;
+        let tx = state.db.begin().await.unwrap();
+        assert!(log_source::acquire(&state, tx, &expired, &version)
+            .await
+            .is_err());
+        sqlx::query("UPDATE identity SET frozen=TRUE WHERE id=$1")
+            .bind(identity)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let tx = state.db.begin().await.unwrap();
+        assert!(log_source::acquire(&state, tx, &renewed, &version)
+            .await
+            .is_err());
+        sqlx::query("UPDATE identity SET frozen=FALSE WHERE id=$1")
+            .bind(identity)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        // No source locks survive commit: an independent writer locks the attempt now.
+        let mut writer = state.db.begin().await.unwrap();
+        sqlx::query("SET LOCAL lock_timeout='1s'")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        sqlx::query("SELECT execution FROM delegated_execution_attempt WHERE execution=$1 FOR UPDATE NOWAIT").bind(execution).execute(&mut *writer).await.unwrap();
+        Delegated::close(&mut writer, execution).await.unwrap();
+        writer.commit().await.unwrap();
+        let tx = state.db.begin().await.unwrap();
+        assert!(log_source::acquire(&state, tx, &renewed, &version)
+            .await
+            .is_err());
+        // Closed authority is never resurrected by the historical binding.
+        database.cleanup().await.unwrap();
     }
 
     #[tokio::test]

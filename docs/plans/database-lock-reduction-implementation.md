@@ -1179,3 +1179,51 @@ manifest size/hash mismatches so the API preserves its prior forbidden response.
 Final code diff and SHA256 are `final-code.patch` / `final-code.patch.sha256`,
 with storage/API executable SHA256 in `executable-sha256.json`, under the same
 validation log directory. Only this documentation changed after the final rerun.
+
+## Source fencing prerequisite continuation (work in progress)
+
+The staged `internal_files::log_source` API acquires shared graph admission before
+source/target protection, returns a transaction-owning `Source`, and derives a
+serializable `HistoricalBinding` only after fresh source, target/origin, bounds
+and authenticated v1 proof checks. Final callers open a new transaction, reacquire
+Source, authorize targets, lock/reload version/stream, and call `bind` with the old
+binding. Recheck immediately before effects/commit after subsequent waits.
+`HistoricalBinding::{producer,proof}` expose server projections to durable selection;
+the binding and a successful prepare never authorize publication.
+
+Native projection locks the actual workflow before selection/authority and
+execution/attempt, validates selection again after execution locking, and permits
+terminal native completion. It does not strengthen the generic require_native_log
+used by the old long route. Sensor sources use the existing current-fence workload
+lock and recheck the current assignment, lease clock and generation metadata after
+waits. Recorded sources preserve existing source/disclosure ordering, then protect
+immutable context/permit rows before artifact/version/stream. Durable projection
+uses server BIGINT context/permit IDs, not their bearer UUIDs. Process identity
+also includes delivery worker/instance. Renewed JWTs do not change identity.
+Delegated execution credentials retain their current claim/attempt validation;
+legacy workers have no synthetic instance or permit. No runtime FK is added.
+
+The old route's source/target code was extracted without activating the staged
+module or adding sensor/native locks across GET. Its module-scoped dead-code
+allowance is deliberate staging, as permitted by AGENTS, rather than a fake
+production caller. Selected-close SQL publication remains fail-closed.
+
+Tests added: API `staged_log_source_fresh_transactions_and_revocation`, common
+`staged_native_log_source_roundtrip_terminal_and_disappearance`,
+`staged_log_sensor_fresh_transaction_and_after_wait_expiry`, and
+`staged_sensor_source_checks_lease_after_queued_target_lock`. These assert fresh
+transactions, credential renewal/expiry, revocation, terminal native identity,
+source disappearance, sensor instance/generation changes and lease checks after
+an observed pg_blocking_pids target wait, plus independent NOWAIT lock release.
+Exact validation results will follow; test existence is not a passing result.
+
+Remaining next-stage work: durable prepare/finalize orchestration, revision/input/
+deadline ownership, current selected-state/bounds checks after final waits,
+atomic publication SQL with encrypted evidence/metadata/Ready, commit-unknown
+reconciliation, abandon/recovery, route split, paused-verification pool/graph
+progress and provider races, and independent review. Existing permanent closure,
+expiry-retirement exception in 004 and UTC snapshot setting in 005 are retained.
+Broader consumers/final CI, earlier unclassified timing/CommitUnknown failures,
+Docker relay omission, 58 base-manifest policy failures and real successful-COMMIT
+lost-ACK coverage remain open. PUT settlement, delayed preadmitted PUT, forgotten
+multipart and post-retention key recreation/path retirement remain outside A.

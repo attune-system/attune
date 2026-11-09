@@ -138,3 +138,47 @@ the finalizer or replacing the selected-close SQL publication vetoes. No claim i
 made that these gaps require a new authority format or retention FK. Typed actual
 producer projections, prepare/final commit reconciliation, publication consistency,
 revision/deadline recovery and the requested route races remain unimplemented.
+
+## Staged source API (2026-11-09 continuation)
+
+`internal_files::log_source::acquire` enters shared capture and owns the
+caller's transaction. `Source::authorize_target` preserves the existing origin,
+disclosure, artifact and owner checks; the caller then locks and reloads the
+version/stream through `Source::transaction`. `Source::bind` authenticates the
+existing v1 manifest, checks current delivery seal bounds, rechecks freshness,
+and compares the newly derived binding with an optional historical binding.
+Only `HistoricalBinding` crosses a commit: it contains typed producer identity,
+version/stream and plain/encrypted proof identity, never a mutation effect,
+connection, secret key, bearer credential or authorization deadline. Encrypted
+identity includes SHA256 of the authenticated manifest and the typed opened
+manifest. Renewed credentials do not enter producer identity.
+
+Supported source classes follow current transport: recorded process (admission,
+attempt and delivery worker/instance), recorded worker delivery (admission,
+attempt and worker/instance), delegated execution/legacy worker (actual delegated
+worker attempt), native workflow (actual workflow row and workflow attempt), and
+sensor (sensor plus workload/worker/instance/generation). Legacy workers have no
+instance credential to manufacture. Native completion can log after terminal
+execution/closed attempt; unlike worker completion, no running/open predicate is
+added. Missing authority denies, without creating source or evidence rows/FKs.
+
+Lock order is shared graph first, then source participants, then artifact advisory
+and owner/origin protection, then version/stream. Native takes workflow before
+selection/authority and execution/attempt, consistent with cancellation and
+outbox source writers; selection validation is repeated after execution locking.
+Sensors reuse schema selection -> assignment NO KEY UPDATE -> generation,
+metadata/admission and schema validation. Recheck the current fence/lease and
+metadata after target waits. Recorded paths retain their existing source ordering
+and approval/delivery expiry checks. Cache PinMutation may precede shared graph;
+this contract does not establish universal graph-before-cache ordering.
+
+The new module's narrow dead-code allowance is intentional staging under AGENTS:
+there is no production caller until the durable finalizer is implemented. The
+old route composes the extracted source/target checks exactly as before and does
+not acquire the new native/sensor locks across GETs. Selected publication still
+fails closed. Prepare/final commit reconciliation, revision/input/deadline
+ownership, atomic final publication SQL, abandon/recovery, route split and a
+subsequent review remain required. Historical identity alone never authorizes
+publication. Permanent closure, accepted membership and cleanup protections from
+003/004/005 remain unchanged; full PUT settlement and path retirement remain
+outside this prerequisite.

@@ -261,3 +261,15 @@ producer authority, committed close binding or publication/recovery races. The
 new database TimeZone retry case uses a nonempty stream, so timestamp rendering
 actually participates in the selected-input hash. Historical non-UTC selections
 are not rewritten. Selected-close publication remains disabled.
+
+### Staged source helpers continuation
+
+The new source API does not move route barriers: no route uses it yet. Tests of
+`log_source::acquire` / `Source::bind` must consume Source through its commit method before opening
+the final transaction, then compare a freshly authenticated binding. The source
+owns its transaction, so it cannot be reused on a different transaction.
+Source lock release must be observed by an independent NOWAIT source writer;
+serializing HistoricalBinding must retain only historical identity. Source
+expiry checks belong after target waits, including sensor lease clock expiry.
+Native terminal completion must remain a positive case; worker terminal completion
+must remain denied. No FK or fabricated worker permit may replace these checks.

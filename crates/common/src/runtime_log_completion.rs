@@ -27,7 +27,7 @@ pub fn execution_stream_is_empty(execution: &crate::models::Execution, stream: &
         })
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FinalLogManifest {
     pub encoding: String,
