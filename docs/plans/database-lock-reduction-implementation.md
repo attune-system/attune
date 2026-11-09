@@ -955,3 +955,69 @@ schema prepare and Clippy results remain historical evidence, as does Astra's P2
 fix confirmation. Earlier timing/CommitUnknown failures remain unclassified.
 The Docker relay fixture omission and 58 base-manifest policy-script failures
 remain gaps; this storage checkpoint cannot turn them into passes.
+
+#### Storage guard checkpoint validation
+
+Status: **work in progress, incomplete foundation**, not ready for route activation
+or merge. Functional source checkpoint is
+`ec4ed280d0b87051e51a9cfe0ee1c5d14c4c9545`; this validation record changes prose
+only. Integration checkpoint is `4ac6ea43b9a52d8c70b345de08357ff8c482874a`.
+No source changes occurred during the final validation sequence. The exact patch
+is `/tmp/attune-close-validation-nu_13_r5/tested-source.patch`; commands, exit
+codes, timings and resource removal evidence are retained in
+`/tmp/attune-close-validation-state.json`, with logs alongside the patch.
+
+Builds and tests ran sequentially. Disposable PG16/18 servers were bound to
+random loopback ports; repository/API fixtures used run-owned, migration-hashed
+physical clones. The final-source clones applied the forward migration.
+
+```bash
+cargo test -p attune-common --test storage_maintenance_repository_tests --no-run --message-format=json
+# Run the resulting executable, cwd crates/common, on each owned PG16/18 URL:
+ATTUNE_TEST_RUN_ID=closefinal16 ATTUNE__DATABASE__URL=<owned-pg16-url> <storage-test-binary> --nocapture --test-threads=4
+ATTUNE_TEST_RUN_ID=closefinal18 ATTUNE__DATABASE__URL=<owned-pg18-url> <storage-test-binary> --nocapture --test-threads=4
+DATABASE_URL=<owned-pg18-url> SQLX_OFFLINE=false cargo sqlx prepare --workspace -- --all-targets
+cargo clippy -p attune-common -p attune-api --all-targets -- -D warnings
+cargo fmt --all -- --check
+cargo test -p attune-api --lib --no-run --message-format=json
+# Run the resulting API libtest executable, cwd crates/api, on each owned URL:
+ATTUNE_TEST_RUN_ID=closeapi16 ATTUNE__DATABASE__URL=<owned-pg16-url> <api-test-binary> internal_files::tests:: --nocapture --test-threads=4
+ATTUNE_TEST_RUN_ID=closeapi18 ATTUNE__DATABASE__URL=<owned-pg18-url> <api-test-binary> internal_files::tests:: --nocapture --test-threads=4
+git diff --check
+```
+
+Results: storage repository **35/35** on PG16 (71.52s) and PG18 (68.18s),
+including four new lifecycle tests and existing cleanup/admission/shared-file
+regressions. API selection **20/20**, zero ignored, on PG16 (52.42s) and PG18
+(32.76s); 479 other API libtests were filtered, not counted as passes. These
+exercise the existing concurrent size-one-pool object append/seal, direct upload
+completion and shared-file seal paths, not the still-unimplemented split route.
+Schema prepare passed (225.91s; no macro queries/offline metadata changes),
+common/API all-target Clippy passed with warnings denied (203.45s), and formatting
+and whitespace passed. The API test build took 777.94s; it did not overlap tests.
+No new public API/generated contract changed in this checkpoint.
+
+Intermediate failure evidence remains: the first local test build had an incorrect
+module path; the first PG16 run passed 33/35 and failed two new fixture assertions.
+One issued a raw deletion claim without required exclusive admission; the other
+mistook a valid identical resume retry for a stale conflicting request. Corrected
+fixtures retain the guard and retry behavior. Their final reruns passed. This does
+not classify the older timing/CommitUnknown failures.
+
+Cleanup: both exact owned containers (`c52ed304c29b`, `565a6498429b`) and their
+anonymous volumes were removed. Each server had zero test-clone databases before
+removal. Both temporary psql shims were removed; logs and drivers remain as local
+evidence. No external PR or production resource was modified.
+
+Remaining gates are the protocol completion items in
+[object-log durable close protocol](object-log-seal-claims.md): typed actual
+producer/proof projection, trusted full-byte verifier, fresh-authority private
+finalizer with atomic SQL publication consistency, bounded recovery, and the
+corresponding full API/provider-backed race/security/independent-retention tests.
+Cross-session timestamp rendering in the current JSONB segment projection also
+needs canonicalization review and a cross-TimeZone retry test before activation;
+a differently rendered creation timestamp currently conflicts safely rather than
+reconciling. No size-one-pool connection-free verification claim is made. The
+retained pre-admitted PUT-start/settlement and filesystem-retirement limitations,
+Docker relay omission, and 58 base-manifest policy-script gaps remain unresolved.
+Astra review has not been requested by this implementation agent.
