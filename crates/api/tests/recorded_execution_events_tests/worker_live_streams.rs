@@ -515,6 +515,61 @@ async fn worker_object_append_and_seal_feed_artifact_and_execution_live_readers(
 }
 
 #[tokio::test]
+async fn worker_seal_retries_reconcile_only_identical_completion_inputs() -> Result<()> {
+    for backend in [
+        LogStreamBackend::SharedFile,
+        LogStreamBackend::ObjectSegments,
+    ] {
+        let fixture = worker_fixture().await?;
+        let mut log = WorkerLog::allocate(&fixture, backend).await?;
+        log.append(&fixture, b"retryable-completion").await?;
+        let proof = log.proof(&fixture)?;
+        let (left, right) = tokio::join!(
+            log.transport
+                .seal_log_stream_with_manifest(log.version, false, &proof),
+            log.transport
+                .seal_log_stream_with_manifest(log.version, false, &proof),
+        );
+        left?;
+        right?;
+        // Replaying after an unobserved acknowledgement must also succeed.
+        log.transport
+            .seal_log_stream_with_manifest(log.version, false, &proof)
+            .await?;
+        assert!(log
+            .transport
+            .seal_log_stream_with_manifest(log.version, true, &proof)
+            .await
+            .is_err());
+        let key = fixture
+            .ctx
+            .state
+            .config
+            .security
+            .encryption_key
+            .as_deref()
+            .unwrap();
+        let mut changed =
+            attune_common::runtime_log_completion::FinalLogManifest::open(key, &proof)?;
+        changed.plaintext_bytes += 1;
+        assert!(log
+            .transport
+            .seal_log_stream_with_manifest(log.version, false, &changed.authenticate(key)?)
+            .await
+            .is_err());
+        let mut conn = fixture.ctx.pool.acquire().await?;
+        let completion = attune_common::repositories::runtime_log_completion::RuntimeLogCompletionRepository::find(&mut conn, log.version).await?.unwrap();
+        assert_eq!(completion.authenticated_manifest, proof);
+        assert!(!completion.truncated);
+        drop(conn);
+        log._server.stop().await?;
+        drop(log);
+        fixture.ctx.cleanup().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn human_worker_live_reader_rechecks_freeze_after_the_decoder_wait() -> Result<()> {
     for backend in [
         LogStreamBackend::SharedFile,

@@ -578,7 +578,7 @@ async fn missing_or_incomplete_capture_never_becomes_successful_empty_output() -
         let (id, token) = stream_fixture_kind(&ctx, sensitive).await?;
         for result in [
             serde_json::json!({}),
-            serde_json::json!({"logs_incomplete":true,"runtime_log_capture":{"stdout":"empty"}}),
+            serde_json::json!({"logs_incomplete":true,"runtime_log_capture":{"stdout":"incomplete"}}),
         ] {
             ExecutionRepository::update(
                 &ctx.pool,
@@ -600,6 +600,44 @@ async fn missing_or_incomplete_capture_never_becomes_successful_empty_output() -
             assert!(text.contains("event: error"), "{text}");
             assert!(!text.contains("event: done"), "{text}");
         }
+        wait_for_no_leases(&ctx).await?;
+        ctx.cleanup().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn incomplete_sibling_does_not_erase_positive_empty_stream_evidence() -> Result<()> {
+    use attune_common::repositories::{execution::UpdateExecutionInput, Update};
+    for sensitive in [false, true] {
+        let ctx = TestContext::new_with_stream_limits(2, 2)
+            .await?
+            .with_auth()
+            .await?;
+        let (id, token) = stream_fixture_kind(&ctx, sensitive).await?;
+        ExecutionRepository::update(&ctx.pool,id,UpdateExecutionInput {
+            status:Some(ExecutionStatus::Completed),
+            result:Some(serde_json::json!({"logs_incomplete":true,"runtime_log_capture":{"stdout":"empty","stderr":"incomplete"}})),
+            ..Default::default()
+        }).await?;
+        let response = ctx
+            .get(
+                &format!("/api/v1/executions/{id}/logs/stdout/stream"),
+                Some(&token),
+            )
+            .await?;
+        let text = tokio::time::timeout(Duration::from_secs(10), response.text()).await??;
+        assert!(text.contains("event: done"), "{text}");
+        assert!(!text.contains("event: error"), "{text}");
+        let response = ctx
+            .get(
+                &format!("/api/v1/executions/{id}/logs/stderr/stream"),
+                Some(&token),
+            )
+            .await?;
+        let text = tokio::time::timeout(Duration::from_secs(10), response.text()).await??;
+        assert!(text.contains("event: error"), "{text}");
+        assert!(!text.contains("event: done"), "{text}");
         wait_for_no_leases(&ctx).await?;
         ctx.cleanup().await?;
     }

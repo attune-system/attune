@@ -961,19 +961,19 @@ pub struct ArtifactsConfig {
     #[serde(default = "default_log_segment_initial_bytes")]
     pub log_segment_initial_bytes: usize,
 
-    /// Total attempts for a retryable immutable segment commit.
+    /// Total attempts for a retryable immutable segment commit or log seal.
     #[serde(default = "default_log_segment_retry_max_attempts")]
     pub log_segment_retry_max_attempts: u32,
 
-    /// Deadline for each immutable segment commit attempt.
+    /// Deadline for each immutable segment commit or log seal attempt.
     #[serde(default = "default_log_segment_retry_attempt_timeout_ms")]
     pub log_segment_retry_attempt_timeout_ms: u64,
 
-    /// Initial retry delay for immutable segment commits.
+    /// Initial retry delay for immutable segment commits and log seals.
     #[serde(default = "default_log_segment_retry_initial_backoff_ms")]
     pub log_segment_retry_initial_backoff_ms: u64,
 
-    /// Maximum retry delay for immutable segment commits.
+    /// Maximum retry delay for immutable segment commits and log seals.
     #[serde(default = "default_log_segment_retry_max_backoff_ms")]
     pub log_segment_retry_max_backoff_ms: u64,
 
@@ -1176,7 +1176,7 @@ fn default_log_segment_retry_max_backoff_ms() -> u64 {
 }
 
 fn default_log_finalization_timeout_ms() -> u64 {
-    1_000
+    60_000
 }
 
 fn default_sensor_log_max_bytes() -> u64 {

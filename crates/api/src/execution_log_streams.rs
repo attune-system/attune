@@ -30,6 +30,8 @@ struct Inner {
     retries: AtomicU64,
     tail_database_queries: AtomicU64,
     object_store_reads: AtomicU64,
+    log_finalizing_responses: AtomicU64,
+    log_incomplete_responses: AtomicU64,
     shutdown: CancellationToken,
     release_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -87,6 +89,8 @@ impl ExecutionLogStreams {
                 retries: AtomicU64::new(0),
                 tail_database_queries: AtomicU64::new(0),
                 object_store_reads: AtomicU64::new(0),
+                log_finalizing_responses: AtomicU64::new(0),
+                log_incomplete_responses: AtomicU64::new(0),
                 shutdown: CancellationToken::new(),
                 release_tasks: Mutex::new(Vec::new()),
             }),
@@ -205,9 +209,20 @@ impl ExecutionLogStreams {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_log_unavailable(&self, incomplete: bool) {
+        let counter = if incomplete {
+            &self.inner.log_incomplete_responses
+        } else {
+            &self.inner.log_finalizing_responses
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn render_metrics(&self) -> String {
         let mut output = String::new();
         for (name, kind, help, value) in [
+            ("attune_runtime_log_finalizing_responses_total", "counter", "Authorized finite log downloads awaiting finalization.", self.inner.log_finalizing_responses.load(Ordering::Relaxed)),
+            ("attune_runtime_log_incomplete_responses_total", "counter", "Authorized incomplete-log responses, including execution SSE errors.", self.inner.log_incomplete_responses.load(Ordering::Relaxed)),
             (
                 "attune_execution_log_streams_active",
                 "gauge",
@@ -392,8 +407,12 @@ mod tests {
         streams.record_tail_database_query();
         streams.record_object_store_read();
 
+        streams.record_log_unavailable(false);
+        streams.record_log_unavailable(true);
         let metrics = streams.render_metrics();
         for metric in [
+            "attune_runtime_log_finalizing_responses_total 1",
+            "attune_runtime_log_incomplete_responses_total 1",
             "attune_execution_log_streams_active 0",
             "attune_execution_log_stream_wakeups_total 1",
             "attune_execution_log_stream_retries_total 1",

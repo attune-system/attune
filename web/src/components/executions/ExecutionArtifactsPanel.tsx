@@ -34,6 +34,8 @@ import {
   ArtifactSseProtocolError,
 } from "@/lib/artifact-live-preview";
 import {
+  artifactContentErrorMessage,
+  artifactStreamErrorMessage,
   ARTIFACT_PREVIEW_BYTES,
   readArtifactPreview,
 } from "@/lib/artifact-preview";
@@ -44,6 +46,7 @@ interface ExecutionArtifactsPanelProps {
   executionId: number;
   /** Whether the execution is still running (enables polling) */
   isRunning?: boolean;
+  logsIncomplete?: boolean;
 }
 
 function getArtifactTypeIcon(type: ArtifactType) {
@@ -242,7 +245,7 @@ function TextFileDetail({
           denied = true;
           if (publishFrame !== undefined) cancelAnimationFrame(publishFrame);
           publishFrame = undefined;
-          setLoadError("Content unavailable or access denied");
+          setLoadError(artifactStreamErrorMessage(data));
           setIsLoadingContent(false);
           setIsStreaming(false);
           controller.abort();
@@ -413,9 +416,8 @@ function TextFileDetail({
         setContent(preview.text);
         setTruncated(preview.truncated);
         setLoadError(null);
-      } catch {
-        if (!signal.aborted)
-          setLoadError("Content unavailable or access denied");
+      } catch (error) {
+        if (!signal.aborted) setLoadError(artifactContentErrorMessage(error));
       } finally {
         if (!signal.aborted) {
           setIsLoadingContent(false);
@@ -672,6 +674,7 @@ export default function ExecutionArtifactsPanel(
 function ExecutionArtifactsView({
   executionId,
   isRunning = false,
+  logsIncomplete = false,
 }: ExecutionArtifactsPanelProps) {
   const pageSize = 20;
   const [paused, setPaused] = useState(false);
@@ -742,6 +745,14 @@ function ExecutionArtifactsView({
 
       {/* Content */}
       <div className="px-4 pb-4">
+        {logsIncomplete && (
+          <p
+            role="status"
+            className="mb-3 rounded bg-amber-50 p-3 text-sm text-amber-900"
+          >
+            Log delivery was incomplete when this execution finished.
+          </p>
+        )}
         {downloadError && (
           <p className="text-sm text-red-600">{downloadError}</p>
         )}
@@ -876,9 +887,9 @@ function ExecutionArtifactsView({
                                 artifact.ref,
                                 artifact.selected_version.version,
                                 artifact.selected_version.id,
-                              ).catch(() =>
+                              ).catch((error: unknown) =>
                                 setDownloadError(
-                                  "Content unavailable or access denied",
+                                  artifactContentErrorMessage(error),
                                 ),
                               );
                             }}

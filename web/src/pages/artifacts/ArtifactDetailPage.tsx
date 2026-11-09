@@ -23,6 +23,7 @@ import { useArtifactCursorPage } from "@/hooks/useArtifactCursorPage";
 import ArtifactCursorControls from "@/components/common/ArtifactCursorControls";
 import { formatJsonValue } from "@/lib/format-utils";
 import {
+  artifactContentErrorMessage,
   ARTIFACT_PREVIEW_BYTES,
   readArtifactPreview,
 } from "@/lib/artifact-preview";
@@ -84,9 +85,9 @@ function TextContentViewer({
         setTruncated(preview.truncated);
         setLoadError(null);
       })
-      .catch(() => {
+      .catch((error: unknown) => {
         if (!controller.signal.aborted) {
-          setLoadError("Content unavailable or access denied");
+          setLoadError(artifactContentErrorMessage(error));
           setContent(null);
         }
       })
@@ -243,8 +244,8 @@ function VersionRow({
         version.version,
         version.id,
       );
-    } catch {
-      setDownloadError("Content unavailable or access denied");
+    } catch (error) {
+      setDownloadError(artifactContentErrorMessage(error));
     }
   }, [artifactId, artifactRef, version.version, version.id]);
 
@@ -391,8 +392,8 @@ function ArtifactMetadata({
                     artifact.ref,
                     versionNumber,
                     versionId,
-                  ).catch(() =>
-                    setDownloadError("Content unavailable or access denied"),
+                  ).catch((error: unknown) =>
+                    setDownloadError(artifactContentErrorMessage(error)),
                   );
                 }}
                 className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors text-sm"

@@ -516,6 +516,7 @@ mod tests {
             transport,
             1,
             "native-text.log".to_string(),
+            attune_common::config::ArtifactsConfig::default().log_segment_writer_config(),
         );
         let source = RuntimeLogSource::Execution {
             execution_id: 1,
