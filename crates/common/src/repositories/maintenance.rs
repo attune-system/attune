@@ -188,10 +188,8 @@ impl MaintenanceRepository {
 
     pub async fn expired_artifact_version_count(pool: &PgPool) -> Result<i64> {
         sqlx::query_scalar::<_, i64>(&format!(
-            "SELECT COUNT(*)::BIGINT FROM artifact_version av
-             JOIN artifact a ON a.id = av.artifact
-             WHERE {}",
-            expired_artifact_version_predicate()
+            "{} SELECT COUNT(*)::BIGINT FROM expired av WHERE file_evidence_version_eligible(av.id)",
+            expired_artifact_prefilter()
         ))
         .fetch_one(pool)
         .await
@@ -203,13 +201,12 @@ impl MaintenanceRepository {
         limit: i64,
     ) -> Result<Vec<ExpiredArtifactVersion>> {
         sqlx::query_as::<_, ExpiredArtifactVersion>(&format!(
-            "SELECT av.id, av.artifact, av.version, av.file_path, av.body_state, av.object_key, av.provider_version
-             FROM artifact_version av
-             JOIN artifact a ON a.id = av.artifact
-             WHERE {}
+            "{} SELECT av.id, av.artifact, av.version, av.file_path, av.body_state, av.object_key, av.provider_version
+             FROM expired av
+             WHERE file_evidence_version_eligible(av.id)
              ORDER BY av.created ASC, av.id ASC
              LIMIT $1",
-            expired_artifact_version_predicate()
+            expired_artifact_prefilter()
         ))
         .bind(limit.max(1))
         .fetch_all(pool)
@@ -223,8 +220,8 @@ impl MaintenanceRepository {
         budget: &MaintenanceBudget,
     ) -> Result<Vec<ExpiredArtifactVersion>> {
         maintenance_admission::probe(pool, budget, Instant::now() + budget.page_timeout, &CancellationToken::new(), move |conn| Box::pin(async move {
-            let predicate = expired_artifact_version_predicate();
-            let versions = sqlx::query_as(&format!("SELECT av.id,av.artifact,av.version,av.file_path,av.body_state,av.object_key,av.provider_version FROM artifact_version av JOIN artifact a ON a.id=av.artifact WHERE {predicate} ORDER BY av.created,av.id LIMIT $1"))
+            let prefilter = expired_artifact_prefilter();
+            let versions = sqlx::query_as(&format!("{prefilter} SELECT av.id,av.artifact,av.version,av.file_path,av.body_state,av.object_key,av.provider_version FROM expired av WHERE file_evidence_version_eligible(av.id) ORDER BY av.created,av.id LIMIT $1"))
                 .bind(limit.max(1)).fetch_all(conn).await?;
             Ok(versions)
         })).await
@@ -327,7 +324,7 @@ impl MaintenanceRepository {
         Ok(sqlx::query_as(&format!(
             "SELECT av.id,av.artifact,av.version,av.file_path,av.body_state,av.object_key,av.provider_version \
              FROM artifact_version av JOIN artifact a ON a.id=av.artifact \
-             WHERE av.id=$1 AND av.artifact=$2 AND {} FOR UPDATE OF av",
+             WHERE av.id=$1 AND av.artifact=$2 AND file_evidence_version_eligible(av.id) AND {} FOR UPDATE OF av",
             expired_artifact_version_predicate()
         )).bind(id).bind(artifact).fetch_optional(connection).await?)
     }
@@ -1008,8 +1005,17 @@ impl MaintenanceRepository {
     }
 }
 
+// This is an expiration prefilter, not a bounded raw scan. Keep evidence
+// evaluation outside the materialized relation; an output LIMIT is not a cursor.
+fn expired_artifact_prefilter() -> String {
+    format!("WITH expired AS MATERIALIZED (
+        SELECT av.id,av.artifact,av.version,av.file_path,av.body_state,av.object_key,av.provider_version,av.created
+        FROM artifact_version av JOIN artifact a ON a.id=av.artifact WHERE {}
+    )", expired_artifact_version_predicate())
+}
+
 fn expired_artifact_version_predicate() -> &'static str {
-    "file_evidence_version_eligible(av.id) AND (av.body_state IS NULL OR av.body_state = 'ready') AND (
+    "(av.body_state IS NULL OR av.body_state = 'ready') AND (
         (a.retention_policy = 'days' AND av.created < NOW() - make_interval(days => a.retention_limit))
         OR (a.retention_policy = 'hours' AND av.created < NOW() - make_interval(hours => a.retention_limit))
         OR (a.retention_policy = 'minutes' AND av.created < NOW() - make_interval(mins => a.retention_limit))
@@ -1021,12 +1027,14 @@ fn expired_artifact_version_predicate() -> &'static str {
                 WHERE active_stream.artifact_version = av.id
                   AND active_stream.backend <> 'shared_file' AND NOT active_stream.sealed
             )
-            AND (
-                SELECT COUNT(*) FROM artifact_version newer
+            AND EXISTS (
+                SELECT 1 FROM artifact_version newer
                 WHERE newer.artifact = av.artifact
                   AND (newer.body_state IS NULL OR newer.body_state = 'ready')
                   AND newer.version > av.version
-            ) >= a.retention_limit
+                ORDER BY newer.version DESC
+                OFFSET GREATEST(a.retention_limit::bigint - 1, 0) LIMIT 1
+            )
         )
     )"
 }
