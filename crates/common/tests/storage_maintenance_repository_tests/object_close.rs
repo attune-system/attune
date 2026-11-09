@@ -4,11 +4,16 @@ use serde_json::json;
 async fn fixture() -> (attune_common::test_database::TestDatabase, i64, i64, i64) {
     // Origin-less log: no fabricated evidence owner or execution retention FK.
     let pool = create_test_pool().await.unwrap();
-    let artifact = ArtifactRepository::create(&pool, artifact_input("close"))
+    let (artifact, version, stream) = create_log(&pool).await;
+    (pool, artifact, version, stream)
+}
+
+async fn create_log(pool: &sqlx::PgPool) -> (i64, i64, i64) {
+    let artifact = ArtifactRepository::create(pool, artifact_input("close"))
         .await
         .unwrap();
     let version = ArtifactVersionRepository::create_log_pending(
-        &pool,
+        pool,
         artifact.id,
         &artifact.r#ref,
         LogStreamBackend::ObjectSegments,
@@ -19,10 +24,162 @@ async fn fixture() -> (attune_common::test_database::TestDatabase, i64, i64, i64
     )
     .await
     .unwrap();
-    let stream = LogStreamRepository::create(&pool, version.id, 1024, 500)
+    let stream = LogStreamRepository::create(pool, version.id, 1024, 500)
         .await
         .unwrap();
-    (pool, artifact.id, version.id, stream.id)
+    (artifact.id, version.id, stream.id)
+}
+
+async fn expired_grant(pool: &sqlx::PgPool, version: i64, key: &str) -> i64 {
+    sqlx::query_scalar("INSERT INTO artifact_upload_grant(artifact_version,segment_sequence,object_key,expected_size,expected_sha256,content_type,expires_at,settle_until) VALUES($1,0,$2,1,repeat('a',64),'application/octet-stream',NOW()-interval '2 minutes',NOW()-interval '1 minute') RETURNING id")
+        .bind(version).bind(key).fetch_one(pool).await.unwrap()
+}
+
+#[tokio::test]
+async fn expiry_and_stream_first_renewal_do_not_reverse_lock_order() {
+    use attune_common::repositories::artifact_upload_grant::ArtifactUploadGrantRepository as Grants;
+    use std::time::Duration as StdDuration;
+    use tokio::time::timeout;
+
+    let (pool, _, version, stream) = fixture().await;
+    let grant = expired_grant(&pool, version, "expiry-renewal").await;
+    // Pause actual maintenance after it locks the grant, before the production
+    // close guard. This creates the precise inverse-order interleaving without
+    // sleeps or relying on the deadlock detector to arrange the race.
+    sqlx::raw_sql("CREATE FUNCTION test_expiry_barrier() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.state='issued' AND NEW.state='expired' THEN PERFORM pg_advisory_xact_lock(48127,1); END IF; RETURN NEW; END $$; CREATE TRIGGER aaa_test_expiry_barrier BEFORE UPDATE ON artifact_upload_grant FOR EACH ROW EXECUTE FUNCTION test_expiry_barrier();")
+        .execute(&*pool).await.unwrap();
+    let mut barrier = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(48127,1)")
+        .execute(&mut *barrier)
+        .await
+        .unwrap();
+    let barrier_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *barrier)
+        .await
+        .unwrap();
+    let mut renewal = pool.begin().await.unwrap();
+    LogStreamRepository::lock(&mut renewal, stream)
+        .await
+        .unwrap();
+    let renewal_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *renewal)
+        .await
+        .unwrap();
+    let expiry_pool = pool.pool().clone();
+    let expiry = tokio::spawn(async move { Grants::mark_expired(&expiry_pool, 10).await });
+    let expiry_pid = timeout(StdDuration::from_secs(5), async {
+        loop {
+            let pid: Option<i32> = sqlx::query_scalar("SELECT pid FROM pg_locks WHERE NOT granted AND locktype='advisory' AND $1=ANY(pg_blocking_pids(pid)) LIMIT 1")
+                .bind(barrier_pid).fetch_optional(&*pool).await.unwrap();
+            if let Some(pid) = pid { break pid; }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    let renewal = tokio::spawn(async move {
+        Grants::find_log_segment_for_update(&mut renewal, version, 0).await?;
+        let renewed = Grants::renew(
+            &mut renewal,
+            grant,
+            Utc::now() + Duration::minutes(1),
+            Utc::now() + Duration::minutes(2),
+        )
+        .await?;
+        renewal.commit().await?;
+        attune_common::Result::Ok(renewed)
+    });
+    let waiting = timeout(StdDuration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar("SELECT $1=ANY(pg_blocking_pids($2))")
+                .bind(expiry_pid)
+                .bind(renewal_pid)
+                .fetch_one(&*pool)
+                .await
+                .unwrap();
+            if waiting {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    // Always release the barrier and join both owners before asserting outcomes.
+    barrier.rollback().await.unwrap();
+    let (expired, renewed) = tokio::join!(expiry, renewal);
+    waiting.unwrap();
+    assert_eq!(expired.unwrap().unwrap(), 1);
+    assert!(renewed.unwrap().unwrap());
+    let state: String =
+        sqlx::query_scalar("SELECT state::text FROM artifact_upload_grant WHERE id=$1")
+            .bind(grant)
+            .fetch_one(&*pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "issued");
+}
+
+#[tokio::test]
+async fn expiry_batches_survive_closing_and_abandoned_streams_without_reopening() {
+    use attune_common::repositories::artifact_upload_grant::ArtifactUploadGrantRepository as Grants;
+
+    for abandon in [false, true] {
+        let (pool, _, version, stream) = fixture().await;
+        let grant = expired_grant(&pool, version, "closed-expiry").await;
+        let (_, other_version, _) = create_log(&pool).await;
+        let other = expired_grant(&pool, other_version, "unrelated-expiry").await;
+        let selected = select(&pool, stream, 0).await.unwrap();
+        if abandon {
+            let mut tx = pool.begin().await.unwrap();
+            Evidence::lock_capture(&mut tx).await.unwrap();
+            assert!(
+                LogStreamRepository::abandon_close(&mut tx, stream, selected.revision())
+                    .await
+                    .unwrap()
+            );
+            tx.commit().await.unwrap();
+        }
+        // The exemption cannot change deadlines or identity, even alongside expiry.
+        for mutation in [
+            "object_key='changed'",
+            "expected_size=2",
+            "settle_until=NOW()+interval '1 hour'",
+            "segment_sequence=1",
+            "expected_sha256=repeat('b',64)",
+            "token=gen_random_uuid()",
+        ] {
+            rejected(
+                &pool,
+                format!(
+                    "UPDATE artifact_upload_grant SET state='expired',{mutation} WHERE id={grant}"
+                ),
+            )
+            .await;
+        }
+        assert_eq!(Grants::mark_expired(&pool, 10).await.unwrap(), 2);
+        let states: Vec<String> = sqlx::query_scalar(
+            "SELECT state::text FROM artifact_upload_grant WHERE id=ANY($1) ORDER BY id",
+        )
+        .bind(vec![grant, other])
+        .fetch_all(&*pool)
+        .await
+        .unwrap();
+        assert_eq!(states, vec!["expired", "expired"]);
+        rejected(
+            &pool,
+            format!("UPDATE artifact_upload_grant SET state='issued' WHERE id={grant}"),
+        )
+        .await;
+        rejected(&pool, format!("INSERT INTO log_segment(stream,sequence,byte_start,byte_end,size_bytes,sha256,object_key,provider_version) VALUES({stream},0,0,1,1,repeat('a',64),'tail','v:1')")).await;
+        let (phase, revision, input): (String, i64, serde_json::Value) = sqlx::query_as(
+            "SELECT close_phase,close_revision,close_input FROM log_stream WHERE id=$1",
+        )
+        .bind(stream)
+        .fetch_one(&*pool)
+        .await
+        .unwrap();
+        assert_eq!(phase, if abandon { "abandoned" } else { "closing" });
+        assert_eq!(revision, if abandon { 2 } else { 1 });
+        assert_eq!(&input, selected.input());
+    }
 }
 
 async fn select(

@@ -39,7 +39,11 @@ The repository provides opaque selected-input projection, revision-qualified
 selection/resume and abandon, and an append/retry guard. Direct issuance, proxy
 reservation, direct completion (including its completed-grant fast path), and
 proxy publication use that guard after stream locking. SQL grant guards provide
-additional consistency enforcement. Exact accepted identity retries are allowed;
+additional consistency enforcement. Forward migration `20261109000004` allows
+only identity-preserving `issued → expired` retirement after the existing settlement
+deadline without acquiring the stream lock. This avoids the maintenance grant-first
+versus producer stream-first inversion and permits expiry through closing and
+abandonment. It neither reopens admission nor proves physical PUT settlement. Exact accepted identity retries are allowed;
 new membership or a changed provider is rejected. Existing proxy reservation
 short-circuits an exact retry before PUT. Earlier admitted requests may still
 **start a PUT after closure**: neither a second database check nor a grant TTL

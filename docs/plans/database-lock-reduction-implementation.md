@@ -1021,3 +1021,57 @@ reconciling. No size-one-pool connection-free verification claim is made. The
 retained pre-admitted PUT-start/settlement and filesystem-retirement limitations,
 Docker relay omission, and 58 base-manifest policy-script gaps remain unresolved.
 Astra review has not been requested by this implementation agent.
+
+
+#### Astra storage-guard review and expiry corrections
+
+Astra's read-only review of `ec4ed280` against dependency merge `4ac6ea43`,
+at documentation head `e5c0b37f`, found two actionable P2 defects in the new
+grant guard: maintenance expiry acquired grant then stream while API renewal
+acquired stream then grant; and an issued grant past settlement could be selected
+into a close but its later expiry poisoned the entire maintenance batch. Neither
+was inherited from PR31. These source-derived interleavings were absent from
+the previously passing focused suites. This review was not merge approval.
+
+Forward migration `20261109000004_object_log_grant_expiry.sql` admits exactly
+identity-preserving `issued → expired` transitions with the original settlement
+deadline elapsed before any stream lock. Other grant writes retain the close
+guard. Expiry retires authority; it does not assert physical settlement or remove
+the permanent close state/pin. Migration `003` remains byte-identical.
+
+New regression coverage pauses real `mark_expired` execution on a test-only
+advisory barrier after the grant row is locked, holds the stream in the renewal
+transaction, observes renewal waiting for the grant, then releases the barrier.
+Both owners must finish successfully. Another case checks both closing and
+abandoned streams, unrelated grants in the same batch, identity-changing expiry
+rejection, continued append/renewal prohibition, and unchanged close identity.
+Correction validation uses base `e5c0b37f` plus the saved staged patch at
+`/tmp/attune-expiry-validation-8_y4k87z/tested-source.patch` and its hash sidecar.
+Source files stayed unchanged throughout the final build and validation.
+
+The final storage target passed **37/37 on PG16** (96.26s). The first PG18 run
+passed 36/37, including both new expiry regressions; the existing
+`bounded_admission::combined_cleanup_rolls_back_version_triggers_when_parent_cleanup_fails`
+failed in its `claimed_pending` setup at line 465 with `DeadlineDeferred`, SQLSTATE
+57014, and a 250ms statement timeout reported in `guard_object_log_close_version`.
+The cause remains **unclassified**, not baseline-proven. No test, budget or
+production timeout was changed to accommodate it.
+
+A fresh owned PG18 run passed that exact case alone (1 passed, 36 filtered;
+42.50s including template setup), then the whole target **37/37** with four workers
+(33.86s). These passes do not erase the failed run. First-run evidence is in
+`/tmp/attune-expiry-validation-state.json`; follow-up commands, timing and logs
+are in `/tmp/attune-expiry-recheck-recheck-state.json`, logs
+`/tmp/attune-expiry-recheck-recheck-pq4dk7l_`.
+
+Workspace all-target schema preparation on PG18 passed (138.06s, no macro queries
+or offline metadata changes). Formatting and whitespace passed. Common all-target
+Clippy passed with warnings denied (138.71s). All three exact owned containers
+and anonymous volumes were removed; successful PG16 and fresh PG18 runs checked
+zero test clones before removal. The failed PG18 run removed its owned server
+and volume without a separate post-test zero-clone query. All temporary psql
+shims were removed. No production or unowned resource was changed.
+
+This does not complete the split sealing route, broader consumer execution,
+required final-head CI, or any previously disclosed validation gaps. Astra has
+not yet re-reviewed the expiry correction.
