@@ -542,23 +542,38 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install Gitleaks
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$HOME/bin"
           GITLEAKS_VERSION="8.24.2"
           ARCH="$(uname -m)"
           case "$ARCH" in
-            x86_64) ARCH="x64" ;;
-            aarch64|arm64) ARCH="arm64" ;;
+            x86_64)
+              ARCH="x64"
+              GITLEAKS_SHA256="fa0500f6b7e41d28791ebc680f5dd9899cd42b58629218a5f041efa899151a8e"
+              ;;
+            aarch64|arm64)
+              ARCH="arm64"
+              GITLEAKS_SHA256="574a6d52573c61173add7ddb5e3cc68c0e82cb0735818a1eeb9a0a2de1643fbc"
+              ;;
             *)
               echo "Unsupported architecture: $ARCH"
               exit 1
               ;;
           esac
-          curl -sSfL --retry 3 --retry-delay 2 \
+          GITLEAKS_ARCHIVE="$RUNNER_TEMP/gitleaks.tar.gz"
+          if ! curl -sSfL --retry 3 --retry-delay 2 \
             --connect-timeout 10 --max-time 30 \
-            -o /tmp/gitleaks.tar.gz \
-            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_${ARCH}.tar.gz"
-          tar -xzf /tmp/gitleaks.tar.gz -C "$HOME/bin" gitleaks
+            -o "$GITLEAKS_ARCHIVE" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_${ARCH}.tar.gz"; then
+            timeout 60 gh release download "v${GITLEAKS_VERSION}" \
+              --repo gitleaks/gitleaks \
+              --pattern "gitleaks_${GITLEAKS_VERSION}_linux_${ARCH}.tar.gz" \
+              --output "$GITLEAKS_ARCHIVE" --clobber
+          fi
+          printf '%s  %s\n' "$GITLEAKS_SHA256" "$GITLEAKS_ARCHIVE" | sha256sum --check --strict
+          tar -xzf "$GITLEAKS_ARCHIVE" -C "$HOME/bin" gitleaks
           chmod +x "$HOME/bin/gitleaks"
 
       - name: Gitleaks
