@@ -360,6 +360,48 @@ Validation logs and the source diff remain in /tmp/attune-lock-review-eade_5to.
 These focused results do not resolve the earlier timing failures or replace
 final-head CI and affected-consumer validation.
 
+## Milestone 3: durable bounded artifact discovery
+
+Implemented in this worktree after `9c832ca9` (plus isolated test-guard correction
+`d78b720f`): a forward migration adds independent artifact discovery state and
+`artifact_version(created,id)`. Existing indexes were examined: `created DESC`
+lacks the deterministic ID tie-break, while `(artifact,version DESC)` supports
+version-frontier checks but not global oldest-first traversal.
+
+Discovery serializes progress-row updates, freezes a greatest `(created,id)` per
+pass, and visits at most `clamp(batch_size,1,256)` raw rows before retention or
+evidence predicates. All eligible rows in the raw page are returned, including
+when fewer than the requested limit survive filtering. Progress includes empty
+filtered pages; completion wraps on the next call. Reporting count/find and their
+global oldest-first contracts are unchanged. Discovery results are released only
+after an acknowledged bounded commit, using detached-session ownership; a failed
+or cancelled scan cannot expose a candidate page. Progress is advisory, so rows
+skipped by cancellation after a commit, late commits, changed policy/pins or
+metadata are revisited on later passes. This adds no deletion authority.
+
+Expired-artifact cleanup now uses the existing object-retention job's durable
+cadence, independently of hourly runtime retention. Successful pending raw pages
+request a one-second continuation; errors retain existing completion-time retry
+backoff. One raw page is processed per attempt. Physical deletion remains in the
+owned task and retains its current `PhysicalCleanup` graph/parent fence, current
+policy/evidence checks, and freshly locked physical identity. No seal, logging,
+sensor, quota, cache protocol, production, branch, push or PR changes are included.
+
+Tests retain the positive shared-file/NULL-newer/extreme-limit and queue-policy
+predicates from `9c832ca9`. The former bounded/global-prefix comparison now checks
+the complete frozen pass against the same independent global oracle. New cases
+cover prefilter bounds, empty pages, 550 pinned rows, competing progress writers,
+cancellation, disconnect during state commit, wrap/unpin, late older commits,
+new arrivals beyond the high-water mark, changed evidence and physical identity,
+and supervisor pending-page scheduling without hourly retention or hot loops.
+The separate test-guard checkpoint corrects the SQL string inspected by the
+existing reporting-count failure fixture; it does not weaken its assertions.
+
+Validation results and resource cleanup are appended after final runs below.
+Prior milestone results remain historical evidence only; the two earlier PG16
+continuation-delay failures remain unclassified. Docker runner relay omission,
+58 base-manifest policy violations, PR31 and final-head CI remain disclosed gaps.
+
 ## Slice 1: cheaper bounded maintenance, with the same locking contract
 
 This is the strongest first implementation candidate: it reduces existing

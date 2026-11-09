@@ -93,7 +93,7 @@ times:
 | `partition` | 3600 seconds | Reconcile daily future leaves, then attempt the oldest DEFAULT day per parent. |
 | `retention` | 3600 seconds | Runtime retention and cache cleanup, plus normal housekeeping. |
 | `summary` | 300 seconds | Refresh bounded completed-hour summaries. |
-| `object_retention` | 3600 seconds after a clean pass | Graph/object cleanup, with independent bounded continuation and retry deadlines. |
+| `object_retention` | 3600 seconds after a clean pass | Graph/object and expired-artifact cleanup, with independent bounded continuation and retry deadlines. |
 
 The loop reloads persisted settings each cycle, with a polling delay of at most
 60 seconds between cycles. A summary tick does not rerun retention, cache expiry,
@@ -131,7 +131,7 @@ that budget, ending each transaction before another page. A completed pass waits
 one hour before rescanning; an incomplete pass persists a short continuation.
 These budgets do not cover filesystem deletion or the entire supervisor cycle.
 
-Hourly artifact housekeeping also uses bounded graph admission. Expired-artifact
+Artifact cleanup on the object-retention cadence uses bounded graph admission. Expired-artifact
 cleanup reports candidates selected for its page, not an exact backlog count;
 reporting cannot prevent that page from making progress. Deferred shared-log
 writers and pinned ready versions remain retryable without hiding independent
@@ -281,7 +281,8 @@ metadata only. They never attempt reclamation under a producer's source locks,
 even when a DELETE would match zero rows. Version-count limits are therefore
 eventually enforced by the bounded cleanup cycle, not synchronously by INSERT.
 
-1. Find bounded, evidence-eligible expired artifact versions.
+1. Visit a bounded raw `(created, id)` page, then select its expiration- and
+   evidence-eligible versions. Persist discovery progress before returning it.
 2. Start a separate transaction with exclusive graph admission before any
    source/target lock. Recheck the current retention policy and version frontier;
    the outside candidate is not deletion authority.
@@ -291,7 +292,8 @@ eventually enforced by the bounded cleanup cycle, not synchronously by INSERT.
 4. Refresh artifact metadata or delete empty artifact metadata rows when no versions/data remain.
 
 This is controlled by `maintenance.artifact_cleanup_enabled` and
-`maintenance.artifact_cleanup_batch_size`. Version-count overflow remains present
+`maintenance.artifact_cleanup_batch_size` (raw rows per page, capped at 256).
+Version-count overflow remains present
 while this cleanup job is disabled. The same cycle checks abandoned `pending`
 uploads and verifies non-log `ready` rows with `HEAD`. A missing or
 mismatched ready object moves to `deleting`; it does not fall back to a bucket
@@ -579,7 +581,7 @@ maintenance:
 | --- | ---: | --- |
 | `enabled` | `true` | Master switch for non-retention maintenance jobs. |
 | `artifact_cleanup_enabled` | `true` | Enables cleanup of expired time-policy artifact versions. |
-| `artifact_cleanup_batch_size` | `100` | Maximum expired artifact versions cleaned per cycle. |
+| `artifact_cleanup_batch_size` | `100` | Raw artifact versions examined per cleanup page (hard cap 256). |
 | `pack_release_retention_enabled` | `true` | Enables bounded cleanup of inactive pack releases. |
 | `pack_release_newest_inactive` | `2` | Newest inactive releases retained per pack after the rollback window. |
 | `pack_release_rollback_seconds` | `604800` | Minimum age before an inactive, unpinned release can be removed. |
@@ -802,3 +804,23 @@ Discovery transactions have local two-second statement deadlines. Cursor rows
 are progress only: the existing graph admission, pin, body identity and state
 checks still decide every claim/deletion. No new artifact index is introduced.
 This work is independent of graph-admission lock ordering and reclamation budgets.
+
+### Expired-artifact discovery windows
+
+`artifact_retention_discovery` stores an independent `(created, id)` cursor and
+frozen pass upper bound. The composite index supports oldest-first raw visits,
+including timestamp ties; this state does not reuse release-phase or object-body
+cursors. Each call visits at most the configured batch size, capped at 256,
+before retention/evidence predicates. It returns every eligible row from that
+raw page, with no smaller output limit. Exact reporting count/find APIs retain
+their global candidate set and oldest-first ordering.
+
+Even a zero-eligible page advances durable progress and requests the existing
+object-retention continuation cadence (one second after successful progress;
+unresolved job failures retain bounded retry backoff). A completed pass wraps on
+the next scheduled invocation. Pins, changed policies, rows committed behind the
+cursor, and formerly ineligible versions are revisited. Continuous arrivals do
+not extend the frozen upper bound. Cancellation or a failed/unknown commit
+returns no candidate page; subsequent passes safely rediscover skipped work.
+Discovery is never deletion authority. Current policy, evidence and physical
+identity remain checked under the existing graph/parent locks and physical fence.

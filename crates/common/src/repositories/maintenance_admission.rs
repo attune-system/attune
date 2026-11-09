@@ -289,6 +289,34 @@ pub(crate) async fn probe<T>(
     result
 }
 
+/// Bounded discovery progress transaction. Returns data only after acknowledged
+/// COMMIT; cancellation/drop disposes the detached session just like `probe`.
+pub(crate) async fn discovery<T>(
+    pool: &PgPool,
+    budget: &MaintenanceBudget,
+    work: impl for<'c> FnOnce(&'c mut PgConnection) -> BoxFuture<'c, Result<T>>,
+) -> Result<T> {
+    let end = Instant::now() + budget.page_timeout;
+    let cancel = CancellationToken::new();
+    let mut conn = limited(end, &cancel, async { Ok(pool.acquire().await?.detach()) }).await?;
+    let mut tx = limited(end, &cancel, async { Ok(conn.begin().await?) }).await?;
+    let result = limited(end, &cancel, async {
+        configure_entry(&mut tx, end, budget).await?;
+        work(&mut tx).await
+    })
+    .await;
+    match result {
+        Ok(value) => {
+            limited(end, &cancel, async { Ok(tx.commit().await?) }).await?;
+            Ok(value)
+        }
+        Err(error) => {
+            rollback(tx, budget.statement_timeout).await?;
+            Err(error)
+        }
+    }
+}
+
 /// Probe without graph admission, end that transaction, then recheck and mutate
 /// under a fresh READ COMMITTED snapshot. `work` must recheck candidate identity,
 /// eligibility and pins, and return its value plus the number of changed rows.

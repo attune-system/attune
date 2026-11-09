@@ -28,10 +28,19 @@ pub struct ExpiredArtifactVersion {
     pub provider_version: Option<String>,
 }
 
+/// One raw oldest-first discovery page. These candidates are advisory only.
+#[derive(Debug)]
+pub struct ArtifactDiscoveryPage {
+    pub versions: Vec<ExpiredArtifactVersion>,
+    pub scanned: usize,
+    pub pending: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactCleanupResult {
     /// Versions considered in this page, not an exact count of the backlog.
     pub candidates: i64,
+    pub scan_pending: bool,
     pub deleted_versions: i64,
     pub deleted_files: i64,
     pub deleted_artifacts: i64,
@@ -214,16 +223,50 @@ impl MaintenanceRepository {
         .map_err(Into::into)
     }
 
+    /// Scan at most `limit` raw rows (hard capped at 256), before retention or
+    /// evidence evaluation. No separate output cap can discard eligible rows.
+    /// Each pass freezes its greatest (created,id); a completed pass wraps on
+    /// the next invocation, revisiting pins, policy changes and late commits.
     pub async fn expired_artifact_candidates_bounded(
         pool: &PgPool,
         limit: i64,
         budget: &MaintenanceBudget,
-    ) -> Result<Vec<ExpiredArtifactVersion>> {
-        maintenance_admission::probe(pool, budget, Instant::now() + budget.page_timeout, &CancellationToken::new(), move |conn| Box::pin(async move {
-            let prefilter = expired_artifact_prefilter();
-            let versions = sqlx::query_as(&format!("{prefilter} SELECT av.id,av.artifact,av.version,av.file_path,av.body_state,av.object_key,av.provider_version FROM expired av WHERE file_evidence_version_eligible(av.id) ORDER BY av.created,av.id LIMIT $1"))
-                .bind(limit.max(1)).fetch_all(conn).await?;
-            Ok(versions)
+    ) -> Result<ArtifactDiscoveryPage> {
+        maintenance_admission::discovery(pool, budget, move |conn| Box::pin(async move {
+            type Cursor = (DateTime<Utc>, i64);
+            let (mut last_created, mut last_id, mut high_created, mut high_id):
+                (Option<DateTime<Utc>>, Option<i64>, Option<DateTime<Utc>>, Option<i64>) =
+                sqlx::query_as("SELECT last_created,last_id,high_created,high_id FROM artifact_retention_discovery WHERE singleton FOR UPDATE")
+                    .fetch_one(&mut *conn).await?;
+            if high_id.is_none() || (last_created,last_id) == (high_created,high_id) {
+                let high: Option<Cursor> = sqlx::query_as("SELECT created,id FROM artifact_version ORDER BY created DESC,id DESC LIMIT 1")
+                    .fetch_optional(&mut *conn).await?;
+                last_created = None;
+                last_id = None;
+                high_created = high.map(|v| v.0);
+                high_id = high.map(|v| v.1);
+            }
+            // The index-supported raw page is materialized before either expensive
+            // predicate, including when every row is unexpired or pinned.
+            let raw: Vec<Cursor> = sqlx::query_as("SELECT created,id FROM artifact_version
+                WHERE ($1::timestamptz IS NULL OR (created,id)>($1,$2))
+                  AND (created,id)<=($3,$4) ORDER BY created,id LIMIT $5")
+                .bind(last_created).bind(last_id).bind(high_created).bind(high_id)
+                .bind(limit.clamp(1,256)).fetch_all(&mut *conn).await?;
+            let ids: Vec<i64> = raw.iter().map(|v| v.1).collect();
+            let versions = sqlx::query_as(&format!("WITH raw AS MATERIALIZED (
+                    SELECT id,artifact,version,file_path,body_state,object_key,provider_version,created
+                    FROM artifact_version WHERE id=ANY($1)),
+                expired AS MATERIALIZED (SELECT av.* FROM raw av JOIN artifact a ON a.id=av.artifact WHERE {})
+                SELECT av.id,av.artifact,av.version,av.file_path,av.body_state,av.object_key,av.provider_version
+                FROM expired av WHERE file_evidence_version_eligible(av.id) ORDER BY av.created,av.id",
+                expired_artifact_version_predicate()))
+                .bind(&ids).fetch_all(&mut *conn).await?;
+            let next = raw.last().copied();
+            let (next_created,next_id) = next.map(|v| (Some(v.0),Some(v.1))).unwrap_or((high_created,high_id));
+            sqlx::query("UPDATE artifact_retention_discovery SET last_created=$1,last_id=$2,high_created=$3,high_id=$4 WHERE singleton")
+                .bind(next_created).bind(next_id).bind(high_created).bind(high_id).execute(conn).await?;
+            Ok(ArtifactDiscoveryPage { versions, scanned: raw.len(), pending: (next_created,next_id)!=(high_created,high_id) })
         })).await
     }
 

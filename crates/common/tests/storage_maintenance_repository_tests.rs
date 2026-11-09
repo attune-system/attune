@@ -1228,21 +1228,28 @@ async fn expiration_prefilter_matches_count_reference_and_claim_rechecks_policy(
             .unwrap(),
         expected.len() as i64
     );
-    let bounded = MaintenanceRepository::expired_artifact_candidates_bounded(
-        &pool,
-        7,
-        &MaintenanceBudget {
-            statement_timeout: std::time::Duration::from_secs(5),
-            page_timeout: std::time::Duration::from_secs(10),
-            ..MaintenanceBudget::default()
-        },
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        bounded.iter().map(|v| v.id).collect::<Vec<_>>(),
-        expected[..7]
-    );
+    // Discovery limits raw work, so a filtered page need not equal the global
+    // eligible prefix. A complete frozen pass still finds every eligible row.
+    let mut discovered = Vec::new();
+    loop {
+        let page = MaintenanceRepository::expired_artifact_candidates_bounded(
+            &pool,
+            7,
+            &MaintenanceBudget {
+                statement_timeout: std::time::Duration::from_secs(5),
+                page_timeout: std::time::Duration::from_secs(10),
+                ..MaintenanceBudget::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(page.scanned <= 7);
+        discovered.extend(page.versions.into_iter().map(|v| v.id));
+        if !page.pending {
+            break;
+        }
+    }
+    assert_eq!(discovered, expected);
     let candidate = &found[0];
     // Policy mutation between discovery and claim must invalidate the advisory
     // candidate, even though its physical identity has not changed.

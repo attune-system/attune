@@ -728,36 +728,6 @@ impl SupervisorService {
         };
         let mut complete = true;
 
-        if maintenance.artifact_cleanup_enabled {
-            match artifact_cleanup::cleanup_expired_artifacts_with_budget(
-                &self.inner.pool,
-                self.inner.artifact_transport.as_ref(),
-                maintenance,
-                &budget,
-            )
-            .await
-            {
-                Ok(result) => {
-                    if result.candidates > 0 || result.deleted_versions > 0 {
-                        info!(
-                            page_candidates = result.candidates,
-                            deleted_versions = result.deleted_versions,
-                            deleted_files = result.deleted_files,
-                            deleted_artifacts = result.deleted_artifacts,
-                            "Artifact cleanup completed"
-                        );
-                        if let Err(err) = self.audit_artifact_cleanup_completed(&result).await {
-                            warn!(error = %err, "Failed to audit artifact cleanup completion");
-                        }
-                    }
-                }
-                Err(_) => {
-                    complete = false;
-                    warn!("Artifact cleanup deferred or failed; retry required");
-                }
-            }
-        }
-
         if self
             .reconcile_artifact_object_metadata(maintenance, &budget)
             .await
@@ -826,6 +796,39 @@ impl SupervisorService {
         {
             return Ok(());
         }
+        // Own physical cleanup through cancellation, retaining its existing fence.
+        let service = self.clone();
+        let artifact_budget = budget.clone();
+        let artifact_result = tokio::spawn(async move {
+            let maintenance = &service.inner.config.maintenance;
+            if !maintenance.artifact_cleanup_enabled {
+                return Ok(None);
+            }
+            artifact_cleanup::cleanup_expired_artifacts_with_budget(
+                &service.inner.pool,
+                service.inner.artifact_transport.as_ref(),
+                maintenance,
+                &artifact_budget,
+            )
+            .await
+            .map(Some)
+        })
+        .await;
+        let (artifact_complete, artifact_pending) = match artifact_result {
+            Ok(Ok(Some(result))) => {
+                if result.deleted_versions > 0 {
+                    if let Err(err) = self.audit_artifact_cleanup_completed(&result).await {
+                        warn!(error = %err, "Failed to audit artifact cleanup completion");
+                    }
+                }
+                (true, result.scan_pending)
+            }
+            Ok(Ok(None)) => (true, false),
+            _ => {
+                warn!("Artifact cleanup deferred or failed; retry required");
+                (false, false)
+            }
+        };
         let mut interval_seconds = retention.check_interval_seconds;
         let complete = match object_retention::run_cycle_with_budget(
             &self.inner.pool,
@@ -900,12 +903,15 @@ impl SupervisorService {
                 false
             }
         };
+        if artifact_pending && artifact_complete && complete {
+            interval_seconds = interval_seconds.min(1);
+        }
         ScheduleRepository::finish_attempt(
             &self.inner.pool,
             MaintenanceJob::ObjectRetention,
             now,
             interval_seconds,
-            complete,
+            complete && artifact_complete,
         )
         .await?;
         Ok(())
@@ -2478,6 +2484,80 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn artifact_empty_raw_pages_continue_without_hourly_retention_or_hot_loop() {
+        let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
+        let mut config = Config::load_from_file(&config_path).unwrap();
+        let database = TestDatabase::create(&config.database).await.unwrap();
+        let artifacts = tempfile::tempdir().unwrap();
+        let objects = tempfile::tempdir().unwrap();
+        config.artifacts_dir = artifacts.path().to_string_lossy().into_owned();
+        config.maintenance.enabled = true;
+        config.maintenance.artifact_cleanup_enabled = true;
+        config.maintenance.artifact_cleanup_batch_size = 2;
+        config.maintenance.pack_release_retention_enabled = false;
+        config.maintenance.monitoring_enabled = false;
+        config.maintenance.corrective_actions_enabled = false;
+        let mut retention = RetentionConfig {
+            enabled: false,
+            check_interval_seconds: 3600,
+            ..Default::default()
+        };
+        retention.cache_retention.enabled = false;
+        retention.native_maintenance.enabled = false;
+        RetentionRepository::update_config(database.pool(), &retention)
+            .await
+            .unwrap();
+        let id =
+            ArtifactRepository::create(database.pool(), housekeeping_artifact_input("raw_prefix"))
+                .await
+                .unwrap()
+                .id;
+        sqlx::query("INSERT INTO artifact_version(artifact,version,created) SELECT $1,n,NOW()-interval '2 days' FROM generate_series(1,7) n")
+            .bind(id).execute(database.pool()).await.unwrap();
+        let now = Utc::now();
+        sqlx::query("UPDATE native_maintenance_schedule SET next_due=$1,last_success=$2 WHERE job='retention'")
+            .bind(now+ChronoDuration::hours(1)).bind(now).execute(database.pool()).await.unwrap();
+        let service = housekeeping_test_service(config, database.pool().clone(), objects.path());
+        let mut clock = now;
+        for expected in [2, 4, 6] {
+            let delay = service
+                .run_retention_cycle_at(SupervisorCycleReason::Scheduled, clock)
+                .await
+                .unwrap();
+            assert!(
+                delay >= Duration::from_secs(1) && delay < Duration::from_secs(60),
+                "pending raw discovery delay: {delay:?}"
+            );
+            let (last,pending): (i64,bool) = sqlx::query_as("SELECT last_id,(last_created,last_id)<(high_created,high_id) FROM artifact_retention_discovery")
+                .fetch_one(database.pool()).await.unwrap();
+            let count: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM artifact_version WHERE id<=$1")
+                    .bind(last)
+                    .fetch_one(database.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(count, expected);
+            assert!(pending);
+            let statuses = ScheduleRepository::status(database.pool()).await.unwrap();
+            assert_eq!(
+                statuses
+                    .iter()
+                    .find(|s| s.job == MaintenanceJob::Retention)
+                    .unwrap()
+                    .last_success,
+                Some(now)
+            );
+            clock = statuses
+                .iter()
+                .find(|s| s.job == MaintenanceJob::ObjectRetention)
+                .unwrap()
+                .next_due;
+        }
+        drop(service);
+        database.cleanup().await.unwrap();
+    }
+
     async fn missing_housekeeping_version(pool: &PgPool, suffix: &str) -> Result<(i64, i64)> {
         let artifact =
             ArtifactRepository::create(pool, housekeeping_artifact_input(suffix)).await?;
@@ -2974,7 +3054,11 @@ mod tests {
         let runner = service.clone();
         let caller = tokio::spawn(async move {
             runner
-                .run_maintenance_cycle(&RetentionConfig::default())
+                .run_object_retention_job(
+                    &RetentionConfig::default(),
+                    SupervisorCycleReason::StartupRecovery,
+                    Utc::now(),
+                )
                 .await
         });
         tokio::time::timeout(Duration::from_secs(5), entered.notified())

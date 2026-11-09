@@ -36,7 +36,7 @@ pub async fn cleanup_expired_artifacts_with_budget(
     maintenance: &SupervisorMaintenanceConfig,
     budget: &MaintenanceBudget,
 ) -> Result<ArtifactCleanupResult> {
-    let versions = MaintenanceRepository::expired_artifact_candidates_bounded(
+    let page = MaintenanceRepository::expired_artifact_candidates_bounded(
         pool,
         maintenance.artifact_cleanup_batch_size,
         budget,
@@ -44,13 +44,14 @@ pub async fn cleanup_expired_artifacts_with_budget(
     .await?;
 
     let mut result = ArtifactCleanupResult {
-        candidates: versions.len() as i64,
+        candidates: page.versions.len() as i64,
+        scan_pending: page.pending,
         deleted_versions: 0,
         deleted_files: 0,
         deleted_artifacts: 0,
     };
 
-    for version in versions {
+    for version in page.versions {
         let id = version.id;
         let mut cleanup = PhysicalCleanup::begin(pool, budget).await?;
         let current = cleanup
