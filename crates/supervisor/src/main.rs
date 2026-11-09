@@ -2426,7 +2426,17 @@ mod tests {
                     .is_some()
             );
         }
-        let retry_now = status.next_due;
+        // Expired artifacts now own the independent object-job retry clock.
+        // Advance to both persisted deadlines rather than assuming housekeeping
+        // completion and object-job completion occur at the same instant.
+        let object_due = ScheduleRepository::status(database.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.job == MaintenanceJob::ObjectRetention)
+            .unwrap()
+            .next_due;
+        let retry_now = status.next_due.max(object_due);
         service
             .run_retention_cycle_at(SupervisorCycleReason::Scheduled, retry_now)
             .await
@@ -2545,8 +2555,9 @@ mod tests {
                     .iter()
                     .find(|s| s.job == MaintenanceJob::Retention)
                     .unwrap()
-                    .last_success,
-                Some(now)
+                    .last_success
+                    .map(|v| v.timestamp_micros()),
+                Some(now.timestamp_micros())
             );
             clock = statuses
                 .iter()
