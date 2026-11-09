@@ -570,8 +570,77 @@ then inserts backdated pairs before a future-created high row on every call. The
 original pass must finish, and the next pass must revisit A/B. The late-commit
 fixture now allocates its uncommitted ID before the visible rows so it really
 falls behind the ID cursor. The scheduler fixture is extended through its final
-page, normal cadence, and the next pass. Validation is pending; no new passing
-results are claimed here. Earlier timing failures remain unclassified.
+page, normal cadence, and the next pass. Earlier timing failures remain
+unclassified; the results below do not erase them.
+
+Astra re-reviewed `7be4dd397dba217e15f08286f38fc2024f508319` against `ea422e3f`
+and confirmed the P2 is fixed, with no new must-fix runtime defect in that delta.
+Its review was read-only; signed-ID extremes and deleted-frontier cases were
+supported by source reasoning, not newly executed boundary tests. This is a
+focused review conclusion rather than approval to merge the full transformation.
+
+### ID-frontier correction validation
+
+The complete pipeline tested clean source `7be4dd397dba217e15f08286f38fc2024f508319`.
+This later validation record changes prose only. Exact commands, exit statuses,
+timings, executable paths and owned-server removal evidence are retained in
+`/tmp/attune-frontier-validation-state.json`; logs are under
+`/tmp/attune-frontier-validation-cmqgg7rj`. The driver remains at
+`/tmp/attune-frontier-validation.py`. It builds before testing and executes every
+suite sequentially, with four libtest threads, so no test suite overlaps compilation.
+
+```bash
+cargo test -p attune-common --test maintenance_repository_tests \
+  --test storage_maintenance_repository_tests --no-run --message-format=json
+cargo test -p attune-supervisor --bin attune-supervisor --no-run --message-format=json
+# Explicit owned PG16/18 URLs; temporary psql shims target their exact containers.
+make db-test-setup TEST_DB_ADMIN_URL=<owned-admin-url> TEST_DB_URL=<owned-test-url>
+DATABASE_URL=<owned-pg18-url> SQLX_OFFLINE=false cargo sqlx prepare --workspace -- --all-targets
+cargo clippy -p attune-common -p attune-supervisor --all-targets -- -D warnings
+cargo fmt --all -- --check
+git diff --check
+```
+
+Both owned servers applied the canonical migrations successfully. The populated
+old-state fixture independently replayed the actual 001/002 SQL against timestamp-
+valid progress whose IDs were reversed, verified both versions survived, and
+restarted discovery. Schema prepare passed (149.69s); SQLx reported no macro
+queries found and changed no offline metadata. Common/supervisor all-targets
+Clippy passed with warnings denied (79.01s); formatting and whitespace passed.
+
+Using the same compiled executables on each server, with run identities
+`frontier16` and `frontier18`, the direct runs were:
+
+- maintenance executable, cwd crates/common, filter `bounded_metadata::`: PG16
+  **13/13** (79.99s including template setup), PG18 **13/13** (44.69s).
+- supervisor executable, cwd crates/supervisor, filters `artifact_empty_raw_pages`,
+  `housekeeping_defers`, `physical_cleanup_keeps`: PG16 **3/3** (3.49s),
+  PG18 **3/3** (4.23s).
+- storage executable, cwd crates/common, filters `bounded_admission::`,
+  `expiration_prefilter_matches`: PG16 **17/17** (13.53s), PG18 **17/17** (20.30s).
+
+All used `--nocapture --test-threads=4`, with zero failures or ignored selected
+tests. Executable SHA-256 values:
+
+- maintenance: `b677284cbe491446240189045667c375b4f8a14b36b95fbfd5fe7deaba1f37d9`
+- supervisor: `fb7a4473e0e3bfb5478015e77776eaf26c24a73a56673989ad662a1a6839f6c0`
+- storage: `a4687ffa55fca35afb705e84dab958220da67ed4ff96b246fd45cde97d5a8dcb`
+
+A PG18 temporary 10,000-row ID/created fixture, including a future-created row,
+used `plan_cache_mode=force_generic_plan`. The continuation query selected two
+rows past ID 9000 using its primary-key range with two heap fetches and three
+local buffer hits. This verifies the chosen query shape on that owned fixture,
+not a production latency target or a universal plan-tree guarantee.
+
+After all commands exited, each server reported zero per-test clones. Their
+run-owned templates were removed with the exact owned containers and anonymous
+volumes; both temporary psql shims were removed. No owned server remains.
+
+Status: scoped correction validation and focused Astra re-review passed. Final-head
+CI, broader affected-consumer execution, real successful-COMMIT/lost-ack coverage,
+and eligibility-error scheduling alongside other object work remain gaps. Prior
+timing/cleanup failures remain unclassified. The existing Docker fixture-packaging
+and base-manifest dependency-policy failures are not relabeled as passes.
 
 ## Slice 1: cheaper bounded maintenance, with the same locking contract
 
