@@ -397,6 +397,10 @@ and supervisor pending-page scheduling without hourly retention or hot loops.
 The separate test-guard checkpoint corrects the SQL string inspected by the
 existing reporting-count failure fixture; it does not weaken its assertions.
 
+The lower cursor is an indexable tuple comparison even for PostgreSQL generic
+prepared plans; an optional `OR cursor IS NULL` would filter old prefixes after
+a generic plan switches away from parameter-specific planning.
+
 Validation results and resource cleanup are appended after final runs below.
 Prior milestone results remain historical evidence only; the two earlier PG16
 continuation-delay failures remain unclassified. Docker runner relay omission,

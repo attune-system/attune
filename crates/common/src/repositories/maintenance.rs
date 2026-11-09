@@ -249,7 +249,7 @@ impl MaintenanceRepository {
             // The index-supported raw page is materialized before either expensive
             // predicate, including when every row is unexpired or pinned.
             let raw: Vec<Cursor> = sqlx::query_as("SELECT created,id FROM artifact_version
-                WHERE ($1::timestamptz IS NULL OR (created,id)>($1,$2))
+                WHERE (created,id)>(COALESCE($1::timestamptz,'-infinity'::timestamptz),COALESCE($2::bigint,'-9223372036854775808'::bigint))
                   AND (created,id)<=($3,$4) ORDER BY created,id LIMIT $5")
                 .bind(last_created).bind(last_id).bind(high_created).bind(high_id)
                 .bind(limit.clamp(1,256)).fetch_all(&mut *conn).await?;
