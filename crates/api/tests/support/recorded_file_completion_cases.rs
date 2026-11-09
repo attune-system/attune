@@ -762,6 +762,77 @@ async fn terminal_log_delivery_keeps_caps_retries_and_sealing_operation_specific
                 .map_err(|error| anyhow::anyhow!("commit {kind}: {error:?}"))?;
         }
     }
+    // Process credentials are not declared consumers of this HTTP route. Keep
+    // that real authorization denial distinct from target contention.
+    let seal_path = format!("/api/v1/internal/logs/{}/seal", version.id);
+    assert_eq!(
+        fixture
+            .ctx
+            .post(&seal_path, json!({}), Some(&fixture.token))
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    // Exercise the process Source target mapper directly, then the actual route
+    // with its permitted recorded worker-delivery credential. Both must retain
+    // retryable503 when the artifact row is contended.
+    let mut blocker = fixture.ctx.pool.begin().await?;
+    sqlx::query("SELECT id FROM artifact WHERE id=$1 FOR UPDATE")
+        .bind(version.artifact)
+        .execute(&mut *blocker)
+        .await?;
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await?;
+    let process_user = attune_api::auth::middleware::AuthenticatedUser {
+        claims: attune_common::auth::jwt::validate_token(
+            &fixture.token,
+            &fixture.ctx.state.jwt_config,
+        )?,
+    };
+    let mut tx = fixture.ctx.pool.begin().await?;
+    LogStreamRepository::configure_close_phase(&mut tx).await?;
+    let mut source = attune_api::routes::internal_files::log_source::acquire(
+        &fixture.ctx.state,
+        tx,
+        &process_user,
+        &version,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("process source: {e:?}"))?;
+    let process_result = source.authorize_target(&process_user, &version).await;
+    source
+        .rollback()
+        .await
+        .map_err(|e| anyhow::anyhow!("process rollback: {e:?}"))?;
+    assert_eq!(
+        process_result.unwrap_err().0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let request = tokio::time::timeout(
+        std::time::Duration::from_secs(25),
+        fixture.ctx.post(&seal_path, json!({}), Some(&token)),
+    );
+    let observe = async {
+        tokio::time::timeout(std::time::Duration::from_secs(15),async {
+            loop {
+                let blocked:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))").bind(blocker_pid).fetch_one(&fixture.ctx.pool).await?;
+                if blocked {break anyhow::Ok(());}
+                tokio::task::yield_now().await;
+            }
+        }).await?
+    };
+    let (response, observed) = tokio::join!(request, observe);
+    blocker.rollback().await?;
+    observed?;
+    assert_eq!(response??.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        ArtifactVersionRepository::find_by_id(&fixture.ctx.pool, version.id)
+            .await?
+            .unwrap()
+            .body_state,
+        Some(ArtifactBodyState::Pending)
+    );
     let mut replacement = context.clone();
     replacement.worker_instance = Uuid::new_v4();
     let replaced_token =

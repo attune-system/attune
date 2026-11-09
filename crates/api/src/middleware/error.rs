@@ -250,7 +250,8 @@ impl From<sqlx::Error> for ApiError {
                 //   55P03 = lock_not_available  → 503 Service Unavailable
                 //   P0001 = raise_exception     → 400 Bad Request (trigger-raised errors)
                 let pg_code = db_err.code().map(|c| c.to_string()).unwrap_or_default();
-                if matches!(pg_code.as_str(), "40001" | "55P03") {
+                if pg_code.starts_with("08")
+                    || matches!(pg_code.as_str(), "40001" | "40P01" | "55P03" | "57014" | "57P01" | "57P02" | "57P03" | "53300") {
                     ApiError::RetryableDatabaseError
                 } else if pg_code == "23505" {
                     // Unique constraint violation — duplicate key
@@ -287,6 +288,7 @@ impl From<sqlx::Error> for ApiError {
                     ApiError::DatabaseError("The database operation failed. Check API database availability and install status before retrying.".into())
                 }
             }
+            sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed => ApiError::RetryableDatabaseError,
             _ => ApiError::DatabaseError("The database operation failed. Check API database availability and install status before retrying.".into()),
         }
     }
@@ -545,7 +547,9 @@ mod tests {
 
     #[test]
     fn retryable_postgres_codes_map_without_database_details() {
-        for code in ["55P03", "40001"] {
+        for code in [
+            "55P03", "40001", "40P01", "57014", "08006", "57P01", "57P02", "57P03", "53300",
+        ] {
             let error = ApiError::from(sqlx::Error::Database(Box::new(TestDatabaseError { code })));
 
             assert!(matches!(error, ApiError::RetryableDatabaseError));

@@ -1427,3 +1427,78 @@ are required before merge readiness.
 Final follow-up code source: base `b15f537fbe57fed8cbcca52a01533fd1d4482cfb` plus `final-source.diff` in the evidence directory, SHA256 `14ff15130bd475d8027d684157673d1ddd556e3501dbdb9266477a0fed46c757`. This captures Source borrow-only lint fixes, synthetic consumer fixtures and forward operational-status guards 010/011. Documentation-only changes after checks preserve code evidence.
 
 Final schema validation: `DATABASE_URL=<owned PG18> SQLX_OFFLINE=false cargo sqlx prepare --workspace -- --all-targets` and the corresponding `--check` command both passed, with no `.sqlx` changes and no workspace all-target warnings. Final `cargo fmt --all -- --check` and `git diff --check` passed. All runtime/build checks were sequential with timing-sensitive tests. The two exact owned PostgreSQL containers and their anonymous volumes were removed; both invocation-owned psql shims were deleted. `cleanup.json` in the evidence directory records their exact identities. Zero per-test clones existed before removal. No production infrastructure was used.
+
+
+## Integrated lifecycle Astra corrections (work in progress)
+
+Astra reviewed pinned `43e22481..1f2e12ee` read-only and found four actionable
+issues: P1 NULL-state plaintext digest replacement, P2 stream/evidence INSERT
+bypasses, P2 standalone published membership removal, and P2 transient target
+contention being mapped to terminal authorization failure. The review did not
+execute DB tests and did not give merge approval. The decisive pool-one split
+remains present; those findings concern its safety and failure contracts.
+
+Forward migration `20261109000012_object_log_publication_hardening.sql` makes
+selected lifecycle/body predicates NULL-safe, requires the result-change exception
+to be explicitly true, initializes object streams only open on pending versions,
+and validates unselected final state/evidence at deferred checks. Standalone
+published segment/final-evidence removal is rejected while its version survives;
+whole-version teardown cascades remain permitted. No earlier migration is edited.
+
+API file-path error mapping retains ApiError status rather than forcing403.
+Typed transient SQL errors (including statement/lock timeout, deadlock, connection
+loss and server unavailability) become503 through source acquisition, target
+checks and freshness; genuine Forbidden remains403. Commit uncertainty handling
+and postcommit freshness rejection are not combined into one error class.
+
+New tests exercise nonempty publication, NULL and two-update replacement attempts,
+reverse Ready/stream creation, presealed INSERT, evidence-before-selection,
+required evidence deletion and legitimate version cascades. The HTTP seal route deliberately denies process credentials before the handler;
+that policy must remain403. The revised fixture separately blocks the process
+Source target helper, then the real route with its permitted worker-delivery
+credential. Both database contention paths must remain503 without publishing.
+The object route's initial discovery now performs only reads/scope/path checks;
+source/target authorization occurs inside the existing bounded phase. Shared-file
+authorization remains on its existing path.
+
+Checkpoint evidence: PG16 close lifecycle **12/12** and selected API/error cases
+**31/31**, four workers, zero ignored (31 and473 other cases filtered). This
+includes the nonempty NULL/deletion, INSERT and evidence-cascade regressions.
+PG18, revised blocked-target test, schema/lint and final cleanup remain pending.
+All earlier unclassified failures and acceptance gaps remain open.
+
+
+Correction validation provenance: base `1f2e12ee` plus saved patches/hashes in
+`/tmp/attune-hardening-validation-eeraujr0`,
+`/tmp/attune-hardening-recheck-5746kv94`, and current run
+`/tmp/attune-hardening-final-h2yet2de`. Commands/results are respectively in
+`/tmp/attune-hardening-validation-state.json`,
+`/tmp/attune-hardening-recheck-state.json`, and
+`/tmp/attune-hardening-final-state.json`.
+
+Intermediate failures remain recorded: initial test compilation used an unsupported
+LowerHex implementation and was corrected with byte-wise encoding. First PG16
+close run passed11/12; the reverse-order fixture constructed an invalid generic
+Ready row without provider metadata, before reaching the new initializer. Its
+fixture now supplies existing required provider metadata; no guard or assertion
+was removed. Next close run passed12/12 and API/error31/31. Its recorded-route test
+failed because a process credential is intentionally not a declared consumer of
+that HTTP endpoint; observation of a target wait timed out after the route's403.
+The revised test preserves that403 policy, exercises the process Source directly,
+and uses the real worker-delivery token for the blocked HTTP route. This test
+correction is currently compiling, not yet reported as passing.
+
+The parent-version initialization check uses a per-version FOR SHARE to serialize
+with concurrent generic Ready updates, confined to short stream initialization,
+never provider I/O. Its final SQL predates all regression test processes. Selected
+TestDatabase::create fixtures load migrations from disk; no migration-history
+macro fixture is selected. API binaries were reused only while API Rust and their
+fixtures remained unchanged; the revised recorded fixture is being rebuilt.
+Final schema/lint checks compile the final source. No API runtime result is reused
+for the revised fixture. Earlier generic lost-ACK and authority/finalizer wait gaps
+remain unverified; these corrections do not supply that missing evidence.
+
+The two failed runs' owned containers/volumes/shims were removed. The current
+run's two disposable servers remain owned and active, with unconditional driver
+cleanup; do not report them removed until the driver records it. No production,
+unowned checkout, deployed service or external data was changed.

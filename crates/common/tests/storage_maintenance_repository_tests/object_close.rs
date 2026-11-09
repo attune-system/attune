@@ -632,3 +632,174 @@ async fn selected_empty_verified_publication_is_atomic_and_immutable() {
     )
     .await;
 }
+
+// Includes deferred constraints; a successful statement is not a successful effect.
+async fn rejected_at_commit(pool: &sqlx::PgPool, sql: &str) {
+    let mut tx = pool.begin().await.unwrap();
+    Evidence::lock_reclamation(&mut tx).await.unwrap();
+    match sqlx::raw_sql(sql).execute(&mut *tx).await {
+        Ok(_) => assert!(
+            tx.commit().await.is_err(),
+            "unexpected committed effect: {sql}"
+        ),
+        Err(_) => tx.rollback().await.unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn published_nonempty_membership_and_digest_survive_standalone_mutations() {
+    let (pool, _, version, stream) = fixture().await;
+    // Shape-only setup: the route suite owns external byte/source verification.
+    let mut tx = pool.begin().await.unwrap();
+    Evidence::lock_capture(&mut tx).await.unwrap();
+    sqlx::query("INSERT INTO object_maintenance_ledger(object_key,provider_version,object_kind,size_bytes,state) VALUES('retained-key','v:1','log',1,'ready')")
+        .execute(&mut *tx).await.unwrap();
+    let locked = LogStreamRepository::lock(&mut tx, stream).await.unwrap();
+    let segment = LogStreamRepository::commit_segment(
+        &mut tx,
+        &locked,
+        0,
+        1,
+        &"a".repeat(64),
+        "retained-key",
+        "v:1",
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let selected = select(&pool, stream, 0).await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    Evidence::lock_capture(&mut tx).await.unwrap();
+    LogStreamRepository::lock(&mut tx, stream).await.unwrap();
+    LogStreamRepository::publish_close(&mut tx, stream, &selected)
+        .await
+        .unwrap();
+    ArtifactVersionRepository::mark_body_ready_in_transaction(
+        &mut tx,
+        version,
+        "segments:1",
+        1,
+        &"a".repeat(64),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tx.commit().await.unwrap();
+    rejected_at_commit(
+        &pool,
+        &format!("UPDATE artifact_version SET body_state=NULL WHERE id={version}"),
+    )
+    .await;
+    rejected_at_commit(&pool,&format!("UPDATE artifact_version SET body_state=NULL WHERE id={version}; UPDATE artifact_version SET body_state='ready',sha256=repeat('b',64) WHERE id={version}")).await;
+    rejected_at_commit(
+        &pool,
+        &format!("DELETE FROM log_segment WHERE id={}", segment.id),
+    )
+    .await;
+    let identity: (String,String,i64) = sqlx::query_as("SELECT body_state::text,sha256,(SELECT count(*) FROM log_segment WHERE stream=$2) FROM artifact_version WHERE id=$1")
+        .bind(version).bind(stream).fetch_one(&*pool).await.unwrap();
+    assert_eq!(identity, ("ready".into(), "a".repeat(64), 1));
+    // Legitimate whole-version teardown is still allowed, including the segment cascade.
+    let mut tx = pool.begin().await.unwrap();
+    Evidence::lock_reclamation(&mut tx).await.unwrap();
+    ArtifactVersionRepository::delete(&mut *tx, version)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(
+        !sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM log_segment WHERE id=$1)")
+            .bind(segment.id)
+            .fetch_one(&*pool)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn object_stream_insert_and_unselected_evidence_require_open_pending_shape() {
+    let (pool, _, version, stream) = fixture().await;
+    rejected_at_commit(&pool,&format!("INSERT INTO runtime_log_final_manifest(artifact_version,stream,execution,admission,attempt,worker,worker_instance,encoding,frame_count,plain_bytes,cipher_bytes,cipher_sha256,truncated,authenticated_manifest) VALUES({version},{stream},1,1,gen_random_uuid(),1,gen_random_uuid(),'attune_encrypted_log_v1',0,0,0,repeat('a',64),false,'unselected')")).await;
+    sqlx::query("DELETE FROM log_stream WHERE id=$1")
+        .bind(stream)
+        .execute(&*pool)
+        .await
+        .unwrap();
+    rejected_at_commit(&pool,&format!("INSERT INTO log_stream(artifact_version,backend,max_unflushed_bytes,max_unflushed_milliseconds,sealed,sealed_at) VALUES({version},'object_segments',1024,500,true,NOW())")).await;
+    // Reverse creation order: a generic Ready version is legal until it is bound
+    // to a log, but cannot become an unselected already-published object stream.
+    sqlx::query("UPDATE artifact_version SET body_state='ready',size_bytes=0,sha256=repeat('a',64),provider_version='v:fixture' WHERE id=$1").bind(version).execute(&*pool).await.unwrap();
+    rejected_at_commit(&pool,&format!("INSERT INTO log_stream(artifact_version,backend,max_unflushed_bytes,max_unflushed_milliseconds) VALUES({version},'object_segments',1024,500)")).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM log_stream WHERE artifact_version=$1")
+            .bind(version)
+            .fetch_one(&*pool)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn published_required_final_evidence_cannot_be_removed_standalone() {
+    let (pool, _, version, stream) = fixture().await;
+    // Synthetic SQL consistency fixture, deliberately independent of incidental
+    // runtime file-evidence pins. It asserts shape, not authority or crypto.
+    let attempt = uuid::Uuid::new_v4();
+    let instance = uuid::Uuid::new_v4();
+    let authenticated = "shape-only";
+    let digest = "a".repeat(64);
+    let producer = json!({"kind":"delivery","execution":1,"admission":1,"attempt":attempt,"worker":1,"instance":instance});
+    let proof = json!({"kind":"encrypted","authenticated_sha256":<sha2::Sha256 as sha2::Digest>::digest(authenticated.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect::<String>(),"manifest":{"encoding":"attune_encrypted_log_v1","frame_count":0,"plaintext_bytes":0,"ciphertext_sha256":digest}});
+    let mut tx = pool.begin().await.unwrap();
+    Evidence::lock_capture(&mut tx).await.unwrap();
+    LogStreamRepository::lock(&mut tx, stream).await.unwrap();
+    let selected = LogStreamRepository::select_close(
+        &mut tx,
+        stream,
+        0,
+        &producer,
+        &proof,
+        false,
+        Utc::now() + Duration::minutes(5),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE artifact_version SET meta=jsonb_build_object('encrypted_log_manifest',$2::text) WHERE id=$1").bind(version).bind(authenticated).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO runtime_log_final_manifest(artifact_version,stream,execution,admission,attempt,worker,worker_instance,encoding,frame_count,plain_bytes,cipher_bytes,cipher_sha256,truncated,authenticated_manifest) VALUES($1,$2,1,1,$3,1,$4,'attune_encrypted_log_v1',0,0,0,$5,false,$6)")
+        .bind(version).bind(stream).bind(attempt).bind(instance).bind(&digest).bind(authenticated).execute(&mut *tx).await.unwrap();
+    LogStreamRepository::publish_close(&mut tx, stream, &selected)
+        .await
+        .unwrap();
+    ArtifactVersionRepository::mark_body_ready_in_transaction(
+        &mut tx,
+        version,
+        "segments:0",
+        0,
+        &digest,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tx.commit().await.unwrap();
+    rejected_at_commit(
+        &pool,
+        &format!("DELETE FROM runtime_log_final_manifest WHERE stream={stream}"),
+    )
+    .await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM runtime_log_final_manifest WHERE stream=$1"
+        )
+        .bind(stream)
+        .fetch_one(&*pool)
+        .await
+        .unwrap(),
+        1
+    );
+    let mut tx = pool.begin().await.unwrap();
+    Evidence::lock_reclamation(&mut tx).await.unwrap();
+    ArtifactVersionRepository::delete(&mut *tx, version)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}

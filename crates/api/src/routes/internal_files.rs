@@ -2103,14 +2103,33 @@ async fn seal_log_stream(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     tracing::Span::current().record("artifact_version", artifact_version);
-    let version = authorize_seal_log_version(&state, &user, artifact_version).await?;
+    // Discovery is read-only. Object source/target authorization belongs inside
+    // its bounded phase, rather than an earlier transaction with no SQL limits.
+    let version = ArtifactVersionRepository::find_by_id(&state.db, artifact_version)
+        .await
+        .map_err(map_repository_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact version not found".into()))?;
     let stream = LogStreamRepository::find_by_artifact_version(&state.db, artifact_version)
         .await
         .map_err(map_repository_error)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Log stream not found".to_string()))?;
     if stream.backend == LogStreamBackend::ObjectSegments {
+        file_authorization_scope(&user, FileOperation::Mutate)?;
+        let path = version.file_path.as_deref().ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "Log artifact version has no authorization path".into(),
+            )
+        })?;
+        if validate_file_path_binding(&state, path)
+            .await?
+            .is_some_and(|bound| bound.id != version.id)
+        {
+            return Err((StatusCode::FORBIDDEN, "Log path binding changed".into()));
+        }
         return object_close::seal(state, user, version, stream.id, headers, query.truncated).await;
     }
+    let version = authorize_seal_log_version(&state, &user, artifact_version).await?;
     // Shared append uses source -> artifact advisory -> version -> stream ->
     // flock. Sealing must acquire the same locks before taking its file snapshot.
     let trace = SharedGraphTransactionTrace::new("api.log_stream_seal");
@@ -4645,6 +4664,7 @@ async fn authorize_file_transfer(
 fn map_transport_error(error: attune_common::error::Error) -> (StatusCode, String) {
     use attune_common::error::Error;
     match error {
+        Error::Database(error) => map_sqlx_error(error),
         Error::Validation(message) => (StatusCode::BAD_REQUEST, message),
         Error::PermissionDenied(message) => (StatusCode::FORBIDDEN, message),
         Error::Io(message) if message.contains("No such file or directory") => {
@@ -4655,7 +4675,7 @@ fn map_transport_error(error: attune_common::error::Error) -> (StatusCode, Strin
 }
 
 fn map_api_error(error: crate::middleware::ApiError) -> (StatusCode, String) {
-    (StatusCode::FORBIDDEN, error.to_string())
+    (error.status_code(), error.to_string())
 }
 
 #[doc(hidden)]
@@ -4866,6 +4886,9 @@ fn delivery_append_end(
 }
 
 fn map_repository_error(error: attune_common::error::Error) -> (StatusCode, String) {
+    if let attune_common::error::Error::Database(error) = error {
+        return map_sqlx_error(error);
+    }
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         format!("Failed to authorize artifact path: {error}"),
@@ -4873,7 +4896,7 @@ fn map_repository_error(error: attune_common::error::Error) -> (StatusCode, Stri
 }
 
 fn map_sqlx_error(error: sqlx::Error) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+    map_api_error(crate::middleware::ApiError::from(error))
 }
 
 #[cfg(test)]

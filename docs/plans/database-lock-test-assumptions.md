@@ -305,3 +305,17 @@ Unknown-close-COMMIT fault injection and the full producer/final-wait matrix are
 still unrun. Preserve the PG16 full-storage 250 ms DeadlineDeferred failure as
 unclassified. Correcting the storage executable's cwd fixes setup only; it is not
 baseline evidence. No existing timeout, ignored status or assertion was relaxed.
+
+
+### Integrated publication regression assumptions
+
+Selected versions cannot have a NULL body state, including between statements;
+only an explicitly true pending-to-ready publication permits result changes.
+Object stream INSERT starts open/pending regardless of version creation order.
+Unselected final evidence cannot commit. Published nonempty segment membership
+and final evidence cannot be removed independently of their version; complete
+version teardown still cascades. Deferred checks must be exercised at COMMIT,
+not inferred from successful statements. Target contention/DB unavailability must
+remain retryable503 through actual source-owner routes, while permission denial
+stays403. Synthetic SQL fixtures verify consistency shape only; they do not prove
+runtime authority or provider bytes.
