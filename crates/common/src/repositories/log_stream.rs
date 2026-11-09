@@ -54,8 +54,8 @@ impl LogStreamRepository {
         super::maintenance_admission::run(pool, budget, deadline, cancel,
             move |conn| Box::pin(async move {
                 Ok(sqlx::query_as::<_, (i64,i64,chrono::DateTime<chrono::Utc>)>(
-                    "SELECT id,close_revision,close_deadline FROM log_stream WHERE close_phase='closing' AND close_deadline<=clock_timestamp() ORDER BY close_deadline,id LIMIT $1")
-                    .bind(limit.clamp(1,256)).fetch_all(conn).await?)
+                    "SELECT id,close_revision,close_deadline FROM log_stream WHERE close_phase='closing' AND close_deadline<=$2 ORDER BY close_deadline,id LIMIT $1")
+                    .bind(limit.clamp(1,256)).bind(chrono::Utc::now()).fetch_all(conn).await?)
             }),
             |conn, candidates| Box::pin(async move {
                 let mut changed=0;
