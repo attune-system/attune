@@ -4,9 +4,10 @@ Status: implementation checkpoint, work in progress; final review and CI require
 
 The production `ObjectSegments` seal route now uses durable prepare, storage-only
 verification, and a freshly authorized final transaction. Shared-file seal keeps
-its transaction, snapshot and flock. The paused-provider test is the required
-proof of released database ownership; until it passes on the checkpoint source,
-this document records implementation structure rather than measured lock removal.
+its transaction, snapshot and flock. Actual-route paused-provider tests passed on
+PG16 and PG18 with pool size one: an unrelated query and shared/exclusive graph
+work finish before GET resumes. This establishes released database ownership for
+that tested path; it does not establish PUT settlement or every authority race.
 
 `log_source::Source` acquires graph/source protection before artifact/version/stream
 locks. Prepare binds current producer identity, authenticated manifest and caps,
@@ -28,7 +29,9 @@ and compares history and exact durable selection. A revision/deadline mismatch
 cannot publish. Fresh encrypted evidence/metadata, sealed/truncated state, verified
 size/digest, Ready and published close state commit atomically. Migration 006
 replaces the selected-publication veto with permanent identity guards and deferred
-cross-table constraints. No session bypass exists. Identical published retries
+cross-table constraints. Forward guards 007–011 prevent generic publication bypass,
+bind recorded final evidence, and preserve PR31 operational `log_state`/`log_failure`
+updates without allowing source/proof/body/binding replacement. No session bypass exists. Identical published retries
 repeat current authorization and compare the selected input and verified result.
 
 Each object request runs in an owned task so waiter cancellation cannot drop an
@@ -58,3 +61,10 @@ Validation and unresolved cases are recorded in the central implementation recor
 and test assumptions. Prior verifier/source test results do not certify this route.
 Real successful COMMIT with lost acknowledgement, mixed eligibility-error scheduling,
 broader consumers and final CI remain acceptance requirements until exercised.
+
+Runtime evidence: API 25/25 and verifier 4/4 on each PG version; close lifecycle
+9/9 on each; full storage PG16 39/40, PG18 40/40; artifact 8/8, wire types 1/1,
+workflow log 30/30 on each. Four workers, zero ignored. The PG16 bounded pending
+claim failed its existing 250 ms budget inside the version guard; it remains
+unclassified, without a quiet-rerun baseline claim or timeout change. See the
+central implementation record for exact source attribution and residual gaps.

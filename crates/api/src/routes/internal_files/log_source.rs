@@ -120,11 +120,11 @@ pub async fn acquire<'db>(
 
 async fn acquire_binding(
     state: &AppState,
-    mut tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     user: &AuthenticatedUser,
     version: &attune_common::models::artifact_version::ArtifactVersion,
 ) -> Result<(Producer, crate::recorded_files::FileMutationProof), (StatusCode, String)> {
-    attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_capture(&mut tx)
+    attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_capture(tx)
         .await.map_err(map_transport_error)?;
     let sensor = if user.claims.token_type == TokenType::Sensor {
         let reference = scoped_metadata_value(user, "sensor_ref", "Sensor")?;
@@ -133,11 +133,10 @@ async fn acquire_binding(
             .map_err(map_transport_error)?
             .ok_or_else(denied)?;
         let fence = user.sensor_workload_fence().map_err(|_| denied())?;
-        let workload =
-            SensorWorkloadRepository::lock_current_fence_workload(&mut tx, row.id, fence)
-                .await
-                .map_err(map_transport_error)?
-                .ok_or_else(denied)?;
+        let workload = SensorWorkloadRepository::lock_current_fence_workload(tx, row.id, fence)
+            .await
+            .map_err(map_transport_error)?
+            .ok_or_else(denied)?;
         if workload.sensor != row.id
             || user
                 .claims
@@ -155,7 +154,7 @@ async fn acquire_binding(
             return Err(denied());
         }
         attune_common::repositories::sensor_schema::SensorSchemaRepository::lock_log_source(
-            &mut tx,
+            tx,
             fence.workload_id,
             fence.generation,
             version.id,
@@ -163,7 +162,7 @@ async fn acquire_binding(
         .await
         .map_err(map_transport_error)?;
         let metadata_revision = attune_common::repositories::managed_sensor_metadata::ManagedSensorMetadataRepository::revision_for_generation(
-            &mut tx, fence.workload_id, fence.generation).await.map_err(map_transport_error)?;
+            tx, fence.workload_id, fence.generation).await.map_err(map_transport_error)?;
         let schema_binding =
             attune_common::repositories::sensor_schema::SensorSchemaRepository::find(
                 &mut **tx,
@@ -209,7 +208,7 @@ async fn acquire_binding(
                 == Some("workflow_log");
         Some(Producer::Delegated {
             binding: DelegatedExecutionRepository::lock_log_producer(
-                &mut tx,
+                tx,
                 execution,
                 if native {
                     None
@@ -226,7 +225,7 @@ async fn acquire_binding(
     let delegated = if user.claims.token_type == TokenType::Execution
         && !crate::recorded_consumers::is_recorded(user).map_err(map_api_error)?
     {
-        let (execution, _) = DelegatedExecutionRepository::validate_claims(&mut tx, &user.claims)
+        let (execution, _) = DelegatedExecutionRepository::validate_claims(tx, &user.claims)
             .await
             .map_err(map_transport_error)?
             .ok_or_else(denied)?;
@@ -239,7 +238,7 @@ async fn acquire_binding(
             .ok_or_else(denied)?;
         Some(Producer::Delegated {
             binding: DelegatedExecutionRepository::lock_log_producer(
-                &mut tx,
+                tx,
                 execution,
                 Some(row.worker.ok_or_else(denied)?),
             )
@@ -249,13 +248,13 @@ async fn acquire_binding(
     } else {
         delegated
     };
-    let effect = authorize_version_mutation_source(state, &mut tx, user, version).await?;
+    let effect = authorize_version_mutation_source(state, tx, user, version).await?;
     let producer = if let Some(authority) = &effect.process {
         {
-            let context = attune_common::repositories::worker_delivery::WorkerDeliveryRepository::for_execution(&mut tx, authority.credential_binding().execution_id)
+            let context = attune_common::repositories::worker_delivery::WorkerDeliveryRepository::for_execution(tx, authority.credential_binding().execution_id)
                 .await.map_err(map_transport_error)?.ok_or_else(denied)?;
             Producer::Process {
-                context: WorkerDeliveryRepository::lock_log_context(&mut tx, &context)
+                context: WorkerDeliveryRepository::lock_log_context(tx, &context)
                     .await
                     .map_err(map_transport_error)?,
                 binding: authority.credential_binding(),
@@ -265,10 +264,10 @@ async fn acquire_binding(
         }
     } else if let Some((context, permit, _)) = &effect.worker {
         Producer::Delivery {
-            context: WorkerDeliveryRepository::lock_log_context(&mut tx, context)
+            context: WorkerDeliveryRepository::lock_log_context(tx, context)
                 .await
                 .map_err(map_transport_error)?,
-            permit: WorkerDeliveryRepository::lock_log_permit(&mut tx, permit)
+            permit: WorkerDeliveryRepository::lock_log_permit(tx, permit)
                 .await
                 .map_err(map_transport_error)?,
             execution: context.execution,

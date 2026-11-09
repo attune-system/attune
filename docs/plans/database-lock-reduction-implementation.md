@@ -1352,3 +1352,78 @@ coverage, older unclassified timing/CommitUnknown failures, Docker relay packagi
 and the 58 unchanged base-manifest policy failures remain disclosed. Complete PUT
 settlement, delayed preadmitted PUT prevention, forgotten multipart obligations,
 post-retention recreation and filesystem retirement remain outside milestone A.
+
+## Object-seal route integration checkpoint (2026-11-09)
+
+Actual object-route integration is implemented, not just verifier/source staging.
+Checkpoint `05c4bff913eb9fb3da776262c2749b0cb23f13b0` introduces prepare/verify/fresh
+publication and bounded housekeeping recovery; `2f88d22f829d475c58e21c002b40a1fffdc83c4d`
+adds publication entry guards, deadline fencing and route/recovery race coverage.
+`025e7c11` makes expiry discovery indexable; `b15f537f` binds every recorded final
+evidence attribute. Follow-up operational-status guards and synthetic consumer
+fixtures preserve workflow delivery/error handling. No source authority is
+manufactured by the fixture helper: it explicitly tests SQL shape, not auth or bytes.
+
+The decisive actual-route test pauses provider GET with a size-one pool. An unrelated
+query and shared/exclusive graph transactions finish before release. Plain and
+encrypted success, authenticated incomplete-manifest rejection, revocation during
+GET, changed truncation, refreshed-credential published retry without GET, identical
+concurrent seals and shared-file behavior passed. The object route uses an owned
+request task, pool-accounted disposable phase sockets, local SQL limits and bounded
+phase cleanup. Unknown commit acknowledgements receive one fresh authorized
+reconciliation; acknowledged commit followed by pure freshness failure stays distinct.
+
+Validation source attribution and commands:
+
+- API source `2f88d22f` (common build metadata also `2f88d22f`):
+  `cargo test -p attune-api --lib --no-run --message-format=json`, then executable
+  filter `routes::internal_files::tests:: --test-threads=4`: **25/25 each PG16/18**.
+  Later common changes are expiry discovery/evidence shape, not the GET connection
+  ownership path. The subsequent Source lint fix removes compiler-inserted redundant
+  borrows only. These results do not certify recorded-delivery constraint 009 or
+  every authority producer through the route.
+- Common source `b15f537f`: build storage integration and common lib test targets
+  before execution. Verifier filter `object_log_verification::tests::`: **4/4 each**.
+  Full storage target from `crates/common`, four workers: **PG16 39/40; PG18 40/40**.
+  All nine `object_close::` cases passed on each, including explicit expiry recovery,
+  stale owner fencing and empty verified atomic publication.
+- The first storage invocation used workspace-root cwd and failed all nine filtered
+  cases before setup (`./../../config.test.yaml` absent). Corrected cwd runs are
+  separate evidence; no test/source/timeout was weakened to correct invocation.
+- PG16 full-storage failure:
+  `bounded_admission::bounded_pending_claim_and_delete_defer_without_releasing_evidence`
+  expected Progress, got DeadlineDeferred/57014 at its existing 250 ms budget, inside
+  `guard_object_log_close_version() line 2 at statement block`. **Unclassified**;
+  no baseline equivalence or quiet rerun is claimed. Earlier timing/CommitUnknown
+  failures remain unclassified too.
+- Consumer fixture follow-up on `b15f537f` plus its saved source diff: common artifact
+  filter `log` **8/8**, artifact wire types **1/1**, executor
+  `workflow::log::tests::` **30/30**, each PG16/18, four workers, zero ignored.
+  Workflow cases cover lost seal response, append/seal races, failures, shutdown,
+  terminal completion and retained root lineage. They use an explicit synthetic
+  transport, not the actual Source authorization path. Operational-status SQL
+  probes on both servers also accepted status updates and rejected identity changes.
+- `cargo clippy -p attune-common -p attune-api -p attune-executor -p attune-supervisor
+  --all-targets -- -D warnings` passed after removing needless borrows. Formatting
+  and diff checks passed. Workspace SQLx validation is recorded below when complete.
+
+Evidence logs: `/tmp/attune-split-validation-fc_9jdgm`; commands/results are in
+`integration-results.json`, `storage-results.json`, and `consumer-results.json`.
+The owned server inspection found zero remaining per-test database clones on each
+server before any janitor/container removal. Exact owned servers/volumes/shims are
+removed at handoff; logs remain. No original dirty checkout, deployment, push,
+external message, PR edit or merge is part of this checkpoint.
+
+Status remains **work in progress**. Unknown prepare/final commit fault injection,
+real successful COMMIT/lost acknowledgement, full finalizer-wait authority matrix,
+actual-route native/sensor/recorded producer coverage, mixed eligibility-error
+scheduling and broader final CI remain gaps. Earlier verifier/source evidence is
+historical, not certification of these new paths. Docker relay-fixture and 58 base
+manifest dependency-policy failures remain separate gaps. Scope A still permits
+delayed pre-admitted PUT starts; full settlement, forgotten staging, post-retention
+recreation and filesystem path retirement are separate. Root Astra review and CI
+are required before merge readiness.
+
+Final follow-up code source: base `b15f537fbe57fed8cbcca52a01533fd1d4482cfb` plus `final-source.diff` in the evidence directory, SHA256 `14ff15130bd475d8027d684157673d1ddd556e3501dbdb9266477a0fed46c757`. This captures Source borrow-only lint fixes, synthetic consumer fixtures and forward operational-status guards 010/011. Documentation-only changes after checks preserve code evidence.
+
+Final schema validation: `DATABASE_URL=<owned PG18> SQLX_OFFLINE=false cargo sqlx prepare --workspace -- --all-targets` and the corresponding `--check` command both passed, with no `.sqlx` changes and no workspace all-target warnings. Final `cargo fmt --all -- --check` and `git diff --check` passed. All runtime/build checks were sequential with timing-sensitive tests. The two exact owned PostgreSQL containers and their anonymous volumes were removed; both invocation-owned psql shims were deleted. `cleanup.json` in the evidence directory records their exact identities. Zero per-test clones existed before removal. No production infrastructure was used.

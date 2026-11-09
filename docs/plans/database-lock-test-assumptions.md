@@ -292,3 +292,16 @@ cleans its own migration context before starting the original 30-second approval
 all wait budgets/barriers/assertions are unchanged. This fixes a demonstrated
 cold-setup failure and does not reclassify older timing or CommitUnknown failures.
 These results still do not certify durable finalization or a pool-free route.
+
+## Integrated object-seal test interpretation
+
+See the central implementation record's 2026-11-09 route checkpoint for exact
+source attribution, commands, counts and failures. Paused GET in the actual route
+with pool size one now proves released connection and graph ownership on PG16/18.
+The new SQL-shape fixture is deliberately synthetic; workflow/repository tests
+using it do not prove producer auth or byte verification. Expiration retains the
+pin until revision/deadline-qualified recovery; stale verifiers cannot publish.
+Unknown-close-COMMIT fault injection and the full producer/final-wait matrix are
+still unrun. Preserve the PG16 full-storage 250 ms DeadlineDeferred failure as
+unclassified. Correcting the storage executable's cwd fixes setup only; it is not
+baseline evidence. No existing timeout, ignored status or assertion was relaxed.

@@ -1,4 +1,7 @@
 //! Metadata visibility must never become a permit for protected content.
+#[path = "../../common/tests/support/object_log.rs"]
+mod object_log_fixture;
+
 use helpers::delegated;
 mod helpers;
 // This action-only suite shares the admitted pack fixture with the sensor suite;
@@ -579,7 +582,8 @@ async fn segment_stream_seal_case(freeze_reader: bool) -> Result<()> {
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
     let mut tx = ctx.pool.begin().await?;
-    LogStreamRepository::seal(&mut tx, stream.id, false).await?;
+    object_log_fixture::admission(&mut tx).await.unwrap();
+    object_log_fixture::seal(&mut tx, stream.id, false).await?;
     let ready = ArtifactVersionRepository::mark_body_ready_in_transaction(
         &mut tx,
         selected.id,
