@@ -174,8 +174,13 @@ where
     }
 
     let seal_error = if let Some(log) = file {
+        let started = TokioInstant::now();
         tokio::select! {
-            result = log.seal() => result.err(),
+            result = log.seal() => {
+                info!(stream = stream.as_str(), elapsed_ms = started.elapsed().as_millis() as u64,
+                    success = result.is_ok(), "Runtime log capture seal finished");
+                result.err()
+            },
             _ = cancel.cancelled() => {
                 logs_incomplete = true;
                 None
@@ -538,6 +543,7 @@ pub async fn execute_streaming_cancellable(
     };
     tokio::pin!(output_results);
     let mut logs_incomplete = false;
+    let finalization_started = TokioInstant::now();
     let outputs = if was_cancelled || was_timed_out {
         output_cancel.cancel();
         output_results.await?
@@ -567,12 +573,24 @@ pub async fn execute_streaming_cancellable(
                     was_timed_out = true;
                 }
                 logs_incomplete = true;
+                warn!(budget_ms = log_finalization_timeout_ms, action_timed_out = was_timed_out,
+                    "Runtime log finalization deadline exceeded; remote outcome may be unknown");
                 output_cancel.cancel();
                 output_results.await?
             }
         }
     };
     let (stdout_output, stderr_output) = outputs;
+    info!(
+        elapsed_ms = finalization_started.elapsed().as_millis() as u64,
+        budget_ms = log_finalization_timeout_ms,
+        interrupted = logs_incomplete,
+        stdout_incomplete = stdout_output.logs_incomplete,
+        stderr_incomplete = stderr_output.logs_incomplete,
+        stdout_seal_failed = stdout_output.seal_error.is_some(),
+        stderr_seal_failed = stderr_output.seal_error.is_some(),
+        "Runtime log finalization finished"
+    );
     logs_incomplete |= stdout_output.logs_incomplete || stderr_output.logs_incomplete;
     if !logs_incomplete {
         if let Some(error) = stdout_output.seal_error {
@@ -1032,6 +1050,9 @@ mod tests {
     struct HangingLogTransport {
         active: AtomicUsize,
         started: Notify,
+        commit_delay: Option<Duration>,
+        seal_delay: Option<Duration>,
+        sealed: AtomicUsize,
     }
 
     struct ActiveCommit<'a>(&'a AtomicUsize);
@@ -1065,9 +1086,19 @@ mod tests {
             self.active.fetch_add(1, Ordering::SeqCst);
             let _active = ActiveCommit(&self.active);
             self.started.notify_one();
-            std::future::pending().await
+            match self.commit_delay {
+                Some(delay) => {
+                    sleep(delay).await;
+                    Ok(())
+                }
+                None => std::future::pending().await,
+            }
         }
         async fn seal_log_stream(&self, _: i64, _: bool) -> attune_common::Result<()> {
+            if let Some(delay) = self.seal_delay {
+                sleep(delay).await;
+            }
+            self.sealed.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         async fn open_reader(
@@ -1465,6 +1496,44 @@ mod tests {
         assert!(result.logs_incomplete);
         assert_eq!(transport.active.load(Ordering::SeqCst), 0);
         assert!(result.duration_ms < 1_000);
+    }
+
+    #[tokio::test]
+    async fn default_finalization_budget_allows_slow_final_upload_and_seal() {
+        let transport = Arc::new(HangingLogTransport {
+            commit_delay: Some(Duration::from_millis(1_200)),
+            seal_delay: Some(Duration::from_millis(1_200)),
+            ..Default::default()
+        });
+        let config = attune_common::config::ArtifactsConfig::default().log_segment_writer_config();
+        let segmented =
+            attune_common::log_stream::SegmentedLogWriter::new(transport.clone(), 4, config)
+                .unwrap();
+        let writer = BoundedLogFileWriter::from_segmented_writer(segmented, 1024, true);
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("printf 'tail'");
+        let result = execute_streaming_cancellable(
+            cmd,
+            &HashMap::new(),
+            None,
+            Some(10),
+            1024,
+            1024,
+            OutputFormat::Text,
+            None,
+            None,
+            None,
+            None,
+            Some(writer),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert!(result.error.is_none());
+        assert!(!result.logs_incomplete);
+        assert_eq!(transport.active.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.sealed.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

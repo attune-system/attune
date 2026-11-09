@@ -1686,6 +1686,7 @@ impl ActionExecutor {
                                 transport,
                                 version,
                                 file_path.clone(),
+                                config,
                             ),
                             max_bytes,
                             is_stdout,

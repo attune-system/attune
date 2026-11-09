@@ -61,6 +61,23 @@ segment rows.
 not set the in-memory segment size. A cap truncation is recorded on the sealed
 stream.
 
+## Bound finalization and retries
+
+`artifacts.log_finalization_timeout_ms` defaults to 60,000 ms for the total
+post-exit drain and log settlement. Segment uploads and seals retry transient
+failures using `log_segment_retry_max_attempts`,
+`log_segment_retry_attempt_timeout_ms`, and the configured backoff settings.
+Sealing preserves the exact final manifest on every retry. Shared-file appends
+are not retried because an append acknowledgement can be ambiguous.
+
+The action deadline, cancellation, and total finalization budget still bound the
+worker's wait. Increasing this budget can keep a worker slot occupied longer
+during storage failures and must fit deployment shutdown budgets. Successful
+requests return immediately. There is no durable retry job after worker loss
+or deadline exhaustion, and a dropped request may have committed remotely.
+Use `logs_incomplete` and finalization warnings to identify affected executions;
+do not interpret action success as proof that logs were sealed.
+
 ## Set stream admission limits
 
 Each API replica enforces `server.execution_log_stream_global_limit`. The default

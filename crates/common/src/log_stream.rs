@@ -64,6 +64,7 @@ pub struct SharedFileLogWriter {
     artifact_version: i64,
     file_path: String,
     failure: std::sync::Mutex<Option<Arc<str>>>,
+    config: SegmentedLogConfig,
 }
 
 impl SharedFileLogWriter {
@@ -71,12 +72,14 @@ impl SharedFileLogWriter {
         transport: Arc<dyn ArtifactFileTransport>,
         artifact_version: i64,
         file_path: String,
+        config: SegmentedLogConfig,
     ) -> Self {
         Self {
             transport,
             artifact_version,
             file_path,
             failure: std::sync::Mutex::new(None),
+            config,
         }
     }
 
@@ -109,18 +112,14 @@ impl SharedFileLogWriter {
                 "shared log writer failed: {message}"
             )));
         }
-        match manifest {
-            Some(manifest) => {
-                self.transport
-                    .seal_log_stream_with_manifest(self.artifact_version, truncated, &manifest)
-                    .await
-            }
-            None => {
-                self.transport
-                    .seal_log_stream(self.artifact_version, truncated)
-                    .await
-            }
-        }
+        seal_log_stream_with_retry(
+            &self.transport,
+            self.artifact_version,
+            truncated,
+            manifest.as_deref(),
+            self.config,
+        )
+        .await
     }
 }
 
@@ -237,10 +236,7 @@ impl SegmentedLogWriter {
                                     if !buffer.is_empty() {
                                         flush(&transport, artifact_version, &mut sequence, &mut buffer, config, FlushReason::Seal, segment_target_bytes).await?;
                                     }
-                                    match manifest {
-                                        Some(manifest) => transport.seal_log_stream_with_manifest(artifact_version,truncated,&manifest).await,
-                                        None => transport.seal_log_stream(artifact_version,truncated).await,
-                                    }
+                                    seal_log_stream_with_retry(&transport, artifact_version, truncated, manifest.as_deref(), config).await
                                 }.await
                             };
                             let _ = reply.send(result);
@@ -428,6 +424,66 @@ pub async fn retry_log_segment_commit<F, Fut>(
     config: SegmentedLogConfig,
     artifact_version: i64,
     sequence: i64,
+    commit: F,
+) -> Result<u32>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    retry_log_operation(
+        config,
+        artifact_version,
+        Some(sequence),
+        "segment_commit",
+        commit,
+    )
+    .await
+}
+
+/// Replays only identical seal inputs. A timed-out request may already have
+/// committed remotely; the API must reconcile that outcome on the next attempt.
+async fn seal_log_stream_with_retry(
+    transport: &Arc<dyn ArtifactFileTransport>,
+    artifact_version: i64,
+    truncated: bool,
+    manifest: Option<&str>,
+    config: SegmentedLogConfig,
+) -> Result<()> {
+    let started = tokio::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_millis(config.finalization_timeout_ms),
+        retry_log_operation(config, artifact_version, None, "seal", || async {
+            match manifest {
+                Some(manifest) => {
+                    transport
+                        .seal_log_stream_with_manifest(artifact_version, truncated, manifest)
+                        .await
+                }
+                None => transport.seal_log_stream(artifact_version, truncated).await,
+            }
+        }),
+    )
+    .await;
+    let result = result.unwrap_or_else(|_| {
+        Err(Error::retryable_transport(
+            "Log seal finalization deadline exceeded; remote outcome may be unknown",
+        ))
+    });
+    tracing::info!(
+        artifact_version,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        success = result.is_ok(),
+        attempts = result.as_ref().ok().copied(),
+        "Log seal attempts finished"
+    );
+    result.map(|_| ())
+}
+
+async fn retry_log_operation<F, Fut>(
+    config: SegmentedLogConfig,
+    artifact_version: i64,
+    sequence: Option<i64>,
+    operation: &'static str,
     mut commit: F,
 ) -> Result<u32>
 where
@@ -444,11 +500,12 @@ where
                 tracing::warn!(
                     artifact_version,
                     sequence,
+                    operation,
                     attempt,
                     next_attempt = attempt + 1,
                     delay_ms,
                     error = %error,
-                    "Retrying immutable log segment commit"
+                    "Retrying runtime log delivery"
                 );
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 attempt += 1;
@@ -457,10 +514,11 @@ where
                 tracing::error!(
                     artifact_version,
                     sequence,
+                    operation,
                     attempts = attempt,
                     retryable = error.is_retryable_transport(),
                     error = %error,
-                    "Immutable log segment commit failed"
+                    "Runtime log delivery failed"
                 );
                 return Err(error);
             }
@@ -479,7 +537,7 @@ where
     .await
     .unwrap_or_else(|_| {
         Err(Error::retryable_transport(format!(
-            "log segment commit attempt timed out after {}ms",
+            "runtime log delivery attempt timed out after {}ms",
             config.retry_attempt_timeout_ms
         )))
     })
@@ -512,6 +570,11 @@ mod tests {
         fail_appends: bool,
         commit_errors: Mutex<VecDeque<Error>>,
         attempts: Mutex<Vec<(i64, i64, Vec<u8>)>>,
+        seal_attempts: Mutex<Vec<(i64, bool, Option<String>)>>,
+        seal_errors: Mutex<VecDeque<Error>>,
+        seal_delays: Mutex<VecDeque<Duration>>,
+        seal_active: AtomicUsize,
+        commit_before_seal_error: bool,
     }
 
     #[derive(Debug, Default)]
@@ -668,11 +731,17 @@ mod tests {
         }
 
         async fn seal_log_stream(&self, artifact_version: i64, truncated: bool) -> Result<()> {
-            self.seals
-                .lock()
-                .unwrap()
-                .push((artifact_version, truncated));
-            Ok(())
+            self.record_seal(artifact_version, truncated, None).await
+        }
+
+        async fn seal_log_stream_with_manifest(
+            &self,
+            artifact_version: i64,
+            truncated: bool,
+            manifest: &str,
+        ) -> Result<()> {
+            self.record_seal(artifact_version, truncated, Some(manifest))
+                .await
         }
 
         async fn open_reader(
@@ -692,6 +761,35 @@ mod tests {
         }
     }
 
+    impl RecordingTransport {
+        async fn record_seal(
+            &self,
+            version: i64,
+            truncated: bool,
+            manifest: Option<&str>,
+        ) -> Result<()> {
+            self.seal_attempts.lock().unwrap().push((
+                version,
+                truncated,
+                manifest.map(str::to_owned),
+            ));
+            self.seal_active.fetch_add(1, Ordering::SeqCst);
+            let _active = ActiveAttempt(&self.seal_active);
+            let delay = self.seal_delays.lock().unwrap().pop_front();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            let error = self.seal_errors.lock().unwrap().pop_front();
+            if error.is_none() || self.commit_before_seal_error {
+                let mut seals = self.seals.lock().unwrap();
+                if !seals.contains(&(version, truncated)) {
+                    seals.push((version, truncated));
+                }
+            }
+            error.map_or(Ok(()), Err)
+        }
+    }
+
     fn writer_config(initial: usize, max: usize, flush_interval_ms: u64) -> SegmentedLogConfig {
         SegmentedLogConfig {
             initial_segment_bytes: initial,
@@ -702,6 +800,185 @@ mod tests {
             retry_initial_backoff_ms: 1,
             retry_max_backoff_ms: 2,
             finalization_timeout_ms: 100,
+        }
+    }
+
+    async fn seal_test_writer(
+        transport: Arc<RecordingTransport>,
+        config: SegmentedLogConfig,
+        shared: bool,
+    ) -> Result<()> {
+        if shared {
+            SharedFileLogWriter::new(transport, 42, "log.txt".into(), config)
+                .seal_with_manifest(true, Some("same-authenticated-manifest".into()))
+                .await
+        } else {
+            let writer = SegmentedLogWriter::new(transport, 42, config)?;
+            writer.write_all(b"tail").await.unwrap();
+            writer
+                .seal_with_manifest(true, Some("same-authenticated-manifest".into()))
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn seal_retries_http_unavailability_with_identical_headers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for status in ["503 Service Unavailable", "200 OK"] {
+                let (mut socket, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buf = [0; 1024];
+                    let count = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buf))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&buf[..count]);
+                    if request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            requests
+        });
+        let transport: Arc<dyn ArtifactFileTransport> = Arc::new(
+            crate::artifact_transport::ApiTransport::new(
+                &format!("http://{address}"),
+                "test-token",
+                "/unused",
+            )
+            .unwrap(),
+        );
+        let mut config = writer_config(16, 16, 60_000);
+        config.retry_attempt_timeout_ms = 2_000;
+        config.finalization_timeout_ms = 5_000;
+        let result =
+            seal_log_stream_with_retry(&transport, 42, true, Some("test-manifest"), config).await;
+        let requests = server.await.unwrap();
+        result.unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert!(
+                request.starts_with("POST /api/v1/internal/logs/42/seal?truncated=true HTTP/1.1")
+            );
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("x-attune-log-final-manifest: test-manifest\r\n"));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn seal_retries_identical_proof_after_lost_acknowledgement() {
+        for shared in [false, true] {
+            let transport = Arc::new(RecordingTransport {
+                seal_errors: Mutex::new(VecDeque::from([Error::retryable_transport(
+                    "lost seal response",
+                )])),
+                commit_before_seal_error: true,
+                ..Default::default()
+            });
+            seal_test_writer(transport.clone(), writer_config(16, 16, 60_000), shared)
+                .await
+                .unwrap();
+            assert_eq!(
+                *transport.seal_attempts.lock().unwrap(),
+                vec![(42, true, Some("same-authenticated-manifest".into())); 2]
+            );
+            assert_eq!(*transport.seals.lock().unwrap(), vec![(42, true)]);
+            if !shared {
+                assert_eq!(
+                    transport.attempts.lock().unwrap().len(),
+                    1,
+                    "sealing must not reupload committed bytes"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn seal_retries_stop_on_permanent_denial_or_attempt_exhaustion() {
+        for shared in [false, true] {
+            for permanent in [false, true] {
+                let errors = if permanent {
+                    vec![Error::PermissionDenied("revoked".into())]
+                } else {
+                    (0..3)
+                        .map(|_| Error::retryable_transport("unavailable"))
+                        .collect()
+                };
+                let transport = Arc::new(RecordingTransport {
+                    seal_errors: Mutex::new(VecDeque::from(errors)),
+                    ..Default::default()
+                });
+                assert!(
+                    seal_test_writer(transport.clone(), writer_config(16, 16, 60_000), shared)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(
+                    transport.seal_attempts.lock().unwrap().len(),
+                    if permanent { 1 } else { 3 }
+                );
+                assert!(transport.seals.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_seal_can_finish_beyond_old_one_second_deadline() {
+        for shared in [false, true] {
+            let transport = Arc::new(RecordingTransport {
+                seal_delays: Mutex::new(VecDeque::from([Duration::from_millis(1_200)])),
+                ..Default::default()
+            });
+            let config = crate::config::ArtifactsConfig::default().log_segment_writer_config();
+            let started = tokio::time::Instant::now();
+            seal_test_writer(transport.clone(), config, shared)
+                .await
+                .unwrap();
+            assert!(started.elapsed() >= Duration::from_millis(1_200));
+            assert_eq!(transport.seal_attempts.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn seal_attempt_timeout_retries_but_total_budget_cancels_active_request() {
+        for shared in [false, true] {
+            let transport = Arc::new(RecordingTransport {
+                seal_delays: Mutex::new(VecDeque::from([Duration::from_secs(60); 3])),
+                ..Default::default()
+            });
+            let mut config = writer_config(16, 16, 60_000);
+            config.retry_attempt_timeout_ms = 10;
+            config.finalization_timeout_ms = 15;
+            let started = tokio::time::Instant::now();
+            let error = seal_test_writer(transport.clone(), config, shared)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("remote outcome may be unknown"));
+            assert_eq!(started.elapsed(), Duration::from_millis(15));
+            assert_eq!(transport.seal_attempts.lock().unwrap().len(), 2);
+            assert_eq!(transport.seal_active.load(Ordering::SeqCst), 0);
+            assert!(transport.seals.lock().unwrap().is_empty());
         }
     }
 
@@ -865,7 +1142,12 @@ mod tests {
             fail_appends: true,
             ..Default::default()
         });
-        let writer = SharedFileLogWriter::new(transport.clone(), 12, "log.txt".to_string());
+        let writer = SharedFileLogWriter::new(
+            transport.clone(),
+            12,
+            "log.txt".to_string(),
+            writer_config(4, 4, 60_000),
+        );
 
         let write_error = writer.write_all(b"partial").await.unwrap_err();
         assert!(write_error
