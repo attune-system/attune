@@ -475,8 +475,12 @@ async fn artifact_raw_hard_cap_crosses_long_pinned_prefix_and_revisits_unpins() 
     assert_eq!(page.versions.len(), 50);
     assert!(!page.pending);
     let mut tx = db.pool().begin().await.unwrap();
-    Evidence::lock_capture(&mut tx).await.unwrap();
-    sqlx::query("DELETE FROM file_evidence_pin WHERE owner=990031")
+    Evidence::lock_reclamation(&mut tx).await.unwrap();
+    sqlx::query("UPDATE file_evidence_owner SET metadata_gone=true WHERE version=990031")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("SELECT file_evidence_release(990031)")
         .execute(&mut *tx)
         .await
         .unwrap();
@@ -603,8 +607,12 @@ async fn artifact_discovery_does_not_authorize_changed_pin_or_physical_identity(
     );
     tx.rollback().await.unwrap();
     let mut tx = db.pool().begin().await.unwrap();
-    Evidence::lock_capture(&mut tx).await.unwrap();
-    sqlx::query("DELETE FROM file_evidence_pin WHERE owner=990041")
+    Evidence::lock_reclamation(&mut tx).await.unwrap();
+    sqlx::query("UPDATE file_evidence_owner SET metadata_gone=true WHERE version=990041")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("SELECT file_evidence_release(990041)")
         .execute(&mut *tx)
         .await
         .unwrap();
