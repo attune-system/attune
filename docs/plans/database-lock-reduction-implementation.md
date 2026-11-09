@@ -1,6 +1,6 @@
 # Database lock reduction: code-level implementation map
 
-Status: first functional checkpoint implemented; later slices remain proposals.
+Status: milestones 1 and 2 implemented for review; later slices remain proposals.
 Date: 2026-11-09 UTC.
 
 This expands the [lock audit](database-lock-scope-audit.md), with a separate
@@ -150,6 +150,165 @@ This checkpoint is saved progress for Astra review, not merge readiness.
 No migrations, SQLx query macros, or public API contracts changed; schema-prepare
 and generated-client updates are not applicable. No latency, production workload,
 PostgreSQL 16, or full service/broker acceptance result is claimed.
+
+## Milestone 2 checkpoint (review pending)
+
+The early Astra review of `3f3b8465078a7ebad0b7d8da852a8d9c8a26ccf6`
+completed with **no actionable runtime bugs**. It confirmed transaction-local
+setting coverage, cleanup, and statistics revision handling. Its nonblocking
+coverage request was effective ownership rejection and ownership loss while
+waiting for the parent lock. Final-source workspace/consumer CI and PostgreSQL
+16 were outstanding at that review; the milestone-1 results above are scoped to
+that checkpoint, not silently carried forward as final-source passes.
+
+Query checkpoints `c54813ab` and `b6866375` materialize current ID/xmin and cheap release
+retention eligibility, then filter pins in a second materialized stage reading
+only those survivors, before rejoining base identities for row locking. This
+avoids base-table predicate pushdown ahead of the coarse join and leaves the
+non-retention phases on their original query shape. Every release pin source
+is retained, with OFFSET 0 barriers preventing anti-join pull-up, including both
+nested static-action paths. Existing raw discovery, durable cursors, graph/table
+lock modes, SKIP LOCKED, deletion allowance, retries and unknown-commit machinery
+are unchanged. The materialized boundary fences execution; it does not avoid
+planning the pin subqueries when coarse eligibility is empty. Application-level
+avoidance of that planning is not claimed.
+
+Artifact count, find and budgeted discovery share a materialized expiration/body
+prefilter before evidence eligibility. Claim retains current parent locking and
+rechecks the same retention predicate plus evidence under graph admission. The
+version threshold uses OFFSET/LIMIT existence only with a positive configured
+limit; bigint subtraction avoids overflow on extreme negative integer limits.
+The existing active-object/shared-file distinction, version gaps, body states,
+strict comparison and created/ID ordering remain. No durable artifact raw cursor
+or bounded raw scan is claimed; that is the next milestone.
+
+New positive fixtures cover all JSON release pin shapes, an independent expanded
+pin-set reference, pin insertion after raw identity discovery, exact delete
+allowance, and EXPLAIN ANALYZE inside a rolled-back savepoint (no plan-tree
+assertion). Artifact fixtures cross all four policies, negative/zero/positive
+limits, version gaps, NULL/ready/pending bodies and open object/shared-file logs;
+selected identities/counts/budgeted prefixes are compared with the original
+count-all reference. Claim checks cover unchanged candidates, changed policy and
+a newly committed evidence pin. Statistics uses real roles and inherited
+ownership, plus independent sessions with an observed pg_locks waiter before
+changing the actual relation owner; both the idle preflight and post-lock ownership checks are necessary.
+
+Validation below distinguishes intermediate attempts from final-source results. The intermediate
+PG16 collector run (`c54813ab` query shape plus new tests) passed 28/29, including
+the positive JSON fixture, but failed the unchanged production-default
+continuation-delay assertion at bounded/tests.rs:973 (expected 1–2 seconds).
+It ran alongside compilation and other template-building suites. No baseline
+reproduction or passing-suite claim is made for that attempt. `b6866375` also
+restores the original query shape for non-retention phases; the final collector
+reruns below retain this failure evidence. No deadlines or assertions were relaxed.
+The run owns container `attune-m2-pg16` (ID
+`6714caec742bc6832d3b4b50effe5004f27a078a9ac1daf7aac20e3d87c0d49e`),
+ephemeral loopback port 39257. `make db-test-setup` passed using both explicit
+owned URLs and a temporary psql shim forwarding only to that container; no
+cluster defaults or Kubernetes contexts were used. The first no-run compile
+caught a SQLx raw_sql/after_connect lifetime error in the new role fixture; the
+fixture now uses a parameterized set_config query. That failed attempt is not
+passing evidence. The first storage run passed 30 existing tests but the new
+matrix fixture failed at its first policy UPDATE with PostgreSQL 42804 (text
+assigned to artifact_retention_enum). Explicit enum casts were added for policy,
+body state and backend before the final runs; that attempt is not a suite pass.
+
+Milestone-2 validation commands (four libtest threads throughout):
+
+```bash
+# Owned PG16: final source plus positive and existing bounded regressions.
+ATTUNE_TEST_RUN_ID=m2-final16 ATTUNE__DATABASE__URL=<owned-pg16-url> \
+  cargo test -p attune-common --lib --test cache_repository_tests \
+  --test storage_maintenance_repository_tests --test file_evidence_retention_tests -- \
+  repositories::pack_retention::bounded::tests:: statistics bounded_admission:: \
+  expiration_prefilter_matches --nocapture --test-threads=4
+# Separate owned PG18: all three new positive/ownership cases.
+ATTUNE_TEST_RUN_ID=m2-positive18 ATTUNE__DATABASE__URL=<owned-pg18-url> \
+  cargo test -p attune-common --lib --test cache_repository_tests \
+  --test storage_maintenance_repository_tests -- release_json_pins_match_reference \
+  expiration_prefilter_matches cache_statistics_rejects_effective_nonowner \
+  --nocapture --test-threads=4
+cargo clippy -p attune-common --all-targets -- -D warnings
+cargo clippy -p attune-common --test storage_maintenance_repository_tests -- -D warnings
+cargo fmt --all -- --check
+git diff --check
+```
+
+Final-source evidence is based on `fe886366` (query checkpoints plus committed
+coverage; only this prose record was uncommitted). PostgreSQL 18.6 passed all
+three new cases: release JSON/reference/deletion (1 test, 48.59s including template
+setup), statistics ownership (1, 1.84s), and artifact reference/policy/pin claims
+(1, 4.09s). No failures or ignored tests. The release fixture's rolled-back
+EXPLAIN ANALYZE observed 25.764 ms planning and 30.005 ms execution. This is a
+small positive owned fixture, not representative production throughput or a
+latency acceptance result. PG18 container ID
+`6b305d35e29f768e3c8daa9d83d85dbd26a8276944a4de66bc2ff8f1071a8d1e`
+used ephemeral loopback port 40179; only its owned `attune_test` bootstrap DB was
+created before TestDatabase built the canonical migration template.
+
+All-targets common Clippy passed with `-D warnings` on `519581fb` (10m11s including
+the shared Cargo lock wait). The subsequent change only adds the preexisting-pin
+fixture to the storage test; a final scoped Clippy rerun covers that target.
+Other all-targets lint results are reusable because no other source changed.
+Formatting and diff checks passed on the final source.
+
+The first final-source PG16 combined command stopped after the library binary:
+28/29 collector tests passed, including the positive JSON/reference case, but
+the unchanged continuation-delay assertion at bounded/tests.rs:973 failed again
+(expected 1–2 seconds). Runtime was 151.35s. This is **not** a passing collector
+suite and has not been reproduced on the base, so it is not classified as a
+baseline failure. The final positive release EXPLAIN observed 30.664 ms planning
+and 24.768 ms execution; again, this is a small owned fixture only.
+
+With no source changes, a follow-up invocation reused the same run-owned PG16
+template after the failed command had fully exited:
+
+```bash
+ATTUNE_TEST_RUN_ID=m2-final16 ATTUNE__DATABASE__URL=<owned-pg16-url> \
+  cargo test -p attune-common --lib --test cache_repository_tests \
+  --test storage_maintenance_repository_tests --test file_evidence_retention_tests -- \
+  production_defaults_cross_ten_thousand_pins_and_persist_fast_continuation \
+  statistics bounded_admission:: expiration_prefilter_matches --nocapture --test-threads=4
+```
+
+It passed the continuation test alone (1, 11.91s), statistics (7, 4.76s), evidence
+bounded admission (15, 25.00s), and storage bounded admission plus the new matrix
+(17, 14.35s), with no failed or ignored tests. This does not erase the broad
+collector failures. The final scoped storage-test Clippy check also passed
+`-D warnings` on `fe886366` (12m26s including build-lock wait).
+
+The same run identity is intentionally retained for sequential commands within
+this owned validation session to reuse its template; commands do not overlap.
+A final quiet four-thread collector rerun uses that same template and source,
+without concurrent compilation or another suite. Its result is recorded below.
+
+The quiet four-thread PG16 collector rerun passed **29/29**, zero failed/ignored,
+in 47.92s (same command as the earlier collector run, `ATTUNE_TEST_RUN_ID=m2-final16`).
+Its small positive release EXPLAIN observed 31.561 ms planning and 23.693 ms
+execution. The isolated and quiet passes do not establish that the earlier
+continuation-delay failures were baseline issues; load sensitivity remains a
+review/CI concern. No test assertions, budgets, or defaults were changed.
+
+Both owned servers were inspected after all their invocations exited and before
+any janitor: zero per-test clones and zero statistics fixture roles remained.
+Their exact container IDs and anonymous volumes were then removed, along with
+the temporary psql shim. No owned database/test process remains running. Logs
+remain at `/tmp/m2-{final16,isolated16,quiet-collector16,positive18,clippy,clippy-final}.log`
+for the parent checkpoint review.
+
+Status: **work in progress for parent Astra review**, not merge readiness.
+Implemented scope stops at query shape and regression coverage. Durable artifact
+paging, logging/PR31, seal claims, scoped lock protocols and migrations remain
+out of scope. No pushes or PR updates were made by this implementation agent.
+
+Remaining gaps: required final-head CI, workspace/consumer checks, full affected
+consumer/service suites, and production-scale planning/execution under load.
+The milestone-1 PG18 suites remain historical checkpoint evidence; final-source
+PG18 coverage here is the three new positive tests, while PG16 covers the selected
+existing bounded suites too. The unchanged Docker relay-fixture packaging blocker
+and 58 dependency-policy violations retain the exact provenance recorded above;
+neither is labeled passing. No migration, SQLx macro metadata, or public contract
+changed, so schema-prepare and generated-client changes are not applicable.
 
 ## Slice 1: cheaper bounded maintenance, with the same locking contract
 
