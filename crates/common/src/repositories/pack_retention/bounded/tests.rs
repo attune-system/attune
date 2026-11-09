@@ -1700,3 +1700,66 @@ async fn release_retention_preserves_strict_cutoff_and_newest_inactive_id_ties()
     );
     db.cleanup().await.unwrap();
 }
+
+#[tokio::test]
+async fn bounded_budget_jit_restores_on_commit_rollback_and_pool_reuse() {
+    let db = database().await;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(db.database_url())
+        .await
+        .unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    sqlx::query("SET jit=on").execute(&mut *conn).await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    for fail in [false, true] {
+        let mut tx = conn.begin().await.unwrap();
+        budget_entry(
+            &mut tx,
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        budget(
+            &mut tx,
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SHOW jit")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap(),
+            "off"
+        );
+        if fail {
+            assert!(sqlx::query("SELECT 1/0").execute(&mut *tx).await.is_err());
+            rollback(tx, Duration::from_secs(2)).await.unwrap();
+        } else {
+            tx.commit().await.unwrap();
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SHOW jit")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap(),
+            "on"
+        );
+    }
+    drop(conn);
+    let (reused_pid, jit): (i32, String) =
+        sqlx::query_as("SELECT pg_backend_pid(), current_setting('jit')")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(reused_pid, pid);
+    assert_eq!(jit, "on");
+    pool.close().await;
+    db.cleanup().await.unwrap();
+}

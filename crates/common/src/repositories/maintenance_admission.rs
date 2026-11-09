@@ -127,6 +127,22 @@ async fn configure(
     Ok(())
 }
 
+// Only at owned transaction entry; later budget refreshes need no JIT setter.
+async fn configure_entry(
+    conn: &mut PgConnection,
+    end: Instant,
+    budget: &MaintenanceBudget,
+) -> Result<()> {
+    let remaining = end
+        .checked_duration_since(Instant::now())
+        .ok_or_else(deadline_error)?;
+    sqlx::query("SELECT set_config('statement_timeout',$1,true), set_config('jit','off',true)")
+        .bind(milliseconds(remaining.min(budget.statement_timeout)))
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 async fn rollback(mut tx: Transaction<'_, Postgres>, cap: Duration) -> Result<()> {
     timeout(cap, async {
         // A dropped query future may leave ErrorResponse before ReadyForQuery.
@@ -183,7 +199,7 @@ impl PhysicalCleanup {
         .await?;
         let admitted = limited(end, &cancel, async {
             sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED").execute(&mut *tx).await?;
-            configure(&mut tx, end, budget).await?;
+            configure_entry(&mut tx, end, budget).await?;
             if budget.queued_admission {
                 let previous: String = sqlx::query_scalar("SELECT current_setting('lock_timeout')").fetch_one(&mut *tx).await?;
                 sqlx::query("SELECT set_config('lock_timeout',$1,true)")
@@ -265,7 +281,7 @@ pub(crate) async fn probe<T>(
     let mut conn = limited(end, cancel, async { Ok(pool.acquire().await?.detach()) }).await?;
     let mut tx = limited(end, cancel, async { Ok(conn.begin().await?) }).await?;
     let result = limited(end, cancel, async {
-        configure(&mut tx, end, budget).await?;
+        configure_entry(&mut tx, end, budget).await?;
         read(&mut tx).await
     })
     .await;
@@ -319,7 +335,7 @@ pub async fn run<C, T>(
         }
     };
     let candidates = limited(end, cancel, async {
-        configure(&mut discovery, end, budget).await?;
+        configure_entry(&mut discovery, end, budget).await?;
         probe(&mut discovery).await
     })
     .await;
@@ -349,7 +365,7 @@ pub async fn run<C, T>(
     };
     let result = limited(end, cancel, async {
         sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED").execute(&mut *tx).await?;
-        configure(&mut tx, end, budget).await?;
+        configure_entry(&mut tx, end, budget).await?;
         if budget.queued_admission {
             let previous: String = sqlx::query_scalar("SELECT current_setting('lock_timeout')").fetch_one(&mut *tx).await?;
             sqlx::query("SELECT set_config('lock_timeout',$1,true)")
@@ -410,4 +426,175 @@ pub async fn run<C, T>(
         }
     }
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::Config, test_database::TestDatabase};
+
+    #[tokio::test]
+    async fn jit_is_local_to_owned_metadata_transactions() {
+        let config = Config::load_from_file(&format!(
+            "{}/../../config.test.yaml",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let db = TestDatabase::create(&config.database)
+            .await
+            .unwrap()
+            .with_cleanup_on_drop();
+        let schema = db.schema().to_owned();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(move |conn, _| {
+                let schema = schema.clone();
+                Box::pin(async move {
+                    sqlx::query("SELECT set_config('search_path',quote_ident($1)||', public',false), set_config('jit','on',false)")
+                        .bind(schema).execute(conn).await?;
+                    Ok(())
+                })
+            })
+            .connect(db.database_url())
+            .await
+            .unwrap();
+        let budget = MaintenanceBudget {
+            statement_timeout: Duration::from_secs(2),
+            page_timeout: Duration::from_secs(10),
+            ..MaintenanceBudget::default()
+        };
+        // Exercise the actual discovery and protected-work owners, including SQL failure.
+        for fail in [false, true] {
+            let report = run(
+                &pool,
+                &budget,
+                Instant::now() + budget.page_timeout,
+                &CancellationToken::new(),
+                |conn| {
+                    Box::pin(async move {
+                        let jit: String = sqlx::query_scalar("SHOW jit").fetch_one(conn).await?;
+                        assert_eq!(jit, "off");
+                        Ok(vec![1])
+                    })
+                },
+                move |conn, _| {
+                    Box::pin(async move {
+                        let jit: String =
+                            sqlx::query_scalar("SHOW jit").fetch_one(&mut *conn).await?;
+                        assert_eq!(jit, "off");
+                        if fail {
+                            sqlx::query("SELECT 1/0").execute(conn).await?;
+                        }
+                        Ok(((), 1))
+                    })
+                },
+            )
+            .await;
+            assert_eq!(
+                report.outcome,
+                if fail {
+                    MaintenanceOutcome::Failed
+                } else {
+                    MaintenanceOutcome::Progress
+                }
+            );
+            if fail {
+                assert!(report.rollback_acknowledged);
+            }
+            let jit: String = sqlx::query_scalar("SHOW jit")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(jit, "on");
+        }
+        let discovered = probe(
+            &pool,
+            &budget,
+            Instant::now() + budget.page_timeout,
+            &CancellationToken::new(),
+            |conn| {
+                Box::pin(async move {
+                    Ok(sqlx::query_scalar::<_, String>("SHOW jit")
+                        .fetch_one(conn)
+                        .await?)
+                })
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(discovered, "off");
+        for commit in [false, true] {
+            let mut owner = PhysicalCleanup::begin(&pool, &budget).await.unwrap();
+            let jit = owner
+                .metadata(|conn| {
+                    Box::pin(async move {
+                        Ok(sqlx::query_scalar::<_, String>("SHOW jit")
+                            .fetch_one(conn)
+                            .await?)
+                    })
+                })
+                .await
+                .unwrap();
+            assert_eq!(jit, "off");
+            if commit {
+                owner.commit().await.unwrap();
+            } else {
+                owner.rollback().await.unwrap();
+            }
+            assert_eq!(
+                sqlx::query_scalar::<_, String>("SHOW jit")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                "on"
+            );
+        }
+        // Check restoration on the very same reusable backend after commit,
+        // server timeout and rollback (production owners conservatively dispose).
+        let mut conn = pool.acquire().await.unwrap();
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        for fail in [false, true] {
+            let mut tx = conn.begin().await.unwrap();
+            configure_entry(&mut tx, Instant::now() + budget.page_timeout, &budget)
+                .await
+                .unwrap();
+            assert_eq!(
+                sqlx::query_scalar::<_, String>("SHOW jit")
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap(),
+                "off"
+            );
+            if fail {
+                sqlx::query("SET LOCAL statement_timeout='20ms'")
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                let error = sqlx::query("SELECT pg_sleep(1)")
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.as_database_error().unwrap().code().as_deref(),
+                    Some("57014")
+                );
+                rollback(tx, budget.statement_timeout).await.unwrap();
+            } else {
+                tx.commit().await.unwrap();
+            }
+        }
+        drop(conn);
+        let (reused_pid, jit): (i32, String) =
+            sqlx::query_as("SELECT pg_backend_pid(), current_setting('jit')")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reused_pid, pid);
+        assert_eq!(jit, "on");
+        pool.close().await;
+        db.cleanup().await.unwrap();
+    }
 }

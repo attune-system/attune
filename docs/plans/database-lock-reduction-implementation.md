@@ -1,0 +1,444 @@
+# Database lock reduction: code-level implementation map
+
+Status: first functional checkpoint implemented; later slices remain proposals.
+Date: 2026-11-09 UTC.
+
+This expands the [lock audit](database-lock-scope-audit.md), with a separate
+[test assumption audit](database-lock-test-assumptions.md). It identifies concrete
+change boundaries; it does not claim that the new concurrency protocols have
+already been implemented or proven.
+
+## Baseline and integration
+
+The analysis checkout is 880b1b2a138a335eb549c08452f0d3440de68d41. The locally
+available origin/main is 8af23fc4d77ce84d661474cb6711d0db3be906d3.
+[PR #31](https://github.com/attune-system/attune/pull/31) is still open at
+c067e88573529466f40849a7b58325a8e4aaa704. The first independent checkpoint is based on main 8af23fc4 and excludes PR #31:
+its JIT and cache-statistics changes do not touch logging reliability. Later
+logging milestones must integrate that reliability change after merge or with an
+explicit dependent branch. Do not implement against the older analysis checkout
+without reconciliation.
+
+The maintenance admission, maintenance queries, bounded release collector,
+pack cleanup, sensor admission, cache admission/statistics, partition repository,
+log-stream repository, and graph tracing files examined here are identical to
+their PR #31 versions. The API seal path was inspected directly at that PR head.
+That PR supplies bounded retries, per-stream outcomes, and accurate delivery
+errors; it does not move seal verification outside the database transaction.
+
+### Preserve existing work
+
+- Release discovery already reads raw bounded ID/xmin pages outside graph
+  admission. Empty pages already skip exclusive admission. Retain its high-water,
+  revision, retry/backoff, partial-progress, and unknown-commit machinery.
+- Proxy object-log PUT already happens between reservation and publication
+  transactions. Do not introduce a new upload worker merely to move that PUT.
+- Shared graph tracing already records owner completion, first acquisition,
+  reentry, and observed hold duration. Extend coverage rather than replace it.
+- Session cleanup/disposal fixes exist on the newer baseline. Preserve them.
+- A queued cache cleanup must release graph admission before waiting on cache
+  admission. Workflow entry can hold cache PinMutation before shared graph
+  admission; imposing a universal graph-before-cache order is incorrect.
+
+## First functional checkpoint (2026-11-09)
+
+Status: work in progress for early review; not ready to merge.
+
+Implemented only transaction-local JIT policy and cache-statistics no-op avoidance.
+Every owned transaction in `maintenance_admission.rs` now disables JIT on entry:
+standalone discovery, `run` discovery and protected work, and `PhysicalCleanup`.
+The physical cleanup owner keeps that local policy throughout its metadata phases
+and physical work until its actual commit/rollback; a helper return does not end
+its transaction. Later deadline refreshes do not repeat the JIT setter.
+`pack_retention/bounded.rs` covers the initial progress read, raw-page discovery,
+protected page work (including empty-page progress), and separately owned deferral
+bookkeeping. The existing budget round trip sets JIT; existing deadlines,
+admission ordering, acknowledged cleanup, disposal, and unknown-commit accounting
+are retained.
+
+Cache statistics validates configuration and effective parent ownership before a
+read-only due preflight. Idle and interval-throttled work returns `NotDue` without
+`SHARE UPDATE EXCLUSIVE`. Due work still acquires the bounded parent lock and
+revalidates ownership and rereads revision/interval eligibility before analyzing. Acknowledgement still uses
+only the captured analyzed revision, so concurrent lifecycle requests stay pending.
+The preflight never updates statistics state.
+
+Added focused real-PostgreSQL regressions for local JIT restoration on success,
+SQL failure, server timeout, and reuse of the same backend; actual maintenance
+owner callbacks also assert JIT is off. Statistics tests cover no pending revision
+and an interval-throttled pending revision under a conflicting parent maintenance
+lock, plus eligibility becoming stale while waiting for that lock. Existing due
+lock deferral, concurrent lifecycle acknowledgement, cancellation, graph/storage,
+and uncertain-commit assertions are unchanged.
+
+Not implemented: retention SQL rewrites (next checkpoint), durable cursors, log
+lifecycle changes, physical-cleanup splitting, or removal of any admission locks.
+The five task analysis documents retain their historical/proposed evidence; their
+measurements do not establish a new implementation performance result.
+
+### Validation provenance and gaps
+
+Source baseline: `8af23fc4d77ce84d661474cb6711d0db3be906d3`, with the
+uncommitted first-checkpoint source diff saved at `/tmp/lock-checkpoint-source.diff`.
+SHA-256 of that diff: `fb26d5f613ccfa4470a27bf608c420061af0a51c69a6df843d39bb5a5d87df28`.
+The diff covers the five changed Rust files only; subsequent documentation edits
+do not invalidate code-test results. Source-file hashes were checked after build
+and remain unchanged. This records uncommitted-source evidence, not tests of the
+base commit alone.
+
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+- `cargo check --all-targets --workspace`: passed without warnings on the initial
+  implementation snapshot (15m56s). This predates the final private ownership
+  recheck and additional tests; do not treat it as a final-head workspace result.
+  A full final-source rerun was stopped while waiting for Cargo's build lock to
+  keep this checkpoint scoped; final-head workspace/consumer CI remains pending.
+- `cargo clippy -p attune-common --all-targets -- -D warnings`: passed on the final
+  source (23m30s including the earlier build-lock wait). This compiles all changed
+  repository code and new tests with zero warnings.
+- `bash scripts/check-db-test-threads.sh 4`: passed.
+- `bash scripts/check-workspace-deps.sh`: failed with 58 violations. Running the
+  same script against an exported snapshot of the base crate manifests produced
+  byte-identical output and exit 1. No manifests or dependency policy were changed.
+- `bash scripts/run-rust-integration-tests.sh --test cache_repository_tests`:
+  failed during image compilation, before tests or dependency-stack startup:
+  `session_lease_tests.rs` cannot read `tests/sqlx-session/src/relay.rs`. The
+  Dockerfile copies `tests/fixtures/tls.rs` but omits that relay fixture. The
+  Dockerfile, referencing test, and fixture are unchanged from the base; no full
+  base Docker rebuild was performed. The queued final-source `--crate common
+  --filter jit` attempt was cancelled rather than repeat the same packaging
+  problem. Both runners reported that no stack was started or needed teardown.
+- Host fallback uses the documented `make db-test-setup`, with both database URLs
+  explicitly targeting a fresh owned `postgres:18-alpine` container on ephemeral
+  loopback port 38363. Because the host lacks `psql`, a temporary host shim
+  forwards psql invocations through `docker exec` to that exact owned container;
+  SQLx migration uses its mapped host port. Setup passed, with no default cluster
+  access. Direct Cargo runs each use their own `ATTUNE_TEST_RUN_ID` and four test
+  threads.
+- `ATTUNE_TEST_RUN_ID=lock-jit-host ATTUNE__DATABASE__URL=<owned URL> cargo test
+  -p attune-common --lib jit -- --nocapture --test-threads=4`: passed, 3 tests
+  (the two new JIT regressions and the existing pure recovery-jitter test), zero
+  failures/ignored; execution 50.20s after 6m09s build/lock wait.
+- `ATTUNE_TEST_RUN_ID=lock-stats-host ATTUNE__DATABASE__URL=<owned URL> cargo test
+  -p attune-common --test cache_repository_tests statistics -- --nocapture
+  --test-threads=4`: passed, 6 tests, zero failures/ignored; execution 48.75s after
+  9m12s build/lock wait. Includes both new tests and existing dry-run, due-lock
+  deferral, concurrent revision, and server cancellation cases. PostgreSQL emitted
+  slow-query warnings for template/clone setup and clone removal (some removals
+  took about 40s); these were completed teardown operations, not test failures.
+- `ATTUNE_TEST_RUN_ID=lock-collector-host ATTUNE__DATABASE__URL=<owned URL> cargo
+  test -p attune-common --lib repositories::pack_retention::bounded::tests:: --
+  --nocapture --test-threads=4`: passed, 28 tests, zero failures/ignored, 82.24s.
+  Includes fresh pin/identity revalidation, raw-page wrapping, discovery timeout,
+  queued deadline isolation, empty sweeps, and lost commit acknowledgements.
+- `ATTUNE_TEST_RUN_ID=lock-storage-host ATTUNE__DATABASE__URL=<owned URL> cargo test
+  -p attune-common --test storage_maintenance_repository_tests bounded_admission::
+  -- --nocapture --test-threads=4`: passed, 16 tests, zero failures/ignored, 41.99s.
+  PhysicalCleanup, rollback, stale identity, physical-authority withholding and
+  unknown-commit assertions were retained.
+- `ATTUNE_TEST_RUN_ID=lock-evidence-host ATTUNE__DATABASE__URL=<owned URL> cargo test
+  -p attune-common --test file_evidence_retention_tests bounded_admission:: --
+  --nocapture --test-threads=4`: passed, 15 tests, zero failures/ignored, 65.14s.
+- After all invocations exited, the owned server had zero per-test or migration
+  database clones before janitor recovery. Its exact container ID and anonymous
+  volumes were then removed. No owned test infrastructure remains running.
+
+Remaining review/CI gaps: final-source workspace-wide checks, full cache/graph and
+consumer suites, PostgreSQL 16 coverage, Docker runner fixture packaging, and
+required CI. The dependency-policy failures above are reproducible on the base.
+This checkpoint is saved progress for Astra review, not merge readiness.
+
+No migrations, SQLx query macros, or public API contracts changed; schema-prepare
+and generated-client updates are not applicable. No latency, production workload,
+PostgreSQL 16, or full service/broker acceptance result is claimed.
+
+## Slice 1: cheaper bounded maintenance, with the same locking contract
+
+This is the strongest first implementation candidate: it reduces existing
+exclusive occupancy and database work without changing ownership semantics.
+
+| Source and entry points | Specific change |
+| --- | --- |
+| [maintenance_admission.rs](../../crates/common/src/repositories/maintenance_admission.rs): configure, probe, run, PhysicalCleanup metadata | Set transaction-local jit off at owned transaction entry. Keep remaining server statement budgets, acknowledged cleanup, and socket quarantine. Avoid adding another setting query before every SQL statement if one transaction-entry setting suffices. |
+| [pack_retention/bounded.rs](../../crates/common/src/repositories/pack_retention/bounded.rs): page, budget_with_lock_timeout, defer | Cover discovery, protected work, and independently owned bookkeeping transactions. Preserve the existing raw-page protocol and do not count JIT disablement as a replacement for query rewriting. |
+| [pack_retention/queries.rs](../../crates/common/src/repositories/pack_retention/queries.rs): delete_sql, RELEASE_PINS | Separate cheap age/active/newest protection from expensive nested JSON dependency checks. Use the correlated existence-query shape validated in the retention investigation where a planner barrier is needed. Preserve every pin source, candidate ID/xmin guard, ID tie-break, and delete limit. SQL predicate order alone does not force evaluation order. |
+| [maintenance.rs](../../crates/common/src/repositories/maintenance.rs): expired_artifact_version_predicate, expired_artifact_candidates_bounded, claim_expired_artifact_version | Separate retention eligibility from evidence eligibility. Use an explicit materialized prefilter before file_evidence_version_eligible. Replace count-all-newer with a bounded existence threshold, preserving positive-limit and ready-version semantics. Reuse the exact eligibility logic in authoritative claim revalidation. |
+
+The first artifact rewrite can preserve the existing candidate interface and
+ordering. It still is not a bounded raw scan merely because its output has LIMIT.
+For a subsequent bounded implementation, add an internal raw-page result with a
+cursor, frozen pass upper bound, scanned-row count, and eligible rows. Store
+durable progress per artifact-cleanup scan, independently of the release phases.
+Advance on raw scanned rows, including pages containing no eligible candidates;
+wrap so formerly pinned or changed rows are revisited. Revalidate identity and
+current policy under reclamation admission before deletion.
+
+Use the existing [retention query plan](bounded-retention-query-optimization.md)
+for prototype SQL and comparison fixtures. Do not adopt its measured savings as
+new performance evidence without rerunning against the implementation baseline.
+
+Migration: none for the initial query/setting rewrite; a durable artifact cursor
+may require a forward migration. No retention policy or authorization change.
+
+## Slice 2: separate object-log verification from publication
+
+### Refactor the route before changing its transaction lifetime
+
+The PR #31 seal route in
+[internal_files.rs](../../crates/api/src/routes/internal_files.rs), seal_log_stream,
+does authorization, artifact/version/stream locking, grant checks, segment
+GET/hash/frame verification, final evidence insertion, seal, and Ready publication
+inside one transaction. Its publication code explicitly relies on rows having
+remained locked since the first validation.
+
+First extract the byte-verification loop into an internal helper that accepts
+only exact segment metadata, immutable proof inputs, and a storage reader. Return
+size, concatenated SHA-256, and authenticated frame-completion results. Its type
+must not accept a PgConnection, Transaction, or authorization effect object.
+Keep the current outer transaction while validating this behavior-preserving
+extraction. This step alone removes no locks.
+
+Next introduce private lifecycle operations, with names such as:
+
+- prepare_close: fresh authorization, exact owner/frontier selection, and durable
+  input protection in a short transaction.
+- verify_close: full pinned-object reads and frame verification without any
+  checked-out database connection.
+- finish_close: fresh authorization and comparison followed by atomic final
+  evidence, seal, Ready, and close-resolution publication in another transaction.
+
+An internal PreparedLogClose value should bind version, stream, close revision,
+producer/attempt where applicable, requested truncation, next sequence, byte
+count, proof identity, and exact ordered segment identities. A VerifiedLogClose
+must be constructible only by successful full verification and bound to that
+same input identity. These are proposed internal types, not new public formats.
+
+Do not carry authorize_version_mutation's effect across transactions. Call the
+current source/worker/origin authorization helpers again in finish_close; compare
+current attempt, assignment, body state, frontier, proof, and deadlines. Existing
+ensure_fresh_on calls alone do not establish all those relationships anew.
+
+### Durable changes required before releasing the prepare transaction
+
+The minimal candidate is close state associated with the existing stream:
+a monotonically changing close revision, fixed frontier/input identity, requested
+truncation, bound producer identity, and unresolved/resolved status. Whether this
+uses internal stream columns or one close row is a schema choice still requiring
+review. Prefer the smaller lifecycle extension; do not add a second generic
+distributed job scheduler or duplicate worker authority.
+
+Keep public sealed false and the body Pending during verification. Do not insert
+runtime_log_final_manifest until verification and final publication succeed.
+Preserve the v1 encrypted-log format and concatenated-stream SHA-256 contract.
+
+Required participants are broader than the seal handler:
+
+| Participant | Required change |
+| --- | --- |
+| [log_stream.rs repository](../../crates/common/src/repositories/log_stream.rs): commit_segment, seal, seal_shared_file, lock | Add internal lifecycle reads/transitions. A fresh append cannot cross a closed frontier. Exact already-accepted retries remain idempotent. Initially retain current metadata locks to isolate the lifetime change from lock removal. |
+| internal_files.rs: authorize_direct_log_segment_upload, complete_direct_log_segment_upload, reserve_proxy_log_upload, commit_log_segment | All upload admission and publication paths must consult the same close state under stream coordination. A request admitted earlier must settle before prepare or be prevented from changing the selected frontier. |
+| [artifact_upload_grant.rs](../../crates/common/src/repositories/artifact_upload_grant.rs) and [blob_store.rs](../../crates/common/src/blob_store.rs) | Supply durable ownership/settlement for every physical PUT, including duplicates, staging/multipart work, and late completion. active_log_segment_exists currently only counts issued grants whose settle_until is in the future; that is insufficient settlement proof. |
+| Forward SQL migration for log_segment | Enforce immutable accepted segment identity/membership during unresolved close. The current create-only table comment is not an UPDATE guard. Retain exact provider-version reads. |
+| [models.rs](../../crates/common/src/models.rs), internal repository projections | Map new internal state without accidentally exposing lifecycle tokens or proof material through the serialized public LogStream model. Update relevant column constants and SQLx metadata if required. |
+| [storage_maintenance.rs](../../crates/common/src/repositories/storage_maintenance.rs), [maintenance.rs](../../crates/common/src/repositories/maintenance.rs), [file_evidence_retention.rs](../../crates/common/src/repositories/file_evidence_retention.rs), object deletion predicates and SQL guards | An unresolved close must veto metadata deletion, cleanup-state transition, segment deletion/replacement, and physical deletion, including parent-artifact cascades. Existing file-evidence owners cannot be fabricated for logs lacking authenticated origins. |
+| Worker [log writer](../../crates/worker/src/runtime/log_writer.rs), workflow [outbox](../../crates/common/src/repositories/workflow_log_outbox.rs), sensor producers | Preserve each producer's existing identity and bounded ordered delivery. Honor the same server close protocol; do not assume every producer has worker-delivery fields. |
+
+Upload settlement is a blocking design prerequisite for claiming the complete
+physical-cleanup guarantee. A final manifest comparison alone detects changed
+metadata but does not settle an old PUT. Reuse protected-file atomic/fencing
+infrastructure only after its owner/lifetime requirements are satisfied for logs.
+Preserve the counterexamples in the [seal claims review](object-log-seal-claims.md).
+
+On cancellation, the unresolved close input remains protected. A bounded recovery
+path may retry the same immutable input with fresh allowed authority, or resolve
+it as abandoned after proving physical settlement. Deadline expiry alone cannot
+remove its cleanup protection. An identical concurrent close may wait for the
+existing result outside any database transaction; do not return a new permanent
+conflict for the identical-retry contract supplied by PR #31.
+
+Migration: required for durable lifecycle and guards. This is a protocol change,
+not a mechanical relocation of the GET loop.
+
+### Remove redundant metadata locking only afterward
+
+LogStreamRepository::lock currently takes the per-version advisory key and then
+the stream row FOR UPDATE. Audit all users, including workflow_log_outbox,
+storage_maintenance, and create_with_backend, before selecting one coordination
+primitive. Existing-row writes can potentially use the row lock alone; stream
+creation needs unique insert/conflict handling for the missing-row case.
+
+Parent artifact locks cannot simply be dropped: find_by_id_for_update participates
+in version allocation, final metadata projection, and deletion ordering. Separate
+stream-frontier writes from parent projection, then prove two independent versions
+of one parent can publish safely. The final retention trigger still updates the
+parent implicitly even after an explicit advisory lock is removed.
+
+Keep shared_file append/seal on its existing safe path until an immutable
+snapshot, open-descriptor fencing, committed-prefix visibility, and cross-process
+flock protocol are established. A backend-specific exception is preferable to
+shipping a partial proof under a shared abstraction.
+
+## Slice 3: remove physical deletion from graph transactions
+
+Two distinct mechanisms need changes; they must not be conflated.
+
+### Artifact and legacy snapshot deletion
+
+[PhysicalCleanup](../../crates/common/src/repositories/maintenance_admission.rs)
+owns an exclusive graph transaction through physical deletion.
+[artifact_cleanup.rs](../../crates/supervisor/src/artifact_cleanup.rs) calls
+claim_expired_artifact_version, awaits artifact_transport.delete_file, then deletes
+metadata and refreshes the parent. The claim helper currently selects/locks the
+candidate; its name does not mean it commits a durable deletion reservation.
+[Supervisor legacy snapshot cleanup](../../crates/supervisor/src/main.rs),
+delete_expired_legacy_snapshots, explicitly notes that no durable filesystem
+claim exists and waits for deletion without a timeout while retaining the gate.
+
+Replace this only after a durable cleanup obligation can commit before I/O.
+Bind exact version/path/provider identity and a generation, deny new references
+and conflicting publication, retain required evidence, and record completion or
+retry after restart. Paths must be fenced against reuse: a cancelled unlink that
+later resumes must never delete replacement content. Existing cleanup_claimed,
+deleting, staging guards, evidence obligations, and ledger state should be reused
+where they actually cover that identity; do not introduce duplicate state blindly.
+
+The target sequence is claim and commit, delete without a connection, then fresh
+identity-checked finalization and parent refresh. After a committed claim, a
+failed finalization does not roll back the claim or resurrect deleted bytes.
+Recover unknown outcomes explicitly. Remove PhysicalCleanup only when every
+production caller has moved to the new protocol; until then keep its cancellation
+and confirmed-rollback protections intact.
+
+### Pack release tree deletion
+
+[PackRetentionRepository::cleanup_unreferenced](../../crates/common/src/repositories/pack_retention.rs)
+holds SHARE on the whole pack_release table during remove_release_tree.
+Add per-content publication/cleanup ownership, shared by this method and
+[PackReleaseRepository::create_or_get_with_policy](../../crates/common/src/repositories/pack_release.rs).
+The content identity includes validated storage location, not just a row ID.
+
+[PackStorage::publish_release](../../crates/common/src/pack_registry/storage.rs)
+can reuse an existing content-addressed directory before the DB transaction.
+Therefore moving only the final INSERT behind a cleanup check is insufficient.
+Keep immutable staging available until publication is confirmed; a publisher
+must detect cleanup and retry installation safely rather than refer to a removed
+directory. Audit worker-side pack materialization/removal separately because its
+storage roots and readers may have a different ownership scope.
+
+A proposed per-content lifecycle must cover publishing, referenced, deleting,
+and absent/retry states with durable recovery, or provide an equally strong
+filesystem quarantine protocol. Recursive deletion belongs outside transactions.
+Preserve existing digest/path validation and shared-digest reference checks.
+
+Migration: likely required for durable filesystem/content ownership. The exact
+representation is a design gate; no safe one-line lock removal was identified.
+
+## Slice 4: avoid strong locks on maintenance no-ops
+
+### Cache statistics
+
+In [CacheStorageRepository::refresh_statistics](../../crates/common/src/repositories/cache/storage.rs),
+check whether a revision is due before requesting SHARE UPDATE EXCLUSIVE.
+Preserve existing ownership/configuration validation. If due, acquire the bounded
+parent lock and reread requested/completed revision and interval eligibility;
+only acknowledge the revision actually analyzed. An idle preflight must not
+consume a concurrent request. No new durable state is needed.
+
+### Already-present native partitions
+
+[PartitionRepository::ensure_day](../../crates/common/src/repositories/native_maintenance/partitions.rs)
+acquires exclusive graph admission before native_partition_ensure_day. Moving
+only the SQL function's already-present check would still retain that broad gate.
+Introduce a separate validated read/preflight path before graph admission.
+For an existing day, protect required relations with compatible read locks and
+validate registry, physical bounds, ownership, and default-partition layout using
+the existing SQL validation helpers. Do not return success from registry presence
+alone. End the read transaction before any repair path requests exclusive graph
+and stronger table locks; avoid lock upgrades behind earlier relation locks.
+
+If missing or repair is required, use the existing bounded authoritative repair
+transaction and recheck under its locks. Actual row movement/DDL remains atomic
+and retains its necessary locks. The existing reconciler already discovers work;
+measure how often an already-present fast path is exercised before ranking its
+benefit above other changes.
+
+Migration: a forward function change/helper may be needed; never edit applied
+migration bytes as a side effect of this optimization.
+
+## Slice 5: narrow sensor admission incrementally
+
+Add explicit scoped operations to
+[SensorAdmissionRepository](../../crates/common/src/repositories/sensor_admission.rs).
+A viable candidate is hierarchical coordination:
+
+1. Keep the existing global key exclusive for topology/runtime/bulk mutations
+   whose complete sensor footprint cannot be fixed safely in advance.
+2. A local mutation takes that key shared, then exclusive per-sensor admission
+   for its complete affected set in stable order, before source/target row locks.
+3. A sensor event/workload check takes global shared admission and shared admission
+   for its exact sensor, then rechecks the current workload fence and membership.
+
+This allows a change to sensor A to coexist with an event from sensor B while
+retaining a safe fallback for unknown or changing footprints. It still requires
+proof that every relevant mutation participates; a local writer must never
+discover it needs global exclusive admission after taking shared/row locks.
+
+Call sites include events, rules, triggers, runtimes, packs, cache request paths,
+auth, inquiry responses/callbacks, and sensor_workload_admission. Some generic
+request paths cannot name one sensor and must retain their broader fence. For
+rule/trigger retargeting, include old and new sensors and revalidate the mapping
+under admission. Cross-pack references and newly inserted dependencies are part
+of footprint correctness. Do not blindly replace lock_mutations with hash(id).
+
+Preparse immutable deployment/configuration input before admission, but preserve
+fresh authorization and atomic activation. Introduce narrower operations first;
+keep the old broad method for unsupported mutation categories until coverage
+proves they can move.
+
+Migration: may be unnecessary for advisory keys, but revision-based alternatives
+would require durable revisions and conditional publication. The hierarchical
+protocol is a candidate, not yet an approved complete access matrix.
+
+## Slice 6: reduce repeated authority work; defer broad cache gate removal
+
+In [runtime_authority.rs](../../crates/common/src/repositories/runtime_authority.rs),
+lock_policy_with_deadline loads/validates a dependency before the visited-set
+check on the next iteration. Deduplicate records and their validation within
+that traversal. Verify every incoming pin against the memoized record and merge
+all required deadline/approval fences; skipping a repeated edge's verification
+would be incorrect. Start with local traversal state rather than a global cache
+or a reusable authority object spanning requests/transactions. Retain ordered
+initial reads and locked rereads of mutable authority.
+
+For cache, first separate the purposes currently bundled into protect_transaction:
+quota admission, pin lifecycle, namespace/generation mutation, and relation
+lifetime. Do not remove its non-Read global gate in the first optimization.
+COUNT-based namespace/partition caps, global/owner byte counters, refresh policy,
+and retained-iteration caps need equivalent atomic accounting. A short reservation
+design must account for committed plus outstanding usage, cancellation, rollback,
+recovery, and trigger updates without double charging. Existing singleton byte
+UPDATEs otherwise remain a bottleneck after removing the advisory lock.
+
+Workflow session locks across broker publication are another independent later
+slice: persist delivery ownership/checkpoints before releasing the lock, then
+publish and reconcile idempotently outside it. Keep current claims and session
+disposal until that delivery protocol replaces them. Neither cache quota redesign
+nor workflow publication redesign is a prerequisite for slices 1–4.
+
+## Suggested delivery order
+
+1. Reconcile baseline with PR #31; add only missing phase measurements and the
+   tests identified in the companion audit.
+2. Ship transaction-local JIT/query-shape fixes and cache-statistics no-op
+   avoidance as independently reviewed changes. Preserve existing lock protocols.
+3. Specify and test close-input immutability, upload settlement, and cleanup veto;
+   then split object-log seal verification. Remove redundant locks afterward.
+4. Introduce durable physical-cleanup ownership and migrate each caller before
+   removing its transaction fence. Partition fast-path work can proceed separately.
+5. Narrow sensor admission with a complete participant matrix; optimize authority
+   traversal locally. Reconsider cache/workflow gate redesign using measured waits.
+
+The acceptance evidence is successful recovery and correct outcomes under forced
+interleavings, plus lower lock/transaction tails under the same workload. At the original document-only analysis stage, no application tests were run.
+Source/link and whitespace checks were its validation; first-checkpoint results
+are recorded above. The companion test audit remains a predictive inventory for
+later milestones, rather than evidence those milestones have passed.
