@@ -281,7 +281,7 @@ metadata only. They never attempt reclamation under a producer's source locks,
 even when a DELETE would match zero rows. Version-count limits are therefore
 eventually enforced by the bounded cleanup cycle, not synchronously by INSERT.
 
-1. Visit a bounded raw `(created, id)` page, then select its expiration- and
+1. Visit a bounded raw insertion-ID page, then select its expiration- and
    evidence-eligible versions. Persist discovery progress before returning it.
 2. Start a separate transaction with exclusive graph admission before any
    source/target lock. Recheck the current retention policy and version frontier;
@@ -807,8 +807,8 @@ This work is independent of graph-admission lock ordering and reclamation budget
 
 ### Expired-artifact discovery windows
 
-`artifact_retention_discovery` stores an independent `(created, id)` cursor and
-frozen pass upper bound. The composite index supports oldest-first raw visits,
+`artifact_retention_discovery` stores an independent insertion-ID cursor and
+frozen maximum-ID pass bound. The primary-key index supports bounded raw visits,
 including timestamp ties; this state does not reuse release-phase or object-body
 cursors. Each call visits at most the configured batch size, capped at 256,
 before retention/evidence predicates. The raw reservation commits before a
@@ -816,7 +816,9 @@ separate bounded eligibility read, sharing one absolute page deadline. A failed
 eligibility read cannot trap later pages; the skipped reservation is revisited
 on wrap. It returns every eligible row from that
 raw page, with no smaller output limit. Exact reporting count/find APIs retain
-their global candidate set and oldest-first ordering.
+their global candidate set and oldest-first ordering. Private maintenance traversal
+is by insertion ID, with eligible rows sorted oldest-first within each raw page.
+Backdated or future-created arrivals cannot extend a frozen pass.
 
 Even a zero-eligible page advances durable progress and requests the existing
 object-retention continuation cadence (one second after successful progress;

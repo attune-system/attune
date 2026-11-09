@@ -440,6 +440,128 @@ async fn artifact_discovery_competing_scanners_and_cancelled_progress() {
 }
 
 #[tokio::test]
+async fn artifact_backdated_arrivals_cannot_starve_wrap_after_failed_reservation() {
+    let db = setup_db().await;
+    let id = artifact(db.pool()).await;
+    sqlx::query("UPDATE artifact SET retention_policy='days',retention_limit=1 WHERE id=$1")
+        .bind(id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let initial: Vec<i64> = sqlx::query_scalar(
+        "INSERT INTO artifact_version(artifact,version,created) VALUES
+        ($1,1,'2020-01-01'),($1,2,'2020-01-02'),($1,3,'2099-01-01') RETURNING id",
+    )
+    .bind(id)
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    sqlx::raw_sql("ALTER FUNCTION file_evidence_version_eligible(BIGINT) RENAME TO owned_real_eligibility;
+        CREATE FUNCTION file_evidence_version_eligible(v BIGINT) RETURNS BOOLEAN LANGUAGE plpgsql STABLE AS $$ BEGIN RAISE EXCEPTION 'owned skipped reservation'; END $$;")
+        .execute(db.pool()).await.unwrap();
+    let budget = MaintenanceBudget::default();
+    let skipped =
+        MaintenanceRepository::expired_artifact_candidates_bounded(db.pool(), 2, &budget).await;
+    sqlx::raw_sql("DROP FUNCTION file_evidence_version_eligible(BIGINT); ALTER FUNCTION owned_real_eligibility(BIGINT) RENAME TO file_evidence_version_eligible")
+        .execute(db.pool()).await.unwrap();
+    assert!(skipped.is_err());
+    let mut completed = false;
+    // The former timestamp frontier remains pending forever: every call can
+    // consume two new Jan-3 rows before it reaches the future-created high row.
+    for wave in 0..4 {
+        sqlx::query("INSERT INTO artifact_version(artifact,version,created) VALUES($1,$2,'2020-01-03'),($1,$3,'2020-01-03')")
+            .bind(id).bind(4 + wave * 2).bind(5 + wave * 2).execute(db.pool()).await.unwrap();
+        let page =
+            MaintenanceRepository::expired_artifact_candidates_bounded(db.pool(), 2, &budget)
+                .await
+                .unwrap();
+        assert!(page.scanned <= 2);
+        assert!(page.versions.iter().all(|v| v.id <= initial[2]));
+        if !page.pending {
+            completed = true;
+            break;
+        }
+    }
+    assert!(
+        completed,
+        "continuous backdated arrivals must not extend frozen pass membership"
+    );
+    let revisited =
+        MaintenanceRepository::expired_artifact_candidates_bounded(db.pool(), 2, &budget)
+            .await
+            .unwrap();
+    assert_eq!(
+        revisited.versions.iter().map(|v| v.id).collect::<Vec<_>>(),
+        initial[..2]
+    );
+    assert!(revisited.pending, "the next pass includes the new arrivals");
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn artifact_id_frontier_forward_migration_restarts_advisory_progress_without_losing_versions()
+{
+    let db = setup_db().await;
+    let id = artifact(db.pool()).await;
+    sqlx::query("INSERT INTO artifact_version(artifact,version,created) VALUES($1,1,'2099-01-01'),($1,2,'2020-01-01')")
+        .bind(id).execute(db.pool()).await.unwrap();
+    // Rebuild only this isolated fixture's original discovery table, then run
+    // the actual forward SQL against populated timestamp-cursor progress.
+    sqlx::query("DROP TABLE artifact_retention_discovery")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../../../migrations/20261109000001_artifact_retention_discovery.sql"
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE artifact_retention_discovery SET
+        last_created='2020-01-01',last_id=(SELECT max(id) FROM artifact_version),
+        high_created='2099-01-01',high_id=(SELECT min(id) FROM artifact_version)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../../../migrations/20261109000002_artifact_discovery_id_frontier.sql"
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let state: (Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT last_id,high_id FROM artifact_retention_discovery")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(state, (None, None));
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact_version WHERE artifact=$1")
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+    let old_index: Option<String> =
+        sqlx::query_scalar("SELECT to_regclass('idx_artifact_version_retention_cursor')::text")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(old_index.is_none());
+    let page = MaintenanceRepository::expired_artifact_candidates_bounded(
+        db.pool(),
+        1,
+        &MaintenanceBudget::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.scanned, 1);
+    assert!(page.pending);
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
 async fn artifact_raw_hard_cap_crosses_long_pinned_prefix_and_revisits_unpins() {
     let db = setup_db().await;
     let id = artifact(db.pool()).await;
@@ -546,11 +668,13 @@ async fn artifact_discovery_late_committing_older_row_is_revisited_after_wrap() 
         .execute(db.pool())
         .await
         .unwrap();
-    sqlx::query("INSERT INTO artifact_version(artifact,version,created) SELECT $1,n,NOW()-interval '2 days'+n*interval '1 second' FROM generate_series(1,3) n")
-        .bind(a).execute(db.pool()).await.unwrap();
     let mut writer = db.pool().begin().await.unwrap();
     let late_id:i64=sqlx::query_scalar("INSERT INTO artifact_version(artifact,version,created) VALUES($1,1,NOW()-interval '3 days') RETURNING id")
         .bind(late).fetch_one(&mut *writer).await.unwrap();
+    // Allocate the hidden ID before the committed rows so it falls behind the
+    // insertion-ID cursor, not merely behind their creation timestamps.
+    sqlx::query("INSERT INTO artifact_version(artifact,version,created) SELECT $1,n,NOW()-interval '2 days'+n*interval '1 second' FROM generate_series(1,3) n")
+        .bind(a).execute(db.pool()).await.unwrap();
     let budget = MaintenanceBudget::default();
     let page = MaintenanceRepository::expired_artifact_candidates_bounded(db.pool(), 2, &budget)
         .await
@@ -567,7 +691,7 @@ async fn artifact_discovery_late_committing_older_row_is_revisited_after_wrap() 
         .unwrap();
     assert_eq!(
         page.versions[0].id, late_id,
-        "created/id ordering must revisit late older commits, independently of ID allocation order"
+        "wrap must revisit a late commit whose insertion ID is behind the cursor"
     );
     db.cleanup().await.unwrap();
 }

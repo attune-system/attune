@@ -225,8 +225,10 @@ impl MaintenanceRepository {
 
     /// Scan at most `limit` raw rows (hard capped at 256), before retention or
     /// evidence evaluation. No separate output cap can discard eligible rows.
-    /// Each pass freezes its greatest (created,id); a completed pass wraps on
-    /// the next invocation, revisiting pins, policy changes and late commits.
+    /// Each pass freezes its maximum insertion ID and traverses the primary key.
+    /// Backdated arrivals cannot extend it. Eligible rows within each raw page
+    /// are oldest-first; only the reporting APIs promise global oldest-first.
+    /// A completed pass wraps, revisiting pins, policy changes and late commits.
     pub async fn expired_artifact_candidates_bounded(
         pool: &PgPool,
         limit: i64,
@@ -234,32 +236,31 @@ impl MaintenanceRepository {
     ) -> Result<ArtifactDiscoveryPage> {
         let deadline = Instant::now() + budget.page_timeout;
         let (ids, scanned, pending) = maintenance_admission::discovery(pool, budget, deadline, move |conn| Box::pin(async move {
-            type Cursor = (DateTime<Utc>, i64);
-            type ScanState = (Option<DateTime<Utc>>, Option<i64>, Option<DateTime<Utc>>, Option<i64>);
-            let (mut last_created, mut last_id, mut high_created, mut high_id): ScanState =
-                sqlx::query_as("SELECT last_created,last_id,high_created,high_id FROM artifact_retention_discovery WHERE singleton FOR UPDATE")
+            let (mut last_id, mut high_id): (Option<i64>, Option<i64>) =
+                sqlx::query_as("SELECT last_id,high_id FROM artifact_retention_discovery WHERE singleton FOR UPDATE")
                     .fetch_one(&mut *conn).await?;
-            if high_id.is_none() || (last_created,last_id) == (high_created,high_id) {
-                let high: Option<Cursor> = sqlx::query_as("SELECT created,id FROM artifact_version ORDER BY created DESC,id DESC LIMIT 1")
-                    .fetch_optional(&mut *conn).await?;
-                last_created = None;
+            if high_id.is_none() || last_id == high_id {
+                high_id = sqlx::query_scalar("SELECT max(id) FROM artifact_version")
+                    .fetch_one(&mut *conn).await?;
                 last_id = None;
-                high_created = high.map(|v| v.0);
-                high_id = high.map(|v| v.1);
             }
-            // The index-supported raw page is materialized before either expensive
-            // predicate, including when every row is unexpired or pinned.
-            let raw: Vec<Cursor> = sqlx::query_as("SELECT created,id FROM artifact_version
-                WHERE (created,id)>(COALESCE($1::timestamptz,'-infinity'::timestamptz),COALESCE($2::bigint,'-9223372036854775808'::bigint))
-                  AND (created,id)<=($3,$4) ORDER BY created,id LIMIT $5")
-                .bind(last_created).bind(last_id).bind(high_created).bind(high_id)
-                .bind(limit.clamp(1,256)).fetch_all(&mut *conn).await?;
-            let ids: Vec<i64> = raw.iter().map(|v| v.1).collect();
-            let next = raw.last().copied();
-            let (next_created,next_id) = next.map(|v| (Some(v.0),Some(v.1))).unwrap_or((high_created,high_id));
-            sqlx::query("UPDATE artifact_retention_discovery SET last_created=$1,last_id=$2,high_created=$3,high_id=$4 WHERE singleton")
-                .bind(next_created).bind(next_id).bind(high_created).bind(high_id).execute(conn).await?;
-            Ok((ids, raw.len(), (next_created,next_id)!=(high_created,high_id)))
+            // Separate first/continuation shapes keep the primary-key bounds
+            // indexable under generic plans, with no rejected timestamp prefix.
+            // No sentinel excludes the minimum signed BIGINT on a first page.
+            let ids: Vec<i64> = if let Some(last) = last_id {
+                sqlx::query_scalar("SELECT id FROM artifact_version WHERE id>$1 AND id<=$2 ORDER BY id LIMIT $3")
+                    .bind(last).bind(high_id).bind(limit.clamp(1,256))
+                    .fetch_all(&mut *conn).await?
+            } else {
+                sqlx::query_scalar("SELECT id FROM artifact_version WHERE id<=$1 ORDER BY id LIMIT $2")
+                    .bind(high_id).bind(limit.clamp(1,256))
+                    .fetch_all(&mut *conn).await?
+            };
+            let next_id = ids.last().copied().or(high_id);
+            sqlx::query("UPDATE artifact_retention_discovery SET last_id=$1,high_id=$2 WHERE singleton")
+                .bind(next_id).bind(high_id).execute(conn).await?;
+            let scanned = ids.len();
+            Ok((ids, scanned, next_id!=high_id))
         })).await?;
         // Reserve before expensive predicates: a persistent eligibility timeout
         // must not trap later raw pages. Reservations are advisory and revisited

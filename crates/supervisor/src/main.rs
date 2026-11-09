@@ -2542,8 +2542,11 @@ mod tests {
                 delay >= Duration::from_secs(1) && delay < Duration::from_secs(60),
                 "pending raw discovery delay: {delay:?}"
             );
-            let (last,pending): (i64,bool) = sqlx::query_as("SELECT last_id,(last_created,last_id)<(high_created,high_id) FROM artifact_retention_discovery")
-                .fetch_one(database.pool()).await.unwrap();
+            let (last, pending): (i64, bool) =
+                sqlx::query_as("SELECT last_id,last_id<high_id FROM artifact_retention_discovery")
+                    .fetch_one(database.pool())
+                    .await
+                    .unwrap();
             let count: i64 =
                 sqlx::query_scalar("SELECT count(*) FROM artifact_version WHERE id<=$1")
                     .bind(last)
@@ -2568,6 +2571,41 @@ mod tests {
                 .unwrap()
                 .next_due;
         }
+        // Finish the seventh raw row, then verify the normal cadence and the
+        // first page of the next pass instead of stopping while still pending.
+        service
+            .run_retention_cycle_at(SupervisorCycleReason::Scheduled, clock)
+            .await
+            .unwrap();
+        let (last, high): (i64, i64) =
+            sqlx::query_as("SELECT last_id,high_id FROM artifact_retention_discovery")
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(last, high);
+        let statuses = ScheduleRepository::status(database.pool()).await.unwrap();
+        let next = statuses
+            .iter()
+            .find(|s| s.job == MaintenanceJob::ObjectRetention)
+            .unwrap()
+            .next_due;
+        assert!(next >= clock + ChronoDuration::seconds(retention.check_interval_seconds as i64));
+        service
+            .run_retention_cycle_at(SupervisorCycleReason::Scheduled, next)
+            .await
+            .unwrap();
+        let (last, pending): (i64, bool) =
+            sqlx::query_as("SELECT last_id,last_id<high_id FROM artifact_retention_discovery")
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        let visited: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact_version WHERE id<=$1")
+            .bind(last)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(visited, 2);
+        assert!(pending);
         drop(service);
         database.cleanup().await.unwrap();
     }

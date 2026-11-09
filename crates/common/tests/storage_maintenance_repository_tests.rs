@@ -1249,7 +1249,12 @@ async fn expiration_prefilter_matches_count_reference_and_claim_rechecks_policy(
             break;
         }
     }
-    assert_eq!(discovered, expected);
+    // Private maintenance traversal is insertion-ID bounded. Reporting retains
+    // global oldest-first order; the complete pass must find the same set once.
+    discovered.sort_unstable();
+    let mut expected_set = expected.clone();
+    expected_set.sort_unstable();
+    assert_eq!(discovered, expected_set);
     let candidate = &found[0];
     // Policy mutation between discovery and claim must invalidate the advisory
     // candidate, even though its physical identity has not changed.

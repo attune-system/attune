@@ -360,7 +360,7 @@ Validation logs and the source diff remain in /tmp/attune-lock-review-eade_5to.
 These focused results do not resolve the earlier timing failures or replace
 final-head CI and affected-consumer validation.
 
-## Milestone 3: durable bounded artifact discovery
+## Milestone 3: durable bounded artifact discovery (initial checkpoint)
 
 Implemented in this worktree after `9c832ca9` (plus isolated test-guard correction
 `d78b720f`): a forward migration adds independent artifact discovery state and
@@ -544,6 +544,34 @@ Status remains **work in progress for parent Astra review**, not merge readiness
 Final-head CI, production-scale performance and the previously disclosed Docker
 relay fixture omission / 58 unchanged base-manifest dependency-policy violations
 remain gaps. PR31 and later seal/cleanup/sensor/cache protocols remain separate.
+
+## Milestone 3 P2 correction: bound membership by insertion ID
+
+Astra found that the timestamp tuple at `ea422e3f` did not freeze membership:
+a future-created high row lets arbitrarily many higher-ID backdated arrivals
+enter between the cursor and high tuple, indefinitely preventing wrap. That
+checkpoint is not accepted as complete despite its scoped passing runs above.
+
+The correction freezes the maximum visible insertion ID and visits primary-key
+pages by ID. Separate initial and continuation SQL shapes keep both bounds
+indexable under generic plans, without filtering an arbitrarily large timestamp
+prefix or excluding the minimum signed ID through a sentinel. Eligible rows are
+still oldest-first within each raw page; global reporting count/find ordering is
+unchanged. Whole-pass tests compare exact candidate sets rather than assuming
+private pages concatenate into globally timestamp-ordered output.
+
+A new forward migration restarts advisory progress, removes the timestamp
+columns and unused maintenance composite index, and adds the ID-state invariants.
+The original migration bytes remain intact. A populated old-state migration
+fixture verifies artifact versions survive and discovery safely restarts.
+
+The deterministic P2 regression reserves and skips A/B after eligibility failure,
+then inserts backdated pairs before a future-created high row on every call. The
+original pass must finish, and the next pass must revisit A/B. The late-commit
+fixture now allocates its uncommitted ID before the visible rows so it really
+falls behind the ID cursor. The scheduler fixture is extended through its final
+page, normal cadence, and the next pass. Validation is pending; no new passing
+results are claimed here. Earlier timing failures remain unclassified.
 
 ## Slice 1: cheaper bounded maintenance, with the same locking contract
 
