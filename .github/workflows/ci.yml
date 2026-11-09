@@ -554,7 +554,8 @@ jobs:
               exit 1
               ;;
           esac
-          curl -sSfL \
+          curl -sSfL --retry 3 --retry-delay 2 \
+            --connect-timeout 10 --max-time 30 \
             -o /tmp/gitleaks.tar.gz \
             "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_${ARCH}.tar.gz"
           tar -xzf /tmp/gitleaks.tar.gz -C "$HOME/bin" gitleaks
