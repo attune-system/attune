@@ -1073,3 +1073,110 @@ async fn runtime_log_download_audit_requires_full_authorized_eof() -> Result<()>
     assert_eq!(AuditRepository::search(&ctx.pool, &filters).await?.len(), 1);
     ctx.cleanup().await
 }
+
+#[tokio::test]
+async fn runtime_log_http1_download_reaches_audited_eof_for_nonempty_and_empty_bodies() -> Result<()>
+{
+    use attune_common::audit::{AuditEventFilters, AuditRepository};
+    use axum::http::{header, Version};
+    use tokio_util::sync::CancellationToken;
+
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
+    grant_artifacts(&ctx).await?;
+    let action_ref = managed_fixture::action_pack(&ctx).await?;
+    let producer = execution(&ctx, &action_ref).await?;
+    let id = artifact(
+        &ctx,
+        "fixture.log",
+        ArtifactClassification::RuntimeLog,
+        ArtifactType::FileText,
+    )
+    .await?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let stop = CancellationToken::new();
+    let shutdown = stop.clone();
+    let app = ctx.app.clone();
+    // JoinSet aborts the server on panic; the normal path stops and joins it.
+    let mut servers = tokio::task::JoinSet::new();
+    servers.spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown.cancelled_owned())
+            .await
+    });
+    let client = reqwest::Client::builder().http1_only().build()?;
+    let checks: Result<()> = async {
+        for payload in [b"HTTP/1 runtime log bytes".as_slice(), b""] {
+            let selected = ArtifactVersionRepository::create(
+                &ctx.pool,
+                CreateArtifactVersionInput {
+                    artifact: id,
+                    execution: Some(producer),
+                    content_type: Some("text/plain".into()),
+                    content: Some(payload.to_vec()),
+                    content_json: None,
+                    file_path: None,
+                    meta: None,
+                    created_by: None,
+                },
+            )
+            .await?;
+            let response = client
+                .get(format!(
+                    "http://{address}/api/v1/artifacts/{id}/versions/{}/download?version_id={}",
+                    selected.version, selected.id
+                ))
+                .bearer_auth(ctx.token().ok_or("reader token missing")?)
+                .header(header::ACCEPT_ENCODING, "identity")
+                .send()
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.version(), Version::HTTP_11);
+            assert!(!response.headers().contains_key(header::CONTENT_ENCODING));
+            assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
+            assert_eq!(response.bytes().await?.as_ref(), payload);
+            ctx.flush_audit().await?;
+            let events = AuditRepository::search(
+                &ctx.pool,
+                &AuditEventFilters {
+                    event_type: Some("artifact.downloaded".into()),
+                    resource_id: Some(id),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            let matching: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    event
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.get("version_id"))
+                        == Some(&json!(selected.id))
+                })
+                .collect();
+            assert_eq!(matching.len(), 1, "HTTP/1 EOF must emit one success audit");
+            assert_eq!(
+                matching[0]
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("delivery")),
+                Some(&json!("verified_eof"))
+            );
+        }
+        Ok(())
+    }
+    .await;
+    drop(client);
+    stop.cancel();
+    let server = tokio::time::timeout(std::time::Duration::from_secs(10), servers.join_next())
+        .await?
+        .ok_or("HTTP/1 server task missing")??;
+    server?;
+    let cleanup = ctx.cleanup().await;
+    checks?;
+    cleanup
+}

@@ -2206,7 +2206,10 @@ fn audit_log_download_eof(
         return response;
     }
 
-    let (parts, body) = response.into_parts();
+    let (mut parts, body) = response.into_parts();
+    // HTTP/1 must poll through EOF, even for an empty body. A fixed length lets
+    // Hyper stop before the reader's final authorization and this audit run.
+    parts.headers.remove(header::CONTENT_LENGTH);
     let stream = futures::stream::try_unfold(
         (body.into_data_stream(), audit),
         |(mut body, audit)| async move {
