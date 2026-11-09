@@ -278,7 +278,7 @@ async fn expired_artifact_page_does_not_depend_on_the_global_reporting_count() {
     sqlx::raw_sql("ALTER FUNCTION file_evidence_version_eligible(BIGINT) RENAME TO owned_real_version_eligibility;
         CREATE FUNCTION file_evidence_version_eligible(v BIGINT) RETURNS BOOLEAN LANGUAGE plpgsql STABLE AS $$
         BEGIN
-          IF current_query() LIKE '%SELECT COUNT(*)::BIGINT FROM artifact_version av%' THEN
+          IF current_query() LIKE '%SELECT COUNT(*)::BIGINT FROM expired av%' THEN
             RAISE EXCEPTION 'owned global reporting count must not gate page discovery';
           END IF;
           RETURN owned_real_version_eligibility(v);
