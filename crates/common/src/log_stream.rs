@@ -1,7 +1,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::Future;
+use futures::{
+    future::{BoxFuture, Shared},
+    Future, FutureExt,
+};
 use rand::Rng;
 use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::AbortHandle;
@@ -55,7 +58,23 @@ pub struct SegmentedLogWriter {
     available_bytes: Arc<Semaphore>,
     failure: watch::Receiver<Option<Arc<str>>>,
     config: SegmentedLogConfig,
-    task_abort: AbortHandle,
+    task: LogWriterTask,
+}
+
+/// Owns completion of a stream task even when its seal future is cancelled.
+#[derive(Clone)]
+pub struct LogWriterTask {
+    abort: AbortHandle,
+    completion: Shared<BoxFuture<'static, std::result::Result<(), Arc<str>>>>,
+}
+
+impl LogWriterTask {
+    pub async fn abort_and_join(self) -> Result<()> {
+        self.abort.abort();
+        self.completion
+            .await
+            .map_err(|message| Error::execution(message.to_string()))
+    }
 }
 
 #[derive(Debug)]
@@ -260,12 +279,22 @@ impl SegmentedLogWriter {
             finalization_timeout_ms = config.finalization_timeout_ms,
             "Configured immutable log stream buffer"
         );
+        let abort = task.abort_handle();
+        let completion = async move {
+            match task.await {
+                Ok(()) => Ok(()),
+                Err(error) if error.is_cancelled() => Ok(()),
+                Err(_) => Err(Arc::<str>::from("Runtime log writer task failed")),
+            }
+        }
+        .boxed()
+        .shared();
         Ok(Self {
             sender,
             available_bytes,
             failure,
             config,
-            task_abort: task.abort_handle(),
+            task: LogWriterTask { abort, completion },
         })
     }
 
@@ -321,6 +350,13 @@ impl SegmentedLogWriter {
     }
 
     pub async fn seal_with_manifest(self, truncated: bool, manifest: Option<String>) -> Result<()> {
+        let task = self.task_handle();
+        let result = self.request_seal(truncated, manifest).await;
+        task.abort_and_join().await?;
+        result
+    }
+
+    async fn request_seal(self, truncated: bool, manifest: Option<String>) -> Result<()> {
         if let Some(message) = self.failure.borrow().clone() {
             return Err(Error::invalid_state(message.to_string()));
         }
@@ -338,6 +374,10 @@ impl SegmentedLogWriter {
         })?
     }
 
+    pub fn task_handle(&self) -> LogWriterTask {
+        self.task.clone()
+    }
+
     pub fn max_unflushed_bytes(&self) -> usize {
         self.config.max_segment_bytes
     }
@@ -352,7 +392,7 @@ impl SegmentedLogWriter {
 
 impl Drop for SegmentedLogWriter {
     fn drop(&mut self) {
-        self.task_abort.abort();
+        self.task.abort.abort();
     }
 }
 
@@ -1129,8 +1169,9 @@ mod tests {
         writer.write_all(b"stop").await.unwrap();
         transport.started.notified().await;
         assert_eq!(transport.active.load(Ordering::SeqCst), 1);
+        let task = writer.task_handle();
         drop(writer);
-        tokio::task::yield_now().await;
+        task.abort_and_join().await.unwrap();
 
         assert_eq!(transport.active.load(Ordering::SeqCst), 0);
         assert_eq!(transport.attempts.load(Ordering::SeqCst), 1);

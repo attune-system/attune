@@ -61,6 +61,10 @@ pub enum ApiError {
     Forbidden(String),
     /// Not found (404)
     NotFound(String),
+    /// An authorized runtime log is still finalizing or permanently incomplete.
+    LogUnavailable {
+        incomplete: bool,
+    },
     /// Conflict (409)
     Conflict(String),
     /// Unprocessable entity (422)
@@ -91,7 +95,7 @@ impl ApiError {
             ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
-            ApiError::Conflict(_) => StatusCode::CONFLICT,
+            ApiError::Conflict(_) | ApiError::LogUnavailable { .. } => StatusCode::CONFLICT,
             ApiError::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::ValidationError(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
@@ -121,6 +125,12 @@ impl ApiError {
             | ApiError::InternalServerError(msg)
             | ApiError::DatabaseError(msg)
             | ApiError::ValidationError(msg) => msg,
+            ApiError::LogUnavailable { incomplete: true } => {
+                "Log is incomplete because delivery did not finish."
+            }
+            ApiError::LogUnavailable { incomplete: false } => {
+                "Log is still being finalized. Try again shortly."
+            }
             ApiError::RetryableDatabaseError => {
                 "Database operation temporarily unavailable; please retry"
             }
@@ -137,6 +147,8 @@ impl ApiError {
             ApiError::Forbidden(_) => "FORBIDDEN",
             ApiError::NotFound(_) => "NOT_FOUND",
             ApiError::Conflict(_) => "CONFLICT",
+            ApiError::LogUnavailable { incomplete: true } => "LOG_INCOMPLETE",
+            ApiError::LogUnavailable { incomplete: false } => "LOG_FINALIZING",
             ApiError::UnprocessableEntity(_) => "UNPROCESSABLE_ENTITY",
             ApiError::TooManyRequests(_) => "TOO_MANY_REQUESTS",
             ApiError::NotImplemented(_) => "NOT_IMPLEMENTED",

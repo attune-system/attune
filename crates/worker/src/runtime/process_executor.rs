@@ -32,6 +32,8 @@ use tokio::time::{timeout, Duration, Instant as TokioInstant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn, Instrument};
 
+const POST_EXIT_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
 const ETXTBSY_RETRY_ATTEMPTS: usize = 5;
 const ETXTBSY_RETRY_DELAY_MS: u64 = 25;
 
@@ -99,6 +101,7 @@ async fn capture_output<R>(
     mut writer: BoundedLogWriter,
     mut file: Option<BoundedLogFileWriter>,
     cancel: CancellationToken,
+    pipe_drain: CancellationToken,
     stream: RuntimeLogStream,
     live_mirror: bool,
 ) -> CapturedOutput
@@ -117,10 +120,17 @@ where
         None
     };
     let mut logs_incomplete = false;
+    let mut task = file.as_ref().and_then(BoundedLogFileWriter::task_handle);
     loop {
         let read = tokio::select! {
-            result = reader.read(&mut buffer) => result,
+            biased;
             _ = cancel.cancelled() => {
+                logs_incomplete = true;
+                file = None;
+                break;
+            }
+            result = reader.read(&mut buffer) => result,
+            _ = pipe_drain.cancelled() => {
                 logs_incomplete = true;
                 file = None;
                 break;
@@ -145,12 +155,17 @@ where
                         result = log.write_all(bytes) => Some(result),
                         _ = cancel.cancelled() => None,
                     };
+                    if task.is_none() {
+                        task = log.task_handle();
+                    }
                     match write {
                         Some(Ok(())) => {}
                         Some(Err(_)) => {
+                            // Storage failure must not close the process pipe or
+                            // discard its remaining structured result. Keep draining
+                            // bounded output, but never seal an uploaded prefix.
                             logs_incomplete = true;
                             file = None;
-                            break;
                         }
                         None => {
                             logs_incomplete = true;
@@ -188,6 +203,17 @@ where
         }
     } else {
         None
+    };
+    let seal_error = if let Some(task) = task {
+        match task.abort_and_join().await {
+            Ok(()) => seal_error,
+            Err(error) => {
+                logs_incomplete = true;
+                Some(error)
+            }
+        }
+    } else {
+        seal_error
     };
     CapturedOutput {
         writer,
@@ -421,6 +447,8 @@ pub async fn execute_streaming_cancellable(
     let stdout_reader = BufReader::new(stdout);
     let stderr_reader = BufReader::new(stderr);
     let output_cancel = CancellationToken::new();
+    let _capture_cancel = output_cancel.clone().drop_guard();
+    let pipe_drain = CancellationToken::new();
     let stdout_cancel = output_cancel.clone();
     let stderr_cancel = output_cancel.clone();
 
@@ -430,6 +458,7 @@ pub async fn execute_streaming_cancellable(
             stdout_writer,
             stdout_log_writer,
             stdout_cancel,
+            pipe_drain.clone(),
             RuntimeLogStream::Stdout,
             !delay_action_mirror,
         )
@@ -444,6 +473,7 @@ pub async fn execute_streaming_cancellable(
             stderr_writer,
             stderr_log_writer,
             stderr_cancel,
+            pipe_drain.clone(),
             RuntimeLogStream::Stderr,
             !delay_action_mirror,
         )
@@ -530,13 +560,14 @@ pub async fn execute_streaming_cancellable(
         elapsed_us = process_wait_elapsed_us,
         "Worker lifecycle phase"
     );
-    let (wait_result, mut was_cancelled, mut was_timed_out, stdin_write_error) = wait;
+    let (wait_result, mut was_cancelled, was_timed_out, stdin_write_error) = wait;
 
     let output_results = async {
-        let stdout = stdout_task.await.map_err(|error| {
+        let (stdout, stderr) = tokio::join!(stdout_task, stderr_task);
+        let stdout = stdout.map_err(|error| {
             RuntimeError::ExecutionFailed(format!("stdout task failed: {error}"))
         })?;
-        let stderr = stderr_task.await.map_err(|error| {
+        let stderr = stderr.map_err(|error| {
             RuntimeError::ExecutionFailed(format!("stderr task failed: {error}"))
         })?;
         Ok::<_, RuntimeError>((stdout, stderr))
@@ -554,29 +585,37 @@ pub async fn execute_streaming_cancellable(
         let effective_deadline = execution_deadline
             .map(|deadline| deadline.min(finalization_deadline))
             .unwrap_or(finalization_deadline);
-        tokio::select! {
-            result = &mut output_results => result?,
-            _ = async {
-                if let Some(token) = cancel_token.as_ref() {
-                    token.cancelled().await;
-                } else {
-                    std::future::pending::<()>().await;
+        let drain_deadline = finalization_started + POST_EXIT_PIPE_DRAIN_TIMEOUT;
+        let mut drain_expired = false;
+        loop {
+            tokio::select! {
+                result = &mut output_results => break result?,
+                _ = tokio::time::sleep_until(drain_deadline), if !drain_expired => {
+                    drain_expired = true;
+                    pipe_drain.cancel();
+                },
+                _ = async {
+                    if let Some(token) = cancel_token.as_ref() {
+                        token.cancelled().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    was_cancelled = true;
+                    logs_incomplete = true;
+                    output_cancel.cancel();
+                    break output_results.await?
                 }
-            } => {
-                was_cancelled = true;
-                logs_incomplete = true;
-                output_cancel.cancel();
-                output_results.await?
-            }
-            _ = tokio::time::sleep_until(effective_deadline) => {
-                if execution_deadline.is_some_and(|deadline| deadline <= effective_deadline) {
-                    was_timed_out = true;
+                _ = tokio::time::sleep_until(effective_deadline) => {
+                    // The process has already exited. A delivery deadline cannot
+                    // retroactively turn its successful exit into a runtime timeout.
+                    let action_deadline_reached = execution_deadline.is_some_and(|deadline| deadline <= effective_deadline);
+                    logs_incomplete = true;
+                    warn!(budget_ms = log_finalization_timeout_ms, action_deadline_reached,
+                        "Runtime log finalization deadline exceeded; remote outcome may be unknown");
+                    output_cancel.cancel();
+                    break output_results.await?
                 }
-                logs_incomplete = true;
-                warn!(budget_ms = log_finalization_timeout_ms, action_timed_out = was_timed_out,
-                    "Runtime log finalization deadline exceeded; remote outcome may be unknown");
-                output_cancel.cancel();
-                output_results.await?
             }
         }
     };
@@ -591,17 +630,18 @@ pub async fn execute_streaming_cancellable(
         stderr_seal_failed = stderr_output.seal_error.is_some(),
         "Runtime log finalization finished"
     );
-    logs_incomplete |= stdout_output.logs_incomplete || stderr_output.logs_incomplete;
-    if !logs_incomplete {
-        if let Some(error) = stdout_output.seal_error {
-            return Err(RuntimeError::ExecutionFailed(format!(
-                "Failed to seal stdout log: {error}"
-            )));
-        }
-        if let Some(error) = stderr_output.seal_error {
-            return Err(RuntimeError::ExecutionFailed(format!(
-                "Failed to seal stderr log: {error}"
-            )));
+    let stdout_incomplete = stdout_output.logs_incomplete || stdout_output.seal_error.is_some();
+    let stderr_incomplete = stderr_output.logs_incomplete || stderr_output.seal_error.is_some();
+    logs_incomplete |= stdout_incomplete || stderr_incomplete;
+    for (stream, failed) in [
+        ("stdout", stdout_output.seal_error.is_some()),
+        ("stderr", stderr_output.seal_error.is_some()),
+    ] {
+        if failed {
+            warn!(
+                stream,
+                "Runtime log sealing failed; process exit status is unchanged"
+            );
         }
     }
 
@@ -674,6 +714,7 @@ pub async fn execute_streaming_cancellable(
             stderr_bytes_truncated: stderr_result.bytes_truncated,
             timed_out: true,
             logs_incomplete,
+            log_capture_incomplete: Some((stdout_incomplete, stderr_incomplete)),
         });
     }
 
@@ -692,6 +733,7 @@ pub async fn execute_streaming_cancellable(
             stderr_bytes_truncated: stderr_result.bytes_truncated,
             timed_out: false,
             logs_incomplete,
+            log_capture_incomplete: Some((stdout_incomplete, stderr_incomplete)),
         });
     }
 
@@ -764,6 +806,7 @@ pub async fn execute_streaming_cancellable(
         stderr_bytes_truncated: stderr_result.bytes_truncated,
         timed_out: false,
         logs_incomplete,
+        log_capture_incomplete: Some((stdout_incomplete, stderr_incomplete)),
     })
 }
 
@@ -1053,6 +1096,7 @@ mod tests {
         commit_delay: Option<Duration>,
         seal_delay: Option<Duration>,
         sealed: AtomicUsize,
+        seal_denied: bool,
     }
 
     struct ActiveCommit<'a>(&'a AtomicUsize);
@@ -1072,6 +1116,12 @@ mod tests {
             _: Option<&str>,
         ) -> attune_common::Result<()> {
             unreachable!()
+        }
+        async fn append_log_file(&self, _: &str, _: &[u8]) -> attune_common::Result<()> {
+            self.started.notify_one();
+            Err(attune_common::Error::PermissionDenied(
+                "injected append denial".into(),
+            ))
         }
         async fn file_exists(&self, _: &str) -> attune_common::Result<bool> {
             unreachable!()
@@ -1097,6 +1147,11 @@ mod tests {
         async fn seal_log_stream(&self, _: i64, _: bool) -> attune_common::Result<()> {
             if let Some(delay) = self.seal_delay {
                 sleep(delay).await;
+            }
+            if self.seal_denied {
+                return Err(attune_common::Error::PermissionDenied(
+                    "injected seal denial".into(),
+                ));
             }
             self.sealed.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -1499,6 +1554,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn storage_failure_keeps_draining_the_process_pipe() {
+        let transport = Arc::new(HangingLogTransport::default());
+        let config = attune_common::config::ArtifactsConfig::default().log_segment_writer_config();
+        let writer = BoundedLogFileWriter::from_shared_file_writer(
+            attune_common::log_stream::SharedFileLogWriter::new(
+                transport.clone(),
+                7,
+                "capture.log".into(),
+                config,
+            ),
+            1024,
+            true,
+            config.finalization_timeout_ms,
+        );
+        let (mut pipe, reader) = tokio::io::duplex(128);
+        let producer = tokio::spawn(async move {
+            pipe.write_all(b"first").await?;
+            transport.started.notified().await;
+            pipe.write_all(b"second").await?;
+            pipe.shutdown().await
+        });
+        let capture = capture_output(
+            BufReader::new(reader),
+            BoundedLogWriter::new_stdout(1024),
+            Some(writer),
+            CancellationToken::new(),
+            CancellationToken::new(),
+            RuntimeLogStream::Stdout,
+            false,
+        )
+        .await;
+        producer.await.unwrap().unwrap();
+        assert!(capture.logs_incomplete);
+        assert!(capture.seal_error.is_none());
+        assert_eq!(capture.writer.into_result().content, "firstsecond");
+    }
+
+    #[tokio::test]
+    async fn pipe_drain_deadline_stops_idle_reads_but_drains_buffered_output() {
+        for closed in [false, true] {
+            let (mut pipe, reader) = tokio::io::duplex(128);
+            pipe.write_all(b"already buffered").await.unwrap();
+            if closed {
+                pipe.shutdown().await.unwrap();
+            }
+            let pipe_drain = CancellationToken::new();
+            pipe_drain.cancel();
+            let captured = capture_output(
+                BufReader::new(reader),
+                BoundedLogWriter::new_stdout(1024),
+                None,
+                CancellationToken::new(),
+                pipe_drain,
+                RuntimeLogStream::Stdout,
+                false,
+            )
+            .await;
+            assert_eq!(captured.writer.into_result().content, "already buffered");
+            assert_eq!(captured.logs_incomplete, !closed);
+        }
+    }
+
+    #[tokio::test]
     async fn default_finalization_budget_allows_slow_final_upload_and_seal() {
         let transport = Arc::new(HangingLogTransport {
             commit_delay: Some(Duration::from_millis(1_200)),
@@ -1534,6 +1652,80 @@ mod tests {
         assert!(!result.logs_incomplete);
         assert_eq!(transport.active.load(Ordering::SeqCst), 0);
         assert_eq!(transport.sealed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn seal_failure_preserves_process_success_and_the_other_stream_capture() {
+        let transport = Arc::new(HangingLogTransport {
+            commit_delay: Some(Duration::ZERO),
+            seal_denied: true,
+            ..Default::default()
+        });
+        let config = attune_common::config::ArtifactsConfig::default().log_segment_writer_config();
+        let writer = BoundedLogFileWriter::from_segmented_writer(
+            attune_common::log_stream::SegmentedLogWriter::new(transport, 5, config).unwrap(),
+            1024,
+            true,
+        );
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("printf 'tail'");
+        let result = execute_streaming_cancellable(
+            cmd,
+            &HashMap::new(),
+            None,
+            Some(10),
+            1024,
+            1024,
+            OutputFormat::Text,
+            None,
+            None,
+            None,
+            None,
+            Some(writer),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert!(result.error.is_none());
+        assert!(result.logs_incomplete);
+        assert_eq!(result.log_capture_incomplete, Some((true, false)));
+    }
+
+    #[tokio::test]
+    async fn action_deadline_after_process_exit_marks_only_logs_incomplete() {
+        let transport = Arc::new(HangingLogTransport::default());
+        let config = attune_common::config::ArtifactsConfig::default().log_segment_writer_config();
+        let writer = BoundedLogFileWriter::from_segmented_writer(
+            attune_common::log_stream::SegmentedLogWriter::new(transport.clone(), 6, config)
+                .unwrap(),
+            1024,
+            true,
+        );
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("printf 'tail'");
+        let result = execute_streaming_cancellable(
+            cmd,
+            &HashMap::new(),
+            None,
+            Some(1),
+            1024,
+            1024,
+            OutputFormat::Text,
+            None,
+            None,
+            None,
+            None,
+            Some(writer),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert!(result.error.is_none());
+        assert!(!result.timed_out);
+        assert!(result.logs_incomplete);
+        assert_eq!(transport.active.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

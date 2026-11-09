@@ -1,6 +1,6 @@
 # Runtime log finalization reliability plan
 
-Status: phase 1 implementation in progress on `fix/runtime-log-finalization`.
+Status: phases 1 and 2 implemented on `fix/runtime-log-finalization`; integration, final validation, and review remain in progress.
 Date: 2026-11-08.
 
 PR scope: phases 1 and 2, including their applicable validation. The user
@@ -69,24 +69,47 @@ Source was rechecked in the release worktree at
 
 ## Implementation progress
 
-The first slice raises the default total finalization budget to 60 seconds and
-shares bounded transient seal retries between segmented and shared-file writers.
-The existing process executor still imposes the earlier action deadline and
-responds to cancellation. The 60-second ceiling accommodates a single default
-segment retry window of up to 51.5 seconds with some headroom; it is a bounded
-starting policy, not a measured optimal value or a guarantee that every upload
-and seal retry will fit. Explicitly configured shorter budgets remain valid.
+The current implementation keeps a bounded 60-second default delivery budget,
+with the action deadline as an earlier bound and cancellation still active.
+Idle pipe reads have a separate one-second post-exit limit; already buffered
+bytes drain first. Exhausting delivery time after process exit marks logs
+incomplete without retroactively timing out a successful process. A storage
+write failure disables storage for that stream while bounded pipe capture
+continues, preventing a logging failure from causing a broken pipe in the action.
 
-Seal retries retain identical proof inputs, cap each request by the existing
-attempt timeout, and have a total seal deadline. The outer process finalization
-deadline also covers pending uploads and backoff. Added tracing distinguishes
-seal operation attempts, capture sealing time, and total post-exit finalization.
+Both storage backends retry transient seals with identical version, truncation,
+and authenticated-manifest inputs. Requests and backoff remain inside bounded
+attempt and total deadlines. Stream tasks are explicitly aborted and joined on
+capture completion or cancellation; Drop remains fallback cleanup.
 
-Regression coverage exercises both transports, retry exhaustion, permanent denial,
-lost acknowledgement with no segment reupload, a slow successful seal, deadline
-exhaustion, and a real subprocess with a slow final upload and seal. Server-side
-idempotency, storage integration, workspace validation, and fault benchmarks
-remain required before merge readiness. Later phases are unimplemented.
+Capture outcomes are independent for stdout and stderr. The existing v1
+`runtime_log_capture` markers are authoritative per stream; aggregate
+`logs_incomplete` does not erase positive evidence that its sibling reached empty
+EOF. Permanent seal failure leaves the process exit outcome intact.
+
+After full selected-version content authorization, finite downloads distinguish
+HTTP 409 `LOG_FINALIZING` from `LOG_INCOMPLETE`. The UI displays only allowlisted
+messages, bounds error-body parsing, and preserves exact immutable selection.
+Execution SSE keeps its incomplete-stream code and two-second terminal grace:
+normal worker settlement still precedes terminal publication, so the longer
+worker budget does not require a longer terminal reader grace.
+
+Runtime-log download success audits require full authorized EOF. Cancelled
+previews, partial ranges, rejected downloads, and failed body reads do not emit
+successful full-download events. Instance-local API counters distinguish
+finalizing and incomplete responses; request logs record observed pending age,
+and worker traces distinguish retry operations, seal timing, and deadline loss.
+The CLI already renders structured API error bodies and needs no fallback reader.
+
+The 60-second ceiling accommodates a single default segment retry window of up
+to 51.5 seconds with headroom. It is a bounded starting policy, not a measured
+optimal value or a guarantee that every upload and seal attempt fits. Durable
+recovery and moving verification outside transactions remain follow-up work.
+
+An initial full web run hit timeouts during concurrent compilation. The clean
+base checkout passed its full 600-test suite; the full fix-suite rerun and final
+integration results will be recorded below. No timeout settings or exclusions
+were changed to obtain passing results.
 
 ### Validation of the first slice
 
@@ -108,7 +131,9 @@ uses an owned local server; it does not prove production API seal idempotency or
 object storage settlement. Workspace-wide checks, PostgreSQL/object-storage
 integration, sensor consumer validation, fault benchmarks, and required CI remain
 unrun. The final plan update is prose only and preserves the code-test results.
-No commits, pushes, PRs, or deployment changes were made for this slice.
+The first slice was subsequently committed as `7ff2fcc4` and published in draft
+PR #31. Those initial results are historical evidence, not final-head readiness.
+No deployment changes were made.
 
 ## Required invariants
 

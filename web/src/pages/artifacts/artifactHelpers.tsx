@@ -1,3 +1,4 @@
+import { artifactContentError } from "@/lib/artifact-preview";
 import {
   FileText,
   FileImage,
@@ -162,7 +163,7 @@ export async function downloadArtifact(
   });
 
   if (!response.ok) {
-    throw new Error("Content unavailable or access denied");
+    throw await artifactContentError(response);
   }
 
   const disposition = response.headers.get("Content-Disposition");

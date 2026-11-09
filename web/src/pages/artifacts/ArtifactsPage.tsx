@@ -1,3 +1,4 @@
+import { artifactContentErrorMessage } from "@/lib/artifact-preview";
 import { useState, useCallback, useMemo, useEffect, memo } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { Search, X, Eye, EyeOff, Download, Package } from "lucide-react";
@@ -226,9 +227,9 @@ const ArtifactsResultsTable = memo(
                                 void downloadArtifact(
                                   artifact.id,
                                   artifact.ref,
-                                ).catch(() =>
+                                ).catch((error: unknown) =>
                                   setDownloadError(
-                                    "Content unavailable or access denied",
+                                    artifactContentErrorMessage(error),
                                   ),
                                 );
                               }}

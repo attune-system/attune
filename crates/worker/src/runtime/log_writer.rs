@@ -479,6 +479,13 @@ impl BoundedLogFileWriter {
             .await
     }
 
+    pub fn task_handle(&self) -> Option<attune_common::log_stream::LogWriterTask> {
+        match self.writer.as_ref()? {
+            RuntimeLogWriter::Segmented(writer) => Some(writer.task_handle()),
+            RuntimeLogWriter::SharedFile(_) => None,
+        }
+    }
+
     pub fn finalization_timeout_ms(&self) -> u64 {
         self.finalization_timeout_ms
     }

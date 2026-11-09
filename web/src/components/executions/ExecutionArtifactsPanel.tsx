@@ -34,6 +34,8 @@ import {
   ArtifactSseProtocolError,
 } from "@/lib/artifact-live-preview";
 import {
+  artifactContentErrorMessage,
+  artifactStreamErrorMessage,
   ARTIFACT_PREVIEW_BYTES,
   readArtifactPreview,
 } from "@/lib/artifact-preview";
@@ -242,7 +244,7 @@ function TextFileDetail({
           denied = true;
           if (publishFrame !== undefined) cancelAnimationFrame(publishFrame);
           publishFrame = undefined;
-          setLoadError("Content unavailable or access denied");
+          setLoadError(artifactStreamErrorMessage(data));
           setIsLoadingContent(false);
           setIsStreaming(false);
           controller.abort();
@@ -413,9 +415,8 @@ function TextFileDetail({
         setContent(preview.text);
         setTruncated(preview.truncated);
         setLoadError(null);
-      } catch {
-        if (!signal.aborted)
-          setLoadError("Content unavailable or access denied");
+      } catch (error) {
+        if (!signal.aborted) setLoadError(artifactContentErrorMessage(error));
       } finally {
         if (!signal.aborted) {
           setIsLoadingContent(false);
@@ -876,9 +877,9 @@ function ExecutionArtifactsView({
                                 artifact.ref,
                                 artifact.selected_version.version,
                                 artifact.selected_version.id,
-                              ).catch(() =>
+                              ).catch((error: unknown) =>
                                 setDownloadError(
-                                  "Content unavailable or access denied",
+                                  artifactContentErrorMessage(error),
                                 ),
                               );
                             }}

@@ -672,3 +672,180 @@ async fn ordinary_progress_detail_keeps_its_protected_data_projection() -> Resul
     assert_eq!(body["data"]["data"], json!({"progress":"protected data"}));
     ctx.cleanup().await
 }
+
+/// Diagnostics follow full content authorization and remain bound to one version.
+#[tokio::test]
+async fn pending_runtime_log_downloads_distinguish_finalizing_incomplete_and_denied() -> Result<()>
+{
+    use attune_common::{
+        audit::{AuditEventFilters, AuditRepository},
+        models::{ExecutionStatus, LogStreamBackend},
+        repositories::{
+            execution::{ExecutionRepository, UpdateExecutionInput},
+            Update,
+        },
+    };
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
+    grant_artifacts(&ctx).await?;
+    let action_ref = managed_fixture::action_pack(&ctx).await?;
+    let producer = execution(&ctx, &action_ref).await?;
+    let id = artifact(
+        &ctx,
+        "fixture.log",
+        ArtifactClassification::RuntimeLog,
+        ArtifactType::FileText,
+    )
+    .await?;
+    let selected = ArtifactVersionRepository::create_log_pending(
+        &ctx.pool,
+        id,
+        "fixture.log",
+        LogStreamBackend::ObjectSegments,
+        "text/plain".into(),
+        Some(producer),
+        Some(json!({"log_encoding":"attune_encrypted_log_v1"})),
+        None,
+    )
+    .await?;
+    let paths = [
+        format!(
+            "/api/v1/artifacts/{id}/versions/{}/download?version_id={}",
+            selected.version, selected.id
+        ),
+        format!("/api/v1/artifacts/{id}/download?version_id={}", selected.id),
+    ];
+    for (status, code) in [
+        (ExecutionStatus::Running, "LOG_FINALIZING"),
+        (ExecutionStatus::Completed, "LOG_INCOMPLETE"),
+        (ExecutionStatus::Failed, "LOG_INCOMPLETE"),
+        (ExecutionStatus::Timeout, "LOG_INCOMPLETE"),
+        (ExecutionStatus::Cancelled, "LOG_INCOMPLETE"),
+        (ExecutionStatus::Abandoned, "LOG_INCOMPLETE"),
+    ] {
+        ExecutionRepository::update(
+            &ctx.pool,
+            producer,
+            UpdateExecutionInput {
+                status: Some(status),
+                ..Default::default()
+            },
+        )
+        .await?;
+        for path in &paths {
+            let response = ctx.get(path, ctx.token()).await?;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body: Value = response.json().await?;
+            assert_eq!(body["code"], code);
+        }
+    }
+    // Readable metadata is not sufficient to learn the state of secret-bearing content.
+    denied_key_origin(&ctx, producer).await?;
+    for path in &paths {
+        let response = ctx.get(path, ctx.token()).await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: Value = response.json().await?;
+        assert_ne!(body["code"], "LOG_INCOMPLETE");
+    }
+    ctx.flush_audit().await?;
+    let events = AuditRepository::search(
+        &ctx.pool,
+        &AuditEventFilters {
+            event_type: Some("artifact.downloaded".into()),
+            resource_id: Some(id),
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert!(
+        events.is_empty(),
+        "failed downloads must not emit success audits"
+    );
+    ctx.cleanup().await
+}
+
+#[tokio::test]
+async fn runtime_log_download_audit_requires_full_authorized_eof() -> Result<()> {
+    use attune_common::{
+        audit::{AuditEventFilters, AuditRepository},
+        repositories::{
+            identity::{IdentityRepository, UpdateIdentityInput},
+            Update,
+        },
+    };
+    use futures::StreamExt;
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
+    grant_artifacts(&ctx).await?;
+    let action_ref = managed_fixture::action_pack(&ctx).await?;
+    let producer = execution(&ctx, &action_ref).await?;
+    let id = artifact(
+        &ctx,
+        "fixture.log",
+        ArtifactClassification::RuntimeLog,
+        ArtifactType::FileText,
+    )
+    .await?;
+    let selected = version(&ctx, id, Some(producer), "owned log bytes").await?;
+    let path = format!(
+        "/api/v1/artifacts/{id}/versions/{}/download?version_id={}",
+        selected.version, selected.id
+    );
+    let filters = AuditEventFilters {
+        event_type: Some("artifact.downloaded".into()),
+        resource_id: Some(id),
+        ..Default::default()
+    };
+    let response = ctx.get(&path, ctx.token()).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    ctx.flush_audit().await?;
+    assert!(AuditRepository::search(&ctx.pool, &filters)
+        .await?
+        .is_empty());
+    assert!(!response.bytes().await?.is_empty());
+    ctx.flush_audit().await?;
+    let events = AuditRepository::search(&ctx.pool, &filters).await?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].details.as_ref().and_then(|d| d.get("delivery")),
+        Some(&json!("verified_eof"))
+    );
+
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::RANGE,
+        axum::http::HeaderValue::from_static("bytes=0-0"),
+    );
+    let response = ctx.get_with_headers(&path, ctx.token(), headers).await?;
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.bytes().await?.len(), 1);
+    ctx.flush_audit().await?;
+    assert_eq!(AuditRepository::search(&ctx.pool, &filters).await?.len(), 1);
+
+    let response = ctx.get(&path, ctx.token()).await?;
+    let mut body = response.into_response().into_body().into_data_stream();
+    assert!(body.next().await.ok_or("missing log bytes")?.is_ok());
+    drop(body); // A cancelled preview has not verified EOF.
+    ctx.flush_audit().await?;
+    assert_eq!(AuditRepository::search(&ctx.pool, &filters).await?.len(), 1);
+
+    let response = ctx.get(&path, ctx.token()).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    IdentityRepository::update(
+        &ctx.pool,
+        ctx.user.as_ref().ok_or("reader missing")?.id,
+        UpdateIdentityInput {
+            frozen: Some(true),
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert!(response.bytes().await.is_err());
+    ctx.flush_audit().await?;
+    assert_eq!(AuditRepository::search(&ctx.pool, &filters).await?.len(), 1);
+    ctx.cleanup().await
+}

@@ -1954,6 +1954,19 @@ impl ArtifactVersionRepository {
             .bind(version).fetch_one(connection).await.map_err(Into::into)
     }
 
+    /// One snapshot distinguishes an abandoned Pending log from a concurrently
+    /// published Ready version. A retained version may outlive its execution.
+    pub async fn log_finalization_incomplete<'e, E>(
+        executor: E,
+        version: i64,
+    ) -> Result<Option<bool>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_scalar("SELECT CASE WHEN av.body_state = 'ready' THEN FALSE ELSE COALESCE(e.status::text IN ('completed','failed','timeout','cancelled','abandoned'), TRUE) END FROM artifact_version av LEFT JOIN execution e ON e.id = av.execution WHERE av.id = $1")
+            .bind(version).fetch_optional(executor).await.map_err(Into::into)
+    }
+
     pub async fn log_is_sealed(connection: &mut PgConnection, version: i64) -> Result<bool> {
         let sealed: Option<bool> = sqlx::query_scalar("SELECT sealed AND sealed_at IS NOT NULL FROM log_stream WHERE artifact_version = $1 FOR SHARE")
             .bind(version).fetch_optional(connection).await?;

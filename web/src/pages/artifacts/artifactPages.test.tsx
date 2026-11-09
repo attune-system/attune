@@ -670,6 +670,36 @@ describe("artifact browsing through production hooks", () => {
     },
   );
 
+  it.each(["LOG_FINALIZING", "LOG_INCOMPLETE"])(
+    "shows %s for the exact selected log version",
+    async (code) => {
+      localStorage.setItem("access_token", "test-token");
+      vi.spyOn(axios, "request").mockResolvedValue({
+        status: 200,
+        data: page([{ ...header, selected_version: selected }]),
+        headers: {},
+      });
+      const fetch = vi
+        .fn()
+        .mockResolvedValue(
+          new Response(JSON.stringify({ code }), { status: 409 }),
+        );
+      vi.stubGlobal("fetch", fetch);
+      mount(<ExecutionArtifactsPanel executionId={10} />);
+      fireEvent.click(await screen.findByRole("button", { name: /stdout/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+      await screen.findByText(
+        code === "LOG_FINALIZING"
+          ? /Log is still being finalized/
+          : /Log is incomplete because delivery did not finish/,
+      );
+      expect(fetch.mock.calls[0][0]).toContain(
+        "/artifacts/42/versions/7/download?version_id=71",
+      );
+      expect(fetch).toHaveBeenCalledTimes(1);
+    },
+  );
+
   it("downloads only the execution-selected version and reports content denial without hiding metadata", async () => {
     vi.spyOn(axios, "request").mockResolvedValue({
       status: 200,

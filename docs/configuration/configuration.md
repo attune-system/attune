@@ -247,6 +247,11 @@ default). This is a maximum, not an added delay: successful settlement returns
 immediately. The budget includes remaining uploads and sealing for both streams,
 so it may interrupt retry attempts or backoff before their individual limits.
 It does not guarantee all configured upload and seal attempts will fit.
+Idle pipe reads stop one second after process exit, independently of uploads and
+sealing. Already buffered pipe bytes are drained first. A descendant retaining
+stdout or stderr without producing output therefore cannot consume the longer
+storage budget. Missing EOF is incomplete capture and is never sealed as complete.
+
 Cancellation and the action timeout remain active during this period. If cancellation, the action
 timeout, or the finalization deadline interrupts the drain, the execution result
 contains `logs_incomplete: true`; the action's exit status is otherwise
