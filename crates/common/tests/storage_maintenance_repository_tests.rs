@@ -1169,6 +1169,20 @@ async fn expiration_prefilter_matches_count_reference_and_claim_rechecks_policy(
             }
         }
     }
+    let pinned: i64 = sqlx::query_scalar("SELECT v.id FROM artifact_version v JOIN artifact a ON a.id=v.artifact WHERE a.retention_policy='versions' AND a.retention_limit=1 AND v.version=3")
+        .fetch_one(&*pool).await.unwrap();
+    let mut capture = pool.begin().await.unwrap();
+    Evidence::lock_capture(&mut capture).await.unwrap();
+    sqlx::query("INSERT INTO file_evidence_owner(version,artifact,root_read,object_done,staging_done) VALUES(990011,990012,990013,true,true)")
+        .execute(&mut *capture).await.unwrap();
+    sqlx::query(
+        "INSERT INTO file_evidence_pin(owner,kind,source) VALUES(990011,'artifact_version',$1)",
+    )
+    .bind(pinned)
+    .execute(&mut *capture)
+    .await
+    .unwrap();
+    capture.commit().await.unwrap();
     // Deliberately retain the original count-all predicate as an independent
     // oracle. Stable now() within the reference is safe: fixtures straddle the
     // cutoffs by minutes/hours, rather than racing wall-clock microseconds.
@@ -1182,6 +1196,10 @@ async fn expiration_prefilter_matches_count_reference_and_claim_rechecks_policy(
         ORDER BY av.created,av.id")
         .fetch_all(&*pool).await.unwrap();
     assert!(!expected.is_empty());
+    assert!(
+        !expected.contains(&pinned),
+        "preexisting evidence pin must exclude discovery"
+    );
     let found = MaintenanceRepository::find_expired_artifact_versions(&pool, 1000)
         .await
         .unwrap();
