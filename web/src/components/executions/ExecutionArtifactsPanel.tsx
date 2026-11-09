@@ -46,6 +46,7 @@ interface ExecutionArtifactsPanelProps {
   executionId: number;
   /** Whether the execution is still running (enables polling) */
   isRunning?: boolean;
+  logsIncomplete?: boolean;
 }
 
 function getArtifactTypeIcon(type: ArtifactType) {
@@ -673,6 +674,7 @@ export default function ExecutionArtifactsPanel(
 function ExecutionArtifactsView({
   executionId,
   isRunning = false,
+  logsIncomplete = false,
 }: ExecutionArtifactsPanelProps) {
   const pageSize = 20;
   const [paused, setPaused] = useState(false);
@@ -743,6 +745,14 @@ function ExecutionArtifactsView({
 
       {/* Content */}
       <div className="px-4 pb-4">
+        {logsIncomplete && (
+          <p
+            role="status"
+            className="mb-3 rounded bg-amber-50 p-3 text-sm text-amber-900"
+          >
+            Log delivery was incomplete when this execution finished.
+          </p>
+        )}
         {downloadError && (
           <p className="text-sm text-red-600">{downloadError}</p>
         )}

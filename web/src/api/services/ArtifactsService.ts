@@ -847,6 +847,7 @@ export class ArtifactsService {
       },
       errors: {
         404: `Artifact not found or no versions`,
+        409: `Authorized log is finalizing (LOG_FINALIZING) or incomplete (LOG_INCOMPLETE)`,
         416: `Requested range is not satisfiable`,
       },
     });
@@ -1592,6 +1593,7 @@ export class ArtifactsService {
       },
       errors: {
         404: `Artifact, version, or content not found`,
+        409: `Authorized log is finalizing (LOG_FINALIZING) or incomplete (LOG_INCOMPLETE)`,
         416: `Requested range is not satisfiable`,
       },
     });

@@ -106,34 +106,43 @@ to 51.5 seconds with headroom. It is a bounded starting policy, not a measured
 optimal value or a guarantee that every upload and seal attempt fits. Durable
 recovery and moving verification outside transactions remain follow-up work.
 
-An initial full web run hit timeouts during concurrent compilation. The clean
-base checkout passed its full 600-test suite; the full fix-suite rerun and final
-integration results will be recorded below. No timeout settings or exclusions
-were changed to obtain passing results.
+### Validation of the integrated implementation
 
-### Validation of the first slice
+Status: work in progress while final storage checks, required CI, and the requested
+GPT-6 Astra review complete. Rust checks target `668c6edad1904ff2f492e1617594a4b116a9b121`
+after integrating main at `8af23fc4d77ce84d661474cb6711d0db3be906d3`.
+Subsequent changes add a web capture-failure notice, generated client responses,
+and this documentation; they do not affect the reused Rust results.
 
-Status: work in progress, not ready to merge. Tested base:
-`d9da94122ff6fab725c212ac81a6a965a3bd2dbd`, with the uncommitted first-slice code
-and documentation changes in `/mnt/wdc/attune-worktrees/runtime-log-finalization`.
-All commands ran in that worktree. Cargo artifacts used the isolated target
-`/mnt/wdc/attune-worktrees/runtime-log-finalization-target`.
+All checks run in the fix worktree. Rust artifacts use its separate target
+cache. PostgreSQL 18 and versioned RustFS storage are disposable, task-owned
+containers; no cluster configuration or deployed data was changed.
 
-- `ATTUNE_TEST_RUN_ID=logfix-common2 cargo test --locked -p attune-common --lib log_stream::tests -- --test-threads=4`: 16 passed.
-- `ATTUNE_TEST_RUN_ID=logfix-worker1 cargo test --locked -p attune-worker --lib runtime::process_executor::tests -- --test-threads=4`: 18 passed.
-- `ATTUNE_TEST_RUN_ID=logfix-writer1 cargo test --locked -p attune-worker --lib runtime::log_writer::tests -- --test-threads=4`: 15 passed.
-- `cargo clippy --locked -p attune-common -p attune-worker --lib -- -D warnings`: passed.
-- `cargo fmt --all -- --check`, `git diff --check`, and plan relative-link checks: passed.
+- `cargo clippy --locked --workspace --all-targets -- -D warnings`: passed,
+  including all-target workspace compilation.
+- Common and worker library tests filtered by `runtime`: 272 passed.
+- API artifact headers/content, single-connection, execution-log admission, and
+  sensor-log integration suites: 27 passed on PostgreSQL. These cover authorized
+  Pending diagnostics, every terminal execution status, hidden-content rejection,
+  per-stream empty results, selected-version fences, and full-EOF audit semantics.
+- Full web suite: 612 tests passed. `npm run build` and
+  `npm run typecheck:contracts` passed. TypeScript, ESLint, and Prettier passed.
+- API generation completed, including the two new HTTP 409 response entries.
+  Workspace, exported OpenAPI, and generated client versions all remain `0.10.3`.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
 
-The selected tests exercise the changed retry mechanism, process boundary, lazy
-allocation, encryption, and truncation without external services. The HTTP test
-uses an owned local server; it does not prove production API seal idempotency or
-object storage settlement. Workspace-wide checks, PostgreSQL/object-storage
-integration, sensor consumer validation, fault benchmarks, and required CI remain
-unrun. The final plan update is prose only and preserves the code-test results.
-The first slice was subsequently committed as `7ff2fcc4` and published in draft
-PR #31. Those initial results are historical evidence, not final-head readiness.
-No deployment changes were made.
+An initial full web run timed out during concurrent compilation. The clean base
+passed all 600 tests, and both subsequent complete fix-suite runs passed without
+changing timeout settings or excluding tests. On Node 26 the local command uses
+`NODE_OPTIONS=--no-experimental-webstorage` so jsdom owns localStorage; CI uses
+Node 22. The earlier CI client-generation failure is addressed by including the
+regenerated `ArtifactsService.ts` rather than changing the contract check.
+
+Storage/replica tests, the final generated-client comparison, required CI, and
+review results will be appended before readiness. These checks validate fault
+handling and authorization contracts, not production throughput or NFS/RWX
+conformance. Durable crash recovery and comparative deployment benchmarking
+remain follow-up work; this PR makes no measured performance-improvement claim.
 
 ## Required invariants
 
@@ -156,48 +165,50 @@ No deployment changes were made.
 
 ## Phase 1 Align deadlines and retry sealing
 
-- [ ] Instrument drain, final frame flush, upload attempts, seal request,
-  verification, and acknowledgement separately, correlated by execution, stream,
-  version, and attempt. Record deadline exhaustion, retry exhaustion, permanent
-  denial, and unknown outcome distinctly.
-- [ ] Define separate process-runtime, pipe-drain, and delivery-finalization
+- [x] Add structured capture, segment-flush, retry, and seal timing diagnostics
+  correlated through execution/stream spans and version/attempt fields. Distinguish
+  deadline exhaustion, retry exhaustion, permanent denial, and unknown outcomes.
+  Fine-grained server verification profiling remains part of phase 4.
+- [x] Define separate process-runtime, pipe-drain, and delivery-finalization
   semantics. Preserve bounded behavior for descendants holding pipes open.
   Decide explicitly whether delivery may continue after the process deadline;
   any continuation must fit valid delivery authority and shutdown budgets.
-- [ ] Replace the 1-second default with a measured, bounded finalization budget.
+- [x] Replace the 1-second default with a bounded 60-second finalization budget.
   Raising the existing setting is a deployment mitigation, not durable recovery.
   Document the chosen value and its effect on occupied worker slots and shutdown.
-- [ ] Give remaining uploads and seal retries one explicit deadline. Bound each
+- [x] Give remaining uploads and seal retries one explicit deadline. Bound each
   attempt and backoff by the remaining budget; avoid nested policies whose
   advertised retry window cannot fit. Validate configuration relationships.
-- [ ] Retry transient seal transport failures with bounded backoff and jitter.
+- [x] Retry transient seal transport failures with bounded backoff and jitter.
   Reuse the same version, truncation, and authenticated-manifest identity.
   Authentication, proof mismatches, and permanent conflicts must fail closed;
   retry only explicitly classified transient conditions.
-- [ ] Reconcile lost acknowledgements through freshly authorized, identical
+- [x] Reconcile lost acknowledgements through freshly authorized, identical
   seal retries. Test server commit followed by a dropped response and concurrent
   identical requests. Different proof or truncation inputs must conflict.
-- [ ] Keep settlement before terminal publication for this phase. Do not add
+- [x] Keep settlement before terminal publication for this phase. Do not add
   detached work or extend execution-token permissions as a shortcut.
 
 ## Phase 2 Expose log delivery state
 
-- [ ] Define per-stream finalizing, complete, and incomplete or failed outcomes,
+- [x] Define per-stream finalizing, complete, and incomplete or failed outcomes,
   with bounded reason codes. Reuse artifact lifecycle and existing capture
   metadata where sufficient; add persisted fields only where recovery or
   accurate reader behavior requires them.
-- [ ] Preserve action success when its process succeeds, while making log
+- [x] Preserve action success when its process succeeds, while making log
   delivery failure visible on execution details. Review whether additional
   operational alerting is needed for repeated failures.
-- [ ] Return a stable incomplete-log response distinguishable from authorization
+- [x] Return a stable incomplete-log response distinguishable from authorization
   failure without disclosing metadata to unauthorized callers. Update finite
   downloads, execution SSE, artifact previews, CLI consumers, and web UI together.
-- [ ] Align SSE terminal grace and reconnect behavior with the finalization
+- [x] Align SSE terminal grace and reconnect behavior with the finalization
   contract. Never emit successful EOF for an unsealed stream.
-- [ ] Correct premature download-success auditing and define its meaning for
+- [x] Correct premature download-success auditing and define its meaning for
   streamed responses; do not claim verified delivery before it occurs.
-- [ ] Add metrics for incomplete streams, retry outcomes, finalization deadline
-  exhaustion, and pending age. Avoid unbounded ID labels in metrics.
+- [x] Expose API counters for finalizing/incomplete responses and structured worker
+  retry/deadline timing diagnostics; log observed pending age. Avoid unbounded ID
+  labels. Dedicated worker metrics and operational alert thresholds can follow
+  measured deployment rates; this PR does not add an alerting policy.
 
 ## Phase 3 Design recovery after worker loss
 

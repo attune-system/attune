@@ -82,6 +82,21 @@ afterEach(() => {
 });
 
 describe("artifact browsing through production hooks", () => {
+  it("shows incomplete capture metadata without requesting private log bodies", async () => {
+    vi.spyOn(axios, "request").mockResolvedValue({
+      status: 200,
+      data: page([]),
+      headers: {},
+    });
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    mount(<ExecutionArtifactsPanel executionId={10} logsIncomplete />);
+    await screen.findByText(
+      "Log delivery was incomplete when this execution finished.",
+    );
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it.each([
     "200 KiB ASCII",
     "1 MiB newline expansion",
