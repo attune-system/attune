@@ -449,3 +449,63 @@ async fn collector_first_barrier_fences_selection() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn selected_snapshot_retry_is_independent_of_session_timezone() {
+    let (pool, _, _, stream) = fixture().await;
+    let mut tx = pool.begin().await.unwrap();
+    Evidence::lock_capture(&mut tx).await.unwrap();
+    sqlx::query("INSERT INTO object_maintenance_ledger(object_key,provider_version,object_kind,size_bytes,state) VALUES('timezone-close','v:1','log',1,'ready')")
+        .execute(&mut *tx).await.unwrap();
+    let locked = LogStreamRepository::lock(&mut tx, stream).await.unwrap();
+    LogStreamRepository::commit_segment(
+        &mut tx,
+        &locked,
+        0,
+        1,
+        &"a".repeat(64),
+        "timezone-close",
+        "v:1",
+    )
+    .await
+    .unwrap();
+    sqlx::query("SET LOCAL TimeZone='Pacific/Honolulu'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let first = LogStreamRepository::select_close(
+        &mut tx,
+        stream,
+        0,
+        &json!({"kind":"native_test"}),
+        &json!({"encoding":"plain"}),
+        false,
+        Utc::now() + Duration::minutes(5),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    Evidence::lock_capture(&mut tx).await.unwrap();
+    LogStreamRepository::lock(&mut tx, stream).await.unwrap();
+    sqlx::query("SET LOCAL TimeZone='Asia/Kathmandu'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let retry = LogStreamRepository::select_close(
+        &mut tx,
+        stream,
+        0,
+        &json!({"kind":"native_test"}),
+        &json!({"encoding":"plain"}),
+        false,
+        Utc::now() + Duration::minutes(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.revision(), retry.revision());
+    assert_eq!(first.input(), retry.input());
+    assert_eq!(first.input_sha256(), retry.input_sha256());
+    tx.rollback().await.unwrap();
+    pool.cleanup().await.unwrap();
+}

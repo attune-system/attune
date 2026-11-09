@@ -39,6 +39,7 @@ pub mod log_stream;
 pub mod metadata_cache;
 pub mod models;
 pub mod mq;
+pub mod object_log_verification;
 pub mod observability;
 mod pack_cache_definition;
 pub mod pack_check;
