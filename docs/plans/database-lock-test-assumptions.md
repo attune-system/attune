@@ -273,3 +273,12 @@ serializing HistoricalBinding must retain only historical identity. Source
 expiry checks belong after target waits, including sensor lease clock expiry.
 Native terminal completion must remain a positive case; worker terminal completion
 must remain denied. No FK or fabricated worker permit may replace these checks.
+
+The completed source prerequisite now has actual integration coverage for process,
+delivery and sensor owners through the hidden Rust helper API, plus typed native
+and legacy-worker repository projections. See the implementation map for the
+PG16/18 35-case inventory and provenance. The approval-expiry fixture warms and
+cleans its own migration context before starting the original 30-second approval;
+all wait budgets/barriers/assertions are unchanged. This fixes a demonstrated
+cold-setup failure and does not reclassify older timing or CommitUnknown failures.
+These results still do not certify durable finalization or a pool-free route.

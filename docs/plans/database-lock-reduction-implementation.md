@@ -1227,3 +1227,118 @@ Broader consumers/final CI, earlier unclassified timing/CommitUnknown failures,
 Docker relay omission, 58 base-manifest policy failures and real successful-COMMIT
 lost-ACK coverage remain open. PUT settlement, delayed preadmitted PUT, forgotten
 multipart and post-retention key recreation/path retirement remain outside A.
+
+### Source prerequisite: completed helper boundary and validation
+
+The finite source prerequisite is implemented; the overall PR remains work in
+progress and selected-close publication remains disabled. The Rust library
+exports `internal_files::log_source` with hidden documentation so the existing
+integration fixtures exercise the actual helper. `Source` and `HistoricalBinding`
+are opaque: no public field/constructor exposes a FileMutationProof or permits a
+historical binding to stand in for current authorization. This adds no HTTP route.
+The module's narrow dead-code allowance remains staging for production integration,
+not a fake caller. The canonical production route retains its old long transaction.
+
+The owner API is `acquire(state, transaction, authenticated_user, version)` ->
+`Source`; `authorize_target`; `transaction` for ordered target locks/reloads;
+`bind(state, user, locked_version, locked_stream, headers, expected_history)`;
+`recheck`; and consuming `commit`. Acquire locks shared graph before sources,
+including legacy callers. Cache PinMutation may precede graph admission. Commit
+rechecks sources before commit and preserves the existing pure effect check after
+commit waits; any commit error must be reconciled, never assumed rolled back.
+Only the immutable historical value crosses phases; final phases must call
+acquire on a NEW transaction and compare freshly authenticated bindings.
+
+Sensor source protection now also locks existing schema/log-generation rows after
+assignment/generation/metadata validation. Identity retains optional actual metadata
+revision, schema ID/digest and log-generation ID/digest; a bound log generation
+must match the current generation. Recheck projections and metadata after waits,
+then check the lease clock. Absence remains absence for legacy evidence; it cannot
+silently equal a previously recorded binding. No execution/admission/event FK,
+missing source recreation, fabricated evidence owner, or workflow/sensor worker
+permit was added. Native source protection uses workflow -> selection/authority
+-> execution/attempt, permitting terminal native completion. Recorded paths retain
+existing authority/origin order, then context/permit protection before targets.
+
+Validation source: runtime checkpoint `499ce06a5fbafbea58f14abdd09b10642f4103a9`
+plus the saved source/test patch under `.scratch/source-validation9/tested-source.patch`
+(SHA256 `660299fb3d7ba634ed1ba133df8b0be6eb01d2acfa7eea2d04fb62dccb8dd030`).
+That patch adds hidden Rust visibility, real integration coverage and fixture/test
+corrections; subsequent edits are this prose record only. Exact executable commands,
+exit codes, container IDs and removal results are in
+`.scratch/source-validation9/state.json`; earlier evidence is in the corresponding
+`source-validation5` and `source-validation8` directories.
+
+All selected executables ran sequentially on owned stock PostgreSQL 16/18, with
+four libtest threads and no overlapping compilation. Host bootstrap used explicit
+owned `make db-test-setup TEST_DB_ADMIN_URL=... TEST_DB_URL=...` URLs and temporary
+psql shims forwarding solely to each exact owned container. No default cluster
+was used. Focused commands and their scope are also in the testing guide.
+
+| Selected target/filter | PG16 | PG18 |
+| --- | --- | --- |
+| API lib `internal_files::tests::` | 21/21 | 21/21 |
+| common `sensor_workload_repository_tests`, `staged_` | 2/2 | 2/2 |
+| API `sensor_log_tests` (entire target) | 3/3 | 3/3 |
+| common `execution_admission_tests`, `staged_` | 6/6 | 6/6 |
+| recorded integration `terminal_log_delivery_keeps_caps` | 1/1 | 1/1 |
+| recorded integration `encrypted_terminal_logs_require` | 1/1 | 1/1 |
+| recorded integration `worker_file_approval_expiry_after_source` | 1/1 | 1/1 |
+
+Total selected coverage is **35/35 per version**, zero ignored. The native filter
+includes four existing staged-completion cases as well as two new source cases.
+PG16's first 34 final passes are from run8; the corrected expiry case passed in
+run9 (96.72s). PG18's complete set passed in run9; expiry took 70.51s. The later
+fixture change affects only the expiry function, so the other PG16 results remain
+valid. The API unit binary predates only Rust visibility changes; its source
+algorithm and tests are unchanged, while the public-helper integration targets
+compile and exercise current source. No old test budget/assertion was weakened.
+
+The recorded integration tests directly exercise actual process and delivery
+Source owners through fresh transactions, numeric context/permit projections,
+instance mismatch, admission revocation, encrypted proof roundtrip and rejection
+of a different authenticated manifest encoding. Sensor API tests exercise actual
+admission/log bindings, renewed credential deadlines, expiry and lifecycle release.
+Native repository tests preserve terminal completion and deny missing workflow
+state; actual worker attempt replacement yields distinct identity and missing
+attempt denies. Sensor repository tests cover generation/instance replacement,
+independent NOWAIT source/schema lock release, and a proven queued target wait
+followed by lease expiry and specifically PermissionDenied.
+
+`cargo clippy -p attune-common -p attune-api --all-targets -- -D warnings`
+passed on the final source. Owned PG18 `DATABASE_URL=... SQLX_OFFLINE=false cargo
+sqlx prepare --workspace -- --all-targets` passed, checking every workspace target;
+SQLx reported no macro queries found and changed no offline metadata. Formatting
+and whitespace are checked again after this prose update. No migration or public
+HTTP contract changed, so no forward migration or generated client was needed.
+
+Failures/corrections are retained, not erased by reruns. Initial compile attempts
+caught stale dependency metadata and fixture mistakes (lease fence conversion,
+fixture destructuring and an unused TTL parameter); corrected checks passed.
+Three superseded optimized builds were explicitly cancelled before any DB test.
+Run5 API passed 21/21, but its sensor fixture expected a schema row after only
+begin_process; run8 admits the schema through the actual producer lifecycle before
+asserting the lock, preserving the assertion. Run8's expiry case failed during
+setup: the original 30-second deadline began before cold schema replay, which
+lasted 37.92s. The fixture now creates/cleans an owned warm-up context before
+starting that same 30-second clock. Its 15/40-second observation budgets, real
+blocking/DB-clock barrier and all publication assertions remain unchanged. This
+classifies that new setup failure, not earlier unclassified timing failures.
+
+All failed and successful runs removed their exact owned containers and anonymous
+volumes. Successful pipelines checked zero per-test clones before teardown; cached
+owned templates were removed with their servers. All temporary psql shims are
+removed, and no owned DB/test/compiler process remains. No push, PR edit, deployment,
+production change or change to the original dirty checkout was performed.
+
+Remaining implementation is the next durable prepare/finalize/route-split task:
+selected input/revision/deadline ownership, binding byte verification to that input,
+atomic final evidence/metadata/seal/Ready/published consistency, commit-unknown
+reconciliation and bounded recovery, followed by review and paused-I/O pool/graph
+and provider races. Existing source helpers no longer constitute the discovered
+sensor/native prerequisite gaps; their production integration still must happen.
+Required final CI, broader consumer runtime coverage, real successful-COMMIT/lost-ACK
+coverage, older unclassified timing/CommitUnknown failures, Docker relay packaging
+and the 58 unchanged base-manifest policy failures remain disclosed. Complete PUT
+settlement, delayed preadmitted PUT prevention, forgotten multipart obligations,
+post-retention recreation and filesystem retirement remain outside milestone A.

@@ -59,10 +59,10 @@ continues to handle streams without selected close state.
 
 The foundation is incomplete until the following are implemented and reviewed:
 
-1. Typed producer/proof projection derived through the actual workflow, sensor,
-   legacy and recorded-worker authorization helpers. The low-level selection
-   repository currently accepts server JSON projections and is not a production
-   authorization boundary. No route invokes it.
+1. Connect the staged typed producer/proof projection described below to durable
+   prepare/final ownership. The low-level selection repository still accepts
+   server JSON projections and is not a production authorization boundary.
+   No route invokes selected close preparation or the staged source owner.
 2. Storage-only verification accepting storage and immutable inputs, with no
    AppState, pool, connection, transaction or old mutation effect. Consume full
    segment bytes through EOF, preserve concatenated SHA256, exact pinned provider
@@ -127,7 +127,7 @@ Selections made before this migration with non-UTC segment timestamp projections
 can still conflict safely; no silent conversion or permanent-closure reset is
 provided. The cross-TimeZone test covers new selections with a real segment.
 
-Activation remains blocked by unimplemented fresh-source ownership and atomic
+Activation remains blocked by unimplemented durable final ownership and atomic
 final publication, rather than by provider verification. In particular, sensor
 fence validation in authentication middleware is not a final-transaction fence;
 `authorize_version_mutation` has no sensor-generation branch. Native workflow
@@ -135,9 +135,10 @@ fence validation in authentication middleware is not a final-transaction fence;
 Simply calling the existing helper again does not establish all requested source
 checks after target waits. These must be corrected and tested before introducing
 the finalizer or replacing the selected-close SQL publication vetoes. No claim is
-made that these gaps require a new authority format or retention FK. Typed actual
-producer projections, prepare/final commit reconciliation, publication consistency,
-revision/deadline recovery and the requested route races remain unimplemented.
+made that these gaps require a new authority format or retention FK. The staged continuation below supplies typed source/proof projections and a fresh
+transaction owner. Their integration into durable prepare/final ownership,
+commit reconciliation, publication consistency, revision/deadline recovery and
+the requested route races remains unimplemented.
 
 ## Staged source API (2026-11-09 continuation)
 
@@ -182,3 +183,17 @@ subsequent review remain required. Historical identity alone never authorizes
 publication. Permanent closure, accepted membership and cleanup protections from
 003/004/005 remain unchanged; full PUT settlement and path retirement remain
 outside this prerequisite.
+
+`Source::commit` consumes the transaction owner, checks source freshness immediately
+before commit and preserves `FileMutationProof`'s pure check after commit waits.
+An error from commit is not evidence of rollback; the next durable orchestration
+must reconcile state in a new freshly authorized transaction. No old Source or
+FileMutationProof is a recovery capability.
+
+Sensor historical identity also retains the actual optional metadata revision,
+schema binding ID/digest and log-generation ID/digest. Existing schema and log
+binding rows are locked in the source stage after assignment/generation checks.
+A bound log generation must match the current generation's schema identity.
+After waits, recheck these projections and metadata, then sample the lease clock.
+Absence stays absence for genuine legacy sources; losing recorded evidence cannot
+silently produce the same historical binding. No missing record is recreated.

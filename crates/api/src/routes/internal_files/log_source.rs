@@ -52,7 +52,7 @@ pub(crate) enum ProofBinding {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct HistoricalBinding {
+pub struct HistoricalBinding {
     version: i64,
     stream: i64,
     producer: Producer,
@@ -71,7 +71,7 @@ impl HistoricalBinding {
 
 /// Must remain within this transaction, and be dropped before storage work.
 /// HistoricalBinding is the only value allowed to cross a phase boundary.
-pub(crate) struct Source<'db> {
+pub struct Source<'db> {
     version: i64,
     artifact: i64,
     execution: Option<i64>,
@@ -89,7 +89,7 @@ fn denied() -> (StatusCode, String) {
 
 /// Call under shared graph admission BEFORE artifact/version/stream locks.
 /// Acquiring capture is idempotent for an admitted caller; legacy paths enter too.
-pub(crate) async fn acquire<'db>(
+pub async fn acquire<'db>(
     state: &AppState,
     mut tx: sqlx::Transaction<'db, sqlx::Postgres>,
     user: &AuthenticatedUser,
@@ -265,18 +265,18 @@ pub(crate) async fn acquire<'db>(
 
 impl<'db> Source<'db> {
     /// Complete this short phase and repeat pure freshness after commit waits.
-    pub(crate) async fn commit(mut self) -> Result<(), (StatusCode, String)> {
+    pub async fn commit(mut self) -> Result<(), (StatusCode, String)> {
         self.recheck().await?;
         self.effect.commit(self.tx).await.map_err(map_api_error)
     }
 
     /// Access only this phase's transaction for target row locks/reloads.
-    pub(crate) fn transaction(&mut self) -> &mut sqlx::Transaction<'db, sqlx::Postgres> {
+    pub fn transaction(&mut self) -> &mut sqlx::Transaction<'db, sqlx::Postgres> {
         &mut self.tx
     }
 
     /// Run after target locks/waits, immediately before every prepare/final effect.
-    pub(crate) async fn recheck(&mut self) -> Result<(), (StatusCode, String)> {
+    pub async fn recheck(&mut self) -> Result<(), (StatusCode, String)> {
         if let Producer::Sensor {
             sensor,
             fence,
@@ -314,7 +314,7 @@ impl<'db> Source<'db> {
     }
 
     /// Target stage; the caller then locks/reloads version and stream and calls bind.
-    pub(crate) async fn authorize_target(
+    pub async fn authorize_target(
         &mut self,
         user: &AuthenticatedUser,
         version: &attune_common::models::artifact_version::ArtifactVersion,
@@ -345,7 +345,7 @@ impl<'db> Source<'db> {
     /// Authenticates the existing v1 final manifest, checks current caps and binds
     /// exact authenticated input without persisting a bearer token or secret key.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn bind(
+    pub async fn bind(
         &mut self,
         state: &AppState,
         user: &AuthenticatedUser,

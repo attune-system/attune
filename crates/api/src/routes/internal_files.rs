@@ -4657,7 +4657,8 @@ fn map_api_error(error: crate::middleware::ApiError) -> (StatusCode, String) {
 
 // Staged split helpers have no production caller until the durable finalizer lands.
 #[allow(dead_code)]
-pub(crate) mod log_source;
+#[doc(hidden)]
+pub mod log_source;
 
 async fn authorize_version_mutation(
     state: &AppState,
@@ -6041,19 +6042,19 @@ mod tests {
             access_token_expiration: 3600,
             refresh_token_expiration: 86400,
         };
-        let credential = || {
+        let credential = |ttl| {
             let token = attune_common::auth::jwt::generate_worker_token(
                 identity,
                 &worker.to_string(),
                 &jwt,
-                Some(60),
+                Some(ttl),
             )
             .unwrap();
             AuthenticatedUser {
                 claims: attune_common::auth::jwt::validate_token(&token, &jwt).unwrap(),
             }
         };
-        let user = credential();
+        let user = credential(60);
         let tx = state.db.begin().await.unwrap();
         let mut source = log_source::acquire(&state, tx, &user, &version)
             .await
@@ -6068,7 +6069,8 @@ mod tests {
         assert!(!encoded.to_string().contains("credential_deadline"));
         let historical = serde_json::from_value(encoded).unwrap();
         // A fresh credential for the same producer preserves the historical identity.
-        let renewed = credential();
+        let renewed = credential(120);
+        assert!(renewed.claims.exp > user.claims.exp);
         let tx = state.db.begin().await.unwrap();
         let mut source = log_source::acquire(&state, tx, &renewed, &version)
             .await
@@ -6107,7 +6109,7 @@ mod tests {
             StatusCode::CONFLICT
         );
         source.commit().await.unwrap();
-        let mut expired = credential();
+        let mut expired = credential(60);
         expired.claims.exp = 0;
         let tx = state.db.begin().await.unwrap();
         assert!(log_source::acquire(&state, tx, &expired, &version)

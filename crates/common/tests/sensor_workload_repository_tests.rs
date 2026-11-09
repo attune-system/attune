@@ -2908,6 +2908,16 @@ async fn staged_log_sensor_fresh_transaction_and_after_wait_expiry() {
     .unwrap()
     .is_none());
     tx.rollback().await.unwrap();
+    let mut admission = database.begin().await.unwrap();
+    attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_capture(&mut admission).await.unwrap();
+    attune_common::repositories::sensor_schema::SensorSchemaRepository::admit(
+        &mut admission,
+        &process,
+        Some("0123456789abcdef0123456789abcdef"),
+    )
+    .await
+    .unwrap();
+    admission.commit().await.unwrap();
     let mut tx = database.begin().await.unwrap();
     assert!(SensorWorkloadRepository::lock_current_fence_workload(
         &mut tx,
@@ -3023,6 +3033,9 @@ async fn staged_sensor_source_checks_lease_after_queued_target_lock() {
     sqlx::query("SELECT pg_sleep(GREATEST(0,extract(epoch FROM (lease_expires_at-clock_timestamp())))::double precision) FROM sensor_workload_assignment WHERE workload=$1")
         .bind(fence.workload_id).execute(&mut *target).await.unwrap();
     target.commit().await.unwrap();
-    assert!(pending.await.unwrap().is_err());
+    assert!(matches!(
+        pending.await.unwrap(),
+        Err(attune_common::Error::PermissionDenied(_))
+    ));
     database.cleanup().await.unwrap();
 }
