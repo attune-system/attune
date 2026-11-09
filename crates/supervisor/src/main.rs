@@ -2498,7 +2498,10 @@ mod tests {
     async fn artifact_empty_raw_pages_continue_without_hourly_retention_or_hot_loop() {
         let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
         let mut config = Config::load_from_file(&config_path).unwrap();
-        let database = TestDatabase::create(&config.database).await.unwrap();
+        let database = TestDatabase::create(&config.database)
+            .await
+            .unwrap()
+            .with_cleanup_on_drop();
         let artifacts = tempfile::tempdir().unwrap();
         let objects = tempfile::tempdir().unwrap();
         config.artifacts_dir = artifacts.path().to_string_lossy().into_owned();
