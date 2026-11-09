@@ -1,6 +1,7 @@
 # Runtime log finalization reliability plan
 
-Status: phases 1 and 2 implemented on `fix/runtime-log-finalization`; integration, final validation, and review remain in progress.
+Status: phases 1 and 2 implemented on `fix/runtime-log-finalization`.
+Current validation, CI, review, and merge readiness are tracked in [PR #31](https://github.com/attune-system/attune/pull/31).
 Date: 2026-11-08.
 
 PR scope: phases 1 and 2, including their applicable validation. The user
@@ -108,11 +109,14 @@ recovery and moving verification outside transactions remain follow-up work.
 
 ### Validation of the integrated implementation
 
-Status: work in progress while final storage checks, required CI, and the requested
-GPT-6 Astra review complete. Rust checks target `668c6edad1904ff2f492e1617594a4b116a9b121`
-after integrating main at `8af23fc4d77ce84d661474cb6711d0db3be906d3`.
-Subsequent changes add a web capture-failure notice, generated client responses,
-and this documentation; they do not affect the reused Rust results.
+This is checkpoint evidence; the PR carries the final validation handoff and
+readiness status. Initial integrated Rust checks target
+`668c6edad1904ff2f492e1617594a4b116a9b121` after integrating main at
+`8af23fc4d77ce84d661474cb6711d0db3be906d3`. Subsequent changes at `7174ff16`
+add a web capture-failure notice and generated client responses. `eec204e0` adds
+concurrent seal-replay coverage and excludes HTTP error-body EOF from download
+success auditing. The affected API tests are rerun for those final changes;
+common/worker and web results remain reusable because their sources did not change.
 
 All checks run in the fix worktree. Rust artifacts use its separate target
 cache. PostgreSQL 18 and versioned RustFS storage are disposable, task-owned
@@ -121,14 +125,24 @@ containers; no cluster configuration or deployed data was changed.
 - `cargo clippy --locked --workspace --all-targets -- -D warnings`: passed,
   including all-target workspace compilation.
 - Common and worker library tests filtered by `runtime`: 272 passed.
+- Common log-writer tests filtered by `log_stream`: 17 passed.
 - API artifact headers/content, single-connection, execution-log admission, and
   sensor-log integration suites: 27 passed on PostgreSQL. These cover authorized
   Pending diagnostics, every terminal execution status, hidden-content rejection,
   per-stream empty results, selected-version fences, and full-EOF audit semantics.
 - Full web suite: 612 tests passed. `npm run build` and
   `npm run typecheck:contracts` passed. TypeScript, ESLint, and Prettier passed.
-- API generation completed, including the two new HTTP 409 response entries.
-  Workspace, exported OpenAPI, and generated client versions all remain `0.10.3`.
+- API generation and `npm run check:api` passed, including the two new HTTP 409
+  response entries. Workspace, exported OpenAPI, and generated client versions
+  all remain `0.10.3`.
+- The direct S3 upload test passed. All nine replica/storage cases passed with
+  versioned RustFS and PostgreSQL, including reconnect, missed notifications,
+  terminal-before-publication, source revocation, ambiguous upload retries,
+  pinned reads, and shared-file cross-process locking/retention. The first
+  integrated run had three SSE timeouts while concurrent compiler I/O produced
+  3–4-second database commits. The full rerun passed with task-owned compilers
+  paused, the same four test threads, timeouts, and coverage. Compilation resumed
+  afterward, and owned object-prefix cleanup completed.
 - `cargo fmt --all -- --check` and `git diff --check`: passed.
 
 An initial full web run timed out during concurrent compilation. The clean base
@@ -138,9 +152,11 @@ changing timeout settings or excluding tests. On Node 26 the local command uses
 Node 22. The earlier CI client-generation failure is addressed by including the
 regenerated `ArtifactsService.ts` rather than changing the contract check.
 
-Storage/replica tests, the final generated-client comparison, required CI, and
-review results will be appended before readiness. These checks validate fault
-handling and authorization contracts, not production throughput or NFS/RWX
+The PR records the final API/encrypted-reader reruns, targeted Clippy, required
+CI, and requested GPT-6 Astra review. A security CI attempt at `eec204e0` failed
+before scanning when GitHub returned HTTP 504 for the Gitleaks download; a
+successful security check is still required for readiness. These checks validate
+fault handling and authorization contracts, not production throughput or NFS/RWX
 conformance. Durable crash recovery and comparative deployment benchmarking
 remain follow-up work; this PR makes no measured performance-improvement claim.
 
@@ -251,32 +267,32 @@ explicit rather than assuming the object protocol applies unchanged.
 
 ## Validation and acceptance
 
-- [ ] Use controlled transports and readiness barriers to test upload and seal
+- Use controlled transports and readiness barriers to test upload and seal
   delays longer than the old 1-second deadline that succeed within the new
   budget. Use deterministic clocks where possible.
-- [ ] Cover transient failures, retry exhaustion, lost acknowledgements,
+- Cover transient failures, retry exhaustion, lost acknowledgements,
   concurrent identical seals, conflicting manifests, and unknown commit outcomes.
-- [ ] Preserve process cancellation, runtime timeout, post-exit cancellation,
+- Preserve process cancellation, runtime timeout, post-exit cancellation,
   bounded pipe drain, and joined background task teardown.
-- [ ] Exercise silent output, stdout only, stderr only, both streams, truncation,
+- Exercise silent output, stdout only, stderr only, both streams, truncation,
   encrypted frame boundaries, and independent failure of either stream.
-- [ ] Run repository/API tests with real disposable PostgreSQL and versioned
+- Run repository/API tests with real disposable PostgreSQL and versioned
   object storage for commit, settlement, and reader contracts. Cover shared-file
   transport separately. Follow [runtime log verification](../deployment/runtime-log-verification.md).
-- [ ] Verify revocation, expired authority, stale attempts, worker reassignment,
+- Verify revocation, expired authority, stale attempts, worker reassignment,
   changed owner bindings, retention races, and invalid or incomplete proofs still
   deny publication and plaintext delivery.
-- [ ] For durable recovery, inject crashes before and after intent persistence,
+- Follow-up phase 3: for durable recovery, inject crashes before and after intent persistence,
   final upload, seal commit, acknowledgement, takeover, and cleanup. Require
   stale owners to be fenced and outstanding obligations to remain owned.
-- [ ] Add UI and API contract cases distinguishing incomplete logs from denied
+- Add UI and API contract cases distinguishing incomplete logs from denied
   access, preserving exact version selection and successful empty-stream behavior.
-- [ ] Repeat identical serial and concurrent workloads with failures included
+- Follow-up phase 4 deployment benchmark: repeat identical serial and concurrent workloads with failures included
   in the denominator. Report incomplete rates, process latency, finalization
   latency, worker occupancy, memory, retries, pool waits, and lock hold times.
   Require no incomplete logs for injected transient faults that recover within
   the configured budget, and explicit bounded failure beyond it.
-- [ ] Follow [running tests](../testing/running-tests.md) for affected crate,
+- Follow [running tests](../testing/running-tests.md) for affected crate,
   formatting, Clippy, web, generated-client, and SQLx checks as applicable.
   Required CI must pass before merge readiness.
 
