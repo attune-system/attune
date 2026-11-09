@@ -710,11 +710,11 @@ ensure_fresh_on calls alone do not establish all those relationships anew.
 
 ### Durable changes required before releasing the prepare transaction
 
-The minimal candidate is close state associated with the existing stream:
-a monotonically changing close revision, fixed frontier/input identity, requested
-truncation, bound producer identity, and unresolved/resolved status. Whether this
-uses internal stream columns or one close row is a schema choice still requiring
-review. Prefer the smaller lifecycle extension; do not add a second generic
+The reviewed design uses private close state on the existing stream: monotonic
+revision, permanent immutable input/frontier/producer/proof identity and a phase.
+Closing supplies a temporary verification pin. Abandoned and published remain
+permanently closed to append. Retain closed streams until allowed version teardown;
+standalone deletion/recreation cannot reset this identity. Do not add a generic
 distributed job scheduler or duplicate worker authority.
 
 Keep public sealed false and the body Pending during verification. Do not insert
@@ -727,7 +727,7 @@ Required participants are broader than the seal handler:
 | --- | --- |
 | [log_stream.rs repository](../../crates/common/src/repositories/log_stream.rs): commit_segment, seal, seal_shared_file, lock | Add internal lifecycle reads/transitions. A fresh append cannot cross a closed frontier. Exact already-accepted retries remain idempotent. Initially retain current metadata locks to isolate the lifetime change from lock removal. |
 | internal_files.rs: authorize_direct_log_segment_upload, complete_direct_log_segment_upload, reserve_proxy_log_upload, commit_log_segment | All upload admission and publication paths must consult the same close state under stream coordination. A request admitted earlier must settle before prepare or be prevented from changing the selected frontier. |
-| [artifact_upload_grant.rs](../../crates/common/src/repositories/artifact_upload_grant.rs) and [blob_store.rs](../../crates/common/src/blob_store.rs) | Supply durable ownership/settlement for every physical PUT, including duplicates, staging/multipart work, and late completion. active_log_segment_exists currently only counts issued grants whose settle_until is in the future; that is insufficient settlement proof. |
+| [artifact_upload_grant.rs](../../crates/common/src/repositories/artifact_upload_grant.rs) and [blob_store.rs](../../crates/common/src/blob_store.rs) | Later milestone B supplies durable ownership/settlement for every physical PUT, including duplicates, staging/multipart work, and late completion. Milestone A preserves the existing active-grant publication exclusion without treating TTL as settlement; earlier admitted PUTs may start after closure. |
 | Forward SQL migration for log_segment | Enforce immutable accepted segment identity/membership during unresolved close. The current create-only table comment is not an UPDATE guard. Retain exact provider-version reads. |
 | [models.rs](../../crates/common/src/models.rs), internal repository projections | Map new internal state without accidentally exposing lifecycle tokens or proof material through the serialized public LogStream model. Update relevant column constants and SQLx metadata if required. |
 | [storage_maintenance.rs](../../crates/common/src/repositories/storage_maintenance.rs), [maintenance.rs](../../crates/common/src/repositories/maintenance.rs), [file_evidence_retention.rs](../../crates/common/src/repositories/file_evidence_retention.rs), object deletion predicates and SQL guards | An unresolved close must veto metadata deletion, cleanup-state transition, segment deletion/replacement, and physical deletion, including parent-artifact cascades. Existing file-evidence owners cannot be fabricated for logs lacking authenticated origins. |
@@ -740,9 +740,10 @@ infrastructure only after its owner/lifetime requirements are satisfied for logs
 Preserve the counterexamples in the [seal claims review](object-log-seal-claims.md).
 
 On cancellation, the unresolved close input remains protected. A bounded recovery
-path may retry the same immutable input with fresh allowed authority, or resolve
-it as abandoned after proving physical settlement. Deadline expiry alone cannot
-remove its cleanup protection. An identical concurrent close may wait for the
+path may retry the same immutable input with fresh allowed authority, or explicitly
+abandon only the temporary verification pin with a revision-qualified transition.
+Abandonment does not prove physical settlement or erase other upload obligations.
+Deadline expiry alone cannot remove its cleanup protection. An identical concurrent close may wait for the
 existing result outside any database transaction; do not return a new permanent
 conflict for the identical-retry contract supplied by PR #31.
 
@@ -933,3 +934,24 @@ interleavings, plus lower lock/transaction tails under the same workload. At the
 Source/link and whitespace checks were its validation; first-checkpoint results
 are recorded above. The companion test audit remains a predictive inventory for
 later milestones, rather than evidence those milestones have passed.
+
+### Object-log close storage guard checkpoint
+
+Dependency integration: normal task-branch merge `4ac6ea43` integrates PR31
+`c067e88573529466f40849a7b58325a8e4aaa704`; PR31 itself remains open and unchanged.
+Only the existing `fix/reduce-database-lock-scopes` worktree is modified. No push,
+PR update, production operation or checkout creation is part of this checkpoint.
+
+The coherent current protocol and explicit incomplete boundary are in
+[object-log durable close protocol](object-log-seal-claims.md). This supersedes the
+older dedicated claim-table/token candidate: temporary pin and permanent closure
+are separate, abandonment never reopens, and stream identity survives until
+allowed version teardown. No production prepare/split is enabled. Selected-close
+publication fails closed pending the typed verified-result/fresh-authority owner.
+The existing production seal transaction still holds locks during storage I/O.
+
+Prior corrected milestone3 PG16/18 repository 13 / supervisor 3 / storage 17,
+schema prepare and Clippy results remain historical evidence, as does Astra's P2
+fix confirmation. Earlier timing/CommitUnknown failures remain unclassified.
+The Docker relay fixture omission and 58 base-manifest policy-script failures
+remain gaps; this storage checkpoint cannot turn them into passes.

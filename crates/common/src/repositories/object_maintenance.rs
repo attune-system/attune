@@ -195,6 +195,7 @@ impl ObjectMaintenanceRepository {
                   SELECT id FROM object_maintenance_ledger \
                   WHERE ($5::bigint[] IS NULL OR (id,xmin::text) IN (SELECT * FROM unnest($5::bigint[],$6::text[]))) \
                     AND NOT EXISTS(SELECT 1 FROM file_evidence_put p JOIN file_evidence_owner o ON o.version=p.owner WHERE o.object_key=object_maintenance_ledger.object_key) \
+                    AND NOT object_log_close_object_pinned(object_key, provider_version) \
                     AND NOT EXISTS (SELECT 1 FROM artifact_upload_grant g \
                                    WHERE g.object_key = object_maintenance_ledger.object_key \
                                      AND g.state = 'issued' \

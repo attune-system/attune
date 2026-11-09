@@ -5,9 +5,119 @@ use crate::models::log_stream::{
 use crate::{Error, Result};
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 
+/// Private projection: lifecycle fields never enter the public LogStream model.
+#[derive(Debug, sqlx::FromRow)]
+pub struct SelectedLogClose {
+    revision: i64,
+    input: serde_json::Value,
+    input_sha256: String,
+}
+
+impl SelectedLogClose {
+    pub fn revision(&self) -> i64 {
+        self.revision
+    }
+    pub fn input(&self) -> &serde_json::Value {
+        &self.input
+    }
+    pub fn input_sha256(&self) -> &str {
+        &self.input_sha256
+    }
+}
+
 pub struct LogStreamRepository;
 
 impl LogStreamRepository {
+    /// Caller owns graph/source/artifact/version/stream locking and fresh producer
+    /// authorization. Binding values are authenticated server projections, never
+    /// client claims. This selects bytes only; it grants no publication authority.
+    /// `expected_revision` fences abandonment, expiry takeover and lost replies.
+    pub async fn select_close(
+        tx: &mut Transaction<'_, Postgres>,
+        stream: i64,
+        expected_revision: i64,
+        producer: &serde_json::Value,
+        proof: &serde_json::Value,
+        truncated: bool,
+        deadline: chrono::DateTime<chrono::Utc>,
+    ) -> Result<SelectedLogClose> {
+        let row = sqlx::query_as(
+            "WITH input AS (SELECT jsonb_build_object('snapshot',object_log_close_snapshot($1), \
+                'producer',$3::jsonb,'proof',$4::jsonb,'truncated',$5::boolean) value) \
+             UPDATE log_stream s SET close_phase='closing',close_revision=close_revision+1, \
+               close_input=input.value, \
+               close_input_sha256=encode(sha256(convert_to(input.value::text,'UTF8')),'hex'), \
+               close_deadline=$6 FROM input WHERE s.id=$1 AND s.close_revision=$2 \
+               AND (s.close_phase IS NULL OR s.close_phase='abandoned' \
+                    OR (s.close_phase='closing' AND s.close_deadline<=clock_timestamp())) \
+             RETURNING close_revision AS revision,close_input AS input,close_input_sha256 AS input_sha256",
+        ).bind(stream).bind(expected_revision).bind(producer).bind(proof).bind(truncated).bind(deadline)
+        .fetch_optional(&mut **tx).await?;
+        let row = match row {
+            Some(row) => Some(row),
+            None => sqlx::query_as(
+                "SELECT close_revision AS revision,close_input AS input,close_input_sha256 AS input_sha256 \
+                 FROM log_stream WHERE id=$1 AND close_revision=$2+1 AND close_phase='closing' \
+                 AND close_deadline>clock_timestamp() AND close_input=jsonb_build_object( \
+                   'snapshot',object_log_close_snapshot($1),'producer',$3::jsonb, \
+                   'proof',$4::jsonb,'truncated',$5::boolean)",
+            ).bind(stream).bind(expected_revision).bind(producer).bind(proof).bind(truncated)
+            .fetch_optional(&mut **tx).await?,
+        };
+        row.ok_or_else(|| Error::invalid_state("close revision changed or input conflicts"))
+    }
+
+    /// Release only the verification pin; identity and admission closure survive.
+    pub async fn abandon_close(
+        tx: &mut Transaction<'_, Postgres>,
+        stream: i64,
+        expected_revision: i64,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE log_stream SET close_phase='abandoned',close_revision=close_revision+1 \
+             WHERE id=$1 AND close_phase='closing' AND close_revision=$2",
+        )
+        .bind(stream)
+        .bind(expected_revision)
+        .execute(&mut **tx)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Check every admission and completed-grant retry under the stream lock.
+    /// Closure preserves exact accepted retries but never authorizes another PUT.
+    pub async fn check_close_append(
+        tx: &mut Transaction<'_, Postgres>,
+        stream: i64,
+        sequence: i64,
+        size: i64,
+        digest: &str,
+        object_key: &str,
+        provider: Option<&str>,
+    ) -> Result<()> {
+        let allowed: bool = sqlx::query_scalar(
+            "SELECT close_phase IS NULL OR EXISTS(SELECT 1 FROM log_segment g \
+             JOIN artifact_version v ON v.id=s.artifact_version \
+             WHERE g.stream=s.id AND g.sequence=$2 AND g.size_bytes=$3 AND g.sha256=$4 \
+               AND g.object_key=$5 AND ($6::text IS NULL OR g.provider_version=$6) \
+               AND v.body_state IN ('pending','ready')) FROM log_stream s WHERE s.id=$1",
+        )
+        .bind(stream)
+        .bind(sequence)
+        .bind(size)
+        .bind(digest)
+        .bind(object_key)
+        .bind(provider)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !allowed {
+            return Err(Error::invalid_state(
+                "log close forbids changed or new segment",
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn segments_with_conn(
         connection: &mut PgConnection,
         stream: i64,

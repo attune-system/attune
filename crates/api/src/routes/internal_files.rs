@@ -1315,6 +1315,17 @@ async fn authorize_direct_log_segment_upload(
     let locked_stream = LogStreamRepository::lock(&mut transaction, stream.id)
         .await
         .map_err(map_repository_error)?;
+    LogStreamRepository::check_close_append(
+        &mut transaction,
+        locked_stream.id,
+        sequence,
+        size,
+        &request.sha256,
+        &object_key,
+        None,
+    )
+    .await
+    .map_err(map_repository_error)?;
     check_delivery_bounds(
         &mut transaction,
         &user,
@@ -1508,6 +1519,17 @@ async fn complete_direct_log_segment_upload(
     let locked_stream = LogStreamRepository::lock(&mut transaction, stream.id)
         .await
         .map_err(map_repository_error)?;
+    LogStreamRepository::check_close_append(
+        &mut transaction,
+        locked_stream.id,
+        sequence,
+        grant.expected_size,
+        &grant.expected_sha256,
+        &grant.object_key,
+        Some(stored.provider_version.as_stored()),
+    )
+    .await
+    .map_err(map_repository_error)?;
     check_delivery_bounds(
         &mut transaction,
         &user,
@@ -1722,6 +1744,17 @@ async fn commit_log_segment(
     let locked = LogStreamRepository::lock(&mut transaction, stream.id)
         .await
         .map_err(map_repository_error)?;
+    LogStreamRepository::check_close_append(
+        &mut transaction,
+        locked.id,
+        sequence,
+        bytes.len() as i64,
+        &digest_hex,
+        key.as_str(),
+        Some(stored.provider_version.as_stored()),
+    )
+    .await
+    .map_err(map_repository_error)?;
     check_delivery_bounds(
         &mut transaction,
         &user,
@@ -1850,6 +1883,17 @@ async fn reserve_proxy_log_upload(
     let locked_stream = LogStreamRepository::lock(&mut transaction, stream.id)
         .await
         .map_err(map_repository_error)?;
+    LogStreamRepository::check_close_append(
+        &mut transaction,
+        locked_stream.id,
+        sequence,
+        size,
+        sha256,
+        object_key,
+        None,
+    )
+    .await
+    .map_err(map_repository_error)?;
     check_delivery_bounds(
         &mut transaction,
         user,

@@ -22,6 +22,8 @@ use chrono::{Duration, Utc};
 #[path = "storage_maintenance_repository_tests/bounded_admission.rs"]
 mod bounded_admission;
 mod helpers;
+#[path = "storage_maintenance_repository_tests/object_close.rs"]
+mod object_close;
 use helpers::{create_test_pool, unique_test_id};
 
 fn artifact_input(suffix: &str) -> CreateArtifactInput {
