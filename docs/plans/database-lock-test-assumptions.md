@@ -326,3 +326,31 @@ API: an existing Ready stream is returned under per-version admission, retaining
 its limits and lifecycle. Strict direct INSERT still requires Pending. Workflow
 lost-seal-response recovery must exercise get-or-create before the replayed seal;
 otherwise a valid idempotent endpoint alone does not establish delivery recovery.
+
+
+## Recorded-delivery successful COMMIT / lost-ACK acceptance
+
+The later successful-COMMIT milestone supersedes the earlier integrated-route
+checkpoint's unrun fault-injection gap for the tested recorded worker-delivery
+ObjectSegments path only. Seven actual full-router cases passed on each stock
+PG16/18 server at four workers, using a nonempty encrypted segment. Prepare and
+publication gates require exact backend COMMIT completion plus idle ReadyForQuery;
+before-COMMIT termination remains insufficient. Fresh-PID reconciliation preserves
+the selection or already-published evidence, and publication reports count UPDATE
+executions. Revocation after each committed phase denies fresh authorization;
+forwarded ACK after actual JWT expiry is terminal with no reconciliation socket;
+two prepare ACK losses retain the pin through 503 and allow later same-input recovery.
+
+Per-relay GET counters/PIDs replace process-global disposal deltas. Every passing
+case explicitly joins HTTP/seal work and relay tasks, closes its application pool,
+checks independent PID/lock disappearance and awaits fixture cleanup. Four-worker
+cold setup first warms the owned template through one OnceCell initializer; no
+existing 300s template-lock or phase budget changed. Process 403 consumer controls
+must precede read-fence closure: RequireAuth intentionally rejects a closed read
+fence earlier with 401. No production policy was widened to force the control.
+
+See the central implementation record for exact source hashes, commands, failed
+initial fixtures, safe per-relay reports, cleanup and Docker build attempts.
+Full packaged runtime/required CI, native/sensor final paths and the broader
+finalizer-wait/producer matrix remain gaps. Older unclassified timing failures and
+Scope A exclusions retain their previous meaning.

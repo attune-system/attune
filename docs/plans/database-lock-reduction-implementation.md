@@ -1589,3 +1589,166 @@ work. Dockerfile.rust-tests also needs the path-imported relay fixture copied in
 the builder. No production test GUC or authority bypass is needed. Native/sensor
 final paths, after-target-wait expiry/authority and broader CI remain subsequent
 acceptance gates, along with all explicitly retained physical-settlement limits.
+
+## Successful COMMIT / lost acknowledgement acceptance checkpoint (2026-11-09 local)
+
+Status: **work in progress**, not merge readiness. Code checkpoints are
+`b784496959b1aa82aaceb0c8a889ea52fac78204` and
+`8bfc7fa9819197ee78d2d034e13e6d0bae51e59c`. Only tests and Docker test packaging
+changed. No production authorization seam, GUC, bypass, dependency, migration,
+production reconciliation change, push, PR edit, deployment or merge was introduced.
+The tests revealed fixture/setup defects, no production reconciliation defect.
+
+The host binaries were built with HEAD/build metadata frozen at `b7844969` plus
+`/tmp/attune-ack-final-source.diff`, SHA256
+`4d6c2bfcdcf98732807fc5a151725986518d855135e5937e8c4d1751c581ae68`.
+That diff is the exact subsequently committed `8bfc7fa9` code. The later code
+checkpoint changes the build stamp, not the tested business behavior. No source
+or HEAD changed during each affected API build or its route run. The common
+session-lease prebuild used unchanged common inputs while API-only fixture fixes
+were prepared; its old relay is unchanged.
+
+`tests/sqlx-session/src/commit_relay.rs` supplies an independent owned controller;
+the old relay API/callers remain intact. It accepts replacement/concurrent sockets,
+requires plaintext startup with SSL disabled, sets TCP_NODELAY, forwards auth
+opaquely, bounds frames/names/registries, tracks prepared statements and portals,
+validates the target stream's text/binary int8 bind at execution, and distinguishes
+selected-only transactions from publication (which overrides selection). Cached
+Bind/Execute, preparation-only Sync, Close invalidation and savepoint rollback /
+release have tests. Unsupported protocol shapes fail with payload-free IO errors.
+Only exact backend `CommandComplete(COMMIT)` followed by idle `ReadyForQuery`
+produces a held event. Completion and intervening frames are withheld together;
+Disconnect drops both directions. Error/ROLLBACK/non-idle completion is not proof.
+The preinstalled plan is consumed globally across sockets without rearming races.
+Publication reports count UPDATE executions, including rolled-back attempts,
+rather than merely counting successful commits. Diagnostics contain connection,
+PID, class, status and disposal counts, never SQL/binds/passwords/bearers/cancel keys.
+
+The seven `recorded_execution_events_tests` cases under
+`recorded_file_completion_cases::object_seal_ack_loss` use the full Server router,
+actual recorded worker-delivery credentials/context/permit and a nonempty encrypted
+16 KiB plaintext frame uploaded through the ordinary segment HTTP route. The
+original pool remains the direct setup/observer; only the cloned app's DB and blob
+store are replaced. Its relay pool has max=1/min=0, bounded acquisition, copied
+connection credentials/options and the direct pool's observed search_path. A
+GET-only barrier delegates other storage operations. A live process credential's
+undeclared-consumer seal remains 403 before read closure/terminal completion;
+the faulted seal uses the delivery credential after both transitions.
+
+Observed causal assertions on **stock PostgreSQL 16.15 and 18.6**, four workers:
+
+- Prepare loss: real committed closing/Pending/unsealed selection, exact revision,
+  input/hash/deadline/membership, no final evidence, GET=0, HTTP pending. Fresh
+  selected-only reconciliation has a different connection and PID, identical
+  selection and GET=0. After forwarding its ACK and releasing GET, HTTP 200,
+  Ready/published/sealed, exact encoded size/digest and one matching authenticated
+  final record. Same-input replay 200 has no GET/mutation; changed truncation 409.
+- Final loss: acknowledged prepare, paused GET with closing/Pending, then complete
+  verified bytes. Before disconnect, the held publication COMMIT independently
+  exposes full Ready/published/sealed state, original selection and exact final
+  encrypted evidence. Fresh selected-only reconciliation preserves sealed_at and
+  all evidence, GET=1, and only one publication UPDATE execution. ACK forwarding
+  returns200; replay/truncation controls preserve the publication.
+- Genuine admission revocation after each committed phase, before disconnect,
+  yields 403 on fresh authorization. Prepare keeps its closing pin and GET=0;
+  final keeps the committed publication and GET=1 without treating Ready as authority.
+- Forwarding, rather than dropping, each phase ACK after a deliberately short,
+  genuinely signed credential expires yields terminal 403. Per-relay PID counts
+  prove that no reconciliation socket was opened. No production deadline changed.
+- Dropping both allowed prepare ACKs yields 503 with identical selection/pin and
+  GET=0; later authorized same-input recovery succeeds with one verification and
+  publication.
+
+Every successful test explicitly resolves ACK/GET gates, awaits HTTP/owned seal
+completion, drops cloned router/state references, closes the proxy pool, stops
+and joins the relay, independently waits for all its PIDs and locks to disappear,
+then awaits TestContext cleanup. A watchdog abort is joined and fails shutdown;
+Drop remains panic fallback. No global disposal counter or environment mutation
+inside concurrent tests was added.
+
+Validation commands/results (all zero ignored):
+
+- Early `cargo check -p attune-api --test recorded_execution_events_tests` checks
+  were run, and the corrected source passed; final log `/tmp/attune-ack-check-control.log`.
+- `cargo test -p attune-api --test recorded_execution_events_tests --no-run
+  --message-format=json` and `cargo test -p attune-common --test session_lease_tests
+  --no-run --message-format=json` prebuilt the executables. Final HTTP prebuild
+  passed in 10m09s including the large existing target's codegen.
+- HTTP executable `target/debug/deps/recorded_execution_events_tests-a91a265e43720315`
+  with `object_seal_ --list`: **7 tests**; with `commit_relay:: --nocapture
+  --test-threads=4`: **8/8**. Then `object_seal_ --nocapture --test-threads=4`, cwd
+  `crates/api`, with its absolute CARGO_MANIFEST_DIR and each owned server's
+  ATTUNE__DATABASE__URL: **7/7 PG16 (233.012s)**, run ID `ack6ffe18f4675d`;
+  **7/7 PG18 (77.261s)**, run ID `ack6f13164fc639`. These are the third, corrected
+  source runs, not quiet baseline reruns.
+- Common executable `target/debug/deps/session_lease_tests-96b53d4b66ddd406
+  --nocapture --test-threads=4`, cwd `crates/common`, unique run IDs / owned URLs:
+  **3/3 each**, 136.041s PG16 / 50.365s PG18.
+- `python3 scripts/run-sqlx-session-tests.py`: **19/19 each PG16/18**, owned servers
+  removed by its joined runner. This exercises the unchanged standalone/old relay;
+  it is not substituted for the new route fault proof.
+- `cargo clippy -p attune-api --test recorded_execution_events_tests -- -D warnings`
+  and `cargo clippy -p attune-common --test session_lease_tests -- -D warnings`
+  passed; final API log `/tmp/attune-ack-clippy-control.log`.
+  `cargo fmt --all -- --check` and `git diff --check` passed. No schema, checked
+  SQL, generated SQLx metadata or API contract changed, so workspace schema/client
+  regeneration was not repeated for this test-only milestone.
+
+Intermediate failures remain recorded:
+
+1. Host psql was absent from the initial Make bootstrap. PG16 migration history
+   ended up in both public/attune; only that owned disposable database was reset
+   and migrated after pinning its database search_path. PG18 Prefer SSL produced
+   SSLRequest response0x00; explicit test SSL-disable URLs fixed setup. Original
+   statuses and logs remain in `/tmp/attune-ack-owned.json` and bootstrap logs.
+2. The first full API prebuild failed E0277: this SHA-256 output does not implement
+   LowerHex. Byte-wise lowercase hex fixed the assertion; initial build log/JSON
+   remain as `/tmp/attune-ack-build-initial.*`.
+3. First HTTP run: PG16 **0/7**, three template-lock timeouts at the unchanged 300s limit while the template
+   builder remained active (whole run369.262s), four 401 process controls; PG18 **0/7**, seven 401 controls.
+   Second run: **0/7 each**, all process controls 401. No COMMIT gate was reached in
+   either run. RequireAuth's lock_open rejects a closed read fence before consumer
+   declaration. The corrected fixture serializes only cold warmup with OnceCell,
+   and places its403 control before read closure as well as terminal completion.
+   No assertion, SQL/lock/phase/template budget or ignored status was relaxed.
+   These are fixture/setup failures, not evidence of a production reconciliation
+   defect and not a baseline reclassification of older timing/CommitUnknown gaps.
+4. Initial direct Docker-script execution returned 126 because the script is not
+   executable; the real run used `bash scripts/run-rust-integration-tests.sh --crate
+   api --test recorded_execution_events_tests --filter object_seal_`. The shared
+   relay COPY passed, but workspace compilation exposed another omitted
+   include_str file, `scripts/prepare-file-evidence-upgrade.sql`. Cancellation was
+   joined; no stack had started. Both COPY and .dockerignore were fixed. A scratch
+   image built from the real COPY lines contained both relay files and that SQL
+   include; its temporary tag was inspected and removed. Full retry result follows.
+
+Resource evidence: `/tmp/attune-ack-validation-record.json`,
+`/tmp/attune-ack-results-{first,second,third}.json`,
+`/tmp/attune-ack-common-results.json`, `/tmp/attune-ack-cleanup.log` and
+`/tmp/attune-ack-owned.json`; all commands/logs use the `/tmp/attune-ack-` prefix.
+Seven per-relay reports on each final route run enumerate **24 distinct owned
+backend PIDs per server**. Independent cluster inspection after all tests found
+**0 reported PIDs, 0 their locks and 0 per-test clones** on each server before
+removal. Only the base DB and run-owned migration templates remained. The exact
+owned containers `50f341a5f2fd2c6d21b9ec7ad9b93985f520dabfbd57d5bc1405e329094a9a7e`
+and `14f5e0deab0eeb7bcd67d0c4219b5fdd7cda9f1994a6e9e10ae6639a285baf0d`
+were label-verified, removed with anonymous volumes, and independently absent.
+The original dirty checkout and unrelated containers were untouched.
+
+Residual gaps: native/sensor final paths and broader finalizer-wait/actual-producer
+coverage remain separate. Required final CI and root's new Astra review remain
+pending. Earlier unclassified 250ms DeadlineDeferred/timing/CommitUnknown failures
+and the 58 base-manifest policy violations remain unclassified/unresolved. Scope A
+still excludes full PUT settlement, preadmitted late physical starts, forgotten
+staging, post-retention recreation and filesystem retirement.
+
+Full Docker retry on code `8bfc7fa9` used the same runner/filter under
+`timeout --signal=INT --kill-after=30s 600`. Both corrected COPY steps passed;
+workspace compilation progressed through API/CLI/executor/sensor/supervisor/notifier
+but exceeded the explicit 600s local limit (exit 124). No stack started. The joined
+runner and independent inspection found zero containers, volumes or networks for
+project `attune-rust-int-20261110020236-445315-15428`. Full packaged runtime
+validation remains **unrun**, not passed or certified by the COPY smoke/host runs.
+Log: `/tmp/attune-ack-docker-retry.log`. The initial missing-file omission is
+preserved above; the bounded retry does not erase it. All code stayed frozen
+through this retry; this final continuation is prose only.

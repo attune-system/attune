@@ -59,8 +59,13 @@ PhysicalCleanup/native filesystem fences remain in place.
 
 Validation and unresolved cases are recorded in the central implementation record
 and test assumptions. Prior verifier/source test results do not certify this route.
-Real successful COMMIT with lost acknowledgement, mixed eligibility-error scheduling,
-broader consumers and final CI remain acceptance requirements until exercised.
+Real successful COMMIT with lost acknowledgement now has actual recorded
+worker-delivery HTTP coverage at both prepare and final publication on PG16/18,
+including revocation, forwarded-ACK expiry and two lost prepare ACKs. Mixed
+eligibility-error scheduling, broader producers/final waits, full packaged runtime
+validation and final CI remain acceptance requirements. See the later successful
+COMMIT acceptance checkpoint in the central implementation record for exact source,
+initial fixture failures and explicit resource cleanup.
 
 Runtime evidence: API 25/25 and verifier 4/4 on each PG version; close lifecycle
 9/9 on each; full storage PG16 39/40, PG18 40/40; artifact 8/8, wire types 1/1,
