@@ -21,11 +21,17 @@ use serde_json::{json, Value};
 
 use helpers::TestContext;
 
-#[tokio::test]
-async fn sensor_tail_collects_multiple_versions_and_requires_current_decrypt() -> helpers::Result<()>
-{
+struct SensorLogFixture {
+    ctx: TestContext,
+    pack: attune_common::models::Pack,
+    sensor: attune_common::models::Sensor,
+    workload: attune_common::models::OwnedSensorWorkload,
+    binding: i64,
+    artifact: attune_common::models::Artifact,
+}
+
+async fn sensor_log_fixture() -> helpers::Result<SensorLogFixture> {
     use attune_common::repositories::{
-        artifact::ArtifactVersionRepository,
         component_lifecycle::PackProjectionIds,
         file_evidence_retention::FileEvidenceRetentionRepository,
         pack::PackRepository,
@@ -155,6 +161,33 @@ async fn sensor_tail_collects_multiple_versions_and_requires_current_decrypt() -
         },
     )
     .await?;
+    Ok(SensorLogFixture {
+        ctx,
+        pack,
+        sensor,
+        workload,
+        binding,
+        artifact,
+    })
+}
+
+#[tokio::test]
+async fn sensor_tail_collects_multiple_versions_and_requires_current_decrypt() -> helpers::Result<()>
+{
+    use attune_common::repositories::{
+        artifact::ArtifactVersionRepository,
+        file_evidence_retention::FileEvidenceRetentionRepository,
+        sensor_schema::SensorSchemaRepository,
+    };
+    let SensorLogFixture {
+        ctx,
+        pack,
+        sensor,
+        binding,
+        artifact,
+        ..
+    } = sensor_log_fixture().await?;
+    let identity = ctx.user.as_ref().unwrap().id;
     for content in ["old-one\nold-two\n", "new-three\nnew-four\n"] {
         let mut tx = ctx.pool.begin().await?;
         FileEvidenceRetentionRepository::lock_reclamation(&mut tx).await?;
@@ -343,3 +376,117 @@ async fn sensor_log_summary_identifies_created_stream_artifacts() {
         ])
     );
 }
+
+#[tokio::test]
+async fn staged_sensor_log_source_roundtrip_refresh_expiry_and_release() -> helpers::Result<()> {
+    use attune_common::{
+        models::LogStreamBackend,
+        repositories::{
+            artifact::ArtifactVersionRepository,
+            file_evidence_retention::FileEvidenceRetentionRepository,
+            log_stream::LogStreamRepository, sensor_schema::SensorSchemaRepository,
+            sensor_workload::SensorWorkloadRepository,
+        },
+    };
+    let SensorLogFixture {
+        ctx,
+        pack,
+        sensor,
+        workload,
+        binding,
+        artifact,
+    } = sensor_log_fixture().await?;
+    let version = ArtifactVersionRepository::create_log_pending(
+        &ctx.pool,
+        artifact.id,
+        &artifact.r#ref,
+        LogStreamBackend::ObjectSegments,
+        "text/plain".into(),
+        None,
+        None,
+        Some("sensor".into()),
+    )
+    .await?;
+    let mut tx = ctx.pool.begin().await?;
+    FileEvidenceRetentionRepository::lock_capture(&mut tx).await?;
+    SensorSchemaRepository::attach_log_version(&mut tx, version.id, binding).await?;
+    tx.commit().await?;
+    let stream = LogStreamRepository::create_with_backend(
+        &ctx.pool,
+        version.id,
+        LogStreamBackend::ObjectSegments,
+        1024,
+        500,
+    )
+    .await?;
+    let credential = |ttl| -> helpers::Result<attune_api::auth::middleware::AuthenticatedUser> {
+        let token = attune_common::auth::jwt::generate_sensor_token_with_cache_authority_and_workload_fence(
+            ctx.user.as_ref().unwrap().id, &sensor.r#ref, vec![], Some(&pack.r#ref), &[], &[], workload.fence(), &ctx.state.jwt_config, Some(ttl))?;
+        Ok(attune_api::auth::middleware::AuthenticatedUser {
+            claims: attune_common::auth::jwt::validate_token(&token, &ctx.state.jwt_config)?,
+        })
+    };
+    let mut historical = None;
+    for ttl in [60, 120] {
+        let user = credential(ttl)?;
+        let tx = ctx.pool.begin().await?;
+        let mut source = attune_api::routes::internal_files::log_source::acquire(
+            &ctx.state, tx, &user, &version,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("sensor source: {error:?}"))?;
+        source
+            .authorize_target(&user, &version)
+            .await
+            .map_err(|error| anyhow::anyhow!("sensor target: {error:?}"))?;
+        let version =
+            ArtifactVersionRepository::find_by_id_for_update(source.transaction(), version.id)
+                .await?
+                .unwrap();
+        let stream = LogStreamRepository::lock(source.transaction(), stream.id).await?;
+        let current = source
+            .bind(
+                &ctx.state,
+                &user,
+                &version,
+                &stream,
+                &axum::http::HeaderMap::new(),
+                historical.as_ref(),
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("sensor binding: {error:?}"))?;
+        let projected = serde_json::to_value(&current)?;
+        assert_eq!(projected["producer"]["kind"], "sensor");
+        assert!(projected["producer"]["schema_binding"].is_array());
+        assert!(projected["producer"]["log_generation"].is_array());
+        historical = Some(current);
+        source
+            .commit()
+            .await
+            .map_err(|error| anyhow::anyhow!("sensor commit: {error:?}"))?;
+    }
+    let mut expired = credential(60)?;
+    expired.claims.exp = 0;
+    let tx = ctx.pool.begin().await?;
+    assert!(attune_api::routes::internal_files::log_source::acquire(
+        &ctx.state, tx, &expired, &version
+    )
+    .await
+    .is_err());
+    // Actual lifecycle release must progress after both short phase commits.
+    assert!(SensorWorkloadRepository::release(&ctx.pool, workload.fence()).await?);
+    let user = credential(120)?;
+    let tx = ctx.pool.begin().await?;
+    assert!(attune_api::routes::internal_files::log_source::acquire(
+        &ctx.state, tx, &user, &version
+    )
+    .await
+    .is_err());
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[path = "support/object_seal_boundary.rs"]
+mod object_seal_boundary;
+#[path = "support/object_seal_producers.rs"]
+mod object_seal_producers;

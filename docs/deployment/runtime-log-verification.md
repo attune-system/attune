@@ -61,6 +61,54 @@ segment rows.
 not set the in-memory segment size. A cap truncation is recorded on the sealed
 stream.
 
+## Bound finalization and retries
+
+`artifacts.log_finalization_timeout_ms` defaults to 60,000 ms for the total
+post-exit drain and log settlement. Segment uploads and seals retry transient
+failures using `log_segment_retry_max_attempts`,
+`log_segment_retry_attempt_timeout_ms`, and the configured backoff settings.
+Sealing preserves the exact final manifest on every retry. Shared-file appends
+are not retried because an append acknowledgement can be ambiguous.
+
+Idle pipe reads stop one second after process exit, independently of uploads and
+sealing. Already buffered pipe bytes are drained first. A descendant retaining
+stdout or stderr without producing output therefore cannot consume the longer
+storage budget. Missing EOF is incomplete capture and is never sealed as complete.
+
+The action deadline, cancellation, and total finalization budget still bound the
+worker's wait. Increasing this budget can keep a worker slot occupied longer
+during storage failures and must fit deployment shutdown budgets. Successful
+requests return immediately. There is no durable retry job after worker loss
+or deadline exhaustion, and a dropped request may have committed remotely.
+Use `logs_incomplete` and finalization warnings to identify affected executions;
+do not interpret action success as proof that logs were sealed.
+
+## Interpret delivery outcomes
+
+Finite execution-log downloads return HTTP 409 with `LOG_FINALIZING` while the
+producer is active, or `LOG_INCOMPLETE` after terminal capture failed. These
+states are returned only after full content authorization. Unauthorized readers
+retain the existing denial behavior. A version published concurrently with a
+Pending selection returns the retryable finalizing diagnosis rather than falsely
+claiming permanent loss; retry the same immutable version ID.
+
+The web UI displays these states explicitly. Execution SSE still uses
+`log_stream_incomplete` and never reports successful completion of an unsealed
+stream. A successful action and its two stream outcomes are independent.
+Positive `runtime_log_capture` evidence that stderr was empty remains valid if
+stdout delivery failed; missing capture evidence remains unknown.
+
+`artifact.downloaded` for runtime logs records full authorized EOF. A cancelled
+preview, partial range, rejected download, or failed body does not count as a
+successful full download. This does not prove a client retained the bytes.
+
+The API exposes `attune_runtime_log_finalizing_responses_total` and
+`attune_runtime_log_incomplete_responses_total`. These count responses, not unique
+logs. Correlate worker retry operation/attempt and finalization deadline logs
+with version IDs; the API diagnostic includes observed `pending_age_ms` without
+an expensive background backlog scan. No content or credentials belong in these
+logs or metric labels.
+
 ## Set stream admission limits
 
 Each API replica enforces `server.execution_log_stream_global_limit`. The default

@@ -100,41 +100,69 @@ impl Phase {
         } else {
             ""
         };
+        // Pin predicates must refer to the materialized survivors themselves.
+        // Joining the base table before filtering would let the planner push
+        // expensive predicates below that join and visit protected releases.
+        let (stages, source, final_predicates) = if retention.is_empty() {
+            (
+                String::new(),
+                "raw",
+                format!("{predicates} {accepted_pin} {queue_pin}"),
+            )
+        } else {
+            (
+                format!(
+                    "coarse AS MATERIALIZED (
+                    SELECT raw.id,raw.version FROM raw
+                    JOIN {table} {alias} ON {alias}.{id}=raw.id AND {alias}.xmin::text=raw.version
+                    {joins} WHERE TRUE {retention}
+                 ), unpinned AS MATERIALIZED (
+                    SELECT {alias}.id,{alias}.version FROM coarse {alias}
+                    WHERE {predicates} {queue_pin}
+                 ),"
+                ),
+                "unpinned",
+                "TRUE".to_string(),
+            )
+        };
         format!("WITH raw AS MATERIALIZED (
                     SELECT candidate.id,candidate.version FROM unnest($1::bigint[],$2::text[]) AS candidate(id,version)
                  ), settings AS (SELECT $3::bigint AS delete_limit,$4::timestamptz AS cutoff,$5::bigint AS newest),
+                 {stages}
                  dormant AS (
-                    SELECT {alias}.{id} AS id FROM raw
+                    SELECT {alias}.{id} AS id FROM {source} raw
                     JOIN {table} {alias} ON {alias}.{id}=raw.id AND {alias}.xmin::text=raw.version
-                    {joins} WHERE {predicates} {retention} {accepted_pin} {queue_pin}
+                    {joins} WHERE {final_predicates}
                     ORDER BY {alias}.{id} LIMIT $3 FOR UPDATE OF {alias} SKIP LOCKED
                  ) DELETE FROM {table} target USING dormant WHERE target.{id}=dormant.id {returning}")
     }
 }
 
+// OFFSET 0 prevents anti-join pull-up, including nested JSON expansion. The
+// materialized coarse stage above excludes protected identities before pin work.
 const RELEASE_PINS: &str = "NOT file_evidence_pinned('pack_release',r.id)
-    AND NOT EXISTS(SELECT 1 FROM runtime_authority_release_dependency d WHERE d.release=r.id)
-    AND NOT EXISTS(SELECT 1 FROM managed_sensor_metadata_revision m WHERE m.release=r.id)
-    AND NOT EXISTS(SELECT 1 FROM sensor_rule_structural_origin o WHERE o.dispatch_source_release=r.id)
-    AND NOT EXISTS(SELECT 1 FROM execution e WHERE e.pack_release=r.id)
-    AND NOT EXISTS(SELECT 1 FROM enforcement e WHERE e.pack_release=r.id)
-    AND NOT EXISTS(SELECT 1 FROM work_queue_item q WHERE q.pack_release=r.id)
-    AND NOT EXISTS(SELECT 1 FROM sensor_workload s WHERE s.pack_release=r.id)
-    AND NOT EXISTS(SELECT 1 FROM sensor_generation_schema_binding b WHERE (b.binding->'executable'->'release'->>'id')::BIGINT=r.id)
-    AND NOT EXISTS(SELECT 1 FROM execution e CROSS JOIN LATERAL jsonb_each(COALESCE(e.executable_snapshot->'pack_executables','{}'::jsonb)) child WHERE (child.value->'release'->>'id')::BIGINT=r.id)
-    AND NOT EXISTS(SELECT 1 FROM enforcement e CROSS JOIN LATERAL jsonb_each(COALESCE(e.executable_snapshot->'pack_executables','{}'::jsonb)) child WHERE (child.value->'release'->>'id')::BIGINT=r.id)
-    AND NOT EXISTS(SELECT 1 FROM work_queue_item q CROSS JOIN LATERAL jsonb_each(COALESCE(q.executable_snapshot->'pack_executables','{}'::jsonb)) child WHERE (child.value->'release'->>'id')::BIGINT=r.id)
-    AND NOT EXISTS(SELECT 1 FROM runtime_schema_binding b CROSS JOIN LATERAL jsonb_each(COALESCE(b.contract->'static_actions','{}'::jsonb)) child WHERE (child.value->'executable_snapshot'->'release'->>'id')::BIGINT=r.id)
-    AND NOT EXISTS(SELECT 1 FROM runtime_schema_binding b CROSS JOIN LATERAL jsonb_each(COALESCE(b.contract->'static_actions','{}'::jsonb)) child CROSS JOIN LATERAL jsonb_each(COALESCE(child.value->'executable_snapshot'->'pack_executables','{}'::jsonb)) nested WHERE (nested.value->'release'->>'id')::BIGINT=r.id)
-    AND NOT EXISTS(SELECT 1 FROM runtime c WHERE c.retired_at IS NULL AND c.managed_release=r.id)
-    AND NOT EXISTS(SELECT 1 FROM runtime_version c WHERE c.retired_at IS NULL AND c.managed_release=r.id)
-    AND NOT EXISTS(SELECT 1 FROM permission_set c WHERE c.retired_at IS NULL AND c.managed_release=r.id)
-    AND NOT EXISTS(SELECT 1 FROM trigger c WHERE c.retired_at IS NULL AND c.managed_release=r.id)
-    AND NOT EXISTS(SELECT 1 FROM action c WHERE c.retired_at IS NULL AND c.managed_release=r.id)
-    AND NOT EXISTS(SELECT 1 FROM sensor c WHERE c.retired_at IS NULL AND c.managed_release=r.id)
-    AND NOT EXISTS(SELECT 1 FROM rule c WHERE c.retired_at IS NULL AND c.managed_release=r.id)
-    AND NOT EXISTS(SELECT 1 FROM policy c WHERE c.retired_at IS NULL AND c.managed_release=r.id)
-    AND NOT EXISTS(SELECT 1 FROM work_queue c WHERE c.retired_at IS NULL AND c.managed_release=r.id)
-    AND NOT EXISTS(SELECT 1 FROM workflow_definition c WHERE c.retired_at IS NULL AND c.managed_release=r.id)
-    AND NOT EXISTS(SELECT 1 FROM dashboard c WHERE c.retired_at IS NULL AND c.managed_release=r.id)
-    AND NOT EXISTS(SELECT 1 FROM cache_namespace c WHERE c.retired_at IS NULL AND c.managed_release=r.id)";
+    AND NOT EXISTS(SELECT 1 FROM runtime_authority_release_dependency d WHERE d.release=r.id OFFSET 0)
+    AND NOT EXISTS(SELECT 1 FROM managed_sensor_metadata_revision m WHERE m.release=r.id OFFSET 0)
+    AND NOT EXISTS(SELECT 1 FROM sensor_rule_structural_origin o WHERE o.dispatch_source_release=r.id OFFSET 0)
+    AND NOT EXISTS(SELECT 1 FROM execution e WHERE e.pack_release=r.id OFFSET 0)
+    AND NOT EXISTS(SELECT 1 FROM enforcement e WHERE e.pack_release=r.id OFFSET 0)
+    AND NOT EXISTS(SELECT 1 FROM work_queue_item q WHERE q.pack_release=r.id OFFSET 0)
+    AND NOT EXISTS(SELECT 1 FROM sensor_workload s WHERE s.pack_release=r.id OFFSET 0)
+    AND NOT EXISTS(SELECT 1 FROM sensor_generation_schema_binding b WHERE (b.binding->'executable'->'release'->>'id')::BIGINT=r.id OFFSET 0)
+    AND NOT EXISTS(SELECT 1 FROM execution e CROSS JOIN LATERAL jsonb_each(COALESCE(e.executable_snapshot->'pack_executables','{}'::jsonb)) child WHERE (child.value->'release'->>'id')::BIGINT=r.id OFFSET 0)
+    AND NOT EXISTS(SELECT 1 FROM enforcement e CROSS JOIN LATERAL jsonb_each(COALESCE(e.executable_snapshot->'pack_executables','{}'::jsonb)) child WHERE (child.value->'release'->>'id')::BIGINT=r.id OFFSET 0)
+    AND NOT EXISTS(SELECT 1 FROM work_queue_item q CROSS JOIN LATERAL jsonb_each(COALESCE(q.executable_snapshot->'pack_executables','{}'::jsonb)) child WHERE (child.value->'release'->>'id')::BIGINT=r.id OFFSET 0)
+    AND NOT EXISTS(SELECT 1 FROM runtime_schema_binding b CROSS JOIN LATERAL jsonb_each(COALESCE(b.contract->'static_actions','{}'::jsonb)) child WHERE (child.value->'executable_snapshot'->'release'->>'id')::BIGINT=r.id OFFSET 0)
+    AND NOT EXISTS(SELECT 1 FROM runtime_schema_binding b CROSS JOIN LATERAL jsonb_each(COALESCE(b.contract->'static_actions','{}'::jsonb)) child CROSS JOIN LATERAL jsonb_each(COALESCE(child.value->'executable_snapshot'->'pack_executables','{}'::jsonb)) nested WHERE (nested.value->'release'->>'id')::BIGINT=r.id OFFSET 0)
+    AND NOT EXISTS(SELECT 1 FROM runtime c WHERE c.retired_at IS NULL AND c.managed_release=r.id OFFSET 0)
+    AND NOT EXISTS(SELECT 1 FROM runtime_version c WHERE c.retired_at IS NULL AND c.managed_release=r.id OFFSET 0)
+    AND NOT EXISTS(SELECT 1 FROM permission_set c WHERE c.retired_at IS NULL AND c.managed_release=r.id OFFSET 0)
+    AND NOT EXISTS(SELECT 1 FROM trigger c WHERE c.retired_at IS NULL AND c.managed_release=r.id OFFSET 0)
+    AND NOT EXISTS(SELECT 1 FROM action c WHERE c.retired_at IS NULL AND c.managed_release=r.id OFFSET 0)
+    AND NOT EXISTS(SELECT 1 FROM sensor c WHERE c.retired_at IS NULL AND c.managed_release=r.id OFFSET 0)
+    AND NOT EXISTS(SELECT 1 FROM rule c WHERE c.retired_at IS NULL AND c.managed_release=r.id OFFSET 0)
+    AND NOT EXISTS(SELECT 1 FROM policy c WHERE c.retired_at IS NULL AND c.managed_release=r.id OFFSET 0)
+    AND NOT EXISTS(SELECT 1 FROM work_queue c WHERE c.retired_at IS NULL AND c.managed_release=r.id OFFSET 0)
+    AND NOT EXISTS(SELECT 1 FROM workflow_definition c WHERE c.retired_at IS NULL AND c.managed_release=r.id OFFSET 0)
+    AND NOT EXISTS(SELECT 1 FROM dashboard c WHERE c.retired_at IS NULL AND c.managed_release=r.id OFFSET 0)
+    AND NOT EXISTS(SELECT 1 FROM cache_namespace c WHERE c.retired_at IS NULL AND c.managed_release=r.id OFFSET 0)";

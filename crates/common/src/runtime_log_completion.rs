@@ -17,19 +17,17 @@ pub fn execution_stream_is_empty(execution: &crate::models::Execution, stream: &
             | crate::models::ExecutionStatus::Timeout
     ) && matches!(stream, "stdout" | "stderr")
         && execution.result.as_ref().is_some_and(|result| {
+            // The aggregate warning does not erase positive evidence that the
+            // other stream reached EOF without producing output.
             result
-                .get("logs_incomplete")
-                .and_then(serde_json::Value::as_bool)
-                != Some(true)
-                && result
-                    .get("runtime_log_capture")
-                    .and_then(|capture| capture.get(stream))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("empty")
+                .get("runtime_log_capture")
+                .and_then(|capture| capture.get(stream))
+                .and_then(serde_json::Value::as_str)
+                == Some("empty")
         })
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FinalLogManifest {
     pub encoding: String,
@@ -252,7 +250,10 @@ mod tests {
         }
         execution.status = ExecutionStatus::Failed;
         execution.result.as_mut().unwrap()["logs_incomplete"] = serde_json::json!(true);
-        assert!(!execution_stream_is_empty(&execution, "stdout"));
+        execution.result.as_mut().unwrap()["runtime_log_capture"]["stderr"] =
+            serde_json::json!("incomplete");
+        assert!(execution_stream_is_empty(&execution, "stdout"));
+        assert!(!execution_stream_is_empty(&execution, "stderr"));
         execution.result = Some(serde_json::json!({}));
         assert!(!execution_stream_is_empty(&execution, "stdout"));
     }

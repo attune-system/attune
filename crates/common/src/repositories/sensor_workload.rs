@@ -456,6 +456,32 @@ impl SensorWorkloadRepository {
         Ok(workload)
     }
 
+    /// Repeat after any target wait while retaining lock_current_fence_workload's
+    /// assignment and generation protection. No lease deadline is historical authority.
+    pub async fn recheck_locked_fence(
+        tx: &mut Transaction<'_, Postgres>,
+        sensor_id: Id,
+        fence: SensorWorkloadFence,
+    ) -> Result<()> {
+        super::managed_sensor_metadata::ManagedSensorMetadataRepository::validate_generation(
+            tx,
+            fence.workload_id,
+            fence.generation,
+        )
+        .await?;
+        // Sample the lease clock after metadata validation and all its waits.
+        let current: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sensor_workload_assignment a JOIN sensor_workload w ON w.id=a.workload WHERE a.workload=$1 AND w.sensor=$2 AND a.worker=$3 AND a.worker_instance=$4 AND a.generation=$5 AND a.lease_expires_at>clock_timestamp())",
+        ).bind(fence.workload_id).bind(sensor_id).bind(fence.worker_id)
+            .bind(fence.worker_instance).bind(fence.generation).fetch_one(&mut **tx).await?;
+        if !current {
+            return Err(Error::PermissionDenied(
+                "Sensor log source is no longer current".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn rule_is_member(
         tx: &mut Transaction<'_, Postgres>,
         sensor_id: Id,

@@ -592,6 +592,12 @@ async fn ensure_log_artifact(
 
 #[cfg(test)]
 mod tests {
+    mod object_log_fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../common/tests/support/object_log.rs"
+        ));
+    }
     use super::*;
     use async_trait::async_trait;
     use std::path::Path;
@@ -753,9 +759,12 @@ mod tests {
                     .await?
                     .expect("workflow log stream");
             let mut transaction = self.pool.begin().await?;
+            object_log_fixture::admission(&mut transaction).await?;
             let locked = LogStreamRepository::lock(&mut transaction, stream.id).await?;
             if !locked.sealed {
-                LogStreamRepository::seal(&mut transaction, stream.id, false).await?;
+                object_log_fixture::seal(&mut transaction, stream.id, false).await?;
+                attune_common::repositories::artifact::ArtifactVersionRepository::mark_body_ready_in_transaction(
+                    &mut transaction,artifact_version,&format!("segments:{}",locked.next_sequence),locked.total_bytes,&"a".repeat(64)).await?;
                 self.operations.lock().unwrap().push("seal".to_string());
             }
             transaction.commit().await?;

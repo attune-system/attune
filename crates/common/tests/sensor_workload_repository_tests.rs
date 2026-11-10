@@ -2818,3 +2818,224 @@ async fn default_workload_membership_requires_enabled_owned_targets() {
     .expect("disabled rule membership"));
     tx.rollback().await.expect("rollback disabled transaction");
 }
+
+#[tokio::test]
+async fn staged_log_sensor_fresh_transaction_and_after_wait_expiry() {
+    let (database, sensor, worker, _) = setup_fixture().await;
+    let lease = match SensorWorkloadRepository::acquire_or_renew(
+        &database,
+        acquire_input(sensor.id, worker.id, Uuid::new_v4()),
+    )
+    .await
+    .unwrap()
+    {
+        AcquireSensorWorkloadOutcome::Acquired(lease) => lease,
+        other => panic!("unexpected {other:?}"),
+    };
+    let fence = lease_fence(&lease);
+    for _ in 0..2 {
+        let mut tx = database.begin().await.unwrap();
+        assert!(
+            SensorWorkloadRepository::lock_current_fence_workload(&mut tx, sensor.id, fence)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        SensorWorkloadRepository::recheck_locked_fence(&mut tx, sensor.id, fence)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    // The immutable fence owns no connection/lock after the short phase.
+    let mut writer = database.begin().await.unwrap();
+    sqlx::query(
+        "SELECT workload FROM sensor_workload_assignment WHERE workload=$1 FOR UPDATE NOWAIT",
+    )
+    .bind(fence.workload_id)
+    .execute(&mut *writer)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE sensor_workload_assignment SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE workload=$1")
+        .bind(fence.workload_id).execute(&mut *writer).await.unwrap();
+    writer.commit().await.unwrap();
+    let mut tx = database.begin().await.unwrap();
+    assert!(
+        SensorWorkloadRepository::lock_current_fence_workload(&mut tx, sensor.id, fence)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    tx.rollback().await.unwrap();
+    let replacement = match SensorWorkloadRepository::acquire_or_renew(
+        &database,
+        acquire_input(sensor.id, worker.id, Uuid::new_v4()),
+    )
+    .await
+    .unwrap()
+    {
+        AcquireSensorWorkloadOutcome::Acquired(lease) => lease,
+        other => panic!("unexpected {other:?}"),
+    };
+    assert_ne!(replacement.worker_instance, fence.worker_instance);
+    let mut tx = database.begin().await.unwrap();
+    assert!(
+        SensorWorkloadRepository::lock_current_fence_workload(&mut tx, sensor.id, fence)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(SensorWorkloadRepository::lock_current_fence_workload(
+        &mut tx,
+        sensor.id,
+        lease_fence(&replacement)
+    )
+    .await
+    .unwrap()
+    .is_some());
+    tx.commit().await.unwrap();
+    let process = SensorWorkloadRepository::begin_process(&database, replacement.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(process.generation, fence.generation);
+    let mut tx = database.begin().await.unwrap();
+    assert!(SensorWorkloadRepository::lock_current_fence_workload(
+        &mut tx,
+        sensor.id,
+        lease_fence(&replacement)
+    )
+    .await
+    .unwrap()
+    .is_none());
+    tx.rollback().await.unwrap();
+    let mut admission = database.begin().await.unwrap();
+    attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_capture(&mut admission).await.unwrap();
+    attune_common::repositories::sensor_schema::SensorSchemaRepository::admit(
+        &mut admission,
+        &process,
+        Some("0123456789abcdef0123456789abcdef"),
+    )
+    .await
+    .unwrap();
+    admission.commit().await.unwrap();
+    let mut tx = database.begin().await.unwrap();
+    assert!(SensorWorkloadRepository::lock_current_fence_workload(
+        &mut tx,
+        sensor.id,
+        process.fence()
+    )
+    .await
+    .unwrap()
+    .is_some());
+    attune_common::repositories::sensor_schema::SensorSchemaRepository::lock_log_source(
+        &mut tx,
+        process.workload_id,
+        process.generation,
+        -1,
+    )
+    .await
+    .unwrap();
+    let (schema, _, _) = attune_common::repositories::sensor_schema::SensorSchemaRepository::find(
+        &mut *tx,
+        process.workload_id,
+        process.generation,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let mut probe = database.begin().await.unwrap();
+    let error = sqlx::query(
+        "SELECT id FROM sensor_generation_schema_binding WHERE id=$1 FOR UPDATE NOWAIT",
+    )
+    .bind(schema)
+    .execute(&mut *probe)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("55P03")
+    );
+    probe.rollback().await.unwrap();
+    tx.commit().await.unwrap();
+    let mut probe = database.begin().await.unwrap();
+    sqlx::query("SELECT id FROM sensor_generation_schema_binding WHERE id=$1 FOR UPDATE NOWAIT")
+        .bind(schema)
+        .execute(&mut *probe)
+        .await
+        .unwrap();
+    probe.rollback().await.unwrap();
+    database.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn staged_sensor_source_checks_lease_after_queued_target_lock() {
+    let (database, sensor, worker, _) = setup_fixture().await;
+    let lease = match SensorWorkloadRepository::acquire_or_renew(
+        &database,
+        acquire_input(sensor.id, worker.id, Uuid::new_v4()),
+    )
+    .await
+    .unwrap()
+    {
+        AcquireSensorWorkloadOutcome::Acquired(lease) => lease,
+        other => panic!("unexpected {other:?}"),
+    };
+    let fence = lease_fence(&lease);
+    let mut target = database.begin().await.unwrap();
+    sqlx::query("SELECT id FROM worker WHERE id=$1 FOR UPDATE")
+        .bind(worker.id)
+        .execute(&mut *target)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE sensor_workload_assignment SET lease_expires_at=clock_timestamp()+interval '2 seconds' WHERE workload=$1")
+        .bind(fence.workload_id).execute(&*database).await.unwrap();
+    let mut source = database.begin().await.unwrap();
+    assert!(
+        SensorWorkloadRepository::lock_current_fence_workload(&mut source, sensor.id, fence)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *source)
+        .await
+        .unwrap();
+    let pending = tokio::spawn(async move {
+        sqlx::query("SELECT id FROM worker WHERE id=$1 FOR SHARE")
+            .bind(worker.id)
+            .execute(&mut *source)
+            .await
+            .unwrap();
+        let result =
+            SensorWorkloadRepository::recheck_locked_fence(&mut source, sensor.id, fence).await;
+        source.rollback().await.unwrap();
+        result
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let blocked: bool = sqlx::query_scalar("SELECT cardinality(pg_blocking_pids($1))>0")
+                .bind(pid)
+                .fetch_one(&*database)
+                .await
+                .unwrap();
+            if blocked {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // Advance beyond the actual database deadline while the target wait is proven.
+    sqlx::query("SELECT pg_sleep(GREATEST(0,extract(epoch FROM (lease_expires_at-clock_timestamp())))::double precision) FROM sensor_workload_assignment WHERE workload=$1")
+        .bind(fence.workload_id).execute(&mut *target).await.unwrap();
+    target.commit().await.unwrap();
+    assert!(matches!(
+        pending.await.unwrap(),
+        Err(attune_common::Error::PermissionDenied(_))
+    ));
+    database.cleanup().await.unwrap();
+}

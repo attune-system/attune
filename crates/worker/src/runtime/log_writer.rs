@@ -479,6 +479,13 @@ impl BoundedLogFileWriter {
             .await
     }
 
+    pub fn task_handle(&self) -> Option<attune_common::log_stream::LogWriterTask> {
+        match self.writer.as_ref()? {
+            RuntimeLogWriter::Segmented(writer) => Some(writer.task_handle()),
+            RuntimeLogWriter::SharedFile(_) => None,
+        }
+    }
+
     pub fn finalization_timeout_ms(&self) -> u64 {
         self.finalization_timeout_ms
     }
@@ -521,6 +528,8 @@ mod tests {
                         transport,
                         42,
                         "lazy.log".into(),
+                        attune_common::config::ArtifactsConfig::default()
+                            .log_segment_writer_config(),
                     ),
                     1024,
                     true,
@@ -799,6 +808,7 @@ mod tests {
             transport.clone(),
             42,
             "core/echo/stdout/log/v1.txt".to_string(),
+            attune_common::config::ArtifactsConfig::default().log_segment_writer_config(),
         );
         let mut writer = BoundedLogFileWriter::from_shared_file_writer(writer, 138, true, 100);
 
@@ -821,6 +831,7 @@ mod tests {
             transport.clone(),
             42,
             "recorded/log.txt".into(),
+            attune_common::config::ArtifactsConfig::default().log_segment_writer_config(),
         );
         let key = "recorded-log-test-key-at-least-32-characters";
         let mut writer = BoundedLogFileWriter::from_shared_file_writer(inner, 1024, true, 100)

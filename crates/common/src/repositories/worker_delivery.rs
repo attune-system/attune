@@ -105,6 +105,25 @@ impl DeliveryPermit {
 
 pub struct WorkerDeliveryRepository;
 impl WorkerDeliveryRepository {
+    /// Staged close source identity: server primary IDs, never bearer UUIDs.
+    /// Caller already holds admission/execution protection and shared graph.
+    pub async fn lock_log_context(
+        connection: &mut PgConnection,
+        context: &DeliveryContext,
+    ) -> Result<i64> {
+        sqlx::query_scalar("SELECT id FROM worker_delivery_context WHERE token=$1 AND execution=$2 AND admission=$3 AND attempt=$4 AND worker=$5 AND worker_instance=$6 AND deadline>clock_timestamp() FOR SHARE")
+            .bind(context.id).bind(context.execution).bind(context.admission).bind(context.attempt)
+            .bind(context.worker).bind(context.worker_instance).fetch_optional(connection).await?.ok_or_else(denied)
+    }
+    pub async fn lock_log_permit(
+        connection: &mut PgConnection,
+        permit: &DeliveryPermit,
+    ) -> Result<i64> {
+        sqlx::query_scalar("SELECT id FROM worker_delivery_permit WHERE token=$1 AND context=$2 AND artifact_version=$3 AND log_stream=$4 FOR SHARE")
+            .bind(permit.id).bind(permit.context).bind(permit.artifact_version).bind(permit.log_stream)
+            .fetch_optional(connection).await?.ok_or_else(denied)
+    }
+
     /// Prelaunch allocation is not terminal delivery. It cannot create fresh
     /// versions after cancellation or under a stale/reassigned launch context.
     pub async fn require_launch_context(

@@ -22,6 +22,8 @@ use chrono::{Duration, Utc};
 #[path = "storage_maintenance_repository_tests/bounded_admission.rs"]
 mod bounded_admission;
 mod helpers;
+#[path = "storage_maintenance_repository_tests/object_close.rs"]
+mod object_close;
 use helpers::{create_test_pool, unique_test_id};
 
 fn artifact_input(suffix: &str) -> CreateArtifactInput {
@@ -1135,4 +1137,181 @@ async fn body_discovery_workload_visits_bounded_windows_through_ineligible_prefi
     );
     pool.close().await;
     db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn expiration_prefilter_matches_count_reference_and_claim_rechecks_policy() {
+    use attune_common::repositories::maintenance_admission::MaintenanceBudget;
+    let pool = create_test_pool().await.unwrap();
+    // Cross policies/limits with gapped versions and mixed body states. Ready
+    // shared-file bodies and legacy NULL bodies count; pending bodies do not.
+    let mut shared_file_counting_null_newer = None;
+    for policy in ["versions", "days", "hours", "minutes"] {
+        let limits = if policy == "versions" {
+            vec![i32::MIN, -1, 0, 1, 2, 3, 9, i32::MAX]
+        } else {
+            vec![-1, 0, 1, 3, 9]
+        };
+        for limit in limits {
+            let artifact = ArtifactRepository::create(&pool, artifact_input("matrix"))
+                .await
+                .unwrap();
+            sqlx::query("UPDATE artifact SET retention_policy=$2::text::artifact_retention_enum,retention_limit=$3 WHERE id=$1")
+                .bind(artifact.id)
+                .bind(policy)
+                .bind(limit)
+                .execute(&*pool)
+                .await
+                .unwrap();
+            for (index, version) in [1, 3, 8, 12, 20].into_iter().enumerate() {
+                let state = [None, Some("ready"), Some("pending"), None, Some("ready")][index];
+                let id: i64 = sqlx::query_scalar("INSERT INTO artifact_version(artifact,version,body_state,file_path,size_bytes,sha256,created)
+                    VALUES($1,$2,$3::text::artifact_body_state_enum,'matrix/body',CASE WHEN $3='ready' THEN 1 END,CASE WHEN $3='ready' THEN repeat('a',64) END,
+                      NOW()-make_interval(secs=>$4::double precision)) RETURNING id")
+                    .bind(artifact.id).bind(version).bind(state).bind([172800,7200,60,0,-3600][index])
+                    .fetch_one(&*pool).await.unwrap();
+                if policy == "versions" && limit == 2 && version == 3 {
+                    shared_file_counting_null_newer = Some(id);
+                }
+                // Object streams must initialize on Pending versions. Retain the
+                // plain legacy NULL rows and the Ready shared-file case rather
+                // than bypassing the object-close initialization guard.
+                if index == 1 || index == 2 {
+                    sqlx::query("INSERT INTO log_stream(artifact_version,backend,max_unflushed_bytes,max_unflushed_milliseconds) VALUES($1,$2::text::log_stream_backend_enum,1024,1000)")
+                        .bind(id).bind(if index==2 {"object_segments"} else {"shared_file"}).execute(&*pool).await.unwrap();
+                }
+            }
+        }
+    }
+    let pinned: i64 = sqlx::query_scalar("SELECT v.id FROM artifact_version v JOIN artifact a ON a.id=v.artifact WHERE a.retention_policy='versions' AND a.retention_limit=1 AND v.version=3")
+        .fetch_one(&*pool).await.unwrap();
+    let mut capture = pool.begin().await.unwrap();
+    Evidence::lock_capture(&mut capture).await.unwrap();
+    sqlx::query("INSERT INTO file_evidence_owner(version,artifact,root_read,object_done,staging_done) VALUES(990011,990012,990013,true,true)")
+        .execute(&mut *capture).await.unwrap();
+    sqlx::query(
+        "INSERT INTO file_evidence_pin(owner,kind,source) VALUES(990011,'artifact_version',$1)",
+    )
+    .bind(pinned)
+    .execute(&mut *capture)
+    .await
+    .unwrap();
+    capture.commit().await.unwrap();
+    // Deliberately retain the original count-all predicate as an independent
+    // oracle. Stable now() within the reference is safe: fixtures straddle the
+    // cutoffs by minutes/hours, rather than racing wall-clock microseconds.
+    let expected: Vec<i64> = sqlx::query_scalar("SELECT av.id FROM artifact_version av JOIN artifact a ON a.id=av.artifact
+        WHERE file_evidence_version_eligible(av.id) AND (av.body_state IS NULL OR av.body_state='ready') AND (
+          (a.retention_policy='days' AND av.created<NOW()-make_interval(days=>a.retention_limit)) OR
+          (a.retention_policy='hours' AND av.created<NOW()-make_interval(hours=>a.retention_limit)) OR
+          (a.retention_policy='minutes' AND av.created<NOW()-make_interval(mins=>a.retention_limit)) OR
+          (a.retention_policy='versions' AND a.retention_limit>0 AND NOT EXISTS(SELECT 1 FROM log_stream s WHERE s.artifact_version=av.id AND s.backend<>'shared_file' AND NOT s.sealed)
+            AND (SELECT count(*) FROM artifact_version n WHERE n.artifact=av.artifact AND n.version>av.version AND (n.body_state IS NULL OR n.body_state='ready'))>=a.retention_limit))
+        ORDER BY av.created,av.id")
+        .fetch_all(&*pool).await.unwrap();
+    assert!(!expected.is_empty());
+    assert!(
+        !expected.contains(&pinned),
+        "preexisting evidence pin must exclude discovery"
+    );
+    let shared_file_counting_null_newer = shared_file_counting_null_newer.unwrap();
+    assert!(
+        expected.contains(&shared_file_counting_null_newer),
+        "unpinned shared-file version 3 expires at limit 2: NULL-state version 12 and Ready version 20 both count"
+    );
+    let found = MaintenanceRepository::find_expired_artifact_versions(&pool, 1000)
+        .await
+        .unwrap();
+    assert!(
+        found.iter().any(|v| v.id == shared_file_counting_null_newer),
+        "production discovery must retain the shared-file exception and count NULL-state newer versions"
+    );
+    assert_eq!(found.iter().map(|v| v.id).collect::<Vec<_>>(), expected);
+    assert_eq!(
+        MaintenanceRepository::expired_artifact_version_count(&pool)
+            .await
+            .unwrap(),
+        expected.len() as i64
+    );
+    // Discovery limits raw work, so a filtered page need not equal the global
+    // eligible prefix. A complete frozen pass still finds every eligible row.
+    let mut discovered = Vec::new();
+    loop {
+        let page = MaintenanceRepository::expired_artifact_candidates_bounded(
+            &pool,
+            7,
+            &MaintenanceBudget {
+                statement_timeout: std::time::Duration::from_secs(5),
+                page_timeout: std::time::Duration::from_secs(10),
+                ..MaintenanceBudget::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(page.scanned <= 7);
+        discovered.extend(page.versions.into_iter().map(|v| v.id));
+        if !page.pending {
+            break;
+        }
+    }
+    // Private maintenance traversal is insertion-ID bounded. Reporting retains
+    // global oldest-first order; the complete pass must find the same set once.
+    discovered.sort_unstable();
+    let mut expected_set = expected.clone();
+    expected_set.sort_unstable();
+    assert_eq!(discovered, expected_set);
+    let candidate = &found[0];
+    // Policy mutation between discovery and claim must invalidate the advisory
+    // candidate, even though its physical identity has not changed.
+    sqlx::query("UPDATE artifact SET retention_policy='versions',retention_limit=999 WHERE id=$1")
+        .bind(candidate.artifact)
+        .execute(&*pool)
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    Evidence::lock_reclamation(&mut tx).await.unwrap();
+    assert!(
+        MaintenanceRepository::claim_expired_artifact_version(&mut tx, candidate.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    tx.rollback().await.unwrap();
+    // An unchanged eligible identity still passes authoritative claim.
+    let candidate = found
+        .iter()
+        .find(|v| v.artifact != candidate.artifact)
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    Evidence::lock_reclamation(&mut tx).await.unwrap();
+    assert!(
+        MaintenanceRepository::claim_expired_artifact_version(&mut tx, candidate.id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    tx.rollback().await.unwrap();
+    let mut capture = pool.begin().await.unwrap();
+    Evidence::lock_capture(&mut capture).await.unwrap();
+    sqlx::query("INSERT INTO file_evidence_owner(version,artifact,root_read,object_done,staging_done) VALUES(990001,990002,990003,true,true)")
+        .execute(&mut *capture).await.unwrap();
+    sqlx::query(
+        "INSERT INTO file_evidence_pin(owner,kind,source) VALUES(990001,'artifact_version',$1)",
+    )
+    .bind(candidate.id)
+    .execute(&mut *capture)
+    .await
+    .unwrap();
+    capture.commit().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    Evidence::lock_reclamation(&mut tx).await.unwrap();
+    assert!(
+        MaintenanceRepository::claim_expired_artifact_version(&mut tx, candidate.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a pin committed after discovery must deny claim"
+    );
+    tx.rollback().await.unwrap();
+    pool.cleanup().await.unwrap();
 }

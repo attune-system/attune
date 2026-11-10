@@ -317,7 +317,11 @@ fn milliseconds(duration: Duration) -> u64 {
 }
 
 async fn budget(conn: &mut PgConnection, end: Instant, cap: Duration) -> Result<()> {
-    budget_with_lock_timeout(conn, end, cap, None).await
+    budget_with_lock_timeout(conn, end, cap, None, false).await
+}
+
+async fn budget_entry(conn: &mut PgConnection, end: Instant, cap: Duration) -> Result<()> {
+    budget_with_lock_timeout(conn, end, cap, None, true).await
 }
 
 async fn budget_with_lock_timeout(
@@ -325,13 +329,15 @@ async fn budget_with_lock_timeout(
     end: Instant,
     cap: Duration,
     lock_timeout: Option<&str>,
+    entry: bool,
 ) -> Result<()> {
     let remaining = end
         .checked_duration_since(Instant::now())
         .ok_or_else(deadline_error)?;
-    sqlx::query("SELECT set_config('statement_timeout',$1,true),CASE WHEN $2::text IS NOT NULL THEN set_config('lock_timeout',$2,true) END")
+    sqlx::query("SELECT set_config('statement_timeout',$1,true),CASE WHEN $2::text IS NOT NULL THEN set_config('lock_timeout',$2,true) END, CASE WHEN $3 THEN set_config('jit','off',true) END")
         .bind(format!("{}ms", milliseconds(remaining.min(cap))))
         .bind(lock_timeout)
+        .bind(entry)
         .execute(conn)
         .await?;
     Ok(())
@@ -406,7 +412,7 @@ pub(super) async fn collect(
         .await
         .map_err(|_| deadline_error())??;
     let states = timeout_at(cycle_end, async {
-        budget(&mut tx, cycle_end, options.statement_timeout).await?;
+        budget_entry(&mut tx, cycle_end, options.statement_timeout).await?;
         Ok::<_,Error>(sqlx::query_as::<_, Progress>(
          "SELECT phase,cursor_id,high_water,probe_limit,revision,last_attempt,next_attempt<=clock_timestamp() AS due,
                  COALESCE(deferred_since<=clock_timestamp()-($1::bigint*interval '1 millisecond'),false) AS aged,
@@ -615,7 +621,7 @@ async fn page(
         .await
         .map_err(|_| deadline_error())??;
     let candidates = timeout_at(end, async {
-        budget(&mut discovery, end, options.statement_timeout).await?;
+        budget_entry(&mut discovery, end, options.statement_timeout).await?;
         // Freeze each pass's upper bound. Continuous insertion must not stop
         // wrapping and hide previously pinned or late-committing older IDs.
         let high_water = if state.high_water == 0 {
@@ -666,7 +672,7 @@ async fn page(
     let mut pending = true;
     let work = timeout_at(end, async {
         sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED").execute(&mut *tx).await?;
-        budget(&mut tx, end, options.statement_timeout).await?;
+        budget_entry(&mut tx, end, options.statement_timeout).await?;
         let mut previous_lock_timeout=None;
         if !candidates.is_empty() {
             // The admission statement's snapshot is never used for deletion.
@@ -693,7 +699,7 @@ async fn page(
         }
         // Restore only our queued-acquisition override. Dependent work keeps the
         // original connection policy and the separate page/statement budgets.
-        budget_with_lock_timeout(&mut tx, end, options.statement_timeout,previous_lock_timeout.as_deref()).await?;
+        budget_with_lock_timeout(&mut tx, end, options.statement_timeout,previous_lock_timeout.as_deref(),false).await?;
         let revision: i64 = sqlx::query_scalar("SELECT revision FROM graph_reclamation_progress WHERE phase=$1 FOR UPDATE")
             .bind(phase.name()).fetch_one(&mut *tx).await?;
         if revision != state.revision {
@@ -842,7 +848,7 @@ async fn defer(
         .await
         .map_err(|_| deadline_error())??;
     let update = timeout_at(end,async {
-        budget(&mut tx,end,options.statement_timeout).await?;
+        budget_entry(&mut tx,end,options.statement_timeout).await?;
         let cursor=sqlx::query_scalar("UPDATE graph_reclamation_progress SET last_attempt=clock_timestamp(),
             next_attempt=clock_timestamp()+($3::bigint*(0.8+random()*0.4)*interval '1 millisecond'),
             deferred_since=COALESCE(deferred_since,clock_timestamp()),revision=revision+1,

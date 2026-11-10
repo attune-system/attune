@@ -744,6 +744,9 @@ export default function ExecutionDetailPage() {
           <ExecutionArtifactsPanel
             executionId={execution.id}
             isRunning={isRunning}
+            logsIncomplete={
+              !isRunning && execution.result?.logs_incomplete === true
+            }
           />
         </div>
       </div>

@@ -1,4 +1,7 @@
 //! Regression for mixed SQLx argument types on the identical cached advisory SQL.
+#[path = "support/object_log.rs"]
+mod object_log_fixture;
+
 use attune_common::{
     config::Config,
     models::{
@@ -72,6 +75,7 @@ async fn both_log_ready_paths_reuse_decimal_text_lock_and_preserve_cross_connect
                 .await
                 .unwrap();
         let mut ready = db.pool().begin().await.unwrap();
+        object_log_fixture::admission(&mut ready).await.unwrap();
         // Prime this exact connection's statement cache using the canonical
         // TEXT argument, then execute the formerly-i64 completion path on it.
         assert!(
@@ -83,7 +87,7 @@ async fn both_log_ready_paths_reuse_decimal_text_lock_and_preserve_cross_connect
         LogStreamRepository::lock(&mut ready, stream.id)
             .await
             .unwrap();
-        LogStreamRepository::seal(&mut ready, stream.id, false)
+        object_log_fixture::seal(&mut ready, stream.id, false)
             .await
             .unwrap();
         let digest = "0".repeat(64);

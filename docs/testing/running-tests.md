@@ -652,3 +652,36 @@ Before completing changes to test infrastructure:
 7. Run `cargo check --all-targets --workspace` with zero warnings.
 
 See [Template-cloned test databases](schema-per-test.md) and [Test concurrency reliability](../plans/test-concurrency-reliability.md).
+
+## Staged object-log source fencing
+
+The source prerequisite is documented in
+[the durable close protocol](../plans/object-log-seal-claims.md). The object route now integrates prepare/verify/finalize; historical source-only
+results below do not certify that integration. Run the new `split_route_` API
+unit cases and storage `object_close::` cases on PG16 and PG18 as well.
+On separately owned PG16 and PG18 servers initialized with the explicit owned
+`make db-test-setup` URLs, run these targets with unique `ATTUNE_TEST_RUN_ID`
+values and `ATTUNE__DATABASE__URL` pointing at that server:
+
+```bash
+cargo test -p attune-api --lib internal_files::tests:: -- --test-threads=4
+cargo test -p attune-common --test sensor_workload_repository_tests -- staged_ --test-threads=4
+cargo test -p attune-api --test sensor_log_tests -- --test-threads=4
+cargo test -p attune-common --test execution_admission_tests -- staged_ --test-threads=4
+cargo test -p attune-api --test recorded_execution_events_tests -- terminal_log_delivery_keeps_caps --test-threads=4
+cargo test -p attune-api --test recorded_execution_events_tests -- encrypted_terminal_logs_require --test-threads=4
+cargo test -p attune-api --test recorded_execution_events_tests -- worker_file_approval_expiry_after_source --test-threads=4
+```
+
+Build all selected executables before running timing-sensitive cases. Do not run
+compilation alongside these database tests. The `staged_` execution-admission
+filter also selects existing native staged-completion tests by module name.
+The new lease wait case observes `pg_blocking_pids` before advancing beyond the
+actual database deadline, and requires PermissionDenied after the target unlock.
+These tests do not establish a connection-free verifier route, atomic final
+publication, unknown-COMMIT reconciliation or provider PUT settlement.
+
+The recorded approval-expiry case initializes and cleans an owned warm-up context
+before starting its original 30-second clock, so cold migration-template creation
+cannot consume the approval before the source/target barrier exists. No expiry or
+observation budget is extended. Keep this setup distinction when running it alone.

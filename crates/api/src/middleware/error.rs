@@ -61,6 +61,10 @@ pub enum ApiError {
     Forbidden(String),
     /// Not found (404)
     NotFound(String),
+    /// An authorized runtime log is still finalizing or permanently incomplete.
+    LogUnavailable {
+        incomplete: bool,
+    },
     /// Conflict (409)
     Conflict(String),
     /// Unprocessable entity (422)
@@ -91,7 +95,7 @@ impl ApiError {
             ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
-            ApiError::Conflict(_) => StatusCode::CONFLICT,
+            ApiError::Conflict(_) | ApiError::LogUnavailable { .. } => StatusCode::CONFLICT,
             ApiError::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::ValidationError(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
@@ -121,6 +125,12 @@ impl ApiError {
             | ApiError::InternalServerError(msg)
             | ApiError::DatabaseError(msg)
             | ApiError::ValidationError(msg) => msg,
+            ApiError::LogUnavailable { incomplete: true } => {
+                "Log is incomplete because delivery did not finish."
+            }
+            ApiError::LogUnavailable { incomplete: false } => {
+                "Log is still being finalized. Try again shortly."
+            }
             ApiError::RetryableDatabaseError => {
                 "Database operation temporarily unavailable; please retry"
             }
@@ -137,6 +147,8 @@ impl ApiError {
             ApiError::Forbidden(_) => "FORBIDDEN",
             ApiError::NotFound(_) => "NOT_FOUND",
             ApiError::Conflict(_) => "CONFLICT",
+            ApiError::LogUnavailable { incomplete: true } => "LOG_INCOMPLETE",
+            ApiError::LogUnavailable { incomplete: false } => "LOG_FINALIZING",
             ApiError::UnprocessableEntity(_) => "UNPROCESSABLE_ENTITY",
             ApiError::TooManyRequests(_) => "TOO_MANY_REQUESTS",
             ApiError::NotImplemented(_) => "NOT_IMPLEMENTED",
@@ -238,7 +250,8 @@ impl From<sqlx::Error> for ApiError {
                 //   55P03 = lock_not_available  → 503 Service Unavailable
                 //   P0001 = raise_exception     → 400 Bad Request (trigger-raised errors)
                 let pg_code = db_err.code().map(|c| c.to_string()).unwrap_or_default();
-                if matches!(pg_code.as_str(), "40001" | "55P03") {
+                if pg_code.starts_with("08")
+                    || matches!(pg_code.as_str(), "40001" | "40P01" | "55P03" | "57014" | "57P01" | "57P02" | "57P03" | "53300") {
                     ApiError::RetryableDatabaseError
                 } else if pg_code == "23505" {
                     // Unique constraint violation — duplicate key
@@ -275,6 +288,7 @@ impl From<sqlx::Error> for ApiError {
                     ApiError::DatabaseError("The database operation failed. Check API database availability and install status before retrying.".into())
                 }
             }
+            sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed => ApiError::RetryableDatabaseError,
             _ => ApiError::DatabaseError("The database operation failed. Check API database availability and install status before retrying.".into()),
         }
     }
@@ -533,7 +547,9 @@ mod tests {
 
     #[test]
     fn retryable_postgres_codes_map_without_database_details() {
-        for code in ["55P03", "40001"] {
+        for code in [
+            "55P03", "40001", "40P01", "57014", "08006", "57P01", "57P02", "57P03", "53300",
+        ] {
             let error = ApiError::from(sqlx::Error::Database(Box::new(TestDatabaseError { code })));
 
             assert!(matches!(error, ApiError::RetryableDatabaseError));

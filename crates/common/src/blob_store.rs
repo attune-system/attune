@@ -1854,11 +1854,11 @@ fn map_backend_error(error: object_store::Error) -> BlobStoreError {
     }
 }
 
-fn encode_digest(digest: &[u8; 32]) -> String {
+pub(crate) fn encode_digest(digest: &[u8; 32]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn decode_digest(value: &str) -> Result<[u8; 32], BlobStoreError> {
+pub(crate) fn decode_digest(value: &str) -> Result<[u8; 32], BlobStoreError> {
     if value.len() != 64 {
         return Err(BlobStoreError::DigestMismatch);
     }

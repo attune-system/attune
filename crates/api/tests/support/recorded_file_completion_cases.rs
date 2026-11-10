@@ -680,9 +680,178 @@ async fn terminal_log_delivery_keeps_caps_retries_and_sealing_operation_specific
         &effect,
     )
     .await?;
+    let source_context = WorkerDeliveryRepository::lock_log_context(&mut tx, &context).await?;
+    let source_permit = WorkerDeliveryRepository::lock_log_permit(&mut tx, &permit).await?;
+    assert!(source_context > 0 && source_permit > 0);
     tx.commit().await?;
+    let mut fresh = fixture.ctx.pool.begin().await?;
+    WorkerDeliveryRepository::require(
+        &mut fresh,
+        permit.id,
+        context.worker,
+        context.worker_instance,
+        version.id,
+    )
+    .await?;
+    assert_eq!(
+        WorkerDeliveryRepository::lock_log_context(&mut fresh, &context).await?,
+        source_context
+    );
+    assert_eq!(
+        WorkerDeliveryRepository::lock_log_permit(&mut fresh, &permit).await?,
+        source_permit
+    );
+    let mut replaced = context.clone();
+    replaced.worker_instance = Uuid::new_v4();
+    assert!(
+        WorkerDeliveryRepository::lock_log_context(&mut fresh, &replaced)
+            .await
+            .is_err()
+    );
+    fresh.commit().await?;
     let token =
         attune_common::worker_delivery::mint(&context, &permit, &fixture.ctx.state.jwt_config)?;
+    // Exercise the staged API with actual process and delivery credentials.
+    // Historical projections contain no bearer context/permit UUIDs.
+    for (credential, kind) in [(&fixture.token, "process"), (&token, "delivery")] {
+        let user = attune_api::auth::middleware::AuthenticatedUser {
+            claims: attune_common::auth::jwt::validate_token(
+                credential,
+                &fixture.ctx.state.jwt_config,
+            )?,
+        };
+        let mut historical = None;
+        for _ in 0..2 {
+            let tx = fixture.ctx.pool.begin().await?;
+            let mut source = attune_api::routes::internal_files::log_source::acquire(
+                &fixture.ctx.state,
+                tx,
+                &user,
+                &version,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("source {kind}: {error:?}"))?;
+            source
+                .authorize_target(&user, &version)
+                .await
+                .map_err(|error| anyhow::anyhow!("target {kind}: {error:?}"))?;
+            let locked =
+                ArtifactVersionRepository::find_by_id_for_update(source.transaction(), version.id)
+                    .await?
+                    .unwrap();
+            let stream = LogStreamRepository::lock(source.transaction(), stream.id).await?;
+            let current = source
+                .bind(
+                    &fixture.ctx.state,
+                    &user,
+                    &locked,
+                    &stream,
+                    &axum::http::HeaderMap::new(),
+                    historical.as_ref(),
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!("binding {kind}: {error:?}"))?;
+            let projected = serde_json::to_value(&current)?;
+            assert_eq!(projected["producer"]["kind"], kind);
+            assert!(!projected.to_string().contains(&context.id.to_string()));
+            assert!(!projected.to_string().contains(&permit.id.to_string()));
+            historical = Some(current);
+            source
+                .commit()
+                .await
+                .map_err(|error| anyhow::anyhow!("commit {kind}: {error:?}"))?;
+        }
+    }
+    // Process credentials are not declared consumers of this HTTP route. Keep
+    // that real authorization denial distinct from target contention.
+    let seal_path = format!("/api/v1/internal/logs/{}/seal", version.id);
+    assert_eq!(
+        fixture
+            .ctx
+            .post(&seal_path, json!({}), Some(&fixture.token))
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    // Exercise the process Source target mapper directly, then the actual route
+    // with its permitted recorded worker-delivery credential. Both must retain
+    // retryable503 when the artifact row is contended.
+    let mut blocker = fixture.ctx.pool.begin().await?;
+    sqlx::query("SELECT id FROM artifact WHERE id=$1 FOR UPDATE")
+        .bind(version.artifact)
+        .execute(&mut *blocker)
+        .await?;
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await?;
+    let process_user = attune_api::auth::middleware::AuthenticatedUser {
+        claims: attune_common::auth::jwt::validate_token(
+            &fixture.token,
+            &fixture.ctx.state.jwt_config,
+        )?,
+    };
+    let mut tx = fixture.ctx.pool.begin().await?;
+    LogStreamRepository::configure_close_phase(&mut tx).await?;
+    let mut source = attune_api::routes::internal_files::log_source::acquire(
+        &fixture.ctx.state,
+        tx,
+        &process_user,
+        &version,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("process source: {e:?}"))?;
+    let process_result = source.authorize_target(&process_user, &version).await;
+    source
+        .rollback()
+        .await
+        .map_err(|e| anyhow::anyhow!("process rollback: {e:?}"))?;
+    assert_eq!(
+        process_result.unwrap_err().0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let request = tokio::time::timeout(
+        std::time::Duration::from_secs(25),
+        fixture.ctx.post(&seal_path, json!({}), Some(&token)),
+    );
+    let observe = async {
+        tokio::time::timeout(std::time::Duration::from_secs(15),async {
+            loop {
+                let blocked:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))").bind(blocker_pid).fetch_one(&fixture.ctx.pool).await?;
+                if blocked {break anyhow::Ok(());}
+                tokio::task::yield_now().await;
+            }
+        }).await?
+    };
+    let (response, observed) = tokio::join!(request, observe);
+    blocker.rollback().await?;
+    observed?;
+    assert_eq!(response??.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        ArtifactVersionRepository::find_by_id(&fixture.ctx.pool, version.id)
+            .await?
+            .unwrap()
+            .body_state,
+        Some(ArtifactBodyState::Pending)
+    );
+    let mut replacement = context.clone();
+    replacement.worker_instance = Uuid::new_v4();
+    let replaced_token =
+        attune_common::worker_delivery::mint(&replacement, &permit, &fixture.ctx.state.jwt_config)?;
+    let replaced_user = attune_api::auth::middleware::AuthenticatedUser {
+        claims: attune_common::auth::jwt::validate_token(
+            &replaced_token,
+            &fixture.ctx.state.jwt_config,
+        )?,
+    };
+    let tx = fixture.ctx.pool.begin().await?;
+    assert!(attune_api::routes::internal_files::log_source::acquire(
+        &fixture.ctx.state,
+        tx,
+        &replaced_user,
+        &version
+    )
+    .await
+    .is_err());
     ExecutionRepository::update(
         &fixture.ctx.pool,
         context.execution,
@@ -783,6 +952,23 @@ async fn terminal_log_delivery_keeps_caps_retries_and_sealing_operation_specific
     .await
     .is_err());
     drop(conn);
+    RuntimeAuthorityRepository::revoke_admission(
+        &mut *fixture.ctx.pool.acquire().await?,
+        context.admission,
+    )
+    .await?;
+    let user = attune_api::auth::middleware::AuthenticatedUser {
+        claims: attune_common::auth::jwt::validate_token(&token, &fixture.ctx.state.jwt_config)?,
+    };
+    let tx = fixture.ctx.pool.begin().await?;
+    assert!(attune_api::routes::internal_files::log_source::acquire(
+        &fixture.ctx.state,
+        tx,
+        &user,
+        &version
+    )
+    .await
+    .is_err());
     fixture.ctx.cleanup().await?;
     Ok(())
 }
@@ -813,6 +999,11 @@ async fn worker_file_live_and_unbounded_approvals_survive_the_same_version_wait(
 async fn approval_expiry_after_version_wait(expire: bool, bound_approval: bool) -> Result<()> {
     use sha2::{Digest, Sha256};
     use std::time::Duration;
+    // Build this invocation's owned migration template before starting the real
+    // 30-second approval clock. Cold schema replay is not the source/target wait
+    // being tested; retain both the approval and observation budgets unchanged.
+    let warmup = TestContext::new().await?;
+    warmup.cleanup().await?;
     let deadline = chrono::Utc::now() + chrono::Duration::seconds(30);
     let fixture = fixture_with_approval_expiry(
         false,
@@ -1978,9 +2169,13 @@ async fn encrypted_terminal_logs_require_a_complete_authenticated_manifest_on_bo
         },
         runtime_log_completion::FrameTotals,
     };
-    for backend in [
-        LogStreamBackend::ObjectSegments,
-        LogStreamBackend::SharedFile,
+    // Object selection permanently freezes the accepted prefix, even when byte
+    // verification rejects its proof. A complete object needs a separate fixture;
+    // shared-file sealing retains its existing append-after-rejection contract.
+    for (backend, incomplete) in [
+        (LogStreamBackend::ObjectSegments, true),
+        (LogStreamBackend::ObjectSegments, false),
+        (LogStreamBackend::SharedFile, true),
     ] {
         let fixture = fixture(true).await?;
         let context = delivery(&fixture).await?;
@@ -2087,6 +2282,20 @@ async fn encrypted_terminal_logs_require_a_complete_authenticated_manifest_on_bo
                 axum::http::StatusCode::CREATED
             );
         }
+        if !incomplete {
+            assert_eq!(
+                raw(
+                    &fixture,
+                    "PUT",
+                    &format!("/api/v1/internal/logs/{}/segments/1", version.id),
+                    &token,
+                    "application/octet-stream",
+                    last.clone()
+                )
+                .await?,
+                StatusCode::CREATED
+            );
+        }
         let seal = |proof: Option<String>| {
             let mut request = Request::builder()
                 .method("POST")
@@ -2105,40 +2314,130 @@ async fn encrypted_terminal_logs_require_a_complete_authenticated_manifest_on_bo
             seal(None).await?.status(),
             axum::http::StatusCode::FORBIDDEN
         );
-        // Every stored prefix frame authenticates, but the final digest/count do not match.
-        assert_eq!(
-            seal(Some(authenticated.clone())).await?.status(),
-            axum::http::StatusCode::FORBIDDEN
-        );
-        let mut conn = fixture.ctx.pool.acquire().await?;
-        assert!(RuntimeLogCompletionRepository::find(&mut conn, version.id)
-            .await?
-            .is_none());
-        assert_eq!(
-            ArtifactVersionRepository::find_by_id(&mut *conn, version.id)
+        if incomplete {
+            // Every stored prefix frame authenticates, but the final digest/count do not match.
+            assert_eq!(
+                seal(Some(authenticated.clone())).await?.status(),
+                axum::http::StatusCode::FORBIDDEN
+            );
+            let mut conn = fixture.ctx.pool.acquire().await?;
+            assert!(RuntimeLogCompletionRepository::find(&mut conn, version.id)
                 .await?
-                .unwrap()
-                .body_state,
-            Some(ArtifactBodyState::Pending)
-        );
-        drop(conn);
-        if backend == LogStreamBackend::SharedFile {
+                .is_none());
+            assert_eq!(
+                ArtifactVersionRepository::find_by_id(&mut *conn, version.id)
+                    .await?
+                    .unwrap()
+                    .body_state,
+                Some(ArtifactBodyState::Pending)
+            );
+            drop(conn);
+            if backend == LogStreamBackend::ObjectSegments {
+                let mut tx = fixture.ctx.pool.begin().await?;
+                let frozen = LogStreamRepository::lock(&mut tx, stream.id).await?;
+                let phase: Option<String> =
+                    sqlx::query_scalar("SELECT close_phase FROM log_stream WHERE id=$1")
+                        .bind(stream.id)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                assert_eq!(phase.as_deref(), Some("closing"));
+                assert!(!frozen.sealed);
+                let segments = LogStreamRepository::segments_with_conn(&mut tx, stream.id).await?;
+                assert_eq!(segments.len(), 1);
+                assert_eq!(segments[0].sequence, 0);
+                use sha2::{Digest, Sha256};
+                let digest = Sha256::digest(&last)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                let error = LogStreamRepository::check_close_append(
+                    &mut tx,
+                    stream.id,
+                    1,
+                    last.len() as i64,
+                    &digest,
+                    "unaccepted-tail",
+                    None,
+                )
+                .await
+                .unwrap_err();
+                assert!(matches!(error, attune_common::Error::InvalidState(_)));
+                tx.rollback().await?;
+                fixture.ctx.cleanup().await?;
+                continue;
+            }
             volume
                 .append_log_file(version.file_path.as_deref().unwrap(), &last)
                 .await?;
-        } else {
-            assert_eq!(
-                raw(
-                    &fixture,
-                    "PUT",
-                    &format!("/api/v1/internal/logs/{}/segments/1", version.id),
-                    &token,
-                    "application/octet-stream",
-                    last.clone()
+        }
+        let user = attune_api::auth::middleware::AuthenticatedUser {
+            claims: attune_common::auth::jwt::validate_token(
+                &token,
+                &fixture.ctx.state.jwt_config,
+            )?,
+        };
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-attune-log-final-manifest", authenticated.parse()?);
+        let mut historical = None;
+        for _ in 0..2 {
+            let tx = fixture.ctx.pool.begin().await?;
+            let mut source = attune_api::routes::internal_files::log_source::acquire(
+                &fixture.ctx.state,
+                tx,
+                &user,
+                &version,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("encrypted source: {error:?}"))?;
+            source
+                .authorize_target(&user, &version)
+                .await
+                .map_err(|error| anyhow::anyhow!("encrypted target: {error:?}"))?;
+            let locked =
+                ArtifactVersionRepository::find_by_id_for_update(source.transaction(), version.id)
+                    .await?
+                    .unwrap();
+            let locked_stream = LogStreamRepository::lock(source.transaction(), stream.id).await?;
+            let current = source
+                .bind(
+                    &fixture.ctx.state,
+                    &user,
+                    &locked,
+                    &locked_stream,
+                    &headers,
+                    historical.as_ref(),
                 )
-                .await?,
-                axum::http::StatusCode::CREATED
+                .await
+                .map_err(|error| anyhow::anyhow!("encrypted binding: {error:?}"))?;
+            assert_eq!(
+                serde_json::to_value(&current)?["proof"]["kind"],
+                "encrypted"
             );
+            let mut changed = headers.clone();
+            changed.insert(
+                "x-attune-log-final-manifest",
+                manifest.authenticate(key)?.parse()?,
+            );
+            assert_eq!(
+                source
+                    .bind(
+                        &fixture.ctx.state,
+                        &user,
+                        &locked,
+                        &locked_stream,
+                        &changed,
+                        Some(&current)
+                    )
+                    .await
+                    .unwrap_err()
+                    .0,
+                StatusCode::CONFLICT
+            );
+            historical = Some(current);
+            source
+                .commit()
+                .await
+                .map_err(|error| anyhow::anyhow!("encrypted commit: {error:?}"))?;
         }
         assert_eq!(
             seal(Some(authenticated.clone())).await?.status(),
@@ -2149,8 +2448,14 @@ async fn encrypted_terminal_logs_require_a_complete_authenticated_manifest_on_bo
             axum::http::StatusCode::OK
         );
         assert_eq!(
+            // A different authenticated proof conflicts with the immutable selected
+            // object-close identity. Shared-file verification retains its 403.
             seal(Some(manifest.authenticate(key)?)).await?.status(),
-            axum::http::StatusCode::FORBIDDEN
+            if backend == LogStreamBackend::ObjectSegments {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::FORBIDDEN
+            }
         );
         let mut conn = fixture.ctx.pool.acquire().await?;
         let recorded = RuntimeLogCompletionRepository::find(&mut conn, version.id)
@@ -2183,3 +2488,8 @@ async fn encrypted_terminal_logs_require_a_complete_authenticated_manifest_on_bo
     }
     Ok(())
 }
+
+#[path = "object_seal_ack_loss.rs"]
+mod object_seal_ack_loss;
+#[path = "object_seal_delivery_boundary.rs"]
+mod object_seal_delivery_boundary;

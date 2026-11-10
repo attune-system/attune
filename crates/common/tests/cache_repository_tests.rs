@@ -4947,3 +4947,169 @@ fn is_deadlock(err: &Error) -> bool {
         Error::Database(sqlx::Error::Database(db)) if db.code().as_deref() == Some("40P01")
     )
 }
+
+#[tokio::test]
+async fn cache_statistics_not_due_skips_conflicting_parent_maintenance_lock() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let config = CacheRetentionConfig::default();
+    // Cover both no pending revision and a pending revision throttled by interval.
+    sqlx::query("UPDATE cache_entry_statistics_state SET completed_revision=requested_revision, last_analyzed_at=clock_timestamp() WHERE id=TRUE")
+        .execute(&*pool).await.unwrap();
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE ONLY cache_entry IN SHARE UPDATE EXCLUSIVE MODE")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    for pending in [false, true] {
+        if pending {
+            sqlx::query("UPDATE cache_entry_statistics_state SET requested_revision=requested_revision+1 WHERE id=TRUE")
+                .execute(&*pool).await.unwrap();
+        }
+        assert_eq!(
+            CacheStorageRepository::refresh_statistics(&pool, &config)
+                .await
+                .unwrap(),
+            CacheStatisticsRefreshOutcome::NotDue
+        );
+        let observation = CacheStorageRepository::observe(&pool, &config)
+            .await
+            .unwrap();
+        assert_eq!(observation.statistics_pending, pending);
+    }
+    blocker.rollback().await.unwrap();
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn cache_statistics_rechecks_due_revision_after_parent_lock_wait() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    sqlx::query("UPDATE cache_entry_statistics_state SET requested_revision=completed_revision+1, last_analyzed_at=NULL WHERE id=TRUE")
+        .execute(&*pool).await.unwrap();
+    let mut blocker = pool.begin().await.unwrap();
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    sqlx::query("LOCK TABLE ONLY cache_entry IN SHARE UPDATE EXCLUSIVE MODE")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let refresh_pool = pool.pool().clone();
+    let refresh = tokio::spawn(async move {
+        CacheStorageRepository::refresh_statistics(
+            &refresh_pool,
+            &CacheRetentionConfig {
+                ddl_lock_timeout_milliseconds: 10_000,
+                statistics_statement_timeout_milliseconds: 10_000,
+                ..CacheRetentionConfig::default()
+            },
+        )
+        .await
+    });
+    let waited = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND relation='cache_entry'::regclass AND mode='ShareUpdateExclusiveLock' AND NOT granted AND $1=ANY(pg_blocking_pids(pid)))")
+                .bind(blocker_pid).fetch_one(&*pool).await.unwrap();
+            if waiting { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await;
+    // Simulate another maintainer completing this revision while we waited.
+    sqlx::query("UPDATE cache_entry_statistics_state SET completed_revision=requested_revision, last_analyzed_at=clock_timestamp() WHERE id=TRUE")
+        .execute(&mut *blocker).await.unwrap();
+    blocker.commit().await.unwrap();
+    let result = refresh.await.unwrap().unwrap();
+    pool.cleanup().await.unwrap();
+    waited.expect("refresh never reached the parent lock after due preflight");
+    assert_eq!(result, CacheStatisticsRefreshOutcome::NotDue);
+}
+
+#[tokio::test]
+async fn cache_statistics_rejects_effective_nonowner_before_idle_preflight_and_after_wait() {
+    let pool = helpers::create_test_pool().await.unwrap();
+    let schema = pool.schema().to_string();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let owner = format!("stats_owner_{suffix}");
+    let runner = format!("stats_runner_{suffix}");
+    let original: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(&*pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(&format!("CREATE ROLE {owner}; CREATE ROLE {runner};
+        ALTER TABLE cache_entry OWNER TO {owner};
+        GRANT USAGE ON SCHEMA \"{schema}\" TO {runner};
+        GRANT SELECT,UPDATE ON cache_entry_statistics_state TO {runner};
+        GRANT ALL ON cache_entry TO {runner};
+        UPDATE cache_entry_statistics_state SET completed_revision=requested_revision,last_analyzed_at=clock_timestamp() WHERE id=TRUE;"))
+        .execute(&*pool).await.unwrap();
+    let role = runner.clone();
+    let restricted = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |conn, _| {
+            let role = role.clone();
+            let schema = schema.clone();
+            Box::pin(async move {
+                sqlx::query("SELECT set_config('role',$1,false),set_config('search_path',quote_ident($2),false)")
+                    .bind(role).bind(schema).execute(conn).await?;
+                Ok(())
+            })
+        })
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let error =
+        CacheStorageRepository::refresh_statistics(&restricted, &CacheRetentionConfig::default())
+            .await
+            .unwrap_err();
+    assert!(error.to_string().contains("effective parent ownership"));
+    sqlx::raw_sql(&format!("GRANT {owner} TO {runner}; UPDATE cache_entry_statistics_state SET requested_revision=completed_revision+1,last_analyzed_at=NULL WHERE id=TRUE;"))
+        .execute(&*pool).await.unwrap();
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE ONLY cache_entry IN SHARE UPDATE EXCLUSIVE MODE")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let refresh_pool = restricted.clone();
+    let refresh = tokio::spawn(async move {
+        CacheStorageRepository::refresh_statistics(
+            &refresh_pool,
+            &CacheRetentionConfig {
+                ddl_lock_timeout_milliseconds: 10_000,
+                statistics_statement_timeout_milliseconds: 10_000,
+                ..CacheRetentionConfig::default()
+            },
+        )
+        .await
+    });
+    let waited = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND relation='cache_entry'::regclass AND mode='ShareUpdateExclusiveLock' AND NOT granted)")
+                .fetch_one(&*pool).await.unwrap();
+            if waiting {break;}
+            tokio::task::yield_now().await;
+        }
+    }).await;
+    // Change the real relation owner while the independent backend is queued.
+    // Its explicit table privileges remain, so LOCK itself can still succeed.
+    sqlx::query(&format!("ALTER TABLE cache_entry OWNER TO {original}"))
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    blocker.commit().await.unwrap();
+    let result = refresh.await.unwrap();
+    restricted.close().await;
+    let pending: bool = sqlx::query_scalar("SELECT requested_revision>completed_revision FROM cache_entry_statistics_state WHERE id=TRUE")
+        .fetch_one(&*pool).await.unwrap();
+    sqlx::raw_sql(&format!("ALTER TABLE cache_entry OWNER TO {original}; DROP OWNED BY {runner}; DROP ROLE {runner}; DROP ROLE {owner};"))
+        .execute(&*pool).await.unwrap();
+    pool.cleanup().await.unwrap();
+    waited.expect("refresh did not pass ownership preflight and queue for parent lock");
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("effective parent ownership"));
+    assert!(
+        pending,
+        "ownership rejection must not acknowledge pending work"
+    );
+}
