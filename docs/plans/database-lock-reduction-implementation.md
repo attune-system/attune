@@ -6,14 +6,16 @@
 > path retirement are deferred protocols, not claimed lock removals.
 > Functional source `d8a037f8` passed all 16 CI checks and the packaged
 > build/runtime proof, in addition to the PG16/18 suites recorded below.
-> The final record commit still requires its own CI and cumulative review.
+> Cumulative review found no new must-fix defect within the fresh-instance
+> contract; the existing-database transition gap is explicitly out of that
+> rollout contract. Final documentation-head CI is still required.
 > Dated design/checkpoint sections below retain historical proposals and failed
 > attempts; current behavior is specified in [the protocol](object-log-seal-claims.md)
 > and the final validation record at the end of this file.
 
 # Database lock reduction: code-level implementation map
 
-Status: implemented scope validated; final cumulative review and record-head CI pending.
+Status: implemented scope validated and cumulatively reviewed for fresh-instance rollout; record-head CI pending.
 Initial analysis: 2026-11-09 UTC; final validation records: 2026-11-10 UTC.
 
 This expands the [lock audit](database-lock-scope-audit.md), with a separate
@@ -2287,3 +2289,31 @@ pre-admitted delayed writes, staging orphans, post-retention recreation and
 filesystem path retirement remain explicit exclusions; shared-file/PhysicalCleanup
 fences remain. The preserved timing failures are disclosed evidence limits,
 not grounds for weakened assertions or speculative guard removal.
+
+
+### Cumulative review and explicit rollout disposition
+
+Astra completed the pinned `8af23fc4..5badd947` cumulative review. It found no new
+must-fix defect within the repository's declared fresh-install contract, but
+confirmed a concrete transition gap for existing pre-close Ready/sealed object
+logs. Migration003 leaves them at revision0/NULL phase. New selection rejects
+already-sealed/Ready input; migration012's deferred consistency check rejects
+retained-row updates on that unselected final state, including operational log
+metadata and deleting-state commits. Reads/getter and some whole-version cascaded
+cleanup can still work; claiming all legacy reads/cleanup fail would overstate it.
+
+Rollout disposition is **fresh instance**, consistent with the approved new-volume
+option for this task and AGENTS.md's preproduction/fresh-baseline policy. The
+[current protocol](object-log-seal-claims.md#rollout-boundary) now makes this an
+explicit deployment requirement, including coherent new managed storage, queue
+and signing context instead of resetting database IDs against old state. This PR
+performs no reset or deployment. An in-place data-preserving upgrade is separate
+work requiring valid pre-close fixtures and truthful historical provenance; no
+synthetic close evidence is introduced.
+
+This closes the rollout-scope decision, not the missing in-place transition.
+Astra did not grant blanket merge approval or universal timing guarantees.
+Functional source and build configuration remain unchanged from validatedd8;
+these edits only clarify the supported rollout and record review. Required CI
+on this final documentation head remains pending. All recorded experiments,
+failures, limits and fresh-instance safety guards retain their previous scope.

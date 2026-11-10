@@ -1,6 +1,6 @@
 # Object-log durable close protocol
 
-Status: implementation checkpoint, work in progress; final review and CI required.
+Status: implemented and reviewed for fresh-instance rollout; final record-head CI pending.
 
 The production `ObjectSegments` seal route now uses durable prepare, storage-only
 verification, and a freshly authorized final transaction. Shared-file seal keeps
@@ -8,6 +8,30 @@ its transaction, snapshot and flock. Actual-route paused-provider tests passed o
 PG16 and PG18 with pool size one: an unrelated query and shared/exclusive graph
 work finish before GET resumes. This establishes released database ownership for
 that tested path; it does not establish PUT settlement or every authority race.
+
+## Rollout boundary
+
+This protocol's supported deployment is a fresh instance. It is not an in-place
+transition for pre-close Ready/sealed object logs. Provision an empty database
+with fresh managed artifact/blob/log storage namespaces, an isolated queue/vhost,
+and fresh instance signing credentials; quiesce old producers before cutover.
+Reusing old numeric-ID storage or authorization/queue state with a reset database
+is not this boundary. Fresh provisioning is a separate explicit deployment
+operation; migrations and this PR do not reset existing data.
+
+Before these migrations, a legitimately sealed object log can have Ready body,
+close_revision=0 and close_phase=NULL. Reads and get-or-create may still work,
+and whole-version cascading deletion may succeed subject to its other fences.
+However, seal replay cannot select the already-Ready/sealed input, and deferred
+publication consistency rejects retained-row updates on that unselected final
+state, including operational log metadata updates or a committed deleting state.
+Pending-only initialization fixtures and selected-publication retries do not
+establish a data-preserving upgrade for those rows.
+
+An existing-database rollout requires a separate approved, data-preserving
+transition with pre-close Ready/sealed fixtures. Do not synthesize historical
+producer/proof bindings or verified-close evidence to bypass that requirement.
+The fresh-instance scope retains all current protocol guards.
 
 `log_source::Source` acquires graph/source protection before artifact/version/stream
 locks. Prepare binds current producer identity, authenticated manifest and caps,
@@ -29,9 +53,9 @@ and compares history and exact durable selection. A revision/deadline mismatch
 cannot publish. Fresh encrypted evidence/metadata, sealed/truncated state, verified
 size/digest, Ready and published close state commit atomically. Migration 006
 replaces the selected-publication veto with permanent identity guards and deferred
-cross-table constraints. Forward guards 007–011 prevent generic publication bypass,
+cross-table constraints. Forward guards 007–012 prevent generic publication bypass,
 bind recorded final evidence, and preserve PR31 operational `log_state`/`log_failure`
-updates without allowing source/proof/body/binding replacement. No session bypass exists. Identical published retries
+updates without allowing source/proof/body/binding replacement. No session bypass exists. Identical selected-publication retries
 repeat current authorization and compare the selected input and verified result.
 
 Each object request runs in an owned task so waiter cancellation cannot drop an
