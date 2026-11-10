@@ -674,9 +674,9 @@ describe("artifact browsing through production hooks", () => {
       fireEvent.click(await screen.findByRole("button", { name: /stdout/ }));
       fireEvent.click(screen.getByRole("button", { name: "Preview" }));
       await waitFor(() => expect(fetch).toHaveBeenCalledOnce());
-      expect(fetch.mock.calls[0][0]).toMatch(
-        new RegExp(`/executions/10/logs/${stream}/stream$`),
-      );
+      expect(
+        fetch.mock.calls[0][0].endsWith(`/executions/10/logs/${stream}/stream`),
+      ).toBe(true);
       await screen.findByText("recorded log");
       await screen.findByText("Stream complete");
       expect(
