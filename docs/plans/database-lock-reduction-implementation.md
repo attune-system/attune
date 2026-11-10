@@ -2114,3 +2114,45 @@ current49216567 proof checkouts are root-owned local test infrastructure, not
 changes to the original dirty checkout. Comparison will start after packaged
 proof and this focused validation, preventing compilation overlap with its
 measurements. All comparative failures must be retained, not retried away.
+
+### Retention CI-fixture validation and packaged builder resource bound
+
+At frozen `bfb147a65183883c1a0c81ba852009cb078811fc`, storage target build,
+focused matrix **1/1 each PG16/18**, full storage **43/43 each**, common all-target
+Clippy `-D warnings`, workspace formatting and whitespace checks passed. Four
+workers, zero ignored. Commands/results and source identity are preserved in
+`/tmp/attune-retention-fixture-validation-state.json`; logs use the matching prefix.
+
+The temporary root validation wrapper then failed in its finally block with
+StopIteration while looking up an unrelated sensor executable. This is a wrapper
+failure, not an application/test failure or successful whole-run exit. It delayed
+explicit teardown. Recovery independently checked zero clones/PIDs/locks on each
+exact owned server, then removed both containers/volumes. The state preserves
+wrapper_exit1, its error, checks_passed and cleanup_recovery separately; original
+pre-recovery state and failed wrapper are retained under `/tmp/attune-retention-fixture-before-cleanup-recovery.json` and
+`/tmp/attune-retention-fixture-validation-failed.py`. Corrected only that temporary
+wrapper's unrelated inventory lookup; no tests were rerun or relabeled.
+
+The packaged runner build at49216567 failed after5454.794s during linking with
+LLVM/linker No space left on device; exit101 within the image build, compose exit1.
+No stack or runtime tests started. Proof project `attune-lockproof72987207d7` left
+zero containers/volumes. See `/tmp/attune-packaged-proof-state.json` and
+`/tmp/attune-packaged-proof-build.log`. This replaces neither the earlier recorded
+600s timeout nor the outstanding runtime validation requirement.
+
+BuildKit inspection identified the specific unused, unshared, reclaimable43.3GB
+`/build/target` cache for `/rust-integration-tests` (ID
+`j0zgli61eej1o3vjuq0cfypuf`). Removed only that exact cache ID with filtered prune;
+no images, application data, or volumes were pruned. Audit and cleanup logs:
+`/tmp/attune-buildkit-cachemount-audit.txt`,
+`/tmp/attune-buildkit-owned-target-cleanup.log`.
+
+The Docker test builder now sets CARGO_INCREMENTAL=0 and CARGO_BUILD_JOBS=4.
+It exports precompiled test binaries, so retaining per-test incremental graphs
+and linking many targets concurrently adds disk pressure without serving runtime
+invocations. These builder-stage settings reduce retained/peak build artifacts;
+assertions, optimization profile, test inventory, runtime thread count and DB
+budgets are unchanged. This is not yet a measured successful packaged build.
+The retry will run after the matched maintenance comparison, preserving that
+comparison's no-concurrent-compilation condition. Baseline/current proof checkouts
+remain frozen independently; main fix worktree runtime code is unchanged.
