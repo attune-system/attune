@@ -137,6 +137,27 @@ async fn bound_stream_fixture(
     access: LogAccess,
     protected: bool,
 ) -> Result<(i64, String)> {
+    bound_stream_fixture_with_policy(
+        ctx,
+        access,
+        if protected {
+            attune_common::output_policy::OutputPolicy {
+                stdout: Some(attune_common::output_policy::StdoutPolicy::Secret),
+                stderr: Some(attune_common::output_policy::OutputVisibility::Secret),
+                error: None,
+            }
+        } else {
+            Default::default()
+        },
+    )
+    .await
+}
+
+async fn bound_stream_fixture_with_policy(
+    ctx: &TestContext,
+    access: LogAccess,
+    output_policy: attune_common::output_policy::OutputPolicy,
+) -> Result<(i64, String)> {
     use attune_common::{
         auth::jwt::{generate_delegated_execution_token, STANDARD_EXECUTION_ACCESS_REF},
         repositories::{
@@ -157,15 +178,7 @@ async fn bound_stream_fixture(
     let action = ActionRepository::create(
         &ctx.pool,
         CreateActionInput {
-            output_policy: if protected {
-                attune_common::output_policy::OutputPolicy {
-                    stdout: Some(attune_common::output_policy::StdoutPolicy::Secret),
-                    stderr: Some(attune_common::output_policy::OutputVisibility::Secret),
-                    error: None,
-                }
-            } else {
-                Default::default()
-            },
+            output_policy,
             output_format: Default::default(),
             r#ref: format!("{}.tail", pack.r#ref),
             pack: pack.id,
@@ -334,6 +347,86 @@ async fn selected_api_permissions_do_not_make_public_channels_require_decrypt() 
         drop(response.into_response());
         wait_for_no_leases(&ctx).await?;
     }
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn early_public_stderr_subscription_does_not_require_secret_stdout_access() -> Result<()> {
+    use attune_common::{
+        output_policy::{OutputPolicy, OutputVisibility, StdoutPolicy},
+        repositories::{
+            identity::{IdentityRepository, UpdateIdentityInput},
+            Update,
+        },
+    };
+    use futures::StreamExt;
+    let ctx = TestContext::new_with_stream_limits(2, 2)
+        .await?
+        .with_auth()
+        .await?;
+    let (id, token) = bound_stream_fixture_with_policy(
+        &ctx,
+        LogAccess::ReadOnly,
+        OutputPolicy {
+            stdout: Some(StdoutPolicy::Secret),
+            stderr: Some(OutputVisibility::Public),
+            error: None,
+        },
+    )
+    .await?;
+    assert!(
+        attune_common::repositories::runtime_read::RuntimeReadRepository::source_admission(
+            &ctx.pool, id
+        )
+        .await?
+        .is_none(),
+        "exercise the unallocated legacy fallback, not the recorded live-log path"
+    );
+    let response = ctx
+        .get(
+            &format!("/api/v1/executions/{id}/logs/stderr/stream"),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_response().into_body().into_data_stream();
+    let chunk = tokio::time::timeout(Duration::from_secs(10), body.next())
+        .await?
+        .unwrap()?;
+    assert!(
+        String::from_utf8_lossy(&chunk).contains("event: waiting"),
+        "public stderr must remain authorized before lazy log allocation"
+    );
+    assert_eq!(
+        ctx.get(
+            &format!("/api/v1/executions/{id}/logs/stdout/stream"),
+            Some(&token)
+        )
+        .await?
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    let identity = ctx.user.as_ref().unwrap().id;
+    IdentityRepository::update(
+        &ctx.pool,
+        identity,
+        UpdateIdentityInput {
+            frozen: Some(true),
+            ..Default::default()
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(identity).await;
+    let chunk = tokio::time::timeout(Duration::from_secs(10), body.next())
+        .await?
+        .unwrap()?;
+    assert!(
+        String::from_utf8_lossy(&chunk).contains("event: error"),
+        "channel-scoped guard must still reauthorize the live reader"
+    );
+    drop(body);
+    wait_for_no_leases(&ctx).await?;
     ctx.cleanup().await?;
     Ok(())
 }

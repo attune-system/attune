@@ -501,6 +501,7 @@ pub(super) fn guard_legacy_log<S>(
     state: Arc<AppState>,
     user: AuthenticatedUser,
     id: i64,
+    channel: ExecutionLogStream,
     permit: crate::execution_log_streams::ExecutionLogStreamPermit,
 ) -> impl futures::Stream<Item = Result<Event, std::convert::Infallible>>
 where
@@ -514,7 +515,11 @@ where
                 return None;
             }
             let event = inner.next().await?;
-            let checked = log_execution(&state, &user, id, None).await;
+            let name = match channel {
+                ExecutionLogStream::Stdout => "stdout",
+                ExecutionLogStream::Stderr => "stderr",
+            };
+            let checked = log_execution(&state, &user, id, Some(name)).await;
             let (event, finished) = if checked.is_err() || permit.lease_lost_token().is_cancelled()
             {
                 (

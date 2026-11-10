@@ -127,6 +127,22 @@ async fn fixture_on_database(
     RuntimePolicy,
     i64,
 ) {
+    fixture_on_database_with_output_mismatch(db, authored_defaults, empty_workflow, staged, false)
+        .await
+}
+
+async fn fixture_on_database_with_output_mismatch(
+    db: TestDatabase,
+    authored_defaults: bool,
+    empty_workflow: bool,
+    staged: Option<native_staged_completion::Case>,
+    invalid_output: bool,
+) -> (
+    TestDatabase,
+    ExecutionExecutableSnapshot,
+    RuntimePolicy,
+    i64,
+) {
     let mut pack_fixture = PackFixture::new_unique("exec_admission");
     if authored_defaults {
         pack_fixture.conf_schema =
@@ -171,7 +187,7 @@ async fn fixture_on_database(
                     "collision_output":{"type":"string"},
                     "envelope_output":{"type":"integer"},
                     "result_output":{"type":"string"},
-                    "literal_output":{"type":"string"}
+                    "literal_output":{"type":if invalid_output { "integer" } else { "string" }}
                 })),
                 ..Default::default()
             },
@@ -2704,11 +2720,11 @@ async fn run_native_initial_variable_case(case: Option<native_staged_completion:
         .clone();
     output["succeeded"] = json!(true);
     if let Some(contract) = &output_contract.output {
-        if let Err(error) = attune_common::value_schema::CompiledContract::new(contract)
-            .unwrap()
-            .validate(&output)
+        let compiled = attune_common::value_schema::CompiledContract::new(contract).unwrap();
+        if let Some(warning) =
+            attune_common::output_classification::output_validation_warning(&compiled, &output)
         {
-            output["output_validation_warning"] = json!({"code":error.code,"path":error.path});
+            output["output_validation_warning"] = warning;
         }
     }
     let mut wrong = output.clone();
@@ -2823,6 +2839,15 @@ async fn run_native_initial_variable_case(case: Option<native_staged_completion:
 
 #[tokio::test]
 async fn empty_workflow_output_uses_persisted_variables_without_a_synthetic_child_or_outcome() {
+    empty_workflow_output_case(false).await;
+}
+
+#[tokio::test]
+async fn invalid_workflow_output_completes_with_an_advisory_code_only_warning() {
+    empty_workflow_output_case(true).await;
+}
+
+async fn empty_workflow_output_case(invalid_output: bool) {
     use attune_common::repositories::{
         cache::{CacheEntryRepository, CacheTransactionMode},
         declared_input_materialization::DeclaredInputMaterializationRepository as Materialize,
@@ -2844,7 +2869,14 @@ async fn empty_workflow_output_uses_persisted_variables_without_a_synthetic_chil
         prepare_secret_values, redact_secret_path_sources, SecretPathSource, SecretSource,
         ENTITY_EXECUTION_CONFIG, ENTITY_EXECUTION_RESULT, ENTITY_WORKFLOW_VARIABLES,
     };
-    let (db, snapshot, policy, human) = fixture_with_native_shape(true, true).await;
+    let (db, snapshot, policy, human) = fixture_on_database_with_output_mismatch(
+        create_test_pool().await.unwrap(),
+        true,
+        true,
+        None,
+        invalid_output,
+    )
+    .await;
     let key = "empty-workflow-output-owned-encryption-key";
     let selected = helpers::KeyFixture::new_pack(
         policy.owner.pack_id,
@@ -2970,12 +3002,31 @@ async fn empty_workflow_output_uses_persisted_variables_without_a_synthetic_chil
     let mut output = plan.output().unwrap().clone();
     output["succeeded"] = json!(true);
     if let Some(contract) = &schema.output {
-        if let Err(error) = attune_common::value_schema::CompiledContract::new(contract)
-            .unwrap()
-            .validate(&output)
+        let compiled = attune_common::value_schema::CompiledContract::new(contract).unwrap();
+        if let Some(warning) =
+            attune_common::output_classification::output_validation_warning(&compiled, &output)
         {
-            output["output_validation_warning"] = json!({"code":error.code,"path":error.path});
+            output["output_validation_warning"] = warning;
         }
+    }
+    if invalid_output {
+        assert!(output["output_validation_warning"].get("code").is_some());
+        assert_eq!(
+            output["output_validation_warning"]
+                .as_object()
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut forged = output.clone();
+        forged["output_validation_warning"]["path"] = json!("/private-instance-path");
+        assert!(plan
+            .record_output(&mut completion, schema.output.as_ref(), &forged, key)
+            .await
+            .is_err());
+        assert_eq!(output["succeeded"], true);
+    } else {
+        assert!(output.get("output_validation_warning").is_none());
     }
     let output_sources = plan
         .record_output(&mut completion, schema.output.as_ref(), &output, key)
@@ -3011,6 +3062,15 @@ async fn empty_workflow_output_uses_persisted_variables_without_a_synthetic_chil
     )
     .await
     .unwrap();
+    let completed = ExecutionRepository::find_by_id(&mut *completion, parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.status, ExecutionStatus::Completed);
+    assert_eq!(
+        completed.result.as_ref().unwrap()["output_validation_warning"],
+        output["output_validation_warning"]
+    );
     for source in output_sources {
         let SecretSource::Bound(provenance) = source.source else {
             panic!("missing exact empty output receipt")

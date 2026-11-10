@@ -364,21 +364,17 @@ impl PreparedNativeTransitions {
         if let Some(contract) = contract {
             let compiled =
                 crate::value_schema::CompiledContract::new(contract).map_err(|_| changed())?;
-            if let Err(error) = compiled.validate(&expected) {
-                expected["output_validation_warning"] =
-                    serde_json::json!({"code":error.code,"path":error.path});
+            if let Some(warning) =
+                crate::output_classification::output_validation_warning(&compiled, &expected)
+            {
+                expected["output_validation_warning"] = warning;
             }
         }
         if actual != &expected {
             return Err(changed());
         }
-        if self.uses_native_result_projection()
-            && expected.get("output_validation_warning").is_some()
-        {
-            // A's finite success-warning recipe is distinct from authored VALUE
-            // leaves and is not implemented by a ResultView or shorthand proof.
-            return Err(changed());
-        }
+        // The diagnostic is derived above from the exact held values and bound
+        // contract. It is generated metadata, not an authored VALUE receipt.
         let mut receipts = Vec::new();
         let mut sources = Vec::new();
         for (path, rendered, destination) in &output.leaves {
@@ -1949,7 +1945,8 @@ async fn prepare_output(
     if let Some(contract) = &binding.output {
         let contract =
             crate::value_schema::CompiledContract::new(contract).map_err(|_| changed())?;
-        let metadata = serde_json::json!({"succeeded":true,"output_validation_warning":{"code":"validation","path":"/field"}});
+        let metadata =
+            serde_json::json!({"succeeded":true,"output_validation_warning":{"code":"validation"}});
         if !contract
             .secret_paths(&metadata)
             .map_err(|_| changed())?

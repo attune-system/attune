@@ -23,6 +23,14 @@ use crate::{
 
 pub const ENTITY_EXECUTION_OUTPUT_CHANNEL: &str = "execution_output_channel";
 
+/// Canonical advisory workflow diagnostic: never include paths or instance values.
+pub fn output_validation_warning(contract: &CompiledContract<'_>, value: &Value) -> Option<Value> {
+    contract
+        .validate(value)
+        .err()
+        .map(|error| json!({"code": error.code}))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputChannel {

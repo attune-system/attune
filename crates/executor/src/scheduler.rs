@@ -444,8 +444,10 @@ async fn prepare_receipted_workflow_output(
     let mut result = build_workflow_result_payload(true, None, Some(data));
     if let Some(output) = output {
         let contract = attune_common::value_schema::CompiledContract::new(output)?;
-        if let Err(error) = contract.validate(&result) {
-            result["output_validation_warning"] = serde_json::json!({"code":error.code});
+        if let Some(warning) =
+            attune_common::output_classification::output_validation_warning(&contract, &result)
+        {
+            result["output_validation_warning"] = warning;
         }
     }
     // Every authored output leaf has its own exact prepared Value destination,
@@ -474,8 +476,10 @@ fn classify_workflow_result(
         return Ok((result, Vec::new()));
     };
     let contract = attune_common::value_schema::CompiledContract::new(output)?;
-    if let Err(error) = contract.validate(&result) {
-        result["output_validation_warning"] = serde_json::json!({"code":error.code});
+    if let Some(warning) =
+        attune_common::output_classification::output_validation_warning(&contract, &result)
+    {
+        result["output_validation_warning"] = warning;
     }
     let mut classified = Vec::new();
     for path in contract.secret_paths(&result)? {

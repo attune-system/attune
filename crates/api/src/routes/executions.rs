@@ -3215,7 +3215,8 @@ pub async fn stream_execution_log(
         }
     });
 
-    let stream = streams::guard_legacy_log(stream, state, authenticated_user, id, permit);
+    let stream =
+        streams::guard_legacy_log(stream, state, authenticated_user, id, stream_name, permit);
     Ok((
         [("x-accel-buffering", "no")],
         Sse::new(stream).keep_alive(KeepAlive::default()),
