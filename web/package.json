@@ -57,6 +57,11 @@
     "vite": "^7.2.4",
     "vitest": "^4.1.11"
   },
+  "overrides": {
+    "@typescript-eslint/typescript-estree": {
+      "minimatch": "^11.0.1"
+    }
+  },
   "allowScripts": {
     "esbuild@0.28.1": true
   }
