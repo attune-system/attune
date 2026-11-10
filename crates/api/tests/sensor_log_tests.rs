@@ -485,3 +485,8 @@ async fn staged_sensor_log_source_roundtrip_refresh_expiry_and_release() -> help
     ctx.cleanup().await?;
     Ok(())
 }
+
+#[path = "support/object_seal_boundary.rs"]
+mod object_seal_boundary;
+#[path = "support/object_seal_producers.rs"]
+mod object_seal_producers;

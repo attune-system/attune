@@ -2446,3 +2446,5 @@ async fn encrypted_terminal_logs_require_a_complete_authenticated_manifest_on_bo
 
 #[path = "object_seal_ack_loss.rs"]
 mod object_seal_ack_loss;
+#[path = "object_seal_delivery_boundary.rs"]
+mod object_seal_delivery_boundary;
