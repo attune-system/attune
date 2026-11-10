@@ -917,7 +917,7 @@ async fn action(ctx: &TestContext) -> Result<String> {
         ]),
     )
     .await?;
-    managed_fixture::action_pack(ctx).await
+    managed_fixture::action_pack_with_secret_channels(ctx, true).await
 }
 
 async fn execution(ctx: &TestContext, action_ref: &str) -> Result<i64> {
@@ -979,7 +979,7 @@ async fn link(ctx: &TestContext, artifact: i64, execution: i64) -> Result<()> {
             content: None,
             content_json: None,
             file_path: None,
-            meta: None,
+            meta: Some(json!({"stream":"stdout"})),
             created_by: None,
         },
     )

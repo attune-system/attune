@@ -120,7 +120,8 @@ async fn selected_runtime_log_download_completes_with_one_connection_and_recursi
         },
     )
     .await?;
-    let action = managed_fixture::action_pack(&ctx).await?;
+    // Exercise recorded-origin traversal through an explicitly secret channel.
+    let action = managed_fixture::action_pack_with_secret_channels(&ctx, true).await?;
     let source = admitted_execution(&ctx, &action).await?;
     let execution = admitted_execution(&ctx, &action).await?;
     origins(
@@ -145,7 +146,7 @@ async fn selected_runtime_log_download_completes_with_one_connection_and_recursi
     let artifact = ArtifactRepository::create(
         &ctx.pool,
         CreateArtifactInput {
-            r#ref: "artifact_perf.run.single_connection.log".into(),
+            r#ref: "artifact_perf.run.single_connection.stdout.log".into(),
             scope: OwnerType::Action,
             owner: action,
             r#type: ArtifactType::FileText,
@@ -174,7 +175,7 @@ async fn selected_runtime_log_download_completes_with_one_connection_and_recursi
             content: None,
             content_json: None,
             file_path: Some(relative.into()),
-            meta: None,
+            meta: Some(json!({"stream":"stdout"})),
             created_by: None,
         },
     )
@@ -245,7 +246,7 @@ async fn legacy_runtime_and_sensor_downloads_reuse_their_one_retained_connection
         grants: json!([
             {"resource":"actions","actions":["read","execute"]},
             {"resource":"executions","actions":["read","decrypt"]},
-            {"resource":"artifacts","actions":["read"],"constraints":{"refs":["single_connection.legacy.log","sensor.artifact_perf.sensor.stdout"]}},
+            {"resource":"artifacts","actions":["read"],"constraints":{"refs":["single_connection.legacy.stdout.log","sensor.artifact_perf.sensor.stdout"]}},
             {"resource":"triggers","actions":["update","decrypt"]}
         ]),
     }).await?;
@@ -276,7 +277,7 @@ async fn legacy_runtime_and_sensor_downloads_reuse_their_one_retained_connection
     let runtime = ArtifactRepository::create(
         &ctx.pool,
         CreateArtifactInput {
-            r#ref: "single_connection.legacy.log".into(),
+            r#ref: "single_connection.legacy.stdout.log".into(),
             scope: OwnerType::Action,
             owner: action,
             r#type: ArtifactType::FileText,
@@ -306,7 +307,7 @@ async fn legacy_runtime_and_sensor_downloads_reuse_their_one_retained_connection
             content: None,
             content_json: None,
             file_path: Some("single-connection/legacy.log".into()),
-            meta: None,
+            meta: Some(json!({"stream":"stdout"})),
             created_by: None,
         },
     )

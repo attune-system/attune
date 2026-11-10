@@ -469,7 +469,7 @@ async fn concurrent_append_and_retained_growth_lock_versions_before_artifact_own
                         json!({"execution":selected.execution,"marker":"concurrent"}),
                     ),
                     file_path: None,
-                    meta: None,
+                    meta: Some(json!({"stream":"stdout"})),
                     created_by: None,
                 },
             )

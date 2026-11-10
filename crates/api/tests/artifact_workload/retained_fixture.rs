@@ -246,12 +246,17 @@ impl RetainedHistory {
             return Err("historical schema batch did not match its pinned executables".into());
         }
         for artifact in artifacts {
+            let stream = if artifact == self.selected.versions[0].artifact {
+                "stdout"
+            } else {
+                "stderr"
+            };
             let linked = sqlx::query(
-                "INSERT INTO artifact_version (artifact,version,execution,content_type) \
-                 SELECT $1,(base.version+n.ordinality)::integer,n.id,'application/json' \
+                "INSERT INTO artifact_version (artifact,version,execution,content_type,meta) \
+                 SELECT $1,(base.version+n.ordinality)::integer,n.id,'application/json',$3 \
                  FROM unnest($2::bigint[]) WITH ORDINALITY n(id,ordinality) CROSS JOIN \
                  (SELECT COALESCE(MAX(version),0) AS version FROM artifact_version WHERE artifact=$1) base",
-            ).bind(artifact).bind(&ids).execute(&mut *tx).await?.rows_affected();
+            ).bind(artifact).bind(&ids).bind(json!({"stream":stream})).execute(&mut *tx).await?.rows_affected();
             if linked != count as u64 {
                 return Err("historical log batch was incomplete".into());
             }
@@ -298,6 +303,16 @@ impl RetainedHistory {
         if marker.len() > 128 {
             return Err("fixture marker exceeds its byte budget".into());
         }
+        let artifact_record = ArtifactRepository::find_by_id(&ctx.pool, artifact)
+            .await?
+            .ok_or("fixture artifact missing")?;
+        let stream = if artifact_record.r#ref.ends_with(".stdout.log") {
+            "stdout"
+        } else if artifact_record.r#ref.ends_with(".stderr.log") {
+            "stderr"
+        } else {
+            return Err("fixture channel missing".into());
+        };
         let version = ArtifactVersionRepository::create(
             &ctx.pool,
             CreateArtifactVersionInput {
@@ -307,7 +322,7 @@ impl RetainedHistory {
                 content: None,
                 content_json: Some(json!({"execution":execution,"marker":marker})),
                 file_path: None,
-                meta: None,
+                meta: Some(json!({"stream":stream})),
                 created_by: None,
             },
         )
