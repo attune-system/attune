@@ -142,13 +142,17 @@ async fn sensor_case(mode: u8) -> helpers::Result<()> {
     let http_request = request;
     let mut http = tokio::spawn(async move {
         let result = http_app.oneshot(http_request).await;
-        assert_ne!(mode, 4, "injected HTTP waiter panic");
+        assert!(mode < 4, "injected HTTP waiter panic");
         result
     });
     let mut joined = false;
     let result = std::panic::AssertUnwindSafe(async {
         tokio::time::timeout(Duration::from_secs(10),store.uploaded.notified()).await?;
         if mode==3 {return Err("injected producer GET failure".into());}
+        if mode==5 {
+            assert!(SensorWorkloadRepository::release(&ctx.pool,workload.fence()).await?);
+            return Err("injected pre-join producer failure".into());
+        }
         let pending=snapshot(&ctx.pool,stream.id).await?;
         assert_eq!(pending["phase"],"closing"); assert_eq!(pending["state"],"pending"); assert_eq!(pending["sealed"],false); assert!(pending["evidence"].is_null());
         let mut blocker=None;
@@ -208,13 +212,16 @@ async fn sensor_case(mode: u8) -> helpers::Result<()> {
     drop(store);
     ctx.cleanup().await?;
     assert!(drained, "owned seal drain watchdog");
-    finished?;
     if let Some(completion) = completion {
         let completion = completion?;
-        assert_eq!(completion["phase"], "published");
+        assert_eq!(
+            completion["phase"], "published",
+            "inner seal did not publish before cleanup"
+        );
         assert_eq!(completion["state"], "ready");
         assert_eq!(completion["sealed"], true);
     }
+    finished?;
     match result {
         Ok(result) => result,
         Err(panic) => std::panic::resume_unwind(panic),
@@ -452,5 +459,26 @@ async fn object_seal_sensor_http_panic_is_joined_once_before_cleanup() -> helper
         .downcast_ref::<tokio::task::JoinError>()
         .expect("HTTP panic must propagate as JoinError after cleanup");
     assert!(error.is_panic());
+    Ok(())
+}
+
+#[tokio::test]
+async fn object_seal_sensor_late_waiter_panic_cannot_mask_failed_publication() -> helpers::Result<()>
+{
+    let panic = std::panic::AssertUnwindSafe(sensor_case(5))
+        .catch_unwind()
+        .await
+        .expect_err(
+            "pending publication must fail its assertion, not return an accepted waiter JoinError",
+        );
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .expect("publication assertion panic");
+    assert!(
+        message.contains("inner seal did not publish before cleanup"),
+        "unexpected panic: {message}"
+    );
     Ok(())
 }

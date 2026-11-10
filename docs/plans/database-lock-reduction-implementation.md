@@ -2000,3 +2000,31 @@ This follow-up requires its own final-source PG16/18 matrix and lint validation
 and focused Astra re-review; neither is claimed by the preceding head's passes.
 All prior disclosed unclassified failures, required CI, packaged runtime and
 physical settlement/retirement limits remain open.
+
+### Validated `ea8a399b`; publication-assertion ordering follow-up
+
+Frozen `ea8a399ba2c3ef397af93eb1138aa4ff3a190892` passed both API integration
+builds, relay **10/10**, recorded object HTTP **14/14 each PG16.15/18.6**, sensor /
+native HTTP **6/6 each**, encrypted manifest contract **1/1 each**, both-target
+Clippy `-D warnings`, formatting and whitespace. Four workers, zero ignored.
+Exact commands, run IDs, durations and results are in
+`/tmp/attune-producer-join-validation-state.json`, logs under the matching prefix.
+Independent checks found zero owned clones, PIDs or locks; both containers and
+volumes removed. These successes do not invalidate Astra's source finding below.
+
+Astra confirmed retained waiter ownership and consumed-handle tracking, but found
+one remaining P2 false-positive path: cleanup's `finished?` could propagate a late
+waiter JoinError before inspecting captured publication state. If the original
+HTTP wait timed out or the scenario returned early, even an HTTP failure followed
+by the injected waiter panic could satisfy the outer panic-JoinError test while
+publication remained Pending.
+
+The follow-up checks the captured Ready/published/sealed state after fixture
+cleanup and before propagating either the cleanup join result or scenario result.
+Two actual-route negative controls deliberately revoke delivery admission / release
+sensor workload during gated GET, return before consuming the HTTP handle, and
+panic the waiter after its resulting response. Each control requires the specific
+publication assertion to fail after cleanup; accepting only a JoinError now fails
+that control. No production or authority/timeout-budget change. Final-source
+reruns, focused Astra re-review and required CI remain pending. All earlier
+physical-lifecycle and validation limitations retain their recorded status.
