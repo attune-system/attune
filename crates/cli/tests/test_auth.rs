@@ -77,9 +77,11 @@ async fn device_denial_leaves_existing_credentials_and_profile_url_untouched() {
             "auth",
             "sso-login",
             "--no-browser",
+            "--print-access-token",
         ])
         .assert()
         .failure()
+        .stdout("")
         .stderr(predicate::str::contains("authorization was denied"));
     assert_eq!(
         std::fs::read_to_string(&fixture.config_path).unwrap(),
@@ -110,11 +112,13 @@ async fn device_login_timeout_is_bounded_and_does_not_save_tokens() {
             "auth",
             "sso-login",
             "--no-browser",
+            "--print-access-token",
             "--timeout",
             "1",
         ])
         .assert()
         .failure()
+        .stdout("")
         .stderr(predicate::str::contains("timed out"));
     assert_eq!(
         std::fs::read_to_string(&fixture.config_path).unwrap(),
@@ -541,4 +545,301 @@ async fn test_whoami_yaml_output() {
         .success()
         .stdout(predicate::str::contains("login:"))
         .stdout(predicate::str::contains("testuser"));
+}
+
+// These commands use encrypted profiles and process-local homes. The returned
+// token must come from this login response, never from an existing credential.
+fn token_output_command(fixture: &TestFixture) -> Command {
+    let mut cmd = Command::cargo_bin("attune").unwrap();
+    cmd.env("XDG_CONFIG_HOME", fixture.config_dir_path())
+        .env("HOME", fixture.config_dir_path())
+        .env_remove("ATTUNE_API_TOKEN")
+        .env_remove("ATTUNE_AUTH_TOKEN")
+        .env_remove("ATTUNE_REFRESH_TOKEN")
+        .env_remove("ATTUNE_EXECUTION_TOKEN")
+        .env_remove("ATTUNE_LOGIN")
+        .env_remove("ATTUNE_PASSWORD")
+        .env_remove("ATTUNE_PROFILE")
+        .env_remove("ATTUNE_API_URL")
+        .timeout(std::time::Duration::from_secs(15));
+    cmd
+}
+
+async fn check_login_token_output(sso: bool) {
+    // Cover configured formats as well as explicit global overrides.
+    for (configured, override_format) in [
+        ("table", None),
+        ("json", None),
+        ("yaml", None),
+        ("table", Some("--json")),
+        ("table", Some("--yaml")),
+    ] {
+        let fixture = TestFixture::new().await;
+        std::fs::write(
+            &fixture.config_path,
+            format!(
+                "profile: default\nformat: {configured}\nprofiles:\n  default:\n    api_url: {}\n",
+                fixture.server_url()
+            ),
+        )
+        .unwrap();
+        if sso {
+            mock_device_login(
+                &fixture,
+                "new-exported-access",
+                "never-export-refresh",
+                std::time::Duration::ZERO,
+            )
+            .await;
+        } else {
+            mock_login_success(
+                &fixture.mock_server,
+                "new-exported-access",
+                "never-export-refresh",
+            )
+            .await;
+        }
+        let mut cmd = token_output_command(&fixture);
+        if let Some(flag) = override_format {
+            cmd.arg(flag);
+        }
+        cmd.args(["auth", if sso { "sso-login" } else { "login" }]);
+        if sso {
+            cmd.arg("--no-browser");
+        } else {
+            cmd.args(["--username", "alice", "--password", "test-password"]);
+        }
+        cmd.arg("--print-access-token")
+            .assert()
+            .success()
+            .stdout("new-exported-access\n")
+            .stderr(predicate::str::contains("new-exported-access").not())
+            .stderr(predicate::str::contains("never-export-refresh").not());
+
+        let disk = std::fs::read_to_string(&fixture.config_path).unwrap();
+        assert!(disk.contains("ciphertext:"));
+        assert!(!disk.contains("new-exported-access"));
+        assert!(!disk.contains("never-export-refresh"));
+    }
+}
+
+#[tokio::test]
+async fn password_login_prints_only_new_access_token_with_encrypted_storage() {
+    check_login_token_output(false).await;
+}
+
+#[tokio::test]
+async fn sso_login_prints_only_new_access_token_with_encrypted_storage() {
+    check_login_token_output(true).await;
+}
+
+#[tokio::test]
+async fn print_access_token_saves_selected_profile_without_changing_selection() {
+    for sso in [false, true] {
+        let fixture = TestFixture::new().await;
+        fixture.write_default_config();
+        if sso {
+            mock_device_login(
+                &fixture,
+                "selected-access",
+                "selected-refresh",
+                std::time::Duration::ZERO,
+            )
+            .await;
+        } else {
+            mock_login_success(&fixture.mock_server, "selected-access", "selected-refresh").await;
+        }
+        let mut cmd = token_output_command(&fixture);
+        cmd.args(["auth", if sso { "sso-login" } else { "login" }]);
+        if sso {
+            cmd.arg("--no-browser");
+        } else {
+            cmd.args(["--username", "alice", "--password", "test-password"]);
+        }
+        cmd.args([
+            "--save-profile",
+            "postman",
+            "--url",
+            &fixture.server_url(),
+            "--print-access-token",
+        ])
+        .assert()
+        .success()
+        .stdout("selected-access\n");
+        let config = load_test_config(&fixture);
+        assert_eq!(config.current_profile, "default");
+        assert!(!config.profiles["default"].has_credentials());
+        assert!(config.profiles["postman"].credentials.is_some());
+        assert!(config.profiles["postman"].credential_encryption);
+    }
+}
+
+#[tokio::test]
+async fn password_login_print_access_token_failure_does_not_export_existing_credentials() {
+    let fixture = TestFixture::new().await;
+    fixture.write_authenticated_config("existing-access", "existing-refresh");
+    mock_login_failure(&fixture.mock_server).await;
+    token_output_command(&fixture)
+        .args([
+            "auth",
+            "login",
+            "--username",
+            "alice",
+            "--password",
+            "wrong",
+            "--print-access-token",
+        ])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(predicate::str::contains("existing-access").not())
+        .stderr(predicate::str::contains("existing-refresh").not());
+}
+
+#[tokio::test]
+async fn print_access_token_waits_for_successful_credential_storage() {
+    let fixture = TestFixture::new().await;
+    fixture.write_default_config();
+    let config_path = fixture.config_path.clone();
+    Mock::given(method("POST"))
+        .and(path("/auth/login"))
+        .respond_with(move |_: &wiremock::Request| {
+            // Simulate a concurrent profile deletion after authentication starts.
+            // save() must reject the stale write before anything is disclosed.
+            std::fs::write(&config_path, "profile: default\nprofiles: {}\n").unwrap();
+            ResponseTemplate::new(200).set_body_json(json!({"data": {
+                "access_token": "unsaved-access", "refresh_token": "unsaved-refresh", "expires_in": 3600
+            }}))
+        })
+        .expect(1)
+        .mount(&fixture.mock_server)
+        .await;
+    token_output_command(&fixture)
+        .args([
+            "auth",
+            "login",
+            "--username",
+            "alice",
+            "--password",
+            "test-password",
+            "--print-access-token",
+        ])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(predicate::str::contains("changed in another process"))
+        .stderr(predicate::str::contains("unsaved-access").not())
+        .stderr(predicate::str::contains("unsaved-refresh").not());
+}
+
+#[tokio::test]
+async fn login_without_print_access_token_keeps_all_output_formats_private() {
+    for sso in [false, true] {
+        for format in ["table", "json", "yaml"] {
+            let fixture = TestFixture::new().await;
+            fixture.write_default_config();
+            if sso {
+                mock_device_login(
+                    &fixture,
+                    "hidden-access",
+                    "hidden-refresh",
+                    std::time::Duration::ZERO,
+                )
+                .await;
+            } else {
+                mock_login_success(&fixture.mock_server, "hidden-access", "hidden-refresh").await;
+            }
+            let mut cmd = token_output_command(&fixture);
+            cmd.args([
+                "--output",
+                format,
+                "auth",
+                if sso { "sso-login" } else { "login" },
+            ]);
+            if sso {
+                cmd.arg("--no-browser");
+            } else {
+                cmd.args(["--username", "alice", "--password", "test-password"]);
+            }
+            cmd.assert()
+                .success()
+                .stdout(predicate::str::contains("hidden-access").not())
+                .stdout(predicate::str::contains("hidden-refresh").not())
+                .stderr(predicate::str::contains("hidden-access").not())
+                .stderr(predicate::str::contains("hidden-refresh").not());
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn sso_print_access_token_keeps_browser_launcher_output_off_stdout() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = TestFixture::new().await;
+    fixture.write_default_config();
+    mock_device_login(
+        &fixture,
+        "browser-access",
+        "browser-refresh",
+        std::time::Duration::ZERO,
+    )
+    .await;
+    let launcher_dir = tempfile::tempdir().unwrap();
+    let launcher = launcher_dir.path().join("xdg-open");
+    std::fs::write(&launcher, "#!/bin/sh\necho browser-launcher-message\n").unwrap();
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+    token_output_command(&fixture)
+        .env("PATH", launcher_dir.path())
+        .args(["auth", "sso-login", "--print-access-token"])
+        .assert()
+        .success()
+        .stdout("browser-access\n")
+        .stderr(predicate::str::contains("browser-launcher-message"))
+        .stderr(predicate::str::contains("browser-access").not())
+        .stderr(predicate::str::contains("browser-refresh").not());
+}
+
+#[tokio::test]
+async fn ldap_login_supports_print_access_token() {
+    let fixture = TestFixture::new().await;
+    fixture.write_default_config();
+    Mock::given(method("GET"))
+        .and(path("/auth/settings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+            "local_password_enabled": false, "ldap_enabled": true
+        }})))
+        .mount(&fixture.mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/auth/ldap/login"))
+        .and(body_json(
+            json!({"login": "alice", "password": "test-password"}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+            "access_token": "ldap-access", "refresh_token": "ldap-refresh", "expires_in": 3600
+        }})))
+        .expect(1)
+        .mount(&fixture.mock_server)
+        .await;
+    token_output_command(&fixture)
+        .args([
+            "auth",
+            "login",
+            "--username",
+            "alice",
+            "--password",
+            "test-password",
+            "--print-access-token",
+        ])
+        .assert()
+        .success()
+        .stdout("ldap-access\n")
+        .stderr(predicate::str::contains("ldap-refresh").not());
+    assert_eq!(
+        load_test_config(&fixture).profiles["default"]
+            .auth_method
+            .as_deref(),
+        Some("ldap")
+    );
 }
