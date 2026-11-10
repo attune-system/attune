@@ -1,7 +1,14 @@
 # Single-writer log streaming simplification
 
-Status: proposed; no implementation, migration, or deployment performed.
-Date: 2026-11-09 UTC.
+Status (2026-11-10 UTC): partially implemented by merged
+[PR32](https://github.com/attune-system/attune/pull/32). Object close verification
+now runs outside database transactions with durable selection and fresh final
+authorization. The full single-writer simplification, physical PUT settlement,
+shared-file split, incremental verification and worker crash recovery remain
+proposed. No deployment is certified here.
+Initial plan date: 2026-11-09 UTC. See the
+[follow-up roadmap](runtime-log-follow-up-roadmap.md) for dependency order,
+acceptance gates, CI evidence and rollout prerequisites.
 
 ## Objective
 
@@ -30,7 +37,8 @@ Zero database locking is not a promise: metadata updates take row locks, and
 publication still needs ordering against ownership changes and cleanup. Optimize
 lock scope and eliminate unnecessary locks rather than weakening those contracts.
 
-This is a planning task. Implementation, release, deployment, and changes to
+This document retains the original design goals. Its object close subset is now
+implemented; remaining implementation, release, deployment, and changes to
 retention or security semantics require their own authorized work.
 
 ## Relationship to existing plans
@@ -63,10 +71,14 @@ The incident investigation inspected deployed Attune `0.10.3` and the local
 checkout at `880b1b2a138a335eb549c08452f0d3440de68d41`. These are different
 revisions; reconcile the current implementation branch before coding.
 
-The inspected sealing route locks the parent artifact, version, and stream,
-then reads and hashes stored content before publishing the seal and Ready state
-in the same transaction. Object storage or filesystem latency therefore extends
-the database transaction and its retained locks.
+At that historical revision, the inspected sealing route locked the parent
+artifact, version, and stream,
+then read and hashed stored content before publishing the seal and Ready state
+in the same transaction. This established a long-lock risk. At main
+`820b4192068ccd321167a28dd888276dd7998368`, ObjectSegments instead uses the
+[durable close protocol](object-log-seal-claims.md). Shared-file verification still
+retains its transaction, snapshot and flock. The old description is not a claim
+about today's object route or deployed image revisions.
 
 Database-path stalls affected multiple services simultaneously during the
 incident. That establishes a shared symptom, not that log sealing initiated it.
@@ -369,7 +381,10 @@ small set of metadata transitions. It must identify which explicit locks were
 removed, which remain, and which safety property each remaining lock protects.
 
 The normal worker binding is source-confirmed. Universal single-writer access,
-the minimum durable close state, incremental-proof recovery, and shared-file
-lock elimination are design/validation work, not established guarantees. The
-existing object-seal review's settlement and cleanup counterexamples are release
-blockers until addressed; this plan does not override them by assumption.
+incremental-proof recovery, and shared-file lock elimination remain
+design/validation work, not established guarantees. PR32 supplies durable object
+close selection, without claiming a globally minimal lifecycle. The object-seal
+review's settlement and cleanup counterexamples block claiming the full
+simplification or removing the corresponding guards. PR32's narrower
+fresh-instance close protocol does not claim those guarantees; this plan does
+not expand its rollout contract.

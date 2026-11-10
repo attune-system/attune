@@ -284,6 +284,61 @@ artifacts:
   sensor_log_max_files: 4
 ```
 
+### Worker and native agent shutdown
+
+`worker.shutdown_timeout` is the execution drain budget in seconds (default 90,
+including when the worker block or value is absent/null). The worker and native
+agent share this default. An explicit value takes precedence. Shipped Docker
+configuration explicitly sets worker shutdown to 30 seconds; development workers
+inherit the 90-second default (development's explicit 30-second shutdown is for
+sensors). SIGTERM stops local execution admission and joins the consumer before
+draining existing tasks. Heartbeat and cancellation handling
+remain running until execution and log-capture teardown completes; deregistration
+happens afterwards. A shutdown-owned cordon stops new scheduler placement without
+changing delivery authority; it is cleared only after the worker becomes inactive,
+provided an operator has not replaced it. Existing cordons remain unchanged. A
+crash or failed deregistration can leave this cordon in place; inspect and uncordon
+the worker explicitly before reusing it. Recorded owner/policy/approval,
+revocation, attempt and delivery deadline checks still apply to every final upload
+and seal.
+
+Registration maintenance is fenced by a per-process UUID stored in worker
+metadata. Once another process re-registers the same worker name, the old
+process cannot heartbeat, overwrite capabilities, deregister or change its
+shutdown cordon. This marker does not replace or extend delivery credentials.
+
+Pack-test consumer cancellation also retains ownership of its active handler.
+Shutdown awaits its subprocess/readers, candidate-effect lease cleanup and
+candidate-directory lifetime before closing shared resources. Preparation and
+repository operations can extend this wait; the execution drain budget below
+is not a hard deadline on the whole service stop.
+
+Up to five seconds of that budget are reserved for cancellation cleanup. At the
+end of the preceding drain window, unfinished tasks receive cancellation; at the
+end of the full budget they are aborted and joined. Owned capture tasks join their
+uploaders before deregistration. A forced drain returns a shutdown error and may
+leave delivery incomplete or its remote outcome unknown. It does not manufacture
+a successful seal or recover work after worker loss. Action cancellation still
+interrupts immediately, and action deadlines are independent of service shutdown.
+
+The default log finalization budget is 60 seconds *after process exit*, further
+bounded by the action deadline and delivery authority deadline. To allow that full
+window during shutdown, configure the drain window to cover remaining process
+time plus 60 seconds. A shorter shutdown deliberately cancels outstanding work
+sooner. The 90-second default provides 85 seconds of draining, not a guarantee
+for an action with arbitrary remaining runtime.
+
+Container/pod termination grace must exceed the configured shutdown budget plus
+capture, process and connection teardown time (and any pre-stop hook). The shipped
+Docker worker settings pair an explicit 30-second drain budget with
+a 45-second Compose grace period. Omitting or nulling that override activates the
+90-second default and requires increasing the container grace at the same time. A
+45-second pod grace cannot accommodate the 90-second default. Configure that in
+the deployment/Helm chart; changing source defaults does not change running pods
+or certify their image provenance. The execution drain deadline bounds the wait
+before forced cancellation; slow OS/filesystem or connection teardown can still
+extend total service-stop time. SIGKILL cannot run this cleanup.
+
 ### Worker Configuration (Optional)
 
 ```yaml
@@ -300,6 +355,7 @@ worker:
   max_concurrent_tasks: 10
   heartbeat_interval: 30  # seconds
   task_timeout: 300       # seconds
+  shutdown_timeout: 90    # seconds, includes up to 5 seconds of cancellation cleanup
 
   # Per-execution action stdout/stderr log artifact retention.
   # Policy can be: versions, days, hours, or minutes.

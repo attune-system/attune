@@ -13,7 +13,7 @@ import time
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 from collections import Counter
@@ -169,11 +169,7 @@ class CompletionObserver:
         assert not alive, f"completion observers did not stop: {alive}"
 
 
-def test_worker_lifecycle_profile(client, tmp_path):
-    samples = int(os.getenv("ATTUNE_WORKER_BENCHMARK_SAMPLES", "20"))
-    assert samples >= 20, "latency profiles require at least 20 complete samples"
-    expect_lazy = os.getenv("ATTUNE_WORKER_BENCHMARK_EXPECT_LAZY") == "1"
-    db_url = os.environ["DATABASE_URL"]
+def _upload_workloads(client, tmp_path, acceptance=False):
     scenarios = [("echo", "core.echo", {"message": "worker-lifecycle-benchmark"}, "completed", 1, 0)]
     pack_ref = "worker_lifecycle_benchmark"
     pack = tmp_path / "pack"
@@ -197,7 +193,26 @@ def test_worker_lifecycle_profile(client, tmp_path):
             "entry_point": f"{name}.sh", "parameters": {}, "output_format": output_format,
         }))
         scenarios.append((name, f"{pack_ref}.{name}", {}, status, stdout, stderr))
+    if acceptance:
+        # Deliberate producer pacing is workload, not readiness synchronization.
+        (actions / "slow.sh").write_text(
+            "#!/bin/sh\ncat >/dev/null\ni=0; while [ $i -lt 8 ]; do "
+            "printf 'tick\\n'; sleep 1; i=$((i+1)); done\n")
+        (actions / "slow.yaml").write_text(yaml.safe_dump({
+            "ref": f"{pack_ref}.slow", "label": "Paced stream", "runner_type": "shell",
+            "entry_point": "slow.sh", "parameters": {}, "output_format": "text",
+        }))
     client.upload_pack(str(pack))
+
+    return pack_ref, actions, scenarios
+
+
+def test_worker_lifecycle_profile(client, tmp_path):
+    samples = int(os.getenv("ATTUNE_WORKER_BENCHMARK_SAMPLES", "20"))
+    assert samples >= 20, "latency profiles require at least 20 complete samples"
+    expect_lazy = os.getenv("ATTUNE_WORKER_BENCHMARK_EXPECT_LAZY") == "1"
+    db_url = os.environ["DATABASE_URL"]
+    pack_ref, _, scenarios = _upload_workloads(client, tmp_path)
 
     report = {"source_revision": os.environ["ATTUNE_WORKER_BENCHMARK_REVISION"],
               "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -343,3 +358,142 @@ def test_worker_lifecycle_profile(client, tmp_path):
                         "statement_deltas": deltas, "allocated_stream_rows": sum(counts.values())})
                     print("WORKER_LIFECYCLE_PARTIAL_REPORT=" + json.dumps(report, sort_keys=True), flush=True)
     print("WORKER_LIFECYCLE_REPORT=" + json.dumps(report, sort_keys=True))
+
+
+def _capture_incomplete(result):
+    """A missing/unknown stream marker cannot establish complete capture."""
+    capture = result.get("runtime_log_capture")
+    if result.get("logs_incomplete") is True:
+        return True
+    if not isinstance(capture, dict):
+        return None
+    states = [capture.get(stream) for stream in ("stdout", "stderr")]
+    if "incomplete" in states:
+        return True
+    if all(state in ("captured", "empty") for state in states):
+        return False
+    return None
+
+
+def _capture_summary(records, submitted):
+    """Unknown/unobserved capture is not successful capture or a zero rate."""
+    incomplete = sum(record["logs_incomplete"] is True for record in records)
+    unknown = submitted - len(records) + sum(
+        record["logs_incomplete"] is None for record in records)
+    return {"submitted_executions": submitted, "observed_terminal_executions": len(records),
+            "incomplete_executions": incomplete, "unknown_executions": unknown,
+            "incomplete_rate": incomplete / submitted if submitted and not unknown else None,
+            "denominator": "all submitted executions, including expected action failures and silence"}
+
+
+@pytest.mark.timeout(300)
+def test_worker_log_acceptance(client, tmp_path):
+    """One paced producer plus 20 short executions; no latency threshold."""
+    assert os.environ.get("ATTUNE_E2E_RUN_ID"), "use the owned E2E runner"
+    assert urlparse(os.environ["DATABASE_URL"]).hostname == "postgres", "requires runner-local PostgreSQL"
+    assert urlparse(client.base_url).hostname == "api", "requires runner-local API"
+    pack_ref, _, scenarios = _upload_workloads(client, tmp_path, acceptance=True)
+    scenarios = [case for case in scenarios if case[0] != "echo"]
+    report = {
+        "source_revision": os.environ["ATTUNE_WORKER_BENCHMARK_REVISION"],
+        "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "backend": os.environ["ATTUNE_WORKER_BENCHMARK_TRANSPORT"],
+        "configured_finalization_timeout_ms": int(os.environ["ATTUNE_WORKER_BENCHMARK_LOG_FINALIZATION_MS"]),
+        "effective_timeout_note": "min(configured finalization budget, remaining action deadline); cancellation can shorten it",
+        "scope": "owned E2E stack, 1 paced producer and 4 concurrent submissions per short scenario; no warmup or revision comparison",
+        "metrics": {name: {"value": None, "availability": reason} for name, reason in {
+            "finalization_times_ms": "structured worker event 'Runtime log finalization finished'; not exported to this test",
+            "worker_slot_occupancy_ms": "no slot acquisition/release observer",
+            "pool_wait_ms": "SQLx traces only; no aggregate observer",
+            "lock_wait_ms": "PostgreSQL logs waits above 50ms only; absence is not zero",
+        }.items()},
+        "records": [], "submitted_execution_ids": [], "acceptance_passed": False,
+    }
+    submitted = {}
+    errors = []
+    base = client.base_url + "/api/v1"
+
+    def submit(case):
+        name, reference, parameters, status, stdout, stderr = case
+        with requests.Session() as session:
+            session.headers.update(client.session.headers)
+            begin = time.monotonic()
+            response = session.post(base + "/executions/execute", json={
+                "action_ref": reference, "parameters": parameters}, timeout=30)
+            response.raise_for_status()
+            return response.json()["data"]["id"], begin, case
+
+    with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as observer, \
+            psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as listener:
+        listener.execute("LISTEN execution_status_changed")
+        try:
+            with CompletionObserver(listener) as completion:
+                slow = ("slow", pack_ref + ".slow", {}, "completed", 1, 0)
+                execution, begin, _ = submit(slow)
+                submitted[execution] = (begin, slow)
+                # Readiness is positive stream allocation while this producer runs.
+                deadline = time.monotonic() + 90
+                while not observer.execute(
+                    "SELECT EXISTS(SELECT 1 FROM execution e JOIN artifact_version av ON av.execution=e.id "
+                    "JOIN log_stream s ON s.artifact_version=av.id WHERE e.id=%s AND e.status='running')",
+                    (execution,)).fetchone()[0]:
+                    assert time.monotonic() < deadline, "paced producer never became observable"
+                    time.sleep(0.05)
+                report["slow_stream_observed_before_short_submissions"] = True
+                for case in scenarios:
+                    # Collect every accepted ID even if another submission fails.
+                    with ThreadPoolExecutor(max_workers=4) as pool:
+                        futures = [pool.submit(submit, case) for _ in range(4)]
+                        for future in futures:
+                            try:
+                                identity, started, workload = future.result()
+                                submitted[identity] = (started, workload)
+                            except Exception as error:
+                                errors.append(type(error).__name__)
+                for identity, (started, case) in submitted.items():
+                    name, _, _, status, stdout, stderr = case
+                    timing = completion.wait({identity: started}, status, True)[identity]
+                    persisted, result, worker, action_timeout = observer.execute(
+                        "SELECT status::text,result,worker,timeout_seconds FROM execution WHERE id=%s",
+                        (identity,)).fetchone()
+                    result = result or {}
+                    streams = observer.execute(
+                        "SELECT av.id,av.artifact,av.meta->>'stream',s.backend::text,s.sealed,av.body_state::text "
+                        "FROM artifact_version av JOIN log_stream s ON s.artifact_version=av.id "
+                        "WHERE av.execution=%s ORDER BY av.id", (identity,)).fetchall()
+                    version_count = observer.execute(
+                        "SELECT count(*) FROM artifact_version WHERE execution=%s", (identity,)).fetchone()[0]
+                    capture = result.get("runtime_log_capture")
+                    expected_capture = {"stdout": "captured" if stdout else "empty",
+                                        "stderr": "captured" if stderr else "empty"}
+                    # Do not print result bodies, stdout, stderr, or error text.
+                    record = {"execution_id": identity, "scenario": name, **timing,
+                              "action_status": persisted, "expected_action_status": status,
+                              "exit_code": result.get("exit_code"),
+                              "action_timeout_seconds": action_timeout, "worker_id": worker,
+                              "logs_incomplete": _capture_incomplete(result),
+                              "capture_matches": capture == expected_capture, "artifact_version_count": version_count,
+                              "structured_result_preserved": result.get("data") == {"answer": 42} if name == "json_stdout" else None,
+                              "streams": [dict(zip(("version_id", "artifact_id", "stream", "backend", "sealed", "body_state"), row)) for row in streams]}
+                    report["records"].append(record)
+                    expected_backend = "shared_file" if report["backend"] == "volume" else "object_segments"
+                    if (persisted != status or result.get("exit_code") != (7 if status == "failed" else 0)
+                            or capture != expected_capture or version_count != stdout + stderr
+                            or record["logs_incomplete"] is not False
+                            or Counter(row[2] for row in streams) != Counter({key: 1 for key, count in (("stdout", stdout), ("stderr", stderr)) if count})
+                            or any(row[3] != expected_backend or not row[4] or row[5] != "ready" for row in streams)
+                            or record["structured_result_preserved"] is False):
+                        errors.append(f"execution {identity}: action/capture/stream contract")
+                for name in ("both", "stderr_failure", "json_stdout"):
+                    for stream in ("stdout", "stderr"):
+                        parents = [item["artifact_id"] for record in report["records"] if record["scenario"] == name
+                                   for item in record["streams"] if item["stream"] == stream]
+                        if parents and (len(parents) != 4 or len(set(parents)) != 1):
+                            errors.append(f"{name}/{stream}: expected shared parent artifact")
+                report["acceptance_passed"] = not errors and len(report["records"]) == 21
+        finally:
+            report["submitted_execution_ids"] = list(submitted)
+            report["capture_summary"] = _capture_summary(report["records"], len(submitted))
+            report["contract_errors"] = errors
+            print("WORKER_LOG_ACCEPTANCE_REPORT=" + json.dumps(report, sort_keys=True), flush=True)
+    assert report["acceptance_passed"], "runtime-log acceptance failed; see metadata-only report"

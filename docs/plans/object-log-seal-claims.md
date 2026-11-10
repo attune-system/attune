@@ -1,6 +1,12 @@
 # Object-log durable close protocol
 
-Status: implemented and reviewed for fresh-instance rollout; final record-head CI pending.
+Status (2026-11-10 UTC): integrated through merged
+[PR32](https://github.com/attune-system/attune/pull/32), with all 16 reported
+head checks successful, including Tests, Clippy and full-stack smoke. Supported
+rollout remains **fresh instance**; merge/CI success does not establish deployed
+source provenance or an in-place upgrade. See the
+[follow-up roadmap](runtime-log-follow-up-roadmap.md) for exact CI heads, rollout
+checklist, current read-only deployment evidence and remaining protocol gates.
 
 The production `ObjectSegments` seal route now uses durable prepare, storage-only
 verification, and a freshly authorized final transaction. Shared-file seal keeps
@@ -81,7 +87,16 @@ protection. Full settlement, forgotten staging, post-retention recreation and
 filesystem path retirement remain separate work. Shared-file/flock and
 PhysicalCleanup/native filesystem fences remain in place.
 
-Validation and unresolved cases are recorded in the central implementation record
+The following paragraphs preserve pre-merge validation checkpoints. Their pending
+review/CI statements are historical: PR32's final head checks subsequently passed.
+The later [central implementation record](database-lock-reduction-implementation.md#root-ack-harness-corrections-and-ci-contract-audit-checkpoint-validation-pending)
+records ACK harness corrections and later packaged validation; the earlier three
+P2 findings below are not current open findings. Unclassified timing failures
+remain disclosed historical evidence, without a claimed root cause or universal
+timing guarantee. Deferred physical settlement and in-place-transition work
+remain open regardless of CI success.
+
+Validation and unresolved cases were recorded in the central implementation record
 and test assumptions. Prior verifier/source test results do not certify this route.
 Real successful COMMIT with lost acknowledgement now has actual recorded
 worker-delivery HTTP coverage at both prepare and final publication on PG16/18,

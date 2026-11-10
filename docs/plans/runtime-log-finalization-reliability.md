@@ -1,12 +1,18 @@
 # Runtime log finalization reliability plan
 
-Status: phases 1 and 2 implemented on `fix/runtime-log-finalization`.
-Current validation, CI, review, and merge readiness are tracked in [PR #31](https://github.com/attune-system/attune/pull/31).
-Date: 2026-11-08.
+Status (2026-11-10 UTC): phases 1 and 2 integrated through merged
+[PR #31](https://github.com/attune-system/attune/pull/31) and main's PR32 integration.
+Object close verification outside transactions is also integrated through
+[PR #32](https://github.com/attune-system/attune/pull/32), for the fresh-instance
+ObjectSegments scope. Worker crash recovery and physical PUT settlement remain
+incomplete. See the [follow-up roadmap](runtime-log-follow-up-roadmap.md) for
+current CI evidence, deployment observations, dependencies and rollout gates.
+Initial plan date: 2026-11-08; dated evidence below is preserved.
 
 PR scope: phases 1 and 2, including their applicable validation. The user
-confirmed durable recovery belongs in a follow-up PR. Phase 4 remains gated by
-measurement and the separate seal-claim protocol.
+confirmed durable recovery belongs in a follow-up PR. PR32 subsequently delivered
+the object verification split using durable close selection. Measurement, physical
+PUT settlement and the shared-file split remain separate work.
 
 Make stdout and stderr delivery tolerate transient storage and API delays without
 leaving completed executions with unreadable logs. First align finalization
@@ -105,9 +111,16 @@ The CLI already renders structured API error bodies and needs no fallback reader
 The 60-second ceiling accommodates a single default segment retry window of up
 to 51.5 seconds with headroom. It is a bounded starting policy, not a measured
 optimal value or a guarantee that every upload and seal attempt fits. Durable
-recovery and moving verification outside transactions remain follow-up work.
+recovery remained follow-up work at the PR31 checkpoint. PR32 subsequently moved
+object verification outside transactions; shared-file verification still retains
+its existing transaction and flock.
 
 ### Validation of the integrated implementation
+
+The following is historical PR31 checkpoint evidence, including its then-pending
+CI/security statements. On 2026-11-10 GitHub reported PR31 merged with all 16
+reported checks successful; the roadmap records exact heads and CI links. Those
+results do not certify the current deployed images or deferred recovery work.
 
 This is checkpoint evidence; the PR carries the final validation handoff and
 readiness status. Initial integrated Rust checks target
@@ -252,6 +265,12 @@ deadline and retry fix. Specify and review the protocol before implementation.
 
 ## Phase 4 Reduce seal contention when measurements justify it
 
+Current disposition (2026-11-10): **partial**. PR32 implements durable object
+prepare, storage-only verification and freshly authorized atomic publication.
+It does not settle outstanding physical PUTs, remove shared-file locks, or prove
+deployment performance. The following design requirements remain the basis for
+those follow-ups; do not treat this whole phase as unimplemented or complete.
+
 Profile API pool waits, graph admission, source/target locks, object reads,
 hashing, frame verification, and final publication separately. Reuse the
 [worker lifecycle performance work](worker-execution-lifecycle-performance.md)
@@ -302,8 +321,10 @@ explicit rather than assuming the object protocol applies unchanged.
 2. Delivery state, reader/UI errors, audit semantics, and contract validation.
 3. Reviewed durable recovery design followed by schema, repository, worker,
    supervisor, retention, and crash-test changes as one coherent protocol.
-4. Measurement-driven verification split, gated by seal claims and upload
-   settlement correctness.
+4. PR32's object verification split is integrated for fresh instances with its
+   documented physical-settlement exclusions. Complete settlement/cleanup and
+   shared-file protocols before removing their remaining fences; measure each
+   subsequent optimization against equal workloads.
 
 Implement and validate on disposable infrastructure first. Production configuration
 changes and application rollout require separate deployment authorization.

@@ -2493,3 +2493,6 @@ async fn encrypted_terminal_logs_require_a_complete_authenticated_manifest_on_bo
 mod object_seal_ack_loss;
 #[path = "object_seal_delivery_boundary.rs"]
 mod object_seal_delivery_boundary;
+
+#[path = "worker_shutdown_authority.rs"]
+mod worker_shutdown_authority;

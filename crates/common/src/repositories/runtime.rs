@@ -740,6 +740,83 @@ impl WorkerRepository {
         Ok(query.build_query_as().fetch_all(executor).await?)
     }
 
+    /// Atomically replace registration ownership while preserving operator metadata
+    /// and cordons. This marker fences worker-row maintenance, not delivery grants.
+    pub async fn register_incarnation(
+        pool: &sqlx::PgPool,
+        input: CreateWorkerInput,
+        role: crate::models::WorkerRole,
+        incarnation: uuid::Uuid,
+    ) -> Result<Worker> {
+        Ok(sqlx::query_as::<_, Worker>(&format!(
+            "INSERT INTO worker (name, worker_type, worker_role, runtime, host, port, status, capabilities, meta, last_heartbeat) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, jsonb_build_object('registration_incarnation', $8::text), NOW()) \
+             ON CONFLICT (name) DO UPDATE SET status = 'active', last_heartbeat = NOW(), \
+             host = EXCLUDED.host, port = EXCLUDED.port, capabilities = EXCLUDED.capabilities, \
+             meta = COALESCE(worker.meta, '{{}}'::jsonb) || EXCLUDED.meta, updated = NOW() \
+             RETURNING {WORKER_SELECT_COLUMNS}"
+        ))
+        .bind(input.name).bind(input.worker_type).bind(role).bind(input.runtime)
+        .bind(input.host).bind(input.port).bind(input.capabilities).bind(incarnation.to_string())
+        .fetch_one(pool).await?)
+    }
+
+    pub async fn deregister_incarnation(
+        pool: &sqlx::PgPool,
+        id: Id,
+        incarnation: uuid::Uuid,
+    ) -> Result<()> {
+        sqlx::query("UPDATE worker SET status = 'inactive', updated = NOW() WHERE id = $1 AND meta->>'registration_incarnation' = $2")
+            .bind(id).bind(incarnation.to_string()).execute(pool).await?;
+        Ok(())
+    }
+
+    pub async fn heartbeat_incarnation(
+        pool: &sqlx::PgPool,
+        id: Id,
+        incarnation: uuid::Uuid,
+    ) -> Result<()> {
+        sqlx::query("UPDATE worker SET status = 'active', last_heartbeat = NOW(), updated = NOW() WHERE id = $1 AND meta->>'registration_incarnation' = $2")
+            .bind(id).bind(incarnation.to_string()).execute(pool).await?;
+        Ok(())
+    }
+
+    pub async fn update_incarnation_capabilities(
+        pool: &sqlx::PgPool,
+        id: Id,
+        incarnation: uuid::Uuid,
+        capabilities: serde_json::Value,
+    ) -> Result<()> {
+        sqlx::query("UPDATE worker SET capabilities = $3, updated = NOW() WHERE id = $1 AND meta->>'registration_incarnation' = $2")
+            .bind(id).bind(incarnation.to_string()).bind(capabilities).execute(pool).await?;
+        Ok(())
+    }
+
+    /// Stop scheduler placement during graceful shutdown without changing
+    /// runtime authority. Existing operator cordons remain untouched.
+    pub async fn cordon_for_shutdown(
+        pool: &sqlx::PgPool,
+        id: Id,
+        incarnation: uuid::Uuid,
+        reason: &str,
+    ) -> Result<bool> {
+        Ok(sqlx::query("UPDATE worker SET cordoned = true, cordon_reason = $2, cordoned_by = NULL, cordoned_at = NOW(), updated = NOW() WHERE id = $1 AND NOT cordoned AND meta->>'registration_incarnation' = $3")
+            .bind(id).bind(reason).bind(incarnation.to_string()).execute(pool).await?.rows_affected() == 1)
+    }
+
+    /// Only undo this shutdown's cordon after deregistration. Never remove an
+    /// operator's replacement cordon, or make an active worker schedulable.
+    pub async fn clear_shutdown_cordon(
+        pool: &sqlx::PgPool,
+        id: Id,
+        incarnation: uuid::Uuid,
+        reason: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE worker SET cordoned = false, cordon_reason = NULL, cordoned_by = NULL, cordoned_at = NULL, updated = NOW() WHERE id = $1 AND status = 'inactive' AND cordoned AND cordon_reason = $2 AND cordoned_by IS NULL AND meta->>'registration_incarnation' = $3")
+            .bind(id).bind(reason).bind(incarnation.to_string()).execute(pool).await?;
+        Ok(())
+    }
+
     pub async fn set_cordoned(
         pool: &sqlx::PgPool,
         id: Id,

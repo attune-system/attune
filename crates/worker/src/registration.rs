@@ -5,12 +5,12 @@
 
 use attune_common::config::Config;
 use attune_common::error::{Error, Result};
-use attune_common::models::{Worker, WorkerRole, WorkerStatus, WorkerType};
+use attune_common::models::{WorkerRole, WorkerType};
+use attune_common::repositories::runtime::{CreateWorkerInput, WorkerRepository};
 use attune_common::runtime_detection::{normalize_runtime_name, RuntimeDetector};
 use attune_common::scheduling::{
     validate_label_map, validate_taints, WORKER_LABELS_CAPABILITY_KEY, WORKER_TAINTS_CAPABILITY_KEY,
 };
-use chrono::Utc;
 use serde_json::json;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -28,6 +28,7 @@ pub struct WorkerRegistration {
     child_environment: attune_common::child_process_environment::ChildProcessEnvironment,
     pool: PgPool,
     worker_id: Option<i64>,
+    incarnation: uuid::Uuid,
     worker_name: String,
     worker_type: WorkerType,
     worker_role: WorkerRole,
@@ -187,6 +188,7 @@ impl WorkerRegistration {
             child_environment: Default::default(),
             pool,
             worker_id: None,
+            incarnation: uuid::Uuid::new_v4(),
             worker_name,
             worker_type,
             worker_role,
@@ -317,68 +319,26 @@ impl WorkerRegistration {
     pub async fn register(&mut self) -> Result<i64> {
         info!("Registering worker: {}", self.worker_name);
 
-        // Check if worker with this name already exists
-        let existing = sqlx::query_as::<_, Worker>(
-            "SELECT * FROM worker WHERE name = $1 ORDER BY created DESC LIMIT 1",
+        // Generate only at registration; heartbeat/capability refreshes retain it.
+        let incarnation = uuid::Uuid::new_v4();
+        let worker = WorkerRepository::register_incarnation(
+            &self.pool,
+            CreateWorkerInput {
+                name: self.worker_name.clone(),
+                worker_type: self.worker_type,
+                runtime: self.runtime_id,
+                host: self.host.clone(),
+                port: self.port,
+                status: None,
+                capabilities: Some(serde_json::to_value(&self.capabilities)?),
+                meta: None,
+            },
+            self.worker_role,
+            incarnation,
         )
-        .bind(&self.worker_name)
-        .fetch_optional(&self.pool)
         .await?;
-
-        let worker_id = if let Some(existing_worker) = existing {
-            info!(
-                "Worker '{}' already exists (ID: {}), updating status",
-                self.worker_name, existing_worker.id
-            );
-
-            // Update existing worker to active status with new heartbeat
-            sqlx::query(
-                r#"
-                UPDATE worker
-                SET status = $1,
-                    last_heartbeat = $2,
-                    host = $3,
-                    port = $4,
-                    capabilities = $5,
-                    updated = $2
-                WHERE id = $6
-                "#,
-            )
-            .bind(WorkerStatus::Active)
-            .bind(Utc::now())
-            .bind(&self.host)
-            .bind(self.port)
-            .bind(serde_json::to_value(&self.capabilities)?)
-            .bind(existing_worker.id)
-            .execute(&self.pool)
-            .await?;
-
-            existing_worker.id
-        } else {
-            info!("Creating new worker registration: {}", self.worker_name);
-
-            // Insert new worker
-            let worker = sqlx::query_as::<_, Worker>(
-                r#"
-                INSERT INTO worker (name, worker_type, worker_role, runtime, host, port, status, capabilities, last_heartbeat)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                RETURNING *
-                "#,
-            )
-            .bind(&self.worker_name)
-            .bind(self.worker_type)
-            .bind(self.worker_role)
-            .bind(self.runtime_id)
-            .bind(&self.host)
-            .bind(self.port)
-            .bind(WorkerStatus::Active)
-            .bind(serde_json::to_value(&self.capabilities)?)
-            .bind(Utc::now())
-            .fetch_one(&self.pool)
-            .await?;
-
-            worker.id
-        };
+        self.incarnation = incarnation;
+        let worker_id = worker.id;
 
         self.worker_id = Some(worker_id);
         info!("Worker registered successfully with ID: {}", worker_id);
@@ -391,19 +351,8 @@ impl WorkerRegistration {
         if let Some(worker_id) = self.worker_id {
             info!("Deregistering worker ID: {}", worker_id);
 
-            sqlx::query(
-                r#"
-                UPDATE worker
-                SET status = $1,
-                    updated = $2
-                WHERE id = $3
-                "#,
-            )
-            .bind(WorkerStatus::Inactive)
-            .bind(Utc::now())
-            .bind(worker_id)
-            .execute(&self.pool)
-            .await?;
+            WorkerRepository::deregister_incarnation(&self.pool, worker_id, self.incarnation)
+                .await?;
 
             info!("Worker deregistered successfully");
         } else {
@@ -416,24 +365,27 @@ impl WorkerRegistration {
     /// Update worker heartbeat
     pub async fn update_heartbeat(&self) -> Result<()> {
         if let Some(worker_id) = self.worker_id {
-            sqlx::query(
-                r#"
-                UPDATE worker
-                SET last_heartbeat = $1,
-                    status = $2,
-                    updated = $1
-                WHERE id = $3
-                "#,
-            )
-            .bind(Utc::now())
-            .bind(WorkerStatus::Active)
-            .bind(worker_id)
-            .execute(&self.pool)
-            .await?;
+            WorkerRepository::heartbeat_incarnation(&self.pool, worker_id, self.incarnation)
+                .await?;
         } else {
             return Err(Error::invalid_state("Worker not registered"));
         }
 
+        Ok(())
+    }
+
+    pub async fn cordon_for_shutdown(&self, reason: &str) -> Result<()> {
+        if let Some(id) = self.worker_id {
+            WorkerRepository::cordon_for_shutdown(&self.pool, id, self.incarnation, reason).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn clear_shutdown_cordon(&self, reason: &str) -> Result<()> {
+        if let Some(id) = self.worker_id {
+            WorkerRepository::clear_shutdown_cordon(&self.pool, id, self.incarnation, reason)
+                .await?;
+        }
         Ok(())
     }
 
@@ -455,18 +407,12 @@ impl WorkerRegistration {
     /// Update worker capabilities in the database
     pub async fn update_capabilities(&self) -> Result<()> {
         if let Some(worker_id) = self.worker_id {
-            sqlx::query(
-                r#"
-                UPDATE worker
-                SET capabilities = $1,
-                    updated = $2
-                WHERE id = $3
-                "#,
+            WorkerRepository::update_incarnation_capabilities(
+                &self.pool,
+                worker_id,
+                self.incarnation,
+                serde_json::to_value(&self.capabilities)?,
             )
-            .bind(serde_json::to_value(&self.capabilities)?)
-            .bind(Utc::now())
-            .bind(worker_id)
-            .execute(&self.pool)
             .await?;
 
             info!("Worker capabilities updated");
@@ -537,6 +483,55 @@ mod tests {
             .expect("Failed to create isolated worker test database")
             .with_cleanup_on_drop();
         (config, database.pool().clone(), database)
+    }
+
+    #[tokio::test]
+    async fn registration_incarnation_rejects_stale_writes_without_cordon() {
+        use attune_common::repositories::runtime::UpdateWorkerInput;
+        use attune_common::repositories::{FindById, Update};
+        let (config, pool, database) = isolated_test_context().await;
+        let mut a = WorkerRegistration::new(pool.clone(), &config);
+        let id = a.register().await.unwrap();
+        WorkerRepository::update(
+            &pool,
+            id,
+            UpdateWorkerInput {
+                meta: Some(json!({"operator_note": "preserve"})),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut b = WorkerRegistration::new(pool.clone(), &config);
+        assert_eq!(b.register().await.unwrap(), id);
+        b.deregister().await.unwrap();
+        let before = WorkerRepository::get_by_id(&pool, id).await.unwrap();
+        assert_eq!(before.meta.as_ref().unwrap()["operator_note"], "preserve");
+        a.cordon_for_shutdown("stale A").await.unwrap();
+        a.update_heartbeat().await.unwrap();
+        a.add_capability(
+            "registration_incarnation".into(),
+            json!(a.incarnation.to_string()),
+        );
+        a.update_capabilities().await.unwrap();
+        let after = WorkerRepository::get_by_id(&pool, id).await.unwrap();
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.last_heartbeat, before.last_heartbeat);
+        assert_eq!(after.capabilities, before.capabilities);
+        assert_eq!(after.meta, before.meta);
+        assert!(!after.cordoned);
+        // Even a matching shutdown reason and inactive status cannot let A
+        // remove a cordon now owned by B's registration.
+        b.cordon_for_shutdown("same reason").await.unwrap();
+        a.clear_shutdown_cordon("same reason").await.unwrap();
+        assert!(
+            WorkerRepository::get_by_id(&pool, id)
+                .await
+                .unwrap()
+                .cordoned
+        );
+        b.clear_shutdown_cordon("same reason").await.unwrap();
+        database.cleanup().await.unwrap();
     }
 
     #[tokio::test]
