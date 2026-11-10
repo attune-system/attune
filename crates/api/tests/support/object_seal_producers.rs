@@ -234,14 +234,29 @@ async fn object_seal_native_workflow_after_terminal_completion() -> helpers::Res
         let action =
             helpers::create_test_action(&ctx.pool, pack.id, &pack.r#ref, "native_seal.workflow")
                 .await?;
+        let leaf = helpers::create_test_action(&ctx.pool, pack.id, &pack.r#ref, "native_seal.leaf")
+            .await?;
         let def =
             helpers::create_test_workflow(&ctx.pool, pack.id, &pack.r#ref, &action.r#ref).await?;
+        let graph = attune_common::workflow::parse_workflow_yaml(&format!(
+            "version: '1.0.0'\ntasks:\n  - name: finish\n    action: {}\n",
+            leaf.r#ref
+        ))?;
+        attune_common::repositories::workflow::WorkflowDefinitionRepository::update(
+            &ctx.pool,
+            def.id,
+            attune_common::repositories::workflow::UpdateWorkflowDefinitionInput {
+                definition: Some(serde_json::to_value(graph)?),
+                ..Default::default()
+            },
+        )
+        .await?;
         ActionRepository::link_workflow_def(&ctx.pool, action.id, def.id).await?;
         helpers::activate_test_pack_release_with_projections(
             &ctx.pool,
             &pack,
             &PackProjectionIds {
-                actions: vec![action.id],
+                actions: vec![action.id, leaf.id],
                 workflows: vec![def.id],
                 ..Default::default()
             },
