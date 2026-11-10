@@ -1,22 +1,25 @@
-> Current object-close checkpoint: the production object seal route now selects
-> durable input, awaits prepare commit, verifies outside database ownership, and
-> freshly authorizes atomic publication. Migration 006 provides deferred shape
-> constraints; bounded object housekeeping abandons expired matching revisions.
-> This is work in progress. Earlier statements below describing publication as
-> disabled or the route as unsplit are historical checkpoint evidence, superseded
-> by [the current protocol](object-log-seal-claims.md). New acceptance tests and
-> source-specific validation must pass before lock-removal/certification claims.
-> No full PUT settlement or filesystem fence removal is claimed.
+> Current implemented scope: bounded maintenance JIT/statistics/query work,
+> durable ID-frontier retention discovery, and the production object-log
+> prepare/verify/finalize split with fresh source authorization and recovery.
+> Verification owns no database connection or transaction. Shared-file and
+> PhysicalCleanup fences remain; full PUT settlement and permanent filesystem
+> path retirement are deferred protocols, not claimed lock removals.
+> Functional source `d8a037f8` passed all 16 CI checks and the packaged
+> build/runtime proof, in addition to the PG16/18 suites recorded below.
+> The final record commit still requires its own CI and cumulative review.
+> Dated design/checkpoint sections below retain historical proposals and failed
+> attempts; current behavior is specified in [the protocol](object-log-seal-claims.md)
+> and the final validation record at the end of this file.
 
 # Database lock reduction: code-level implementation map
 
-Status: milestones 1–3 implemented for review; later slices remain proposals.
-Date: 2026-11-09 UTC.
+Status: implemented scope validated; final cumulative review and record-head CI pending.
+Initial analysis: 2026-11-09 UTC; final validation records: 2026-11-10 UTC.
 
 This expands the [lock audit](database-lock-scope-audit.md), with a separate
 [test assumption audit](database-lock-test-assumptions.md). It identifies concrete
-change boundaries; it does not claim that the new concurrency protocols have
-already been implemented or proven.
+change boundaries. The original design sections are historical; the current scope
+and evidence are summarized above and in the final validation record.
 
 ## Baseline and integration
 
@@ -2156,3 +2159,131 @@ budgets are unchanged. This is not yet a measured successful packaged build.
 The retry will run after the matched maintenance comparison, preserving that
 comparison's no-concurrent-compilation condition. Baseline/current proof checkouts
 remain frozen independently; main fix worktree runtime code is unchanged.
+
+
+## Final validation record: functional source `d8a037f8`
+
+All **16 GitHub checks passed** on
+`d8a037f813d4a779aeb20b21efc8ffdb23a42c11`, including the workspace/all-features
+Tests job, Clippy, formatting, full-stack smoke, security/audit, web, golden and
+credential platforms, and Windows CLI. CI run42773479162 and the associated
+platform runs are the authoritative CI evidence. The full-stack smoke and host
+Tests job did not by themselves certify the Docker Rust test image; the separate
+packaged proof below closes that gap for its selected API cases.
+
+### Completed matched comparison and retained failures
+
+Compared old-main `8af23fc4` against functional candidate `49216567` (application
+runtime unchanged in later fixture/build/docs commits), with separately migrated
+fresh servers, pinned image digests and recorded settings. Built executables
+before measurement; no owned compilation overlapped DB measurements. Three
+alternating paired rounds per exact case/pin/major/condition yielded **96/96 exact
+passes** across PG16.15/18.6. Quiet servers used2CPUs/2GB; CPU-contended cells used
+1CPU and a bounded generated-series CPU query. These declared conditions are not
+identical to the unknown historical load.
+
+Collector groups passed27/27 on baseline and30/30 on candidate on both majors.
+The16-case storage group ran once per pin/major, with two failures retained:
+
+- BaselinePG16 shared-cleanup claim: DeadlineDeferred/57014 rather than Progress,
+  rollback acknowledged. This is a different case from the historical failures.
+- CandidatePG18 parent-cleanup retry: DeadlineDeferred/57014 in
+  `guard_object_log_close_parent`, valueNone, rollback acknowledged. This is not
+  the historical accidental CommitUnknown and exposes no physical authority.
+
+Other two storage-group cells passed16/16. Do not call the entire comparison
+passed just because its recording wrapper exited0. These are not equivalent-case
+baseline reproductions. The original collector-delay, observed-lock,
+accidental-CommitUnknown and pending-claim failures remain unclassified.
+
+Exact commands, timings, run IDs, pins, settings and digests:
+`/tmp/attune-maintenance-baseline-proof-state.json`; executable hashes and scoped
+summary: `/tmp/attune-maintenance-baseline-proof-summary.json`. Four owned servers
+were independently checked for zero clones/PIDs/locks and removed with volumes.
+Pinned proof sources and copied executables are retained for inspection; they
+are not changes to the original dirty checkout.
+
+Astra's read-only attribution review found conservative acknowledged deferral,
+not a demonstrated must-fix production regression. The parent guard adds reads
+but no explicit row/advisory lock; existing child/log indexes are suitable but
+actual plans were not established by that comparison. Cancellation at trigger
+line2 does not prove that block consumed the budget. The candidate failure
+coincided with clone I/O and a1.671s checkpoint, not proof of a blocker on its
+backend. Removing the guard or increasing budgets was not justified.
+
+### Bounded diagnostic of fixture lifecycle interference
+
+A standalone harness reused the pinned candidate repository library and exact
+16 test bodies, with a fixture wrapper selecting ordinary clone/drop versus
+precreated clones/pool closure with database teardown deferred. Four workers,
+unchanged repository budgets and explicit assertions, three alternating rounds.
+Prepared mode passed16/16 in all three runs. Ordinary mode passed once and failed
+twice with DeadlineDeferred before the intended Failed/CommitUnknown fault paths.
+The specific original parent retry failure was not reproduced by these runs.
+
+This supports fixture-lifecycle/shared-resource contribution in the instrumented
+setup, not complete attribution of historical failures or a measurement of the
+parent trigger's compute cost. It is **not canonical acceptance-test evidence**:
+the wrapper omitted helper tracing initialization in both modes; direct rustc
+flags did not explicitly set test-body debug-assertions/overflow defaults; the
+pinned repository rlib was unchanged and unconditional test assertions remained.
+Nested auto_explain/analyze/timing, statement logging, a wait observer and recent
+filesystem expansion can perturb measurements. CPU/I/O pressure and backend wait
+samples were retained. All these confounds apply to interpretation, not erased
+by passing prepared runs.
+
+Source/linked-library hashes and compile commands:
+`/tmp/attune-clone-diagnostic-provenance.json`; completed results, server trace,
+wait/resource captures and summary under `/tmp/attune-clone-recovered-` (including
+`state.json`, `server.log`, `summary.json`). Initial compile selection errors and
+failed disk-full container starts remain separate preserved attempts. The final
+owned server had zero clones/PIDs/locks and was removed. No production source,
+schema, timeout, assertion or guard was changed based on this diagnostic.
+
+### Approved infrastructure recovery and successful packaged proof
+
+After the two preserved full-workspace image builds exhausted Desktop storage,
+targeted cleanup failed with gcfailed; a diagnostic could not create a snapshot.
+User explicitly approved increasing Desktop256GiB to384GiB and restarting it.
+Changed only DiskSizeMiB from262144 to393216 with a settings backup. The engine
+was started via its user service manager and completed filesystem checks/resize.
+Container verification reported405238906880 filesystem bytes and157929529344
+available bytes; engine29.9.2. No application volumes were reset or broadly
+pruned. Recovery record: `/tmp/attune-docker-approved-expansion-state.json`.
+
+Retained the committed line-table test debug profile. The smaller-debug-profile
+proposal and private binary-size probe were **not applied** to the repository.
+The builder's four-job setting and explicit incremental disablement remain;
+the workspace test profile already disabled incremental compilation, so the
+explicit environment setting is not evidence of a measured additional saving.
+
+At frozen functional source `d8a037f8`:
+
+- Normal `docker/Dockerfile.rust-tests` full-workspace/all-features precompile and
+  image export succeeded in5572.8s; no target inventory was reduced.
+- Image ID: `sha256:b87da600a4c362f2e4b7f0107e1faea1e134ab77757328d1e543fe0fc5fa9d9a`.
+- `bash scripts/run-rust-integration-tests.sh --no-build --crate api --test recorded_execution_events_tests --filter object_seal_`
+  completed stack startup, migrations, **15/15** selected tests, zero ignored,
+  and teardown in269.894s (test body96.85s).
+- Unique project `attune-lockproof337c6ad45d`; run ID `lockproof337c6ad45d`.
+  PostgreSQL/RabbitMQ containers, volumes and network were removed. Independent
+  before-fallback checks found no containers or volumes; no fallback was needed.
+
+State/commands: `/tmp/attune-packaged-expanded-state.json`; build/runtime logs
+under the matching prefix. The15 packaged API cases establish this packaging
+path, not additional packaged execution of every precompiled target. Broader
+runtime execution is covered to its CI and host-suite scope, not inferred from
+compilation alone. Earlier failed builds and the temporary validation-wrapper
+cleanup failure remain preserved; later success does not recast them as passes.
+
+### Final review boundary
+
+No actionable source finding remains from the completed milestone/harness
+reviews. A cumulative final review and CI on this prose-only record commit are
+pending. Functional source validation is reused because this record changes no
+application, migrations, tests, dependencies or build configuration. No merge or
+production deployment is authorized or claimed here. Full physical PUT settlement,
+pre-admitted delayed writes, staging orphans, post-retention recreation and
+filesystem path retirement remain explicit exclusions; shared-file/PhysicalCleanup
+fences remain. The preserved timing failures are disclosed evidence limits,
+not grounds for weakened assertions or speculative guard removal.
