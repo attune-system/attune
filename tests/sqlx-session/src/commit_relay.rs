@@ -127,7 +127,9 @@ async fn write<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, k: u8, b: &[u8]) -> 
 #[derive(Default)]
 struct Parser {
     statements: HashMap<Vec<u8>, u8>,
-    portals: HashMap<Vec<u8>, u8>,
+    portals: HashMap<Vec<u8>, (Vec<u8>, u8)>,
+    savepoints: Vec<(String, bool, bool)>,
+    publication_executions: usize,
     selected: bool,
     publication: bool,
 }
@@ -139,6 +141,13 @@ fn string<'a>(b: &mut &'a [u8]) -> io::Result<&'a [u8]> {
     let (v, rest) = b.split_at(n);
     *b = &rest[1..];
     Ok(v)
+}
+fn name<'a>(b: &mut &'a [u8]) -> io::Result<&'a [u8]> {
+    let n = string(b)?;
+    if n.len() > 256 {
+        return Err(invalid());
+    }
+    Ok(n)
 }
 fn take<'a>(b: &mut &'a [u8], n: usize) -> io::Result<&'a [u8]> {
     if b.len() < n {
@@ -175,7 +184,7 @@ impl Parser {
         }
         match k {
             b'P' => {
-                let name = string(&mut b)?.to_vec();
+                let name = name(&mut b)?.to_vec();
                 let sql = string(&mut b)?;
                 let upper = String::from_utf8_lossy(sql).trim().to_ascii_uppercase();
                 if matches!(upper.as_str(), "COMMIT" | "ROLLBACK" | "BEGIN")
@@ -186,8 +195,8 @@ impl Parser {
                 self.statements.insert(name, fingerprint(sql));
             }
             b'B' => {
-                let portal = string(&mut b)?.to_vec();
-                let stmt = string(&mut b)?;
+                let portal = name(&mut b)?.to_vec();
+                let stmt = name(&mut b)?;
                 let class = *self.statements.get(stmt).ok_or_else(invalid)?;
                 let n = short(&mut b)?;
                 let mut formats = Vec::new();
@@ -235,22 +244,31 @@ impl Parser {
                 if class != 0 && !matched {
                     return Err(invalid());
                 }
-                self.portals.insert(portal, class);
+                self.portals.insert(portal, (stmt.to_vec(), class));
             }
             b'E' => {
-                let portal = string(&mut b)?;
-                match self.portals.get(portal).copied().ok_or_else(invalid)? {
+                let portal = name(&mut b)?;
+                match self
+                    .portals
+                    .get(portal)
+                    .map(|(_, class)| *class)
+                    .ok_or_else(invalid)?
+                {
                     1 => self.selected = true,
-                    2 => self.publication = true,
+                    2 => {
+                        self.publication = true;
+                        self.publication_executions += 1;
+                    }
                     _ => {}
                 }
             }
             b'C' => {
                 let which = take(&mut b, 1)?[0];
-                let name = string(&mut b)?;
+                let name = name(&mut b)?;
                 match which {
                     b'S' => {
                         self.statements.remove(name);
+                        self.portals.retain(|_, (statement, _)| statement != name);
                     }
                     b'P' => {
                         self.portals.remove(name);
@@ -278,14 +296,54 @@ impl Parser {
                     };
                     self.selected = false;
                     self.publication = false;
+                    self.savepoints.clear();
                     return Ok(Some(class));
                 }
-                if sql == "BEGIN" || sql == "ROLLBACK" {
-                    self.selected = false;
-                    self.publication = false;
-                }
-                if sql.contains("COMMIT") || sql.contains("SAVEPOINT") {
-                    return Err(invalid());
+                let words = sql.split_whitespace().collect::<Vec<_>>();
+                let valid_name = |n: &str| {
+                    !n.is_empty()
+                        && n.len() <= 256
+                        && n.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                };
+                match words.as_slice() {
+                    ["BEGIN", ..] | ["ROLLBACK"] => {
+                        self.selected = false;
+                        self.publication = false;
+                        self.savepoints.clear();
+                    }
+                    ["SAVEPOINT", n] if valid_name(n) => {
+                        if self.savepoints.len() >= 64 {
+                            return Err(invalid());
+                        }
+                        self.savepoints
+                            .push((n.to_string(), self.selected, self.publication));
+                    }
+                    ["ROLLBACK", "TO", n] | ["ROLLBACK", "TO", "SAVEPOINT", n] if valid_name(n) => {
+                        let i = self
+                            .savepoints
+                            .iter()
+                            .rposition(|(name, _, _)| name == n)
+                            .ok_or_else(invalid)?;
+                        self.selected = self.savepoints[i].1;
+                        self.publication = self.savepoints[i].2;
+                        self.savepoints.truncate(i + 1);
+                    }
+                    ["RELEASE", n] | ["RELEASE", "SAVEPOINT", n] if valid_name(n) => {
+                        let i = self
+                            .savepoints
+                            .iter()
+                            .rposition(|(name, _, _)| name == n)
+                            .ok_or_else(invalid)?;
+                        self.savepoints.truncate(i);
+                    }
+                    _ if sql.contains("COMMIT")
+                        || sql.contains("SAVEPOINT")
+                        || sql.starts_with("ROLLBACK")
+                        || sql.starts_with("RELEASE") =>
+                    {
+                        return Err(invalid())
+                    }
+                    _ => {}
                 }
             }
             _ => {}
@@ -323,7 +381,10 @@ async fn connection(
         let mut parser = Parser::default();
         loop {
             let (k, b) = frame(&mut cr).await?;
-            if let Some(class) = parser.frontend(k, &b, stream)? {
+            let before = parser.publication_executions;
+            let event = parser.frontend(k, &b, stream)?;
+            report.lock().await.publications += parser.publication_executions - before;
+            if let Some(class) = event {
                 tx.send(class).await.map_err(|_| invalid())?;
             }
             write(&mut sw, k, &b).await?;
@@ -347,9 +408,6 @@ async fn connection(
                     rx.try_recv().unwrap_or(None)
                 };
                 if b == b"COMMIT\0" {
-                    if class == Some(Class::Publication) {
-                        report.lock().await.publications += 1;
-                    }
                     let hold = {
                         let mut p = plan.lock().await;
                         if class.is_some() && p.front().copied() == class {
@@ -485,6 +543,24 @@ mod tests {
         assert!(p.frontend(b'E', b"missing\0", 42).is_err());
     }
     #[test]
+    fn text_int8_bind_is_validated_at_execution() {
+        let mut p = Parser::default();
+        parse(&mut p, b"s", SELECT);
+        let mut b = b"\0s\0".to_vec();
+        b.extend([0, 0, 0, 1]);
+        b.extend(2i32.to_be_bytes());
+        b.extend(b"42");
+        b.extend([0, 0]);
+        p.frontend(b'B', &b, 42).unwrap();
+        p.frontend(b'E', b"\0\0\0\0\0", 42).unwrap();
+        assert_eq!(
+            p.frontend(b'Q', b"COMMIT\0", 42).unwrap(),
+            Some(Some(Class::SelectedOnly))
+        );
+        p.frontend(b'C', b"Ss\0", 42).unwrap();
+        assert!(p.frontend(b'E', b"\0\0\0\0\0", 42).is_err());
+    }
+    #[test]
     fn publication_overrides_selection() {
         let mut p = Parser::default();
         parse(&mut p, b"s", SELECT);
@@ -497,5 +573,129 @@ mod tests {
             p.frontend(b'Q', b"COMMIT\0", 42).unwrap(),
             Some(Some(Class::Publication))
         );
+    }
+}
+
+#[cfg(test)]
+mod savepoint_tests {
+    use super::*;
+    #[test]
+    fn savepoint_rollback_restores_classification_and_release_is_not_root_commit() {
+        let mut p = Parser {
+            selected: true,
+            ..Parser::default()
+        };
+        assert!(p
+            .frontend(b'Q', b"SAVEPOINT owned\0", 42)
+            .unwrap()
+            .is_none());
+        p.publication = true;
+        assert!(p
+            .frontend(b'Q', b"ROLLBACK TO SAVEPOINT owned\0", 42)
+            .unwrap()
+            .is_none());
+        assert!(!p.publication);
+        assert!(p.selected);
+        assert!(p
+            .frontend(b'Q', b"RELEASE SAVEPOINT owned\0", 42)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            p.frontend(b'Q', b"COMMIT\0", 42).unwrap(),
+            Some(Some(Class::SelectedOnly))
+        );
+        assert!(p.frontend(b'Q', b"ROLLBACK TO absent\0", 42).is_err());
+    }
+}
+
+#[cfg(test)]
+mod backend_tests {
+    use super::*;
+    async fn rejected_completion(error: bool, status: u8) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let len = socket.read_u32().await.unwrap();
+            let mut startup = vec![0; len as usize - 4];
+            socket.read_exact(&mut startup).await.unwrap();
+            write(&mut socket, b'R', &0u32.to_be_bytes()).await.unwrap();
+            write(&mut socket, b'K', &[0, 0, 0, 42, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            write(&mut socket, b'Z', b"I").await.unwrap();
+            loop {
+                let (k, b) = frame(&mut socket).await.unwrap();
+                if k == b'Q' && b == b"COMMIT\0" {
+                    break;
+                }
+            }
+            if error {
+                write(&mut socket, b'E', b"SERROR\0C40001\0\0")
+                    .await
+                    .unwrap();
+            }
+            write(
+                &mut socket,
+                b'C',
+                if error { b"ROLLBACK\0" } else { b"COMMIT\0" },
+            )
+            .await
+            .unwrap();
+            write(&mut socket, b'Z', &[status]).await.unwrap();
+            // Keep upstream alive until the client or explicit relay shutdown closes it.
+            let _ = socket.read_u8().await;
+        });
+        let mut relay = OwnedCommitRelay::start(target, 42, vec![Class::SelectedOnly])
+            .await
+            .unwrap();
+        let mut client = TcpStream::connect(("127.0.0.1", relay.port)).await.unwrap();
+        client.write_u32(8).await.unwrap();
+        client.write_u32(196608).await.unwrap();
+        for _ in 0..3 {
+            frame(&mut client).await.unwrap();
+        }
+        let mut parse=b"s\0WITH input AS (SELECT jsonb_build_object('snapshot',object_log_close_snapshot($1), UPDATE log_stream s SET close_phase='closing',close_revision=close_revision+1,".to_vec();
+        parse.extend([0, 0, 0]);
+        write(&mut client, b'P', &parse).await.unwrap();
+        let mut bind = b"\0s\0".to_vec();
+        bind.extend([0, 1, 0, 1, 0, 1]);
+        bind.extend(8i32.to_be_bytes());
+        bind.extend(42i64.to_be_bytes());
+        bind.extend([0, 0]);
+        write(&mut client, b'B', &bind).await.unwrap();
+        write(&mut client, b'E', b"\0\0\0\0\0").await.unwrap();
+        write(&mut client, b'S', b"").await.unwrap();
+        write(&mut client, b'Q', b"COMMIT\0").await.unwrap();
+        if error {
+            assert_eq!(frame(&mut client).await.unwrap().0, b'E');
+            assert_eq!(frame(&mut client).await.unwrap().1, b"ROLLBACK\0");
+            assert_eq!(frame(&mut client).await.unwrap().1, b"I");
+            drop(client);
+            let report = relay.shutdown().await.unwrap();
+            assert_eq!(report.held, 0);
+            assert_eq!(report.disconnected, 0);
+        } else {
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), relay.next_event())
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            assert!(relay.shutdown().await.is_err());
+            drop(client);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn error_and_rollback_are_never_successful_commit_proof() {
+        rejected_completion(true, b'I').await
+    }
+    #[tokio::test]
+    async fn commit_with_nonidle_ready_is_not_successful_commit_proof() {
+        rejected_completion(false, b'T').await
     }
 }

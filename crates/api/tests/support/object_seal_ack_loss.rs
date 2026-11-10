@@ -116,6 +116,17 @@ async fn snapshot(pool: &sqlx::PgPool, stream: i64, version: i64) -> Result<Valu
     Ok(sqlx::query_scalar("SELECT jsonb_build_object('phase',s.close_phase,'revision',s.close_revision,'input',s.close_input,'hash',s.close_input_sha256,'deadline',s.close_deadline,'sealed',s.sealed,'sealed_at',s.sealed_at,'state',v.body_state,'meta',v.meta,'size',v.size_bytes,'digest',v.sha256,'membership',(SELECT jsonb_agg(to_jsonb(x) ORDER BY x.sequence) FROM log_segment x WHERE x.stream=s.id),'evidence',(SELECT jsonb_agg(to_jsonb(e)) FROM runtime_log_final_manifest e WHERE e.artifact_version=v.id)) FROM log_stream s JOIN artifact_version v ON v.id=s.artifact_version WHERE s.id=$1 AND v.id=$2").bind(stream).bind(version).fetch_one(pool).await?)
 }
 async fn run(final_loss: bool, revoke: bool, twice: bool, forwarded_expiry: bool) -> Result<()> {
+    // Only the initializer enters cold migration setup; the other libtest workers
+    // wait here rather than consuming the database template lock's 300s budget.
+    static WARM: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    WARM.get_or_try_init(|| async {
+        super::super::helpers::TestContext::new()
+            .await?
+            .cleanup()
+            .await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+    .await?;
     let backend = LogStreamBackend::ObjectSegments;
     let fixture = fixture(true).await?;
     let context = delivery(&fixture).await?;
@@ -158,22 +169,7 @@ async fn run(final_loss: bool, revoke: bool, twice: bool, forwarded_expiry: bool
         &effect,
     )
     .await?;
-    // C intentionally closes acquisition before the platform finishes logs.
-    let _ = attune_common::repositories::runtime_read::RuntimeReadRepository::close_execution(
-        &mut tx,
-        context.execution,
-    )
-    .await?;
     tx.commit().await?;
-    ExecutionRepository::update(
-        &fixture.ctx.pool,
-        context.execution,
-        UpdateExecutionInput {
-            status: Some(ExecutionStatus::Completed),
-            ..Default::default()
-        },
-    )
-    .await?;
     let token =
         attune_common::worker_delivery::mint(&context, &permit, &fixture.ctx.state.jwt_config)?;
     let key = fixture
@@ -229,10 +225,23 @@ async fn run(final_loss: bool, revoke: bool, twice: bool, forwarded_expiry: bool
         ],
     )
     .await?;
+    let search_path: String = sqlx::query_scalar("SHOW search_path")
+        .fetch_one(&fixture.ctx.pool)
+        .await?;
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .min_connections(0)
         .acquire_timeout(Duration::from_secs(5))
+        .after_connect(move |connection, _| {
+            let search_path = search_path.clone();
+            Box::pin(async move {
+                sqlx::query("SELECT set_config('search_path',$1,false)")
+                    .bind(search_path)
+                    .execute(connection)
+                    .await?;
+                Ok(())
+            })
+        })
         .connect_with(
             (*options)
                 .clone()
@@ -246,6 +255,39 @@ async fn run(final_loss: bool, revoke: bool, twice: bool, forwarded_expiry: bool
     state.blob_store = store.clone();
     let state = Arc::new(state);
     let app = attune_api::server::Server::new(state.clone()).router();
+    // The process credential deliberately has no consumer declaration here.
+    let denied = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/internal/logs/{}/seal", version.id))
+        .header("authorization", format!("Bearer {}", fixture.token))
+        .header("x-attune-log-final-manifest", authenticated.clone())
+        .body(Body::empty())?;
+    let denied = app.clone().oneshot(denied).await?;
+    let denied_status = denied.status();
+    let denied_body = axum::body::to_bytes(denied.into_body(), 64 * 1024).await?;
+    assert_eq!(
+        denied_status,
+        StatusCode::FORBIDDEN,
+        "process consumer control: {}",
+        String::from_utf8_lossy(&denied_body)
+    );
+    let mut tx = fixture.ctx.pool.begin().await?;
+    // C intentionally closes acquisition before the platform finishes logs.
+    let _ = attune_common::repositories::runtime_read::RuntimeReadRepository::close_execution(
+        &mut tx,
+        context.execution,
+    )
+    .await?;
+    tx.commit().await?;
+    ExecutionRepository::update(
+        &fixture.ctx.pool,
+        context.execution,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Completed),
+            ..Default::default()
+        },
+    )
+    .await?;
     let (token, credential_deadline) = if forwarded_expiry {
         let mut claims =
             attune_common::auth::jwt::validate_token(&token, &fixture.ctx.state.jwt_config)?;
@@ -273,17 +315,6 @@ async fn run(final_loss: bool, revoke: bool, twice: bool, forwarded_expiry: bool
             .body(Body::empty())
             .unwrap()
     };
-    // The process credential deliberately has no consumer declaration here.
-    let denied = Request::builder()
-        .method("POST")
-        .uri(format!("/api/v1/internal/logs/{}/seal", version.id))
-        .header("authorization", format!("Bearer {}", fixture.token))
-        .header("x-attune-log-final-manifest", authenticated.clone())
-        .body(Body::empty())?;
-    assert_eq!(
-        app.clone().oneshot(denied).await?.status(),
-        StatusCode::FORBIDDEN
-    );
     let mut http = tokio::spawn(app.clone().oneshot(request()));
     let mut original_pending = None;
     if final_loss {
@@ -306,6 +337,10 @@ async fn run(final_loss: bool, revoke: bool, twice: bool, forwarded_expiry: bool
             Class::SelectedOnly
         }
     );
+    eprintln!(
+        "seal commit held: connection={} backend_pid={} class={:?} status={}",
+        held.connection, held.backend_pid, held.class, held.status
+    );
     let first_pid = held.backend_pid;
     let first_conn = held.connection;
     let committed = snapshot(&fixture.ctx.pool, stream.id, version.id).await?;
@@ -318,7 +353,10 @@ async fn run(final_loss: bool, revoke: bool, twice: bool, forwarded_expiry: bool
     assert_eq!(committed["membership"].as_array().unwrap().len(), 1);
     assert_eq!(committed["membership"][0]["sequence"], 0);
     use sha2::{Digest, Sha256};
-    let expected_digest = format!("{:x}", Sha256::digest(&first));
+    let expected_digest = Sha256::digest(&first)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     if final_loss {
         assert_eq!(committed["digest"], expected_digest);
     }
@@ -374,6 +412,14 @@ async fn run(final_loss: bool, revoke: bool, twice: bool, forwarded_expiry: bool
         drop(state);
         pool.close().await;
         let report = relay.shutdown().await?;
+        eprintln!("seal relay disposed: {report:?}");
+        if forwarded_expiry {
+            assert_eq!(
+                report.backend_pids.len() as u64,
+                first_conn,
+                "acknowledged freshness rejection must not open reconciliation"
+            );
+        }
         assert_eq!(report.held, 1);
         assert_eq!(report.disconnected, usize::from(!forwarded_expiry));
         assert_eq!(report.publications, usize::from(final_loss));
@@ -383,6 +429,10 @@ async fn run(final_loss: bool, revoke: bool, twice: bool, forwarded_expiry: bool
     }
     held.decide(Decision::Disconnect)?;
     let retry = tokio::time::timeout(Duration::from_secs(10), relay.next_event()).await??;
+    eprintln!(
+        "seal reconciliation held: connection={} backend_pid={} class={:?} status={}",
+        retry.connection, retry.backend_pid, retry.class, retry.status
+    );
     assert_ne!(retry.backend_pid, first_pid);
     assert_ne!(retry.connection, first_conn);
     assert_eq!(retry.class, Class::SelectedOnly);
@@ -455,7 +505,9 @@ async fn run(final_loss: bool, revoke: bool, twice: bool, forwarded_expiry: bool
     );
     drop(conn);
     assert_eq!(
-        app.clone().oneshot(request()).await?.status(),
+        tokio::time::timeout(Duration::from_secs(10), app.clone().oneshot(request()))
+            .await??
+            .status(),
         StatusCode::OK
     );
     let changed = Request::builder()
@@ -468,7 +520,9 @@ async fn run(final_loss: bool, revoke: bool, twice: bool, forwarded_expiry: bool
         .header("x-attune-log-final-manifest", authenticated.clone())
         .body(Body::empty())?;
     assert_eq!(
-        app.clone().oneshot(changed).await?.status(),
+        tokio::time::timeout(Duration::from_secs(10), app.clone().oneshot(changed))
+            .await??
+            .status(),
         StatusCode::CONFLICT
     );
     assert_eq!(
@@ -480,6 +534,7 @@ async fn run(final_loss: bool, revoke: bool, twice: bool, forwarded_expiry: bool
     drop(state);
     pool.close().await;
     let report = relay.shutdown().await?;
+    eprintln!("seal relay disposed: {report:?}");
     assert_eq!(report.held, 2);
     assert_eq!(report.disconnected, if twice { 2 } else { 1 });
     assert_eq!(report.publications, 1);
