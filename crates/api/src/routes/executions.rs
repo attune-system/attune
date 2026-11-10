@@ -13,6 +13,7 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
+use serde_json::Value as JsonValue;
 use sqlx::{Postgres, QueryBuilder};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -640,7 +641,7 @@ pub async fn create_execution(
 
         let mut response = ExecutionResponse::from(created_execution);
         response.schema_binding = Some(
-            serde_json::json!({"input_digest":binding.input.semantic_digest().map_err(|_| ApiError::InternalServerError("Invalid execution rendering contract".into()))?,"input":binding.input,"output":binding.output}),
+            serde_json::json!({"input_digest":binding.input.semantic_digest().map_err(|_| ApiError::InternalServerError("Invalid execution rendering contract".into()))?,"input":binding.input,"output":binding.output,"output_policy":binding.output_policy,"output_format":binding.output_format}),
         );
 
         // Audit: explicit semantic event for manual execution requests so the
@@ -1407,7 +1408,7 @@ pub async fn get_execution(
     {
         binding.validate()?;
         response.schema_binding = Some(
-            serde_json::json!({"input_digest":binding.input.semantic_digest().map_err(|_| ApiError::InternalServerError("Invalid execution rendering contract".into()))?,"input":binding.input,"output":binding.output}),
+            serde_json::json!({"input_digest":binding.input.semantic_digest().map_err(|_| ApiError::InternalServerError("Invalid execution rendering contract".into()))?,"input":binding.input,"output":binding.output,"output_policy":binding.output_policy,"output_format":binding.output_format}),
         );
     }
     if query.include_secret_values {
@@ -1427,12 +1428,59 @@ pub async fn get_execution(
             execution.id,
         )
         .await?;
+        response.revealed_output_channels =
+            reveal_output_channels(&state, &user, &execution).await?;
         emit_execution_secret_disclosure_audit(&state, &user, &execution, reveal_paths);
     }
 
     let response = ApiResponse::new(response);
 
-    Ok((StatusCode::OK, Json(response)).into_response())
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CACHE_CONTROL, "private, no-store")],
+        Json(response),
+    )
+        .into_response())
+}
+
+/// Restore original channel bodies into a separate response projection.
+async fn reveal_output_channels(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    execution: &attune_common::models::Execution,
+) -> ApiResult<Option<JsonValue>> {
+    let Some(result) = execution.result.as_ref() else {
+        return Ok(None);
+    };
+    let channels =
+        attune_common::output_classification::output_channel_projections(result, execution.id)
+            .map_err(|_| ApiError::InternalServerError("Invalid stored output channels".into()))?;
+    if channels.is_empty() {
+        return Ok(None);
+    }
+    let slots = channels
+        .keys()
+        .map(|channel| {
+            (
+                channel.as_str().to_string(),
+                attune_common::secret_values::redaction_marker(),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let value = crate::secret_disclosure::reveal_authorized(
+        state,
+        user,
+        Some(JsonValue::Object(slots)),
+        attune_common::output_classification::ENTITY_EXECUTION_OUTPUT_CHANNEL,
+        execution.id,
+    )
+    .await?;
+    Ok(value.map(|mut value| {
+        if let Some(slots) = value.as_object_mut() {
+            slots.retain(|_, value| !attune_common::secret_values::is_redaction_marker(value));
+        }
+        value
+    }))
 }
 
 /// List safe workflow cache iteration status for an execution.
@@ -2787,7 +2835,7 @@ pub async fn stream_execution_log(
     let execution = ExecutionRepository::find_by_id(&state.db, id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Execution with ID {} not found", id)))?;
-    authorize_execution_log_stream(&state, &authenticated_user, &execution).await?;
+    authorize_execution_log_stream(&state, &authenticated_user, &execution, &stream_name).await?;
 
     let stream_name = ExecutionLogStream::parse(&stream_name)?;
     let artifact_ref = stream_name.artifact_ref(&execution.action_ref);
@@ -3745,6 +3793,7 @@ async fn authorize_execution_log_stream(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
     execution: &attune_common::models::Execution,
+    stream_name: &str,
 ) -> Result<(), ApiError> {
     if user.claims.token_type != TokenType::Access {
         state.authorization_service().effective_grants(user).await?;
@@ -3759,7 +3808,11 @@ async fn authorize_execution_log_stream(
         )
         .await?;
     }
-    crate::secret_disclosure::authorize_runtime_log(state, user, execution).await
+    let channel = match ExecutionLogStream::parse(stream_name)? {
+        ExecutionLogStream::Stdout => attune_common::output_classification::OutputChannel::Stdout,
+        ExecutionLogStream::Stderr => attune_common::output_classification::OutputChannel::Stderr,
+    };
+    crate::secret_disclosure::authorize_runtime_log(state, user, execution, channel).await
 }
 
 /// Authorizes access to an execution for the given action.

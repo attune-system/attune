@@ -768,6 +768,8 @@ pub async fn create_test_action(
     ref_name: &str,
 ) -> Result<Action> {
     let input = CreateActionInput {
+        output_policy: Default::default(),
+        output_format: Default::default(),
         r#ref: ref_name.to_string(),
         pack: pack_id,
         pack_ref: pack_ref.to_string(),

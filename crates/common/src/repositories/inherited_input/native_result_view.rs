@@ -57,6 +57,9 @@ impl InheritedInputRepository {
         }
         view.ensure_fresh()?;
         session.fence = session.fence.intersect(&view.fence);
+        session
+            .result_selection_guards
+            .push((view.snapshot, view.selection_guard()));
         // A transformed VALUE can be staged before the source view is released,
         // without a shorthand or Condition to carry its private read for it.
         // Bind only this real session's admitted declaration. Archived views

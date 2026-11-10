@@ -3,6 +3,8 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { ActionReferenceVisibility } from "./ActionReferenceVisibility";
+import type { OutputFormat } from "./OutputFormat";
+import type { OutputPolicy } from "./OutputPolicy";
 import type { RetentionPolicyType } from "./RetentionPolicyType";
 import type { WorkerAffinity } from "./WorkerAffinity";
 import type { WorkerToleration } from "./WorkerToleration";
@@ -50,6 +52,14 @@ export type CreateActionRequest = {
    * Output schema (flat format) defining expected outputs with inline required/secret
    */
   out_schema?: Record<string, any> | null;
+  /**
+   * Parsing format for stdout.
+   */
+  output_format?: OutputFormat;
+  /**
+   * Output channel visibility choices, independent of secret inputs.
+   */
+  output_policy?: OutputPolicy;
   /**
    * Pack reference this action belongs to
    */

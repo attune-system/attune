@@ -136,6 +136,39 @@ Retrieve detailed information about a specific execution.
 **Path Parameters:**
 - `id` (integer): Execution ID
 
+**Query Parameters:**
+
+- `include_secret_values` (boolean, optional, default `false`): Explicitly request
+  authorized disclosure of protected parameters, structured result fields, and
+  original output channels. Requires execution visibility, decrypt permission,
+  and authorization for the value's recorded origins.
+
+The ordinary response keeps public output fields visible and replaces only
+schema-secret values with redaction markers. Secret parameters and runtime API
+reads do not themselves classify output as secret. Classification uses the
+execution's immutable `out_schema` and `output_policy` binding; later action
+edits do not change it. See [action output secrecy](../action-output-secrecy.md).
+
+Execution detail responses use `Cache-Control: private, no-store`.
+
+With disclosure enabled, authorized structured values are restored in `config`
+and `result`. Original protected channels are returned separately in
+`revealed_output_channels`, keyed by `stdout`, `stderr`, or `error`. A sanitized
+`result.stdout` remains the public projection: clients must not replace it with
+its private original in a shared cache.
+
+A `200` response can still contain redaction markers when a particular value's
+origins are no longer available or authorized. An absent original channel is not
+proof that its public projection contains no secrets. Missing permission to make
+a disclosure request returns `403`; an ordinary redacted read remains available
+with the appropriate read permission.
+
+CLI users can request disclosure with
+`attune execution show ID --include-secret-values` or
+`attune execution result ID --decrypt`. MCP callers use `executions_export` with
+an explicit `output_file`; inline `executions_get` stays redacted. See
+[CLI and MCP disclosure](../cli/cli.md#file-only-execution-disclosure-through-mcp).
+
 **Response:** `200 OK`
 
 ```json

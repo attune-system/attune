@@ -20,7 +20,7 @@ use super::{
 pub const ACTION_COLUMNS: &str = "id, ref, pack, pack_ref, label, description, entrypoint, \
     runtime, effective_enabled AS enabled, enabled_override, runtime_version_constraint, required_worker_runtimes, \
     worker_selector, worker_tolerations, worker_affinity, \
-    param_schema, out_schema, workflow_def, is_adhoc, accesses_mcp, \
+    param_schema, out_schema, output_policy, workflow_def, is_adhoc, accesses_mcp, \
     default_execution_permission_set_refs, \
     reference_visibility, reference_allowed_pack_refs, \
     log_retention_policy, log_retention_limit, artifact_retention_policy, artifact_retention_limit, \
@@ -178,6 +178,8 @@ pub struct CreateActionInput {
     pub worker_affinity: JsonDict,
     pub param_schema: Option<JsonSchema>,
     pub out_schema: Option<JsonSchema>,
+    pub output_policy: crate::output_policy::OutputPolicy,
+    pub output_format: crate::models::OutputFormat,
     pub is_adhoc: bool,
     #[doc = "Hint that this action may invoke the MCP server and spawn child executions."]
     pub accesses_mcp: bool,
@@ -206,6 +208,7 @@ pub struct UpdateActionInput {
     pub worker_affinity: Option<JsonDict>,
     pub param_schema: Option<JsonSchema>,
     pub out_schema: Option<JsonSchema>,
+    pub output_policy: Option<crate::output_policy::OutputPolicy>,
     pub parameter_delivery: Option<String>,
     pub parameter_format: Option<String>,
     pub output_format: Option<String>,
@@ -279,7 +282,8 @@ super::schema_consumer::schema_consumer_repository!(
     UpdateActionInput,
     "action",
     value_patch,
-    [param_schema, out_schema]
+    [param_schema, out_schema],
+    output_policy output_policy
 );
 
 impl ActionRepository {
@@ -329,8 +333,8 @@ impl ActionRepository {
                                   default_execution_permission_set_refs,
                                   reference_visibility, reference_allowed_pack_refs,
                                   log_retention_policy, log_retention_limit,
-                                  artifact_retention_policy, artifact_retention_limit, timeout_seconds)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+                                  artifact_retention_policy, artifact_retention_limit, timeout_seconds, output_policy, output_format)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
             RETURNING {}
             "#,
             ACTION_COLUMNS
@@ -360,6 +364,8 @@ impl ActionRepository {
         .bind(input.artifact_retention_policy)
         .bind(input.artifact_retention_limit)
         .bind(input.timeout_seconds)
+        .bind(sqlx::types::Json(&input.output_policy))
+        .bind(input.output_format.to_string())
         .fetch_one(executor)
         .await
         .map_err(|e| {
@@ -555,6 +561,15 @@ impl ActionRepository {
             }
             query.push("parameter_format = ");
             query.push_bind(parameter_format);
+            has_updates = true;
+        }
+
+        if let Some(policy) = &input.output_policy {
+            if has_updates {
+                query.push(", ");
+            }
+            query.push("output_policy = ");
+            query.push_bind(sqlx::types::Json(policy));
             has_updates = true;
         }
 

@@ -40,6 +40,7 @@ pub(crate) struct ArtifactReads<'a> {
     context: Option<ArtifactReadContext>,
     disclosure_snapshot: Option<AuthorizationSnapshot>,
     execution_disclosure: HashMap<i64, bool>,
+    execution_channels: HashMap<i64, attune_common::output_classification::OutputChannel>,
     source_records: DisclosureRecords,
     receipt_guard: Option<crate::receipt_disclosure::SharedHumanReceiptGuard>,
 }
@@ -67,6 +68,7 @@ impl<'a> ArtifactReads<'a> {
             context,
             disclosure_snapshot: None,
             execution_disclosure: HashMap::new(),
+            execution_channels: HashMap::new(),
             source_records: DisclosureRecords::default(),
             receipt_guard: None,
         }
@@ -264,10 +266,33 @@ impl<'a> ArtifactReads<'a> {
             }
         };
         let executions = selected.execution.into_iter().collect::<Vec<_>>();
-        let mut guard = Box::pin(
-            crate::receipt_disclosure::HumanReceiptGuard::for_executions(state, user, &executions),
-        )
-        .await?;
+        let channel = if sensor_ref.is_none() {
+            Some(crate::secret_disclosure::runtime_log_artifact_channel(
+                artifact, selected,
+            )?)
+        } else {
+            None
+        };
+        let mut guard = match (selected.execution, channel) {
+            (Some(execution), Some(channel)) => {
+                Box::pin(
+                    crate::receipt_disclosure::HumanReceiptGuard::for_execution_channel(
+                        state, user, execution, channel,
+                    ),
+                )
+                .await?
+            }
+            _ => {
+                Box::pin(
+                    crate::receipt_disclosure::HumanReceiptGuard::for_executions(
+                        state,
+                        user,
+                        &executions,
+                    ),
+                )
+                .await?
+            }
+        };
         if sensor_ref.is_some() {
             Box::pin(guard.prepare_sensor_logs(state, &[selected.id])).await?;
         }
@@ -282,6 +307,9 @@ impl<'a> ArtifactReads<'a> {
                 grants: snapshot.grants.clone(),
             }),
         );
+        if let (Some(execution), Some(channel)) = (selected.execution, channel) {
+            reads.execution_channels.insert(execution, channel);
+        }
         reads.disclosure_snapshot = Some(snapshot.clone());
         let mut caller = attune_common::rbac::AuthorizationContext::new(snapshot.identity_id);
         caller.identity_attributes = snapshot.identity_attributes.clone();
@@ -331,32 +359,7 @@ impl<'a> ArtifactReads<'a> {
                     held.connection(),
                 )
                 .await?;
-                // The process may not have read a Key or materialized result
-                // provenance yet. Retain its frozen read/use ceiling even on
-                // this receipt-guarded path, using the same IAM transaction.
-                if let Some(origin) = attune_common::repositories::delegated_execution::DelegatedExecutionRepository::output_origin(held.connection(), execution.id).await? {
-                    crate::routes::executions::authorize_execution_projection_on(
-                        state,
-                        user,
-                        &execution,
-                        attune_common::rbac::Action::Decrypt,
-                        &snapshot,
-                        &mut reads.source_records.visibility,
-                        held.connection(),
-                    ).await?;
-                    let attune_common::secret_provenance::SecretOrigin::Local {source_kind, source_ref} = origin else {
-                        return Err(denied());
-                    };
-                    if source_kind != "delegated_execution_output" {
-                        return Err(denied());
-                    }
-                    let viewer = attune_common::delegation::DelegationAuthority::new(
-                        snapshot.identity_id, snapshot.identity_attributes.clone(), snapshot.grants.clone(),
-                    );
-                    if !attune_common::repositories::delegated_execution::DelegatedExecutionRepository::output_allowed(held.connection(), source_ref.as_deref(), &viewer).await? {
-                        return Err(denied());
-                    }
-                }
+
                 execution
             };
             reads.load_execution_disclosure(&executions).await?;
@@ -398,6 +401,8 @@ impl<'a> ArtifactReads<'a> {
         if pinned.artifact != selected.artifact
             || pinned.version != selected.version
             || pinned.execution != selected.execution
+            || pinned.meta.as_ref().and_then(|meta| meta.get("stream"))
+                != selected.meta.as_ref().and_then(|meta| meta.get("stream"))
             || pinned.file_path != selected.file_path
             || pinned.object_key != selected.object_key
             || pinned.provider_version != selected.provider_version
@@ -606,6 +611,7 @@ impl<'a> ArtifactReads<'a> {
                 &[
                     ENTITY_EXECUTION_CONFIG,
                     ENTITY_EXECUTION_RESULT,
+                    attune_common::output_classification::ENTITY_EXECUTION_OUTPUT_CHANNEL,
                     "workflow_variables",
                 ],
                 missing_origins,
@@ -630,10 +636,15 @@ impl<'a> ArtifactReads<'a> {
         let mut sensitive = HashSet::new();
         for id in ids {
             if let (Some(_), Some(binding)) = (executions.get(id), bindings.get(id)) {
-                if runtime_log_requires_disclosure(
+                let sensitive_channel = self.execution_channels.get(id).map(|channel| {
+                    crate::secret_disclosure::runtime_log_channel_requires_disclosure(
+                        binding, *channel,
+                    )
+                });
+                if sensitive_channel.unwrap_or(runtime_log_requires_disclosure(
                     binding,
                     secrets.get(id).map(Vec::as_slice).unwrap_or(&[]),
-                )? {
+                )?) {
                     sensitive.insert(*id);
                 }
             }
@@ -747,10 +758,15 @@ impl<'a> ArtifactReads<'a> {
             let mut sensitive = HashSet::new();
             for id in ids {
                 if let (Some(_), Some(binding)) = (executions.get(id), bindings.get(id)) {
-                    if runtime_log_requires_disclosure(
+                    let sensitive_channel = self.execution_channels.get(id).map(|channel| {
+                        crate::secret_disclosure::runtime_log_channel_requires_disclosure(
+                            binding, *channel,
+                        )
+                    });
+                    if sensitive_channel.unwrap_or(runtime_log_requires_disclosure(
                         binding,
                         secrets.get(id).map(Vec::as_slice).unwrap_or(&[]),
-                    )? {
+                    )?) {
                         sensitive.insert(*id);
                     }
                 }

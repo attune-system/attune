@@ -20,42 +20,103 @@ use serde_json::Value;
 
 #[tokio::test]
 async fn genuine_stdout_view_records_authored_output_and_replays_after_raw_child_gc() {
-    result_view_case(false, false, false, false).await;
+    result_view_case(false, false, false, false, false, false).await;
 }
 
 #[tokio::test]
 async fn genuine_failure_metadata_has_native_recipe_and_retained_original_children() {
-    result_view_case(true, false, false, false).await;
+    result_view_case(true, false, false, false, false, false).await;
 }
 
 #[tokio::test]
 async fn native_failure_and_result_view_expire_at_the_actual_last_workflow_row_wait() {
-    result_view_case(true, true, false, false).await;
+    result_view_case(true, true, false, false, false, false).await;
 }
 
 #[tokio::test]
 async fn pending_value_to_with_items_control_must_publish_before_item_receipt_and_first_seal() {
-    result_view_case(false, false, true, false).await;
+    result_view_case(false, false, true, false, false, false).await;
 }
 
 #[tokio::test]
 async fn pending_iteration_control_keeps_original_approval_deadline_across_actual_target_wait() {
-    result_view_case(false, true, true, false).await;
+    result_view_case(false, true, true, false, false, false).await;
 }
 
 #[tokio::test]
 async fn prospective_result_conditions_and_whole_publication_require_each_real_release() {
-    result_view_case(false, false, false, true).await;
+    result_view_case(false, false, false, true, false, false).await;
 }
 
-async fn result_view_case(failure: bool, expires: bool, pending: bool, private_results: bool) {
+#[tokio::test]
+async fn public_result_sibling_remains_selectable_after_unrelated_origin_admission_revocation() {
+    result_view_case(false, false, false, false, true, false).await;
+}
+
+#[tokio::test]
+async fn public_result_sibling_remains_selectable_after_secret_input_key_source_removal() {
+    result_view_case(false, false, false, false, false, true).await;
+}
+
+async fn result_view_case(
+    failure: bool,
+    expires: bool,
+    pending: bool,
+    private_results: bool,
+    revoked_origin: bool,
+    removed_key: bool,
+) {
     let (db, fixture) = if expires {
         fixture_with_approval_lifetime(None, None, Some(Duration::seconds(30))).await
     } else {
         fixture().await
     };
+    let read_origin = if revoked_origin {
+        use attune_common::repositories::runtime_read::{
+            RuntimeReadOrigin, RuntimeReadRepository, RuntimeReadTarget,
+        };
+        let mut source_tx = db.begin().await.unwrap();
+        let producer = RuntimeAuthorityRepository::validate_execution_credential(
+            &mut source_tx,
+            &fixture.credential,
+        )
+        .await
+        .unwrap();
+        let origin = RuntimeReadRepository::record(
+            &mut source_tx,
+            &producer,
+            RuntimeReadOrigin {
+                target: RuntimeReadTarget::ExecutionMetadata {
+                    execution: fixture.admission.owner_id,
+                },
+                provenance: vec![],
+                parents: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        source_tx.commit().await.unwrap();
+        Some(origin)
+    } else {
+        None
+    };
     let owner = &fixture.policy.policy.owner;
     let key = NATIVE_WAIT_TEST_KEY;
+    let source_key = if removed_key {
+        Some(
+            helpers::KeyFixture::new_pack(
+                owner.pack_id,
+                &owner.pack_ref,
+                "result_input",
+                "source-value",
+            )
+            .create(&db)
+            .await
+            .unwrap(),
+        )
+    } else {
+        None
+    };
     let graph_action = ActionFixture::new(owner.pack_id, &owner.pack_ref, "result_view_graph")
         .create(&db)
         .await
@@ -68,7 +129,10 @@ async fn result_view_case(failure: bool, expires: bool, pending: bool, private_r
         &db,
         leaf.id,
         UpdateActionInput {
-            out_schema: Some(json!({"stdout":{"type":"string","secret":true}})),
+            param_schema: (revoked_origin || removed_key)
+                .then(|| json!({"secret":{"type":"string","secret":true}})),
+            out_schema: Some(json!({"token":{"type":"string","secret":true}})),
+            output_format: Some(attune_common::models::OutputFormat::Json.to_string()),
             ..Default::default()
         },
     )
@@ -76,6 +140,14 @@ async fn result_view_case(failure: bool, expires: bool, pending: bool, private_r
     .unwrap();
     let mut definition = json!({"tasks":[{"name":"source","action":leaf.r#ref,"publish":["whole"]}],
         "output_map":{"answer":"{{ result().token }}"}});
+    if revoked_origin || removed_key {
+        definition["output_map"]["public_answer"] = json!("{{ result().status }}");
+        definition["output_map"]["blocked_whole"] = json!("{{ result() }}");
+        definition["tasks"][0]["next"] = json!([
+            {"when":"{{ result().token == 'never' }}"},
+            {"when":"{{ result().status == 'public-ok' }}"}
+        ]);
+    }
     if failure {
         definition["tasks"][0]["next"] = json!([{"when":"{{ result().token == 'never' }}"}]);
     }
@@ -253,7 +325,7 @@ async fn result_view_case(failure: bool, expires: bool, pending: bool, private_r
     .unwrap();
     let child=ExecutionRepository::create_pinned(&mut *tx,CreateExecutionInput {
         action:Some(leaf.id),action_ref:leaf.r#ref.clone(),parent:Some(root.id),status:if failure {ExecutionStatus::Failed}else {ExecutionStatus::Completed},
-        result:Some(json!({"stdout":attune_common::secret_values::redaction_marker()})),config:Some(json!({})),
+        result:Some(json!({"stdout":attune_common::secret_values::redaction_marker()})),config:Some(if revoked_origin || removed_key { json!({"secret":attune_common::secret_values::redaction_marker()}) } else { json!({}) }),
         workflow_task:Some(serde_json::from_value(json!({"workflow_execution":workflow.id,"task_name":"source","retry_count":0,"max_retries":0,"timed_out":false})).unwrap()),
         permission_set_refs:vec![],..Default::default()
     },&snapshots[&leaf.r#ref]).await.unwrap();
@@ -287,19 +359,89 @@ async fn result_view_case(failure: bool, expires: bool, pending: bool, private_r
             .unwrap();
     }
     let literal = "{{ keystore['never.evaluate.this'] }}";
-    let fields = attune_common::secret_values::prepare_secret_values(
-        vec![attune_common::secret_values::SecretValueInput {
-            json_path: "/stdout".into(),
-            value: json!(serde_json::to_string(&json!({"token":literal})).unwrap()),
-            source_kind: "parameter_schema".into(),
-            source_ref: Some("/stdout".into()),
-        }],
-        key,
-    )
-    .unwrap();
+    let binding = Schemas::find(&mut tx, BindingOwner::Execution, child.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut source_origins = attune_common::secret_provenance::SecretProvenance::default();
+    if revoked_origin || removed_key {
+        let input_origin = if let Some(origin) = read_origin {
+            origin
+        } else {
+            SecretOrigin::Key(attune_common::key_access::key_origin(
+                source_key.as_ref().unwrap(),
+            ))
+        };
+        let input_provenance = attune_common::secret_provenance::SecretProvenance {
+            origins: vec![input_origin],
+            templates: vec![],
+        };
+        let config_fields = attune_common::secret_values::prepare_secret_values(
+            vec![attune_common::secret_values::SecretValueInput {
+                json_path: "/secret".into(),
+                value: json!(literal),
+                source_kind: "provenance".into(),
+                source_ref: Some(serde_json::to_string(&input_provenance).unwrap()),
+            }],
+            key,
+        )
+        .unwrap();
+        Secrets::upsert_many_with_conn(&mut tx, "execution_config", child.id, &config_fields)
+            .await
+            .unwrap();
+        // This is the ordinary worker provenance boundary: secret output
+        // records the protected input slot, whose own origins control access.
+        source_origins.origins.push(SecretOrigin::Entity {
+            entity_type: "execution_config".into(),
+            entity_id: child.id,
+            path: "/secret".into(),
+        });
+        if let Some(source_key) = source_key.as_ref() {
+            assert!(attune_common::repositories::key::KeyRepository::delete(
+                &mut *tx,
+                source_key.id
+            )
+            .await
+            .unwrap());
+        } else {
+            // The revoked admission belongs to another producer, not the
+            // observed child or its consuming workflow.
+            RuntimeAuthorityRepository::revoke_admission(&mut tx, fixture.admission.id)
+                .await
+                .unwrap();
+        }
+    }
+    let classified = attune_common::output_classification::classify_action_output(
+        json!({"data":{"token":literal,"status":"public-ok"},"stdout":serde_json::to_string(&json!({"token":literal,"status":"public-ok"})).unwrap()}),
+        binding.output.as_ref(),binding.output_format,binding.output_policy,child.id,&source_origins,
+    ).unwrap();
+    assert!(classified.public_result["stdout"]
+        .as_str()
+        .unwrap()
+        .contains("redacted"));
+    assert!(!classified.public_result.to_string().contains(literal));
+    let fields =
+        attune_common::secret_values::prepare_secret_values(classified.structured_secrets, key)
+            .unwrap();
+    let channels =
+        attune_common::secret_values::prepare_secret_values(classified.channel_secrets, key)
+            .unwrap();
     Secrets::upsert_many_with_conn(&mut tx, "execution_result", child.id, &fields)
         .await
         .unwrap();
+    Secrets::upsert_many_with_conn(&mut tx, "execution_output_channel", child.id, &channels)
+        .await
+        .unwrap();
+    ExecutionRepository::update(
+        &mut *tx,
+        child.id,
+        attune_common::repositories::execution::UpdateExecutionInput {
+            result: Some(classified.public_result),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
 
     let mut tx = db.begin().await.unwrap();
@@ -533,7 +675,7 @@ async fn result_view_case(failure: bool, expires: bool, pending: bool, private_r
         );
         assert_eq!(
             storage.completion_sources()[0].original_fields()[0].json_path,
-            "/stdout"
+            "/data/token"
         );
         tx.commit().await.unwrap();
         prepared.ensure_fresh().unwrap();
@@ -562,6 +704,124 @@ async fn result_view_case(failure: bool, expires: bool, pending: bool, private_r
     let view = Inputs::prepare_native_result_view(&mut tx, root.id, child.id, key)
         .await
         .unwrap();
+    if revoked_origin || removed_key {
+        assert_eq!(view.value()["status"], "public-ok");
+        assert!(attune_common::secret_values::is_redaction_marker(
+            &view.value()["token"]
+        ));
+        let declarations = DeclaredInputRepository::bindings(&mut tx, root.id)
+            .await
+            .unwrap();
+        let public = declarations
+            .iter()
+            .find(|declaration| declaration.source_path == "/workflow/output_map/public_answer")
+            .unwrap();
+        let mut session = Inputs::begin_render(
+            &mut tx,
+            root.id,
+            &public.declaration_revision,
+            &public.source_path,
+            &public.expression,
+            InputSitePurpose::Value,
+        )
+        .await
+        .unwrap();
+        Inputs::bind_native_result_view(
+            &mut session,
+            &view,
+            NativeResultViewBinding::CurrentAndTask,
+        )
+        .unwrap();
+        let rendered = Inputs::evaluate(&mut tx, session).await.unwrap();
+        assert_eq!(rendered.value(), &json!("public-ok"));
+        let site = InputSite {
+            execution: root.id,
+            kind: InputEntityKind::ExecutionResult,
+            purpose: InputSitePurpose::Value,
+            path: "/public_answer".into(),
+        };
+        let destination =
+            Inputs::prepare_native_value_destination(&mut tx, &view, &rendered, &site, key)
+                .await
+                .unwrap();
+        view.finalize(&mut tx).await.unwrap();
+        let receipt = Inputs::record_native_value(
+            &mut tx,
+            &view,
+            &rendered,
+            &destination,
+            rendered.value(),
+            key,
+        )
+        .await
+        .unwrap();
+        receipt.ensure_fresh_on(&mut tx).await.unwrap();
+        for source in [
+            "/workflow/output_map/answer",
+            "/workflow/output_map/blocked_whole",
+        ] {
+            let declaration = declarations
+                .iter()
+                .find(|declaration| declaration.source_path == source)
+                .unwrap();
+            let mut session = Inputs::begin_render(
+                &mut tx,
+                root.id,
+                &declaration.declaration_revision,
+                &declaration.source_path,
+                &declaration.expression,
+                InputSitePurpose::Value,
+            )
+            .await
+            .unwrap();
+            Inputs::bind_native_result_view(
+                &mut session,
+                &view,
+                NativeResultViewBinding::CurrentAndTask,
+            )
+            .unwrap();
+            assert!(Inputs::evaluate(&mut tx,session).await.is_err(),"a selected secret or its parent object cannot treat unavailable markers as plaintext");
+        }
+        for (index, allowed) in [(0, false), (1, true)] {
+            let path = format!("/workflow/tasks/0/next/{index}/when");
+            let declaration = declarations.iter().find(|d| d.source_path == path).unwrap();
+            let mut session = Inputs::begin_render(
+                &mut tx,
+                root.id,
+                &declaration.declaration_revision,
+                &declaration.source_path,
+                &declaration.expression,
+                InputSitePurpose::Condition,
+            )
+            .await
+            .unwrap();
+            Inputs::bind_native_result_view(
+                &mut session,
+                &view,
+                NativeResultViewBinding::CurrentAndTask,
+            )
+            .unwrap();
+            let result = Inputs::evaluate_condition(&mut tx, session).await;
+            if allowed {
+                assert_eq!(result.unwrap().value(), &json!(true));
+            } else {
+                assert!(
+                    result.is_err(),
+                    "conditions cannot consume unavailable secret markers"
+                );
+            }
+        }
+        tx.commit().await.unwrap();
+        let mut replay = db.begin().await.unwrap();
+        let archived =
+            Inputs::replay_native_result_view(&mut replay, root.id, view.snapshot(), key)
+                .await
+                .unwrap();
+        assert_eq!(archived.value()["status"], "public-ok");
+        replay.rollback().await.unwrap();
+        db.cleanup().await.unwrap();
+        return;
+    }
     let original_body: Value =
         sqlx::query_scalar("SELECT body FROM runtime_native_input_snapshot WHERE id=$1")
             .bind(view.snapshot())
@@ -584,8 +844,8 @@ async fn result_view_case(failure: bool, expires: bool, pending: bool, private_r
         .iter()
         .find(|mapping| mapping.view_path() == "/token")
         .unwrap();
-    assert_eq!(mapping.source_path(), "/stdout");
-    assert_eq!(mapping.decoded_path(), Some("/token"));
+    assert_eq!(mapping.source_path(), "/data/token");
+    assert_eq!(mapping.decoded_path(), None);
     let mut other = db.begin().await.unwrap();
     assert!(
         view.ensure_fresh_on(&mut other).await.is_err(),
@@ -679,6 +939,7 @@ async fn result_view_case(failure: bool, expires: bool, pending: bool, private_r
         Inputs::record_native_result_shorthand(&mut tx, &view, &shorthand, view.value(), key)
             .await
             .unwrap();
+    let whole_metadata = whole.native_source_metadata().to_vec();
     let whole_origin = whole.origin();
     let whole_site = whole.site().clone();
     sqlx::query("SAVEPOINT stale_output_target")
@@ -759,7 +1020,8 @@ async fn result_view_case(failure: bool, expires: bool, pending: bool, private_r
     let replay_whole = Inputs::receipt_context(&mut tx, &whole_site, &whole_origin, key)
         .await
         .unwrap();
-    assert!(replay_whole.native_source_metadata().contains(&metadata));
+    assert_eq!(replay_whole.native_source_metadata(), whole_metadata);
+    assert_ne!(whole_metadata, receipt.native_source_metadata());
     Snapshots::source_evidence(&mut tx, &metadata, key)
         .await
         .unwrap();
@@ -1120,9 +1382,12 @@ async fn pending_result_case(
         .await
         .unwrap();
     assert_eq!(
-        replayed.native_source_metadata(),
-        recorded.native_source_metadata()
+        replayed.native_source_metadata().len(),
+        recorded.native_source_metadata().len()
     );
+    for metadata in recorded.native_source_metadata() {
+        assert!(replayed.native_source_metadata().contains(metadata));
+    }
     assert!(!conditions[2].value());
     let sources: i64 =
         sqlx::query_scalar("SELECT count(*) FROM runtime_input_receipt_source WHERE receipt=$1")

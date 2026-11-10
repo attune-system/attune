@@ -171,6 +171,9 @@ pub struct ExecutionContext {
     /// Format for output parsing
     pub output_format: OutputFormat,
 
+    /// Immutable author-selected classification for raw output channels.
+    pub output_policy: attune_common::output_policy::ResolvedOutputPolicy,
+
     /// Action output schema used to protect mirrored container output.
     pub out_schema: Option<attune_common::value_schema::Contract>,
 
@@ -231,6 +234,9 @@ impl ExecutionContext {
             parameter_delivery: ParameterDelivery::default(),
             parameter_format: ParameterFormat::default(),
             output_format: OutputFormat::default(),
+            output_policy: attune_common::output_policy::OutputPolicy::default()
+                .resolve(None, OutputFormat::default())
+                .expect("public fixture output policy"),
             out_schema: None,
             cancel_token: None,
         }

@@ -872,11 +872,29 @@ pub async fn get_queue_item(
         item.payload =
             restore_queue_payload(&state, &user, &mut transaction, &queue, &item).await?;
     }
-    let response = queue_item_response_with_execution_visibility(&state, &user, item).await?;
+    let mut response = queue_item_response_with_execution_visibility(&state, &user, item).await?;
     if let Some(fence) = effect_fence {
         fence.ensure_fresh_on(&mut transaction).await?;
     }
     transaction.commit().await?;
+    if query.decrypt && !recorded::active(&user)? {
+        response.ack_summary = crate::secret_disclosure::reveal_authorized(
+            &state,
+            &user,
+            response.ack_summary,
+            attune_common::repositories::work_queue_output::ENTITY_QUEUE_ITEM_ACK_SUMMARY,
+            item_id,
+        )
+        .await?;
+        response.last_error = crate::secret_disclosure::reveal_authorized(
+            &state,
+            &user,
+            response.last_error,
+            attune_common::repositories::work_queue_output::ENTITY_QUEUE_ITEM_LAST_ERROR,
+            item_id,
+        )
+        .await?;
+    }
 
     Ok((StatusCode::OK, Json(ApiResponse::new(response))))
 }

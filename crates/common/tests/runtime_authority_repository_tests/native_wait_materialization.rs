@@ -1070,18 +1070,16 @@ pub(super) async fn empty_control_expiry(
             InputSitePurpose::Value,
         )
         .await?;
-        anyhow::ensure!(matches!(
-            Inputs::bind_public_field(
-                &mut tx,
-                &mut keyless,
-                "/task/native_recovery/probe",
-                &source_site
-            )
-            .await,
-            Err(attune_common::Error::PermissionDenied(_))
-        ));
-        // Ignoring the failed bind must not have inserted its public value.
-        anyhow::ensure!(Inputs::evaluate(&mut tx, keyless).await.is_err());
+        Inputs::bind_public_field(
+            &mut tx,
+            &mut keyless,
+            "/task/native_recovery/probe",
+            &source_site,
+        )
+        .await?;
+        let public_keyless = Inputs::evaluate(&mut tx, keyless).await?;
+        anyhow::ensure!(public_keyless.value() == &json!("public-probe"));
+        anyhow::ensure!(public_keyless.approval_deadline().is_none());
         let mut session = Inputs::begin_render(
             &mut tx,
             root,
@@ -1101,7 +1099,7 @@ pub(super) async fn empty_control_expiry(
         .await?;
         let rendered = Inputs::evaluate(&mut tx, session).await?;
         anyhow::ensure!(rendered.value() == &json!("public-probe"));
-        anyhow::ensure!(rendered.approval_deadline() == Some(expires_at));
+        anyhow::ensure!(rendered.approval_deadline().is_none());
         let destination = InputSite {
             execution: root,
             kind: InputEntityKind::WorkflowVariables,
@@ -1119,7 +1117,7 @@ pub(super) async fn empty_control_expiry(
         )
         .await?;
         receipt.ensure_fresh_on(&mut tx).await?;
-        anyhow::ensure!(receipt.approval_deadline() == Some(expires_at));
+        anyhow::ensure!(receipt.approval_deadline().is_none());
         Ok((
             destination,
             receipt.origin(),
@@ -1150,8 +1148,8 @@ pub(super) async fn empty_control_expiry(
             .await?;
         let receipt = Inputs::receipt_context(&mut tx, &public_site, &public_origin, key).await?;
         receipt.ensure_fresh_on(&mut tx).await?;
-        anyhow::ensure!(receipt.approval_deadline() == Some(expires_at));
-        anyhow::ensure!(receipt
+        anyhow::ensure!(receipt.approval_deadline().is_none());
+        anyhow::ensure!(!receipt
             .source_receipts()
             .iter()
             .any(|source| source.origin() == root_origin));
@@ -1194,13 +1192,15 @@ pub(super) async fn empty_control_expiry(
             Err(attune_common::Error::PermissionDenied(_))), "persisted CONTROL must reject original consent expiry");
         anyhow::ensure!(matches!(Accepted::revalidate_execution(&mut tx, child, key).await,
             Err(attune_common::Error::PermissionDenied(_))), "empty accepted input must not erase the expired root fence");
-        anyhow::ensure!(matches!(Inputs::receipt_context(&mut tx, &public_site, &public_origin, key).await,
-            Err(attune_common::Error::PermissionDenied(_))), "public receipt must retain the producer's original expiry");
+        let public=Inputs::receipt_context(&mut tx,&public_site,&public_origin,key).await?;
+        public.ensure_fresh_on(&mut tx).await?;
+        anyhow::ensure!(public.approval_deadline().is_none(),"completed public output must not inherit the producer's expired input CONTROL");
         let mut session = Inputs::begin_render(&mut tx, root, &binding.declaration_revision,
             &binding.source_path, &binding.expression, InputSitePurpose::Value).await?;
-        anyhow::ensure!(matches!(Inputs::bind_public_field_with_key(&mut tx, &mut session,
-            "/task/native_recovery/probe", &source_site, key).await, Err(attune_common::Error::PermissionDenied(_))),
-            "new public binding must not bypass original CONTROL expiry");
+        Inputs::bind_public_field_with_key(&mut tx,&mut session,"/task/native_recovery/probe",&source_site,key).await?;
+        let public=Inputs::evaluate(&mut tx,session).await?;
+        anyhow::ensure!(public.value()==&json!("public-probe"));
+        anyhow::ensure!(public.approval_deadline().is_none());
         Ok(())
     }.await;
     tx.rollback().await?;

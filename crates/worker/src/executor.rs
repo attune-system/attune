@@ -44,9 +44,7 @@ use attune_common::repositories::runtime_version::RuntimeVersionRepository;
 use attune_common::repositories::schema_contract::ActionSchemaBinding;
 use attune_common::repositories::{FindById, FindByRef, Update};
 use attune_common::runtime_detection::normalize_runtime_name;
-use attune_common::secret_values::{
-    prepare_secret_values, redact_bound_action_result, ENTITY_EXECUTION_RESULT,
-};
+use attune_common::secret_values::{prepare_secret_values, ENTITY_EXECUTION_RESULT};
 use attune_common::version_matching::{matches_constraint, select_best_version};
 use std::path::PathBuf as StdPathBuf;
 
@@ -192,8 +190,20 @@ fn record_runtime_log_capture(
     result: &ExecutionResult,
     allocation: Option<(bool, bool)>,
 ) {
-    // Structured stdout is removed from ExecutionResult.stdout after parsing.
-    // Allocation evidence, rather than that string, proves whether bytes arrived.
+    if result.stdout_truncated {
+        result_data["stdout_truncated"] = serde_json::json!(true);
+        result_data["stdout_bytes_truncated"] = serde_json::json!(result.stdout_bytes_truncated);
+    }
+    if result.stderr_truncated {
+        result_data["stderr_truncated"] = serde_json::json!(true);
+        result_data["stderr_bytes_truncated"] = serde_json::json!(result.stderr_bytes_truncated);
+    }
+    // Keep the bounded original diagnostic available for channel classification.
+    if !result.stderr.is_empty() {
+        result_data["stderr"] = serde_json::json!(result.stderr);
+    }
+    // Allocation evidence proves whether bytes arrived independently of bounded
+    // captures and parsed structured output.
     let state = |allocated: Option<bool>| {
         if result.logs_incomplete {
             "incomplete"
@@ -617,12 +627,6 @@ impl ActionExecutor {
             "Worker lifecycle phase"
         );
         let artifacts_started = std::time::Instant::now();
-        // Store artifacts
-        if let Err(e) = self.store_execution_artifacts(execution_id, &result).await {
-            warn!("Failed to store artifacts: {}", e);
-            // Don't fail the execution just because artifact storage failed
-        }
-
         // Finalize file-backed artifacts (stat files on disk and update size_bytes)
         if let Err(e) = self.finalize_file_artifacts(execution_id).await {
             warn!(
@@ -1292,7 +1296,8 @@ impl ActionExecutor {
             stderr_log_writer: Some(log_artifacts.stderr_writer),
             parameter_delivery: action.parameter_delivery,
             parameter_format: action.parameter_format,
-            output_format: action.output_format,
+            output_format: binding.output_format,
+            output_policy: binding.output_policy,
             out_schema: binding.output.clone(),
             cancel_token: None,
         };
@@ -1570,32 +1575,17 @@ impl ActionExecutor {
         Ok(result)
     }
 
-    /// Store execution artifacts (logs, results)
+    /// Store only the classified public result; raw output is a protected channel.
     async fn store_execution_artifacts(
         &self,
         execution_id: i64,
-        result: &ExecutionResult,
+        public_result: &JsonValue,
     ) -> Result<()> {
-        debug!("Storing artifacts for execution: {}", execution_id);
-
-        let mut conn = self.pool.acquire().await?;
-        let protected =
-            attune_common::repositories::delegated_execution::DelegatedExecutionRepository::find(
-                &mut conn,
-                execution_id,
-            )
-            .await?
-            .explicit;
-        if protected {
-            return Ok(());
-        }
-        // Store result if available
-        if let Some(result_data) = &result.result {
+        if let Some(data) = public_result.get("data") {
             self.artifact_manager
-                .store_result(execution_id, result_data)
+                .store_result(execution_id, data)
                 .await?;
         }
-
         Ok(())
     }
 
@@ -1627,26 +1617,23 @@ impl ActionExecutor {
             .await?
             .explicit;
         drop(connection);
-        let log_encryption_key = if delivery.is_some() || protected_delegation {
-            Some(
-                self.secret_manager
-                    .encryption_key()
-                    .ok_or_else(|| {
-                        Error::PermissionDenied("Recorded logs require encryption".into())
-                    })?
-                    .to_owned(),
-            )
-        } else {
-            None
-        };
-        let sensitive_inputs =
-            attune_common::value_schema::CompiledContract::new(&preparation.binding.input)
-                .map_err(|error| {
-                    Error::Validation(format!("Invalid stored input contract: {error}"))
-                })?
-                .declares_secrets()
-                || delivery.is_some()
-                || protected_delegation;
+        let policy = preparation.binding.output_policy;
+        let protected_stdout = policy.stdout != attune_common::output_policy::StdoutPolicy::Public;
+        let protected_stderr =
+            policy.stderr == attune_common::output_policy::OutputVisibility::Secret;
+        let log_encryption_key =
+            if delivery.is_some() || protected_delegation || protected_stdout || protected_stderr {
+                Some(
+                    self.secret_manager
+                        .encryption_key()
+                        .ok_or_else(|| {
+                            Error::PermissionDenied("Recorded logs require encryption".into())
+                        })?
+                        .to_owned(),
+                )
+            } else {
+                None
+            };
         let (stdout_mirror, stderr_mirror) =
             attune_common::runtime_log_mirror::select_mirror_sources(
                 attune_common::runtime_log_mirror::RuntimeLogSource::Execution {
@@ -1659,8 +1646,9 @@ impl ActionExecutor {
                     worker_name: self.worker_name.clone(),
                     worker_instance: self.worker_instance,
                 },
-                self.mirror_runtime_stdout_to_stdio && !sensitive_inputs,
-                self.mirror_runtime_stderr_to_stdio && !sensitive_inputs,
+                self.mirror_runtime_stdout_to_stdio
+                    && policy.stdout != attune_common::output_policy::StdoutPolicy::Secret,
+                self.mirror_runtime_stderr_to_stdio && !protected_stderr,
             );
         let execution = Arc::new(execution.clone());
         let make_writer = |stream: ExecutionLogArtifactStream,
@@ -2207,7 +2195,7 @@ impl ActionExecutor {
     async fn redact_execution_result_data(
         &self,
         execution_id: i64,
-        action: &Action,
+        _action: &Action,
         result_data: JsonValue,
         preparation: Option<&ExecutionPreparation>,
     ) -> Result<JsonValue> {
@@ -2218,7 +2206,6 @@ impl ActionExecutor {
                 execution_id,
             )
             .await?;
-        if let Some(origin)=attune_common::repositories::delegated_execution::DelegatedExecutionRepository::output_origin(&mut origin_tx,execution_id).await? { runtime_reads.push(origin); }
         origin_tx.commit().await?;
         let loaded_paths;
         let paths = match preparation.and_then(|context| context.parameter_secret_paths.as_deref())
@@ -2255,29 +2242,44 @@ impl ActionExecutor {
                 .cloned()
                 .map(attune_common::secret_provenance::SecretOrigin::Key),
         );
-        let original = result_data;
-        let (result_data, secret_inputs) = redact_bound_action_result(
-            original.clone(),
+        let mut origins = attune_common::secret_provenance::SecretProvenance {
+            origins: paths
+                .iter()
+                .map(
+                    |path| attune_common::secret_provenance::SecretOrigin::Entity {
+                        entity_type: attune_common::secret_values::ENTITY_EXECUTION_CONFIG.into(),
+                        entity_id: execution_id,
+                        path: path.clone(),
+                    },
+                )
+                .collect(),
+            templates: Vec::new(),
+        };
+        origins.origins.extend(runtime_reads);
+        let classified = attune_common::output_classification::classify_action_output(
+            result_data,
             binding.output.as_ref(),
-            action.output_format,
+            binding.output_format,
+            binding.output_policy,
             execution_id,
-            paths,
-            &runtime_origins,
+            &origins,
         )?;
-        let (result_data, secret_inputs) =
-            attune_common::secret_values::protect_runtime_read_result(
-                &original,
-                result_data,
-                secret_inputs,
-                &runtime_reads,
-            )?;
+        let result_data = classified.public_result;
+        if let Err(error) = self
+            .store_execution_artifacts(execution_id, &result_data)
+            .await
+        {
+            warn!(execution_id, %error, "Failed to store classified result artifact");
+        }
+        let secret_inputs = classified.structured_secrets;
+        let channel_inputs = classified.channel_secrets;
         if result_data.get("output_validation_warning").is_some() {
             warn!(
                 execution_id,
                 "Action output did not conform to its stored schema; successful status retained"
             );
         }
-        if secret_inputs.is_empty() {
+        if secret_inputs.is_empty() && channel_inputs.is_empty() {
             return Ok(result_data);
         }
 
@@ -2286,13 +2288,23 @@ impl ActionExecutor {
             .encryption_key()
             .ok_or_else(|| Error::Internal("No encryption key configured".to_string()))?;
         let prepared = prepare_secret_values(secret_inputs, encryption_key)?;
-        ExecutionSecretValueRepository::upsert_many(
-            &self.pool,
+        let channels = prepare_secret_values(channel_inputs, encryption_key)?;
+        let mut tx = self.pool.begin().await?;
+        ExecutionSecretValueRepository::replace_entity_with_conn(
+            &mut tx,
             ENTITY_EXECUTION_RESULT,
             execution_id,
             &prepared,
         )
         .await?;
+        ExecutionSecretValueRepository::replace_entity_with_conn(
+            &mut tx,
+            attune_common::output_classification::ENTITY_EXECUTION_OUTPUT_CHANNEL,
+            execution_id,
+            &channels,
+        )
+        .await?;
+        tx.commit().await?;
 
         Ok(result_data)
     }
@@ -2595,6 +2607,46 @@ mod tests {
     use attune_common::repositories::Create;
     use attune_common::test_database::TestDatabase;
     use chrono::Utc;
+
+    #[test]
+    fn successful_truncated_stdout_keeps_its_protection_reason() {
+        use attune_common::{
+            models::OutputFormat,
+            output_classification::classify_action_output,
+            output_policy::OutputPolicy,
+            secret_provenance::SecretProvenance,
+            value_schema::{compile_inline, SchemaContext},
+        };
+        let data = serde_json::json!({"token":"private","status":"visible"});
+        let mut result = ExecutionResult::success(data.to_string(), Some(data.clone()), 1);
+        result.stdout_truncated = true;
+        result.stdout_bytes_truncated = 9;
+        let mut envelope = serde_json::json!({"succeeded":true,"stdout":result.stdout,"data":data});
+        record_runtime_log_capture(&mut envelope, &result, Some((true, false)));
+        assert_eq!(envelope["stdout_bytes_truncated"], 9);
+        let contract = compile_inline(
+            "fixture.output",
+            SchemaContext::FlatDocument,
+            &serde_json::json!({"token":{"type":"string","secret":true}}),
+        )
+        .unwrap();
+        let classified = classify_action_output(
+            envelope,
+            Some(&contract),
+            OutputFormat::Json,
+            OutputPolicy::default()
+                .resolve(Some(&contract), OutputFormat::Json)
+                .unwrap(),
+            42,
+            &SecretProvenance::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            classified.public_result["output_channels"]["stdout"]["reason"],
+            "truncated"
+        );
+        assert_eq!(classified.public_result["data"]["status"], "visible");
+    }
 
     #[test]
     fn parsed_stdout_is_captured_even_when_the_result_stdout_string_is_empty() {

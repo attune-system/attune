@@ -1,3 +1,5 @@
+import type { OutputPolicy } from "@/api";
+
 /**
  * Workflow Builder Types
  *
@@ -281,6 +283,8 @@ export interface WorkflowBuilderState {
   parameters: Record<string, ParamDefinition>;
   /** Output schema (flat format) */
   output: Record<string, ParamDefinition>;
+  /** Authored channel choices stored on the companion action. */
+  outputPolicy?: OutputPolicy;
   /**
    * Output mapping — keys are output field names, values are template
    * expressions evaluated against the WorkflowContext on completion. Maps
@@ -320,6 +324,7 @@ export interface WorkflowYamlDefinition {
   version: string;
   parameters?: Record<string, unknown>;
   output?: Record<string, unknown>;
+  output_policy?: OutputPolicy;
   vars?: Record<string, unknown>;
   tasks: WorkflowYamlTasks;
   [key: string]: unknown;
@@ -359,6 +364,8 @@ export interface ActionYamlDefinition {
   workflow_file: string;
   parameters?: Record<string, unknown>;
   output?: Record<string, unknown>;
+  output_policy?: OutputPolicy;
+  output_format?: "json";
   tags?: string[];
 }
 
@@ -422,6 +429,8 @@ export type WorkflowYamlTasks =
 
 /** Request to save a workflow file to disk and sync to DB */
 export interface SaveWorkflowFileRequest {
+  /** Output channel choices captured by the companion action. */
+  output_policy?: OutputPolicy;
   /** Workflow name (becomes filename: {name}.workflow.yaml) */
   name: string;
   /** Human-readable label */
@@ -737,6 +746,8 @@ export function builderStateToGraph(
     "description",
     "parameters",
     "output",
+    "output_policy",
+    "output_format",
     "tags",
     "vars",
     "output_map",
@@ -783,6 +794,8 @@ export function builderStateToActionYaml(
     ref: `${state.packRef}.${state.name}`,
     label: state.label,
     workflow_file: `workflows/${state.name}.workflow.yaml`,
+    output_format: "json",
+    output_policy: { ...state.outputPolicy },
   };
 
   if (state.referenceVisibility !== "public") {
@@ -1176,6 +1189,7 @@ export function definitionToBuilderState(
       ParamDefinition
     >,
     output: (definition.output || {}) as Record<string, ParamDefinition>,
+    outputPolicy: { ...definition.output_policy },
     outputMap: (definition.output_map || {}) as Record<string, string>,
     vars: definition.vars || {},
     tasks,

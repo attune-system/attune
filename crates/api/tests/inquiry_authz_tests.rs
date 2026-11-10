@@ -104,6 +104,8 @@ async fn setup_pack_action(pool: &PgPool, suffix: &str) -> TResult<(Pack, Action
     let action = ActionRepository::create(
         pool,
         CreateActionInput {
+            output_policy: Default::default(),
+            output_format: Default::default(),
             r#ref: format!("{}.ask", pack.r#ref),
             pack: pack.id,
             pack_ref: pack.r#ref.clone(),

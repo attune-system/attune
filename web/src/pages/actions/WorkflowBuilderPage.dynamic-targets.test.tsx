@@ -14,6 +14,7 @@ const api = vi.hoisted(() => {
   };
   return {
     definition,
+    outputPolicy: {} as Record<string, string>,
     save: vi.fn<(request: unknown) => Promise<unknown>>(),
     update: vi.fn<(request: unknown) => Promise<unknown>>(),
     execute: vi.fn<(request: unknown) => Promise<{ data: { id: number } }>>(),
@@ -35,6 +36,7 @@ vi.mock("@/hooks/useActions", () => ({
         reference === "example.flow"
           ? {
               data: {
+                output_policy: api.outputPolicy,
                 reference_visibility: "public",
                 reference_allowed_pack_refs: [],
               },
@@ -176,6 +178,7 @@ describe("workflow builder finite target authoring", () => {
       },
     } satisfies Storage);
     api.definition = definition();
+    api.outputPolicy = {};
     api.save.mockReset().mockResolvedValue({});
     api.update.mockReset().mockResolvedValue({});
     api.execute.mockReset().mockResolvedValue({ data: { id: 42 } });
@@ -317,5 +320,23 @@ describe("workflow builder finite target authoring", () => {
     fireEvent.click(screen.getByRole("button", { name: "Run" }));
     await waitFor(() => expect(api.update).toHaveBeenCalledTimes(2));
     expect(api.execute).not.toHaveBeenCalled();
+  });
+  it("loads, edits, and saves the companion action output policy", async () => {
+    api.outputPolicy = { stdout: "secret", error: "public" };
+    showBuilder();
+    fireEvent.click(screen.getByRole("button", { name: /Workflow Options/ }));
+    expect(screen.getByLabelText("Stdout")).toHaveValue("secret");
+    fireEvent.change(screen.getByLabelText("Stdout"), {
+      target: { value: "sanitized" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+    await waitFor(() => expect(api.update).toHaveBeenCalled());
+    expect(api.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          output_policy: { stdout: "sanitized", error: "public" },
+        }),
+      }),
+    );
   });
 });

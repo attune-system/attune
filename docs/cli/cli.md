@@ -117,6 +117,36 @@ Container deployment surfaces:
 - Docker Compose includes an optional `mcp` profile-backed service on port `8090`.
 - The Helm chart includes an optional `mcp.enabled` deployment/service, disabled by default.
 
+#### File-only execution disclosure through MCP
+
+`executions_get` always requests the ordinary redacted execution view. To obtain
+an authorized plaintext execution without putting its content into the model
+context, call `executions_export` with an explicit output filepath:
+
+```json
+{"id": 123, "output_file": "/workspace/private/execution-123.json"}
+```
+
+The tool requests API disclosure and writes the full execution object, including
+`config`, `result`, and separate `revealed_output_channels`, to that file. Its MCP
+text and structured results contain only the absolute filepath, byte count, and
+write status. There is no content preview or resource attachment.
+
+The parent directory must already exist. Export creates a new file, never
+clobbers existing files or final symlinks, and uses mode `0600` at creation on
+Unix. Private-file export currently supports Unix hosts only; other platforms
+reject the operation before fetching plaintext or creating a file. CLI explicit
+terminal decryption remains available on all supported platforms. There is no
+temporary-file fallback. API denial creates no file, and errors
+do not echo remote response bodies. If a failed write cannot safely clean up its
+own partial file, the tool reports failure; it never deletes an unowned target.
+
+The filepath refers to the MCP server filesystem, including when using HTTP.
+Because export writes a local file, its annotation is `readOnlyHint: false` and
+the default read-only MCP policy excludes it. Enable it through an existing
+custom tool allowlist or `full-access`; normal Attune API permissions still apply.
+Do not load the exported secret file back into model context when processing it.
+
 #### User-managed MCP access policies
 
 MCP defaults to the built-in **read-only** access policy. Select `full-access`
@@ -676,6 +706,20 @@ attune execution list --limit 100
 ```bash
 attune execution show 123
 ```
+
+Secret parameters and result fields remain redacted unless explicitly requested:
+
+```bash
+attune execution show 123 --include-secret-values --output json
+attune execution result 123 --include-secret-values --format yaml
+# --decrypt is an alias for --include-secret-values.
+```
+
+The API still requires execution visibility, decrypt permission, and recorded
+source access. Public sanitized stdout stays in `result`; authorized original
+channels are returned separately as `revealed_output_channels`. With disclosure
+enabled, `execution result` prints an object containing `result` and
+`revealed_output_channels`. Partially authorized responses can retain redactions.
 
 #### View Logs
 ```bash

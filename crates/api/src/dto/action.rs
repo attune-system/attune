@@ -85,6 +85,14 @@ pub struct CreateActionRequest {
     #[schema(value_type = Object, nullable = true, example = json!({"message_id": {"type": "string", "description": "ID of the sent message", "required": true}}))]
     pub out_schema: Option<JsonValue>,
 
+    /// Output channel visibility choices, independent of secret inputs.
+    #[serde(default)]
+    pub output_policy: attune_common::output_policy::OutputPolicy,
+
+    /// Parsing format for stdout.
+    #[serde(default)]
+    pub output_format: attune_common::models::OutputFormat,
+
     /// Hint that this action may invoke the Attune MCP server and spawn child executions.
     /// When true, consumers (UI, CLI, timeline charts) render subtask views eagerly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -196,6 +204,12 @@ pub struct UpdateActionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Object, nullable = true)]
     pub out_schema: Option<JsonValue>,
+
+    /// Replace output channel visibility choices; an empty object restores defaults.
+    pub output_policy: Option<attune_common::output_policy::OutputPolicy>,
+
+    /// Parsing format for stdout.
+    pub output_format: Option<attune_common::models::OutputFormat>,
 
     /// Hint that this action may invoke the Attune MCP server and spawn child executions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -339,6 +353,10 @@ pub struct ActionResponse {
     /// Output schema
     #[schema(value_type = Object, nullable = true)]
     pub out_schema: Option<JsonValue>,
+
+    /// Authored output channel policy; defaults resolve under the stored schema.
+    pub output_policy: attune_common::output_policy::OutputPolicy,
+    pub output_format: attune_common::models::OutputFormat,
 
     /// Workflow definition ID (non-null if this action is a workflow)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -550,6 +568,8 @@ impl From<attune_common::models::action::Action> for ActionResponse {
             worker_affinity,
             param_schema: action.param_schema,
             out_schema: action.out_schema,
+            output_policy: action.output_policy,
+            output_format: action.output_format,
             workflow_def: action.workflow_def,
             is_adhoc: action.is_adhoc,
             accesses_mcp: action.accesses_mcp,
@@ -808,6 +828,8 @@ mod tests {
             worker_affinity: WorkerAffinity::default(),
             param_schema: None,
             out_schema: None,
+            output_policy: Default::default(),
+            output_format: Default::default(),
             accesses_mcp: None,
             default_execution_permission_set_refs: Vec::new(),
             reference_visibility: None,
@@ -840,6 +862,8 @@ mod tests {
             worker_affinity: WorkerAffinity::default(),
             param_schema: None,
             out_schema: None,
+            output_policy: Default::default(),
+            output_format: Default::default(),
             accesses_mcp: None,
             default_execution_permission_set_refs: Vec::new(),
             reference_visibility: None,
@@ -870,6 +894,8 @@ mod tests {
             worker_affinity: None,
             param_schema: None,
             out_schema: None,
+            output_policy: None,
+            output_format: None,
             accesses_mcp: None,
             default_execution_permission_set_refs: None,
             reference_visibility: None,

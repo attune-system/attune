@@ -154,6 +154,8 @@ tasks:
                 ActionRepository::create(
                     pool,
                     CreateActionInput {
+                        output_policy: Default::default(),
+                        output_format: Default::default(),
                         r#ref: format!("{}.{}", pack.r#ref, name),
                         pack: pack.id,
                         pack_ref: pack.r#ref.clone(),

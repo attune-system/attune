@@ -30,6 +30,8 @@ async fn adhoc_target_under_recorded_parent_cannot_reopen_without_child_admissio
     let action = ActionRepository::create(
         pool,
         CreateActionInput {
+            output_policy: Default::default(),
+            output_format: Default::default(),
             r#ref: "receipt_adhoc_target_it.target".into(),
             pack: pack.id,
             pack_ref: pack.r#ref.clone(),

@@ -5788,6 +5788,8 @@ mod tests {
         let action = ActionRepository::create(
             &mut *tx,
             CreateActionInput {
+                output_policy: Default::default(),
+                output_format: Default::default(),
                 r#ref: "log_binding.echo".into(),
                 pack: pack.id,
                 pack_ref: pack.r#ref.clone(),

@@ -1651,6 +1651,13 @@ impl TransactionalPackComponentLoader<'_> {
                 &data,
                 crate::schema_type::OUTPUT_SCHEMA_FIELDS,
             )?;
+            let output_policy: crate::output_policy::OutputPolicy = data
+                .get("output_policy")
+                .cloned()
+                .map(serde_yaml_ng::from_value)
+                .transpose()
+                .map_err(|_| Error::validation("Invalid action output_policy"))?
+                .unwrap_or_default();
             let enabled = data.get("enabled").and_then(|v| v.as_bool());
 
             let parameter_delivery = data
@@ -1761,6 +1768,17 @@ impl TransactionalPackComponentLoader<'_> {
                 })?;
             let timeout_seconds = parse_timeout_seconds(data.get("timeout_seconds"))?;
 
+            crate::repositories::validate_action_output_policy(
+                self.connection,
+                self.pack_id,
+                &action_ref,
+                out_schema.as_ref(),
+                &output_policy,
+                output_format.parse().map_err(Error::validation)?,
+                Some(&self.candidate_schema_registry),
+            )
+            .await?;
+
             // Check if action already exists — update in place if so
             if let Some(existing) =
                 ActionRepository::find_by_ref_including_retired(&mut *self.connection, &action_ref)
@@ -1792,6 +1810,7 @@ impl TransactionalPackComponentLoader<'_> {
                     worker_affinity: Some(worker_affinity.clone()),
                     param_schema,
                     out_schema,
+                    output_policy: Some(output_policy.clone()),
                     parameter_delivery: Some(parameter_delivery),
                     parameter_format: Some(parameter_format),
                     output_format: Some(output_format),
@@ -1879,9 +1898,9 @@ impl TransactionalPackComponentLoader<'_> {
                     output_format, accesses_mcp, default_execution_permission_set_refs,
                     reference_visibility, reference_allowed_pack_refs,
                     log_retention_policy, log_retention_limit,
-                    artifact_retention_policy, artifact_retention_limit, timeout_seconds
+                    artifact_retention_policy, artifact_retention_limit, timeout_seconds, output_policy
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
                 RETURNING id
                 "#,
             )
@@ -1913,6 +1932,7 @@ impl TransactionalPackComponentLoader<'_> {
             .bind(artifact_retention_policy)
             .bind(artifact_retention_limit)
             .bind(timeout_seconds)
+            .bind(sqlx::types::Json(&output_policy))
             .fetch_one(&mut *self.connection)
             .await;
 

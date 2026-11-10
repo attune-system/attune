@@ -140,6 +140,53 @@ impl PreparedExecutionContent {
         )?)
     }
 
+    /// Restore separately addressed raw channels; never replace sanitized stdout.
+    pub async fn restore_output_channels(
+        &self,
+        conn: &mut PgConnection,
+        result: Option<&serde_json::Value>,
+    ) -> ApiResult<Option<serde_json::Value>> {
+        use attune_common::output_classification::{
+            output_channel_projections, ENTITY_EXECUTION_OUTPUT_CHANNEL,
+        };
+        let result = result.cloned().unwrap_or(serde_json::Value::Null);
+        let projections = output_channel_projections(&result, self.execution)?;
+        let frozen = self
+            .fields
+            .get(ENTITY_EXECUTION_OUTPUT_CHANNEL)
+            .ok_or_else(|| ApiError::Forbidden("Execution channel content unavailable".into()))?;
+        let expected = projections
+            .keys()
+            .map(|channel| channel.json_path())
+            .collect::<std::collections::BTreeSet<_>>();
+        let actual = frozen
+            .iter()
+            .map(|field| field.json_path.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if expected != actual || actual.len() != frozen.len() {
+            return Err(ApiError::Forbidden(
+                "Execution channel content unavailable".into(),
+            ));
+        }
+        if projections.is_empty() {
+            return Ok(None);
+        }
+        let mut value = serde_json::Map::new();
+        for channel in projections.keys() {
+            value.insert(
+                channel.as_str().into(),
+                attune_common::secret_values::redaction_marker(),
+            );
+        }
+        self.restore_entity(
+            conn,
+            ENTITY_EXECUTION_OUTPUT_CHANNEL,
+            serde_json::Value::Object(value),
+        )
+        .await
+        .map(Some)
+    }
+
     pub async fn ensure_fresh_on(&self, conn: &mut PgConnection) -> ApiResult<()> {
         self.budget.ensure_receipts_fresh_on(conn).await?;
         self.authority.ensure_fresh_on(conn).await?;
@@ -179,6 +226,7 @@ pub async fn authorize_execution_content_prepared(
     for entity in [
         attune_common::secret_values::ENTITY_EXECUTION_CONFIG,
         attune_common::secret_values::ENTITY_EXECUTION_RESULT,
+        attune_common::output_classification::ENTITY_EXECUTION_OUTPUT_CHANNEL,
     ] {
         let frozen = attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::find_stored_by_entity(&mut *conn, entity, execution_id).await?;
         for field in &frozen {
@@ -288,29 +336,40 @@ pub(crate) async fn execution_content_frontier(
     Vec<attune_common::repositories::execution_secret_value::SecretProvenanceRow>,
     crate::recorded_disclosure::OriginBudget,
 )> {
+    let (origins, protected) = if let Some(stream) = self_log {
+        execution_log_content_origins(
+            conn,
+            execution_id,
+            stream,
+            authority.credential_binding().execution_id == execution_id,
+        )
+        .await?
+    } else {
+        attune_common::repositories::schema_contract::SchemaContractRepository::find(
+            &mut *conn,
+            attune_common::repositories::schema_contract::BindingOwner::Execution,
+            execution_id,
+        )
+        .await?
+        .ok_or_else(|| ApiError::Forbidden("Execution disclosure binding unavailable".into()))?;
+        (
+            execution_content_origins(conn, execution_id, None).await?,
+            true,
+        )
+    };
     crate::recorded_disclosure::require_target(
         conn,
         authority,
         RuntimeTarget::Execution(execution_id),
-        &[Action::Read, Action::Decrypt],
-    )
-    .await?;
-    let binding = attune_common::repositories::schema_contract::SchemaContractRepository::find(
-        &mut *conn,
-        attune_common::repositories::schema_contract::BindingOwner::Execution,
-        execution_id,
-    )
-    .await?
-    .ok_or_else(|| ApiError::Forbidden("Execution disclosure binding unavailable".into()))?;
-    let origins = execution_content_origins(
-        conn,
-        execution_id,
-        self_log.filter(|_| authority.credential_binding().execution_id == execution_id),
+        if protected {
+            &[Action::Read, Action::Decrypt]
+        } else {
+            &[Action::Read]
+        },
     )
     .await?;
     crate::recorded_disclosure::authorize_origins_bounded(conn, authority, &origins, &mut budget)
         .await?;
-    crate::secret_disclosure::runtime_log_requires_disclosure(&binding, &origins)?;
     authority.ensure_fresh_on(conn).await?;
     Ok((origins, budget))
 }
@@ -334,6 +393,46 @@ pub(crate) async fn execution_content_origins(
         });
     }
     Ok(origins)
+}
+
+pub(crate) async fn execution_log_content_origins(
+    conn: &mut PgConnection,
+    execution: i64,
+    stream: i64,
+    self_read: bool,
+) -> ApiResult<(
+    Vec<attune_common::repositories::execution_secret_value::SecretProvenanceRow>,
+    bool,
+)> {
+    use attune_common::repositories::{
+        artifact::ArtifactVersionRepository,
+        log_stream::LogStreamRepository,
+        schema_contract::{BindingOwner, SchemaContractRepository},
+    };
+    let log = LogStreamRepository::find_by_id(conn, stream).await?;
+    let version = ArtifactVersionRepository::find_by_id(&mut *conn, log.artifact_version)
+        .await?
+        .ok_or_else(|| ApiError::Forbidden("Log source unavailable".into()))?;
+    if version.execution != Some(execution) {
+        return Err(ApiError::Forbidden("Log source changed".into()));
+    }
+    let binding = SchemaContractRepository::find(conn, BindingOwner::Execution, execution)
+        .await?
+        .ok_or_else(|| ApiError::Forbidden("Log output binding unavailable".into()))?;
+    let artifact = ArtifactRepository::find_by_id(&mut *conn, version.artifact)
+        .await?
+        .ok_or_else(|| ApiError::Forbidden("Log artifact unavailable".into()))?;
+    let channel = crate::secret_disclosure::runtime_log_artifact_channel(&artifact, &version)?;
+    let protected =
+        crate::secret_disclosure::runtime_log_channel_requires_disclosure(&binding, channel);
+    if !protected {
+        return Ok((Vec::new(), false));
+    }
+    let rows = execution_content_origins(conn, execution, self_read.then_some(stream)).await?;
+    Ok((
+        crate::secret_disclosure::runtime_log_channel_origins(&rows, channel),
+        true,
+    ))
 }
 
 pub(crate) async fn artifact_mutation(

@@ -346,14 +346,14 @@ impl BoundedLogFileWriter {
         Ok(())
     }
 
+    /// Retain attribution for either live public or delayed sanitized output.
+    /// A source is not permission to mirror raw bytes: the process executor must
+    /// apply the immutable per-channel output policy independently of encryption.
     pub fn with_mirror_source(
         mut self,
         source: Option<attune_common::runtime_log_mirror::RuntimeLogSource>,
     ) -> Self {
         self.mirror_source = source;
-        if self.encryption.is_some() {
-            self.mirror_source = None;
-        }
         self
     }
 
@@ -367,7 +367,6 @@ impl BoundedLogFileWriter {
                 pending: Vec::with_capacity(attune_common::runtime_read_log::FRAME_BYTES),
                 totals: attune_common::runtime_log_completion::FrameTotals::default(),
             });
-            self.mirror_source = None;
         }
         self
     }
@@ -823,8 +822,23 @@ mod tests {
             "recorded/log.txt".into(),
         );
         let key = "recorded-log-test-key-at-least-32-characters";
+        let source = attune_common::runtime_log_mirror::RuntimeLogSource::Execution {
+            execution_id: 7,
+            parent_execution_id: None,
+            action_ref: "test.action".into(),
+            pack_ref: "test".into(),
+            trace_tag: None,
+            worker_id: 1,
+            worker_name: "test-worker".into(),
+            worker_instance: uuid::Uuid::nil(),
+        };
         let mut writer = BoundedLogFileWriter::from_shared_file_writer(inner, 1024, true, 100)
-            .with_encryption(Some(key), 7, 42);
+            .with_mirror_source(Some(source.clone()))
+            .with_encryption(Some(key), 7, 42)
+            .with_mirror_source(Some(source));
+        // Storage encryption must not discard the source needed for a public
+        // sanitized mirror. The process executor independently enforces policy.
+        assert!(writer.mirror_source().is_some());
         for byte in b"sdk-secret" {
             writer.write_all(&[*byte]).await.unwrap();
         }

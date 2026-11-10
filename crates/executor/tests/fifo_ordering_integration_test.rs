@@ -105,6 +105,8 @@ async fn _create_test_runtime(pool: &PgPool, suffix: &str) -> i64 {
 /// Test helper to create a test action
 async fn create_test_action(pool: &PgPool, pack_id: i64, pack_ref: &str, suffix: &str) -> i64 {
     let action_input = CreateActionInput {
+        output_policy: Default::default(),
+        output_format: Default::default(),
         r#ref: format!("{}.action_{}", pack_ref, suffix),
         pack: pack_id,
         pack_ref: pack_ref.to_string(),

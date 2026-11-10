@@ -69,6 +69,8 @@ impl Fixture {
         let action = ActionRepository::create(
             db.pool(),
             CreateActionInput {
+                output_policy: Default::default(),
+                output_format: Default::default(),
                 r#ref: format!("{}.run", pack.r#ref),
                 pack: pack.id,
                 pack_ref: pack.r#ref.clone(),

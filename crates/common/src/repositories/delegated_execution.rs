@@ -26,7 +26,7 @@ pub struct ExecutionAuthoritySelection {
 }
 pub struct DelegatedExecutionRepository;
 
-/// A native consumer receives controls, never the decrypted private fields.
+/// Validated internal acknowledgement; copied details must use protected queue storage.
 pub enum ProtectedQueueAck {
     Unprotected,
     Invalid,
@@ -35,15 +35,11 @@ pub enum ProtectedQueueAck {
 
 impl ProtectedQueueAck {
     fn validate(value: &serde_json::Value, items: &[Id], version: i32) -> Self {
-        let Ok(Some(mut ack)) = crate::models::WorkQueueAck::from_execution_result(value) else {
+        let Ok(Some(ack)) = crate::models::WorkQueueAck::from_execution_result(value) else {
             return Self::Invalid;
         };
         if ack.validate_for_items(items, version).is_err() {
             return Self::Invalid;
-        }
-        for item in &mut ack.items {
-            item.summary = None;
-            item.error = None;
         }
         Self::Controls(ack)
     }
@@ -337,7 +333,7 @@ impl DelegatedExecutionRepository {
         encryption_key: Option<&str>,
     ) -> Result<ProtectedQueueAck> {
         use crate::secret_values::{restore_secret_values, ENTITY_EXECUTION_RESULT};
-        let selected = Self::require_closed_output(conn, execution).await?;
+        Self::require_closed_output(conn, execution).await?;
         let mut secrets =
             super::execution_secret_value::ExecutionSecretValueRepository::find_stored_by_entity(
                 &mut *conn,
@@ -351,16 +347,9 @@ impl DelegatedExecutionRepository {
                 || secret.json_path.starts_with("/queue_ack/")
         });
         if secrets.is_empty() {
-            return Ok(
-                if selected.selected_refs.is_empty() || selection_producer(&selected)? == "workflow"
-                {
-                    ProtectedQueueAck::Unprotected
-                } else {
-                    // API-capable opaque output is protected even when provenance
-                    // is missing; absence must never select public consumption.
-                    ProtectedQueueAck::Invalid
-                },
-            );
+            // Output classification is authored, not inferred from selected API
+            // permissions. A closed execution can have an entirely public ack.
+            return Ok(ProtectedQueueAck::Unprotected);
         }
         crate::key_access::authorize_execution_control_origins(conn, execution, &secrets).await?;
         let source = ExecutionRepository::find_by_id(&mut *conn, execution)
@@ -766,7 +755,7 @@ mod control_tests {
     use serde_json::json;
 
     #[test]
-    fn protected_ack_exposes_only_validated_protocol_controls() {
+    fn protected_ack_keeps_details_for_protected_internal_copy() {
         let original = json!({"queue_ack":{"version":1,"items":[{"id":10,"status":"completed","summary":{"value":"private"},"error":{"value":"private"}}]}});
         let ProtectedQueueAck::Controls(ack) = ProtectedQueueAck::validate(&original, &[10], 1)
         else {
@@ -777,7 +766,8 @@ mod control_tests {
             ack.items[0].status,
             crate::models::WorkQueueAckItemStatus::Completed
         );
-        assert!(ack.items[0].summary.is_none() && ack.items[0].error.is_none());
+        assert_eq!(ack.items[0].summary.as_ref().unwrap()["value"], "private");
+        assert_eq!(ack.items[0].error.as_ref().unwrap()["value"], "private");
         assert!(original.to_string().contains("private"));
     }
 

@@ -1,3 +1,5 @@
+import type { OutputPolicy } from "@/api";
+import OutputPolicyEditor from "@/components/common/OutputPolicyEditor";
 import { useState } from "react";
 import {
   Pencil,
@@ -27,6 +29,8 @@ interface WorkflowInputsPanelProps {
   parameters: Record<string, ParamDefinition>;
   output: Record<string, ParamDefinition>;
   outputMap: Record<string, string>;
+  outputPolicy: OutputPolicy;
+  onOutputPolicyChange: (policy: OutputPolicy) => void;
   onLabelChange: (label: string) => void;
   onVersionChange: (version: string) => void;
   onDescriptionChange: (description: string) => void;
@@ -42,6 +46,7 @@ interface WorkflowInputsPanelProps {
 type ModalTarget = "parameters" | "output" | null;
 
 interface OutputRow {
+  authored?: ParamDefinition;
   key: string;
   type: string;
   required: boolean;
@@ -70,6 +75,7 @@ function buildOutputRows(
   for (const [key, def] of Object.entries(schema)) {
     seen.add(key);
     rows.push({
+      authored: { ...def },
       key,
       type: typeof def.type === "string" ? def.type : "string",
       required: !!def.required,
@@ -103,10 +109,19 @@ function rowsToSchemaAndMap(rows: OutputRow[]): {
   for (const row of rows) {
     const key = row.key.trim();
     if (!key) continue;
-    const def: ParamDefinition = { type: row.type || "string" };
-    if (row.required) def.required = true;
+    const def = { ...row.authored } as ParamDefinition;
+    const authoredType =
+      typeof row.authored?.type === "string" ? row.authored.type : "string";
+    if (!row.authored || row.type !== authoredType)
+      def.type = row.type || "string";
+    if (!Array.isArray(row.authored?.required)) {
+      if (row.required) def.required = true;
+      else delete def.required;
+    }
     if (row.secret) def.secret = true;
+    else delete def.secret;
     if (row.description.trim()) def.description = row.description.trim();
+    else delete def.description;
     schema[key] = def;
     if (row.expression.length > 0) {
       outputMap[key] = row.expression;
@@ -441,6 +456,8 @@ export default function WorkflowInputsPanel({
   parameters,
   output,
   outputMap,
+  outputPolicy,
+  onOutputPolicyChange,
   onLabelChange,
   onVersionChange,
   onDescriptionChange,
@@ -453,6 +470,7 @@ export default function WorkflowInputsPanel({
   onOutputMapChange,
 }: WorkflowInputsPanelProps) {
   const [modalTarget, setModalTarget] = useState<ModalTarget>(null);
+  const [advancedOutputSchema, setAdvancedOutputSchema] = useState(false);
 
   // Draft state for the schema modal so changes only apply on confirm
   const [draftSchema, setDraftSchema] = useState<
@@ -463,6 +481,7 @@ export default function WorkflowInputsPanel({
   const [draftOutputRows, setDraftOutputRows] = useState<OutputRow[]>([]);
 
   const openModal = (target: ModalTarget) => {
+    setAdvancedOutputSchema(false);
     if (target === "parameters") {
       setDraftSchema({ ...parameters });
     } else if (target === "output") {
@@ -715,6 +734,12 @@ export default function WorkflowInputsPanel({
               emptyMessage="Add output fields"
               onEdit={() => openModal("output")}
             />
+            <div className="mt-3">
+              <OutputPolicyEditor
+                value={outputPolicy}
+                onChange={onOutputPolicyChange}
+              />
+            </div>
           </div>
         </div>
       </div>
@@ -752,10 +777,42 @@ export default function WorkflowInputsPanel({
             {/* Body */}
             <div className="flex-1 overflow-y-auto px-6 py-4">
               {modalTarget === "output" ? (
-                <CombinedOutputEditor
-                  rows={draftOutputRows}
-                  onChange={setDraftOutputRows}
-                />
+                <div className="space-y-4">
+                  <button
+                    type="button"
+                    onClick={() => setAdvancedOutputSchema((open) => !open)}
+                    className="text-sm font-medium text-blue-700"
+                  >
+                    {advancedOutputSchema
+                      ? "Edit fields and expressions"
+                      : "Edit nested output schema and secret fields"}
+                  </button>
+                  {advancedOutputSchema ? (
+                    <div>
+                      <p className="mb-2 text-xs text-gray-500">
+                        Mark nested object or array fields as secret. Output
+                        expressions are preserved.
+                      </p>
+                      <SchemaBuilder
+                        placeholder='{"account": {"type": "object", "properties": {"token": {"type": "string", "secret": true}}}}'
+                        value={rowsToSchemaAndMap(draftOutputRows).schema}
+                        onChange={(schema) =>
+                          setDraftOutputRows(
+                            buildOutputRows(
+                              schema as Record<string, ParamDefinition>,
+                              rowsToSchemaAndMap(draftOutputRows).outputMap,
+                            ),
+                          )
+                        }
+                      />
+                    </div>
+                  ) : (
+                    <CombinedOutputEditor
+                      rows={draftOutputRows}
+                      onChange={setDraftOutputRows}
+                    />
+                  )}
+                </div>
               ) : (
                 <SchemaBuilder
                   value={draftSchema}

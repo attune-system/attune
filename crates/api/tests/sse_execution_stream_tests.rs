@@ -66,6 +66,8 @@ async fn setup_test_pack_and_action(pool: &PgPool) -> Result<(Pack, Action)> {
     let pack = PackRepository::create(pool, pack_input).await?;
 
     let action_input = CreateActionInput {
+        output_policy: Default::default(),
+        output_format: Default::default(),
         r#ref: format!("{}.test_action", pack.r#ref),
         pack: pack.id,
         pack_ref: pack.r#ref.clone(),

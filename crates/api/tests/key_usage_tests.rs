@@ -1478,6 +1478,8 @@ async fn execution_action(
     let action = attune_common::repositories::action::ActionRepository::create(
         &ctx.pool,
         attune_common::repositories::action::CreateActionInput {
+            output_policy: Default::default(),
+            output_format: Default::default(),
             r#ref: format!("{pack_ref}.login"),
             pack: pack.id,
             pack_ref: pack_ref.into(),

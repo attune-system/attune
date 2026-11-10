@@ -48,6 +48,7 @@ struct CompanionActionUpdate<'a> {
     description: Option<&'a str>,
     param_schema: Option<&'a serde_json::Value>,
     out_schema: Option<&'a serde_json::Value>,
+    output_policy: Option<&'a attune_common::output_policy::OutputPolicy>,
     reference_visibility: Option<ActionReferenceVisibility>,
     reference_allowed_pack_refs: Option<&'a [String]>,
 }
@@ -606,6 +607,7 @@ pub async fn create_workflow(
         "workflow",
         request.param_schema.as_ref(),
         request.out_schema.as_ref(),
+        &request.output_policy,
         ActionReferenceVisibility::Public,
         &[],
         workflow.id,
@@ -662,7 +664,8 @@ pub async fn update_workflow(
 
     let metadata_changed = request.definition.is_some()
         || request.param_schema.is_some()
-        || request.out_schema.is_some();
+        || request.out_schema.is_some()
+        || request.output_policy.is_some();
     let mut tx = state.db.begin().await?;
     attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
         .await?;
@@ -701,6 +704,7 @@ pub async fn update_workflow(
             description: request.description.as_deref(),
             param_schema: request.param_schema.as_ref(),
             out_schema: request.out_schema.as_ref(),
+            output_policy: request.output_policy.as_ref(),
             reference_visibility: None,
             reference_allowed_pack_refs: None,
         },
@@ -851,6 +855,7 @@ pub async fn save_workflow_file(
         &entrypoint,
         request.param_schema.as_ref(),
         request.out_schema.as_ref(),
+        &request.output_policy,
         request
             .reference_visibility
             .unwrap_or(ActionReferenceVisibility::Public),
@@ -964,6 +969,7 @@ pub async fn update_workflow_file(
             description: request.description.as_deref(),
             param_schema: request.param_schema.as_ref(),
             out_schema: request.out_schema.as_ref(),
+            output_policy: Some(&request.output_policy),
             reference_visibility: request.reference_visibility,
             reference_allowed_pack_refs: Some(&request.reference_allowed_pack_refs),
         },
@@ -981,6 +987,7 @@ pub async fn update_workflow_file(
             &format!("workflows/{}.workflow.yaml", request.name),
             request.param_schema.as_ref(),
             request.out_schema.as_ref(),
+            &request.output_policy,
             request
                 .reference_visibility
                 .unwrap_or(ActionReferenceVisibility::Public),
@@ -1003,6 +1010,7 @@ pub async fn update_workflow_file(
             || previous_companion.as_ref().is_none_or(|previous| {
                 previous.param_schema != action.param_schema
                     || previous.out_schema != action.out_schema
+                    || previous.output_policy != action.output_policy
                     || previous.reference_visibility != action.reference_visibility
                     || previous.reference_allowed_pack_refs != action.reference_allowed_pack_refs
             });
@@ -1209,7 +1217,14 @@ fn build_action_yaml(pack_ref: &str, request: &SaveWorkflowFileRequest) -> Strin
         }
     }
 
+    lines.push(format!(
+        "output_policy: {}",
+        serde_json::to_string(&request.output_policy).expect("serializable output policy")
+    ));
+    lines.push("output_format: json".into());
+
     // Tags
+
     if let Some(ref tags) = request.tags {
         if !tags.is_empty() {
             lines.push(String::new());
@@ -1269,6 +1284,7 @@ async fn create_companion_action(
     entrypoint: &str,
     param_schema: Option<&serde_json::Value>,
     out_schema: Option<&serde_json::Value>,
+    output_policy: &attune_common::output_policy::OutputPolicy,
     reference_visibility: ActionReferenceVisibility,
     reference_allowed_pack_refs: &[String],
     workflow_def_id: i64,
@@ -1289,6 +1305,8 @@ async fn create_companion_action(
         worker_affinity: serde_json::json!({}),
         param_schema: param_schema.cloned(),
         out_schema: out_schema.cloned(),
+        output_policy: output_policy.clone(),
+        output_format: attune_common::models::OutputFormat::Json,
         is_adhoc: true, // API-authored workflows are not pack release projections.
         accesses_mcp: false,
         default_execution_permission_set_refs: Vec::new(),
@@ -1409,6 +1427,7 @@ async fn update_companion_action(
             worker_affinity: None,
             param_schema: update.param_schema.cloned(),
             out_schema: update.out_schema.cloned(),
+            output_policy: update.output_policy.cloned(),
             parameter_delivery: None,
             parameter_format: None,
             output_format: None,

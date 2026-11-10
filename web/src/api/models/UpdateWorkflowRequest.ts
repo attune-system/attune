@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { OutputPolicy } from "./OutputPolicy";
 /**
  * Request DTO for updating a workflow
  */
@@ -24,6 +25,7 @@ export type UpdateWorkflowRequest = {
    * Output schema
    */
   out_schema: Record<string, any> | null;
+  output_policy?: null | OutputPolicy;
   /**
    * Parameter schema (StackStorm-style with inline required/secret)
    */

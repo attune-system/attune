@@ -1271,6 +1271,7 @@ impl Runtime for ProcessRuntime {
             context.max_stdout_bytes,
             context.max_stderr_bytes,
             context.output_format,
+            context.output_policy,
             context.out_schema.as_ref(),
             context.cancel_token.clone(),
             context.stdout_log_path.as_deref(),
@@ -1828,6 +1829,7 @@ mod tests {
             parameter_delivery: ParameterDelivery::default(),
             parameter_format: ParameterFormat::default(),
             output_format: OutputFormat::default(),
+            output_policy: attune_common::output_policy::ResolvedOutputPolicy::default(),
             out_schema: None,
             cancel_token: None,
         };
@@ -1869,6 +1871,7 @@ mod tests {
             parameter_delivery: ParameterDelivery::default(),
             parameter_format: ParameterFormat::default(),
             output_format: OutputFormat::default(),
+            output_policy: attune_common::output_policy::ResolvedOutputPolicy::default(),
             out_schema: None,
             cancel_token: None,
         };
@@ -1910,6 +1913,7 @@ mod tests {
             parameter_delivery: ParameterDelivery::default(),
             parameter_format: ParameterFormat::default(),
             output_format: OutputFormat::default(),
+            output_policy: attune_common::output_policy::ResolvedOutputPolicy::default(),
             out_schema: None,
             cancel_token: None,
         };
@@ -2007,6 +2011,7 @@ mod tests {
             parameter_delivery: ParameterDelivery::default(),
             parameter_format: ParameterFormat::default(),
             output_format: OutputFormat::default(),
+            output_policy: attune_common::output_policy::ResolvedOutputPolicy::default(),
             out_schema: None,
             cancel_token: None,
         };
@@ -2072,6 +2077,7 @@ mod tests {
             parameter_delivery: ParameterDelivery::default(),
             parameter_format: ParameterFormat::default(),
             output_format: OutputFormat::default(),
+            output_policy: attune_common::output_policy::ResolvedOutputPolicy::default(),
             out_schema: None,
             cancel_token: None,
         };
@@ -2158,6 +2164,7 @@ mod tests {
             parameter_delivery: ParameterDelivery::default(),
             parameter_format: ParameterFormat::default(),
             output_format: OutputFormat::default(),
+            output_policy: attune_common::output_policy::ResolvedOutputPolicy::default(),
             out_schema: None,
             cancel_token: None,
         };
@@ -2243,6 +2250,7 @@ mod tests {
             parameter_delivery: ParameterDelivery::default(),
             parameter_format: ParameterFormat::default(),
             output_format: OutputFormat::default(),
+            output_policy: attune_common::output_policy::ResolvedOutputPolicy::default(),
             out_schema: None,
             cancel_token: None,
         };
@@ -2291,6 +2299,7 @@ mod tests {
             parameter_delivery: ParameterDelivery::default(),
             parameter_format: ParameterFormat::default(),
             output_format: OutputFormat::default(),
+            output_policy: attune_common::output_policy::ResolvedOutputPolicy::default(),
             out_schema: None,
             cancel_token: None,
         };
@@ -2351,6 +2360,7 @@ mod tests {
             parameter_delivery: ParameterDelivery::default(),
             parameter_format: ParameterFormat::default(),
             output_format: OutputFormat::default(),
+            output_policy: attune_common::output_policy::ResolvedOutputPolicy::default(),
             out_schema: None,
             cancel_token: None,
         };
@@ -2410,6 +2420,7 @@ mod tests {
             parameter_delivery: ParameterDelivery::default(),
             parameter_format: ParameterFormat::default(),
             output_format: OutputFormat::default(),
+            output_policy: attune_common::output_policy::ResolvedOutputPolicy::default(),
             out_schema: None,
             cancel_token: None,
         };
@@ -2625,6 +2636,7 @@ mod tests {
             parameter_delivery: ParameterDelivery::default(),
             parameter_format: ParameterFormat::default(),
             output_format: OutputFormat::default(),
+            output_policy: attune_common::output_policy::ResolvedOutputPolicy::default(),
             out_schema: None,
             cancel_token: None,
         };
@@ -2683,6 +2695,7 @@ mod tests {
             parameter_delivery: ParameterDelivery::default(),
             parameter_format: ParameterFormat::default(),
             output_format: OutputFormat::default(),
+            output_policy: attune_common::output_policy::ResolvedOutputPolicy::default(),
             out_schema: None,
             cancel_token: None,
         };

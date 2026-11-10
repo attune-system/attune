@@ -146,6 +146,8 @@ async fn ad_hoc_action_snapshots_current_definition_against_active_release() {
     let action = ActionRepository::create(
         &pool,
         CreateActionInput {
+            output_policy: Default::default(),
+            output_format: Default::default(),
             r#ref: action_ref,
             pack: pack.id,
             pack_ref: pack.r#ref.clone(),

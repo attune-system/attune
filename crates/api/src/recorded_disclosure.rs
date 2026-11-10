@@ -151,6 +151,7 @@ pub(crate) async fn execution_origins_many(
         &[
             ENTITY_EXECUTION_CONFIG,
             ENTITY_EXECUTION_RESULT,
+            attune_common::output_classification::ENTITY_EXECUTION_OUTPUT_CHANNEL,
             "workflow_variables",
         ],
         executions,
@@ -783,13 +784,15 @@ pub(crate) async fn authorize_origins_bounded(
                                 if pending.len() + *nodes > MAX_ORIGIN_NODES { return Err(denied_at(OriginDenialStage::Bounds)); }
                                 continue;
                             }
+                            let protected_content = crate::secret_disclosure::runtime_read_requires_decrypt(conn, &read.target).await?;
                             match read.target {
                                 RuntimeReadTarget::ExecutionMetadata { execution } => {
                                     require_target(conn, authority, RuntimeTarget::Execution(execution), &[Action::Read]).await?;
                                 }
                                 RuntimeReadTarget::LiveLog { artifact, version, execution, stream, owner } => {
-                                    require_target(conn, authority, RuntimeTarget::Execution(execution), &[Action::Read, Action::Decrypt]).await.map_err(|error| tag_error(OriginDenialStage::ReadExecutionTarget, error))?;
-                                    let target = require_target(conn, authority, RuntimeTarget::Artifact(artifact), &[Action::Read, Action::Decrypt]).await?;
+                                    let actions: &[Action] = if protected_content { &[Action::Read, Action::Decrypt] } else { &[Action::Read] };
+                                    require_target(conn, authority, RuntimeTarget::Execution(execution), actions).await.map_err(|error| tag_error(OriginDenialStage::ReadExecutionTarget, error))?;
+                                    let target = require_target(conn, authority, RuntimeTarget::Artifact(artifact), actions).await?;
                                     if attune_common::repositories::runtime_read::RuntimeReadOwner::of(&target) != owner { return Err(denied()); }
                                     RuntimeReadRepository::validate_log_target(conn, artifact, version, execution, stream).await?;
                                 }
@@ -808,10 +811,11 @@ pub(crate) async fn authorize_origins_bounded(
                                     if attune_common::repositories::runtime_read::RuntimeReadOwner::of(&target) != owner { return Err(denied()); }
                                 }
                                 RuntimeReadTarget::ArtifactVersion { artifact, version, execution, owner, encrypted_manifest } => {
+                                    let actions: &[Action] = if protected_content { &[Action::Read, Action::Decrypt] } else { &[Action::Read] };
                                     if let Some(execution) = execution {
-                                        require_target(conn, authority, RuntimeTarget::Execution(execution), &[Action::Read, Action::Decrypt]).await.map_err(|error| tag_error(OriginDenialStage::ReadExecutionTarget, error))?;
+                                        require_target(conn, authority, RuntimeTarget::Execution(execution), actions).await.map_err(|error| tag_error(OriginDenialStage::ReadExecutionTarget, error))?;
                                     }
-                                    let target = require_target(conn, authority, RuntimeTarget::Artifact(artifact), &[Action::Read, Action::Decrypt]).await.map_err(|error| tag_error(OriginDenialStage::ReadArtifactTarget, error))?;
+                                    let target = require_target(conn, authority, RuntimeTarget::Artifact(artifact), actions).await.map_err(|error| tag_error(OriginDenialStage::ReadArtifactTarget, error))?;
                                     if attune_common::repositories::runtime_read::RuntimeReadOwner::of(&target) != owner { return Err(denied_at(OriginDenialStage::ReadOwnerMismatch)); }
                                     let row = ArtifactVersionRepository::find_pinned_for_share(conn, version).await?.ok_or_else(|| denied_at(OriginDenialStage::ReadVersionUnavailable))?;
                                     if row.artifact != artifact || row.execution != execution { return Err(denied()); }
@@ -834,7 +838,7 @@ pub(crate) async fn authorize_origins_bounded(
                             if pending.len() + *nodes > MAX_ORIGIN_NODES { return Err(denied()); }
                             continue;
                         }
-                        ENTITY_EXECUTION_CONFIG | ENTITY_EXECUTION_RESULT | "workflow_variables" => {
+                        ENTITY_EXECUTION_CONFIG | ENTITY_EXECUTION_RESULT | "execution_output_channel" | "workflow_variables" => {
                             require_target(conn, authority, RuntimeTarget::Execution(entity_id), &[Action::Read, Action::Decrypt]).await.map_err(|error| tag_error(OriginDenialStage::SourceExecutionTarget, error))?;
                             if attune_common::repositories::schema_contract::SchemaContractRepository::find(
                                 &mut *conn, attune_common::repositories::schema_contract::BindingOwner::Execution, entity_id,

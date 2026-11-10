@@ -1,3 +1,7 @@
+import OutputPolicyEditor from "@/components/common/OutputPolicyEditor";
+import SchemaBuilder from "@/components/common/SchemaBuilder";
+import { isFlatSchema, type FlatSchema } from "@/lib/flat-schema";
+import type { OutputPolicy } from "@/api";
 import {
   Link,
   useParams,
@@ -1141,7 +1145,7 @@ function ActionDefaultsDisplay({ action }: { action: ActionResponse }) {
   );
 }
 
-function ConfigureActionModal({
+export function ConfigureActionModal({
   action,
   onClose,
 }: {
@@ -1155,6 +1159,13 @@ function ConfigureActionModal({
   const [label, setLabel] = useState(action.label);
   const [description, setDescription] = useState(action.description ?? "");
   const [entrypoint, setEntrypoint] = useState(action.entrypoint);
+  const [outputPolicy, setOutputPolicy] = useState<OutputPolicy>(
+    action.output_policy ?? {},
+  );
+  const [outputFormat, setOutputFormat] = useState(action.output_format);
+  const [outSchema, setOutSchema] = useState<FlatSchema>(
+    isFlatSchema(action.out_schema) ? action.out_schema : {},
+  );
   const [accessesMcp, setAccessesMcp] = useState(action.accesses_mcp ?? false);
   const [referenceVisibility, setReferenceVisibility] =
     useState<ActionReferenceVisibility>(
@@ -1278,11 +1289,13 @@ function ConfigureActionModal({
             timeoutSeconds && timeoutSeconds > 0
               ? { op: "set", value: timeoutSeconds }
               : { op: "clear" },
+          output_policy: outputPolicy,
+          output_format: outputFormat,
           // Preserve fields we don't edit in this modal
           runtime: action.runtime ?? null,
           required_worker_runtimes: action.required_worker_runtimes ?? {},
           param_schema: action.param_schema ?? null,
-          out_schema: action.out_schema ?? null,
+          out_schema: outSchema,
         },
       });
       setSuccessMessage("Action defaults saved.");
@@ -1438,6 +1451,35 @@ function ConfigureActionModal({
                 placeholder="Search and select permission sets..."
               />
             )}
+          </div>
+
+          <div className="border-t pt-5 space-y-4">
+            <label className="block text-sm font-medium text-gray-700">
+              Output format
+              <select
+                value={outputFormat}
+                onChange={(event) =>
+                  setOutputFormat(event.target.value as typeof outputFormat)
+                }
+                className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm"
+              >
+                <option value="text">Text</option>
+                <option value="json">JSON</option>
+                <option value="yaml">YAML</option>
+                <option value="jsonl">JSONL</option>
+              </select>
+            </label>
+            <SchemaBuilder
+              value={outSchema}
+              onChange={setOutSchema}
+              label="Output schema"
+              placeholder='{"status": {"type": "string"}, "token": {"type": "string", "secret": true}}'
+            />
+            <OutputPolicyEditor
+              value={outputPolicy}
+              onChange={setOutputPolicy}
+              structured={outputFormat !== "text"}
+            />
           </div>
 
           {/* Retention Defaults */}

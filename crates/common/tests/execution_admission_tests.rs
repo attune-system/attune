@@ -1657,6 +1657,8 @@ async fn recorded_task_schema_ignores_same_ref_release_only_parent_cache() {
     root.static_actions.insert(
         leaf_ref,
         StaticActionSchemaBinding {
+            output_policy: Default::default(),
+            output_format: Default::default(),
             input: other.input.clone(),
             output: other.output,
             executable_snapshot: serde_json::to_value(other_metadata).unwrap(),

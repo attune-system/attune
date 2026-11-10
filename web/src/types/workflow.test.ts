@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   builderStateToGraph,
+  builderStateToActionYaml,
   definitionToBuilderState,
   validateWorkflow,
   type WorkflowBuilderState,
@@ -260,4 +261,28 @@ describe("workflow wait authoring", () => {
       validateWorkflow({ ...state(first), tasks: [first, second] }),
     ).toContain('Task "first" cannot define wait_for in a cyclic graph region');
   });
+});
+
+it("keeps output policy in companion action YAML and outside the workflow graph", () => {
+  const definition: WorkflowYamlDefinition = {
+    ref: "example.flow",
+    label: "Flow",
+    version: "1.0.0",
+    tasks: [],
+    output_policy: JSON.parse(
+      '{"stdout":"sanitized","stderr":"secret","error":"public"}',
+    ),
+    output: { token: { type: "string", secret: true } },
+  };
+  const workflowState = definitionToBuilderState(definition, "example", "flow");
+  const action = builderStateToActionYaml(workflowState);
+  expect(action.output_policy).toEqual(definition.output_policy);
+  expect(action.output_format).toBe("json");
+  expect(action.output).toEqual(definition.output);
+  expect(builderStateToGraph(workflowState)).not.toHaveProperty(
+    "output_policy",
+  );
+  expect(builderStateToGraph(workflowState)).not.toHaveProperty(
+    "output_format",
+  );
 });

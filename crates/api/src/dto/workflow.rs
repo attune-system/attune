@@ -85,6 +85,10 @@ pub struct SaveWorkflowFileRequest {
     #[schema(value_type = Object, nullable = true)]
     pub out_schema: Option<JsonValue>,
 
+    /// Companion action output channel classification.
+    #[serde(default)]
+    pub output_policy: attune_common::output_policy::OutputPolicy,
+
     /// Tags for categorization
     #[schema(example = json!(["deployment", "automation"]))]
     pub tags: Option<Vec<String>>,
@@ -127,6 +131,10 @@ pub struct CreateWorkflowRequest {
     #[schema(value_type = Object, example = json!({"incident_id": {"type": "string", "description": "Unique incident identifier", "required": true}}))]
     pub out_schema: Option<JsonValue>,
 
+    /// Companion action output channel classification.
+    #[serde(default)]
+    pub output_policy: attune_common::output_policy::OutputPolicy,
+
     /// Workflow definition (complete workflow YAML structure as JSON)
     #[schema(value_type = Object)]
     pub definition: JsonValue,
@@ -160,6 +168,9 @@ pub struct UpdateWorkflowRequest {
     /// Output schema
     #[schema(value_type = Object, nullable = true)]
     pub out_schema: Option<JsonValue>,
+
+    /// Companion action output channel classification.
+    pub output_policy: Option<attune_common::output_policy::OutputPolicy>,
 
     /// Workflow definition. A task with a templated action requires a finite
     /// literal allowed_action_refs array. Rendered permissions only reduce its
@@ -342,6 +353,7 @@ mod tests {
             version: "1.0.0".to_string(),
             param_schema: None,
             out_schema: None,
+            output_policy: Default::default(),
             definition: serde_json::json!({"tasks": []}),
             tags: None,
         };
@@ -359,6 +371,7 @@ mod tests {
             version: "1.0.0".to_string(),
             param_schema: None,
             out_schema: None,
+            output_policy: Default::default(),
             definition: serde_json::json!({"tasks": []}),
             tags: Some(vec!["test".to_string()]),
         };
@@ -374,6 +387,7 @@ mod tests {
             version: None,
             param_schema: None,
             out_schema: None,
+            output_policy: None,
             definition: None,
             tags: None,
         };

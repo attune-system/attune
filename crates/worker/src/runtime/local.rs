@@ -218,6 +218,7 @@ mod tests {
             parameter_delivery: ParameterDelivery::default(),
             parameter_format: ParameterFormat::default(),
             output_format: OutputFormat::default(),
+            output_policy: attune_common::output_policy::ResolvedOutputPolicy::default(),
             out_schema: None,
             cancel_token: None,
         };
@@ -257,6 +258,7 @@ mod tests {
             parameter_delivery: ParameterDelivery::default(),
             parameter_format: ParameterFormat::default(),
             output_format: OutputFormat::default(),
+            output_policy: attune_common::output_policy::ResolvedOutputPolicy::default(),
             out_schema: None,
             cancel_token: None,
         };

@@ -3,6 +3,8 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { ActionReferenceVisibility } from "./ActionReferenceVisibility";
+import type { OutputFormat } from "./OutputFormat";
+import type { OutputPolicy } from "./OutputPolicy";
 import type { RetentionPolicyType } from "./RetentionPolicyType";
 import type { WorkerAffinity } from "./WorkerAffinity";
 import type { WorkerToleration } from "./WorkerToleration";
@@ -60,6 +62,11 @@ export type ActionResponse = {
    * Output schema
    */
   out_schema: Record<string, any> | null;
+  output_format: OutputFormat;
+  /**
+   * Authored output channel policy; defaults resolve under the stored schema.
+   */
+  output_policy: OutputPolicy;
   /**
    * Pack ID
    */

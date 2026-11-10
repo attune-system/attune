@@ -699,6 +699,7 @@ pub(super) fn empty_metadata(
     source: &EmptyIterationArchive,
 ) -> NativeSnapshotMetadata {
     NativeSnapshotMetadata {
+        result_selection: None,
         result_contract_kind: None,
         result_mappings: None,
         snapshot,

@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use attune_cli::{
     client::{log_http_request, sanitize_url_for_display, ApiClient, ApiError},
     config::CliConfig,
+    execution_disclosure::{export_execution_to_file, safe_disclosure_error},
     inquiry::{self, InquiryListFilters},
     manual_execution::ManualExecutionRequest,
 };
@@ -23,6 +24,10 @@ use tokio::sync::Mutex;
 
 #[path = "attune-mcp/interoperability.rs"]
 mod interoperability;
+
+#[cfg(test)]
+#[path = "attune-mcp/execution_export_tests.rs"]
+mod execution_export_tests;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -389,6 +394,19 @@ impl McpServer {
         tool_name: &str,
         args: &Map<String, Value>,
     ) -> Result<Value> {
+        let result = self.call_tool_with_reauth_inner(tool_name, args).await;
+        if tool_name == "executions_export" {
+            result.map_err(safe_disclosure_error)
+        } else {
+            result
+        }
+    }
+
+    async fn call_tool_with_reauth_inner(
+        &mut self,
+        tool_name: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Value> {
         match self.call_tool(tool_name, args).await {
             Ok(value) => Ok(value),
             Err(err) if Self::is_auth_error(&err) => {
@@ -460,6 +478,18 @@ impl McpServer {
             "events_get" => {
                 let id = required_i64(args, "id")?;
                 self.client.get::<Value>(&format!("/events/{id}")).await
+            }
+            "executions_export" => {
+                let id = required_i64(args, "id")?;
+                let output_file = required_string(args, "output_file")?;
+                let receipt = export_execution_to_file(
+                    &mut self.client,
+                    id,
+                    std::path::Path::new(output_file),
+                )
+                .await?;
+                serde_json::to_value(receipt)
+                    .map_err(|_| anyhow!("Cannot encode execution export receipt"))
             }
             "executions_get" => {
                 let id = required_i64(args, "id")?;
@@ -1482,8 +1512,14 @@ fn tool_defs() -> &'static [ToolDef] {
         ToolDef {
             name: "executions_get", read_only: true,
             title: "Get execution",
-            description: "Fetch a single execution by numeric ID.",
+            description: "Fetch a single execution by numeric ID with secrets redacted. Use executions_export with an explicit output_file for authorized decryption to a private file.",
             input_schema: id_schema,
+        },
+        ToolDef {
+            name: "executions_export", read_only: false,
+            title: "Export execution to private file",
+            description: "Explicitly request authorized secret execution values and write the full execution payload to output_file on the MCP server filesystem. Includes config, result, and separately revealed original output channels. Returns only absolute filepath, byte count and status; never puts secret payloads into tool content. Requires existing parent directory, a new file path, and API execution decrypt/source permissions. No overwrite or temporary-file fallback. Private-file export is supported on Unix hosts; other platforms reject before plaintext fetch.",
+            input_schema: executions_export_schema,
         },
         ToolDef {
             name: "executions_list", read_only: true,
@@ -1833,6 +1869,13 @@ fn pack_check_schema() -> Value {
         "required": ["path"],
         "additionalProperties": false
     })
+}
+
+fn executions_export_schema() -> Value {
+    json!({"type":"object","properties":{
+        "id":{"type":"integer","minimum":1,"description":"Execution ID"},
+        "output_file":{"type":"string","minLength":1,"description":"Explicit new file path on the MCP server filesystem; parent directory must already exist"}
+    },"required":["id","output_file"],"additionalProperties":false})
 }
 
 fn id_schema() -> Value {

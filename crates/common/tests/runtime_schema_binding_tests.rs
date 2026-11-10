@@ -159,6 +159,8 @@ async fn static_task_bindings_protect_external_packs_before_child_creation() {
     binding.static_actions.insert(
         task_action.r#ref.clone(),
         StaticActionSchemaBinding {
+            output_policy: Default::default(),
+            output_format: Default::default(),
             input: task_binding.input,
             output: task_binding.output,
             executable_snapshot: serde_json::to_value(&task_snapshot).unwrap(),

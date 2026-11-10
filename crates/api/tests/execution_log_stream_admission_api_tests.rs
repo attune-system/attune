@@ -20,7 +20,7 @@ async fn stream_fixture(ctx: &TestContext) -> Result<(i64, String)> {
     stream_fixture_kind(ctx, false).await
 }
 
-async fn stream_fixture_kind(ctx: &TestContext, sensitive: bool) -> Result<(i64, String)> {
+async fn stream_fixture_kind(ctx: &TestContext, protected: bool) -> Result<(i64, String)> {
     let pack = create_test_pack(
         &ctx.pool,
         &format!("stream_{}", uuid::Uuid::new_v4().simple()),
@@ -28,13 +28,17 @@ async fn stream_fixture_kind(ctx: &TestContext, sensitive: bool) -> Result<(i64,
     .await?;
     let action_ref = format!("{}.tail", pack.r#ref);
     let action = create_test_action(&ctx.pool, pack.id, &pack.r#ref, &action_ref).await?;
-    if sensitive {
+    if protected {
         use attune_common::repositories::action::{ActionRepository, UpdateActionInput};
         ActionRepository::update(
             &ctx.pool,
             action.id,
             UpdateActionInput {
-                param_schema: Some(serde_json::json!({"secret":{"type":"string","secret":true}})),
+                output_policy: Some(attune_common::output_policy::OutputPolicy {
+                    stdout: Some(attune_common::output_policy::StdoutPolicy::Secret),
+                    stderr: Some(attune_common::output_policy::OutputVisibility::Secret),
+                    error: None,
+                }),
                 ..Default::default()
             },
         )
@@ -98,7 +102,7 @@ async fn stream_fixture_kind(ctx: &TestContext, sensitive: bool) -> Result<(i64,
             pack_ref: None,
             label: None,
             description: None,
-            grants: serde_json::json!([{"resource":"executions","actions": if sensitive { vec!["read", "decrypt"] } else { vec!["read"] },
+            grants: serde_json::json!([{"resource":"executions","actions": if protected { vec!["read", "decrypt"] } else { vec!["read"] },
             "constraints":{"ids":[execution.id]}}]),
         },
     )
@@ -128,9 +132,10 @@ enum LogAccess {
     Standard,
 }
 
-async fn bound_legacy_stream_fixture(
+async fn bound_stream_fixture(
     ctx: &TestContext,
     access: LogAccess,
+    protected: bool,
 ) -> Result<(i64, String)> {
     use attune_common::{
         auth::jwt::{generate_delegated_execution_token, STANDARD_EXECUTION_ACCESS_REF},
@@ -152,6 +157,16 @@ async fn bound_legacy_stream_fixture(
     let action = ActionRepository::create(
         &ctx.pool,
         CreateActionInput {
+            output_policy: if protected {
+                attune_common::output_policy::OutputPolicy {
+                    stdout: Some(attune_common::output_policy::StdoutPolicy::Secret),
+                    stderr: Some(attune_common::output_policy::OutputVisibility::Secret),
+                    error: None,
+                }
+            } else {
+                Default::default()
+            },
+            output_format: Default::default(),
             r#ref: format!("{}.tail", pack.r#ref),
             pack: pack.id,
             pack_ref: pack.r#ref.clone(),
@@ -257,7 +272,7 @@ async fn empty_ref_execution_token_cannot_stream_validly_bound_own_logs() -> Res
         .await?
         .with_auth()
         .await?;
-    let (id, token) = bound_legacy_stream_fixture(&ctx, LogAccess::Disabled).await?;
+    let (id, token) = bound_stream_fixture(&ctx, LogAccess::Disabled, true).await?;
     for stream in ["stdout", "stderr"] {
         let response = ctx
             .get(
@@ -268,7 +283,7 @@ async fn empty_ref_execution_token_cannot_stream_validly_bound_own_logs() -> Res
         assert_eq!(
             response.status(),
             StatusCode::FORBIDDEN,
-            "an original nonsensitive schema binding must not grant an empty-ref workload API access"
+            "output policy must not grant an empty-ref workload API access"
         );
         drop(response.into_response());
     }
@@ -277,13 +292,13 @@ async fn empty_ref_execution_token_cannot_stream_validly_bound_own_logs() -> Res
 }
 
 #[tokio::test]
-async fn read_only_and_standard_only_tokens_cannot_decrypt_api_capable_logs() -> Result<()> {
+async fn read_only_and_standard_only_tokens_cannot_decrypt_protected_logs() -> Result<()> {
     let ctx = TestContext::new_with_stream_limits(2, 2)
         .await?
         .with_auth()
         .await?;
     for access in [LogAccess::ReadOnly, LogAccess::StandardOnly] {
-        let (id, token) = bound_legacy_stream_fixture(&ctx, access).await?;
+        let (id, token) = bound_stream_fixture(&ctx, access, true).await?;
         let response = ctx
             .get(
                 &format!("/api/v1/executions/{id}/logs/stdout/stream"),
@@ -293,10 +308,32 @@ async fn read_only_and_standard_only_tokens_cannot_decrypt_api_capable_logs() ->
         assert_eq!(
             response.status(),
             StatusCode::FORBIDDEN,
-            "API-capable logs retain explicit execution read/decrypt and output-origin checks"
+            "Protected logs retain explicit execution read/decrypt and output-origin checks"
         );
     }
     wait_for_no_leases(&ctx).await?;
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn selected_api_permissions_do_not_make_public_channels_require_decrypt() -> Result<()> {
+    let ctx = TestContext::new_with_stream_limits(2, 2)
+        .await?
+        .with_auth()
+        .await?;
+    let (id, token) = bound_stream_fixture(&ctx, LogAccess::ReadOnly, false).await?;
+    for stream in ["stdout", "stderr"] {
+        let response = ctx
+            .get(
+                &format!("/api/v1/executions/{id}/logs/{stream}/stream"),
+                Some(&token),
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response.into_response());
+        wait_for_no_leases(&ctx).await?;
+    }
     ctx.cleanup().await?;
     Ok(())
 }
@@ -311,8 +348,8 @@ async fn opted_in_execution_log_token_is_narrow_and_requires_active_owner() -> R
         .await?
         .with_auth()
         .await?;
-    let (id, token) = bound_legacy_stream_fixture(&ctx, LogAccess::Named).await?;
-    let (other, _) = bound_legacy_stream_fixture(&ctx, LogAccess::Named).await?;
+    let (id, token) = bound_stream_fixture(&ctx, LogAccess::Named, true).await?;
+    let (other, _) = bound_stream_fixture(&ctx, LogAccess::Named, true).await?;
     let response = ctx
         .get(
             &format!("/api/v1/executions/{id}/logs/stdout/stream"),
@@ -361,8 +398,8 @@ async fn standard_and_explicit_log_decrypt_access_remain_scoped_to_own_execution
         .await?
         .with_auth()
         .await?;
-    let (id, token) = bound_legacy_stream_fixture(&ctx, LogAccess::Standard).await?;
-    let (other, _) = bound_legacy_stream_fixture(&ctx, LogAccess::Standard).await?;
+    let (id, token) = bound_stream_fixture(&ctx, LogAccess::Standard, true).await?;
+    let (other, _) = bound_stream_fixture(&ctx, LogAccess::Standard, true).await?;
     for stream in ["stdout", "stderr"] {
         let response = ctx
             .get(
@@ -393,7 +430,7 @@ async fn empty_ref_denial_precedes_log_stream_lease_admission() -> Result<()> {
         .await?
         .with_auth()
         .await?;
-    let (id, token) = bound_legacy_stream_fixture(&ctx, LogAccess::Disabled).await?;
+    let (id, token) = bound_stream_fixture(&ctx, LogAccess::Disabled, true).await?;
     let (occupied, reader) = stream_fixture(&ctx).await?;
     let open = ctx
         .get(
@@ -519,12 +556,12 @@ async fn server_shutdown_waits_for_reconnect_and_lease_release() -> Result<()> {
 #[tokio::test]
 async fn terminal_empty_logs_finish_without_stream_rows_on_both_reader_paths() -> Result<()> {
     use attune_common::repositories::{execution::UpdateExecutionInput, Update};
-    for sensitive in [false, true] {
+    for protected in [false, true] {
         let ctx = TestContext::new_with_stream_limits(4, 4)
             .await?
             .with_auth()
             .await?;
-        let (id, token) = stream_fixture_kind(&ctx, sensitive).await?;
+        let (id, token) = stream_fixture_kind(&ctx, protected).await?;
         for status in [
             ExecutionStatus::Completed,
             ExecutionStatus::Failed,
@@ -546,7 +583,7 @@ async fn terminal_empty_logs_finish_without_stream_rows_on_both_reader_paths() -
                 let text = tokio::time::timeout(Duration::from_secs(5), response.text()).await??;
                 assert!(
                     text.contains("event: done"),
-                    "sensitive={sensitive}, {status:?}: {text}"
+                    "protected={protected}, {status:?}: {text}"
                 );
                 assert!(!text.contains("event: error"), "{text}");
                 let response = ctx
@@ -570,12 +607,12 @@ async fn terminal_empty_logs_finish_without_stream_rows_on_both_reader_paths() -
 #[tokio::test]
 async fn missing_or_incomplete_capture_never_becomes_successful_empty_output() -> Result<()> {
     use attune_common::repositories::{execution::UpdateExecutionInput, Update};
-    for sensitive in [false, true] {
+    for protected in [false, true] {
         let ctx = TestContext::new_with_stream_limits(2, 2)
             .await?
             .with_auth()
             .await?;
-        let (id, token) = stream_fixture_kind(&ctx, sensitive).await?;
+        let (id, token) = stream_fixture_kind(&ctx, protected).await?;
         for result in [
             serde_json::json!({}),
             serde_json::json!({"logs_incomplete":true,"runtime_log_capture":{"stdout":"empty"}}),

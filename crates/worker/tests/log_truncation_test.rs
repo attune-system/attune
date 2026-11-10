@@ -88,6 +88,7 @@ fn make_python_context(
         parameter_delivery: attune_worker::runtime::ParameterDelivery::default(),
         parameter_format: attune_worker::runtime::ParameterFormat::default(),
         output_format: attune_worker::runtime::OutputFormat::default(),
+        output_policy: Default::default(),
         out_schema: None,
         cancel_token: None,
     }
@@ -178,6 +179,7 @@ done
         parameter_delivery: attune_worker::runtime::ParameterDelivery::default(),
         parameter_format: attune_worker::runtime::ParameterFormat::default(),
         output_format: attune_worker::runtime::OutputFormat::default(),
+        output_policy: Default::default(),
         out_schema: None,
         cancel_token: None,
     };
@@ -349,6 +351,7 @@ async fn test_shell_process_runtime_truncation() {
         parameter_delivery: attune_worker::runtime::ParameterDelivery::default(),
         parameter_format: attune_worker::runtime::ParameterFormat::default(),
         output_format: attune_worker::runtime::OutputFormat::default(),
+        output_policy: Default::default(),
         out_schema: None,
         cancel_token: None,
     };

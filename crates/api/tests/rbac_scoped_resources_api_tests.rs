@@ -259,6 +259,8 @@ async fn create_pack_with_action(
     let action = ActionRepository::create(
         &ctx.pool,
         CreateActionInput {
+            output_policy: Default::default(),
+            output_format: Default::default(),
             r#ref: action_ref.to_string(),
             pack: pack.id,
             pack_ref: pack.r#ref.clone(),

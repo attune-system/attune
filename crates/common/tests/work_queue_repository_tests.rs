@@ -1281,3 +1281,159 @@ async fn readiness_hints_only_include_selected_queues_with_dispatchable_statuses
     );
     db.cleanup().await.unwrap();
 }
+
+#[tokio::test]
+async fn queue_ack_metadata_keeps_public_siblings_and_reclaims_superseded_ciphertext() {
+    use attune_common::repositories::{
+        execution_secret_value::ExecutionSecretValueRepository as Secrets,
+        work_queue::UpdateWorkQueueItemInput,
+        work_queue_output::{
+            WorkQueueOutputRepository as Outputs, ENTITY_QUEUE_ITEM_ACK_SUMMARY,
+            ENTITY_QUEUE_ITEM_LAST_ERROR, ENTITY_QUEUE_ITEM_RESULT,
+        },
+        Patch,
+    };
+    use attune_common::secret_values::{
+        prepare_secret_values, restore_secret_values, SecretSource, SecretValueInput,
+        ENTITY_EXECUTION_RESULT,
+    };
+    let (db, queue) = create_queue_fixture().await;
+    let key = "queue-ack-projection-owned-fixture-key";
+    let item = WorkQueueItemRepository::create(
+        &db,
+        CreateWorkQueueItemInput {
+            queue: queue.id,
+            queue_ref: queue.r#ref,
+            item_key: None,
+            priority: 0,
+            status: WorkQueueItemStatus::Queued,
+            payload: json!({"order_id":1}),
+            metadata: json!({}),
+            trace_tag: None,
+            enqueue_source: "test".into(),
+            requested_by_identity: None,
+            requested_by_execution: None,
+            requested_by_enforcement: None,
+            leased_execution: None,
+            lease_token: None,
+            lease_expires_at: None,
+            attempt_count: 0,
+            last_error: None,
+            ack_summary: None,
+        },
+    )
+    .await
+    .unwrap();
+    // Secret entity IDs intentionally have no runtime FK; this owned synthetic
+    // source exercises projection storage independently of admission fixtures.
+    let source_id = item.id;
+    let secret_path = "/queue_ack/items/0/summary/token";
+    let provenance = SecretSource::ParameterSchema {
+        path: secret_path.into(),
+    }
+    .provenance();
+    let input = SecretValueInput {
+        json_path: secret_path.into(),
+        value: json!("private-ack-token"),
+        source_kind: "provenance".into(),
+        source_ref: Some(serde_json::to_string(&provenance).unwrap()),
+    };
+    let mut tx = db.begin().await.unwrap();
+    Secrets::upsert_many_with_conn(
+        &mut tx,
+        ENTITY_EXECUTION_RESULT,
+        source_id,
+        &prepare_secret_values(vec![input], key).unwrap(),
+    )
+    .await
+    .unwrap();
+    let prepared = Outputs::prepare_item_metadata(
+        &mut tx,
+        source_id,
+        0,
+        WorkQueueItemStatus::Completed,
+        json!({"status":"completed","summary":{"token":"private-ack-token","count":3}}),
+        None,
+        Some(key),
+    )
+    .await
+    .unwrap();
+    assert_eq!(prepared.summary["summary"]["count"], 3);
+    assert!(attune_common::secret_values::is_redaction_marker(
+        &prepared.summary["summary"]["token"]
+    ));
+    assert!(!prepared.summary.to_string().contains("private-ack-token"));
+    WorkQueueItemRepository::update(
+        &mut *tx,
+        item.id,
+        UpdateWorkQueueItemInput {
+            status: Some(WorkQueueItemStatus::Completed),
+            ack_summary: Some(Patch::Set(prepared.summary.clone())),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    Outputs::persist_item_metadata(&mut tx, item.id, &prepared)
+        .await
+        .unwrap();
+    let stored = Secrets::find_stored_by_entity(&mut *tx, ENTITY_QUEUE_ITEM_ACK_SUMMARY, item.id)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].json_path, "/summary/token");
+    assert_eq!(
+        restore_secret_values(prepared.summary.clone(), &stored, key).unwrap()["summary"]["token"],
+        "private-ack-token"
+    );
+    assert_eq!(
+        Secrets::find_stored_by_entity(&mut *tx, ENTITY_QUEUE_ITEM_RESULT, item.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    WorkQueueItemRepository::update(
+        &mut *tx,
+        item.id,
+        UpdateWorkQueueItemInput {
+            ack_summary: Some(Patch::Set(
+                json!({"status":"completed","summary":{"count":4}}),
+            )),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        Secrets::find_stored_by_entity(&mut *tx, ENTITY_QUEUE_ITEM_ACK_SUMMARY, item.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        Secrets::find_stored_by_entity(&mut *tx, ENTITY_QUEUE_ITEM_RESULT, item.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // Re-materialize to verify owned queue deletion also clears all projections.
+    Outputs::persist_item_metadata(&mut tx, item.id, &prepared)
+        .await
+        .unwrap();
+    WorkQueueItemRepository::delete(&mut *tx, item.id)
+        .await
+        .unwrap();
+    for kind in [
+        ENTITY_QUEUE_ITEM_ACK_SUMMARY,
+        ENTITY_QUEUE_ITEM_LAST_ERROR,
+        ENTITY_QUEUE_ITEM_RESULT,
+    ] {
+        assert!(Secrets::find_stored_by_entity(&mut *tx, kind, item.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+    tx.commit().await.unwrap();
+    db.cleanup().await.unwrap();
+}

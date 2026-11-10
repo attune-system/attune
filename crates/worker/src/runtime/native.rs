@@ -57,6 +57,7 @@ impl NativeRuntime {
         max_stdout_bytes: usize,
         max_stderr_bytes: usize,
         output_format: OutputFormat,
+        output_policy: attune_common::output_policy::ResolvedOutputPolicy,
         out_schema: Option<&attune_common::value_schema::Contract>,
         _stdout_log_path: Option<&Path>,
         _stderr_log_path: Option<&Path>,
@@ -105,6 +106,7 @@ impl NativeRuntime {
             max_stdout_bytes,
             max_stderr_bytes,
             output_format,
+            output_policy,
             out_schema,
             cancel_token,
             None,
@@ -193,6 +195,7 @@ impl Runtime for NativeRuntime {
             context.max_stdout_bytes,
             context.max_stderr_bytes,
             context.output_format,
+            context.output_policy,
             context.out_schema.as_ref(),
             context.stdout_log_path.as_deref(),
             context.stderr_log_path.as_deref(),
@@ -541,8 +544,12 @@ mod tests {
             )
             .unwrap(),
         );
+        context.output_policy = attune_common::output_policy::OutputPolicy::default()
+            .resolve(context.out_schema.as_ref(), context.output_format)
+            .unwrap();
         context.stdout_log_writer = Some(
             BoundedLogFileWriter::from_shared_file_writer(writer, 1024, true, 1_000)
+                .with_encryption(Some("native-secret-output-test-key"), 1, 1)
                 .with_mirror_source(Some(source)),
         );
 

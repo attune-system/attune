@@ -701,6 +701,20 @@ impl<'a> CompiledContract<'a> {
         walk: &mut Walk,
     ) -> Result<()> {
         let effective = self.effective(node, path, depth, &mut walk.budget)?;
+        // Output redaction must cover a malformed container that may hold
+        // declared secret descendants. Keep the fallback at this subtree rather
+        // than turning an unrelated output-validation error into root secrecy.
+        let wrong_container = matches!(effective.get("type"), Some(Value::String(kind))
+            if kind == "object" && !value.is_object() || kind == "array" && !value.is_array());
+        if walk.secret_paths.is_some()
+            && wrong_container
+            && self.node_declares_secrets(node, path, depth, &mut walk.budget)?
+        {
+            if let Some(paths) = &mut walk.secret_paths {
+                paths.insert(path.to_owned());
+            }
+            return Ok(());
+        }
         if walk.rule_templates
             && value.is_string()
             && self.node_declares_secrets(node, path, depth, &mut walk.budget)?

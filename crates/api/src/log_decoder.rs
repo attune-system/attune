@@ -95,6 +95,7 @@ pub(crate) enum LiveInput {
     Data(Bytes),
     Tick,
     Seal(FinalLogManifest),
+    PlainSeal { bytes: u64, sha256: String },
 }
 
 /// Retain only an incomplete UTF-8 suffix between frames. Byte contents and
@@ -203,7 +204,13 @@ pub(crate) fn live_ciphertext(
                         .as_ref()
                         .and_then(|meta| meta.get("log_encoding"))
                         .and_then(serde_json::Value::as_str)
-                        != Some(ENCODING)
+                        != pin.encrypted.then_some(ENCODING)
+                    || version
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta.get("stream"))
+                        .and_then(serde_json::Value::as_str)
+                        != Some(pin.channel.as_str())
                     || version
                         .meta
                         .as_ref()
@@ -277,6 +284,23 @@ pub(crate) fn live_ciphertext(
                     {
                         return Err(invalid());
                     }
+                    if !pin.encrypted {
+                        let sha256 = version
+                            .sha256
+                            .clone()
+                            .filter(|digest| digest.len() == 64)
+                            .ok_or_else(invalid)?;
+                        if version.size_bytes != i64::try_from(offset).ok() {
+                            return Err(invalid());
+                        }
+                        return Ok(Some((
+                            LiveInput::PlainSeal {
+                                bytes: offset,
+                                sha256,
+                            },
+                            (state, pin, next_segment, offset, end, None, true),
+                        )));
+                    }
                     let key = state
                         .config
                         .security
@@ -341,6 +365,7 @@ where
                         return Ok(());
                     }
                 }
+                LiveInput::PlainSeal { .. } => return Err(invalid()),
                 LiveInput::Seal(manifest) => {
                     if !pending.is_empty() {
                         return Err(invalid());
@@ -390,6 +415,41 @@ where
                 producer.await.map_err(|_| invalid())??;
             }
             Ok(None)
+        },
+    )
+}
+
+/// Plaintext storage is an explicit public-channel path, never recovery from
+/// a failed authenticated decode. Check the final pinned digest before Done.
+pub(crate) fn verified_public_live_plaintext<S>(reader: S) -> impl Stream<Item = io::Result<Bytes>>
+where
+    S: Stream<Item = io::Result<LiveInput>> + Send + 'static,
+{
+    use sha2::{Digest, Sha256};
+    futures::stream::try_unfold(
+        (Box::pin(reader), Sha256::new(), 0u64, false),
+        |(mut reader, mut digest, mut total, finished)| async move {
+            if finished {
+                return Ok(None);
+            }
+            match reader.try_next().await? {
+                Some(LiveInput::Data(bytes)) => {
+                    total = total.checked_add(bytes.len() as u64).ok_or_else(invalid)?;
+                    digest.update(&bytes);
+                    Ok(Some((bytes, (reader, digest, total, false))))
+                }
+                Some(LiveInput::Tick) => Ok(Some((Bytes::new(), (reader, digest, total, false)))),
+                Some(LiveInput::PlainSeal { bytes, sha256 }) => {
+                    if total != bytes
+                        || hex::encode(digest.finalize()) != sha256
+                        || reader.try_next().await?.is_some()
+                    {
+                        return Err(invalid());
+                    }
+                    Ok(None)
+                }
+                Some(LiveInput::Seal(_)) | None => Err(invalid()),
+            }
         },
     )
 }
@@ -800,5 +860,74 @@ mod tests {
             &[0xf0, 0x9f, 0x98, 0x80, 0xff, b'z']
         );
         assert!(stream.try_next().await.unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod public_channel_tests {
+    use super::*;
+    use attune_common::runtime_log_completion::FrameTotals;
+    use sha2::{Digest, Sha256};
+
+    fn seal(bytes: &[u8]) -> LiveInput {
+        LiveInput::PlainSeal {
+            bytes: bytes.len() as u64,
+            sha256: hex::encode(Sha256::digest(bytes)),
+        }
+    }
+
+    #[tokio::test]
+    async fn public_plaintext_channel_checks_exact_size_and_digest_before_done() {
+        let chunks = futures::stream::iter(vec![
+            Ok(LiveInput::Data(Bytes::from_static(b"public-"))),
+            Ok(LiveInput::Tick),
+            Ok(LiveInput::Data(Bytes::from_static(b"output"))),
+            Ok(seal(b"public-output")),
+        ]);
+        let bytes = verified_public_live_plaintext(chunks)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(bytes.concat(), b"public-output");
+    }
+
+    #[tokio::test]
+    async fn missing_or_mismatched_plaintext_seal_never_reports_success() {
+        for end in [None, Some(seal(b"wrong-data"))] {
+            let mut chunks = vec![Ok(LiveInput::Data(Bytes::from_static(b"public-output")))];
+            if let Some(end) = end {
+                chunks.push(Ok(end));
+            }
+            assert!(
+                verified_public_live_plaintext(futures::stream::iter(chunks))
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn encoded_decoder_rejects_plaintext_seal_without_a_downgrade() {
+        let stream = verified_live_plaintext(
+            futures::stream::iter(vec![Ok(seal(b""))]),
+            "decoder-policy-test-key-at-least-32-bytes".into(),
+            11,
+            12,
+        );
+        assert!(stream.try_collect::<Vec<_>>().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn public_plaintext_decoder_rejects_authenticated_ciphertext_seal() {
+        let manifest = FrameTotals::default().manifest(11, 12).unwrap();
+        assert!(
+            verified_public_live_plaintext(futures::stream::iter(vec![Ok(LiveInput::Seal(
+                manifest
+            ))]))
+            .try_collect::<Vec<_>>()
+            .await
+            .is_err()
+        );
     }
 }

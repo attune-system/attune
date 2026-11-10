@@ -20,6 +20,9 @@ use super::{
     parameter_passing, BoundedLogFileWriter, BoundedLogWriter, ExecutionResult, OutputFormat,
     RuntimeError, RuntimeResult,
 };
+use attune_common::output_policy::{
+    OutputPolicy, OutputVisibility, ResolvedOutputPolicy, StdoutPolicy,
+};
 use attune_common::runtime_log_mirror::{RuntimeLogMirror, RuntimeLogSource, RuntimeLogStream};
 use std::collections::HashMap;
 use std::future::Future;
@@ -309,6 +312,7 @@ pub async fn execute_streaming(
         max_stdout_bytes,
         max_stderr_bytes,
         output_format,
+        ResolvedOutputPolicy::default(),
         None,
         None,
         None,
@@ -348,6 +352,7 @@ pub async fn execute_streaming_cancellable(
     max_stdout_bytes: usize,
     max_stderr_bytes: usize,
     output_format: OutputFormat,
+    output_policy: ResolvedOutputPolicy,
     out_schema: Option<&attune_common::value_schema::Contract>,
     cancel_token: Option<CancellationToken>,
     _stdout_log_path: Option<&Path>,
@@ -356,7 +361,15 @@ pub async fn execute_streaming_cancellable(
     stderr_log_writer: Option<BoundedLogFileWriter>,
 ) -> RuntimeResult<ExecutionResult> {
     let start = Instant::now();
-    let delay_action_mirror = action_output_requires_delayed_mirror(out_schema);
+    // Reject a mismatched executable policy before any child output can escape.
+    OutputPolicy {
+        stdout: Some(output_policy.stdout),
+        stderr: Some(output_policy.stderr),
+        error: Some(output_policy.error),
+    }
+    .resolve(out_schema, output_format)
+    .map_err(|error| RuntimeError::InvalidAction(error.to_string()))?;
+    let delay_action_mirror = action_output_requires_delayed_mirror(output_policy);
     let execution_deadline = timeout_secs
         .and_then(|seconds| TokioInstant::now().checked_add(Duration::from_secs(seconds)));
     let log_finalization_timeout_ms = stdout_log_writer
@@ -426,7 +439,7 @@ pub async fn execute_streaming_cancellable(
             stdout_log_writer,
             stdout_cancel,
             RuntimeLogStream::Stdout,
-            !delay_action_mirror,
+            output_policy.stdout == StdoutPolicy::Public,
         )
         .instrument(tracing::debug_span!(
             "runtime_log_capture",
@@ -440,7 +453,7 @@ pub async fn execute_streaming_cancellable(
             stderr_log_writer,
             stderr_cancel,
             RuntimeLogStream::Stderr,
-            !delay_action_mirror,
+            output_policy.stderr == OutputVisibility::Public,
         )
         .instrument(tracing::debug_span!(
             "runtime_log_capture",
@@ -598,12 +611,13 @@ pub async fn execute_streaming_cancellable(
             stdout: &stdout_result.content,
             stderr: &stderr_result.content,
             output_format,
+            output_policy,
             out_schema,
             stdout_truncated: stdout_result.truncated,
-            stderr_truncated: stderr_result.truncated,
-            logs_incomplete,
+            logs_incomplete: stdout_output.logs_incomplete,
             mirror_stdout: stdout_output.mirror_source.is_some(),
-            mirror_stderr: stderr_output.mirror_source.is_some(),
+            // Public stderr was mirrored live; protected stderr never mirrors.
+            mirror_stderr: false,
         }) {
             ActionOutputMirrorDecision::Delayed(content) => {
                 if let (Some(source), Some(stdout)) =
@@ -730,12 +744,9 @@ pub async fn execute_streaming_cancellable(
 
     Ok(ExecutionResult {
         exit_code,
-        // Only populate stdout if result wasn't parsed (avoid duplication)
-        stdout: if result.is_some() {
-            String::new()
-        } else {
-            stdout_result.content.clone()
-        },
+        // Completion classifies the public projection and stores protected raw
+        // originals separately; parsing must not discard the original channel.
+        stdout: stdout_result.content.clone(),
         stderr: stderr_result.content.clone(),
         result,
         duration_ms,
@@ -1276,6 +1287,7 @@ mod tests {
             1024 * 1024,
             1024 * 1024,
             OutputFormat::Text,
+            ResolvedOutputPolicy::default(),
             None,
             Some(cancel_token),
             None,
@@ -1389,6 +1401,7 @@ mod tests {
             1024,
             1024,
             OutputFormat::Text,
+            ResolvedOutputPolicy::default(),
             None,
             Some(cancel_token),
             None,
@@ -1447,6 +1460,7 @@ mod tests {
             1024,
             1024,
             OutputFormat::Text,
+            ResolvedOutputPolicy::default(),
             None,
             Some(cancel_token),
             None,
@@ -1497,6 +1511,7 @@ mod tests {
             1024,
             1024,
             OutputFormat::Text,
+            ResolvedOutputPolicy::default(),
             None,
             None,
             None,
@@ -1528,6 +1543,7 @@ mod tests {
             1024,
             1024,
             OutputFormat::Text,
+            ResolvedOutputPolicy::default(),
             None,
             None,
             None,
@@ -1569,5 +1585,114 @@ mod tests {
             "expected timeout termination, got {}ms",
             result.duration_ms
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod output_policy_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn structured_execution_retains_bounded_raw_stdout_for_protected_original_storage() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("printf '%s\\n' '{\"status\":\"ok\",\"token\":\"private-original\"}'");
+        let result = execute_streaming_cancellable(
+            command,
+            &HashMap::new(),
+            None,
+            Some(5),
+            4096,
+            4096,
+            OutputFormat::Json,
+            ResolvedOutputPolicy {
+                stdout: StdoutPolicy::Secret,
+                stderr: OutputVisibility::Public,
+                error: OutputVisibility::Public,
+            },
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.result.as_ref().unwrap()["status"], "ok");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result.stdout).unwrap(),
+            result.result.unwrap()
+        );
+        assert!(result.stdout.contains("private-original"));
+    }
+
+    #[tokio::test]
+    async fn secret_parameters_do_not_override_a_public_output_policy() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("printf 'public summary\\n'; printf 'public diagnostic\\n' >&2");
+        let secrets = HashMap::from([("credential".into(), json!("private-input"))]);
+        let result = execute_streaming_cancellable(
+            command,
+            &secrets,
+            None,
+            Some(5),
+            4096,
+            4096,
+            OutputFormat::Text,
+            ResolvedOutputPolicy::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.stdout, "public summary\n");
+        assert_eq!(result.stderr, "public diagnostic\n");
+        assert_eq!(result.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_public_policy_is_rejected_before_child_can_publish_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("spawned");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("touch \"$SPAWN_MARKER\"; printf 'should never run\\n'")
+            .env("SPAWN_MARKER", &marker);
+        let contract = attune_common::value_schema::compile_inline(
+            "test.action",
+            attune_common::value_schema::SchemaContext::FlatDocument,
+            &json!({"token":{"type":"string","secret":true}}),
+        )
+        .unwrap();
+        let result = execute_streaming_cancellable(
+            command,
+            &HashMap::new(),
+            None,
+            Some(5),
+            4096,
+            4096,
+            OutputFormat::Json,
+            ResolvedOutputPolicy::default(),
+            Some(&contract),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(result, Err(RuntimeError::InvalidAction(_))));
+        assert!(!marker.exists());
     }
 }

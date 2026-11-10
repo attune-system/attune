@@ -40,6 +40,8 @@ pub mod metadata_cache;
 pub mod models;
 pub mod mq;
 pub mod observability;
+pub mod output_classification;
+pub mod output_policy;
 mod pack_cache_definition;
 pub mod pack_check;
 pub mod pack_environment;

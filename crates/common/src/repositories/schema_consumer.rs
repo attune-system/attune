@@ -128,8 +128,49 @@ pub(crate) fn workflow_fields<'a>(
     ])
 }
 
+/// Validate channel choices against the same resolved authoring graph as values.
+pub(crate) async fn validate_output_policy(
+    connection: &mut PgConnection,
+    pack_id: i64,
+    reference: &str,
+    output: Option<&Value>,
+    policy: &crate::output_policy::OutputPolicy,
+    format: crate::models::OutputFormat,
+    candidate: Option<&RegistryView>,
+) -> Result<()> {
+    let output = if let Some(schema) = output {
+        let source = SourceIdentity::Authoring {
+            component_ref: reference.into(),
+        };
+        Some(if let Some(registry) = candidate {
+            compile(
+                source,
+                SchemaContext::FlatDocument,
+                schema,
+                registry,
+                Limits::default(),
+            )
+            .map_err(|_| Error::validation("Invalid output policy schema"))?
+        } else {
+            let pack = PackRepository::get_by_id(&mut *connection, pack_id).await?;
+            SchemaContractRepository::compile_owned_assignment(
+                connection,
+                source,
+                SchemaContext::FlatDocument,
+                schema,
+                &pack,
+            )
+            .await?
+        })
+    } else {
+        None
+    };
+    policy.resolve(output.as_ref(), format)?;
+    Ok(())
+}
+
 macro_rules! schema_consumer_repository {
-    ($repository:ident, $create:ident, $update:ident, $kind:literal, $patch:ident, [$($field:ident),+] $(, graph $graph:ident)?) => {
+    ($repository:ident, $create:ident, $update:ident, $kind:literal, $patch:ident, [$($field:ident),+] $(, graph $graph:ident)? $(, output_policy $policy:ident)?) => {
         impl $repository {
             pub fn create<'a, 'c, A>(executor: A, input: $create) -> impl std::future::Future<Output = crate::Result<<Self as super::Repository>::Entity>> + Send + 'a
             where A: sqlx::Acquire<'c, Database = sqlx::Postgres> + Send + 'a {
@@ -151,6 +192,8 @@ macro_rules! schema_consumer_repository {
                     &[$((stringify!($field), input.$field.as_ref())),+], candidate).await?;
                 $(super::schema_consumer::validate_fields(connection, input.pack, &input.r#ref,
                     &super::schema_consumer::workflow_fields(&input.$graph, input.param_schema.as_ref(), input.out_schema.as_ref())?, candidate).await?;)?
+                $(super::schema_consumer::validate_output_policy(connection, input.pack, &input.r#ref,
+                    input.out_schema.as_ref(), &input.$policy, input.output_format, candidate).await?;)?
                 let entity = Self::create_row(&mut *connection, input).await?;
                 super::schema_consumer::replace_fields(connection, entity.pack, $kind, &entity.r#ref,
                     &[$((stringify!($field), entity.$field.as_ref())),+]).await?;
@@ -185,6 +228,9 @@ macro_rules! schema_consumer_repository {
                 $(super::schema_consumer::validate_fields(connection, existing.pack, &existing.r#ref,
                     &super::schema_consumer::workflow_fields(input.$graph.as_ref().unwrap_or(&existing.$graph),
                         input.param_schema.as_ref().or(existing.param_schema.as_ref()), input.out_schema.as_ref().or(existing.out_schema.as_ref()))?, candidate).await?;)?
+                $(super::schema_consumer::validate_output_policy(connection, existing.pack, &existing.r#ref,
+                    input.out_schema.as_ref().or(existing.out_schema.as_ref()), input.$policy.as_ref().unwrap_or(&existing.$policy),
+                    input.output_format.as_deref().map(str::parse).transpose().map_err(crate::Error::validation)?.unwrap_or(existing.output_format), candidate).await?;)?
                 let entity = Self::update_row(&mut *connection, id, input).await?;
                 super::schema_consumer::replace_fields(connection, entity.pack, $kind, &entity.r#ref,
                     &[$((stringify!($field), entity.$field.as_ref())),+]).await?;
