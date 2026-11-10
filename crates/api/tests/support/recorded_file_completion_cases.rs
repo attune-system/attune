@@ -2169,9 +2169,13 @@ async fn encrypted_terminal_logs_require_a_complete_authenticated_manifest_on_bo
         },
         runtime_log_completion::FrameTotals,
     };
-    for backend in [
-        LogStreamBackend::ObjectSegments,
-        LogStreamBackend::SharedFile,
+    // Object selection permanently freezes the accepted prefix, even when byte
+    // verification rejects its proof. A complete object needs a separate fixture;
+    // shared-file sealing retains its existing append-after-rejection contract.
+    for (backend, incomplete) in [
+        (LogStreamBackend::ObjectSegments, true),
+        (LogStreamBackend::ObjectSegments, false),
+        (LogStreamBackend::SharedFile, true),
     ] {
         let fixture = fixture(true).await?;
         let context = delivery(&fixture).await?;
@@ -2278,6 +2282,20 @@ async fn encrypted_terminal_logs_require_a_complete_authenticated_manifest_on_bo
                 axum::http::StatusCode::CREATED
             );
         }
+        if !incomplete {
+            assert_eq!(
+                raw(
+                    &fixture,
+                    "PUT",
+                    &format!("/api/v1/internal/logs/{}/segments/1", version.id),
+                    &token,
+                    "application/octet-stream",
+                    last.clone()
+                )
+                .await?,
+                StatusCode::CREATED
+            );
+        }
         let seal = |proof: Option<String>| {
             let mut request = Request::builder()
                 .method("POST")
@@ -2296,40 +2314,61 @@ async fn encrypted_terminal_logs_require_a_complete_authenticated_manifest_on_bo
             seal(None).await?.status(),
             axum::http::StatusCode::FORBIDDEN
         );
-        // Every stored prefix frame authenticates, but the final digest/count do not match.
-        assert_eq!(
-            seal(Some(authenticated.clone())).await?.status(),
-            axum::http::StatusCode::FORBIDDEN
-        );
-        let mut conn = fixture.ctx.pool.acquire().await?;
-        assert!(RuntimeLogCompletionRepository::find(&mut conn, version.id)
-            .await?
-            .is_none());
-        assert_eq!(
-            ArtifactVersionRepository::find_by_id(&mut *conn, version.id)
+        if incomplete {
+            // Every stored prefix frame authenticates, but the final digest/count do not match.
+            assert_eq!(
+                seal(Some(authenticated.clone())).await?.status(),
+                axum::http::StatusCode::FORBIDDEN
+            );
+            let mut conn = fixture.ctx.pool.acquire().await?;
+            assert!(RuntimeLogCompletionRepository::find(&mut conn, version.id)
                 .await?
-                .unwrap()
-                .body_state,
-            Some(ArtifactBodyState::Pending)
-        );
-        drop(conn);
-        if backend == LogStreamBackend::SharedFile {
+                .is_none());
+            assert_eq!(
+                ArtifactVersionRepository::find_by_id(&mut *conn, version.id)
+                    .await?
+                    .unwrap()
+                    .body_state,
+                Some(ArtifactBodyState::Pending)
+            );
+            drop(conn);
+            if backend == LogStreamBackend::ObjectSegments {
+                let mut tx = fixture.ctx.pool.begin().await?;
+                let frozen = LogStreamRepository::lock(&mut tx, stream.id).await?;
+                let phase: Option<String> =
+                    sqlx::query_scalar("SELECT close_phase FROM log_stream WHERE id=$1")
+                        .bind(stream.id)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                assert_eq!(phase.as_deref(), Some("closing"));
+                assert!(!frozen.sealed);
+                let segments = LogStreamRepository::segments_with_conn(&mut tx, stream.id).await?;
+                assert_eq!(segments.len(), 1);
+                assert_eq!(segments[0].sequence, 0);
+                use sha2::{Digest, Sha256};
+                let digest = Sha256::digest(&last)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                let error = LogStreamRepository::check_close_append(
+                    &mut tx,
+                    stream.id,
+                    1,
+                    last.len() as i64,
+                    &digest,
+                    "unaccepted-tail",
+                    None,
+                )
+                .await
+                .unwrap_err();
+                assert!(matches!(error, attune_common::Error::InvalidState(_)));
+                tx.rollback().await?;
+                fixture.ctx.cleanup().await?;
+                continue;
+            }
             volume
                 .append_log_file(version.file_path.as_deref().unwrap(), &last)
                 .await?;
-        } else {
-            assert_eq!(
-                raw(
-                    &fixture,
-                    "PUT",
-                    &format!("/api/v1/internal/logs/{}/segments/1", version.id),
-                    &token,
-                    "application/octet-stream",
-                    last.clone()
-                )
-                .await?,
-                axum::http::StatusCode::CREATED
-            );
         }
         let user = attune_api::auth::middleware::AuthenticatedUser {
             claims: attune_common::auth::jwt::validate_token(
@@ -2409,8 +2448,14 @@ async fn encrypted_terminal_logs_require_a_complete_authenticated_manifest_on_bo
             axum::http::StatusCode::OK
         );
         assert_eq!(
+            // A different authenticated proof conflicts with the immutable selected
+            // object-close identity. Shared-file verification retains its 403.
             seal(Some(manifest.authenticate(key)?)).await?.status(),
-            axum::http::StatusCode::FORBIDDEN
+            if backend == LogStreamBackend::ObjectSegments {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::FORBIDDEN
+            }
         );
         let mut conn = fixture.ctx.pool.acquire().await?;
         let recorded = RuntimeLogCompletionRepository::find(&mut conn, version.id)

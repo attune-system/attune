@@ -41,6 +41,7 @@ pub struct OwnedCommitRelay {
     events: mpsc::Receiver<CommitHeld>,
     stop: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<io::Result<Report>>,
+    release: tokio::sync::watch::Sender<bool>,
 }
 fn invalid() -> io::Error {
     io::Error::new(
@@ -56,6 +57,7 @@ impl OwnedCommitRelay {
         let (stop, mut stop_rx) = oneshot::channel();
         let plan = Arc::new(Mutex::new(std::collections::VecDeque::from(plan)));
         let report = Arc::new(Mutex::new(Report::default()));
+        let (release, release_rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(async move {
             let mut tasks = JoinSet::new();
             let mut id = 0;
@@ -65,32 +67,14 @@ impl OwnedCommitRelay {
                     _ = &mut stop_rx => break None,
                     accepted=listener.accept()=> { let (client,_)=match accepted {Ok(v)=>v,Err(e)=>break Some(e)}; id+=1;
                         let target=target.clone(); let events=events_tx.clone(); let plan=plan.clone(); let report=report.clone();
-                        let mut cancelled=cancel.subscribe(); tasks.spawn(async move { tokio::select! { result=connection(client,target,stream,id,events,plan,report)=>result, _=cancelled.changed()=>Ok(()) } });
+                        let mut cancelled=cancel.subscribe(); let release=release_rx.clone(); tasks.spawn(async move { tokio::select! { result=connection(client,target,stream,id,events,plan,(report,release))=>result, _=cancelled.changed()=>Ok(()) } });
                     }
                     result=tasks.join_next(), if !tasks.is_empty()=> { match result {Some(Ok(Ok(())))=>(),Some(Ok(Err(e)))=>break Some(e),Some(Err(e))=>break Some(io::Error::other(e)),None=>break Some(invalid())} }
                 }
             };
             // Explicit shutdown cancels both halves and joins every owned socket task.
             let _ = cancel.send(true);
-            let joined = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                while let Some(result) = tasks.join_next().await {
-                    result.map_err(io::Error::other)??;
-                }
-                Ok::<_, io::Error>(())
-            })
-            .await;
-            if joined.is_err() {
-                tasks.abort_all();
-                while tasks.join_next().await.is_some() {}
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "relay tasks required watchdog abort",
-                ));
-            }
-            joined.map_err(io::Error::other)??;
-            if let Some(error) = failure {
-                return Err(error);
-            }
+            drain_tasks(&mut tasks, failure, std::time::Duration::from_secs(5)).await?;
             let value = std::mem::take(&mut *report.lock().await);
             Ok(value)
         });
@@ -99,7 +83,12 @@ impl OwnedCommitRelay {
             events,
             stop,
             task,
+            release,
         })
+    }
+    /// Release current and future gates before awaiting a failed test's owned work.
+    pub fn release_holds(&self) {
+        self.release.send_replace(true);
     }
     pub async fn next_event(&mut self) -> io::Result<CommitHeld> {
         self.events.recv().await.ok_or_else(invalid)
@@ -107,6 +96,39 @@ impl OwnedCommitRelay {
     pub async fn shutdown(self) -> io::Result<Report> {
         let _ = self.stop.send(());
         self.task.await.map_err(io::Error::other)?
+    }
+}
+async fn drain_tasks(
+    tasks: &mut JoinSet<io::Result<()>>,
+    mut failure: Option<io::Error>,
+    deadline: std::time::Duration,
+) -> io::Result<()> {
+    let joined = tokio::time::timeout(deadline, async {
+        while let Some(result) = tasks.join_next().await {
+            let error = match result {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(e),
+                Err(e) => Some(io::Error::other(e)),
+            };
+            if failure.is_none() {
+                failure = error;
+            }
+        }
+    })
+    .await;
+    if joined.is_err() {
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        failure.get_or_insert_with(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "relay tasks required watchdog abort",
+            )
+        });
+    }
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 async fn frame<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> io::Result<(u8, Vec<u8>)> {
@@ -358,8 +380,9 @@ async fn connection(
     id: u64,
     events: mpsc::Sender<CommitHeld>,
     plan: Arc<Mutex<std::collections::VecDeque<Class>>>,
-    report: Arc<Mutex<Report>>,
+    ownership: (Arc<Mutex<Report>>, tokio::sync::watch::Receiver<bool>),
 ) -> io::Result<()> {
+    let (report, mut release) = ownership;
     let server = TcpStream::connect(target).await?;
     client.set_nodelay(true)?;
     server.set_nodelay(true)?;
@@ -392,6 +415,7 @@ async fn connection(
     };
     let down = async {
         let mut pid = 0;
+        let mut backend_error = false;
         loop {
             let (k, b) = frame(&mut sr).await?;
             if k == b'K' {
@@ -400,6 +424,15 @@ async fn connection(
                 }
                 pid = i32::from_be_bytes(b[..4].try_into().map_err(|_| invalid())?);
                 report.lock().await.backend_pids.push(pid);
+            }
+            if k == b'E' {
+                backend_error = true;
+            }
+            if k == b'Z' && backend_error {
+                // A deferred COMMIT failure has ErrorResponse + idle ReadyForQuery,
+                // without CommandComplete. Do not allow stale classification on reuse.
+                // Fail closed: unsupported pipelining cannot be correlated safely here.
+                return Err(invalid());
             }
             if k == b'C' && (b == b"COMMIT\0" || b == b"ROLLBACK\0") {
                 let class = if b == b"COMMIT\0" {
@@ -410,7 +443,7 @@ async fn connection(
                 if b == b"COMMIT\0" {
                     let hold = {
                         let mut p = plan.lock().await;
-                        if class.is_some() && p.front().copied() == class {
+                        if !*release.borrow() && class.is_some() && p.front().copied() == class {
                             p.pop_front();
                             true
                         } else {
@@ -448,7 +481,15 @@ async fn connection(
                             })
                             .await
                             .map_err(|_| invalid())?;
-                        match answer.await.map_err(|_| invalid())? {
+                        let decision = if *release.borrow() {
+                            Decision::Forward
+                        } else {
+                            tokio::select! {
+                                value = answer => value.unwrap_or(Decision::Forward),
+                                _ = release.changed() => Decision::Forward,
+                            }
+                        };
+                        match decision {
                             Decision::Disconnect => {
                                 report.lock().await.disconnected += 1;
                                 return Ok(());
@@ -635,13 +676,9 @@ mod backend_tests {
                     .await
                     .unwrap();
             }
-            write(
-                &mut socket,
-                b'C',
-                if error { b"ROLLBACK\0" } else { b"COMMIT\0" },
-            )
-            .await
-            .unwrap();
+            if !error {
+                write(&mut socket, b'C', b"COMMIT\0").await.unwrap();
+            }
             write(&mut socket, b'Z', &[status]).await.unwrap();
             // Keep upstream alive until the client or explicit relay shutdown closes it.
             let _ = socket.read_u8().await;
@@ -669,12 +706,11 @@ mod backend_tests {
         write(&mut client, b'Q', b"COMMIT\0").await.unwrap();
         if error {
             assert_eq!(frame(&mut client).await.unwrap().0, b'E');
-            assert_eq!(frame(&mut client).await.unwrap().1, b"ROLLBACK\0");
-            assert_eq!(frame(&mut client).await.unwrap().1, b"I");
+            // Attempt socket reuse after a real failed-COMMIT response shape.
+            let _ = write(&mut client, b'Q', b"COMMIT\0").await;
+            assert!(frame(&mut client).await.is_err());
             drop(client);
-            let report = relay.shutdown().await.unwrap();
-            assert_eq!(report.held, 0);
-            assert_eq!(report.disconnected, 0);
+            assert!(relay.shutdown().await.is_err());
         } else {
             assert!(
                 tokio::time::timeout(std::time::Duration::from_secs(2), relay.next_event())
@@ -691,11 +727,71 @@ mod backend_tests {
             .unwrap();
     }
     #[tokio::test]
-    async fn error_and_rollback_are_never_successful_commit_proof() {
+    async fn failed_commit_without_completion_rejects_unrelated_commit_reuse() {
         rejected_completion(true, b'I').await
     }
     #[tokio::test]
     async fn commit_with_nonidle_ready_is_not_successful_commit_proof() {
         rejected_completion(false, b'T').await
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::{
+        sync::atomic::{AtomicBool, Ordering},
+        time::Duration,
+    };
+    #[tokio::test]
+    async fn first_error_does_not_skip_sibling_join() {
+        let done = Arc::new(AtomicBool::new(false));
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async { Err(io::Error::other("first")) });
+        let flag = done.clone();
+        tasks.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            flag.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        assert_eq!(
+            drain_tasks(&mut tasks, None, Duration::from_secs(1))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "first"
+        );
+        assert!(done.load(Ordering::SeqCst));
+        assert!(tasks.is_empty());
+    }
+    #[tokio::test]
+    async fn watchdog_aborts_and_joins_remainder_preserving_first_error() {
+        struct Finished(Arc<AtomicBool>);
+        impl Drop for Finished {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Finished(done.clone());
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        assert_eq!(
+            drain_tasks(
+                &mut tasks,
+                Some(io::Error::other("first")),
+                Duration::from_millis(20)
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "first"
+        );
+        assert!(done.load(Ordering::SeqCst));
+        assert!(tasks.is_empty());
     }
 }

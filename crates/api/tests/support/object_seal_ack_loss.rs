@@ -4,6 +4,7 @@ use attune_common::{
     models::LogStreamBackend, repositories::log_stream::LogStreamRepository,
     runtime_log_completion::FrameTotals,
 };
+use futures::FutureExt;
 use std::{
     sync::{atomic::Ordering, Arc},
     time::Duration,
@@ -116,6 +117,15 @@ async fn snapshot(pool: &sqlx::PgPool, stream: i64, version: i64) -> Result<Valu
     Ok(sqlx::query_scalar("SELECT jsonb_build_object('phase',s.close_phase,'revision',s.close_revision,'input',s.close_input,'hash',s.close_input_sha256,'deadline',s.close_deadline,'sealed',s.sealed,'sealed_at',s.sealed_at,'state',v.body_state,'meta',v.meta,'size',v.size_bytes,'digest',v.sha256,'membership',(SELECT jsonb_agg(to_jsonb(x) ORDER BY x.sequence) FROM log_segment x WHERE x.stream=s.id),'evidence',(SELECT jsonb_agg(to_jsonb(e)) FROM runtime_log_final_manifest e WHERE e.artifact_version=v.id)) FROM log_stream s JOIN artifact_version v ON v.id=s.artifact_version WHERE s.id=$1 AND v.id=$2").bind(stream).bind(version).fetch_one(pool).await?)
 }
 async fn run(final_loss: bool, revoke: bool, twice: bool, forwarded_expiry: bool) -> Result<()> {
+    run_with_failure(final_loss, revoke, twice, forwarded_expiry, None).await
+}
+async fn run_with_failure(
+    final_loss: bool,
+    revoke: bool,
+    twice: bool,
+    forwarded_expiry: bool,
+    failure: Option<bool>,
+) -> Result<()> {
     // Only the initializer enters cold migration setup; the other libtest workers
     // wait here rather than consuming the database template lock's 300s budget.
     static WARM: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
@@ -129,417 +139,494 @@ async fn run(final_loss: bool, revoke: bool, twice: bool, forwarded_expiry: bool
     .await?;
     let backend = LogStreamBackend::ObjectSegments;
     let fixture = fixture(true).await?;
-    let context = delivery(&fixture).await?;
-    let created = fixture
-        .ctx
-        .post(
-            "/api/v1/artifacts",
-            json!({"ref":"recorded_emitter.encrypted.stdout.log",
+    let mut owned_http = None;
+    let mut owned_relay = None;
+    let mut owned_pool = None;
+    let mut owned_store: Option<Arc<SealGetBarrier>> = None;
+    let mut first_connection = None;
+    let mut http_joined = false;
+    let scenario = std::panic::AssertUnwindSafe(async {
+        let context = delivery(&fixture).await?;
+        let created = fixture
+            .ctx
+            .post(
+                "/api/v1/artifacts",
+                json!({"ref":"recorded_emitter.encrypted.stdout.log",
             "scope":"action","owner":"recorded_emitter.emit","type":"file_text"}),
-            Some(&fixture.token),
+                Some(&fixture.token),
+            )
+            .await?;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let body: Value = created.json().await?;
+        let mut tx = fixture.ctx.pool.begin().await?;
+        let (_, effect) =
+            WorkerDeliveryRepository::require_launch_context(&mut tx, &context).await?;
+        let version = ArtifactVersionRepository::create_log_pending_with_conn(
+            &mut tx,
+            body["data"]["id"].as_i64().unwrap(),
+            "recorded_emitter.encrypted.stdout.log",
+            backend,
+            context.execution,
+            json!({"stream":"stdout"}),
         )
         .await?;
-    assert_eq!(created.status(), StatusCode::CREATED);
-    let body: Value = created.json().await?;
-    let mut tx = fixture.ctx.pool.begin().await?;
-    let (_, effect) = WorkerDeliveryRepository::require_launch_context(&mut tx, &context).await?;
-    let version = ArtifactVersionRepository::create_log_pending_with_conn(
-        &mut tx,
-        body["data"]["id"].as_i64().unwrap(),
-        "recorded_emitter.encrypted.stdout.log",
-        backend,
-        context.execution,
-        json!({"stream":"stdout"}),
-    )
-    .await?;
-    ArtifactVersionRepository::mark_encrypted_log(&mut *tx, version.id).await?;
-    let wire_cap = attune_common::runtime_read_log::maximum_encoded_bytes(32768)?;
-    let stream = LogStreamRepository::create_with_backend_with_conn(
-        &mut tx, version.id, backend, wire_cap, 500,
-    )
-    .await?;
-    let permit = WorkerDeliveryRepository::bind_encrypted_log(
-        &mut tx,
-        &context,
-        version.id,
-        stream.id,
-        wire_cap as i64,
-        wire_cap as i64,
-        32896,
-        &effect,
-    )
-    .await?;
-    tx.commit().await?;
-    let token =
-        attune_common::worker_delivery::mint(&context, &permit, &fixture.ctx.state.jwt_config)?;
-    let key = fixture
-        .ctx
-        .state
-        .config
-        .security
-        .encryption_key
-        .as_deref()
-        .unwrap();
-    let first = attune_common::runtime_read_log::encode(
-        key,
-        context.execution,
-        version.id,
-        0,
-        &vec![255; 16384],
-    )?;
-
-    let mut totals = FrameTotals::default();
-    totals.record(&first, 16384)?;
-    let manifest = totals.manifest(context.execution, version.id)?;
-    let authenticated = manifest.authenticate(key)?;
-    assert_eq!(
-        raw(
-            &fixture,
-            "PUT",
-            &format!("/api/v1/internal/logs/{}/segments/0", version.id),
-            &token,
-            "application/octet-stream",
-            first.clone()
+        ArtifactVersionRepository::mark_encrypted_log(&mut *tx, version.id).await?;
+        let wire_cap = attune_common::runtime_read_log::maximum_encoded_bytes(32768)?;
+        let stream = LogStreamRepository::create_with_backend_with_conn(
+            &mut tx, version.id, backend, wire_cap, 500,
         )
-        .await?,
-        StatusCode::CREATED
-    );
-    let store = Arc::new(SealGetBarrier {
-        inner: fixture.ctx.state.blob_store.clone(),
-        uploaded: tokio::sync::Notify::new(),
-        finish: tokio::sync::Semaphore::new(0),
-        gets: std::sync::atomic::AtomicUsize::new(0),
-    });
-    let options = fixture.ctx.pool.connect_options();
-    let target = format!("{}:{}", options.get_host(), options.get_port());
-    let mut relay = OwnedCommitRelay::start(
-        target,
-        stream.id,
-        vec![
+        .await?;
+        let permit = WorkerDeliveryRepository::bind_encrypted_log(
+            &mut tx,
+            &context,
+            version.id,
+            stream.id,
+            wire_cap as i64,
+            wire_cap as i64,
+            32896,
+            &effect,
+        )
+        .await?;
+        tx.commit().await?;
+        let token =
+            attune_common::worker_delivery::mint(&context, &permit, &fixture.ctx.state.jwt_config)?;
+        let key = fixture
+            .ctx
+            .state
+            .config
+            .security
+            .encryption_key
+            .as_deref()
+            .unwrap();
+        let first = attune_common::runtime_read_log::encode(
+            key,
+            context.execution,
+            version.id,
+            0,
+            &vec![255; 16384],
+        )?;
+
+        let mut totals = FrameTotals::default();
+        totals.record(&first, 16384)?;
+        let manifest = totals.manifest(context.execution, version.id)?;
+        let authenticated = manifest.authenticate(key)?;
+        assert_eq!(
+            raw(
+                &fixture,
+                "PUT",
+                &format!("/api/v1/internal/logs/{}/segments/0", version.id),
+                &token,
+                "application/octet-stream",
+                first.clone()
+            )
+            .await?,
+            StatusCode::CREATED
+        );
+        let store = Arc::new(SealGetBarrier {
+            inner: fixture.ctx.state.blob_store.clone(),
+            uploaded: tokio::sync::Notify::new(),
+            finish: tokio::sync::Semaphore::new(0),
+            gets: std::sync::atomic::AtomicUsize::new(0),
+        });
+        owned_store = Some(store.clone());
+        let options = fixture.ctx.pool.connect_options();
+        let target = format!("{}:{}", options.get_host(), options.get_port());
+        owned_relay = Some(
+            OwnedCommitRelay::start(
+                target,
+                stream.id,
+                vec![
+                    if final_loss {
+                        Class::Publication
+                    } else {
+                        Class::SelectedOnly
+                    },
+                    Class::SelectedOnly,
+                ],
+            )
+            .await?,
+        );
+        let relay = owned_relay.as_mut().unwrap();
+        let search_path: String = sqlx::query_scalar("SHOW search_path")
+            .fetch_one(&fixture.ctx.pool)
+            .await?;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .min_connections(0)
+            .acquire_timeout(Duration::from_secs(5))
+            .after_connect(move |connection, _| {
+                let search_path = search_path.clone();
+                Box::pin(async move {
+                    sqlx::query("SELECT set_config('search_path',$1,false)")
+                        .bind(search_path)
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect_with(
+                (*options)
+                    .clone()
+                    .host("127.0.0.1")
+                    .port(relay.port)
+                    .ssl_mode(sqlx::postgres::PgSslMode::Disable),
+            )
+            .await?;
+        owned_pool = Some(pool.clone());
+        let mut state = (*fixture.ctx.state).clone();
+        state.db = pool.clone();
+        state.blob_store = store.clone();
+        let state = Arc::new(state);
+        let app = attune_api::server::Server::new(state.clone()).router();
+        // The process credential deliberately has no consumer declaration here.
+        let denied = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/internal/logs/{}/seal", version.id))
+            .header("authorization", format!("Bearer {}", fixture.token))
+            .header("x-attune-log-final-manifest", authenticated.clone())
+            .body(Body::empty())?;
+        let denied = app.clone().oneshot(denied).await?;
+        let denied_status = denied.status();
+        let denied_body = axum::body::to_bytes(denied.into_body(), 64 * 1024).await?;
+        assert_eq!(
+            denied_status,
+            StatusCode::FORBIDDEN,
+            "process consumer control: {}",
+            String::from_utf8_lossy(&denied_body)
+        );
+        let mut tx = fixture.ctx.pool.begin().await?;
+        // C intentionally closes acquisition before the platform finishes logs.
+        let _ = attune_common::repositories::runtime_read::RuntimeReadRepository::close_execution(
+            &mut tx,
+            context.execution,
+        )
+        .await?;
+        tx.commit().await?;
+        ExecutionRepository::update(
+            &fixture.ctx.pool,
+            context.execution,
+            UpdateExecutionInput {
+                status: Some(ExecutionStatus::Completed),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let (token, credential_deadline) = if forwarded_expiry {
+            let mut claims =
+                attune_common::auth::jwt::validate_token(&token, &fixture.ctx.state.jwt_config)?;
+            claims.exp = chrono::Utc::now().timestamp() + 5;
+            let deadline = claims.exp;
+            (
+                jsonwebtoken::encode(
+                    &jsonwebtoken::Header::default(),
+                    &claims,
+                    &jsonwebtoken::EncodingKey::from_secret(
+                        fixture.ctx.state.jwt_config.secret.as_bytes(),
+                    ),
+                )?,
+                deadline,
+            )
+        } else {
+            (token, 0)
+        };
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/internal/logs/{}/seal", version.id))
+                .header("authorization", format!("Bearer {token}"))
+                .header("x-attune-log-final-manifest", authenticated.clone())
+                .body(Body::empty())
+                .unwrap()
+        };
+        owned_http = Some(tokio::spawn(app.clone().oneshot(request())));
+        let http = owned_http.as_mut().unwrap();
+        let mut original_pending = None;
+        if final_loss {
+            tokio::time::timeout(Duration::from_secs(10), store.uploaded.notified()).await?;
+            if failure == Some(false) {
+                return Err("injected gated GET failure".into());
+            }
+            let pending = snapshot(&fixture.ctx.pool, stream.id, version.id).await?;
+            assert_eq!(pending["phase"], "closing");
+            assert_eq!(pending["state"], "pending");
+            assert_eq!(pending["sealed"], false);
+            assert!(pending["evidence"].is_null());
+            original_pending = Some(pending);
+            store.finish.add_permits(1);
+        }
+        let held = tokio::time::timeout(Duration::from_secs(10), relay.next_event()).await??;
+        assert!(failure != Some(true), "injected held ACK panic");
+        assert_eq!(held.status, b'I');
+        assert_eq!(
+            held.class,
             if final_loss {
                 Class::Publication
             } else {
                 Class::SelectedOnly
-            },
-            Class::SelectedOnly,
-        ],
-    )
-    .await?;
-    let search_path: String = sqlx::query_scalar("SHOW search_path")
-        .fetch_one(&fixture.ctx.pool)
-        .await?;
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .min_connections(0)
-        .acquire_timeout(Duration::from_secs(5))
-        .after_connect(move |connection, _| {
-            let search_path = search_path.clone();
-            Box::pin(async move {
-                sqlx::query("SELECT set_config('search_path',$1,false)")
-                    .bind(search_path)
-                    .execute(connection)
-                    .await?;
-                Ok(())
-            })
-        })
-        .connect_with(
-            (*options)
-                .clone()
-                .host("127.0.0.1")
-                .port(relay.port)
-                .ssl_mode(sqlx::postgres::PgSslMode::Disable),
-        )
-        .await?;
-    let mut state = (*fixture.ctx.state).clone();
-    state.db = pool.clone();
-    state.blob_store = store.clone();
-    let state = Arc::new(state);
-    let app = attune_api::server::Server::new(state.clone()).router();
-    // The process credential deliberately has no consumer declaration here.
-    let denied = Request::builder()
-        .method("POST")
-        .uri(format!("/api/v1/internal/logs/{}/seal", version.id))
-        .header("authorization", format!("Bearer {}", fixture.token))
-        .header("x-attune-log-final-manifest", authenticated.clone())
-        .body(Body::empty())?;
-    let denied = app.clone().oneshot(denied).await?;
-    let denied_status = denied.status();
-    let denied_body = axum::body::to_bytes(denied.into_body(), 64 * 1024).await?;
-    assert_eq!(
-        denied_status,
-        StatusCode::FORBIDDEN,
-        "process consumer control: {}",
-        String::from_utf8_lossy(&denied_body)
-    );
-    let mut tx = fixture.ctx.pool.begin().await?;
-    // C intentionally closes acquisition before the platform finishes logs.
-    let _ = attune_common::repositories::runtime_read::RuntimeReadRepository::close_execution(
-        &mut tx,
-        context.execution,
-    )
-    .await?;
-    tx.commit().await?;
-    ExecutionRepository::update(
-        &fixture.ctx.pool,
-        context.execution,
-        UpdateExecutionInput {
-            status: Some(ExecutionStatus::Completed),
-            ..Default::default()
-        },
-    )
-    .await?;
-    let (token, credential_deadline) = if forwarded_expiry {
-        let mut claims =
-            attune_common::auth::jwt::validate_token(&token, &fixture.ctx.state.jwt_config)?;
-        claims.exp = chrono::Utc::now().timestamp() + 5;
-        let deadline = claims.exp;
-        (
-            jsonwebtoken::encode(
-                &jsonwebtoken::Header::default(),
-                &claims,
-                &jsonwebtoken::EncodingKey::from_secret(
-                    fixture.ctx.state.jwt_config.secret.as_bytes(),
-                ),
-            )?,
-            deadline,
-        )
-    } else {
-        (token, 0)
-    };
-    let request = || {
-        Request::builder()
-            .method("POST")
-            .uri(format!("/api/v1/internal/logs/{}/seal", version.id))
-            .header("authorization", format!("Bearer {token}"))
-            .header("x-attune-log-final-manifest", authenticated.clone())
-            .body(Body::empty())
-            .unwrap()
-    };
-    let mut http = tokio::spawn(app.clone().oneshot(request()));
-    let mut original_pending = None;
-    if final_loss {
-        tokio::time::timeout(Duration::from_secs(10), store.uploaded.notified()).await?;
-        let pending = snapshot(&fixture.ctx.pool, stream.id, version.id).await?;
-        assert_eq!(pending["phase"], "closing");
-        assert_eq!(pending["state"], "pending");
-        assert_eq!(pending["sealed"], false);
-        assert!(pending["evidence"].is_null());
-        original_pending = Some(pending);
-        store.finish.add_permits(1);
-    }
-    let held = tokio::time::timeout(Duration::from_secs(10), relay.next_event()).await??;
-    assert_eq!(held.status, b'I');
-    assert_eq!(
-        held.class,
-        if final_loss {
-            Class::Publication
-        } else {
-            Class::SelectedOnly
-        }
-    );
-    eprintln!(
-        "seal commit held: connection={} backend_pid={} class={:?} status={}",
-        held.connection, held.backend_pid, held.class, held.status
-    );
-    let first_pid = held.backend_pid;
-    let first_conn = held.connection;
-    let committed = snapshot(&fixture.ctx.pool, stream.id, version.id).await?;
-    if let Some(pending) = original_pending {
-        for field in ["revision", "input", "hash", "deadline", "membership"] {
-            assert_eq!(committed[field], pending[field]);
-        }
-    }
-    assert_eq!(committed["revision"], 1);
-    assert_eq!(committed["membership"].as_array().unwrap().len(), 1);
-    assert_eq!(committed["membership"][0]["sequence"], 0);
-    use sha2::{Digest, Sha256};
-    let expected_digest = Sha256::digest(&first)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    if final_loss {
-        assert_eq!(committed["digest"], expected_digest);
-    }
-    assert_eq!(
-        committed["phase"],
-        if final_loss { "published" } else { "closing" }
-    );
-    assert_eq!(
-        committed["state"],
-        if final_loss { "ready" } else { "pending" }
-    );
-    assert_eq!(committed["sealed"], final_loss);
-    assert_eq!(store.gets.load(Ordering::SeqCst), usize::from(final_loss));
-    if final_loss {
-        assert_eq!(committed["size"], first.len() as i64);
-        assert_eq!(committed["evidence"].as_array().unwrap().len(), 1);
-    } else {
-        assert!(committed["evidence"].is_null());
-    }
-    assert!(tokio::time::timeout(Duration::from_millis(50), &mut http)
-        .await
-        .is_err());
-    if revoke || forwarded_expiry {
-        if revoke {
-            RuntimeAuthorityRepository::revoke_admission(
-                &mut *fixture.ctx.pool.acquire().await?,
-                fixture.credential.admission_id,
-            )
-            .await?;
-        }
-        if forwarded_expiry {
-            while chrono::Utc::now().timestamp() < credential_deadline {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        );
+        eprintln!(
+            "seal commit held: connection={} backend_pid={} class={:?} status={}",
+            held.connection, held.backend_pid, held.class, held.status
+        );
+        let first_pid = held.backend_pid;
+        let first_conn = held.connection;
+        first_connection = Some(first_conn);
+        let committed = snapshot(&fixture.ctx.pool, stream.id, version.id).await?;
+        if let Some(pending) = original_pending {
+            for field in ["revision", "input", "hash", "deadline", "membership"] {
+                assert_eq!(committed[field], pending[field]);
             }
         }
-        held.decide(if forwarded_expiry {
-            Decision::Forward
-        } else {
-            Decision::Disconnect
-        })?;
+        assert_eq!(committed["revision"], 1);
+        assert_eq!(committed["membership"].as_array().unwrap().len(), 1);
+        assert_eq!(committed["membership"][0]["sequence"], 0);
+        use sha2::{Digest, Sha256};
+        let expected_digest = Sha256::digest(&first)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if final_loss {
+            assert_eq!(committed["digest"], expected_digest);
+        }
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(10), http)
-                .await???
-                .status(),
-            StatusCode::FORBIDDEN
+            committed["phase"],
+            if final_loss { "published" } else { "closing" }
         );
+        assert_eq!(
+            committed["state"],
+            if final_loss { "ready" } else { "pending" }
+        );
+        assert_eq!(committed["sealed"], final_loss);
+        assert_eq!(store.gets.load(Ordering::SeqCst), usize::from(final_loss));
+        if final_loss {
+            assert_eq!(committed["size"], first.len() as i64);
+            assert_eq!(committed["evidence"].as_array().unwrap().len(), 1);
+        } else {
+            assert!(committed["evidence"].is_null());
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut *http)
+            .await
+            .inspect(|_| {
+                http_joined = true;
+            })
+            .is_err());
+        if revoke || forwarded_expiry {
+            if revoke {
+                RuntimeAuthorityRepository::revoke_admission(
+                    &mut *fixture.ctx.pool.acquire().await?,
+                    fixture.credential.admission_id,
+                )
+                .await?;
+            }
+            if forwarded_expiry {
+                while chrono::Utc::now().timestamp() < credential_deadline {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+            held.decide(if forwarded_expiry {
+                Decision::Forward
+            } else {
+                Decision::Disconnect
+            })?;
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(10), &mut *http)
+                    .await
+                    .inspect(|_| {
+                        http_joined = true;
+                    })???
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                snapshot(&fixture.ctx.pool, stream.id, version.id).await?,
+                committed
+            );
+            assert_eq!(store.gets.load(Ordering::SeqCst), usize::from(final_loss));
+            return Ok(());
+        }
+        held.decide(Decision::Disconnect)?;
+        let retry = tokio::time::timeout(Duration::from_secs(10), relay.next_event()).await??;
+        eprintln!(
+            "seal reconciliation held: connection={} backend_pid={} class={:?} status={}",
+            retry.connection, retry.backend_pid, retry.class, retry.status
+        );
+        assert_ne!(retry.backend_pid, first_pid);
+        assert_ne!(retry.connection, first_conn);
+        assert_eq!(retry.class, Class::SelectedOnly);
         assert_eq!(
             snapshot(&fixture.ctx.pool, stream.id, version.id).await?,
             committed
         );
         assert_eq!(store.gets.load(Ordering::SeqCst), usize::from(final_loss));
-        drop(app);
-        drop(state);
-        pool.close().await;
-        let report = relay.shutdown().await?;
-        eprintln!("seal relay disposed: {report:?}");
-        if forwarded_expiry {
+        retry.decide(if twice {
+            Decision::Disconnect
+        } else {
+            Decision::Forward
+        })?;
+        if twice {
             assert_eq!(
-                report.backend_pids.len() as u64,
-                first_conn,
-                "acknowledged freshness rejection must not open reconciliation"
+                tokio::time::timeout(Duration::from_secs(10), &mut *http)
+                    .await
+                    .inspect(|_| {
+                        http_joined = true;
+                    })???
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE
             );
+            assert_eq!(
+                snapshot(&fixture.ctx.pool, stream.id, version.id).await?,
+                committed
+            );
+            assert_eq!(store.gets.load(Ordering::SeqCst), 0);
+            *http = tokio::spawn(app.clone().oneshot(request()));
+            http_joined = false;
         }
-        assert_eq!(report.held, 1);
-        assert_eq!(report.disconnected, usize::from(!forwarded_expiry));
-        assert_eq!(report.publications, usize::from(final_loss));
-        assert_no_backends(&fixture.ctx.pool, &report.backend_pids).await?;
-        fixture.ctx.cleanup().await?;
-        return Ok(());
-    }
-    held.decide(Decision::Disconnect)?;
-    let retry = tokio::time::timeout(Duration::from_secs(10), relay.next_event()).await??;
-    eprintln!(
-        "seal reconciliation held: connection={} backend_pid={} class={:?} status={}",
-        retry.connection, retry.backend_pid, retry.class, retry.status
-    );
-    assert_ne!(retry.backend_pid, first_pid);
-    assert_ne!(retry.connection, first_conn);
-    assert_eq!(retry.class, Class::SelectedOnly);
-    assert_eq!(
-        snapshot(&fixture.ctx.pool, stream.id, version.id).await?,
-        committed
-    );
-    assert_eq!(store.gets.load(Ordering::SeqCst), usize::from(final_loss));
-    retry.decide(if twice {
-        Decision::Disconnect
-    } else {
-        Decision::Forward
-    })?;
-    if twice {
+        if !final_loss {
+            tokio::time::timeout(Duration::from_secs(10), store.uploaded.notified()).await?;
+            store.finish.add_permits(1);
+        }
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(10), http)
-                .await???
+            tokio::time::timeout(Duration::from_secs(10), &mut *http)
+                .await
+                .inspect(|_| {
+                    http_joined = true;
+                })???
                 .status(),
-            StatusCode::SERVICE_UNAVAILABLE
+            StatusCode::OK
         );
-        assert_eq!(
-            snapshot(&fixture.ctx.pool, stream.id, version.id).await?,
-            committed
-        );
-        assert_eq!(store.gets.load(Ordering::SeqCst), 0);
-        http = tokio::spawn(app.clone().oneshot(request()));
-    }
-    if !final_loss {
-        tokio::time::timeout(Duration::from_secs(10), store.uploaded.notified()).await?;
-        store.finish.add_permits(1);
-    }
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(10), http)
-            .await???
-            .status(),
-        StatusCode::OK
-    );
-    let published = snapshot(&fixture.ctx.pool, stream.id, version.id).await?;
-    assert_eq!(published["phase"], "published");
-    assert_eq!(published["state"], "ready");
-    assert_eq!(published["sealed"], true);
-    for field in ["revision", "input", "hash", "deadline", "membership"] {
-        assert_eq!(published[field], committed[field]);
-    }
-    assert_eq!(published["evidence"].as_array().unwrap().len(), 1);
-    assert_eq!(published["digest"], expected_digest);
-    assert_eq!(published["size"], first.len() as i64);
-    if final_loss {
-        assert_eq!(published, committed);
-    }
-    let mut conn = fixture.ctx.pool.acquire().await?;
-    let recorded =
+        let published = snapshot(&fixture.ctx.pool, stream.id, version.id).await?;
+        assert_eq!(published["phase"], "published");
+        assert_eq!(published["state"], "ready");
+        assert_eq!(published["sealed"], true);
+        for field in ["revision", "input", "hash", "deadline", "membership"] {
+            assert_eq!(published[field], committed[field]);
+        }
+        assert_eq!(published["evidence"].as_array().unwrap().len(), 1);
+        assert_eq!(published["digest"], expected_digest);
+        assert_eq!(published["size"], first.len() as i64);
+        if final_loss {
+            assert_eq!(published, committed);
+        }
+        let mut conn = fixture.ctx.pool.acquire().await?;
+        let recorded =
         attune_common::repositories::runtime_log_completion::RuntimeLogCompletionRepository::find(
             &mut conn, version.id,
         )
         .await?
         .unwrap();
-    assert_eq!(recorded.cipher_sha256, expected_digest);
-    assert_eq!(recorded.stream, stream.id);
-    assert_eq!(recorded.attempt, context.attempt);
-    assert_eq!(recorded.worker_instance, context.worker_instance);
-    assert_eq!(recorded.frame_count, 1);
-    assert_eq!(recorded.plain_bytes, 16384);
-    assert_eq!(recorded.cipher_bytes, first.len() as i64);
-    assert!(
-        attune_common::runtime_log_completion::FinalLogManifest::open(
-            key,
-            &recorded.authenticated_manifest
-        )? == manifest
-    );
-    drop(conn);
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(10), app.clone().oneshot(request()))
-            .await??
-            .status(),
-        StatusCode::OK
-    );
-    let changed = Request::builder()
-        .method("POST")
-        .uri(format!(
-            "/api/v1/internal/logs/{}/seal?truncated=true",
-            version.id
-        ))
-        .header("authorization", format!("Bearer {token}"))
-        .header("x-attune-log-final-manifest", authenticated.clone())
-        .body(Body::empty())?;
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(10), app.clone().oneshot(changed))
-            .await??
-            .status(),
-        StatusCode::CONFLICT
-    );
-    assert_eq!(
-        snapshot(&fixture.ctx.pool, stream.id, version.id).await?,
-        published
-    );
-    assert_eq!(store.gets.load(Ordering::SeqCst), 1);
-    drop(app);
-    drop(state);
-    pool.close().await;
-    let report = relay.shutdown().await?;
-    eprintln!("seal relay disposed: {report:?}");
-    assert_eq!(report.held, 2);
-    assert_eq!(report.disconnected, if twice { 2 } else { 1 });
-    assert_eq!(report.publications, 1);
-    assert_no_backends(&fixture.ctx.pool, &report.backend_pids).await?;
-    fixture.ctx.cleanup().await?;
+        assert_eq!(recorded.cipher_sha256, expected_digest);
+        assert_eq!(recorded.stream, stream.id);
+        assert_eq!(recorded.attempt, context.attempt);
+        assert_eq!(recorded.worker_instance, context.worker_instance);
+        assert_eq!(recorded.frame_count, 1);
+        assert_eq!(recorded.plain_bytes, 16384);
+        assert_eq!(recorded.cipher_bytes, first.len() as i64);
+        assert!(
+            attune_common::runtime_log_completion::FinalLogManifest::open(
+                key,
+                &recorded.authenticated_manifest
+            )? == manifest
+        );
+        drop(conn);
+        *http = tokio::spawn(app.clone().oneshot(request()));
+        http_joined = false;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), &mut *http)
+                .await
+                .inspect(|_| {
+                    http_joined = true;
+                })???
+                .status(),
+            StatusCode::OK
+        );
+        let changed = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/api/v1/internal/logs/{}/seal?truncated=true",
+                version.id
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .header("x-attune-log-final-manifest", authenticated.clone())
+            .body(Body::empty())?;
+        *http = tokio::spawn(app.clone().oneshot(changed));
+        http_joined = false;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), &mut *http)
+                .await
+                .inspect(|_| {
+                    http_joined = true;
+                })???
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            snapshot(&fixture.ctx.pool, stream.id, version.id).await?,
+            published
+        );
+        assert_eq!(store.gets.load(Ordering::SeqCst), 1);
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+    .catch_unwind()
+    .await;
+    // Ownership lives outside the caught scenario: even assertions and early ? exits
+    // must release both gates and await the HTTP waiter AND its inner owned seal.
+    if let Some(store) = owned_store {
+        store.finish.add_permits(1024);
+    }
+    if let Some(relay) = owned_relay.as_ref() {
+        relay.release_holds();
+    }
+    let joined = if !http_joined {
+        if let Some(http) = owned_http.as_mut() {
+            Some(http.await)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(pool) = owned_pool {
+        pool.close().await;
+    }
+    let report = match owned_relay {
+        Some(relay) => Some(relay.shutdown().await),
+        None => None,
+    };
+    let disposed = match &report {
+        Some(Ok(report)) => assert_no_backends(&fixture.ctx.pool, &report.backend_pids).await,
+        _ => Ok(()),
+    };
+    let cleaned = fixture.ctx.cleanup().await;
+    // Cleanup failures also fail the injected-error regressions.
+    disposed?;
+    cleaned?;
+    if let Some(joined) = joined {
+        joined??;
+    }
+    let report = report.transpose()?;
+    if let Some(report) = &report {
+        eprintln!("seal relay disposed: {report:?}");
+    }
+    // Propagate only after every teardown stage has been attempted.
+    match scenario {
+        Ok(result) => result?,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+    if let Some(report) = report {
+        if revoke || forwarded_expiry {
+            if forwarded_expiry {
+                assert_eq!(report.backend_pids.len() as u64, first_connection.unwrap());
+            }
+            assert_eq!(report.held, 1);
+            assert_eq!(report.disconnected, usize::from(!forwarded_expiry));
+            assert_eq!(report.publications, usize::from(final_loss));
+        } else {
+            assert_eq!(report.held, 2);
+            assert_eq!(report.disconnected, if twice { 2 } else { 1 });
+            assert_eq!(report.publications, 1);
+        }
+    }
     Ok(())
 }
 #[tokio::test]
@@ -594,4 +681,29 @@ async fn object_seal_prepare_commit_ack_forwarded_after_credential_expiry_is_ter
 async fn object_seal_final_commit_ack_forwarded_after_credential_expiry_is_terminal() -> Result<()>
 {
     run(true, false, false, true).await
+}
+
+#[tokio::test]
+async fn object_seal_error_with_get_gated_awaits_cleanup() -> Result<()> {
+    let error = run_with_failure(true, false, false, false, Some(false))
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "injected gated GET failure");
+    Ok(())
+}
+#[tokio::test]
+async fn object_seal_panic_with_ack_held_awaits_cleanup() -> Result<()> {
+    let panic =
+        std::panic::AssertUnwindSafe(run_with_failure(false, false, false, false, Some(true)))
+            .catch_unwind()
+            .await
+            .expect_err("injected panic must propagate after cleanup");
+    assert_eq!(
+        panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied()),
+        Some("injected held ACK panic")
+    );
+    Ok(())
 }

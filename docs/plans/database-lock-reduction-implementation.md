@@ -1910,3 +1910,57 @@ unclassified/unresolved. Scope A still does not solve full PUT settlement,
 pre-admitted late starts, forgotten staging, post-retention recreation or filesystem
 retirement. The finite supported producer/final-wait matrix is now tested; it does
 not prove every possible lifecycle transition or erase those physical limits.
+
+### Root ACK harness corrections and CI contract audit (checkpoint; validation pending)
+
+Astra's three P2 harness findings at `e4b35e40` are corrected in source:
+
+- The ACK scenario catches panics and errors with HTTP, relay, pool and GET-gate
+  ownership outside the scenario. Teardown releases existing/future ACK gates and
+  GET, awaits the HTTP task (including the production-owned seal), closes the
+  pool, joins the relay, checks backend disposal, and cleans the fixture before
+  propagating failure. Timeout awaits borrow handles; completed handles are not
+  polled twice. Added actual-route injected GET-error and held-ACK-panic cases.
+- Failed COMMIT ErrorResponse followed by ReadyForQuery without CommandComplete
+  now closes the relay connection, failing closed rather than allowing stale
+  queued classification on socket reuse. Added an attempted-reuse regression.
+- Relay shutdown retains its first failure while draining every socket task;
+  watchdog cancellation aborts and awaits the remainder. Added sibling-completion
+  and watchdog/first-error regressions.
+
+Initial evidence: the standalone relay import and actual API target each passed
+10/10 relay tests. API target passed 12/12 HTTP cases on PG16.15 and PG18.6 (four
+workers, zero ignored), including the two injected cleanup failures and the three
+recorded-delivery boundary cases. The initial Clippy run failed six manual-inspect
+lints; changed bookkeeping to `inspect`. Its failed run remains recorded in
+`/tmp/attune-harness-validation-state.json`, with independent zero clone/PID/lock
+checks and owned server/volume removal. An initial standalone filter matched zero
+tests and is not test evidence. Provisioning initially hit PostgreSQL's temporary
+initialization socket; TCP readiness corrected that setup failure.
+
+CI at pushed head `e4b35e40` (run 42741719657) had green lint, smoke, security and
+other checks but failed the encrypted-terminal-log API fixture: it expected an
+append after rejected object verification. Permanent selection deliberately
+forbids that append. Split incomplete-object and complete-object fixtures; retain
+shared-file append-after-rejection behavior. The incomplete object now asserts
+Pending/no evidence, closing/unsealed membership, and typed InvalidState on new
+segment admission. Complete-object publication still checks authenticated final
+counts, replay, changed-proof rejection and immutable metadata. A changed proof
+against selected object identity expects 409, while shared-file expects 403.
+
+The first revised fixture run passed the 12 HTTP cases on PG16 but failed its
+old changed-proof expectation (409 versus 403); corrected the exact expected
+status by backend. This is a second contract assumption, not authorization
+widening. That failure remains in
+`/tmp/attune-harness-final-validation-state.json`; both owned servers were removed
+with independent zero clones/PIDs/locks. A compile-only check also caught an
+unsupported SHA digest LowerHex formatter; byte-wise hex corrected it before
+that validation build. The preserved final pre-status-fix source diff is
+`/tmp/attune-harness-final-tested.diff` (SHA256
+`3e627e10c8671ff0829243851a6d07def876393db45bc5a1bc24cd048c530e66`);
+its provenance file corrects the runner's earlier initial hash.
+
+This checkpoint is not validated final source or merge approval. PG16/18 final
+reruns, lint, Astra review and required CI remain pending. The preceding producer
+matrix, packaged-runtime gap, earlier unclassified failures and physical PUT /
+filesystem limitations retain their recorded scope.
