@@ -2081,3 +2081,36 @@ dependency-policy script violations remain separately recorded; current CI Cargo
 Audit & Deny passed, which is a different check and does not erase that script
 failure. Scope A's physical PUT/settlement and filesystem limitations remain
 explicit design exclusions. This remains work in progress, not merge readiness.
+
+### Required CI `49216567`: correct retention-matrix initialization
+
+Tests job 129646753258 in run 42761102305 failed
+`expiration_prefilter_matches_count_reference_and_claim_rechecks_policy` at
+storage fixture line1178; target result42/43. Its seed attached an object stream
+to the NULL-state version1, rejected by migration012's
+`guard_object_log_initialization` with P0001, "Object log stream must start open
+on a pending version". This is a new, concrete fixture incompatibility, separate
+from the six earlier timing invocations. Preserved log:
+`/tmp/attune-492-ci-tests-failed.log`.
+
+Move the object-stream attachment to the existing Pending version8. Keep the
+same five version numbers, body states, timestamps, retention policies, extreme
+limits, independent count-reference oracle, evidence pin, Ready shared-file
+version3, explicit NULL-newer counting assertion, bounded-discovery comparison
+and authoritative claim rechecks. NULL versions1/12 remain ordinary legacy body
+rows. New object streams do not bypass the initializer, and the shared-file
+exception still has its own positive identity assertion. The matrix does not
+claim to construct grandfathered NULL-state object streams through current DDL.
+No production predicate or SQL guard changes; no assertion or budget relaxation.
+Focused/full storage PG16/18 and relevant Clippy validation are pending for this
+checkpoint, followed by required CI.
+
+The packaged proof at frozen49216567 continues using a private Docker build
+context snapshot; its selected object-seal API tests do not use this retention
+fixture. To avoid disrupting baseline provenance, the idle root-owned comparison
+runner was stopped before any builds or servers; a separate detached49216567
+proof worktree now freezes its current comparison source. Baseline8af23fc4 and
+current49216567 proof checkouts are root-owned local test infrastructure, not
+changes to the original dirty checkout. Comparison will start after packaged
+proof and this focused validation, preventing compilation overlap with its
+measurements. All comparative failures must be retained, not retried away.

@@ -1173,9 +1173,12 @@ async fn expiration_prefilter_matches_count_reference_and_claim_rechecks_policy(
                 if policy == "versions" && limit == 2 && version == 3 {
                     shared_file_counting_null_newer = Some(id);
                 }
-                if index == 0 || index == 1 {
+                // Object streams must initialize on Pending versions. Retain the
+                // plain legacy NULL rows and the Ready shared-file case rather
+                // than bypassing the object-close initialization guard.
+                if index == 1 || index == 2 {
                     sqlx::query("INSERT INTO log_stream(artifact_version,backend,max_unflushed_bytes,max_unflushed_milliseconds) VALUES($1,$2::text::log_stream_backend_enum,1024,1000)")
-                        .bind(id).bind(if index==0 {"object_segments"} else {"shared_file"}).execute(&*pool).await.unwrap();
+                        .bind(id).bind(if index==2 {"object_segments"} else {"shared_file"}).execute(&*pool).await.unwrap();
                 }
             }
         }
