@@ -2028,3 +2028,56 @@ publication assertion to fail after cleanup; accepting only a JoinError now fail
 that control. No production or authority/timeout-budget change. Final-source
 reruns, focused Astra re-review and required CI remain pending. All earlier
 physical-lifecycle and validation limitations retain their recorded status.
+
+### Frozen-source validation and Astra closure: `0e44ccd3`
+
+Source `0e44ccd36fddef37595df9f100435deae7a8ec5d` passed the full follow-up
+pipeline. The working tree was clean and source/HEAD stayed frozen throughout.
+Astra's pinned `ea8a399b..0e44ccd3` read-only re-review found no new actionable
+finding and confirmed the publication-assertion ordering P2 resolved. It checked
+that captured publication is asserted after fixture cleanup and before either
+join/scenario error propagation, and that the negative controls cannot accept a
+returned JoinError, snapshot error or unrelated panic. No runtime suites were
+executed by that review and it did not grant merge approval.
+
+Executed locally (SQLx offline mode for Cargo build/check/lint):
+
+- `cargo test -p attune-api --test recorded_execution_events_tests --test sensor_log_tests --no-run --message-format=json`: passed.
+- Compiled recorded target, `commit_relay:: --nocapture --test-threads=4`: **10/10**.
+- Compiled recorded target, `object_seal_ --nocapture --test-threads=4`: **15/15 each PG16.15/18.6**.
+- Compiled sensor target, same filter/workers: **7/7 each**, including native terminal publication.
+- Compiled recorded target, `encrypted_terminal_logs_require_a_complete_authenticated_manifest_on_both_backends --nocapture --test-threads=4`: **1/1 each**.
+- `cargo clippy -p attune-api --test recorded_execution_events_tests --test sensor_log_tests -- -D warnings`: passed.
+- `cargo check --workspace --all-targets`: passed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+
+All filtered suites had zero ignored tests; checked inventories matched the
+counts above. Real-route tests include acknowledged prepare/publication COMMIT
+loss and reconciliation, revoked/expired authority, native/sensor source paths,
+actual target-wait expiry, early scenario errors and HTTP waiter panics. The two
+new negative controls rejected Pending publication after authority loss even with
+an injected late waiter panic. No test budgets, assertions or authentication
+policies were relaxed to obtain these passes.
+
+Exact executable paths, commands, durations, return codes and identities are in
+`/tmp/attune-publication-guard-validation-state.json`; logs and checked inventories
+use `/tmp/attune-publication-guard-`. Run IDs were `harnessb5ba7dd792f8` (PG16)
+and `harness4dd4ad9e529a` (PG18). Independent final checks on both owned servers
+found zero test clones, zero test backends and zero corresponding locks. Both
+owned containers/volumes were removed, as recorded in
+`/tmp/attune-publication-guard-owned.json`. No production resources changed.
+
+This record is prose only; the frozen-source results remain applicable to this
+record commit because application, tests, migrations, dependencies and runtime
+configuration are unchanged. Required CI must still validate its pushed head.
+At the last inspection, CI on `0e44ccd3` had passed formatting, Clippy,
+security/audit, web and release checks; Tests, full-stack smoke and Windows were
+still running. These pending checks are not passes.
+
+Remaining acceptance gaps: required final-head CI; packaged Docker runtime after
+its earlier compile timeout; classification of the preserved earlier timing /
+250ms DeadlineDeferred / CommitUnknown failures. The 58 baseline-reproduced local
+dependency-policy script violations remain separately recorded; current CI Cargo
+Audit & Deny passed, which is a different check and does not erase that script
+failure. Scope A's physical PUT/settlement and filesystem limitations remain
+explicit design exclusions. This remains work in progress, not merge readiness.
