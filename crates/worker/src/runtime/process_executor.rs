@@ -32,6 +32,31 @@ use tokio::time::{timeout, Duration, Instant as TokioInstant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn, Instrument};
 
+tokio::task_local! {
+    static RUNTIME_TASKS: tokio_util::task::TaskTracker;
+}
+
+pub(crate) async fn track_runtime_tasks<F: Future>(
+    tracker: tokio_util::task::TaskTracker,
+    future: F,
+) -> F::Output {
+    RUNTIME_TASKS.scope(tracker, future).await
+}
+
+fn spawn_capture<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    // Direct runtime callers own their capture joins. Worker/agent executions
+    // additionally retain them across forced cancellation of the parent task.
+    let tracker = RUNTIME_TASKS.try_with(Clone::clone).ok();
+    match tracker {
+        Some(tracker) => tracker.spawn(future),
+        None => tokio::spawn(future),
+    }
+}
+
 const POST_EXIT_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 const ETXTBSY_RETRY_ATTEMPTS: usize = 5;
@@ -406,7 +431,8 @@ pub async fn execute_streaming_cancellable(
 
     // Spawn process with piped I/O. Native executables can briefly return
     // ETXTBSY after installation, so keep the existing bounded retry here.
-    cmd.stdin(std::process::Stdio::piped())
+    cmd.kill_on_drop(true)
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let mut last_spawn_error = None;
@@ -430,6 +456,9 @@ pub async fn execute_streaming_cancellable(
         last_spawn_error.unwrap_or_else(|| io::Error::other("process spawn retry exhausted"))
     })?;
 
+    #[cfg(unix)]
+    let mut process_group_guard = KillProcessGroupOnDrop(child.id());
+
     // A Job Object makes Windows cancellation/timeout apply to the action's
     // entire process tree, not just its interpreter wrapper.
     #[cfg(windows)]
@@ -452,7 +481,7 @@ pub async fn execute_streaming_cancellable(
     let stdout_cancel = output_cancel.clone();
     let stderr_cancel = output_cancel.clone();
 
-    let stdout_task = tokio::spawn(
+    let stdout_task = spawn_capture(
         capture_output(
             stdout_reader,
             stdout_writer,
@@ -467,7 +496,7 @@ pub async fn execute_streaming_cancellable(
             stream = "stdout"
         )),
     );
-    let stderr_task = tokio::spawn(
+    let stderr_task = spawn_capture(
         capture_output(
             stderr_reader,
             stderr_writer,
@@ -697,6 +726,15 @@ pub async fn execute_streaming_cancellable(
         }
     };
 
+    // A leader exiting does not release ownership of its remaining process
+    // group. Retain the guard through log finalization so cancellation, failed
+    // capture or abort cannot leave a pipe-holding descendant behind. Preserve
+    // normal, fully captured completion semantics by disarming only here.
+    #[cfg(unix)]
+    if !was_cancelled && !was_timed_out && !logs_incomplete && process_error.is_none() {
+        process_group_guard.0 = None;
+    }
+
     if was_timed_out {
         return Ok(ExecutionResult {
             exit_code: -1,
@@ -726,7 +764,7 @@ pub async fn execute_streaming_cancellable(
             stderr: stderr_result.content.clone(),
             result: None,
             duration_ms,
-            error: Some("Execution cancelled by user".to_string()),
+            error: Some("Execution cancelled".to_string()),
             stdout_truncated: stdout_result.truncated,
             stderr_truncated: stderr_result.truncated,
             stdout_bytes_truncated: stdout_result.bytes_truncated,
@@ -1097,6 +1135,7 @@ mod tests {
         seal_delay: Option<Duration>,
         sealed: AtomicUsize,
         seal_denied: bool,
+        commit_release: Option<Arc<tokio::sync::Semaphore>>,
     }
 
     struct ActiveCommit<'a>(&'a AtomicUsize);
@@ -1136,6 +1175,10 @@ mod tests {
             self.active.fetch_add(1, Ordering::SeqCst);
             let _active = ActiveCommit(&self.active);
             self.started.notify_one();
+            if let Some(release) = &self.commit_release {
+                release.acquire().await.unwrap().forget();
+                return Ok(());
+            }
             match self.commit_delay {
                 Some(delay) => {
                     sleep(delay).await;
@@ -1613,6 +1656,282 @@ mod tests {
             .await;
             assert_eq!(captured.writer.into_result().content, "already buffered");
             assert_eq!(captured.logs_incomplete, !closed);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_abort_kills_running_process_and_joins_capture() {
+        let transport = Arc::new(HangingLogTransport::default());
+        let mut config =
+            attune_common::config::ArtifactsConfig::default().log_segment_writer_config();
+        config.initial_segment_bytes = 1;
+        config.max_segment_bytes = 1;
+        let writer = BoundedLogFileWriter::from_segmented_writer(
+            attune_common::log_stream::SegmentedLogWriter::new(transport.clone(), 4, config)
+                .unwrap(),
+            1024,
+            true,
+        );
+        let root = tempfile::tempdir().unwrap();
+        let pid_path = root.path().join("pid");
+        let command_path = pid_path.clone();
+        let tracker = tokio_util::task::TaskTracker::new();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(track_runtime_tasks(tracker.clone(), async move {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg("-c")
+                .arg("printf '%s' \"$$\" > \"$1\"; printf x; sleep 30")
+                .arg("shutdown-test")
+                .arg(command_path);
+            execute_streaming_cancellable(
+                cmd,
+                &HashMap::new(),
+                None,
+                Some(60),
+                1024,
+                1024,
+                OutputFormat::Text,
+                None,
+                None,
+                None,
+                None,
+                Some(writer),
+                None,
+            )
+            .await
+        }));
+        tokio::time::timeout(Duration::from_secs(5), transport.started.notified())
+            .await
+            .unwrap();
+        let pid = fs::read_to_string(pid_path)
+            .await
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        tasks.shutdown().await;
+        tracker.close();
+        tokio::time::timeout(Duration::from_secs(2), tracker.wait())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("forced shutdown left the action process alive");
+        assert_eq!(transport.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn shutdown_after_leader_exit_stops_owned_descendant() {
+        for abort in [false, true] {
+            let transport = Arc::new(HangingLogTransport::default());
+            let mut config =
+                attune_common::config::ArtifactsConfig::default().log_segment_writer_config();
+            config.initial_segment_bytes = 1;
+            config.max_segment_bytes = 1;
+            let writer = BoundedLogFileWriter::from_segmented_writer(
+                attune_common::log_stream::SegmentedLogWriter::new(transport.clone(), 4, config)
+                    .unwrap(),
+                1024,
+                true,
+            );
+            let root = tempfile::tempdir().unwrap();
+            let pid_path = root.path().join("pids");
+            let command_path = pid_path.clone();
+            let token = CancellationToken::new();
+            let action_token = token.clone();
+            let tracker = tokio_util::task::TaskTracker::new();
+            let mut tasks = tokio::task::JoinSet::new();
+            tasks.spawn(track_runtime_tasks(tracker.clone(), async move {
+                let mut cmd = Command::new("/bin/sh");
+                cmd.arg("-c")
+                    .arg("sleep 30 & printf '%s %s' \"$$\" \"$!\" > \"$1\"; printf x; exit 0")
+                    .arg("shutdown-test")
+                    .arg(command_path);
+                execute_streaming_cancellable(
+                    cmd,
+                    &HashMap::new(),
+                    None,
+                    Some(60),
+                    1024,
+                    1024,
+                    OutputFormat::Text,
+                    None,
+                    Some(action_token),
+                    None,
+                    None,
+                    Some(writer),
+                    None,
+                )
+                .await
+            }));
+            timeout(Duration::from_secs(5), transport.started.notified())
+                .await
+                .unwrap();
+            let pids = fs::read_to_string(pid_path).await.unwrap();
+            let pids: Vec<i32> = pids
+                .split_whitespace()
+                .map(|pid| pid.parse().unwrap())
+                .collect();
+            let (leader, descendant) = (pids[0], pids[1]);
+            // Fallback only: failed assertions must not leave our owned sleeper.
+            let _cleanup = KillProcessGroupOnDrop(Some(leader as u32));
+            timeout(Duration::from_secs(5), async {
+                while unsafe { libc::kill(leader, 0) } == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("leader must exit and be reaped before cancellation");
+            assert_eq!(unsafe { libc::kill(descendant, 0) }, 0);
+            if abort {
+                tasks.shutdown().await;
+            } else {
+                token.cancel();
+                let result = timeout(Duration::from_secs(5), tasks.join_next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert!(result.logs_incomplete);
+                assert!(result
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("cancelled")));
+            }
+            tracker.close();
+            timeout(Duration::from_secs(5), tracker.wait())
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    match fs::read_to_string(format!("/proc/{descendant}/stat")).await {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+                        Ok(stat)
+                            if stat
+                                .rsplit_once(')')
+                                .is_some_and(|(_, tail)| tail.trim_start().starts_with('Z')) =>
+                        {
+                            break
+                        }
+                        _ => tokio::task::yield_now().await,
+                    }
+                }
+            })
+            .await
+            .expect("same-group descendant survived finalization cancellation");
+            assert_eq!(transport.active.load(Ordering::SeqCst), 0);
+            assert_eq!(transport.sealed.load(Ordering::SeqCst), 0);
+            root.close().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_successful_finalization_and_joins_forced_upload_cleanup() {
+        use crate::service::drain_execution_tasks;
+        use tokio::sync::Mutex;
+        use tokio::task::JoinSet;
+        for mode in ["finish", "cancel", "abort"] {
+            let finish = mode == "finish";
+            let release = Arc::new(tokio::sync::Semaphore::new(0));
+            let transport = Arc::new(HangingLogTransport {
+                commit_release: Some(release.clone()),
+                ..Default::default()
+            });
+            let config =
+                attune_common::config::ArtifactsConfig::default().log_segment_writer_config();
+            let writer = BoundedLogFileWriter::from_segmented_writer(
+                attune_common::log_stream::SegmentedLogWriter::new(transport.clone(), 4, config)
+                    .unwrap(),
+                1024,
+                true,
+            );
+            let token = CancellationToken::new();
+            let tokens = Mutex::new(HashMap::from([(1, token.clone())]));
+            let tracker = tokio_util::task::TaskTracker::new();
+            let mut tasks = JoinSet::new();
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            tasks.spawn(track_runtime_tasks(tracker.clone(), async move {
+                let mut cmd = Command::new("/bin/sh");
+                cmd.arg("-c").arg("printf 'shutdown tail'");
+                let result = execute_streaming_cancellable(
+                    cmd,
+                    &HashMap::new(),
+                    None,
+                    Some(30),
+                    1024,
+                    1024,
+                    OutputFormat::Text,
+                    None,
+                    Some(token),
+                    None,
+                    None,
+                    Some(writer),
+                    None,
+                )
+                .await
+                .unwrap();
+                result_tx.send(result).unwrap();
+            }));
+            tokio::time::timeout(Duration::from_secs(5), transport.started.notified())
+                .await
+                .unwrap();
+            // The tail is in an actual upload, with the process pipe at EOF.
+            // Release it only after polling the production shutdown drain.
+            if mode == "abort" {
+                tasks.shutdown().await;
+                tracker.close();
+                tokio::time::timeout(Duration::from_secs(2), tracker.wait())
+                    .await
+                    .unwrap();
+                assert_eq!(transport.active.load(Ordering::SeqCst), 0);
+                assert_eq!(transport.sealed.load(Ordering::SeqCst), 0);
+                assert!(result_rx.await.is_err());
+                continue;
+            }
+            let shutdown = drain_execution_tasks(
+                &mut tasks,
+                &tokens,
+                if finish {
+                    Duration::from_secs(10)
+                } else {
+                    Duration::from_secs(1)
+                },
+            );
+            tokio::pin!(shutdown);
+            let forced = if finish {
+                tokio::select! {
+                    result = &mut shutdown => panic!("shutdown finished before upload release: {result}"),
+                    _ = tokio::task::yield_now() => {}
+                }
+                release.add_permits(1);
+                shutdown.await
+            } else {
+                shutdown.await
+            };
+            tracker.close();
+            tokio::time::timeout(Duration::from_secs(2), tracker.wait())
+                .await
+                .unwrap();
+            let result = result_rx.await.unwrap();
+            assert_eq!(forced, !finish);
+            assert_eq!(result.logs_incomplete, !finish);
+            assert_eq!(transport.active.load(Ordering::SeqCst), 0);
+            assert_eq!(transport.sealed.load(Ordering::SeqCst), usize::from(finish));
+            if finish {
+                assert_eq!(result.exit_code, 0);
+                assert!(result.error.is_none());
+            } else {
+                assert!(result
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("cancelled")));
+            }
         }
     }
 

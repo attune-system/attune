@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{debug, error, info, warn};
 
 use crate::artifacts::ArtifactManager;
@@ -132,6 +132,65 @@ async fn refresh_runtime_version_capabilities_for_registration(
     }
 }
 
+async fn abort_and_join(handle: &mut Option<JoinHandle<()>>) {
+    if let Some(handle) = handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
+/// The total execution-drain budget includes a small reserved cancellation
+/// window. Graceful service shutdown does not cancel an action until that
+/// window; user cancellation and action deadlines remain independent.
+pub(crate) async fn drain_execution_tasks(
+    tasks: &mut JoinSet<()>,
+    tokens: &Mutex<HashMap<i64, CancellationToken>>,
+    budget: Duration,
+) -> bool {
+    let cleanup = budget.min(Duration::from_secs(5));
+    let deadline = tokio::time::Instant::now() + budget;
+    let drain = async {
+        while let Some(result) = tasks.join_next().await {
+            if let Err(error) = result {
+                warn!(%error, "Execution task failed during shutdown");
+            }
+        }
+    };
+    if tokio::time::timeout(budget - cleanup, drain).await.is_ok() {
+        return false;
+    }
+    warn!("Worker shutdown drain expired; cancelling unfinished executions");
+    for token in tokens.lock().await.values() {
+        token.cancel();
+    }
+    let cleanup = async { while tasks.join_next().await.is_some() {} };
+    if tokio::time::timeout_at(deadline, cleanup).await.is_err() {
+        warn!("Worker shutdown cleanup expired; aborting and joining unfinished tasks");
+        tasks.shutdown().await;
+    }
+    true
+}
+
+/// Keep the handler (including its candidate roots) alive when its MQ caller is
+/// aborted. Shutdown must stop admission, join that caller, then await the tracker.
+fn own_pack_test_handler<F>(
+    tasks: &tokio_util::task::TaskTracker,
+    cancellation: CancellationToken,
+    handler: F,
+) -> impl std::future::Future<Output = attune_common::mq::MqResult<()>> + Send
+where
+    F: std::future::Future<Output = attune_common::mq::MqResult<()>> + Send + 'static,
+{
+    let cancel_on_drop = cancellation.drop_guard();
+    let task = tasks.spawn(handler);
+    async move {
+        let _cancel_on_drop = cancel_on_drop;
+        task.await.map_err(|error| {
+            attune_common::mq::MqError::Consume(format!("Pack test handler failed: {error}"))
+        })?
+    }
+}
+
 /// Worker service that manages execution lifecycle
 pub struct WorkerService {
     child_environment: attune_common::child_process_environment::ChildProcessEnvironment,
@@ -145,10 +204,12 @@ pub struct WorkerService {
     consumer: Option<Arc<Consumer>>,
     consumer_handle: Option<JoinHandle<()>>,
     task_reaper_handle: Option<JoinHandle<()>>,
+    runtime_tasks: TaskTracker,
     pack_consumer: Option<Arc<Consumer>>,
     pack_consumer_handle: Option<JoinHandle<()>>,
     pack_test_consumer: Option<Arc<Consumer>>,
     pack_test_consumer_handle: Option<JoinHandle<()>>,
+    pack_test_tasks: tokio_util::task::TaskTracker,
     cancel_consumer: Option<Arc<Consumer>>,
     cancel_consumer_handle: Option<JoinHandle<()>>,
     metadata_consumer_handle: Option<JoinHandle<()>>,
@@ -581,10 +642,12 @@ impl WorkerService {
             consumer: None,
             consumer_handle: None,
             task_reaper_handle: None,
+            runtime_tasks: TaskTracker::new(),
             pack_consumer: None,
             pack_consumer_handle: None,
             pack_test_consumer: None,
             pack_test_consumer_handle: None,
+            pack_test_tasks: tokio_util::task::TaskTracker::new(),
             cancel_consumer: None,
             cancel_consumer_handle: None,
             metadata_consumer_handle: None,
@@ -714,15 +777,6 @@ impl WorkerService {
         Ok(())
     }
 
-    /// Stop the worker service gracefully
-    ///
-    /// Shutdown order (mirrors sensor service pattern):
-    /// 1. Deregister worker (mark inactive to stop receiving new work)
-    /// 2. Stop heartbeat
-    /// 3. Wait for in-flight tasks with timeout
-    /// 4. Close MQ connection
-    /// 5. Close DB connection
-    ///
     /// Verify which runtime versions are available on this host/container.
     ///
     /// Runs each version's verification commands (from `distributions` JSONB)
@@ -1207,6 +1261,7 @@ impl WorkerService {
             .replace("://0.0.0.0", "://127.0.0.1")
             .replace("://[::]", "://127.0.0.1");
 
+        let pack_test_tasks = self.pack_test_tasks.clone();
         let consumer_for_task = consumer.clone();
         let handle = tokio::spawn(async move {
             info!("Pack test consumer loop started for queue '{}'", queue_name);
@@ -1223,7 +1278,8 @@ impl WorkerService {
                         let child_environment = child_environment.clone();
                         let candidate_api_url = candidate_api_url.clone();
 
-                        async move {
+                        let cancellation = CancellationToken::new();
+                        own_pack_test_handler(&pack_test_tasks, cancellation.clone(), async move {
                             let payload = envelope.payload;
                             if let Err(e) = handle_pack_test(
                                 &db_pool,
@@ -1236,6 +1292,7 @@ impl WorkerService {
                                 pack_transport.as_ref(),
                                 &payload,
                                 &child_environment,
+                                cancellation,
                             )
                             .await
                             {
@@ -1256,7 +1313,7 @@ impl WorkerService {
                                 return Err(format!("Failed to run pack tests: {}", e).into());
                             }
                             Ok(())
-                        }
+                        })
                     },
                 )
                 .await;
@@ -1281,75 +1338,76 @@ impl WorkerService {
     pub async fn stop(&mut self) -> Result<()> {
         info!("Stopping Worker Service - initiating graceful shutdown");
 
-        // 1. Mark worker as inactive first to stop receiving new tasks
-        // Use if-let instead of ? so shutdown continues even if DB call fails
+        // Stop the only producer of execution tasks before taking ownership of
+        // the JoinSet. Awaiting the consumer is the admission barrier, including
+        // a handler currently waiting for a concurrency permit.
+        self.execution_semaphore.close();
+        abort_and_join(&mut self.consumer_handle).await;
+        abort_and_join(&mut self.task_reaper_handle).await;
+        abort_and_join(&mut self.pack_consumer_handle).await;
+        abort_and_join(&mut self.pack_test_consumer_handle).await;
+        // The consumer is joined, so no handler can be admitted after this
+        // barrier. Keep candidate roots and leases owned through subprocess and
+        // reader cleanup before any shared service resources are closed.
+        self.pack_test_tasks.close();
+        self.pack_test_tasks.wait().await;
+        abort_and_join(&mut self.metadata_consumer_handle).await;
+
+        // Cordon placement independently of active delivery ownership. Use an
+        // invocation-specific marker so cleanup cannot clear an operator cordon.
+        let cordon_reason = format!("Graceful shutdown {}", uuid::Uuid::new_v4());
+        if let Err(error) = self
+            .registration
+            .read()
+            .await
+            .cordon_for_shutdown(&cordon_reason)
+            .await
         {
-            let reg = self.registration.read().await;
-            info!("Marking worker as inactive to stop receiving new tasks");
-            if let Err(e) = reg.deregister().await {
-                error!("Failed to deregister worker: {}", e);
-            }
+            warn!(%error, "Failed to cordon worker; local execution admission is stopped");
         }
 
-        // 2. Stop heartbeat
-        info!("Stopping heartbeat updates");
-        self.heartbeat.stop().await;
-
-        // 3. Wait for in-flight tasks to complete (with timeout)
         let shutdown_timeout = self
             .config
             .worker
             .as_ref()
             .and_then(|w| w.shutdown_timeout)
-            .unwrap_or(30); // Default: 30 seconds
+            .unwrap_or(attune_common::config::DEFAULT_WORKER_SHUTDOWN_TIMEOUT_SECS);
+        let mut tasks = self.in_flight_tasks.lock().await;
+        let forced = drain_execution_tasks(
+            &mut tasks,
+            &self.cancel_tokens,
+            Duration::from_secs(shutdown_timeout),
+        )
+        .await;
+        drop(tasks);
+        // Aborting an execution cancels its capture guard. Capture tasks own and
+        // join their segmented uploaders; retain them until teardown completes.
+        self.runtime_tasks.close();
+        self.runtime_tasks.wait().await;
+        self.cancel_tokens.lock().await.clear();
+        self.pending_cancellations.lock().await.clear();
 
-        info!(
-            "Waiting up to {} seconds for in-flight tasks to complete",
-            shutdown_timeout
-        );
+        // Cancellation requests remain effective throughout the drain. Neither
+        // heartbeat shutdown nor deregistration may invalidate final delivery.
+        abort_and_join(&mut self.cancel_consumer_handle).await;
+        self.heartbeat.stop().await;
+        let deregistered = {
+            let reg = self.registration.read().await;
+            let result = reg.deregister().await;
+            if let Err(error) = &result {
+                error!(%error, "Failed to deregister worker");
+            }
+            result
+        };
 
-        let timeout_duration = Duration::from_secs(shutdown_timeout);
-        match tokio::time::timeout(timeout_duration, self.wait_for_in_flight_tasks()).await {
-            Ok(_) => info!("All in-flight tasks completed"),
-            Err(_) => warn!("Shutdown timeout reached - some tasks may have been interrupted"),
-        }
-
-        // 4. Abort consumer tasks and close message queue connection
-        if let Some(handle) = self.consumer_handle.take() {
-            info!("Stopping execution consumer task...");
-            handle.abort();
-            // Wait briefly for the task to finish
-            let _ = handle.await;
-        }
-
-        if let Some(handle) = self.task_reaper_handle.take() {
-            info!("Stopping in-flight task reaper...");
-            handle.abort();
-            let _ = handle.await;
-        }
-
-        if let Some(handle) = self.pack_consumer_handle.take() {
-            info!("Stopping pack consumer task...");
-            handle.abort();
-            let _ = handle.await;
-        }
-
-        if let Some(handle) = self.pack_test_consumer_handle.take() {
-            info!("Stopping pack test consumer task...");
-            handle.abort();
-            let _ = handle.await;
-        }
-
-        if let Some(handle) = self.cancel_consumer_handle.take() {
-            info!("Stopping cancel consumer task...");
-            handle.abort();
-            let _ = handle.await;
-        }
-
-        if let Some(handle) = self.metadata_consumer_handle.take() {
-            info!("Stopping metadata invalidation consumer task...");
-            handle.abort();
-            let _ = handle.await;
+        if let Err(error) = self
+            .registration
+            .read()
+            .await
+            .clear_shutdown_cordon(&cordon_reason)
+            .await
+        {
+            warn!(%error, "Failed to clear owned shutdown cordon");
         }
 
         info!("Closing message queue connection...");
@@ -1362,35 +1420,11 @@ impl WorkerService {
         self.db_pool.close().await;
 
         info!("Worker Service stopped");
-
-        Ok(())
-    }
-
-    /// Wait for in-flight tasks to complete
-    async fn wait_for_in_flight_tasks(&self) {
-        loop {
-            let remaining = self.reap_completed_in_flight_tasks().await;
-
-            if remaining == 0 {
-                info!("All in-flight execution tasks have completed");
-                break;
-            }
-
-            info!(
-                "Waiting for {} in-flight execution task(s) to complete...",
-                remaining
-            );
-            tokio::time::sleep(Duration::from_secs(1)).await;
+        if forced {
+            Err(Error::execution("Worker shutdown deadline exhausted; unfinished execution tasks were cancelled (remote log outcome may be unknown)"))
+        } else {
+            deregistered
         }
-    }
-
-    async fn reap_completed_in_flight_tasks(&self) -> usize {
-        let mut tasks = self.in_flight_tasks.lock().await;
-        let drained = Self::drain_completed_in_flight_tasks(&mut tasks);
-        if drained > 0 {
-            debug!("Reaped {} completed in-flight execution task(s)", drained);
-        }
-        tasks.len()
     }
 
     fn drain_completed_in_flight_tasks(tasks: &mut JoinSet<()>) -> usize {
@@ -1483,6 +1517,7 @@ impl WorkerService {
         let queue_name_for_log = queue_name.clone();
         let semaphore = self.execution_semaphore.clone();
         let in_flight = self.in_flight_tasks.clone();
+        let runtime_tasks = self.runtime_tasks.clone();
         let cancel_tokens = self.cancel_tokens.clone();
         let pending_cancellations = self.pending_cancellations.clone();
         let pack_transport = self.pack_transport.clone();
@@ -1498,6 +1533,7 @@ impl WorkerService {
                         let db_pool = db_pool.clone();
                         let semaphore = semaphore.clone();
                         let in_flight = in_flight.clone();
+                        let runtime_tasks = runtime_tasks.clone();
                         let cancel_tokens = cancel_tokens.clone();
                         let pending_cancellations = pending_cancellations.clone();
                         let pack_transport = pack_transport.clone();
@@ -1546,7 +1582,7 @@ impl WorkerService {
                             // the consumer loop to process the next delivery.
                             let mut tasks = in_flight.lock().await;
                             Self::drain_completed_in_flight_tasks(&mut tasks);
-                            tasks.spawn(async move {
+                            tasks.spawn(crate::runtime::process_executor::track_runtime_tasks(runtime_tasks, async move {
                                 // The permit is moved into this task and will be released
                                 // when the task completes (on drop).
                                 let _permit = permit;
@@ -1569,7 +1605,7 @@ impl WorkerService {
                                 tokens.remove(&execution_id);
                                 let mut pending = pending_cancellations.lock().await;
                                 pending.remove(&execution_id);
-                            });
+                            }));
 
                             Ok(())
                         }
@@ -2150,6 +2186,7 @@ async fn handle_pack_test(
     pack_transport: &dyn attune_common::pack_transport::PackFileTransport,
     payload: &PackTestRequestedPayload,
     child_environment: &attune_common::child_process_environment::ChildProcessEnvironment,
+    cancellation: CancellationToken,
 ) -> Result<()> {
     use attune_common::test_executor::{TestConfig, TestExecutor};
     use std::path::PathBuf;
@@ -2399,7 +2436,8 @@ async fn handle_pack_test(
         None
     };
 
-    let mut executor = TestExecutor::new(PathBuf::from(packs_base_dir));
+    let mut executor =
+        TestExecutor::new(PathBuf::from(packs_base_dir)).with_cancellation(cancellation);
     let candidate_lease = if test_config.candidate_api_effects {
         use attune_common::repositories::candidate_effect::CandidateEffectRepository;
         if payload.candidate_path.is_none() {
@@ -2453,6 +2491,9 @@ async fn handle_pack_test(
             python_interpreter.as_deref(),
         )
         .await;
+    // Explicit process/read barrier before revoking the lease or releasing
+    // candidate roots. The handler itself remains owned by pack_test_tasks.
+    executor.process_owner().shutdown().await;
     // Revoke before interpreting/persisting the result, including runner errors.
     if let Some(lease) = candidate_lease {
         attune_common::repositories::candidate_effect::CandidateEffectRepository::close(
@@ -2562,6 +2603,42 @@ async fn mark_pack_install_failed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use attune_common::repositories::runtime::WorkerRepository;
+
+    #[tokio::test]
+    async fn aborted_pack_test_caller_keeps_handler_and_roots_owned_until_cleanup() {
+        let tasks = tokio_util::task::TaskTracker::new();
+        let cancellation = CancellationToken::new();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_path_buf();
+        let (ready, readiness) = tokio::sync::oneshot::channel();
+        let (release, cleanup) = tokio::sync::oneshot::channel();
+        let token = cancellation.clone();
+        let caller = tokio::spawn(own_pack_test_handler(
+            &tasks,
+            cancellation.clone(),
+            async move {
+                ready.send(()).unwrap();
+                token.cancelled().await;
+                // Model the awaited process/read cleanup barrier.
+                cleanup.await.unwrap();
+                root.close().unwrap();
+                Ok(())
+            },
+        ));
+        readiness.await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert!(cancellation.is_cancelled());
+        assert!(path.exists());
+        assert!(!tasks.is_empty());
+        release.send(()).unwrap();
+        tasks.close();
+        tokio::time::timeout(Duration::from_secs(5), tasks.wait())
+            .await
+            .unwrap();
+        assert!(!path.exists());
+    }
 
     fn persisted_execution(status: ExecutionStatus) -> Execution {
         serde_json::from_value(serde_json::json!({
@@ -2758,6 +2835,157 @@ mod tests {
         assert!(validate_mq_pack_ref("org.pack", "PackRegistered").is_err());
         assert!(validate_mq_pack_ref("../escape", "PackRegistered").is_err());
         assert!(validate_mq_pack_ref("pack/name", "PackDeleted").is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_registration_incarnation_barrier_preserves_replacement() {
+        use attune_common::repositories::FindById;
+        use attune_common::test_database::TestDatabase;
+        let mut config = Config::load_from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config.test.yaml"
+        ))
+        .unwrap();
+        config.worker = Some(
+            serde_json::from_value(serde_json::json!({
+                "name": format!("incarnation-{}", uuid::Uuid::new_v4())
+            }))
+            .unwrap(),
+        );
+        let database = TestDatabase::create(&config.database)
+            .await
+            .unwrap()
+            .with_cleanup_on_drop();
+        let pool = database.pool().clone();
+        let mut a = WorkerRegistration::new(pool.clone(), &config);
+        let id = a.register().await.unwrap();
+        let (draining_tx, draining_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let old = tokio::spawn(async move {
+            a.cordon_for_shutdown("A drain").await.unwrap();
+            let mut tasks = JoinSet::new();
+            tasks.spawn(async move {
+                release_rx.await.unwrap();
+            });
+            draining_tx.send(()).unwrap();
+            assert!(
+                !drain_execution_tasks(
+                    &mut tasks,
+                    &Mutex::new(HashMap::new()),
+                    Duration::from_secs(30)
+                )
+                .await
+            );
+            // Both the late drain entry and its final maintenance are stale.
+            a.cordon_for_shutdown("late A").await.unwrap();
+            a.add_capability("stale".into(), serde_json::json!(true));
+            a.update_capabilities().await.unwrap();
+            a.update_heartbeat().await.unwrap();
+            a.deregister().await.unwrap();
+            a.clear_shutdown_cordon("A drain").await.unwrap();
+        });
+        draining_rx.await.unwrap();
+        let mut b = WorkerRegistration::new(pool.clone(), &config);
+        assert_eq!(b.register().await.unwrap(), id);
+        // Restart must not silently remove the pre-existing cordon.
+        assert_eq!(
+            WorkerRepository::get_by_id(&pool, id)
+                .await
+                .unwrap()
+                .cordon_reason
+                .as_deref(),
+            Some("A drain")
+        );
+        b.add_capability("replacement".into(), serde_json::json!(true));
+        b.update_capabilities().await.unwrap();
+        b.update_heartbeat().await.unwrap();
+        WorkerRepository::set_cordoned(&pool, id, true, Some("B maintenance".into()), None)
+            .await
+            .unwrap();
+        let before = WorkerRepository::get_by_id(&pool, id).await.unwrap();
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), old)
+            .await
+            .unwrap()
+            .unwrap();
+        let after = WorkerRepository::get_by_id(&pool, id).await.unwrap();
+        assert_eq!(
+            after.status,
+            Some(attune_common::models::WorkerStatus::Active)
+        );
+        assert_eq!(after.meta, before.meta);
+        assert_eq!(after.capabilities, before.capabilities);
+        assert_eq!(after.last_heartbeat, before.last_heartbeat);
+        assert_eq!(after.updated, before.updated);
+        assert!(after.cordoned);
+        assert_eq!(after.cordon_reason.as_deref(), Some("B maintenance"));
+        // Matching ownership still permits ordinary maintenance and cleanup.
+        b.deregister().await.unwrap();
+        WorkerRepository::set_cordoned(&pool, id, false, None, None)
+            .await
+            .unwrap();
+        b.cordon_for_shutdown("B drain").await.unwrap();
+        b.clear_shutdown_cordon("B drain").await.unwrap();
+        assert!(
+            !WorkerRepository::get_by_id(&pool, id)
+                .await
+                .unwrap()
+                .cordoned
+        );
+        database.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_admission_barrier_joins_blocked_producer() {
+        let semaphore = Arc::new(Semaphore::new(0));
+        let tasks = Arc::new(Mutex::new(JoinSet::new()));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let permits = semaphore.clone();
+        let owned_tasks = tasks.clone();
+        let mut producer = Some(tokio::spawn(async move {
+            ready_tx.send(()).unwrap();
+            if let Ok(permit) = permits.acquire_owned().await {
+                owned_tasks.lock().await.spawn(async move {
+                    drop(permit);
+                });
+            }
+        }));
+        ready_rx.await.unwrap();
+        semaphore.close();
+        abort_and_join(&mut producer).await;
+        assert!(producer.is_none());
+        assert!(semaphore.acquire().await.is_err());
+        assert!(tasks.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_forces_and_joins_unresponsive_task() {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        struct Dropped(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            let _guard = Dropped(Some(dropped_tx));
+            ready_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        ready_rx.await.unwrap();
+        let token = CancellationToken::new();
+        let tokens = Mutex::new(HashMap::from([(1, token.clone())]));
+        assert!(tokio::time::timeout(
+            Duration::from_secs(1),
+            drain_execution_tasks(&mut tasks, &tokens, Duration::from_millis(20))
+        )
+        .await
+        .unwrap());
+        assert!(token.is_cancelled());
+        assert!(tasks.is_empty());
+        dropped_rx.await.unwrap();
     }
 
     #[tokio::test]

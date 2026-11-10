@@ -657,7 +657,7 @@ pub struct WorkerConfig {
     #[serde(default = "default_execution_log_retention_limit")]
     pub execution_log_retention_limit: i32,
 
-    /// Graceful shutdown timeout in seconds
+    /// Execution drain budget in seconds, including up to five seconds for forced cancellation.
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout: Option<u64>,
 
@@ -674,8 +674,11 @@ fn default_heartbeat_interval() -> u64 {
     30
 }
 
+/// Worker and native agent default, including the cancellation cleanup reserve.
+pub const DEFAULT_WORKER_SHUTDOWN_TIMEOUT_SECS: u64 = 90;
+
 fn default_shutdown_timeout() -> Option<u64> {
-    Some(30)
+    Some(DEFAULT_WORKER_SHUTDOWN_TIMEOUT_SECS)
 }
 
 fn default_task_timeout() -> u64 {
@@ -2877,6 +2880,37 @@ mod tests {
         let sensor: SensorConfig = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(worker.passthrough_env.is_empty());
         assert!(sensor.passthrough_env.is_empty());
+    }
+
+    #[test]
+    fn worker_shutdown_budget_defaults_and_explicit_overrides() {
+        for (value, expected) in [
+            (serde_json::json!({}), DEFAULT_WORKER_SHUTDOWN_TIMEOUT_SECS),
+            (
+                serde_json::json!({"shutdown_timeout": null}),
+                DEFAULT_WORKER_SHUTDOWN_TIMEOUT_SECS,
+            ),
+            (serde_json::json!({"shutdown_timeout": 30}), 30),
+        ] {
+            let worker: WorkerConfig = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                worker
+                    .shutdown_timeout
+                    .unwrap_or(DEFAULT_WORKER_SHUTDOWN_TIMEOUT_SECS),
+                expected
+            );
+        }
+        // These are independent service budgets: sensor's explicit 30 must not
+        // be mistaken for an override of the worker's absent setting.
+        let development: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(include_str!("../../../config.development.yaml")).unwrap();
+        assert!(development["worker"]["shutdown_timeout"].is_null());
+        assert_eq!(development["sensor"]["shutdown_timeout"].as_u64(), Some(30));
+        let shipped: serde_yaml_ng::Value = serde_yaml_ng::from_str(include_str!(
+            "../../../docker/distributable/config.docker.yaml"
+        ))
+        .unwrap();
+        assert_eq!(shipped["worker"]["shutdown_timeout"].as_u64(), Some(30));
     }
 
     #[test]
