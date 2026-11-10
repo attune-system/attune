@@ -1964,3 +1964,39 @@ This checkpoint is not validated final source or merge approval. PG16/18 final
 reruns, lint, Astra review and required CI remain pending. The preceding producer
 matrix, packaged-runtime gap, earlier unclassified failures and physical PUT /
 filesystem limitations retain their recorded scope.
+
+### Validated `11e6fadc`; producer-helper follow-up checkpoint
+
+The frozen `11e6fadc142ba419efdd45e84d1f3e8dae57354e` rerun passed:
+API target build; relay **10/10**; recorded object HTTP **12/12 on each PG16.15
+and PG18.6**; encrypted manifest/closure fixture **1/1 each** (both backends);
+API recorded-target Clippy with `-D warnings`; workspace formatting and whitespace.
+Four libtest workers, zero ignored in these filtered suites. Exact commands,
+run identities, timings and exit codes are in
+`/tmp/attune-harness-recheck-validation-state.json`; logs use the matching
+`/tmp/attune-harness-recheck-` prefix. Independent final checks found zero owned
+clones, PIDs or locks on both servers; containers/volumes removed. This validates
+that checkpoint's scoped behavior, not broad workspace/consumer or merge readiness.
+
+Astra reviewed the pinned source and confirmed the original three ACK/relay fixes,
+actual producer authority, observed final waits and permanent-close test changes.
+It found two P2 issues in the newer delivery/sensor helper teardown: aborting an
+HTTP waiter detaches production's ordinary inner seal spawn, outside
+`file_transfers`; and propagating JoinError before marking the waiter consumed
+can poll a completed JoinHandle twice outside caught cleanup.
+
+The follow-up removes HTTP abort, releases GET and awaits the retained waiter
+before tracker draining or fixture cleanup. It records a completed timeout result
+before propagating either inner error. Added four actual-route cases: gated GET
+scenario error and HTTP waiter panic for each producer helper. The waiter panic
+is injected only after the real HTTP response, exercising consumed-JoinError
+cleanup. For both injections the helper captures publication state before fixture
+teardown, then asserts Ready/published/sealed only after cleanup; this establishes
+that the real inner seal completed rather than accepting an empty tracker drain
+as evidence. The error/JoinError is propagated after teardown for exact assertions.
+No production code or authority/timeout budgets changed.
+
+This follow-up requires its own final-source PG16/18 matrix and lint validation
+and focused Astra re-review; neither is claimed by the preceding head's passes.
+All prior disclosed unclassified failures, required CI, packaged runtime and
+physical settlement/retirement limits remain open.

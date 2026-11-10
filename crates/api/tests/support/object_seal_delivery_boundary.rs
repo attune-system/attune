@@ -131,10 +131,17 @@ async fn boundary(mode: u8) -> Result<()> {
             &jsonwebtoken::EncodingKey::from_secret(fixture.ctx.state.jwt_config.secret.as_bytes()),
         )?;
     }
-    let mut http = tokio::spawn(app.clone().oneshot(request(&credential)));
+    let http_app = app.clone();
+    let http_request = request(&credential);
+    let mut http = tokio::spawn(async move {
+        let result = http_app.oneshot(http_request).await;
+        assert_ne!(mode, 4, "injected HTTP waiter panic");
+        result
+    });
     let mut joined = false;
     let result=std::panic::AssertUnwindSafe(async {
         tokio::time::timeout(Duration::from_secs(10),store.uploaded.notified()).await?;
+        if mode==3 {return Err("injected producer GET failure".into());}
         let pending=snapshot(&fixture.ctx.pool,stream.id,version.id).await?;
         assert_eq!(pending["phase"],"closing");assert_eq!(pending["state"],"pending");assert_eq!(pending["sealed"],false);assert!(pending["evidence"].is_null());
         let mut blocker=None;
@@ -158,8 +165,7 @@ async fn boundary(mode: u8) -> Result<()> {
             sqlx::query("SELECT pg_sleep(GREATEST(0,$1-extract(epoch FROM clock_timestamp()))::double precision)").bind(claims.exp as f64).execute(&fixture.ctx.pool).await?;
             let expired:bool=sqlx::query_scalar("SELECT extract(epoch FROM clock_timestamp()) >= $1").bind(claims.exp as f64).fetch_one(&fixture.ctx.pool).await?;assert!(expired);tx.rollback().await?;
         }
-        let response=tokio::time::timeout(Duration::from_secs(10),&mut http).await???;
-        joined=true;
+        let response=tokio::time::timeout(Duration::from_secs(10),&mut http).await.inspect(|_| { joined=true; })???;
         let status=response.status(); let body=axum::body::to_bytes(response.into_body(),65536).await?;
         assert_eq!(status,StatusCode::FORBIDDEN,"{}",String::from_utf8_lossy(&body));
         assert_eq!(snapshot(&fixture.ctx.pool,stream.id,version.id).await?,pending);
@@ -173,12 +179,20 @@ async fn boundary(mode: u8) -> Result<()> {
         Ok::<_,Box<dyn std::error::Error>>(())
     }).catch_unwind().await;
     store.finish.add_permits(10);
-    if !joined {
-        if !http.is_finished() {
-            http.abort();
-        }
-        let _ = http.await;
-    }
+    // Releasing GET lets the ordinary production-owned inner seal complete.
+    // Aborting only this waiter would detach it; file_transfers does not own it.
+    let finished = if !joined {
+        http.await.map(|_| ())
+    } else {
+        Ok(())
+    };
+    // Capture before teardown, assert only after cleanup so a failed observation
+    // cannot recreate the early-exit leak being tested.
+    let completion = if mode >= 3 {
+        Some(snapshot(&fixture.ctx.pool, stream.id, version.id).await)
+    } else {
+        None
+    };
     let drained = fixture
         .ctx
         .state
@@ -190,6 +204,13 @@ async fn boundary(mode: u8) -> Result<()> {
     drop(store);
     fixture.ctx.cleanup().await?;
     assert!(drained, "owned seal drain watchdog");
+    finished?;
+    if let Some(completion) = completion {
+        let completion = completion?;
+        assert_eq!(completion["phase"], "published");
+        assert_eq!(completion["state"], "ready");
+        assert_eq!(completion["sealed"], true);
+    }
     match result {
         Ok(result) => result,
         Err(panic) => std::panic::resume_unwind(panic),
@@ -208,4 +229,20 @@ async fn object_seal_delivery_credential_expires_during_target_wait_and_recovers
 async fn object_seal_delivery_real_attempt_replacement_during_get_denies_old_context() -> Result<()>
 {
     boundary(2).await
+}
+
+#[tokio::test]
+async fn object_seal_delivery_gated_get_error_awaits_inner_seal_cleanup() -> Result<()> {
+    let error = boundary(3).await.unwrap_err();
+    assert_eq!(error.to_string(), "injected producer GET failure");
+    Ok(())
+}
+#[tokio::test]
+async fn object_seal_delivery_http_panic_is_joined_once_before_cleanup() -> Result<()> {
+    let error = boundary(4).await.unwrap_err();
+    let error = error
+        .downcast_ref::<tokio::task::JoinError>()
+        .expect("HTTP panic must propagate as JoinError after cleanup");
+    assert!(error.is_panic());
+    Ok(())
 }
