@@ -2443,3 +2443,6 @@ async fn encrypted_terminal_logs_require_a_complete_authenticated_manifest_on_bo
     }
     Ok(())
 }
+
+#[path = "object_seal_ack_loss.rs"]
+mod object_seal_ack_loss;
