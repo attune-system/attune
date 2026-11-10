@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
                 execution_log_retention_policy:
                     attune_common::models::enums::RetentionPolicyType::Days,
                 execution_log_retention_limit: 7,
-                shutdown_timeout: Some(30),
+                shutdown_timeout: Some(attune_common::config::DEFAULT_WORKER_SHUTDOWN_TIMEOUT_SECS),
                 stream_logs: true,
             });
         }

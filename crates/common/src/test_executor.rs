@@ -12,6 +12,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{debug, error, info, warn};
 
 const MAX_TEST_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -107,6 +108,23 @@ pub struct TestExecutor {
     /// Base directory for pack files
     pack_base_dir: PathBuf,
     candidate_effects: Option<CandidateTestEnvironment>,
+    processes: TestProcessOwner,
+    cancellation: CancellationToken,
+}
+
+/// Owns subprocess supervisors independently of the future consuming their output.
+/// After stopping admission/aborting consumers, explicitly await `shutdown` before
+/// removing their working directories. Dropping this owner is not a cleanup barrier.
+#[derive(Clone, Default)]
+pub struct TestProcessOwner {
+    tasks: TaskTracker,
+}
+
+impl TestProcessOwner {
+    pub async fn shutdown(&self) {
+        self.tasks.close();
+        self.tasks.wait().await;
+    }
 }
 
 /// Separate from ATTUNE_API_TOKEN and archive-download credentials.
@@ -122,7 +140,18 @@ impl TestExecutor {
         Self {
             pack_base_dir,
             candidate_effects: None,
+            processes: TestProcessOwner::default(),
+            cancellation: CancellationToken::new(),
         }
+    }
+
+    pub fn process_owner(&self) -> TestProcessOwner {
+        self.processes.clone()
+    }
+
+    pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
     }
 
     pub fn with_candidate_effects(mut self, environment: CandidateTestEnvironment) -> Self {
@@ -199,6 +228,9 @@ impl TestExecutor {
 
         // Execute tests for each runner
         for (runner_name, runner_config) in &test_config.runners {
+            if self.cancellation.is_cancelled() {
+                return Err(Error::Internal("Pack tests cancelled".into()));
+            }
             info!(
                 "Running test suite: {} ({})",
                 runner_name, runner_config.r#type
@@ -237,6 +269,12 @@ impl TestExecutor {
                     });
                 }
             }
+        }
+
+        // Cancellation is an interrupted attempt, even when the pack's failure
+        // policy would otherwise permit failed/error suites to be published.
+        if self.cancellation.is_cancelled() {
+            return Err(Error::Internal("Pack tests cancelled".into()));
         }
 
         let total_duration_ms = start_time.elapsed().as_millis() as i64;
@@ -413,8 +451,12 @@ impl TestExecutor {
             .map(|path| format!("{}:/usr/local/bin:/usr/bin:/bin", path.display()))
             .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".to_string());
         let mut cmd = Command::new(command);
-        cmd.env_clear()
-            .env("PATH", path)
+        crate::child_process_environment::ChildProcessEnvironment::from_parent(
+            std::iter::empty(),
+            &[],
+        )?
+        .apply(cmd.as_std_mut());
+        cmd.env("PATH", path)
             .env("HOME", working_dir)
             .env("LANG", "C.UTF-8")
             .env("LC_ALL", "C.UTF-8")
@@ -431,59 +473,98 @@ impl TestExecutor {
         #[cfg(unix)]
         cmd.process_group(0);
 
-        let start = Instant::now();
-        let mut child = cmd.spawn().map_err(|e| {
+        // No await between spawning and transferring ownership to the tracker.
+        // Closing the sender signals cancellation even when the consuming task is aborted.
+        let child = cmd.spawn().map_err(|e| {
             Error::Internal(format!("Failed to spawn command '{}': {}", command, e))
         })?;
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| Error::Internal("Test process stdout was not captured".to_string()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| Error::Internal("Test process stderr was not captured".to_string()))?;
-        let stdout_task = tokio::spawn(Self::read_stream(stdout));
-        let stderr_task = tokio::spawn(Self::read_stream(stderr));
-
-        let status = match tokio::time::timeout(timeout, child.wait()).await {
-            Ok(status) => {
-                status.map_err(|e| Error::Internal(format!("Process wait failed: {e}")))?
+        let (consumer, cancelled) = tokio::sync::oneshot::channel::<()>();
+        let cancellation = self.cancellation.clone();
+        let task = self.processes.tasks.spawn(async move {
+            let result = Self::collect_command(child, timeout, cancelled, cancellation).await;
+            if let Err(error) = &result {
+                // The consuming future may have been aborted, so also surface
+                // failures here rather than relying on its JoinHandle result.
+                warn!(%error, "Pack test subprocess supervisor completed with an error");
             }
-            Err(_) => {
-                #[cfg(unix)]
-                if let Some(pid) = child.id() {
-                    // The child starts its own process group, so this also stops descendants.
-                    unsafe {
-                        libc::kill(-(pid as i32), libc::SIGKILL);
-                    }
-                }
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
-                return Err(Error::Timeout(format!(
-                    "Test execution timed out after {:?}",
-                    timeout
-                )));
+            result
+        });
+        let result = task
+            .await
+            .map_err(|error| Error::Internal(format!("Test process supervisor failed: {error}")))?;
+        drop(consumer);
+        result
+    }
+
+    async fn collect_command(
+        mut child: tokio::process::Child,
+        timeout: Duration,
+        mut cancelled: tokio::sync::oneshot::Receiver<()>,
+        cancellation: CancellationToken,
+    ) -> Result<CommandOutput> {
+        let start = Instant::now();
+        #[cfg(unix)]
+        let group = child.id();
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        // Readers are inline futures, never detached tasks. Keep them alive when
+        // cancelling the wait so cleanup can drain both after killing the group.
+        let readers = async { tokio::join!(Self::read_stream(stdout), Self::read_stream(stderr)) };
+        tokio::pin!(readers);
+        let mut captured = None;
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+        let result = loop {
+            tokio::select! {
+                status = child.wait() => break status.map_err(|error| Error::Internal(format!("Process wait failed: {error}"))),
+                output = &mut readers, if captured.is_none() => captured = Some(output),
+                _ = &mut deadline => break Err(Error::Timeout(format!("Test execution timed out after {timeout:?}"))),
+                _ = &mut cancelled => break Err(Error::Internal("Pack test consumer cancelled".into())),
+                _ = cancellation.cancelled() => break Err(Error::Internal("Pack tests cancelled".into())),
             }
         };
-        let stdout = stdout_task
+        // Also clean up descendants after a normal leader exit. On Windows we
+        // own only the direct child; process-tree containment needs Job Objects.
+        #[cfg(unix)]
+        if let Some(pid) = group {
+            let killed = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+            if killed != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    warn!(%error, "Failed to kill pack test process group");
+                }
+            }
+        }
+        if result.is_err() {
+            if let Err(error) = child.start_kill() {
+                warn!(%error, "Failed to kill pack test child; awaiting reap");
+            }
+        }
+        // Always reap before reporting cancellation/timeout to the caller.
+        child
+            .wait()
             .await
-            .map_err(|error| Error::Internal(format!("Stdout reader task failed: {error}")))??;
-        let stderr = stderr_task
-            .await
-            .map_err(|error| Error::Internal(format!("Stderr reader task failed: {error}")))??;
-
-        let duration_ms = start.elapsed().as_millis() as u64;
-        let exit_code = status.code().unwrap_or(-1);
-
+            .map_err(|error| Error::Internal(format!("Process reap failed: {error}")))?;
+        let (stdout, stderr) = match captured {
+            Some(output) => output,
+            None => {
+                // Escaped groups / Windows descendants can retain the pipes.
+                // Expiry drops the inline readers, closing both handles; no task survives.
+                tokio::time::timeout(Duration::from_secs(2), &mut readers)
+                    .await
+                    .map_err(|_| {
+                        Error::Internal(
+                            "Pack test output pipes did not close after termination".into(),
+                        )
+                    })?
+            }
+        };
+        let status = result?;
         Ok(CommandOutput {
-            exit_code,
-            stdout,
-            stderr,
-            duration_ms,
+            exit_code: status.code().unwrap_or(-1),
+            stdout: stdout?,
+            stderr: stderr?,
+            duration_ms: start.elapsed().as_millis() as u64,
         })
     }
 
@@ -853,6 +934,185 @@ mod tests {
 
         assert!(matches!(result, Err(Error::Timeout(_))));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_failure_leaves_no_owned_process() {
+        let root = tempfile::tempdir().unwrap();
+        let executor = TestExecutor::new(root.path().into());
+        let owner = executor.process_owner();
+        assert!(executor
+            .run_command(
+                &root.path().join("missing-executable").to_string_lossy(),
+                &[],
+                root.path(),
+                None,
+                Duration::from_secs(5),
+            )
+            .await
+            .is_err());
+        owner.shutdown().await;
+        assert!(owner.tasks.is_empty());
+        root.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn descendant_ready(root: &Path) -> i32 {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(pid) = tokio::fs::read_to_string(root.join("ready")).await {
+                    if let Ok(pid) = pid.trim().parse() {
+                        return pid;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("descendant readiness signal")
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_descendant_stopped(pid: i32) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match tokio::fs::read_to_string(format!("/proc/{pid}/stat")).await {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                    Ok(stat)
+                        if stat
+                            .rsplit_once(')')
+                            .unwrap()
+                            .1
+                            .trim_start()
+                            .starts_with('Z') =>
+                    {
+                        break
+                    }
+                    _ => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await
+        .expect("descendant must terminate (an orphan zombie cannot retain pipes)");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_aborted_consumer_awaits_process_and_readers_before_root_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_path_buf();
+        let executor = TestExecutor::new(path.clone());
+        let processes = executor.process_owner();
+        let consumer = tokio::spawn(async move {
+            executor
+                .run_command(
+                    "/bin/sh",
+                    &["-c".into(), "sleep 60 & echo $! > ready; wait".into()],
+                    &path,
+                    None,
+                    Duration::from_secs(30),
+                )
+                .await
+        });
+        let pid = descendant_ready(root.path()).await;
+        consumer.abort();
+        assert!(consumer.await.unwrap_err().is_cancelled());
+        // This is the cleanup barrier, not the abort/join of the consumer.
+        tokio::time::timeout(Duration::from_secs(10), processes.shutdown())
+            .await
+            .unwrap();
+        assert_descendant_stopped(pid).await;
+        assert!(root.path().exists());
+        root.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_cancelled_pack_runner_retains_root_until_owned_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_path_buf();
+        std::fs::write(path.join("test.sh"), "sleep 60 & echo $! > ready; wait").unwrap();
+        let cancellation = CancellationToken::new();
+        let consumer_guard = cancellation.clone().drop_guard();
+        let tasks = TaskTracker::new();
+        let (finished, completion) = tokio::sync::oneshot::channel();
+        let handler_path = path.clone();
+        let handler = tasks.spawn(async move {
+            let path = handler_path;
+            let executor = TestExecutor::new(path.clone()).with_cancellation(cancellation);
+            let config = TestConfig {
+                enabled: true,
+                candidate_api_effects: false,
+                discovery: DiscoveryConfig {
+                    method: "explicit".into(),
+                    path: None,
+                },
+                runners: HashMap::from([(
+                    "script".into(),
+                    RunnerConfig {
+                        r#type: "script".into(),
+                        entry_point: "test.sh".into(),
+                        timeout: Some(30),
+                        result_format: None,
+                    },
+                )]),
+                result_format: None,
+                result_path: None,
+                min_pass_rate: None,
+                on_failure: Some("warn".into()),
+            };
+            let result = executor
+                .execute_pack_tests_at(&path, "candidate", "1.0.0", &config)
+                .await;
+            assert!(path.exists(), "candidate root must survive runner cleanup");
+            root.close().unwrap();
+            finished.send(result).unwrap();
+        });
+        let consumer = tokio::spawn(async move {
+            let _guard = consumer_guard;
+            handler.await.unwrap();
+        });
+        let pid = descendant_ready(&path).await;
+        consumer.abort();
+        assert!(consumer.await.unwrap_err().is_cancelled());
+        tasks.close();
+        tokio::time::timeout(Duration::from_secs(10), tasks.wait())
+            .await
+            .unwrap();
+        let result = completion.await.unwrap();
+        assert!(
+            result.is_err(),
+            "cancellation must not become an acceptable suite result"
+        );
+        assert_descendant_stopped(pid).await;
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_normal_leader_exit_terminates_descendants_holding_pipes() {
+        let root = tempfile::tempdir().unwrap();
+        let executor = TestExecutor::new(root.path().into());
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            executor.run_command(
+                "/bin/sh",
+                &[
+                    "-c".into(),
+                    "sleep 60 & printf done; printf error >&2".into(),
+                ],
+                root.path(),
+                None,
+                Duration::from_secs(30),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "done");
+        assert_eq!(result.stderr, "error");
+        root.close().unwrap();
     }
 
     #[tokio::test]

@@ -370,13 +370,13 @@ logs provide lifecycle phases and SQL/pool traces;
 API traces and version IDs correlate seal requests. PostgreSQL logs lock waits
 longer than 50 ms. No arbitrary latency target is asserted by this test.
 
-The benchmark override gives both revisions a 10-second capture-finalization
-window. A diagnostic run with the product's 1-second default recorded incomplete
-capture during concurrent storage waits on this host. The benchmark requires
-complete capture and sealed, ready output on both revisions; increasing this
-fixture window avoids comparing truncated work. It leaves product defaults,
-execution timeouts and authority deadlines unchanged. Record this setting with
-results; these measurements do not establish default-window capture capacity.
+The benchmark override now defaults explicitly to the product's 60,000 ms
+capture-finalization budget. `ATTUNE_WORKER_BENCHMARK_LOG_FINALIZATION_MS` can
+select a different diagnostic budget; the report records it. Earlier lifecycle
+measurements used a 10,000 ms override against a then-1,000 ms product default.
+Those results do not establish capacity at the current default and must not be
+compared with current runs unless both revisions use identical workload,
+finalization budget, storage durability, and observation settings.
 
 The lazy expectation additionally checks independent per-stream allocation,
 zero log versions for silence, terminal capture markers, backend selection and
@@ -402,6 +402,83 @@ API selections stay empty; these tests do not enable coordinated credential
 readiness or repair absent ad hoc admissions. The repository's lock-controlled
 reader case separately covers sealing between pending discovery and authorization
 through both execution and artifact stream entry points.
+
+## Bounded post-PR32 acceptance
+
+Use the same owned runner and lifecycle override for a smaller correctness run:
+
+```bash
+export ATTUNE_E2E_RUN_ID="log-accept-$(date -u +%Y%m%d%H%M%S)-$$"
+export ATTUNE_E2E_PROJECT_NAME="attune-$ATTUNE_E2E_RUN_ID"
+export ATTUNE_E2E_COMPOSE_OVERRIDE="$PWD/docker-compose.worker-lifecycle-benchmark.yaml"
+export ATTUNE_WORKER_BENCHMARK_REVISION="$(git rev-parse HEAD)"
+export ATTUNE_BUILD_GIT_SHA="$ATTUNE_WORKER_BENCHMARK_REVISION"
+export ATTUNE_WORKER_BENCHMARK_TRANSPORT=api # repeat in a fresh project with volume
+export ATTUNE_WORKER_BENCHMARK_LOG_FINALIZATION_MS=60000
+bash scripts/run-integration-tests.sh -k test_worker_log_acceptance -m performance -s
+```
+
+This selects one test with a 300-second test deadline, in addition to the
+runner's bounded startup. It publishes the existing lifecycle workload pack,
+starts an eight-second paced stdout producer, waits for positive stream allocation
+while it is running, then submits four concurrent instances of each short action:
+silent success, silent failure, stderr failure, both streams, and structured JSON
+stdout. There are 21 accepted executions in a complete run, without warmup. The
+producer pacing is workload, not a simulated slow storage provider. Submission
+alongside an active producer does not prove simultaneous worker-slot occupancy.
+
+`WORKER_LOG_ACCEPTANCE_REPORT` contains IDs and metadata only. It checks action
+status independently of capture, structured result preservation, exact per-stream
+allocation (including no versions for silence), sealed/ready output, requested
+backend, and shared action-level parent artifacts across the concurrent versions.
+It does not download or print plaintext logs. It is not a byte-integrity test or
+a latency target. The existing runtime-log correctness suite retains those
+transport and fault boundaries.
+
+The report records incomplete executions over **all accepted submissions**,
+including silence and expected action failures. Missing terminal observations or
+missing positive capture markers are unknown; the rate is `null` when any are
+unknown. It emits the report on assertion failure after submission as well as on
+success; a partial report never passes acceptance. A failed/ambiguous submission
+is a test failure, not evidence of zero incomplete captures. Keep the runner exit
+status with the report. Failed setup before any submission is not workload evidence.
+
+The configured finalization timeout and each execution's snapshotted action
+timeout are recorded separately. The effective post-exit wait is the minimum of
+that configured budget and the remaining action deadline; cancellation can shorten
+it. Exact effective per-execution budgets and finalization duration are not
+exported here. Request-to-observed database/MQ completion times are not
+finalization times. Finalization duration, slot occupancy, pool wait, and lock wait
+are explicitly unavailable in the JSON; worker IDs are observations, not occupancy.
+Existing structured worker `Runtime log finalization finished` events provide
+`elapsed_ms` and `budget_ms`; SQLx traces and PostgreSQL waits above 50 ms can
+support separate trace review. Do not interpret missing traces as zero waits or
+publish raw service logs that may include content.
+
+Save the metadata report, command, exit status, full source SHA, uncommitted diff,
+harness and override SHA-256 hashes, host/build/storage versions, and effective
+Compose settings. This bounded run does not compare revisions. For a comparison,
+use identical harness hashes, all 21 executions, concurrency, budgets, durability,
+workers and observer overhead on both revisions; never discard incomplete runs
+from the denominator to report a speedup.
+
+Fault coverage is reused, not injected again into this mode:
+
+- `crates/common/src/log_stream.rs`: `retries_the_same_sequence_and_bytes_before_continuing_in_order`,
+  `seal_retries_http_unavailability_with_identical_headers`,
+  `seal_retries_identical_proof_after_lost_acknowledgement`, and bounded
+  attempt/exhaustion tests cover deterministic transient upload/seal and lost ACK.
+- `crates/worker/src/runtime/process_executor.rs`:
+  `default_finalization_budget_allows_slow_final_upload_and_seal`,
+  `seal_failure_preserves_process_success_and_the_other_stream_capture`, and
+  `post_exit_log_finalization_deadline_is_bounded` cover process/capture separation.
+- `crates/api/tests/support/object_seal_ack_loss.rs`, compiled by
+  `recorded_execution_events_tests`, covers prepare/final commit ACK loss, exact selection
+  recovery, admission revocation and repeated ambiguity through the PR32 route.
+  Run that subset through the existing owned PostgreSQL runner:
+  `bash scripts/run-rust-integration-tests.sh --test recorded_execution_events_tests --filter object_seal_ack_loss`.
+  The separate versioned-storage suite above still covers real S3 transport.
+  Worker acceptance does not certify durable-close recovery after worker loss.
 
 ## Recover failed streams
 

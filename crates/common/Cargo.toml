@@ -10,7 +10,7 @@ repository.workspace = true
 serde_path_to_error = "0.1"
 # Async runtime
 tokio = { workspace = true }
-tokio-util = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 libc = "0.2"
 async-trait = { workspace = true }
 futures = { workspace = true }

@@ -2477,7 +2477,7 @@ impl ActionExecutor {
             "cancelled": true,
             "exit_code": result.exit_code,
             "duration_ms": result.duration_ms,
-            "error": result.error.clone().unwrap_or_else(|| "Execution cancelled by user".to_string()),
+            "error": result.error.clone().unwrap_or_else(|| "Execution cancelled".to_string()),
         });
 
         if !result.stdout.is_empty() {
