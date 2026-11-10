@@ -62,8 +62,16 @@ and test assumptions. Prior verifier/source test results do not certify this rou
 Real successful COMMIT with lost acknowledgement now has actual recorded
 worker-delivery HTTP coverage at both prepare and final publication on PG16/18,
 including revocation, forwarded-ACK expiry and two lost prepare ACKs. Mixed
-eligibility-error scheduling, broader producers/final waits, full packaged runtime
-validation and final CI remain acceptance requirements. See the later successful
+eligibility-error scheduling, full packaged runtime validation and final CI remain
+acceptance requirements. The finite seven-case native/sensor/recorded-delivery
+producer and final-target-wait matrix now passes on each PG16/18: actual terminal
+native and current sensor HTTP publication, sensor release/reacquire and worker
+admission/attempt changes during GET, and observed target waits crossing actual
+JWT/sensor-lease expiry with403 and retained selection. Same-producer renewed
+worker credentials recover without resetting history. This does not certify every
+lifecycle transition. The existing ACK harness's three P2 failure-path/relay/drain
+review findings remain pending root's follow-up; no general review approval is
+claimed. See the later successful
 COMMIT acceptance checkpoint in the central implementation record for exact source,
 initial fixture failures and explicit resource cleanup.
 

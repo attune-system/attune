@@ -354,3 +354,34 @@ initial fixtures, safe per-relay reports, cleanup and Docker build attempts.
 Full packaged runtime/required CI, native/sensor final paths and the broader
 finalizer-wait/producer matrix remain gaps. Older unclassified timing failures and
 Scope A exclusions retain their previous meaning.
+
+## Actual producer and final-target-wait acceptance
+
+The 2026-11-10 central implementation checkpoint supersedes the earlier unrun
+native/sensor/final-wait gap for its seven named supported cases. Four actual
+producer HTTP cases and three recorded-delivery boundary cases passed on each
+stock PG16.15/18.6 server at four workers. Native terminal completion uses real
+selection/schema/executable/native-attempt/workflow authority, server-owned
+executor JWT conventions and nonempty verified object bytes. Sensor publication
+and generation turnover use actual schema/log generation and repository fences.
+Recorded admission revocation and real running-attempt replacement happen during
+GET, before a newly acquired final Source; neither uses synthetic transport or
+raw ownership mutation.
+
+Final-target-wait credential and sensor lease expiry require an observed
+pg_blocking_pids waiter on only the target version row. SQL clock_timestamp and
+actual signed JWT/stored assignment deadlines determine expiry; production five-
+second SQL/fifteen-second phase limits are unchanged. Both return403 with closing
+selection/Pending/no-evidence retained. Longer-lived legitimate same-producer
+worker delivery recovers without input/revision/history reset. Source rows already
+SHARE-locked by finalization intentionally serialize authority mutation; temporal
+lease expiry exercises the after-wait recheck without demanding an impossible
+revocation through that lock.
+
+The seven unchanged ACK cases also passed again per PG version. Their success
+proof remains valid, but root's three P2 harness failure-path/protocol/drain review
+findings remain open for a later checkpoint. No general harness review approval
+is inferred. Exact commits, saved source diffs, inventories, intermediate native
+fixture failures, reused checks and independent zero-clone/PID/lock cleanup are in
+the central record. Full packaged runtime, required CI, older unclassified failures
+and Scope A physical-settlement/retirement exclusions remain separate gates.

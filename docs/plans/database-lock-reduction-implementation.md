@@ -1752,3 +1752,161 @@ validation remains **unrun**, not passed or certified by the COPY smoke/host run
 Log: `/tmp/attune-ack-docker-retry.log`. The initial missing-file omission is
 preserved above; the bounded retry does not erase it. All code stayed frozen
 through this retry; this final continuation is prose only.
+
+## Actual producer and final-target-wait matrix (2026-11-10 UTC)
+
+Status: **work in progress**, not merge approval. Implementation checkpoints
+`170bd251009f5dbbda991ee02767494faf2459a7` and
+`8f3a1238783c5b0aa9a4bc32d04f53e2b2e0f262` add tests only. Production remains
+`c711bf25`; no authorization, SQL budget, migration, session bypass, worker permit,
+policy, shared-file/flock or PhysicalCleanup behavior changed. No push, PR edit,
+checkout, deployment, merge, external message or subagent was used.
+
+The finite seven-case missing matrix now passes on stock **PG16.15 and PG18.6**,
+with four libtest workers and zero ignored tests:
+
+1. `object_seal_native_workflow_after_terminal_completion`: real repositories
+   project a pack, workflow action and leaf action, typed parsed workflow graph,
+   executable/schema snapshot, execution authority selection and native attempt,
+   and workflow execution. The normal server-owned worker JWT has sub `0` and
+   worker_id `executor`; the actual pending object version has kind `workflow_log`.
+   Full Server router/RequireAuth accepts a nonempty segment (201), then native
+   attempt closure and workflow/execution Completed precede seal (200). Ready,
+   published, sealed, exact nonempty byte count and SHA256 are asserted. This
+   supported plain native path has no encrypted worker final-manifest row. No
+   delivery permit or Running requirement was introduced for terminal completion.
+2. `object_seal_sensor_current_generation_publishes_verified_bytes`: the existing
+   genuine sensor fixture admits its workload fence and schema and attaches its
+   log generation. A legitimately signed fenced sensor token appends through the
+   router (201) and seals (200). One pinned GET consumes nonempty actual bytes;
+   Ready/published/sealed, exact size/digest and the supported plain sensor's
+   absence of encrypted worker evidence are checked.
+3. `object_seal_sensor_released_reacquired_generation_denies_old_source`: while
+   pinned GET is gated, repository release, acquire_or_renew and begin_process
+   produce a different generation. The old request returns403 after GET. Exact
+   closing/Pending/unsealed selection, revision, input/hash/deadline, accepted
+   membership and absent final evidence remain unchanged. No immutable row is
+   edited to manufacture ownership. The real transition progressing at the GET
+   barrier also establishes absence of the old source locks at that point.
+4. `object_seal_delivery_admission_revoked_during_get`: authentic recorded
+   worker-delivery context/permit and a nonempty encrypted frame use the full
+   router. Real revoke_admission completes during GET; fresh final Source returns
+   403 and leaves the complete closing selection/Pending/no-evidence snapshot.
+5. `object_seal_delivery_credential_expires_during_target_wait_and_recovers`:
+   the existing owned credential is re-signed with a four-second JWT expiration,
+   bound to the same genuine context/permit. During GET only artifact_version's
+   target row is locked FOR UPDATE. After releasing GET, pg_blocking_pids proves
+   a finalizer waiter on that exact blocker in the current database. SQL pg_sleep
+   waits only the remaining actual JWT deadline; clock_timestamp independently
+   confirms expiry. Unlock occurs before the unchanged five-second SQL timeout.
+   The route returns403 (not503), retaining the exact closing snapshot. The
+   original legitimate longer-lived same-producer token then recovers to200,
+   Ready/published/sealed with identical revision/input/hash/deadline/membership;
+   no history/reset mutation occurs.
+6. `object_seal_sensor_lease_expires_during_actual_target_wait`: the actual
+   current assignment is renewed through the repository to three seconds while
+   GET is paused. Only the target version row is then blocked. pg_blocking_pids
+   proves the wait; SQL waits to the stored assignment lease_expires_at and
+   clock_timestamp confirms expiry before target unlock. After-wait recheck
+   returns403 and preserves the entire closing/Pending/no-evidence snapshot.
+   The finalizer already holds SHARE source protection: this tests temporal
+   validity, not an impossible concurrent authority-row mutation through its lock.
+7. `object_seal_delivery_real_attempt_replacement_during_get_denies_old_context`:
+   the real begin_execution_attempt repository advances the current fence while
+   the execution is legitimately running. No raw fence UPDATE, terminal-context
+   resurrection, worker-instance fabrication or permit deletion is used. Fresh
+   final Source denies the old context403, retaining the exact selected snapshot.
+   This covers the supported attempt transition; it does not assert that an
+   unrelated attempt must invalidate an independently retained terminal context,
+   or invent public lifecycle APIs for deleting permits/instances.
+
+The three delivery cases are a separate module using copied authentic setup and
+an independent test-only GET wrapper; the ACK fixture and commit_relay.rs are
+byte-for-byte unchanged. The four producer cases are a separate sensor target
+module. Gate/error assertions are caught before teardown, GET gates are released,
+HTTP handles are awaited (aborted and awaited on watchdog/error), and the shared
+file_transfers tracker is drained before awaited TestContext cleanup. An expired
+drain watchdog fails the test after joining tracked seal work. Passing normal
+paths are not blanket certification of every partial-construction/failure path.
+No global environment mutation or global disposal-counter delta was added.
+
+### Exact validation attribution
+
+Main prebuild and first route run froze source/HEAD at `170bd251`. Early cargo
+checks exposed fixture Rust type/field errors and one duplicated assignment
+warning; these were corrected before checkpoint, without weakening assertions.
+Final early check `/tmp/attune-matrix-check-final.log` passed. Command:
+`cargo test -p attune-api --test sensor_log_tests --test recorded_execution_events_tests --no-run --message-format=json`
+passed (26m25s, including shared rebuild). Timed tests started only after it ended.
+
+Executables, from crates/api with absolute CARGO_MANIFEST_DIR and unique
+ATTUNE_TEST_RUN_ID/owned ATTUNE__DATABASE__URL, ran `object_seal_ --nocapture
+--test-threads=4`; `--list` required **4 producer** and **10 recorded** cases.
+The recorded executable `recorded_execution_events_tests-a91a265e43720315` passed
+**10/10 PG16 (118.74s)** and **10/10 PG18 (59.48s)**. This includes the unchanged
+original seven ACK tests and the three new delivery boundary cases on each server.
+Logs/results: `/tmp/attune-matrix-first-*-recorded_execution_events_tests.log`,
+`/tmp/attune-matrix-results-first.json`. These success paths do not close the ACK
+harness review findings below.
+
+Native fixture failures remain explicit: the first producer run was **3/4 each**;
+only native failed before HTTP, with Invalid immutable workflow definition from
+its generic helper JSON. A typed-parser correction using an empty graph was also
+**3/4 each**, rejected by the real minimum-one-task validation before HTTP. A real
+projected leaf and parsed task corrected setup. No production bug was established
+and no validation rule or policy was relaxed. The three sensor cases passed in
+all three source runs on each server; these are not baseline classifications of
+older failures. Original logs/results remain under `/tmp/attune-matrix-first-*`
+and `/tmp/attune-matrix-nativefix-*` / `native-results.json`.
+
+Final producer source was frozen at `170bd251` plus
+`/tmp/attune-matrix-native-fix2.diff`, SHA256
+`a836aa7565d3b4261ddca5755e6608ba1849eaac9bc183d471cefbeaa81af516`, exactly the
+subsequently committed `8f3a1238` patch. Early check passed; rebuilt producer
+executable `sensor_log_tests-2240e9a0433642eb` passed **4/4 PG16 (93.77s)** and
+**4/4 PG18 (57.51s)**. Logs `/tmp/attune-matrix-nativefix2-{16,18}.log`, results
+`/tmp/attune-matrix-native-results2.json`, prebuild `native-build2.{log,jsonl}`.
+Main and corrected-fixture prebuilds and timed test runs kept source/HEAD frozen;
+exploratory early type checks preceded that freeze. The final patch
+only affects the native producer fixture in the other test target, so recorded
+10/10 results are reused without attributing them to a fresh recorded-binary run.
+
+`cargo clippy -p attune-api --test sensor_log_tests --test recorded_execution_events_tests -- -D warnings`
+passed (2m20s); `cargo fmt --all -- --check` and `git diff --check` passed.
+Logs `/tmp/attune-matrix-clippy.log`, `/tmp/attune-matrix-fmt-final.log`. Earlier
+root-validated c711 Source/getter/close lifecycle 12 and executor workflow-log30
+checks per PG version, including lost_seal_response_is_replayed_safely, are reused:
+production, existing source fixtures, strict initialization/getter retry and
+executor code did not change. Schema/client regeneration is inapplicable to these
+new test modules; required broader workspace/CI/dependency-policy gates still apply.
+
+### Owned cleanup and remaining limits
+
+All runner subprocesses were joined before removal. `/tmp/attune-matrix-owned.json`
+records the exact containers, migrations, URLs, 24 distinct ACK-reported PIDs per
+server and independent post-test counts: **0 clones, 0 clone PIDs, 0 clone locks,
+0 reported ACK PIDs, 0 reported locks** on each server, before removal. Tests
+cleaned normally; no janitor was used. The initial native failure also left zero
+clones/PIDs/locks by independent inspection. Label-verified containers
+`15ad79abd4c986d0e5d596ba6472a64d5b17aae3c63edbacbcdd3080a2843d54` and
+`99e9512ba670c3dcf1d3d061869ee327fec57ce2e2afa1bc201dfda15ab76929` were removed
+with awaited `docker rm -f -v` (anonymous volumes included), and independently
+absent. `/tmp/attune-matrix-cleanup.log` records the checks. No shim, network,
+broker or packaged runtime stack was created. The original dirty checkout and
+unrelated container remain untouched. Initial bootstrap reached PG16's temporary
+initialization server during shutdown; retry waited for real TCP readiness before
+migrating both owned servers. That setup failure is retained in the tool record.
+
+Root's concurrent Astra review closed the c711 getter finding and reported no new
+production reconciliation bug, but three P2 **existing harness** findings remain
+for root's subsequent checkpoint: ACK failure paths can skip joined cleanup,
+relay queued-COMMIT classification can survive deferred Error+Ready without
+CommandComplete, and relay shutdown can stop awaiting after its first task error.
+This implementation did not modify those files or claim review approval. Further
+review of the new tests and required CI are pending. Full packaged Docker runtime
+remains unvalidated after the previously recorded 600s compilation timeout. Older
+250ms/timing/CommitUnknown failures and 58 base-manifest policy failures remain
+unclassified/unresolved. Scope A still does not solve full PUT settlement,
+pre-admitted late starts, forgotten staging, post-retention recreation or filesystem
+retirement. The finite supported producer/final-wait matrix is now tested; it does
+not prove every possible lifecycle transition or erase those physical limits.
