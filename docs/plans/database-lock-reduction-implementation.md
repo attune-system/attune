@@ -1549,3 +1549,43 @@ schema/lint. Its driver is `/tmp/attune-getorcreate-validation.py`; results and
 resource ownership will be recorded before this correction is certified. No
 production changes, deployment or merge occurred. All other acceptance gaps,
 including real lost-ACK and actual finalizer-wait/producer coverage, remain open.
+
+
+### Getter retry validation complete (scoped, not merge readiness)
+
+Source checkpoint `c711bf257320a9882a250fe91208144a9667cade` passed on fresh owned
+PG16/18 servers with four workers: all12 close cases on each (including the new
+published get-or-create/configuration/revision/invalid-limit assertions), and all30
+workflow log cases on each. `lost_seal_response_is_replayed_safely` passed on both,
+alongside append/seal races, replica serialization, shutdown and independent root
+execution retention. Other31 storage and301 executor cases were filtered, not
+passed. No failures/ignored cases occurred in this run; this does not classify
+older maintenance timing/CommitUnknown failures.
+
+Exact commands/timings are in `/tmp/attune-getorcreate-validation-state.json`,
+logs `/tmp/attune-getorcreate-validation-zzs_uisf`. Builds preceded timed execution.
+Workspace SQLx prepare, common/executor all-target Clippy with warnings denied,
+formatting and whitespace passed. Both exact owned containers and anonymous
+volumes were removed after zero remaining per-test clone checks; all temporary
+psql shims were deleted. This record changes prose only; runtime evidence applies
+to the preceding code checkpoint. No original checkout or production resource
+was changed.
+
+The prior e93566fa hardening record remains separate:12 close/31 API-error/1
+recorded contention case per PG version, not the new getter tests. Astra's four
+original integrated-lifecycle findings are addressed; its subsequent initializer
+retry regression is now corrected and demonstrated by the existing workflow
+replay test. Additional Astra review of the next acceptance milestone is required;
+these scoped results are not merge approval.
+
+Read-only research located the real lost-ACK test seam: current shared relay gates
+ReadyForQuery after CommandComplete, while cache-cleanup wire fixtures already
+correlate Parse/Bind/Execute and can hold CommandComplete COMMIT. The next test
+milestone must add multi-connection phase/stream-aware gating before forwarding
+COMMIT completion, independently observe durable state, then disconnect. It must
+exercise prepare and final publication separately through the allowed recorded
+worker-delivery HTTP route, retain process HTTP denial, and join all relay/request
+work. Dockerfile.rust-tests also needs the path-imported relay fixture copied into
+the builder. No production test GUC or authority bypass is needed. Native/sensor
+final paths, after-target-wait expiry/authority and broader CI remain subsequent
+acceptance gates, along with all explicitly retained physical-settlement limits.
