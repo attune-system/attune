@@ -1508,6 +1508,7 @@ pub async fn upload_version(
         ("version" = i32, Path, description = "Version number"),
     ),
     responses(
+        (status = 409, description = "Authorized log is finalizing (LOG_FINALIZING) or incomplete (LOG_INCOMPLETE)", body = crate::middleware::error::ErrorResponse),
         (status = 200, description = "Binary file content", content_type = "application/octet-stream"),
         (status = 206, description = "Requested byte range", content_type = "application/octet-stream"),
         (status = 416, description = "Requested range is not satisfiable"),
@@ -1551,24 +1552,27 @@ pub async fn download_version(
 
     ensure_selected_version_id(&selector, &ver)?;
     authorize_selected_artifact_version(&state, &user, &artifact, &ver).await?;
+    require_runtime_log_ready(&state, &artifact, &ver).await?;
 
     if let Some(response) = protected_file_response(&state, &user, &ver, &request_headers).await? {
         return Ok(response);
     }
 
-    emit_artifact_audit(
-        &state,
-        &user,
-        event_type::artifact::DOWNLOADED,
-        AuditOutcome::Success,
-        &artifact,
-        serde_json::json!({
-            "version": version,
-            "file_backed": ver.file_path.is_some(),
-            "content_type": ver.content_type.as_deref(),
-            "size_bytes": ver.size_bytes,
-        }),
-    );
+    if artifact.classification != ArtifactClassification::RuntimeLog {
+        emit_artifact_audit(
+            &state,
+            &user,
+            event_type::artifact::DOWNLOADED,
+            AuditOutcome::Success,
+            &artifact,
+            serde_json::json!({
+                "version": version,
+                "file_backed": ver.file_path.is_some(),
+                "content_type": ver.content_type.as_deref(),
+                "size_bytes": ver.size_bytes,
+            }),
+        );
+    }
 
     if protected_log_marker(&ver) {
         return download_human_encrypted_log(state, user, artifact, ver).await;
@@ -1622,6 +1626,7 @@ pub async fn download_version(
     tag = "artifacts",
     params(ArtifactContentSelector, ("id" = i64, Path, description = "Artifact ID")),
     responses(
+        (status = 409, description = "Authorized log is finalizing (LOG_FINALIZING) or incomplete (LOG_INCOMPLETE)", body = crate::middleware::error::ErrorResponse),
         (status = 200, description = "Binary file content of latest version", content_type = "application/octet-stream"),
         (status = 206, description = "Requested byte range", content_type = "application/octet-stream"),
         (status = 416, description = "Requested range is not satisfiable"),
@@ -1679,24 +1684,27 @@ pub async fn download_latest(
 
     ensure_selected_version_id(&selector, &ver)?;
     authorize_selected_artifact_version(&state, &user, &artifact, &ver).await?;
+    require_runtime_log_ready(&state, &artifact, &ver).await?;
     let version = ver.version;
     if let Some(response) = protected_file_response(&state, &user, &ver, &request_headers).await? {
         return Ok(response);
     }
 
-    emit_artifact_audit(
-        &state,
-        &user,
-        event_type::artifact::DOWNLOADED,
-        AuditOutcome::Success,
-        &artifact,
-        serde_json::json!({
-            "version": version,
-            "file_backed": ver.file_path.is_some(),
-            "content_type": ver.content_type.as_deref(),
-            "size_bytes": ver.size_bytes,
-        }),
-    );
+    if artifact.classification != ArtifactClassification::RuntimeLog {
+        emit_artifact_audit(
+            &state,
+            &user,
+            event_type::artifact::DOWNLOADED,
+            AuditOutcome::Success,
+            &artifact,
+            serde_json::json!({
+                "version": version,
+                "file_backed": ver.file_path.is_some(),
+                "content_type": ver.content_type.as_deref(),
+                "size_bytes": ver.size_bytes,
+            }),
+        );
+    }
 
     if protected_log_marker(&ver) {
         return download_human_encrypted_log(state, user, artifact, ver).await;
@@ -2143,6 +2151,88 @@ fn protected_log_marker(
     })
 }
 
+/// This diagnostic is disclosed only after selected-version content authorization.
+async fn require_runtime_log_ready(
+    state: &Arc<AppState>,
+    artifact: &attune_common::models::Artifact,
+    selected: &attune_common::models::ArtifactVersion,
+) -> ApiResult<()> {
+    if artifact.classification != ArtifactClassification::RuntimeLog || selected.execution.is_none()
+    {
+        return Ok(());
+    }
+    match selected.body_state {
+        Some(ArtifactBodyState::Ready) | None => return Ok(()),
+        Some(ArtifactBodyState::Deleting | ArtifactBodyState::CleanupClaimed) => {
+            return Err(ApiError::NotFound("Log is unavailable".into()))
+        }
+        _ => {}
+    }
+    let incomplete = ArtifactVersionRepository::log_finalization_incomplete(&state.db, selected.id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Log is unavailable".into()))?;
+    state
+        .execution_log_streams
+        .record_log_unavailable(incomplete);
+    tracing::info!(
+        artifact_version = selected.id,
+        execution_id = selected.execution,
+        incomplete,
+        pending_age_ms = (chrono::Utc::now() - selected.created)
+            .num_milliseconds()
+            .max(0),
+        "Runtime log delivery is unavailable"
+    );
+    Err(ApiError::LogUnavailable { incomplete })
+}
+
+type LogDownloadAudit = (
+    Arc<AppState>,
+    AuthenticatedUser,
+    attune_common::models::Artifact,
+    attune_common::models::ArtifactVersion,
+);
+
+/// A download audit records verified EOF, not response construction or a prefix
+/// preview that the client cancelled. Guarded readers authorize their final EOF.
+fn audit_log_download_eof(
+    audit: LogDownloadAudit,
+    response: axum::response::Response,
+) -> axum::response::Response {
+    use futures::TryStreamExt;
+    // Only a full successful response can prove delivery of the complete log.
+    // Range EOF and error-body EOF do not represent a full log download.
+    if response.status() != StatusCode::OK {
+        return response;
+    }
+
+    let (mut parts, body) = response.into_parts();
+    // HTTP/1 must poll through EOF, even for an empty body. A fixed length lets
+    // Hyper stop before the reader's final authorization and this audit run.
+    parts.headers.remove(header::CONTENT_LENGTH);
+    let stream = futures::stream::try_unfold(
+        (body.into_data_stream(), audit),
+        |(mut body, audit)| async move {
+            match body.try_next().await? {
+                Some(bytes) => Ok(Some((bytes, (body, audit)))),
+                None => {
+                    let (state, user, artifact, selected) = audit;
+                    emit_artifact_audit(
+                        &state,
+                        &user,
+                        event_type::artifact::DOWNLOADED,
+                        AuditOutcome::Success,
+                        &artifact,
+                        serde_json::json!({"version":selected.version,"version_id":selected.id,"delivery":"verified_eof"}),
+                    );
+                    Ok::<_, axum::Error>(None)
+                }
+            }
+        },
+    );
+    axum::response::Response::from_parts(parts, axum::body::Body::from_stream(stream))
+}
+
 fn download_human_encrypted_log(
     state: Arc<AppState>,
     user: AuthenticatedUser,
@@ -2171,6 +2261,12 @@ fn download_human_encrypted_log(
         .ok_or_else(denied)?;
         let owner = RuntimeReadOwner::of(&target);
         tx.commit().await?;
+        let audit = (
+            state.clone(),
+            user.clone(),
+            artifact.clone(),
+            selected.clone(),
+        );
         let response = crate::recorded_reads::sealed_log_response(&state, &selected).await?;
         let (parts, body) = response.into_parts();
         let authorize = move || {
@@ -2258,9 +2354,9 @@ fn download_human_encrypted_log(
         // A HEAD response is authorized here even when Hyper never polls its body.
         authorize().await.map_err(|_| denied())?;
         let stream = crate::recorded_reads::guarded_chunks(body.into_data_stream(), authorize);
-        Ok(axum::response::Response::from_parts(
-            parts,
-            axum::body::Body::from_stream(stream),
+        Ok(audit_log_download_eof(
+            audit,
+            axum::response::Response::from_parts(parts, axum::body::Body::from_stream(stream)),
         ))
     })
 }
@@ -2570,6 +2666,12 @@ fn guard_selected_log_download<'a>(
         {
             return Ok(response);
         }
+        let audit = (
+            state.clone(),
+            user.clone(),
+            artifact.clone(),
+            selected.clone(),
+        );
         let selected = selected.clone();
         let state = state.clone();
         let user = user.clone();
@@ -2627,9 +2729,9 @@ fn guard_selected_log_download<'a>(
             .await
             .map_err(|_| ApiError::NotFound("Log disclosure authority is unavailable".into()))?;
         let stream = crate::recorded_reads::guarded_chunks(body.into_data_stream(), authorize);
-        Ok(axum::response::Response::from_parts(
-            parts,
-            Body::from_stream(stream),
+        Ok(audit_log_download_eof(
+            audit,
+            axum::response::Response::from_parts(parts, Body::from_stream(stream)),
         ))
     })
 }

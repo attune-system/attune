@@ -287,6 +287,8 @@ pub struct ExecutionResult {
     /// Whether live logs could not be fully drained and sealed.
     #[serde(default)]
     pub logs_incomplete: bool,
+    /// Independent capture outcomes; absent when capture never ran.
+    pub log_capture_incomplete: Option<(bool, bool)>,
 }
 
 impl ExecutionResult {
@@ -310,6 +312,7 @@ impl ExecutionResult {
             stderr_bytes_truncated: 0,
             timed_out: false,
             logs_incomplete: false,
+            log_capture_incomplete: None,
         }
     }
 
@@ -328,6 +331,7 @@ impl ExecutionResult {
             stderr_bytes_truncated: 0,
             timed_out: false,
             logs_incomplete: false,
+            log_capture_incomplete: None,
         }
     }
 }

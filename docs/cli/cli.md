@@ -253,6 +253,36 @@ The provider must advertise `device_authorization_endpoint` and enable the devic
 grant for the configured client. See [OIDC device login](../deployment/oidc-device-login.md)
 for server and provider configuration.
 
+#### Use a login access token in another REST client
+
+Request the newly issued access token explicitly during password or SSO login:
+
+```bash
+attune auth login --username admin --print-access-token
+attune auth sso-login --print-access-token
+# Headless SSO also works with --no-browser
+```
+
+After successful authentication and credential storage, stdout contains only the
+access token followed by a newline. This flag overrides table, JSON, and YAML
+output, including the configured default format. SSO instructions remain on
+stderr. Credentials are still saved using the profile's existing encryption
+setting; the refresh token is never printed by this flag. Without the flag,
+normal login output continues to hide tokens.
+
+Copy the value into Postman's **Authorization → Bearer Token → Token** field,
+or use it as `Authorization: Bearer <access-token>` in another REST client.
+You can also capture it without printing it to the terminal:
+
+```bash
+access_token="$(attune auth sso-login --print-access-token)"
+```
+
+The flag displays the token only for that explicit login invocation. There is no
+stored-token export command, and refresh/re-authentication does not enable the
+flag. The token remains reusable until its normal expiry; one-time display does
+not make it a single-use token. Log in again with the flag to obtain a fresh one.
+
 #### Passwordless Token Login
 ```bash
 attune auth token-login --token attune_it_...

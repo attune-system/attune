@@ -3,6 +3,9 @@
 //! Tests cover CRUD operations, specialized queries, constraints,
 //! enum handling, timestamps, and edge cases.
 
+#[path = "support/object_log.rs"]
+mod object_log_fixture;
+
 use attune_common::models::enums::{
     ArtifactBodyState, ArtifactClassification, ArtifactType, ArtifactVisibility, LogStreamBackend,
     OwnerType, RetentionPolicyType,
@@ -398,10 +401,11 @@ async fn test_log_stream_commits_in_order_and_seals_before_ready() {
     tx.commit().await.unwrap();
 
     let mut tx = pool.begin().await.unwrap();
+    object_log_fixture::admission(&mut tx).await.unwrap();
     let locked = LogStreamRepository::lock(&mut tx, stream.id).await.unwrap();
     assert_eq!(locked.next_sequence, 1);
     assert_eq!(locked.total_bytes, 3);
-    LogStreamRepository::seal(&mut tx, stream.id, false)
+    object_log_fixture::seal(&mut tx, stream.id, false)
         .await
         .unwrap();
     ArtifactVersionRepository::mark_body_ready_in_transaction(
@@ -534,9 +538,20 @@ async fn log_stream_commit_and_seal_emit_compact_transactional_wakeups() {
     assert_eq!(committed.as_object().unwrap().len(), 4);
 
     let mut tx = pool.begin().await.unwrap();
-    LogStreamRepository::seal(&mut tx, stream.id, false)
+    object_log_fixture::admission(&mut tx).await.unwrap();
+    object_log_fixture::seal(&mut tx, stream.id, false)
         .await
         .unwrap();
+    ArtifactVersionRepository::mark_body_ready_in_transaction(
+        &mut tx,
+        version.id,
+        "segments:1",
+        committed_bytes,
+        &"a".repeat(64),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     tx.commit().await.unwrap();
 
     let sealed =
@@ -689,7 +704,8 @@ async fn supervisor_reclaims_sealed_object_logs_after_retention_override() {
             .unwrap();
         if index < 2 {
             let mut tx = pool.begin().await.unwrap();
-            LogStreamRepository::seal(&mut tx, stream.id, false)
+            object_log_fixture::admission(&mut tx).await.unwrap();
+            object_log_fixture::seal(&mut tx, stream.id, false)
                 .await
                 .unwrap();
             ArtifactVersionRepository::mark_body_ready_in_transaction(

@@ -236,11 +236,23 @@ sequence and bytes. Authentication, authorization, validation, and conflict
 responses fail immediately. Each attempt has its own deadline, independent of
 the API transport's general request timeout. The defaults allow at most 51.5
 seconds across five attempts and four backoffs. Shared-file log appends remain
-single-attempt.
+single-attempt. Sealing on both backends uses the same retry attempt and backoff
+settings. Each retry preserves the version, truncation flag, and authenticated
+manifest; an identical retry can reconcile a committed seal whose response was
+lost. Permanent authorization and proof failures are not retried.
 
 After an action process exits, the worker drains both pipes and seals their log
-streams for at most `log_finalization_timeout_ms` in total. Cancellation and the
-action timeout remain active during this period. If cancellation, the action
+streams for at most `log_finalization_timeout_ms` in total (60 seconds by
+default). This is a maximum, not an added delay: successful settlement returns
+immediately. The budget includes remaining uploads and sealing for both streams,
+so it may interrupt retry attempts or backoff before their individual limits.
+It does not guarantee all configured upload and seal attempts will fit.
+Idle pipe reads stop one second after process exit, independently of uploads and
+sealing. Already buffered pipe bytes are drained first. A descendant retaining
+stdout or stderr without producing output therefore cannot consume the longer
+storage budget. Missing EOF is incomplete capture and is never sealed as complete.
+
+Cancellation and the action timeout remain active during this period. If cancellation, the action
 timeout, or the finalization deadline interrupts the drain, the execution result
 contains `logs_incomplete: true`; the action's exit status is otherwise
 unchanged.
@@ -267,7 +279,7 @@ artifacts:
   log_segment_retry_attempt_timeout_ms: 10000
   log_segment_retry_initial_backoff_ms: 100
   log_segment_retry_max_backoff_ms: 2000
-  log_finalization_timeout_ms: 1000
+  log_finalization_timeout_ms: 60000
   sensor_log_max_bytes: 10485760
   sensor_log_max_files: 4
 ```

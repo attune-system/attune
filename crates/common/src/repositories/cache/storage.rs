@@ -90,14 +90,19 @@ impl CacheStorageRepository {
             .bind(format!("{}ms", config.statistics_statement_timeout_milliseconds))
             .execute(&mut *tx).await?;
         let result: Result<bool> = async {
+            validate_statistics_ownership(&mut tx).await?;
+            let due: Option<i64> = sqlx::query_scalar(
+                "SELECT requested_revision FROM cache_entry_statistics_state WHERE id=TRUE
+                 AND requested_revision > completed_revision
+                 AND (last_analyzed_at IS NULL OR last_analyzed_at <= clock_timestamp() - make_interval(secs => $1::DOUBLE PRECISION))",
+            ).bind(config.statistics_interval_seconds as i64)
+                .fetch_optional(&mut *tx).await?;
+            if due.is_none() { return Ok(false); }
+            // The preflight holds no strong parent lock and acknowledges nothing.
+            // A fresh READ COMMITTED snapshot under the lock is authoritative.
             sqlx::query("LOCK TABLE ONLY cache_entry IN SHARE UPDATE EXCLUSIVE MODE")
                 .execute(&mut *tx).await?;
-            let owns_parent: bool = sqlx::query_scalar(
-                "SELECT pg_has_role(current_user, relowner, 'USAGE') FROM pg_class WHERE oid='cache_entry'::REGCLASS AND relkind='p'",
-            ).fetch_one(&mut *tx).await?;
-            if !owns_parent {
-                return Err(Error::invalid_state("cache statistics maintenance requires effective parent ownership"));
-            }
+            validate_statistics_ownership(&mut tx).await?;
             let revision: Option<i64> = sqlx::query_scalar(
                 "SELECT requested_revision FROM cache_entry_statistics_state WHERE id=TRUE
                  AND requested_revision > completed_revision
@@ -143,4 +148,18 @@ impl CacheStorageRepository {
             }
         }
     }
+}
+
+// Validate even idle preflights; due work must revalidate after a lock wait,
+// since ANALYZE can warn and skip a relation after ownership changes.
+async fn validate_statistics_ownership(conn: &mut sqlx::PgConnection) -> Result<()> {
+    let owns_parent: bool = sqlx::query_scalar(
+        "SELECT pg_has_role(current_user, relowner, 'USAGE') FROM pg_class WHERE oid='cache_entry'::REGCLASS AND relkind='p'",
+    ).fetch_one(conn).await?;
+    if !owns_parent {
+        return Err(Error::invalid_state(
+            "cache statistics maintenance requires effective parent ownership",
+        ));
+    }
+    Ok(())
 }

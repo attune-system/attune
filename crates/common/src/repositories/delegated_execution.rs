@@ -24,6 +24,22 @@ pub struct ExecutionAuthoritySelection {
     pub grant_digest: Option<String>,
     pub output_grants: Option<serde_json::Value>,
 }
+/// Immutable historical producer identity, never a publication capability.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LogProducerBinding {
+    Worker {
+        execution: Id,
+        worker: Id,
+        attempt: Uuid,
+    },
+    Workflow {
+        execution: Id,
+        workflow: Id,
+        attempt: Uuid,
+    },
+}
+
 pub struct DelegatedExecutionRepository;
 
 /// Validated internal acknowledgement; copied details must use protected queue storage.
@@ -636,6 +652,60 @@ impl DelegatedExecutionRepository {
         }
         Ok(authority.covers(&serde_json::from_value::<Vec<crate::rbac::Grant>>(grants)?))
     }
+    /// Staged close source protection. Caller enters shared graph admission first.
+    /// Workflow precedes execution/attempt, matching cancellation and outbox writers.
+    /// Terminal native producers remain eligible: outbox sealing follows completion.
+    pub async fn lock_log_producer(
+        conn: &mut PgConnection,
+        execution: Id,
+        worker: Option<Id>,
+    ) -> Result<LogProducerBinding> {
+        let workflow = if worker.is_none() {
+            Some(
+                sqlx::query_scalar::<_, Id>(
+                    "SELECT id FROM workflow_execution WHERE execution=$1 FOR SHARE",
+                )
+                .bind(execution)
+                .fetch_optional(&mut *conn)
+                .await?
+                .ok_or_else(denied)?,
+            )
+        } else {
+            None
+        };
+        let selection = Box::pin(Self::validate(conn, execution)).await?;
+        if selection_producer(&selection)?
+            != if worker.is_some() {
+                "worker"
+            } else {
+                "workflow"
+            }
+        {
+            return Err(denied());
+        }
+        let (attempt,): (Uuid,) = if let Some(worker) = worker {
+            sqlx::query_as("SELECT a.attempt FROM execution e JOIN delegated_execution_attempt a ON a.execution=e.id WHERE e.id=$1 AND e.worker=$2 AND a.worker=e.worker AND a.producer_kind='worker' AND e.status='running' AND NOT a.closed FOR SHARE OF e,a")
+                .bind(execution).bind(worker).fetch_optional(&mut *conn).await?.ok_or_else(denied)?
+        } else {
+            sqlx::query_as("SELECT a.attempt FROM execution e JOIN delegated_execution_attempt a ON a.execution=e.id WHERE e.id=$1 AND e.worker IS NULL AND a.worker IS NULL AND a.producer_kind='workflow' FOR SHARE OF e,a")
+                .bind(execution).fetch_optional(&mut *conn).await?.ok_or_else(denied)?
+        };
+        // validate() reads execution without a lock; repeat after acquiring it.
+        Box::pin(Self::validate(conn, execution)).await?;
+        Ok(match worker {
+            Some(worker) => LogProducerBinding::Worker {
+                execution,
+                worker,
+                attempt,
+            },
+            None => LogProducerBinding::Workflow {
+                execution,
+                workflow: workflow.ok_or_else(denied)?,
+                attempt,
+            },
+        })
+    }
+
     pub async fn require_native_log(conn: &mut PgConnection, execution: Id) -> Result<()> {
         Box::pin(Self::validate(conn, execution)).await?;
         let exists: bool = sqlx::query_scalar(

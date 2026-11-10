@@ -1,10 +1,81 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  artifactContentErrorMessage,
+  artifactStreamErrorMessage,
+  LOG_FINALIZING_MESSAGE,
+  LOG_INCOMPLETE_MESSAGE,
   ARTIFACT_PREVIEW_BYTES,
   readArtifactPreview,
 } from "./artifact-preview";
 
 describe("artifact previews", () => {
+  it.each([
+    ["LOG_FINALIZING", LOG_FINALIZING_MESSAGE],
+    ["LOG_INCOMPLETE", LOG_INCOMPLETE_MESSAGE],
+  ])("distinguishes authorized %s diagnostics", async (code, message) => {
+    const response = new Response(
+      JSON.stringify({ code, error: "untrusted server text" }),
+      { status: 409 },
+    );
+    try {
+      await readArtifactPreview(response);
+      throw new Error("expected failure");
+    } catch (error) {
+      expect(artifactContentErrorMessage(error)).toBe(message);
+    }
+  });
+
+  it.each([403, 404, 409, 500])(
+    "keeps unknown and unauthorized HTTP %s errors generic",
+    async (status) => {
+      const response = new Response(
+        JSON.stringify({ code: "UNKNOWN", error: "private information" }),
+        { status },
+      );
+      try {
+        await readArtifactPreview(response);
+        throw new Error("expected failure");
+      } catch (error) {
+        expect(artifactContentErrorMessage(error)).toBe(
+          "Content unavailable or access denied",
+        );
+      }
+    },
+  );
+
+  it("does not accept delivery codes from authorization failures", async () => {
+    const response = new Response(JSON.stringify({ code: "LOG_INCOMPLETE" }), {
+      status: 403,
+    });
+    await expect(
+      readArtifactPreview(response).catch(artifactContentErrorMessage),
+    ).resolves.toBe("Content unavailable or access denied");
+  });
+
+  it("bounds untrusted delivery error bodies", async () => {
+    const response = new Response(
+      JSON.stringify({ padding: "x".repeat(8192), code: "LOG_INCOMPLETE" }),
+      { status: 409 },
+    );
+    await expect(
+      readArtifactPreview(response).catch(artifactContentErrorMessage),
+    ).resolves.toBe("Content unavailable or access denied");
+    expect(response.body?.locked).toBe(false);
+  });
+
+  it("shows incomplete SSE logs without accepting arbitrary error text", () => {
+    expect(
+      artifactStreamErrorMessage(
+        JSON.stringify({ code: "log_stream_incomplete", message: "private" }),
+      ),
+    ).toBe(LOG_INCOMPLETE_MESSAGE);
+    expect(
+      artifactStreamErrorMessage(
+        JSON.stringify({ code: "denied", message: "private" }),
+      ),
+    ).toBe("Content unavailable or access denied");
+  });
+
   it("reads complete small text", async () => {
     expect(await readArtifactPreview(new Response("hello 🐘"))).toEqual({
       text: "hello 🐘",

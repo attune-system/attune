@@ -29,6 +29,11 @@ WORKDIR /build
 # Increase rustc stack size to prevent SIGSEGV
 ENV RUST_MIN_STACK=67108864
 
+# Exported test binaries use the persistent target cache; per-target incremental
+# graphs and many concurrent link jobs can exhaust the builder's disk.
+ENV CARGO_INCREMENTAL=0
+ENV CARGO_BUILD_JOBS=4
+
 # Copy dependency metadata first for layer caching
 COPY Cargo.toml Cargo.lock ./
 COPY vendor/ ./vendor/
@@ -63,6 +68,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry
 # not invalidate the expensive workspace test build.
 COPY crates/ ./crates/
 COPY tests/fixtures/tls.rs ./tests/fixtures/tls.rs
+COPY tests/sqlx-session/src/ ./tests/sqlx-session/src/
+COPY scripts/prepare-file-evidence-upgrade.sql ./scripts/prepare-file-evidence-upgrade.sql
 COPY web/src/test/fixtures/form-requests.json ./web/src/test/fixtures/form-requests.json
 COPY web/src/test/fixtures/permission-grant-options.json ./web/src/test/fixtures/permission-grant-options.json
 COPY migrations/ ./migrations/

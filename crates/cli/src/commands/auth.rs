@@ -29,6 +29,10 @@ pub enum AuthCommands {
         /// Save credentials into a named profile (creates it if it doesn't exist)
         #[arg(long)]
         save_profile: Option<String>,
+
+        /// Print only the new access token to stdout after login (overrides output format)
+        #[arg(long)]
+        print_access_token: bool,
     },
     /// Log in using the OIDC Device Authorization Grant, without a local listener.
     SsoLogin {
@@ -39,6 +43,10 @@ pub enum AuthCommands {
         /// Save credentials into a named profile (creates it if it doesn't exist)
         #[arg(long)]
         save_profile: Option<String>,
+
+        /// Print only the new access token to stdout after login (overrides output format)
+        #[arg(long)]
+        print_access_token: bool,
 
         /// Maximum wait in seconds. Defaults to the provider's device-code lifetime.
         #[arg(long)]
@@ -209,6 +217,7 @@ pub async fn handle_auth_command(
             save_profile,
             timeout,
             no_browser,
+            print_access_token,
         } => {
             let effective_api_url = url.or_else(|| api_url.clone());
             handle_sso_login(
@@ -216,6 +225,7 @@ pub async fn handle_auth_command(
                 &effective_api_url,
                 timeout,
                 no_browser,
+                print_access_token,
                 output_format,
             )
             .await
@@ -225,6 +235,7 @@ pub async fn handle_auth_command(
             password,
             url,
             save_profile,
+            print_access_token,
         } => {
             // --url is a convenient alias for --api-url at login time
             let effective_api_url = url.or_else(|| api_url.clone());
@@ -233,6 +244,7 @@ pub async fn handle_auth_command(
                 password,
                 save_profile.as_ref().or(profile.as_ref()),
                 &effective_api_url,
+                print_access_token,
                 output_format,
             )
             .await
@@ -265,6 +277,7 @@ async fn handle_sso_login(
     api_url: &Option<String>,
     timeout: Option<u64>,
     no_browser: bool,
+    print_access_token: bool,
     output_format: OutputFormat,
 ) -> Result<()> {
     let mut config = CliConfig::load()?;
@@ -348,6 +361,11 @@ async fn handle_sso_login(
     p.auth_method = Some("sso".to_string());
     p.username = None;
     config.save()?;
+
+    if print_access_token {
+        println!("{}", tokens.access_token);
+        return Ok(());
+    }
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {
@@ -468,16 +486,23 @@ async fn poll_device_login(
 fn open_browser(url: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open").arg(url).spawn()?;
+        std::process::Command::new("open")
+            .arg(url)
+            .stdout(std::io::stderr())
+            .spawn()?;
     }
     #[cfg(target_os = "linux")]
     {
-        std::process::Command::new("xdg-open").arg(url).spawn()?;
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .stdout(std::io::stderr())
+            .spawn()?;
     }
     #[cfg(target_os = "windows")]
     {
         std::process::Command::new("explorer.exe")
             .arg(url)
+            .stdout(std::io::stderr())
             .spawn()?;
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -492,6 +517,7 @@ async fn handle_login(
     password: Option<String>,
     profile: Option<&String>,
     api_url: &Option<String>,
+    print_access_token: bool,
     output_format: OutputFormat,
 ) -> Result<()> {
     let mut config = CliConfig::load()?;
@@ -593,6 +619,11 @@ async fn handle_login(
     p.auth_method = Some(auth_method.to_string());
     p.username = Some(username);
     config.save()?;
+
+    if print_access_token {
+        println!("{}", response.access_token);
+        return Ok(());
+    }
 
     match output_format {
         OutputFormat::Json | OutputFormat::Yaml => {
@@ -946,6 +977,7 @@ async fn handle_refresh(
                         api_url,
                         None,  // use the device-code lifetime
                         false, // no_browser: open browser
+                        false, // Never disclose tokens during refresh fallback.
                         output_format,
                     )
                     .await
@@ -967,6 +999,7 @@ async fn handle_refresh(
                         None, // prompt for password
                         profile.as_ref(),
                         api_url,
+                        false, // Never disclose tokens during refresh fallback.
                         output_format,
                     )
                     .await

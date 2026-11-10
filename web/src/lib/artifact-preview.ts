@@ -1,3 +1,67 @@
+export const LOG_FINALIZING_MESSAGE =
+  "Log is still being finalized. Try again shortly.";
+export const LOG_INCOMPLETE_MESSAGE =
+  "Log is incomplete because delivery did not finish.";
+const CONTENT_UNAVAILABLE = "Content unavailable or access denied";
+
+class ArtifactDeliveryError extends Error {}
+
+export function artifactContentErrorMessage(error: unknown): string {
+  return error instanceof ArtifactDeliveryError
+    ? error.message
+    : CONTENT_UNAVAILABLE;
+}
+
+export function artifactStreamErrorMessage(data: string): string {
+  try {
+    const { code } = JSON.parse(data) as { code?: string };
+    if (code === "log_stream_incomplete") return LOG_INCOMPLETE_MESSAGE;
+  } catch {
+    /* Legacy and unknown frames remain generic. */
+  }
+  return CONTENT_UNAVAILABLE;
+}
+
+/** Only known delivery codes may become UI text. Never display arbitrary error bodies. */
+export async function artifactContentError(response: Response): Promise<Error> {
+  let code: unknown;
+  if (response.status === 409 && response.body) {
+    const reader = response.body.getReader();
+    let bytes = new Uint8Array(0);
+    try {
+      while (bytes.length <= 4096) {
+        const { value, done } = await reader.read();
+        if (done) {
+          code = (
+            JSON.parse(new TextDecoder().decode(bytes)) as { code?: unknown }
+          ).code;
+          break;
+        }
+        if (bytes.length + value.length > 4096) break;
+        const next = new Uint8Array(bytes.length + value.length);
+        next.set(bytes);
+        next.set(value, bytes.length);
+        bytes = next;
+      }
+    } catch {
+      /* Unknown or interrupted error bodies remain generic. */
+    } finally {
+      try {
+        await reader.cancel();
+      } finally {
+        reader.releaseLock();
+      }
+    }
+  } else {
+    await response.body?.cancel();
+  }
+  if (code === "LOG_FINALIZING")
+    return new ArtifactDeliveryError(LOG_FINALIZING_MESSAGE);
+  if (code === "LOG_INCOMPLETE")
+    return new ArtifactDeliveryError(LOG_INCOMPLETE_MESSAGE);
+  return new Error(`HTTP ${response.status}: ${response.statusText}`);
+}
+
 export const ARTIFACT_PREVIEW_BYTES = 64 * 1024;
 
 export async function readArtifactPreview(response: Response) {
@@ -9,8 +73,7 @@ export async function readArtifactPreview(response: Response) {
     return { text: "", truncated: false };
   }
   if (!response.ok) {
-    await response.body?.cancel();
-    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    throw await artifactContentError(response);
   }
   if (!response.body) return { text: "", truncated: false };
 

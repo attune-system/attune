@@ -970,7 +970,10 @@ async fn production_defaults_cross_ten_thousand_pins_and_persist_fast_continuati
         let progress = epoch_progress(db.pool()).await;
         if progress.pending {
             let delay = progress.next_attempt.unwrap() - progress.last_attempt.unwrap();
-            assert!(delay >= chrono::Duration::seconds(1) && delay < chrono::Duration::seconds(2));
+            assert!(
+                delay >= chrono::Duration::seconds(1) && delay < chrono::Duration::seconds(2),
+                "unexpected pending delay {delay:?}; progress={progress:?}; result={result:?}"
+            );
             assert!(result.backlog_pending() && !result.complete(), "{result:?}");
         }
         if epoch(&result).changed > 0 {
@@ -1698,5 +1701,235 @@ async fn release_retention_preserves_strict_cutoff_and_newest_inactive_id_ties()
         kept.iter().map(|release| release.id).collect::<Vec<_>>(),
         releases[3..]
     );
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn bounded_budget_jit_restores_on_commit_rollback_and_pool_reuse() {
+    let db = database().await;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(db.database_url())
+        .await
+        .unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    sqlx::query("SET jit=on").execute(&mut *conn).await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    for fail in [false, true] {
+        let mut tx = conn.begin().await.unwrap();
+        budget_entry(
+            &mut tx,
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        budget(
+            &mut tx,
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SHOW jit")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap(),
+            "off"
+        );
+        if fail {
+            assert!(sqlx::query("SELECT 1/0").execute(&mut *tx).await.is_err());
+            rollback(tx, Duration::from_secs(2)).await.unwrap();
+        } else {
+            tx.commit().await.unwrap();
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SHOW jit")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap(),
+            "on"
+        );
+    }
+    drop(conn);
+    let (reused_pid, jit): (i32, String) =
+        sqlx::query_as("SELECT pg_backend_pid(), current_setting('jit')")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(reused_pid, pid);
+    assert_eq!(jit, "on");
+    pool.close().await;
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn release_json_pins_match_reference_and_recheck_discovered_identities() {
+    use serde_json::json;
+    let db = database().await;
+    let ids = seed_inactive_releases(db.pool(), 10).await;
+    // Capture the exact production raw identity before installing pins. The
+    // authoritative DELETE must evaluate the new bindings, not discovery state.
+    let versions: Vec<String> =
+        sqlx::query_scalar("SELECT xmin::text FROM pack_release ORDER BY id")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    let mut tx = db.pool().begin().await.unwrap();
+    SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await
+        .unwrap();
+    for (entity, contract) in [
+        (
+            1_i64,
+            json!({"static_actions":{"direct":{"executable_snapshot":{"release":{"id":ids[0]}}}}}),
+        ),
+        (
+            2,
+            json!({"static_actions":{"outer":{"executable_snapshot":{"pack_executables":{"inner":{"release":{"id":ids[1]}}}}}}}),
+        ),
+        (3, json!({"static_actions":{}})),
+        (4, json!({})),
+    ] {
+        sqlx::query("INSERT INTO runtime_schema_binding(entity_kind,entity_id,contract,binding_digest) VALUES('execution',$1,$2,repeat('a',64))")
+            .bind(entity).bind(contract).execute(&mut *tx).await.unwrap();
+    }
+    sqlx::query("INSERT INTO sensor_generation_schema_binding(workload,generation,binding,binding_digest,config) VALUES(1,1,$1,repeat('b',64),'{}')")
+        .bind(json!({"executable":{"release":{"id":ids[2]}}})).execute(&mut *tx).await.unwrap();
+    let snapshot = |id| json!({"pack_executables":{"child":{"release":{"id":id}}}});
+    sqlx::query("INSERT INTO execution(action_ref,pack_release_digest,executable_snapshot) VALUES('test.action',repeat('c',64),$1)")
+        .bind(snapshot(ids[3])).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO enforcement(rule_ref,trigger_ref,payload,pack_release_digest,executable_snapshot) VALUES('test.rule','test.trigger','{}',repeat('c',64),$1)")
+        .bind(snapshot(ids[4])).execute(&mut *tx).await.unwrap();
+    let queue: i64 = sqlx::query_scalar("INSERT INTO work_queue(ref,label,dispatch_action_ref) VALUES('test.queue','Test','test.action') RETURNING id")
+        .fetch_one(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO work_queue_item(queue,queue_ref,payload,enqueue_source,pack_release_digest,executable_snapshot) VALUES($1,'test.queue','{}','test',repeat('c',64),$2)")
+        .bind(queue).bind(snapshot(ids[5])).execute(&mut *tx).await.unwrap();
+    // Independent oracle expands the complete JSON pin set once, rather than
+    // repeating the correlated production predicates for each release.
+    let expected: Vec<i64> = sqlx::query_scalar("WITH pins AS (
+        SELECT (child.value->'executable_snapshot'->'release'->>'id')::bigint AS id
+        FROM runtime_schema_binding b, LATERAL jsonb_each(COALESCE(b.contract->'static_actions','{}')) child
+        UNION SELECT (nested.value->'release'->>'id')::bigint
+        FROM runtime_schema_binding b, LATERAL jsonb_each(COALESCE(b.contract->'static_actions','{}')) child,
+          LATERAL jsonb_each(COALESCE(child.value->'executable_snapshot'->'pack_executables','{}')) nested
+        UNION SELECT (child.value->'release'->>'id')::bigint FROM (
+            SELECT executable_snapshot FROM execution UNION ALL SELECT executable_snapshot FROM enforcement
+            UNION ALL SELECT executable_snapshot FROM work_queue_item
+        ) snapshots, LATERAL jsonb_each(COALESCE(executable_snapshot->'pack_executables','{}')) child
+        UNION SELECT (binding->'executable'->'release'->>'id')::bigint FROM sensor_generation_schema_binding
+    ) SELECT r.id FROM pack_release r WHERE NOT EXISTS(SELECT 1 FROM pins WHERE pins.id=r.id) ORDER BY r.id")
+        .fetch_all(&mut *tx).await.unwrap();
+    assert_eq!(expected, ids[6..]);
+    let sql = GraphReclamationPhase::Releases.delete_sql(false, false);
+    sqlx::query("SAVEPOINT plan_probe")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let plan: serde_json::Value =
+        sqlx::query_scalar(&format!("EXPLAIN (ANALYZE, FORMAT JSON, TIMING OFF) {sql}"))
+            .bind(&ids)
+            .bind(&versions)
+            .bind(2_i64)
+            .bind(Utc::now())
+            .bind(0_i64)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    eprintln!(
+        "owned positive release fixture planning_ms={} execution_ms={}",
+        plan[0]["Planning Time"], plan[0]["Execution Time"]
+    );
+    sqlx::query("ROLLBACK TO SAVEPOINT plan_probe")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let removed = sqlx::query(&sql)
+        .bind(&ids)
+        .bind(&versions)
+        .bind(2_i64)
+        .bind(Utc::now())
+        .bind(0_i64)
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(removed.len(), 2, "delete allowance remains authoritative");
+    let remaining: Vec<i64> = sqlx::query_scalar("SELECT id FROM pack_release ORDER BY id")
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(
+        remaining,
+        [ids[..6].to_vec(), expected[2..].to_vec()].concat()
+    );
+    tx.commit().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn policy_revision_survivors_preserve_newest_release_and_optional_queue_pin() {
+    let db = database().await;
+    let releases = seed_inactive_releases(db.pool(), 3).await;
+    let mut tx = db.pool().begin().await.unwrap();
+    SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await
+        .unwrap();
+    let policies: Vec<i64> = sqlx::query_scalar(
+        "INSERT INTO pack_runtime_policy_revision(pack,release,policy,policy_digest)
+         SELECT pack,id,'{}',repeat('a',64) FROM pack_release ORDER BY id RETURNING id",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(policies.len(), releases.len());
+    let versions: Vec<String> =
+        sqlx::query_scalar("SELECT xmin::text FROM pack_runtime_policy_revision ORDER BY id")
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+    for queue_pin in [false, true] {
+        sqlx::query("SAVEPOINT policy_probe")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        if queue_pin {
+            let queue: i64 = sqlx::query_scalar("INSERT INTO work_queue(ref,label,dispatch_action_ref) VALUES('policy.pin','Policy pin','test.action') RETURNING id")
+                .fetch_one(&mut *tx).await.unwrap();
+            let item: i64 = sqlx::query_scalar("INSERT INTO work_queue_item(queue,queue_ref,payload,enqueue_source) VALUES($1,'policy.pin','{}','test') RETURNING id")
+                .bind(queue).fetch_one(&mut *tx).await.unwrap();
+            sqlx::query("INSERT INTO work_queue_item_runtime_admission(item,policy_revision,authority,authority_digest) VALUES($1,$2,'{}',repeat('b',64))")
+                .bind(item).bind(policies[1]).execute(&mut *tx).await.unwrap();
+        }
+        let removed =
+            sqlx::query(&GraphReclamationPhase::PolicyRevisions.delete_sql(false, queue_pin))
+                .bind(&policies)
+                .bind(&versions)
+                .bind(10_i64)
+                .bind(Utc::now())
+                .bind(1_i64)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!(removed.rows_affected(), if queue_pin { 1 } else { 2 });
+        let remaining: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM pack_runtime_policy_revision ORDER BY id")
+                .fetch_all(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!(remaining, policies[if queue_pin { 1 } else { 2 }..]);
+        sqlx::query("ROLLBACK TO SAVEPOINT policy_probe")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("RELEASE SAVEPOINT policy_probe")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+    tx.rollback().await.unwrap();
     db.cleanup().await.unwrap();
 }

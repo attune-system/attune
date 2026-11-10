@@ -578,6 +578,22 @@ impl SensorSchemaRepository {
         Ok(Some((binding, config)))
     }
 
+    /// Source stage of a short log close transaction, after assignment/generation
+    /// protection and before artifact/version/stream locks. Missing legacy rows
+    /// stay missing; this never creates metadata or a log evidence owner.
+    pub async fn lock_log_source(
+        connection: &mut PgConnection,
+        workload: i64,
+        generation: i64,
+        version: i64,
+    ) -> Result<()> {
+        sqlx::query("SELECT id FROM sensor_generation_schema_binding WHERE workload=$1 AND generation=$2 FOR SHARE")
+            .bind(workload).bind(generation).execute(&mut *connection).await?;
+        sqlx::query("SELECT artifact_version FROM sensor_log_generation_binding WHERE artifact_version=$1 FOR SHARE")
+            .bind(version).execute(connection).await?;
+        Ok(())
+    }
+
     pub async fn find_log_generation<'e, E>(
         executor: E,
         artifact_version: i64,

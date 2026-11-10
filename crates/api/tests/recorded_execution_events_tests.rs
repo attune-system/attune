@@ -24,6 +24,8 @@ mod c_native_socket;
 mod c_native_transport;
 #[path = "recorded_execution_events_tests/c_recorded_key_classification.rs"]
 mod c_recorded_key_classification;
+#[path = "../../../tests/sqlx-session/src/commit_relay.rs"]
+mod commit_relay;
 mod helpers;
 #[cfg(unix)]
 #[path = "recorded_execution_events_tests/http_handoff.rs"]

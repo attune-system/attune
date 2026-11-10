@@ -4565,3 +4565,185 @@ async fn delegated_authority_enforcement_selection_retains_match_time_owner_and_
     tx.rollback().await.unwrap();
     db.cleanup().await.unwrap();
 }
+
+#[tokio::test]
+async fn staged_native_log_source_roundtrip_terminal_and_disappearance() {
+    use attune_common::repositories::{
+        delegated_execution::{DelegatedExecutionRepository as Delegated, LogProducerBinding},
+        execution::UpdateExecutionInput,
+        workflow::{CreateWorkflowExecutionInput, WorkflowExecutionRepository},
+    };
+    let (db, snapshot, _, human) = fixture().await;
+    let mut tx = db.begin().await.unwrap();
+    let execution =
+        delegated_fixture_execution(&mut tx, &snapshot, human, vec!["standard".into()], None).await;
+    Delegated::select(&mut tx, execution.id, None)
+        .await
+        .unwrap();
+    let workflow = WorkflowExecutionRepository::create(
+        &mut *tx,
+        CreateWorkflowExecutionInput {
+            execution: execution.id,
+            workflow_def: snapshot.executable.workflow_definition.as_ref().unwrap().id,
+            task_graph: json!({}),
+            variables: json!({}),
+            status: ExecutionStatus::Running,
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let mut tx = db.begin().await.unwrap();
+    attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_capture(&mut tx).await.unwrap();
+    let historical = Delegated::lock_log_producer(&mut tx, execution.id, None)
+        .await
+        .unwrap();
+    assert!(
+        matches!(historical, LogProducerBinding::Workflow { workflow: id, .. } if id == workflow.id)
+    );
+    tx.commit().await.unwrap();
+    // Lock release and ordinary completion are independent of historical data.
+    let mut writer = db.begin().await.unwrap();
+    sqlx::query("SELECT id FROM workflow_execution WHERE id=$1 FOR UPDATE NOWAIT")
+        .bind(workflow.id)
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    ExecutionRepository::update(
+        &mut *writer,
+        execution.id,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Completed),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    writer.commit().await.unwrap();
+    let mut tx = db.begin().await.unwrap();
+    assert_eq!(
+        Delegated::lock_log_producer(&mut tx, execution.id, None)
+            .await
+            .unwrap(),
+        historical
+    );
+    tx.commit().await.unwrap();
+    sqlx::query("DELETE FROM workflow_execution WHERE id=$1")
+        .bind(workflow.id)
+        .execute(&*db)
+        .await
+        .unwrap();
+    let mut tx = db.begin().await.unwrap();
+    assert!(Delegated::lock_log_producer(&mut tx, execution.id, None)
+        .await
+        .is_err());
+    tx.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn staged_worker_log_source_replacement_attempt_is_distinct_and_missing_denies() {
+    use attune_common::{
+        models::{WorkerStatus, WorkerType},
+        repositories::{
+            delegated_execution::DelegatedExecutionRepository as Delegated,
+            execution::UpdateExecutionInput,
+            runtime::{CreateWorkerInput, WorkerRepository},
+        },
+    };
+    let (db, mut snapshot, _, human) = fixture().await;
+    snapshot.executable = snapshot
+        .pack_executables
+        .values()
+        .find(|p| p.executable.action.workflow_def.is_none())
+        .unwrap()
+        .executable
+        .clone();
+    let mut tx = db.begin().await.unwrap();
+    let execution = delegated_fixture_execution(&mut tx, &snapshot, human, vec![], None).await;
+    Delegated::select(&mut tx, execution.id, None)
+        .await
+        .unwrap();
+    let worker = WorkerRepository::create(
+        &mut *tx,
+        CreateWorkerInput {
+            name: "staged-worker".into(),
+            worker_type: WorkerType::Local,
+            runtime: None,
+            host: None,
+            port: None,
+            status: Some(WorkerStatus::Active),
+            capabilities: None,
+            meta: None,
+        },
+    )
+    .await
+    .unwrap();
+    ExecutionRepository::update(
+        &mut *tx,
+        execution.id,
+        UpdateExecutionInput {
+            worker: Some(worker.id),
+            status: Some(ExecutionStatus::Scheduled),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    Delegated::start(&mut tx, execution.id, worker.id)
+        .await
+        .unwrap();
+    ExecutionRepository::update(
+        &mut *tx,
+        execution.id,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Running),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let mut tx = db.begin().await.unwrap();
+    let historical = Delegated::lock_log_producer(&mut tx, execution.id, Some(worker.id))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    // Deliberate source-replacement fixture: production helpers never recreate
+    // missing attempts. A new current nonce must not match historical authority.
+    let mut replacement = db.begin().await.unwrap();
+    sqlx::query("DELETE FROM delegated_execution_attempt WHERE execution=$1")
+        .bind(execution.id)
+        .execute(&mut *replacement)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO delegated_execution_attempt(execution,attempt,worker) VALUES($1,$2,$3)",
+    )
+    .bind(execution.id)
+    .bind(uuid::Uuid::new_v4())
+    .bind(worker.id)
+    .execute(&mut *replacement)
+    .await
+    .unwrap();
+    replacement.commit().await.unwrap();
+    let mut tx = db.begin().await.unwrap();
+    let current = Delegated::lock_log_producer(&mut tx, execution.id, Some(worker.id))
+        .await
+        .unwrap();
+    assert_ne!(current, historical);
+    tx.commit().await.unwrap();
+    sqlx::query("DELETE FROM delegated_execution_attempt WHERE execution=$1")
+        .bind(execution.id)
+        .execute(&*db)
+        .await
+        .unwrap();
+    let mut tx = db.begin().await.unwrap();
+    assert!(
+        Delegated::lock_log_producer(&mut tx, execution.id, Some(worker.id))
+            .await
+            .is_err()
+    );
+    tx.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}

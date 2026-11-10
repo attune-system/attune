@@ -204,8 +204,8 @@ fn record_runtime_log_capture(
     }
     // Allocation evidence proves whether bytes arrived independently of bounded
     // captures and parsed structured output.
-    let state = |allocated: Option<bool>| {
-        if result.logs_incomplete {
+    let state = |allocated: Option<bool>, incomplete: bool| {
+        if incomplete {
             "incomplete"
         } else {
             match allocated {
@@ -216,8 +216,8 @@ fn record_runtime_log_capture(
         }
     };
     result_data["runtime_log_capture"] = serde_json::json!({
-        "stdout": state(allocation.map(|(stdout, _)| stdout)),
-        "stderr": state(allocation.map(|(_, stderr)| stderr)),
+        "stdout": state(allocation.map(|(stdout, _)| stdout), result.log_capture_incomplete.map(|(stdout,_)|stdout).unwrap_or(result.logs_incomplete)),
+        "stderr": state(allocation.map(|(_, stderr)| stderr), result.log_capture_incomplete.map(|(_,stderr)|stderr).unwrap_or(result.logs_incomplete)),
     });
     if result.logs_incomplete {
         result_data["logs_incomplete"] = serde_json::json!(true);
@@ -1727,6 +1727,7 @@ impl ActionExecutor {
                                 transport,
                                 version,
                                 file_path.clone(),
+                                config,
                             ),
                             max_bytes,
                             is_stdout,
@@ -2664,6 +2665,10 @@ mod tests {
         record_runtime_log_capture(&mut metadata, &result, Some((false, false)));
         assert_eq!(metadata["runtime_log_capture"]["stdout"], "incomplete");
         assert_eq!(metadata["runtime_log_capture"]["stderr"], "incomplete");
+        result.log_capture_incomplete = Some((true, false));
+        record_runtime_log_capture(&mut metadata, &result, Some((true, false)));
+        assert_eq!(metadata["runtime_log_capture"]["stdout"], "incomplete");
+        assert_eq!(metadata["runtime_log_capture"]["stderr"], "empty");
     }
 
     #[tokio::test]

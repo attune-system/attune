@@ -3142,6 +3142,9 @@ pub async fn stream_execution_log(
                             let (terminal_since, expired) =
                                 advance_terminal_grace(terminal, terminal_since, now);
                             if expired {
+                                stream_state
+                                    .execution_log_streams
+                                    .record_log_unavailable(true);
                                 return Some((
                                     Ok(execution_log_error_event(
                                         "log_stream_incomplete",
