@@ -263,6 +263,7 @@ struct Harness {
     worker_id: i64,
     execution_identity: i64,
     execution_refs: Vec<String>,
+    secret_stdout: bool,
     jwt: JwtConfig,
 }
 
@@ -381,6 +382,7 @@ impl Harness {
             worker_id: worker.id,
             execution_identity,
             execution_refs: vec!["standard".into()],
+            secret_stdout: false,
             jwt,
         })
     }
@@ -450,6 +452,21 @@ impl Harness {
                 let pack = helpers::create_test_pack(pool, pack_ref).await?;
                 let action =
                     helpers::create_test_action(pool, pack.id, pack_ref, action_ref).await?;
+                if self.secret_stdout {
+                    use attune_common::repositories::action::UpdateActionInput;
+                    ActionRepository::update(
+                        pool,
+                        action.id,
+                        UpdateActionInput {
+                            output_policy: Some(attune_common::output_policy::OutputPolicy {
+                                stdout: Some(attune_common::output_policy::StdoutPolicy::Secret),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                }
                 helpers::activate_test_pack_release_with_projections(
                     pool,
                     &pack,
@@ -544,7 +561,7 @@ impl Harness {
             backend,
             "text/plain".to_string(),
             Some(execution_id),
-            None,
+            Some(serde_json::json!({"stream":"stdout"})),
             Some("replica-test".to_string()),
         )
         .await?;
@@ -624,9 +641,8 @@ impl Harness {
     }
 }
 
-// Opaque workload output requires the complete frozen read ceiling, even
-// before any Key is fetched. Limit this audience to the producing action/pack
-// and execution read/decrypt to the single row.
+// Scope the fixture audience to the producing action/pack and this execution.
+// Explicitly protected channels also enforce their recorded source origins.
 fn log_reader_grants(execution: i64, action: &str) -> serde_json::Value {
     let pack = action.split_once('.').unwrap().0;
     serde_json::json!([
@@ -1084,6 +1100,7 @@ async fn object_artifact_stream_rechecks_recorded_key_authority_between_frames()
     )
     .await?;
     harness.execution_refs.push(origin_grant.r#ref);
+    harness.secret_stdout = true;
     let fixture = harness.fixture(LogStreamBackend::ObjectSegments).await?;
     let provenance = SecretProvenance::key(attune_common::key_access::key_origin(&key));
     let secrets = prepare_secret_values(
