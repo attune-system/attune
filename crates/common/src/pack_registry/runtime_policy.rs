@@ -1168,6 +1168,7 @@ mod tests {
                 "accesses_mcp": false, "default_execution_permission_set_refs": defaults,
                 "reference_visibility": "public", "reference_allowed_pack_refs": [],
                 "parameter_delivery": "stdin", "parameter_format": "json", "output_format": "text",
+                "output_policy": {},
                 "created": "2026-10-21T00:00:00Z", "updated": "2026-10-21T00:00:00Z"
             }}
         }))
