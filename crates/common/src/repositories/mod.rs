@@ -119,6 +119,7 @@ pub mod runtime_target;
 mod runtime_target_binding;
 pub mod runtime_version;
 mod schema_consumer;
+pub(crate) use schema_consumer::validate_output_policy as validate_action_output_policy;
 pub mod schema_contract;
 pub mod schema_type;
 pub mod sensor_admission;
@@ -524,3 +525,5 @@ mod tests {
     }
 }
 pub mod iam_ownership;
+
+pub mod work_queue_output;

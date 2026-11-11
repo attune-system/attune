@@ -67,6 +67,7 @@ const INITIAL_STATE: WorkflowBuilderState = {
   referenceAllowedPackRefs: [],
   parameters: {},
   output: {},
+  outputPolicy: {},
   outputMap: {},
   vars: {},
   tasks: [],
@@ -192,6 +193,7 @@ export default function WorkflowBuilderPage() {
         action?.reference_visibility ?? "public";
       builderState.referenceAllowedPackRefs =
         action?.reference_allowed_pack_refs ?? [];
+      builderState.outputPolicy = { ...action?.output_policy };
       setState(builderState);
       setInitialized(true);
       setJustInitialized(true);
@@ -540,6 +542,7 @@ export default function WorkflowBuilderPage() {
                 : undefined,
             out_schema:
               Object.keys(state.output).length > 0 ? state.output : undefined,
+            output_policy: state.outputPolicy ?? {},
             tags: state.tags.length > 0 ? state.tags : undefined,
           },
         });
@@ -562,6 +565,7 @@ export default function WorkflowBuilderPage() {
               : undefined,
           out_schema:
             Object.keys(state.output).length > 0 ? state.output : undefined,
+          output_policy: state.outputPolicy ?? {},
           tags: state.tags.length > 0 ? state.tags : undefined,
         };
         try {
@@ -1047,6 +1051,10 @@ export default function WorkflowBuilderPage() {
                   parameters={state.parameters}
                   output={state.output}
                   outputMap={state.outputMap}
+                  outputPolicy={state.outputPolicy ?? {}}
+                  onOutputPolicyChange={(outputPolicy) =>
+                    updateMetadata({ outputPolicy })
+                  }
                   onLabelChange={(label) => updateMetadata({ label })}
                   onVersionChange={(version) => updateMetadata({ version })}
                   onDescriptionChange={(description) =>

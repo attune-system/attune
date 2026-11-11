@@ -502,6 +502,16 @@ impl CompletionListener {
                 Self::apply_retry_limit(requested_status, leased_item.attempt_count, retry_limit);
             let ack_summary = Self::ack_summary_json(ack_item, new_status);
             let last_error = Self::ack_item_error_json(ack_item, new_status, retry_limit);
+            let ack_index = queue_ack
+                .items
+                .iter()
+                .position(|item| item.id == leased_item.id)
+                .expect("validated acknowledgement index is present");
+            let protected_output = attune_common::repositories::work_queue_output::WorkQueueOutputRepository::prepare_item_metadata(
+                &mut tx,execution.id,ack_index,new_status,ack_summary,last_error,encryption_key,
+            ).await?;
+            let ack_summary = protected_output.summary.clone();
+            let last_error = protected_output.error.clone();
 
             let updated_item = WorkQueueItemRepository::update_if_statuses(
                 &mut *tx,
@@ -529,6 +539,9 @@ impl CompletionListener {
                     dispatch.id
                 ));
             }
+            attune_common::repositories::work_queue_output::WorkQueueOutputRepository::persist_item_metadata(
+                &mut tx,leased_item.id,&protected_output,
+            ).await?;
         }
 
         WorkQueueDispatchRepository::update(

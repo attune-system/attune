@@ -64,6 +64,8 @@ async fn create_action(
     Ok(ActionRepository::create(
         pool,
         CreateActionInput {
+            output_policy: Default::default(),
+            output_format: Default::default(),
             r#ref: format!("{}.{}", pack.r#ref, suffix),
             pack: pack.id,
             pack_ref: pack.r#ref.clone(),

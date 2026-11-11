@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use attune_common::{
     event_schema::EventSchemaBinding,
+    output_classification::ENTITY_EXECUTION_OUTPUT_CHANNEL,
     rbac::Grant,
     repositories::{
         component_configuration::{
@@ -48,6 +49,7 @@ mod frozen_parent_tests {
         for kind in [
             ENTITY_EXECUTION_CONFIG,
             ENTITY_EXECUTION_RESULT,
+            ENTITY_EXECUTION_OUTPUT_CHANNEL,
             "workflow_variables",
         ] {
             assert!(supported_entity(kind));
@@ -212,7 +214,10 @@ impl DisclosureRecords {
             .filter(|(kind, _, _)| {
                 matches!(
                     kind.as_str(),
-                    ENTITY_EXECUTION_CONFIG | ENTITY_EXECUTION_RESULT | "workflow_variables"
+                    ENTITY_EXECUTION_CONFIG
+                        | ENTITY_EXECUTION_RESULT
+                        | ENTITY_EXECUTION_OUTPUT_CHANNEL
+                        | "workflow_variables"
                 )
             })
             .map(|(_, id, _)| *id)
@@ -248,6 +253,7 @@ impl DisclosureRecords {
             for kind in [
                 ENTITY_EXECUTION_CONFIG,
                 ENTITY_EXECUTION_RESULT,
+                ENTITY_EXECUTION_OUTPUT_CHANNEL,
                 "workflow_variables",
             ] {
                 self.provenance.entry((kind.into(), *id)).or_default();
@@ -571,7 +577,10 @@ impl DisclosureRecords {
                 }
                 if matches!(
                     kind.as_str(),
-                    ENTITY_EXECUTION_CONFIG | ENTITY_EXECUTION_RESULT | "workflow_variables"
+                    ENTITY_EXECUTION_CONFIG
+                        | ENTITY_EXECUTION_RESULT
+                        | ENTITY_EXECUTION_OUTPUT_CHANNEL
+                        | "workflow_variables"
                 ) {
                     execution_ids.push(*id);
                 }
@@ -581,7 +590,10 @@ impl DisclosureRecords {
             for (kind, mut ids) in by_kind {
                 if matches!(
                     kind.as_str(),
-                    ENTITY_EXECUTION_CONFIG | ENTITY_EXECUTION_RESULT | "workflow_variables"
+                    ENTITY_EXECUTION_CONFIG
+                        | ENTITY_EXECUTION_RESULT
+                        | ENTITY_EXECUTION_OUTPUT_CHANNEL
+                        | "workflow_variables"
                 ) {
                     continue;
                 }
@@ -663,6 +675,7 @@ impl DisclosureRecords {
                 [
                     ENTITY_EXECUTION_CONFIG,
                     ENTITY_EXECUTION_RESULT,
+                    ENTITY_EXECUTION_OUTPUT_CHANNEL,
                     "workflow_variables",
                 ]
                 .iter()
@@ -677,6 +690,7 @@ impl DisclosureRecords {
                 &[
                     ENTITY_EXECUTION_CONFIG,
                     ENTITY_EXECUTION_RESULT,
+                    ENTITY_EXECUTION_OUTPUT_CHANNEL,
                     "workflow_variables",
                 ],
                 batch,
@@ -1107,6 +1121,7 @@ fn supported_entity(kind: &str) -> bool {
             | attune_common::repositories::event_origin::EVENT_SOURCE_CONFIG
             | attune_common::repositories::runtime_read::ENTITY_RUNTIME_READ
             | ENTITY_EXECUTION_RESULT
+            | ENTITY_EXECUTION_OUTPUT_CHANNEL
             | "workflow_variables"
             | ENTITY_INQUIRY_OPTIONS
             | ENTITY_INQUIRY_RESPONSE

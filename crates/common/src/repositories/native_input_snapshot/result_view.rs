@@ -1,6 +1,13 @@
 //! Genuine persisted-child result observations. No caller data, aliases or
 //! pointer assertions can construct this finite native projection.
 use super::*;
+use std::collections::BTreeSet;
+
+type ApprovalAvailabilityRow = (
+    Id,
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -30,6 +37,16 @@ impl NativeResultPointerMapping {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct ResultFieldDisclosure {
+    pub(super) path: String,
+    pub(super) parents: Vec<(Id, InputSite)>,
+    pub(super) origins: Vec<SecretOrigin>,
+    pub(super) contributors: Vec<super::super::accepted_input::AcceptedContributorManifest>,
+    pub(super) deadline: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ResultViewSource {
     pub(super) execution: Id,
     pub(super) admission: Id,
@@ -44,8 +61,12 @@ pub(super) struct ResultViewSource {
     pub(super) version: Value,
     pub(super) contract: Option<Value>,
     pub(super) contract_kind: NativeResultContractKind,
+    pub(super) output_policy: crate::output_policy::ResolvedOutputPolicy,
+    pub(super) channel_fields: Vec<ArchivedField>,
     pub(super) binding_digest: String,
     pub(super) fields: Vec<ArchivedField>,
+    pub(super) field_disclosures: Vec<ResultFieldDisclosure>,
+    unavailable_fields: BTreeSet<String>,
     pub(super) contributors: Vec<super::super::accepted_input::AcceptedContributorManifest>,
     pub(super) parents: Vec<(Id, InputSite)>,
     pub(super) origins: Vec<SecretOrigin>,
@@ -61,8 +82,23 @@ pub(super) fn convert_encryption_metadata(
         contributor.validate()?;
     }
     super::encryption_conversion::fields(&mut source.fields, conversion)?;
+    super::encryption_conversion::fields(&mut source.channel_fields, conversion)?;
+    source.version["channel_ciphertext_digest"] =
+        json!(hash(&serde_json::to_value(&source.channel_fields)?)?);
     source.version["ciphertext_digest"] = json!(hash(&serde_json::to_value(&source.fields)?)?);
     validate_storage(source)
+}
+
+/// Private selection guard copied only from an authenticated prepared view.
+pub(crate) struct NativeResultSelectionGuard {
+    task: String,
+    mappings: Vec<NativeResultPointerMapping>,
+    unavailable: BTreeSet<String>,
+}
+impl NativeResultSelectionGuard {
+    pub(crate) fn allows(&self, path: &str) -> bool {
+        available_selection_path(&self.task, &self.mappings, &self.unavailable, path).is_some()
+    }
 }
 
 pub struct PreparedNativeResultView {
@@ -76,6 +112,13 @@ pub struct PreparedNativeResultView {
     pub(super) archived: bool,
 }
 impl PreparedNativeResultView {
+    pub(crate) fn selection_guard(&self) -> NativeResultSelectionGuard {
+        NativeResultSelectionGuard {
+            task: self.source.task_name.clone(),
+            mappings: self.source.mappings.clone(),
+            unavailable: self.source.unavailable_fields.clone(),
+        }
+    }
     pub fn snapshot(&self) -> Id {
         self.snapshot
     }
@@ -245,7 +288,7 @@ impl NativeInputSnapshotRepository {
         let admission = RuntimeAuthorityRepository::execution_admission(conn, child)
             .await?
             .ok_or_else(denied)?;
-        let mut fence = RuntimeAuthorityRepository::retained_admission_fence(conn, record.id)
+        let fence = RuntimeAuthorityRepository::retained_admission_fence(conn, record.id)
             .await?
             .intersect(
                 &RuntimeAuthorityRepository::retained_admission_fence(conn, admission.id).await?,
@@ -281,24 +324,22 @@ impl NativeInputSnapshotRepository {
                 format: executable.executable.action.output_format,
             }
         };
-        sqlx::query("SELECT id FROM execution_secret_value WHERE entity_type='execution_result' AND entity_id=$1 ORDER BY json_path FOR SHARE").bind(child).fetch_all(&mut *conn).await?;
+        sqlx::query("SELECT id FROM execution_secret_value WHERE entity_type IN ('execution_result','execution_output_channel') AND entity_id=$1 ORDER BY entity_type,json_path FOR SHARE").bind(child).fetch_all(&mut *conn).await?;
         let fields = load_fields(conn, "execution_result", child).await?;
-        validate_field_paths(&raw, &fields)?;
+        let channel_fields = load_fields(conn, "execution_output_channel", child).await?;
+        validate_output_fields(&raw, &fields, &channel_fields, child)?;
         let restored = crate::secret_values::restore_secret_values(
             raw.clone(),
             &fields.iter().map(ArchivedField::stored).collect::<Vec<_>>(),
             key,
         )?;
-        if !crate::secret_values::redacted_paths(&restored).is_empty() {
-            return Err(denied());
-        }
-        let mut parents = Vec::new();
-        let mut origins = vec![SecretOrigin::Entity {
+        require_only_channel_markers(&restored, child)?;
+        let parents = Vec::new();
+        let origins = vec![SecretOrigin::Entity {
             entity_type: "execution_result".into(),
             entity_id: child,
             path: String::new(),
         }];
-        let mut ordinary = Vec::new();
         let schema_sources = schema_sources(&restored, &contract, contract_kind, child)?;
         if schema_sources.iter().any(|(path, _)| {
             !fields.iter().any(|field| {
@@ -311,88 +352,33 @@ impl NativeInputSnapshotRepository {
         }) {
             return Err(denied());
         }
+        let mut field_disclosures = Vec::new();
+        let mut unavailable_fields = BTreeSet::new();
+        let mut available_value = raw.clone();
         for field in &fields {
-            let mut value_source = false;
             let provenance = field.provenance()?;
             if provenance.origins.is_empty() {
                 return Err(denied());
             }
-            for origin in provenance.origins {
-                if super::super::immutable_input_origin::is_input_receipt(&origin) {
-                    let parent =
-                        InheritedInputRepository::receipt_source_site(conn, &origin).await?;
-                    let context =
-                        InheritedInputRepository::receipt_context(conn, &parent.1, &origin, key)
-                            .await?;
-                    let original_path = if parent.1.execution == child
-                        && parent.1.kind
-                            == super::super::inherited_input::InputEntityKind::ExecutionResult
-                        && covers(&field.json_path, &parent.1.path)
-                    {
-                        &parent.1.path
-                    } else {
-                        &field.json_path
-                    };
-                    if parent.1.purpose == InputSitePurpose::Value
-                        && Some(context.accepted_value()) != restored.pointer(original_path)
-                    {
-                        return Err(denied());
-                    }
-                    value_source |= parent.1.purpose == InputSitePurpose::Value;
-                    fence = fence.intersect(context.accepted_fence());
-                    if !parents.contains(&parent) {
-                        parents.push(parent);
-                    }
-                } else if schema_sources.iter().any(|(path, origins)| {
-                    covers(&field.json_path, path) && origins.contains(&origin)
-                }) {
-                    // Canonical schema redaction, including the producer's
-                    // protected whole-result fallback for an invalid output.
-                    value_source = true;
-                } else {
-                    if matches!(origin, SecretOrigin::Local { .. }) {
-                        return Err(denied());
-                    }
-                    ordinary.push(origin.clone());
-                    value_source = true;
-                }
-                if !origins.contains(&origin) {
-                    origins.push(origin);
-                }
+            if !field_sources_available(conn, child, &provenance.origins, true).await? {
+                unavailable_fields.insert(field.json_path.clone());
+                continue;
             }
-            if !value_source {
-                return Err(denied());
-            }
+            let disclosure =
+                prepare_field_disclosure(conn, child, field, &restored, &schema_sources, key)
+                    .await?;
+            available_value = crate::secret_values::restore_secret_values(
+                available_value,
+                &[field.stored()],
+                key,
+            )?;
+            field_disclosures.push(disclosure);
         }
-        for control in
-            super::super::accepted_input::AcceptedInputRepository::prepare_public_source_controls(
-                conn, child, key,
-            )
-            .await?
-        {
-            fence = fence.intersect(control.accepted_fence());
-            let parent =
-                InheritedInputRepository::receipt_source_site(conn, &control.origin()).await?;
-            if !parents.contains(&parent) {
-                parents.push(parent);
-            }
-        }
-        let contributors = if ordinary.is_empty() {
-            vec![]
-        } else {
-            let (authorities, manifests) =
-                super::super::accepted_input::AcceptedInputRepository::source_contributors(
-                    conn, child,
-                )
-                .await?;
-            super::super::immutable_input_origin::ImmutableInputOriginRepository::require(
-                conn,
-                &authorities,
-                &ordinary,
-            )
-            .await?;
-            manifests
-        };
+        // A completed producer's input CONTROL receipts authorized its earlier
+        // invocation, not observation of its author-classified public output.
+        // The consuming execution/outcome authority remains checked above;
+        // selected protected fields carry their own exact receipt guards.
+        let contributors = Vec::new();
         let resolved = RuntimeTargetRepository::resolve(
             conn,
             RuntimeTarget::Execution(child),
@@ -400,12 +386,19 @@ impl NativeInputSnapshotRepository {
         )
         .await?
         .ok_or_else(denied)?;
-        let (value, mappings) = project(&restored)?;
+        let (value, mappings) = project(&available_value)?;
         let mut version:Value=sqlx::query_scalar("SELECT jsonb_build_object('updated',updated,'status',status,'workflow_task',workflow_task) FROM execution WHERE id=$1").bind(child).fetch_one(&mut *conn).await?;
         version["projection_digest"] = json!(hash(&raw)?);
         version["ciphertext_digest"] = json!(hash(&serde_json::to_value(&fields)?)?);
         version["contract_digest"] = json!(contract.as_ref().map(hash).transpose()?);
         version["contract_kind"] = serde_json::to_value(contract_kind)?;
+        version["output_policy"] = serde_json::to_value(binding.output_policy)?;
+        version["field_disclosures_digest"] = json!(hash(&serde_json::to_value((
+            &field_disclosures,
+            &unavailable_fields
+        ))?)?);
+        version["channel_ciphertext_digest"] =
+            json!(hash(&serde_json::to_value(&channel_fields)?)?);
         let source = ResultViewSource {
             execution: child,
             admission: admission.id,
@@ -423,8 +416,12 @@ impl NativeInputSnapshotRepository {
             version,
             contract,
             contract_kind,
+            output_policy: binding.output_policy,
+            channel_fields,
             binding_digest: hash(&serde_json::to_value(&binding)?)?,
             fields,
+            field_disclosures,
+            unavailable_fields,
             contributors,
             parents,
             origins,
@@ -452,7 +449,12 @@ impl NativeInputSnapshotRepository {
             source: Source::ResultView(source.clone()),
         };
         let snapshot = save(conn, &body, &value, key).await?;
-        for (receipt, _) in &source.parents {
+        for (receipt, _) in source.parents.iter().chain(
+            source
+                .field_disclosures
+                .iter()
+                .flat_map(|field| field.parents.iter()),
+        ) {
             sqlx::query("INSERT INTO runtime_native_input_snapshot_parent(snapshot,receipt) VALUES($1,$2) ON CONFLICT DO NOTHING").bind(snapshot).bind(receipt).execute(&mut *conn).await?;
         }
         sqlx::query(
@@ -561,14 +563,321 @@ fn require_legacy_publish_success(task: &Value, version: &Value) -> Result<()> {
     Ok(())
 }
 
+async fn prepare_field_disclosure(
+    conn: &mut PgConnection,
+    child: Id,
+    field: &ArchivedField,
+    restored: &Value,
+    schema_sources: &[(String, Vec<SecretOrigin>)],
+    key: &str,
+) -> Result<ResultFieldDisclosure> {
+    let provenance = field.provenance()?;
+    let mut parents = Vec::new();
+    let mut origins = Vec::new();
+    let mut ordinary = Vec::new();
+    let mut fence = ApprovalEffectFence::from_input_approval(None)?;
+    let mut value_source = false;
+    if provenance.origins.is_empty() {
+        return Err(denied());
+    }
+    for origin in provenance.origins {
+        if super::super::immutable_input_origin::is_input_receipt(&origin) {
+            let parent = InheritedInputRepository::receipt_source_site(conn, &origin).await?;
+            let context =
+                InheritedInputRepository::receipt_context(conn, &parent.1, &origin, key).await?;
+            let original_path = if parent.1.execution == child
+                && parent.1.kind == super::super::inherited_input::InputEntityKind::ExecutionResult
+                && covers(&field.json_path, &parent.1.path)
+            {
+                &parent.1.path
+            } else {
+                &field.json_path
+            };
+            if parent.1.purpose == InputSitePurpose::Value
+                && Some(context.accepted_value()) != restored.pointer(original_path)
+            {
+                return Err(denied());
+            }
+            value_source |= parent.1.purpose == InputSitePurpose::Value;
+            fence = fence.intersect(context.accepted_fence());
+            if !parents.contains(&parent) {
+                parents.push(parent);
+            }
+        } else if schema_sources
+            .iter()
+            .any(|(path, origins)| covers(&field.json_path, path) && origins.contains(&origin))
+        {
+            // Canonical schema redaction, including the producer's
+            // protected whole-result fallback for an invalid output.
+            value_source = true;
+        } else {
+            if matches!(origin, SecretOrigin::Local { .. }) {
+                return Err(denied());
+            }
+            ordinary.push(origin.clone());
+            value_source = true;
+        }
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    }
+    if !value_source {
+        return Err(denied());
+    }
+
+    let contributors = if ordinary.is_empty() {
+        Vec::new()
+    } else {
+        let (authorities, manifests) =
+            super::super::accepted_input::AcceptedInputRepository::source_contributors(conn, child)
+                .await?;
+        super::super::immutable_input_origin::ImmutableInputOriginRepository::require(
+            conn,
+            &authorities,
+            &ordinary,
+        )
+        .await?;
+        manifests
+    };
+    Ok(ResultFieldDisclosure {
+        path: field.json_path.clone(),
+        parents,
+        origins,
+        contributors,
+        deadline: fence.approval_deadline(),
+    })
+}
+
+/// Only explicit absence/revocation is an unavailable field. Structural receipt
+/// validation and graph limits still fail the entire preparation on corruption.
+async fn field_sources_available(
+    conn: &mut PgConnection,
+    child: Id,
+    sources: &[SecretOrigin],
+    check_grants: bool,
+) -> Result<bool> {
+    let mut pending = sources.to_vec();
+    let mut receipts = BTreeSet::new();
+    let mut work = 0usize;
+    while let Some(origin) = pending.pop() {
+        work += 1;
+        if work > 256 {
+            return Err(denied());
+        }
+        if super::super::immutable_input_origin::is_input_receipt(&origin) {
+            let SecretOrigin::Entity { entity_id, .. } = &origin else {
+                return Err(denied());
+            };
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM runtime_input_receipt WHERE id=$1)",
+            )
+            .bind(entity_id)
+            .fetch_one(&mut *conn)
+            .await?;
+            if !exists {
+                return Ok(false);
+            }
+            if !receipts.insert(*entity_id) {
+                continue;
+            }
+            InheritedInputRepository::receipt_source_site(conn, &origin).await?;
+            // The typed inventory validates proof digests and bounded parent
+            // identities before any availability decision is trusted.
+            let inventory = InheritedInputRepository::retention_parents(conn, *entity_id).await?;
+            let approvals:Vec<ApprovalAvailabilityRow>=sqlx::query_as("SELECT id,revoked_at,expires_at FROM runtime_external_approval WHERE id=ANY($1) ORDER BY id FOR SHARE").bind(inventory.approvals()).fetch_all(&mut *conn).await?;
+            if approvals.len() != inventory.approvals().len()
+                || approvals.iter().any(|(_, revoked, expires)| {
+                    revoked.is_some()
+                        || expires.is_some_and(|deadline| deadline <= chrono::Utc::now())
+                })
+            {
+                return Ok(false);
+            }
+            let admissions:Vec<(Id,Option<chrono::DateTime<chrono::Utc>>)>=sqlx::query_as("SELECT id,revoked_at FROM runtime_authority_admission WHERE id=ANY($1) ORDER BY id FOR SHARE").bind(inventory.admissions()).fetch_all(&mut *conn).await?;
+            if admissions.len() != inventory.admissions().len()
+                || admissions.iter().any(|(_, revoked)| revoked.is_some())
+            {
+                return Ok(false);
+            }
+            for parent in inventory.receipts() {
+                let exists: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM runtime_input_receipt WHERE id=$1)",
+                )
+                .bind(parent)
+                .fetch_one(&mut *conn)
+                .await?;
+                if !exists {
+                    return Ok(false);
+                }
+                // Parent IDs are authenticated by the inventory, while site
+                // descriptors are loaded and checked by the original reader.
+                let row: Value =
+                    sqlx::query_scalar("SELECT proof FROM runtime_input_receipt WHERE id=$1")
+                        .bind(parent)
+                        .fetch_one(&mut *conn)
+                        .await?;
+                let site: InputSite =
+                    serde_json::from_value(row.get("site").cloned().ok_or_else(denied)?)?;
+                pending.push(SecretOrigin::Entity {
+                    entity_type: site.kind.origin_kind(site.purpose),
+                    entity_id: *parent,
+                    path: site.path,
+                });
+            }
+            pending.extend(inventory.origins().iter().cloned());
+        } else if let SecretOrigin::Entity {
+            entity_type,
+            entity_id,
+            path,
+        } = &origin
+        {
+            if entity_type == super::super::runtime_read::ENTITY_RUNTIME_READ {
+                if !matches!(&origin,SecretOrigin::Entity{path,..} if path.is_empty()) {
+                    return Err(denied());
+                }
+                let admission: Option<Id> = sqlx::query_scalar(
+                    "SELECT admission FROM execution_runtime_read_origin WHERE id=$1 FOR SHARE",
+                )
+                .bind(entity_id)
+                .fetch_optional(&mut *conn)
+                .await?;
+                let Some(admission) = admission else {
+                    return Ok(false);
+                };
+                // Validate the immutable origin before treating its source's
+                // explicit revocation as field unavailability.
+                let read =
+                    super::super::runtime_read::RuntimeReadRepository::find(&mut *conn, *entity_id)
+                        .await?;
+                let state: Option<Option<chrono::DateTime<chrono::Utc>>> = sqlx::query_scalar(
+                    "SELECT revoked_at FROM runtime_authority_admission WHERE id=$1 FOR SHARE",
+                )
+                .bind(admission)
+                .fetch_optional(&mut *conn)
+                .await?;
+                if !matches!(state, Some(None)) {
+                    return Ok(false);
+                }
+                pending.extend(
+                    read.provenance
+                        .into_iter()
+                        .flat_map(|provenance| provenance.origins),
+                );
+                pending.extend(
+                    read.parents
+                        .into_iter()
+                        .flat_map(|parent| parent.provenance.origins),
+                );
+            } else if matches!(
+                entity_type.as_str(),
+                "execution_config" | "execution_result" | "workflow_variables"
+            ) {
+                let owner_exists: bool = if entity_type == "workflow_variables" {
+                    sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM workflow_execution WHERE execution=$1)",
+                    )
+                    .bind(entity_id)
+                    .fetch_one(&mut *conn)
+                    .await?
+                } else {
+                    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM execution WHERE id=$1)")
+                        .bind(entity_id)
+                        .fetch_one(&mut *conn)
+                        .await?
+                };
+                if !owner_exists {
+                    return Ok(false);
+                }
+                let fields=super::super::execution_secret_value::ExecutionSecretValueRepository::find_bounded_provenance(&mut *conn,&[entity_type.as_str()],&[*entity_id]).await?;
+                if fields.len() > 256 {
+                    return Err(denied());
+                }
+                for field in fields.into_iter().filter(|field| {
+                    covers(&field.json_path, path) || covers(path, &field.json_path)
+                }) {
+                    let provenance = if field.source_kind == "provenance" {
+                        serde_json::from_str::<crate::secret_provenance::SecretProvenance>(
+                            field.source_ref.as_deref().ok_or_else(denied)?,
+                        )?
+                    } else if field.source_kind == "parameter_schema"
+                        && field.source_ref.as_deref() == Some(field.json_path.as_str())
+                    {
+                        crate::secret_values::SecretSource::ParameterSchema {
+                            path: field.json_path,
+                        }
+                        .provenance()
+                    } else {
+                        return Err(denied());
+                    };
+                    if provenance.origins.is_empty() {
+                        return Err(denied());
+                    }
+                    pending.extend(provenance.origins);
+                }
+            }
+        } else if let SecretOrigin::Key(key) = origin {
+            let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM key WHERE id=$1)")
+                .bind(key.key_id)
+                .fetch_one(&mut *conn)
+                .await?;
+            if !exists {
+                return Ok(false);
+            }
+            if !check_grants {
+                let record = RuntimeAuthorityRepository::execution_admission(conn, child)
+                    .await?
+                    .ok_or_else(denied)?;
+                let mut ownership = super::super::iam_ownership::VerifiedKeyOrigins::default();
+                if ownership
+                    .retain_recorded(conn, record.authority.owner.sponsor_identity_id, &key)
+                    .await?
+                    .is_none()
+                {
+                    return Ok(false);
+                }
+                continue;
+            }
+            let (authorities, _) =
+                super::super::accepted_input::AcceptedInputRepository::source_contributors(
+                    conn, child,
+                )
+                .await?;
+            for authority in &authorities {
+                for action in [crate::rbac::Action::Read]
+                    .into_iter()
+                    .chain(key.encrypted.then_some(crate::rbac::Action::Decrypt))
+                {
+                    if !super::super::recorded_input_authority::RecordedInputAuthorityRepository::key_origin_allowed(conn,authority,&key,action).await? {return Ok(false);}
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
 pub(super) fn validate_storage(source: &ResultViewSource) -> Result<()> {
-    validate_field_paths(&source.raw, &source.fields)?;
+    validate_output_fields(
+        &source.raw,
+        &source.fields,
+        &source.channel_fields,
+        source.execution,
+    )?;
     if source.version.get("projection_digest") != Some(&json!(hash(&source.raw)?))
         || source.version.get("ciphertext_digest")
             != Some(&json!(hash(&serde_json::to_value(&source.fields)?)?))
         || source.version.get("contract_digest")
             != Some(&json!(source.contract.as_ref().map(hash).transpose()?))
         || source.version.get("contract_kind") != Some(&serde_json::to_value(source.contract_kind)?)
+        || source.version.get("output_policy") != Some(&serde_json::to_value(source.output_policy)?)
+        || source.version.get("field_disclosures_digest")
+            != Some(&json!(hash(&serde_json::to_value((
+                &source.field_disclosures,
+                &source.unavailable_fields
+            ))?)?))
+        || source.version.get("channel_ciphertext_digest")
+            != Some(&json!(hash(&serde_json::to_value(
+                &source.channel_fields
+            )?)?))
     {
         return Err(denied());
     }
@@ -580,6 +889,12 @@ pub(super) fn validate_storage(source: &ResultViewSource) -> Result<()> {
         || source.task_name.is_empty()
         || source.transaction.is_empty()
         || source.fields.len()
+            + source.channel_fields.len()
+            + source
+                .field_disclosures
+                .iter()
+                .map(|field| field.parents.len() + field.origins.len() + field.contributors.len())
+                .sum::<usize>()
             + source.parents.len()
             + source.origins.len()
             + source.contributors.len()
@@ -619,11 +934,120 @@ pub(super) fn validate_storage(source: &ResultViewSource) -> Result<()> {
     {
         return Err(denied());
     }
+    let expected = source
+        .fields
+        .iter()
+        .map(|field| field.json_path.clone())
+        .collect::<BTreeSet<_>>();
+    let disclosed = source
+        .field_disclosures
+        .iter()
+        .map(|field| field.path.clone())
+        .collect::<BTreeSet<_>>();
+    if disclosed.len() != source.field_disclosures.len()
+        || !disclosed.is_disjoint(&source.unavailable_fields)
+        || disclosed
+            .union(&source.unavailable_fields)
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            != expected
+    {
+        return Err(denied());
+    }
+    for disclosure in &source.field_disclosures {
+        if disclosure.parents.len() + disclosure.origins.len() + disclosure.contributors.len() > 256
+        {
+            return Err(denied());
+        }
+        for manifest in &disclosure.contributors {
+            manifest.validate()?;
+        }
+        let stored = source
+            .fields
+            .iter()
+            .find(|field| field.json_path == disclosure.path)
+            .ok_or_else(denied)?
+            .provenance()?;
+        if stored.origins != disclosure.origins {
+            return Err(denied());
+        }
+        for origin in &disclosure.origins {
+            if super::super::immutable_input_origin::is_input_receipt(origin) {
+                let SecretOrigin::Entity {
+                    entity_type,
+                    entity_id,
+                    path,
+                } = origin
+                else {
+                    return Err(denied());
+                };
+                if !disclosure.parents.iter().any(|(receipt, site)| {
+                    receipt == entity_id
+                        && site.kind.origin_kind(site.purpose) == *entity_type
+                        && site.path == *path
+                }) {
+                    return Err(denied());
+                }
+            }
+        }
+    }
     for manifest in &source.contributors {
         manifest.validate()?;
     }
     Ok(())
 }
+/// Structured slots replace public markers. Original channels are separate typed
+/// objects and never replace a sanitized string in the native public result.
+fn validate_output_fields(
+    raw: &Value,
+    fields: &[ArchivedField],
+    channels: &[ArchivedField],
+    execution: Id,
+) -> Result<()> {
+    use std::collections::BTreeSet;
+    let projections = crate::output_classification::output_channel_projections(raw, execution)?;
+    let channel_paths = projections
+        .keys()
+        .map(|channel| channel.json_path().to_owned())
+        .collect::<BTreeSet<_>>();
+    let stored_paths = channels
+        .iter()
+        .map(|field| field.json_path.clone())
+        .collect::<BTreeSet<_>>();
+    if channels.len() != stored_paths.len() || stored_paths != channel_paths {
+        return Err(denied());
+    }
+    let mut structured = raw.clone();
+    for path in &channel_paths {
+        if let Some(value) = structured.pointer_mut(path) {
+            *value = Value::Null;
+        }
+    }
+    if fields
+        .iter()
+        .any(|field| channel_paths.contains(&field.json_path))
+    {
+        return Err(denied());
+    }
+    validate_field_paths(&structured, fields)
+}
+
+fn require_only_channel_markers(raw: &Value, execution: Id) -> Result<()> {
+    let projections = crate::output_classification::output_channel_projections(raw, execution)?;
+    let mut public = raw.clone();
+    for channel in projections.keys() {
+        let name = serde_json::to_value(channel)?;
+        if let Some(value) = public.get_mut(name.as_str().ok_or_else(denied)?) {
+            *value = Value::Null;
+        }
+    }
+    if crate::secret_values::redacted_paths(&public).is_empty() {
+        Ok(())
+    } else {
+        Err(denied())
+    }
+}
+
 fn validate_field_paths(raw: &Value, fields: &[ArchivedField]) -> Result<()> {
     use std::collections::BTreeSet;
     let actual: BTreeSet<_> = crate::secret_values::redacted_paths(raw)
@@ -647,66 +1071,89 @@ fn schema_sources(
     restored: &Value,
     contract: &Option<Value>,
     kind: NativeResultContractKind,
-    execution: Id,
+    _execution: Id,
 ) -> Result<Vec<(String, Vec<SecretOrigin>)>> {
     use crate::secret_values::{SecretSource, SecretValueInput};
     let contract = contract
         .as_ref()
         .map(|value| serde_json::from_value::<crate::value_schema::Contract>(value.clone()))
         .transpose()?;
-    let fields = match kind {
-        NativeResultContractKind::Action { format } => {
-            crate::secret_values::redact_bound_action_result(
-                restored.clone(),
-                contract.as_ref(),
-                format,
-                execution,
-                &[],
-                &[],
-            )?
-            .1
-        }
-        NativeResultContractKind::Workflow => {
-            if let Some(contract) = &contract {
+    let redact_value = |value: Value| -> Result<Vec<SecretValueInput>> {
+        match &contract {
+            Some(contract) => {
                 let compiled =
                     crate::value_schema::CompiledContract::new(contract).map_err(|_| denied())?;
-                match compiled
-                    .validate(restored)
-                    .and_then(|_| compiled.secret_paths(restored))
-                {
-                    Ok(_) => {
-                        crate::secret_values::merge_contract_secret_redactions(
-                            restored.clone(),
-                            &[],
-                            &compiled,
-                        )?
-                        .1
-                    }
-                    Err(_) if compiled.declares_secrets() => vec![SecretValueInput {
-                        json_path: String::new(),
-                        value: restored.clone(),
-                        source_kind: "parameter_schema".into(),
-                        source_ref: Some(String::new()),
-                    }],
-                    Err(_) => Vec::new(),
-                }
-            } else {
-                Vec::new()
+                Ok(
+                    crate::secret_values::merge_contract_secret_redactions(value, &[], &compiled)?
+                        .1,
+                )
             }
+            None => Ok(Vec::new()),
         }
+    };
+    let fields = match kind {
+        NativeResultContractKind::Action { format } => {
+            let mut fields = match restored.get("data") {
+                Some(data) => crate::output_classification::action_data_secret_inputs(
+                    data,
+                    contract.as_ref(),
+                    format,
+                )?,
+                None => Vec::new(),
+            };
+            // queue_ack duplicates a field of data, so it must retain the same
+            // schema-local source even when native consumers read controls.
+            let duplicates = fields
+                .iter()
+                .filter_map(|field| {
+                    if field.json_path == "/data" {
+                        Some(("/queue_ack".to_owned(), field.source_ref.clone()))
+                    } else {
+                        field
+                            .json_path
+                            .strip_prefix("/data/queue_ack")
+                            .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+                            .map(|suffix| (format!("/queue_ack{suffix}"), field.source_ref.clone()))
+                    }
+                })
+                .collect::<Vec<_>>();
+            for (path, source_ref) in duplicates {
+                if let Some(value) = restored.pointer(&path) {
+                    fields.push(SecretValueInput {
+                        json_path: path,
+                        value: value.clone(),
+                        source_kind: "provenance".into(),
+                        source_ref,
+                    });
+                }
+            }
+            fields
+        }
+        NativeResultContractKind::Workflow => redact_value(restored.clone())?,
     };
     fields
         .into_iter()
         .map(|field| {
-            let provenance = match field.source_kind.as_str() {
-                "parameter_schema" => SecretSource::ParameterSchema {
-                    path: field.source_ref.ok_or_else(denied)?,
+            let provenance = if matches!(kind, NativeResultContractKind::Action { .. }) {
+                // The canonical action classifier records envelope-qualified
+                // local paths, including queue acknowledgement duplicates.
+                SecretSource::ParameterSchema {
+                    path: field.json_path.clone(),
                 }
-                .provenance(),
-                "provenance" => serde_json::from_str::<crate::secret_provenance::SecretProvenance>(
-                    field.source_ref.as_deref().ok_or_else(denied)?,
-                )?,
-                _ => return Err(denied()),
+                .provenance()
+            } else {
+                match field.source_kind.as_str() {
+                    "parameter_schema" => SecretSource::ParameterSchema {
+                        path: field.source_ref.ok_or_else(denied)?,
+                    }
+                    .provenance(),
+                    "provenance" => {
+                        serde_json::from_str::<crate::secret_provenance::SecretProvenance>(
+                            field.source_ref.as_deref().ok_or_else(denied)?,
+                        )?
+                    }
+                    _ => return Err(denied()),
+                }
             };
             Ok((field.json_path, provenance.origins))
         })
@@ -753,6 +1200,10 @@ pub(super) fn public_selection_sites(
     let actual = mapped_source_path(&source.mappings, selected).ok_or_else(denied)?;
     if source.raw.pointer(&actual).is_none()
         || source
+            .raw
+            .pointer(&actual)
+            .is_some_and(|value| !crate::secret_values::redacted_paths(value).is_empty())
+        || source
             .fields
             .iter()
             .any(|field| covers(&field.json_path, &actual) || covers(&actual, &field.json_path))
@@ -767,8 +1218,184 @@ pub(super) fn public_selection_sites(
     }])
 }
 
+fn available_selection_path(
+    task: &str,
+    mappings: &[NativeResultPointerMapping],
+    unavailable: &BTreeSet<String>,
+    path: &str,
+) -> Option<String> {
+    let selected = selection_path(task, path)?;
+    let actual = mapped_source_path(mappings, selected)?;
+    (!unavailable
+        .iter()
+        .any(|field| covers(field, &actual) || covers(&actual, field)))
+    .then_some(actual)
+}
+
 pub(super) fn context_path(source: &ResultViewSource, path: &str) -> bool {
-    selection_path(&source.task_name, path).is_some()
+    available_selection_path(
+        &source.task_name,
+        &source.mappings,
+        &source.unavailable_fields,
+        path,
+    )
+    .is_some()
+}
+
+pub(super) fn storage_receipts(source: &ResultViewSource) -> Vec<(Id, InputSite)> {
+    let mut parents = source.parents.clone();
+    for field in &source.field_disclosures {
+        for parent in &field.parents {
+            if !parents.contains(parent) {
+                parents.push(parent.clone());
+            }
+        }
+    }
+    parents
+}
+
+pub(super) fn storage_origins(source: &ResultViewSource) -> Vec<SecretOrigin> {
+    let mut origins = source.origins.clone();
+    for field in &source.field_disclosures {
+        for origin in &field.origins {
+            if !origins.contains(origin) {
+                origins.push(origin.clone());
+            }
+        }
+    }
+    origins
+}
+
+pub(super) fn storage_contributors(
+    source: &ResultViewSource,
+) -> Vec<super::super::accepted_input::AcceptedContributorManifest> {
+    let mut contributors = source.contributors.clone();
+    for field in &source.field_disclosures {
+        for manifest in &field.contributors {
+            if !contributors.contains(manifest) {
+                contributors.push(manifest.clone());
+            }
+        }
+    }
+    contributors
+}
+
+pub(super) fn selection_source_path(source: &ResultViewSource, path: &str) -> Result<String> {
+    if !context_path(source, path) {
+        return Err(denied());
+    }
+    mapped_source_path(
+        &source.mappings,
+        selection_path(&source.task_name, path).ok_or_else(denied)?,
+    )
+    .ok_or_else(denied)
+}
+
+pub(super) fn selection_fields(
+    source: &ResultViewSource,
+    path: &str,
+) -> Result<Vec<ArchivedField>> {
+    let actual = selection_source_path(source, path)?;
+    Ok(source
+        .fields
+        .iter()
+        .filter(|field| covers(&field.json_path, &actual) || covers(&actual, &field.json_path))
+        .cloned()
+        .collect())
+}
+
+pub(super) fn selection_contributors(
+    source: &ResultViewSource,
+    path: &str,
+) -> Result<Vec<super::super::accepted_input::AcceptedContributorManifest>> {
+    let actual = selection_source_path(source, path)?;
+    let mut contributors = source.contributors.clone();
+    for field in source
+        .field_disclosures
+        .iter()
+        .filter(|field| covers(&field.path, &actual) || covers(&actual, &field.path))
+    {
+        for manifest in &field.contributors {
+            if !contributors.contains(manifest) {
+                contributors.push(manifest.clone());
+            }
+        }
+    }
+    Ok(contributors)
+}
+
+/// Actual evaluator-selected source scope. A parent object is a selection of
+/// every descendant; withheld markers cannot become arithmetic or string data.
+pub(super) async fn selection_evidence(
+    conn: &mut PgConnection,
+    source: &ResultViewSource,
+    path: &str,
+    key: &str,
+) -> Result<(Vec<SecretOrigin>, Vec<(Id, InputSite)>, ApprovalEffectFence)> {
+    if !context_path(source, path) {
+        return Err(denied());
+    }
+    let actual = mapped_source_path(
+        &source.mappings,
+        selection_path(&source.task_name, path).ok_or_else(denied)?,
+    )
+    .ok_or_else(denied)?;
+    let mut origins = source
+        .origins
+        .iter()
+        .cloned()
+        .map(|origin| match origin {
+            SecretOrigin::Entity {
+                entity_type,
+                entity_id,
+                path,
+            } if entity_type == "execution_result"
+                && entity_id == source.execution
+                && path.is_empty() =>
+            {
+                SecretOrigin::Entity {
+                    entity_type,
+                    entity_id,
+                    path: actual.clone(),
+                }
+            }
+            other => other,
+        })
+        .collect::<Vec<_>>();
+    let mut parents = source.parents.clone();
+    let mut fence = ApprovalEffectFence::from_input_approval(None)?;
+    for field in source
+        .field_disclosures
+        .iter()
+        .filter(|field| covers(&field.path, &actual) || covers(&actual, &field.path))
+    {
+        if !field_sources_available(conn, source.execution, &field.origins, false).await? {
+            return Err(denied());
+        }
+        fence = fence.intersect(&ApprovalEffectFence::from_input_approval(field.deadline)?);
+        for (receipt, site) in &field.parents {
+            let origin = SecretOrigin::Entity {
+                entity_type: site.kind.origin_kind(site.purpose),
+                entity_id: *receipt,
+                path: site.path.clone(),
+            };
+            let context = Box::pin(InheritedInputRepository::receipt_context(
+                conn, site, &origin, key,
+            ))
+            .await?;
+            fence = fence.intersect(context.accepted_fence());
+            if !parents.contains(&(*receipt, site.clone())) {
+                parents.push((*receipt, site.clone()));
+            }
+        }
+        for origin in &field.origins {
+            if !origins.contains(origin) {
+                origins.push(origin.clone());
+            }
+        }
+    }
+    fence.ensure_fresh_on(conn).await?;
+    Ok((origins, parents, fence))
 }
 pub(super) async fn validate_value(
     conn: &mut PgConnection,
@@ -793,13 +1420,20 @@ pub(super) fn original_value(source: &ResultViewSource, key: &str) -> Result<Val
         &source
             .fields
             .iter()
+            .filter(|field| !source.unavailable_fields.contains(&field.json_path))
             .map(ArchivedField::stored)
             .collect::<Vec<_>>(),
         key,
     )?;
-    if !crate::secret_values::redacted_paths(&raw).is_empty() {
-        return Err(denied());
+    let mut check = raw.clone();
+    for path in &source.unavailable_fields {
+        let value = check.pointer_mut(path).ok_or_else(denied)?;
+        if !crate::secret_values::is_redaction_marker(value) {
+            return Err(denied());
+        }
+        *value = Value::Null;
     }
+    require_only_channel_markers(&check, source.execution)?;
     let schema = schema_sources(
         &raw,
         &source.contract,
@@ -814,7 +1448,11 @@ pub(super) fn original_value(source: &ResultViewSource, key: &str) -> Result<Val
     }) {
         return Err(denied());
     }
-    for field in &source.fields {
+    for field in source
+        .fields
+        .iter()
+        .filter(|field| !source.unavailable_fields.contains(&field.json_path))
+    {
         for origin in field.provenance()?.origins {
             if matches!(origin, SecretOrigin::Local { .. })
                 && !schema.iter().any(|(path, origins)| {
@@ -866,6 +1504,10 @@ pub(super) async fn compare_current(
     let row:Option<(Option<Value>,Value)>=sqlx::query_as("SELECT result,jsonb_build_object('updated',updated,'status',status,'workflow_task',workflow_task) FROM execution WHERE id=$1").bind(source.execution).fetch_optional(&mut *conn).await?;
     let (raw, mut version) = row.ok_or_else(denied)?;
     let fields = load_fields(conn, "execution_result", source.execution).await?;
+    let channel_fields = load_fields(conn, "execution_output_channel", source.execution).await?;
+    version["channel_ciphertext_digest"] = json!(hash(&serde_json::to_value(&channel_fields)?)?);
+    version["output_policy"] = serde_json::to_value(source.output_policy)?;
+    version["field_disclosures_digest"] = source.version["field_disclosures_digest"].clone();
     version["projection_digest"] = json!(hash(&raw.clone().unwrap_or(Value::Null))?);
     version["ciphertext_digest"] = json!(hash(&serde_json::to_value(&fields)?)?);
     version["contract_digest"] = source.version["contract_digest"].clone();
@@ -873,6 +1515,7 @@ pub(super) async fn compare_current(
     if raw.unwrap_or(Value::Null) != source.raw
         || version != source.version
         || fields != source.fields
+        || channel_fields != source.channel_fields
     {
         return Err(denied());
     }
@@ -889,6 +1532,7 @@ pub(super) async fn compare_current(
         .map(serde_json::to_value)
         .transpose()?
         != source.contract
+        || binding.output_policy != source.output_policy
         || hash(&serde_json::to_value(binding)?)? != source.binding_digest
     {
         return Err(denied());
@@ -954,6 +1598,75 @@ fn project(raw: &Value) -> Result<(Value, Vec<NativeResultPointerMapping>)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_action_sources_share_record_and_traversal_limit_fallbacks() {
+        use crate::{
+            models::OutputFormat,
+            output_classification::classify_action_output,
+            output_policy::OutputPolicy,
+            secret_provenance::SecretProvenance,
+            secret_values::is_redaction_marker,
+            value_schema::{compile, Limits, RegistryView, SchemaContext, SourceIdentity},
+        };
+        for format in [OutputFormat::Jsonl, OutputFormat::Json] {
+            let limits = if format == OutputFormat::Json {
+                Limits {
+                    max_value_nodes: 32,
+                    ..Limits::default()
+                }
+            } else {
+                Limits::default()
+            };
+            let contract = compile(
+                SourceIdentity::Authoring {
+                    component_ref: "fixture.output".into(),
+                },
+                SchemaContext::FlatDocument,
+                &serde_json::json!({"token":{"type":"string","secret":true}}),
+                &RegistryView::default(),
+                limits,
+            )
+            .unwrap();
+            let data = if format == OutputFormat::Jsonl {
+                serde_json::Value::Array(vec![
+                    serde_json::json!({"token":"private"});
+                    contract.limits.max_literal_checks + 1
+                ])
+            } else {
+                serde_json::json!({"token":"private","public":vec![1;64]})
+            };
+            let raw = serde_json::json!({"data":data,"succeeded":true});
+            let classified = classify_action_output(
+                raw.clone(),
+                Some(&contract),
+                format,
+                OutputPolicy::default()
+                    .resolve(Some(&contract), format)
+                    .unwrap(),
+                42,
+                &SecretProvenance::default(),
+            )
+            .unwrap();
+            assert!(is_redaction_marker(&classified.public_result["data"]));
+            assert_eq!(classified.structured_secrets.len(), 1);
+            let expected: SecretProvenance = serde_json::from_str(
+                classified.structured_secrets[0]
+                    .source_ref
+                    .as_deref()
+                    .unwrap(),
+            )
+            .unwrap();
+            let sources = super::schema_sources(
+                &raw,
+                &Some(serde_json::to_value(&contract).unwrap()),
+                super::NativeResultContractKind::Action { format },
+                42,
+            )
+            .unwrap();
+            assert_eq!(sources, vec![("/data".into(), expected.origins)]);
+        }
+    }
+
     #[test]
     fn public_selection_keeps_original_pointer_when_aliases_collide() {
         let (_, mappings) = super::project(&serde_json::json!({
@@ -1084,9 +1797,9 @@ mod tests {
             .unwrap();
         assert!(origins.contains(&SecretOrigin::Local {
             source_kind: "parameter_schema".into(),
-            source_ref: Some("/token".into())
+            source_ref: Some("/data/token".into())
         }));
-        assert!(expected.iter().any(|(path, _)| path == "/stdout"));
+        assert!(!expected.iter().any(|(path, _)| path == "/stdout"));
         assert!(!expected.iter().any(|(path, _)| path == "/token"));
         let mut invalid = action.clone();
         invalid["data"]["token"] = json!(42);
@@ -1100,7 +1813,7 @@ mod tests {
         )
         .unwrap()
         .iter()
-        .any(|(path, _)| path == "/data"));
+        .any(|(path, _)| path == "/data/token"));
         let workflow = json!({"token":"{{ opaque workflow }}"});
         assert!(
             schema_sources(&workflow, &contract, NativeResultContractKind::Workflow, 1)
@@ -1113,7 +1826,7 @@ mod tests {
             schema_sources(&invalid, &contract, NativeResultContractKind::Workflow, 1)
                 .unwrap()
                 .iter()
-                .any(|(path, _)| path.is_empty())
+                .any(|(path, _)| path == "/token")
         );
     }
     #[test]
@@ -1158,6 +1871,73 @@ mod tests {
         field.json_path = "/token".into();
         assert!(validate_field_paths(&raw, &[field]).is_err());
         assert!(validate_field_paths(&raw, &[]).is_err());
+    }
+
+    #[test]
+    fn unavailable_secret_paths_deny_aliases_containers_and_marker_properties_only() {
+        let raw = json!({"data":{"public":"ok","private":crate::secret_values::redaction_marker(),"a/b":crate::secret_values::redaction_marker()}});
+        let (_, mappings) = project(&raw).unwrap();
+        let unavailable = ["/data/private".to_owned(), "/data/a~1b".to_owned()]
+            .into_iter()
+            .collect();
+        for path in [
+            "/result/public",
+            "/result/data/public",
+            "/task/source/public",
+            "/tasks/source/data/public",
+        ] {
+            assert_eq!(
+                available_selection_path("source", &mappings, &unavailable, path),
+                Some("/data/public".into())
+            );
+        }
+        for path in [
+            "/result",
+            "/result/data",
+            "/result/private",
+            "/result/private/redacted",
+            "/task/source/private",
+            "/tasks/source/data/private",
+            "/result/a~1b",
+        ] {
+            assert!(
+                available_selection_path("source", &mappings, &unavailable, path).is_none(),
+                "{path} must not cross an unavailable protected subtree"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitized_channel_original_is_not_a_structured_marker_replacement() {
+        let raw = json!({"data":{"status":"ok"},"stdout":"{\"status\":\"ok\"}","output_channels":{"stdout":{"policy":"sanitized","original":{"execution_id":42,"channel":"stdout"}}}});
+        let original = ArchivedField {
+            json_path: "/stdout".into(),
+            encrypted_value: Value::Null,
+            encryption_key_hash: None,
+            source_kind: "provenance".into(),
+            source_ref: None,
+        };
+        validate_output_fields(&raw, &[], std::slice::from_ref(&original), 42).unwrap();
+        require_only_channel_markers(&raw, 42).unwrap();
+        assert!(validate_output_fields(&raw, std::slice::from_ref(&original), &[], 42).is_err());
+        assert!(validate_output_fields(&raw, &[], &[original], 43).is_err());
+    }
+
+    #[test]
+    fn protected_channel_marker_does_not_require_a_structured_slot() {
+        let raw = json!({"data":{"status":"ok"},"stdout":crate::secret_values::redaction_marker(),"output_channels":{"stdout":{"policy":"secret","original":{"execution_id":42,"channel":"stdout"}}}});
+        let original = ArchivedField {
+            json_path: "/stdout".into(),
+            encrypted_value: Value::Null,
+            encryption_key_hash: None,
+            source_kind: "provenance".into(),
+            source_ref: None,
+        };
+        validate_output_fields(&raw, &[], &[original], 42).unwrap();
+        require_only_channel_markers(&raw, 42).unwrap();
+        let mut missing = raw.clone();
+        missing.as_object_mut().unwrap().remove("output_channels");
+        assert!(require_only_channel_markers(&missing, 42).is_err());
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use attune_common::{
     crypto,
+    output_classification::{OutputChannel, ENTITY_EXECUTION_OUTPUT_CHANNEL},
     rbac::{Action, AuthorizationContext, Grant},
     repositories::{
         execution::ExecutionAuthorizationRow,
@@ -26,6 +27,10 @@ use crate::{
 #[cfg(test)]
 #[path = "secret_disclosure_empty_root_tests.rs"]
 mod empty_root_tests;
+
+#[cfg(test)]
+#[path = "secret_disclosure_output_tests.rs"]
+mod output_tests;
 
 pub async fn reveal_authorized(
     state: &Arc<AppState>,
@@ -295,17 +300,8 @@ pub async fn authorize_runtime_log(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
     execution: &attune_common::models::Execution,
+    channel: OutputChannel,
 ) -> ApiResult<()> {
-    let secrets = ExecutionSecretValueRepository::find_provenance_by_entities(
-        &state.db,
-        &[
-            ENTITY_EXECUTION_CONFIG,
-            ENTITY_EXECUTION_RESULT,
-            "workflow_variables",
-        ],
-        &[execution.id],
-    )
-    .await?;
     let binding = SchemaContractRepository::find_with_executor(
         &state.db,
         BindingOwner::Execution,
@@ -315,32 +311,173 @@ pub async fn authorize_runtime_log(
     .ok_or_else(|| {
         ApiError::Forbidden("Runtime log disclosure requires the original schema binding".into())
     })?;
+    if !runtime_log_channel_requires_disclosure(&binding, channel) {
+        return Ok(());
+    }
+    let secrets = ExecutionSecretValueRepository::find_provenance_by_entities(
+        &state.db,
+        &[
+            ENTITY_EXECUTION_CONFIG,
+            ENTITY_EXECUTION_RESULT,
+            attune_common::output_classification::ENTITY_EXECUTION_OUTPUT_CHANNEL,
+            "workflow_variables",
+        ],
+        &[execution.id],
+    )
+    .await?;
+    let mut secrets = secrets;
+    secrets.extend(runtime_key_read_provenance(&state.db, &[execution.id]).await?);
+    let secrets = runtime_log_channel_origins(&secrets, channel);
     authorize_runtime_log_records(
         state,
         user,
         &ExecutionAuthorizationRow::from(execution),
         &binding,
+        channel,
         &secrets,
         None,
     )
     .await
 }
 
+/// Raw channel classification is independent of every other output channel.
+pub(crate) fn runtime_log_channel_requires_disclosure(
+    binding: &ActionSchemaBinding,
+    channel: OutputChannel,
+) -> bool {
+    use attune_common::output_policy::{OutputVisibility, StdoutPolicy};
+    match channel {
+        OutputChannel::Stdout => binding.output_policy.stdout != StdoutPolicy::Public,
+        OutputChannel::Stderr => binding.output_policy.stderr == OutputVisibility::Secret,
+        OutputChannel::Error => binding.output_policy.error == OutputVisibility::Secret,
+    }
+}
+
+pub(crate) fn runtime_log_version_channel(
+    version: &attune_common::models::ArtifactVersion,
+) -> ApiResult<OutputChannel> {
+    match version
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("stream"))
+        .and_then(Value::as_str)
+    {
+        Some("stdout") => Ok(OutputChannel::Stdout),
+        Some("stderr") => Ok(OutputChannel::Stderr),
+        _ => Err(ApiError::Forbidden(
+            "Runtime log channel binding unavailable".into(),
+        )),
+    }
+}
+
+pub(crate) fn runtime_log_artifact_channel(
+    artifact: &attune_common::models::Artifact,
+    version: &attune_common::models::ArtifactVersion,
+) -> ApiResult<OutputChannel> {
+    let channel = runtime_log_version_channel(version)?;
+    if version.artifact != artifact.id
+        || !artifact
+            .r#ref
+            .ends_with(&format!(".{}.log", channel.as_str()))
+    {
+        return Err(ApiError::Forbidden(
+            "Runtime log channel identity changed".into(),
+        ));
+    }
+    Ok(channel)
+}
+
+/// Replay the same selected-channel policy used at acquisition. A recorded
+/// public log read must not later turn into a demand for unrelated decrypt rights.
+pub(crate) async fn runtime_read_requires_decrypt(
+    conn: &mut sqlx::PgConnection,
+    target: &attune_common::repositories::runtime_read::RuntimeReadTarget,
+) -> ApiResult<bool> {
+    use attune_common::repositories::{
+        artifact::{ArtifactRepository, ArtifactVersionRepository},
+        runtime_read::RuntimeReadTarget,
+        FindById,
+    };
+    let (artifact, version, execution) = match target {
+        RuntimeReadTarget::ExecutionMetadata { .. } => return Ok(false),
+        RuntimeReadTarget::ArtifactVersion {
+            artifact,
+            version,
+            execution: Some(execution),
+            ..
+        }
+        | RuntimeReadTarget::LiveLog {
+            artifact,
+            version,
+            execution,
+            ..
+        } => (*artifact, *version, *execution),
+        _ => return Ok(true),
+    };
+    let selected = ArtifactVersionRepository::find_pinned_for_share(conn, version)
+        .await?
+        .ok_or_else(|| ApiError::Forbidden("Recorded log source unavailable".into()))?;
+    if selected.artifact != artifact || selected.execution != Some(execution) {
+        return Err(ApiError::Forbidden("Recorded log source changed".into()));
+    }
+    let artifact = ArtifactRepository::find_by_id(&mut *conn, artifact)
+        .await?
+        .ok_or_else(|| ApiError::Forbidden("Recorded artifact source unavailable".into()))?;
+    if artifact.classification != attune_common::models::ArtifactClassification::RuntimeLog
+        && !ArtifactVersionRepository::has_runtime_log_binding(conn, version).await?
+    {
+        return Ok(true);
+    }
+    let binding = SchemaContractRepository::find(conn, BindingOwner::Execution, execution)
+        .await?
+        .ok_or_else(|| ApiError::Forbidden("Recorded log binding unavailable".into()))?;
+    Ok(runtime_log_channel_requires_disclosure(
+        &binding,
+        runtime_log_artifact_channel(&artifact, &selected)?,
+    ))
+}
+
+/// Completed protected channels carry their exact frozen source union. Pending
+/// streams conservatively inherit delivered inputs/actual reads, not unrelated
+/// output fields or selected API capability ceilings.
+pub(crate) fn runtime_log_channel_origins(
+    rows: &[SecretProvenanceRow],
+    channel: OutputChannel,
+) -> Vec<SecretProvenanceRow> {
+    let selected = rows
+        .iter()
+        .filter(|row| {
+            row.entity_type == ENTITY_EXECUTION_OUTPUT_CHANNEL
+                && row.json_path == channel.json_path()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !selected.is_empty() {
+        return selected;
+    }
+    rows.iter()
+        .filter(|row| {
+            !matches!(
+                row.entity_type.as_str(),
+                ENTITY_EXECUTION_RESULT | "workflow_variables" | ENTITY_EXECUTION_OUTPUT_CHANNEL
+            )
+        })
+        .cloned()
+        .collect()
+}
+
 pub(crate) fn runtime_log_requires_disclosure(
     binding: &ActionSchemaBinding,
     secrets: &[SecretProvenanceRow],
 ) -> ApiResult<bool> {
-    let input_sensitive = attune_common::value_schema::CompiledContract::new(&binding.input)
-        .map_err(|_| ApiError::Forbidden("Runtime log schema binding is unavailable".into()))?
-        .declares_secrets();
-    let output_sensitive = binding
-        .output
-        .as_ref()
-        .map(attune_common::value_schema::CompiledContract::new)
-        .transpose()
-        .map_err(|_| ApiError::Forbidden("Runtime log schema binding is unavailable".into()))?
-        .is_some_and(|contract| contract.declares_secrets());
-    Ok(!secrets.is_empty() || input_sensitive || output_sensitive)
+    let _ = secrets;
+    // Source provenance controls disclosure of protected channels, not their
+    // classification. Secret inputs cannot make public output private.
+    Ok(
+        binding.output_policy.stdout != attune_common::output_policy::StdoutPolicy::Public
+            || binding.output_policy.stderr
+                == attune_common::output_policy::OutputVisibility::Secret,
+    )
 }
 
 pub(crate) async fn authorize_runtime_log_records(
@@ -348,13 +485,11 @@ pub(crate) async fn authorize_runtime_log_records(
     user: &AuthenticatedUser,
     execution: &ExecutionAuthorizationRow,
     binding: &ActionSchemaBinding,
+    channel: OutputChannel,
     secrets: &[SecretProvenanceRow],
     snapshot: Option<&crate::authz::AuthorizationSnapshot>,
 ) -> ApiResult<()> {
-    let mut combined = secrets.to_vec();
-    combined.extend(runtime_key_read_provenance(&state.db, &[execution.id]).await?);
-    let secrets = combined.as_slice();
-    if !runtime_log_requires_disclosure(binding, secrets)? {
+    if !runtime_log_channel_requires_disclosure(binding, channel) {
         return Ok(());
     }
     let loaded = if snapshot.is_none() {
@@ -367,7 +502,8 @@ pub(crate) async fn authorize_runtime_log_records(
     })?;
     let mut records = DisclosureRecords::default();
     records.seed_executions([execution.clone()]);
-    records.seed_execution_provenance(&[execution.id], secrets.iter().cloned());
+    // These are selected channel roots, not complete execution provenance.
+    // Let preparation load any referenced result/config parent normally.
     records.load_executions(&state.db, &[execution.id]).await?;
     records
         .prepare(
@@ -389,13 +525,6 @@ pub(crate) async fn runtime_key_read_provenance(
     executions: &[i64],
 ) -> ApiResult<Vec<SecretProvenanceRow>> {
     let mut rows = Vec::new();
-    let mut conn = pool.acquire().await?;
-    for execution in executions {
-        if let Some(origin)=attune_common::repositories::delegated_execution::DelegatedExecutionRepository::output_origin(&mut conn,*execution).await? {
-            rows.push(SecretProvenanceRow{entity_type:"execution_runtime_authority".into(),entity_id:*execution,json_path:"/authority".into(),source_kind:"provenance".into(),source_ref:Some(serde_json::to_string(&attune_common::secret_provenance::SecretProvenance{origins:vec![origin],templates:vec![]}).map_err(|_|ApiError::InternalServerError("Invalid delegated output provenance".into()))?)});
-        }
-    }
-    drop(conn);
 
     for (execution, origins) in attune_common::repositories::execution_key_read::ExecutionKeyReadRepository::origins_for_executions(pool, executions).await? {
         for (index, origin) in origins.into_iter().enumerate() {
@@ -1772,6 +1901,16 @@ impl OriginAuthorization<'_> {
                                     .runtime_budget
                                     .file_denied(HumanFileOriginStage::ReadBounds));
                             }
+                            let protected_content = if let Some(shared) =
+                                self.runtime_budget.receipt_guard.as_ref()
+                            {
+                                let mut held = shared.lock().await;
+                                runtime_read_requires_decrypt(held.connection(), &read.target)
+                                    .await?
+                            } else {
+                                let mut connection = state.db.acquire().await?;
+                                runtime_read_requires_decrypt(&mut connection, &read.target).await?
+                            };
                             let executions = match &read.target {
                                 RuntimeReadTarget::Execution { execution }
                                 | RuntimeReadTarget::ExecutionMetadata { execution }
@@ -1789,10 +1928,7 @@ impl OriginAuthorization<'_> {
                                         .runtime_budget
                                         .file_denied(HumanFileOriginStage::ReadExecutionMissing));
                                 };
-                                let actions: &[Action] = if matches!(
-                                    &read.target,
-                                    RuntimeReadTarget::ExecutionMetadata { .. }
-                                ) {
+                                let actions: &[Action] = if !protected_content {
                                     &[Action::Read]
                                 } else {
                                     &[Action::Read, Action::Decrypt]
@@ -1898,9 +2034,12 @@ impl OriginAuthorization<'_> {
                                 }
                                 let mut context = target.context().clone();
                                 context.identity_attributes = caller.identity_attributes.clone();
-                                let actions: &[Action] = match &read.target {
-                                    RuntimeReadTarget::Artifact { .. } => &[Action::Read],
-                                    _ => &[Action::Read, Action::Decrypt],
+                                let actions: &[Action] = if !protected_content
+                                    || matches!(&read.target, RuntimeReadTarget::Artifact { .. })
+                                {
+                                    &[Action::Read]
+                                } else {
+                                    &[Action::Read, Action::Decrypt]
                                 };
                                 for &action in actions {
                                     if !grants.iter().any(|grant| grant.allows(target.resource(), action, &context)
@@ -2175,6 +2314,7 @@ impl OriginAuthorization<'_> {
                         if entity_type != ENTITY_EXECUTION_CONFIG
                             && entity_type != ENTITY_EXECUTION_RESULT
                             && entity_type != "workflow_variables"
+                            && entity_type != ENTITY_EXECUTION_OUTPUT_CHANNEL
                         {
                             return Ok(false);
                         }

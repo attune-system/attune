@@ -5,6 +5,8 @@
 import type { ActionReferenceVisibility } from "./ActionReferenceVisibility";
 import type { LogRetentionLimitPatch } from "./LogRetentionLimitPatch";
 import type { LogRetentionPolicyPatch } from "./LogRetentionPolicyPatch";
+import type { OutputFormat } from "./OutputFormat";
+import type { OutputPolicy } from "./OutputPolicy";
 import type { RuntimeVersionConstraintPatch } from "./RuntimeVersionConstraintPatch";
 import type { TimeoutSecondsPatch } from "./TimeoutSecondsPatch";
 import type { WorkerAffinity } from "./WorkerAffinity";
@@ -45,6 +47,8 @@ export type UpdateActionRequest = {
    * Output schema
    */
   out_schema?: Record<string, any> | null;
+  output_format?: null | OutputFormat;
+  output_policy?: null | OutputPolicy;
   /**
    * Parameter schema (StackStorm-style with inline required/secret)
    */

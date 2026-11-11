@@ -312,6 +312,8 @@ pub async fn create_action(
         worker_affinity: json!(request.worker_affinity),
         param_schema: request.param_schema,
         out_schema: request.out_schema,
+        output_policy: request.output_policy,
+        output_format: request.output_format,
         is_adhoc: true, // Actions created via API are ad-hoc (not from pack installation)
         accesses_mcp: request.accesses_mcp.unwrap_or(false),
         default_execution_permission_set_refs: request.default_execution_permission_set_refs,
@@ -449,9 +451,10 @@ pub async fn update_action(
         worker_affinity: request.worker_affinity.map(|affinity| json!(affinity)),
         param_schema: request.param_schema,
         out_schema: request.out_schema,
+        output_policy: request.output_policy,
         parameter_delivery: None,
         parameter_format: None,
-        output_format: None,
+        output_format: request.output_format.map(|format| format.to_string()),
         accesses_mcp: request.accesses_mcp,
         default_execution_permission_set_refs: request.default_execution_permission_set_refs,
         reference_visibility: request.reference_visibility,
@@ -1117,6 +1120,7 @@ mod tests {
 
     fn make_action(pack_ref: &str, action_ref: &str) -> ActionModel {
         ActionModel {
+            output_policy: Default::default(),
             id: 1,
             r#ref: action_ref.to_string(),
             pack: 1,

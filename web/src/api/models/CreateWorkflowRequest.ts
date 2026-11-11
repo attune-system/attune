@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { OutputPolicy } from "./OutputPolicy";
 /**
  * Request DTO for creating a new workflow
  */
@@ -22,6 +23,10 @@ export type CreateWorkflowRequest = {
    * Output schema (flat format) defining expected outputs with inline required/secret
    */
   out_schema: Record<string, any>;
+  /**
+   * Companion action output channel classification.
+   */
+  output_policy?: OutputPolicy;
   /**
    * Pack reference this workflow belongs to
    */

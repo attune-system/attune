@@ -148,6 +148,7 @@ struct BoundValue {
     source: SelectionSource,
 }
 pub struct RenderSession {
+    result_selection_guards: Vec<(Id, super::native_input_snapshot::NativeResultSelectionGuard)>,
     empty_reads: Vec<super::native_input_snapshot::empty_iteration::IssuedEmptyRead>,
     result_reads: Vec<super::native_input_snapshot::IssuedResultRead>,
     wait_reads: Vec<IssuedWaitRead>,
@@ -1450,7 +1451,8 @@ impl InheritedInputRepository {
         Ok(())
     }
 
-    /// Keyless public reads reject any source with accepted input controls.
+    /// Public completed results are output observations, not new input delivery.
+    /// Other public source kinds retain their accepted input controls.
     pub async fn bind_public_field(
         conn: &mut PgConnection,
         session: &mut RenderSession,
@@ -1458,6 +1460,11 @@ impl InheritedInputRepository {
         site: &InputSite,
     ) -> Result<()> {
         require_transaction(conn, &session.transaction).await?;
+        if completed_result_observation(conn, site).await? {
+            return Self::bind_public_field_value(conn, session, context_path, site)
+                .await
+                .map(|_| ());
+        }
         super::accepted_input::AcceptedInputRepository::require_no_input_controls(
             conn,
             site.execution,
@@ -1468,7 +1475,8 @@ impl InheritedInputRepository {
             .map(|_| ())
     }
 
-    /// Carry the producer's controls even if this public value is not selected.
+    /// Completed public result fields do not inherit the producer's expired
+    /// input consent. Input/configuration sources still carry their controls.
     pub async fn bind_public_field_with_key(
         conn: &mut PgConnection,
         session: &mut RenderSession,
@@ -1477,6 +1485,11 @@ impl InheritedInputRepository {
         key: &str,
     ) -> Result<()> {
         require_transaction(conn, &session.transaction).await?;
+        if completed_result_observation(conn, site).await? {
+            return Self::bind_public_field_value(conn, session, context_path, site)
+                .await
+                .map(|_| ());
+        }
         let admission = RuntimeAuthorityRepository::execution_admission(conn, site.execution)
             .await?
             .ok_or_else(denied)?
@@ -1677,6 +1690,7 @@ impl InheritedInputRepository {
         }
         let fence = permit.effect_fence.clone();
         Ok(RenderSession {
+            result_selection_guards: Vec::new(),
             result_reads: Vec::new(),
             empty_reads: Vec::new(),
             wait_reads: Vec::new(),
@@ -2585,6 +2599,22 @@ impl InheritedInputRepository {
         fields: BTreeSet<SelectedField>,
     ) -> Result<RenderedReceiptContext> {
         let mut selections = selected_sources(&session.values, &fields)?;
+        // A missing protected source is not a literal redaction-marker value.
+        // Validate the evaluator's exact reads, including condition reads, before
+        // returning any derived value. Public siblings remain independently usable.
+        for selection in &selections {
+            if let SelectionSource::NativeSnapshot { snapshot } = selection.source {
+                for (_, guard) in session
+                    .result_selection_guards
+                    .iter()
+                    .filter(|(id, _)| *id == snapshot)
+                {
+                    if !guard.allows(&selection.context_path) {
+                        return Err(denied());
+                    }
+                }
+            }
+        }
         selections.extend(session.controls);
         bounded(&value)?;
         if selections.len() > 256 {
@@ -5069,6 +5099,27 @@ fn literal_site(path: &str) -> bool {
         _ => false,
     }
 }
+async fn completed_result_observation(conn: &mut PgConnection, site: &InputSite) -> Result<bool> {
+    if site.kind != InputEntityKind::ExecutionResult || site.purpose != InputSitePurpose::Value {
+        return Ok(false);
+    }
+    let status: Option<crate::models::ExecutionStatus> =
+        sqlx::query_scalar("SELECT status FROM execution WHERE id=$1 FOR SHARE")
+            .bind(site.execution)
+            .fetch_optional(&mut *conn)
+            .await?;
+    Ok(status.is_some_and(|status| {
+        matches!(
+            status,
+            crate::models::ExecutionStatus::Completed
+                | crate::models::ExecutionStatus::Failed
+                | crate::models::ExecutionStatus::Cancelled
+                | crate::models::ExecutionStatus::Timeout
+                | crate::models::ExecutionStatus::Abandoned
+        )
+    }))
+}
+
 fn check_public_control_sites(root: &InputSite, source: &InputSite) -> Result<()> {
     check_site(root)?;
     check_site(source)?;

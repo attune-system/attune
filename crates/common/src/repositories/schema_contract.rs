@@ -22,6 +22,8 @@ pub struct SchemaContractRepository;
 pub struct ActionSchemaBinding {
     pub input: Contract,
     pub output: Option<Contract>,
+    pub output_policy: crate::output_policy::ResolvedOutputPolicy,
+    pub output_format: crate::models::OutputFormat,
     #[serde(default)]
     pub static_actions: BTreeMap<String, StaticActionSchemaBinding>,
 }
@@ -31,6 +33,8 @@ pub struct ActionSchemaBinding {
 pub struct StaticActionSchemaBinding {
     pub input: Contract,
     pub output: Option<Contract>,
+    pub output_policy: crate::output_policy::ResolvedOutputPolicy,
+    pub output_format: crate::models::OutputFormat,
     pub executable_snapshot: Value,
 }
 
@@ -56,6 +60,15 @@ impl ActionSchemaBinding {
                 Error::validation(format!("Invalid action output contract: {error}"))
             })?;
         }
+        let authored_policy = crate::output_policy::OutputPolicy {
+            stdout: Some(self.output_policy.stdout),
+            stderr: Some(self.output_policy.stderr),
+            error: Some(self.output_policy.error),
+        };
+        if authored_policy.resolve(self.output.as_ref(), self.output_format)? != self.output_policy
+        {
+            return Err(Error::validation("Invalid bound output policy"));
+        }
         for (action_ref, binding) in &self.static_actions {
             let snapshot: crate::models::ExecutionExecutableSnapshot =
                 serde_json::from_value(binding.executable_snapshot.clone()).map_err(|_| {
@@ -66,6 +79,18 @@ impl ActionSchemaBinding {
                 release_id: snapshot.release.id,
                 release_digest: snapshot.release.digest,
             };
+            if binding.output_format != snapshot.executable.action.output_format
+                || binding.output_policy
+                    != snapshot
+                        .executable
+                        .action
+                        .output_policy
+                        .resolve(binding.output.as_ref(), binding.output_format)?
+            {
+                return Err(Error::validation(
+                    "Static workflow output policy differs from its executable",
+                ));
+            }
             if snapshot.executable.action.r#ref != *action_ref || binding.input.source != expected {
                 return Err(Error::validation(
                     "Static workflow contract does not match its executable",
@@ -74,6 +99,8 @@ impl ActionSchemaBinding {
             ActionSchemaBinding {
                 input: binding.input.clone(),
                 output: binding.output.clone(),
+                output_policy: binding.output_policy,
+                output_format: binding.output_format,
                 static_actions: BTreeMap::new(),
             }
             .validate()?;
@@ -169,6 +196,8 @@ impl SchemaContractRepository {
                     StaticActionSchemaBinding {
                         input: task_binding.input,
                         output: task_binding.output,
+                        output_policy: task_binding.output_policy,
+                        output_format: task_binding.output_format,
                         executable_snapshot: serde_json::to_value(task_snapshot)
                             .map_err(|_| Error::validation("Invalid static workflow snapshot"))?,
                     },
@@ -232,9 +261,14 @@ impl SchemaContractRepository {
         } else {
             None
         };
+        let output_policy = action
+            .output_policy
+            .resolve(output.as_ref(), action.output_format)?;
         let binding = ActionSchemaBinding {
             input,
             output,
+            output_policy,
+            output_format: action.output_format,
             static_actions: BTreeMap::new(),
         };
         binding.validate()?;
@@ -266,6 +300,8 @@ impl SchemaContractRepository {
             let mut binding = ActionSchemaBinding {
                 input: selected.input.clone(),
                 output: selected.output.clone(),
+                output_policy: selected.output_policy,
+                output_format: selected.output_format,
                 static_actions: BTreeMap::new(),
             };
             Self::capture_static_actions(transaction, snapshot, &mut binding).await?;
@@ -303,6 +339,18 @@ impl SchemaContractRepository {
         let owner_snapshot: crate::models::ExecutionExecutableSnapshot =
             serde_json::from_value(owner_snapshot)
                 .map_err(|_| Error::validation("Invalid runtime binding owner snapshot"))?;
+        if binding.output_format != owner_snapshot.executable.action.output_format
+            || binding.output_policy
+                != owner_snapshot
+                    .executable
+                    .action
+                    .output_policy
+                    .resolve(binding.output.as_ref(), binding.output_format)?
+        {
+            return Err(Error::validation(
+                "Runtime output policy differs from its executable",
+            ));
+        }
         let expected = SourceIdentity::Released {
             component_ref: owner_snapshot.executable.action.r#ref,
             release_id: owner_snapshot.release.id,
@@ -772,4 +820,48 @@ pub(crate) fn check_dependency(declaring: &PackRelease, selected: &PackRelease) 
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod output_policy_tests {
+    use super::*;
+    use crate::{
+        models::OutputFormat,
+        output_policy::{OutputPolicy, StdoutPolicy},
+    };
+
+    fn contract(schema: Value) -> Contract {
+        compile(
+            SourceIdentity::Released {
+                component_ref: "example.run".into(),
+                release_id: 1,
+                release_digest: "release".into(),
+            },
+            SchemaContext::FlatDocument,
+            &schema,
+            &RegistryView::new(),
+            Limits::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn stored_binding_requires_concrete_policy_and_validates_schema_consistency() {
+        let output = contract(serde_json::json!({"token":{"type":"string","secret":true}}));
+        let mut binding = ActionSchemaBinding {
+            input: contract(serde_json::json!({})),
+            output_policy: OutputPolicy::default()
+                .resolve(Some(&output), OutputFormat::Json)
+                .unwrap(),
+            output_format: OutputFormat::Json,
+            output: Some(output),
+            static_actions: BTreeMap::new(),
+        };
+        binding.validate().unwrap();
+        let mut encoded = serde_json::to_value(&binding).unwrap();
+        encoded.as_object_mut().unwrap().remove("output_policy");
+        assert!(serde_json::from_value::<ActionSchemaBinding>(encoded).is_err());
+        binding.output_policy.stdout = StdoutPolicy::Public;
+        assert!(binding.validate().is_err());
+    }
 }

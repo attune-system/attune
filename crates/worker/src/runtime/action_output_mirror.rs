@@ -1,18 +1,24 @@
-use attune_common::models::OutputFormat;
-use attune_common::secret_values::{is_redaction_marker, merge_contract_secret_redactions};
-use attune_common::value_schema::{CompiledContract, Contract};
-use serde_json::Value;
-use std::collections::BTreeSet;
+//! Channel policy drives mirroring; private originals are never mirror input.
 
-const REDACTION: &str = "[REDACTED]";
+use attune_common::{
+    models::OutputFormat,
+    output_classification::{
+        classify_action_output, output_channel_projections, OutputChannel,
+        OutputChannelProjectionReason,
+    },
+    output_policy::{OutputVisibility, ResolvedOutputPolicy, StdoutPolicy},
+    secret_provenance::SecretProvenance,
+    value_schema::Contract,
+};
+use serde_json::{json, Value};
 
 pub(super) struct ActionOutputMirrorInput<'a> {
     pub stdout: &'a str,
     pub stderr: &'a str,
     pub output_format: OutputFormat,
+    pub output_policy: ResolvedOutputPolicy,
     pub out_schema: Option<&'a Contract>,
     pub stdout_truncated: bool,
-    pub stderr_truncated: bool,
     pub logs_incomplete: bool,
     pub mirror_stdout: bool,
     pub mirror_stderr: bool,
@@ -26,21 +32,21 @@ pub(super) struct SafeActionOutputMirror {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ActionOutputMirrorSuppression {
-    TextOutputWithSecretSchema,
     IncompleteCapture,
     TruncatedCapture,
     OutputParseFailed,
-    SecretValuesUnavailable,
+    ResourceLimit,
+    InvalidPolicy,
 }
 
 impl ActionOutputMirrorSuppression {
     pub(super) fn as_str(self) -> &'static str {
         match self {
-            Self::TextOutputWithSecretSchema => "text_output_with_secret_schema",
             Self::IncompleteCapture => "incomplete_capture",
             Self::TruncatedCapture => "truncated_capture",
             Self::OutputParseFailed => "output_parse_failed",
-            Self::SecretValuesUnavailable => "secret_values_unavailable",
+            Self::ResourceLimit => "resource_limit",
+            Self::InvalidPolicy => "invalid_policy",
         }
     }
 }
@@ -52,668 +58,400 @@ pub(super) enum ActionOutputMirrorDecision {
     Suppressed(ActionOutputMirrorSuppression),
 }
 
-pub(super) fn action_output_requires_delayed_mirror(out_schema: Option<&Contract>) -> bool {
-    out_schema.is_some_and(|schema| {
-        CompiledContract::new(schema)
-            .map(|contract| contract.declares_secrets())
-            .unwrap_or(true)
-    })
+pub(super) fn action_output_requires_delayed_mirror(policy: ResolvedOutputPolicy) -> bool {
+    policy.stdout == StdoutPolicy::Sanitized
 }
 
+/// Uses the canonical classifier so result views and console projections cannot
+/// disagree about secret fields, malformed values, or JSONL records.
 pub(super) fn safe_action_output_mirror(
     input: ActionOutputMirrorInput<'_>,
 ) -> ActionOutputMirrorDecision {
-    let contract = match input.out_schema.map(CompiledContract::new).transpose() {
-        Ok(Some(contract)) => contract,
-        Ok(None) => return ActionOutputMirrorDecision::Live,
-        Err(_) => {
-            return ActionOutputMirrorDecision::Suppressed(
-                ActionOutputMirrorSuppression::OutputParseFailed,
-            )
-        }
-    };
-    if !contract.declares_secrets() {
+    if input.output_policy.stdout == StdoutPolicy::Public
+        && input.output_policy.stderr == OutputVisibility::Public
+    {
         return ActionOutputMirrorDecision::Live;
     }
-    if !input.mirror_stdout && !input.mirror_stderr {
+    let stderr = (input.mirror_stderr && input.output_policy.stderr == OutputVisibility::Public)
+        .then(|| input.stderr.to_string());
+    if input.output_policy.stdout != StdoutPolicy::Sanitized || !input.mirror_stdout {
         return ActionOutputMirrorDecision::Delayed(SafeActionOutputMirror {
             stdout: None,
-            stderr: None,
+            stderr,
         });
-    }
-    if input.output_format == OutputFormat::Text {
-        return ActionOutputMirrorDecision::Suppressed(
-            ActionOutputMirrorSuppression::TextOutputWithSecretSchema,
-        );
     }
     if input.logs_incomplete {
         return ActionOutputMirrorDecision::Suppressed(
             ActionOutputMirrorSuppression::IncompleteCapture,
         );
     }
-    if input.stdout_truncated || input.stderr_truncated {
+    if input.stdout_truncated {
         return ActionOutputMirrorDecision::Suppressed(
             ActionOutputMirrorSuppression::TruncatedCapture,
         );
     }
-
-    let Some(mut parsed) = parse_completed_stdout(input.stdout, input.output_format) else {
-        return ActionOutputMirrorDecision::Suppressed(
-            ActionOutputMirrorSuppression::OutputParseFailed,
-        );
-    };
-    let mut found_paths = BTreeSet::new();
-    let records = parsed.records_mut();
-    if records.len() > input.out_schema.unwrap().limits.max_literal_checks {
-        return ActionOutputMirrorDecision::Suppressed(
-            ActionOutputMirrorSuppression::IncompleteCapture,
-        );
-    }
-    for record in records {
-        if contract.validate(record).is_err() {
+    let classified = match classify_action_output(
+        json!({"stdout":input.stdout}),
+        input.out_schema,
+        input.output_format,
+        input.output_policy,
+        1,
+        &SecretProvenance::default(),
+    ) {
+        Ok(classified) => classified,
+        Err(_) => {
             return ActionOutputMirrorDecision::Suppressed(
-                ActionOutputMirrorSuppression::OutputParseFailed,
-            );
+                ActionOutputMirrorSuppression::InvalidPolicy,
+            )
         }
-        let (mut redacted, secrets) =
-            match merge_contract_secret_redactions(record.clone(), &[], &contract) {
-                Ok(result) => result,
-                Err(_) => {
-                    return ActionOutputMirrorDecision::Suppressed(
-                        ActionOutputMirrorSuppression::SecretValuesUnavailable,
-                    )
-                }
-            };
-        replace_redaction_markers(&mut redacted);
-        *record = redacted;
-        for secret in secrets {
-            found_paths.insert(secret.json_path);
-        }
-    }
-    if found_paths.is_empty() {
-        return ActionOutputMirrorDecision::Suppressed(
-            ActionOutputMirrorSuppression::SecretValuesUnavailable,
-        );
-    }
-
-    let Some(stdout) = serialize_redacted_stdout(parsed) else {
-        return ActionOutputMirrorDecision::Suppressed(
-            ActionOutputMirrorSuppression::OutputParseFailed,
-        );
     };
-    ActionOutputMirrorDecision::Delayed(SafeActionOutputMirror {
-        stdout: input.mirror_stdout.then_some(stdout),
-        stderr: input.mirror_stderr.then(|| redact_diagnostic(input.stderr)),
-    })
-}
-
-enum ParsedStdout {
-    Json {
-        prefix: Option<String>,
-        value: Value,
-    },
-    Yaml(Value),
-    Jsonl(Vec<Value>),
-}
-
-impl ParsedStdout {
-    fn records_mut(&mut self) -> Vec<&mut Value> {
-        match self {
-            Self::Json { value, .. } | Self::Yaml(value) => vec![value],
-            Self::Jsonl(records) => records.iter_mut().collect(),
+    let projections = match output_channel_projections(&classified.public_result, 1) {
+        Ok(projections) => projections,
+        Err(_) => {
+            return ActionOutputMirrorDecision::Suppressed(
+                ActionOutputMirrorSuppression::InvalidPolicy,
+            )
         }
-    }
-}
-
-fn parse_completed_stdout(stdout: &str, format: OutputFormat) -> Option<ParsedStdout> {
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    match format {
-        OutputFormat::Text => None,
-        OutputFormat::Json => serde_json::from_str(trimmed)
-            .ok()
-            .map(|value| ParsedStdout::Json {
-                prefix: None,
-                value,
-            })
-            .or_else(|| {
-                let trimmed_end = stdout.trim_end();
-                let (prefix, final_line) = trimmed_end.rsplit_once('\n')?;
-                serde_json::from_str(final_line.trim())
-                    .ok()
-                    .map(|value| ParsedStdout::Json {
-                        prefix: Some(prefix.to_string()),
-                        value,
-                    })
-            }),
-        OutputFormat::Yaml => serde_yaml_ng::from_str(trimmed)
-            .ok()
-            .map(ParsedStdout::Yaml),
-        OutputFormat::Jsonl => trimmed
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(serde_json::from_str)
-            .collect::<Result<Vec<Value>, _>>()
-            .ok()
-            .filter(|records| !records.is_empty())
-            .map(ParsedStdout::Jsonl),
-    }
-}
-
-fn serialize_redacted_stdout(parsed: ParsedStdout) -> Option<String> {
-    match parsed {
-        ParsedStdout::Json { prefix, value } => {
-            let result = serde_json::to_string(&value).ok()?;
-            match prefix {
-                Some(prefix) if !prefix.is_empty() => Some(format!("{REDACTION}\n{result}")),
-                None => Some(result),
-                Some(_) => Some(result),
+    };
+    if let Some(reason) = projections
+        .get(&OutputChannel::Stdout)
+        .and_then(|projection| projection.reason)
+    {
+        return ActionOutputMirrorDecision::Suppressed(match reason {
+            OutputChannelProjectionReason::Truncated => {
+                ActionOutputMirrorSuppression::TruncatedCapture
             }
+            OutputChannelProjectionReason::Unparseable => {
+                ActionOutputMirrorSuppression::OutputParseFailed
+            }
+            OutputChannelProjectionReason::ResourceLimit => {
+                ActionOutputMirrorSuppression::ResourceLimit
+            }
+        });
+    }
+    match classified
+        .public_result
+        .get("stdout")
+        .and_then(Value::as_str)
+    {
+        Some(stdout) => ActionOutputMirrorDecision::Delayed(SafeActionOutputMirror {
+            stdout: Some(stdout.into()),
+            stderr,
+        }),
+        None => {
+            ActionOutputMirrorDecision::Suppressed(ActionOutputMirrorSuppression::OutputParseFailed)
         }
-        ParsedStdout::Yaml(value) => serde_yaml_ng::to_string(&value).ok(),
-        ParsedStdout::Jsonl(records) => records
-            .iter()
-            .map(serde_json::to_string)
-            .collect::<Result<Vec<_>, _>>()
-            .ok()
-            .map(|lines| lines.join("\n")),
-    }
-}
-
-fn redact_diagnostic(content: &str) -> String {
-    if content.is_empty() {
-        String::new()
-    } else if content.ends_with('\n') {
-        format!("{REDACTION}\n")
-    } else {
-        REDACTION.to_string()
-    }
-}
-
-fn replace_redaction_markers(value: &mut Value) {
-    if is_redaction_marker(value) {
-        *value = Value::String(REDACTION.to_string());
-        return;
-    }
-    match value {
-        Value::Array(items) => items.iter_mut().for_each(replace_redaction_markers),
-        Value::Object(object) => object.values_mut().for_each(replace_redaction_markers),
-        _ => {}
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use attune_common::models::OutputFormat;
-    use serde_json::json;
+    use attune_common::{
+        output_policy::OutputPolicy,
+        secret_values::is_redaction_marker,
+        value_schema::{compile_inline, SchemaContext},
+    };
 
-    #[test]
-    fn schema_secret_printed_to_both_streams_is_only_mirrored_redacted() {
-        let secret = "unique-action-output-secret";
-        let schema = json!({
-            "token": {"type": "string", "secret": true}
-        });
-        let schema = attune_common::value_schema::compile_inline(
+    fn schema() -> Contract {
+        compile_inline(
             "test.action",
-            attune_common::value_schema::SchemaContext::FlatDocument,
-            &schema,
+            SchemaContext::FlatDocument,
+            &json!({
+                "token":{"type":"string","secret":true},"public":{"type":"string"}
+            }),
         )
-        .unwrap();
-
-        let decision = safe_action_output_mirror(ActionOutputMirrorInput {
-            stdout: &format!("{{\"token\":\"{secret}\",\"status\":\"ok\"}}\n"),
-            stderr: &format!("debug token={secret}\n"),
-            output_format: OutputFormat::Json,
-            out_schema: Some(&schema),
-            stdout_truncated: false,
-            stderr_truncated: false,
-            logs_incomplete: false,
-            mirror_stdout: true,
-            mirror_stderr: true,
-        });
-
-        let ActionOutputMirrorDecision::Delayed(content) = decision else {
-            panic!("secret output must use delayed mirroring");
-        };
-        let stdout = content.stdout.expect("stdout mirror");
-        let stderr = content.stderr.expect("stderr mirror");
-        assert!(!stdout.contains(secret));
-        assert!(!stderr.contains(secret));
-        assert!(stdout.contains("[REDACTED]"));
-        assert!(stderr.contains("[REDACTED]"));
+        .unwrap()
     }
 
     fn mirror(
         stdout: &str,
         stderr: &str,
         format: OutputFormat,
-        schema: &Value,
-        mirror_stdout: bool,
-        mirror_stderr: bool,
+        schema: Option<&Contract>,
+        policy: ResolvedOutputPolicy,
     ) -> ActionOutputMirrorDecision {
-        let schema = attune_common::value_schema::compile_inline(
-            "test.action",
-            attune_common::value_schema::SchemaContext::FlatDocument,
-            schema,
-        )
-        .unwrap();
         safe_action_output_mirror(ActionOutputMirrorInput {
             stdout,
             stderr,
             output_format: format,
-            out_schema: Some(&schema),
+            output_policy: policy,
+            out_schema: schema,
             stdout_truncated: false,
-            stderr_truncated: false,
             logs_incomplete: false,
-            mirror_stdout,
-            mirror_stderr,
+            mirror_stdout: true,
+            mirror_stderr: true,
         })
     }
 
     #[test]
-    fn secret_streams_are_independently_enabled() {
-        let schema = json!({"secret": {"type": "string", "secret": true}});
-        for (stdout_enabled, stderr_enabled) in
-            [(true, false), (false, true), (true, true), (false, false)]
-        {
-            let ActionOutputMirrorDecision::Delayed(content) = mirror(
-                r#"{"secret":"value"}"#,
-                "value",
-                OutputFormat::Json,
-                &schema,
-                stdout_enabled,
-                stderr_enabled,
-            ) else {
-                panic!("expected delayed mirror");
-            };
-            assert_eq!(content.stdout.is_some(), stdout_enabled);
-            assert_eq!(content.stderr.is_some(), stderr_enabled);
+    fn public_channels_keep_live_mirroring_without_any_input_secret_check() {
+        let policy = OutputPolicy::default()
+            .resolve(None, OutputFormat::Text)
+            .unwrap();
+        assert!(!action_output_requires_delayed_mirror(policy));
+        assert_eq!(
+            mirror(
+                "public summary",
+                "public diagnostic",
+                OutputFormat::Text,
+                None,
+                policy
+            ),
+            ActionOutputMirrorDecision::Live
+        );
+    }
+
+    #[test]
+    fn explicit_secret_channels_never_mirror_even_without_a_schema() {
+        let policy = ResolvedOutputPolicy {
+            stdout: StdoutPolicy::Secret,
+            stderr: OutputVisibility::Secret,
+            error: OutputVisibility::Public,
+        };
+        assert!(!action_output_requires_delayed_mirror(policy));
+        assert_eq!(
+            mirror(
+                "private-stdout",
+                "private-stderr",
+                OutputFormat::Text,
+                None,
+                policy
+            ),
+            ActionOutputMirrorDecision::Delayed(SafeActionOutputMirror {
+                stdout: None,
+                stderr: None
+            })
+        );
+    }
+
+    #[test]
+    fn public_stderr_is_independent_of_private_stdout() {
+        let policy = ResolvedOutputPolicy {
+            stdout: StdoutPolicy::Secret,
+            stderr: OutputVisibility::Public,
+            error: OutputVisibility::Public,
+        };
+        assert_eq!(
+            mirror(
+                "private",
+                "public diagnostic",
+                OutputFormat::Text,
+                None,
+                policy
+            ),
+            ActionOutputMirrorDecision::Delayed(SafeActionOutputMirror {
+                stdout: None,
+                stderr: Some("public diagnostic".into())
+            })
+        );
+    }
+
+    #[test]
+    fn sanitized_stdout_uses_canonical_markers_and_omits_private_stderr() {
+        let schema = schema();
+        let policy = OutputPolicy::default()
+            .resolve(Some(&schema), OutputFormat::Json)
+            .unwrap();
+        assert!(action_output_requires_delayed_mirror(policy));
+        let ActionOutputMirrorDecision::Delayed(content) = mirror(
+            r#"{"token":"private-token","public":"visible"}"#,
+            "private-token",
+            OutputFormat::Json,
+            Some(&schema),
+            policy,
+        ) else {
+            panic!("expected sanitized mirror")
+        };
+        let stdout = content.stdout.unwrap();
+        assert!(!stdout.contains("private-token"));
+        let data: Value = serde_json::from_str(&stdout).unwrap();
+        assert!(is_redaction_marker(&data["token"]));
+        assert_eq!(data["public"], "visible");
+        assert!(content.stderr.is_none());
+    }
+
+    #[test]
+    fn explicit_public_stderr_does_not_inherit_output_field_secrecy() {
+        let schema = schema();
+        let policy = OutputPolicy {
+            stderr: Some(OutputVisibility::Public),
+            ..Default::default()
+        }
+        .resolve(Some(&schema), OutputFormat::Json)
+        .unwrap();
+        let ActionOutputMirrorDecision::Delayed(content) = mirror(
+            r#"{"token":"private-token"}"#,
+            "author-declared public stderr",
+            OutputFormat::Json,
+            Some(&schema),
+            policy,
+        ) else {
+            panic!("expected sanitized mirror")
+        };
+        assert_eq!(
+            content.stderr.as_deref(),
+            Some("author-declared public stderr")
+        );
+    }
+
+    #[test]
+    fn leading_debug_lines_never_enter_the_sanitized_projection() {
+        let schema = schema();
+        let policy = OutputPolicy::default()
+            .resolve(Some(&schema), OutputFormat::Json)
+            .unwrap();
+        let ActionOutputMirrorDecision::Delayed(content) = mirror(
+            "unclassified private prefix\n{\"token\":\"private-token\",\"public\":\"visible\"}",
+            "",
+            OutputFormat::Json,
+            Some(&schema),
+            policy,
+        ) else {
+            panic!("expected sanitized mirror")
+        };
+        let stdout = content.stdout.unwrap();
+        assert!(!stdout.contains("prefix"));
+        assert!(!stdout.contains("private-token"));
+        assert!(stdout.contains("visible"));
+    }
+
+    #[test]
+    fn jsonl_classifies_each_record_before_any_mirroring() {
+        let schema = schema();
+        let policy = OutputPolicy::default()
+            .resolve(Some(&schema), OutputFormat::Jsonl)
+            .unwrap();
+        let ActionOutputMirrorDecision::Delayed(content) = mirror(
+            "{\"token\":\"first\",\"public\":\"one\"}\n{\"token\":\"second\",\"public\":\"two\"}",
+            "",
+            OutputFormat::Jsonl,
+            Some(&schema),
+            policy,
+        ) else {
+            panic!("expected sanitized mirror")
+        };
+        let stdout = content.stdout.unwrap();
+        assert_eq!(stdout.lines().count(), 2);
+        assert!(!stdout.contains("first"));
+        assert!(!stdout.contains("second"));
+    }
+
+    #[test]
+    fn malformed_middle_jsonl_record_suppresses_opaque_raw_bytes() {
+        let schema = schema();
+        let policy = OutputPolicy::default()
+            .resolve(Some(&schema), OutputFormat::Jsonl)
+            .unwrap();
+        assert_eq!(
+            mirror(
+                "{\"token\":\"one\"}\nmalformed-private-debug\n{\"token\":\"two\"}",
+                "",
+                OutputFormat::Jsonl,
+                Some(&schema),
+                policy
+            ),
+            ActionOutputMirrorDecision::Suppressed(
+                ActionOutputMirrorSuppression::OutputParseFailed
+            )
+        );
+    }
+
+    #[test]
+    fn invalid_public_output_fields_do_not_suppress_safe_projection() {
+        let schema = schema();
+        let policy = OutputPolicy::default()
+            .resolve(Some(&schema), OutputFormat::Json)
+            .unwrap();
+        let ActionOutputMirrorDecision::Delayed(content) = mirror(
+            r#"{"token":99,"public":37}"#,
+            "",
+            OutputFormat::Json,
+            Some(&schema),
+            policy,
+        ) else {
+            panic!("expected sanitized mirror")
+        };
+        let stdout = content.stdout.unwrap();
+        let data: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(data["public"], 37);
+        assert!(is_redaction_marker(&data["token"]));
+    }
+
+    #[test]
+    fn absent_secret_fields_do_not_suppress_public_output() {
+        let schema = schema();
+        let policy = OutputPolicy::default()
+            .resolve(Some(&schema), OutputFormat::Json)
+            .unwrap();
+        let ActionOutputMirrorDecision::Delayed(content) = mirror(
+            r#"{"public":"visible"}"#,
+            "",
+            OutputFormat::Json,
+            Some(&schema),
+            policy,
+        ) else {
+            panic!("expected sanitized mirror")
+        };
+        assert_eq!(content.stdout.as_deref(), Some(r#"{"public":"visible"}"#));
+    }
+
+    #[test]
+    fn truncated_or_incomplete_stdout_never_mirrors_raw_bytes() {
+        let schema = schema();
+        let policy = OutputPolicy::default()
+            .resolve(Some(&schema), OutputFormat::Json)
+            .unwrap();
+        for (truncated, incomplete, expected) in [
+            (true, false, ActionOutputMirrorSuppression::TruncatedCapture),
+            (
+                false,
+                true,
+                ActionOutputMirrorSuppression::IncompleteCapture,
+            ),
+        ] {
+            assert_eq!(
+                safe_action_output_mirror(ActionOutputMirrorInput {
+                    stdout: r#"{"token":"private"}"#,
+                    stderr: "",
+                    output_format: OutputFormat::Json,
+                    output_policy: policy,
+                    out_schema: Some(&schema),
+                    stdout_truncated: truncated,
+                    logs_incomplete: incomplete,
+                    mirror_stdout: true,
+                    mirror_stderr: false,
+                }),
+                ActionOutputMirrorDecision::Suppressed(expected)
+            );
         }
     }
 
     #[test]
-    fn actions_without_secret_paths_keep_live_mirroring() {
-        let decision = mirror(
-            r#"{"value":"public"}"#,
-            "public",
-            OutputFormat::Json,
-            &json!({"value": {"type": "string"}}),
-            true,
-            true,
-        );
-        assert_eq!(decision, ActionOutputMirrorDecision::Live);
-    }
-
-    #[test]
-    fn json_final_line_fallback_supplies_secret_values() {
-        let schema = json!({"token": {"type": "string", "secret": true}});
-        let decision = mirror(
-            "public log\n{\"token\":\"fallback-secret\"}\n",
-            "fallback-secret",
-            OutputFormat::Json,
-            &schema,
-            true,
-            true,
-        );
-        let ActionOutputMirrorDecision::Delayed(content) = decision else {
-            panic!("expected delayed mirror");
-        };
-        assert!(!content.stdout.unwrap().contains("fallback-secret"));
-        assert!(!content.stderr.unwrap().contains("fallback-secret"));
-    }
-
-    #[test]
-    fn json_reserializes_unicode_escapes_and_numeric_text_after_redaction() {
-        let schema = json!({
-            "token": {"type": "string", "secret": true},
-            "count": {"type": "string", "secret": true}
-        });
-        let decision = mirror(
-            r#"{"token":"\u0073\u0065\u0063\u0072\u0065\u0074","count":"1e3","public":"ok"}"#,
-            "",
-            OutputFormat::Json,
-            &schema,
-            true,
-            false,
-        );
-        let ActionOutputMirrorDecision::Delayed(content) = decision else {
-            panic!("expected delayed mirror");
-        };
-        let stdout = content.stdout.unwrap();
-        assert!(!stdout.contains("secret"));
-        assert!(!stdout.contains("1000"));
-        assert!(!stdout.contains("1e3"));
-        assert_eq!(
-            serde_json::from_str::<Value>(&stdout).unwrap()["public"],
-            "ok"
-        );
-    }
-
-    #[test]
-    fn formatted_object_and_array_secrets_are_structurally_redacted() {
-        let schema = json!({
-            "credentials": {"type": "object", "secret": true},
-            "codes": {"type": "array", "secret": true}
-        });
-        let decision = mirror(
-            r#"{
-  "credentials": {
-    "token": "object-secret"
-  },
-  "codes": [
-    "1e3",
-    "array-secret"
-  ],
-  "public": true
-}"#,
-            "",
-            OutputFormat::Json,
-            &schema,
-            true,
-            false,
-        );
-        let ActionOutputMirrorDecision::Delayed(content) = decision else {
-            panic!("expected delayed mirror");
-        };
-        let stdout = content.stdout.unwrap();
-        assert!(!stdout.contains("object-secret"));
-        assert!(!stdout.contains("array-secret"));
-        assert!(!stdout.contains("1000"));
-        let mirrored: Value = serde_json::from_str(&stdout).unwrap();
-        assert_eq!(mirrored["credentials"], REDACTION);
-        assert_eq!(mirrored["codes"], REDACTION);
-        assert_eq!(mirrored["public"], true);
-    }
-
-    #[test]
-    fn json_prefix_and_stderr_are_redacted_wholesale() {
-        let schema = json!({
-            "token": {"type": "string", "secret": true},
-            "count": {"type": "string", "secret": true}
-        });
-        let stdout = concat!(
-            r#"{"message":"saw snowman \u2603","count":1e3}"#,
-            "\n\n",
-            r#"{"token":"snowman \u2603","count":"1e3"}"#,
-        );
-        let stderr = concat!(
-            r#"{"message":"failed for snowman \u2603","count":1e3}"#,
-            "\npublic line\n",
-        );
-        let decision = mirror(stdout, stderr, OutputFormat::Json, &schema, true, true);
-        let ActionOutputMirrorDecision::Delayed(content) = decision else {
-            panic!("expected delayed mirror");
-        };
-        assert_eq!(
-            content.stdout.as_deref(),
-            Some("[REDACTED]\n{\"count\":\"[REDACTED]\",\"token\":\"[REDACTED]\"}")
-        );
-        assert_eq!(content.stderr.as_deref(), Some("[REDACTED]\n"));
-    }
-
-    #[test]
-    fn malformed_numeric_secret_output_suppresses_mirroring() {
-        let schema = json!({"count": {"type": "string", "secret": true}});
-        let stdout = concat!(
-            r#"{"integer":1e3,"decimal":1000.0,"public":7}"#,
-            "\n",
-            r#"{"count":1000}"#,
-        );
-        let stderr = r#"{"upper":1E+3,"decimal":1000.0,"public":7}"#;
-
-        let decision = mirror(stdout, stderr, OutputFormat::Json, &schema, true, true);
-        assert_eq!(
-            decision,
-            ActionOutputMirrorDecision::Suppressed(
-                ActionOutputMirrorSuppression::OutputParseFailed
-            )
-        );
-    }
-
-    #[test]
-    fn object_secret_keys_are_redacted_in_stderr_and_json_prefix() {
-        let schema = json!({"credentials": {"type": "object", "secret": true}});
-        let stdout = concat!(
-            r#"diagnostic api_key=failed {"api_key":"named field"}"#,
-            "\n",
-            r#"{"credentials":{"api_key":"object-secret"}}"#,
-        );
-        let stderr = r#"failed api_key {"api_key":"named field"}"#;
-
-        let decision = mirror(stdout, stderr, OutputFormat::Json, &schema, true, true);
-        let ActionOutputMirrorDecision::Delayed(content) = decision else {
-            panic!("expected delayed mirror");
-        };
-        assert_eq!(content.stderr.as_deref(), Some(REDACTION));
-        assert_eq!(
-            content.stdout.as_deref(),
-            Some("[REDACTED]\n{\"credentials\":\"[REDACTED]\"}")
-        );
-    }
-
-    #[test]
-    fn jsonl_applies_the_output_schema_to_every_record() {
-        let schema = json!({"token": {"type": "string", "secret": true}});
-        let decision = mirror(
-            "{\"token\":\"first-secret\"}\n{\"token\":\"second-secret\"}\n",
-            "first-secret second-secret",
-            OutputFormat::Jsonl,
-            &schema,
-            true,
-            true,
-        );
-        let ActionOutputMirrorDecision::Delayed(content) = decision else {
-            panic!("expected delayed mirror");
-        };
-        let combined = format!("{}{}", content.stdout.unwrap(), content.stderr.unwrap());
-        assert!(!combined.contains("first-secret"));
-        assert!(!combined.contains("second-secret"));
-        assert_eq!(combined.matches(REDACTION).count(), 3);
-    }
-
-    #[test]
-    fn yaml_output_supplies_secret_values() {
-        let schema = json!({"token": {"type": "string", "secret": true}});
-        let decision = mirror(
-            "token: yaml-secret\nstatus: ok\n",
-            "yaml-secret",
-            OutputFormat::Yaml,
-            &schema,
-            true,
-            true,
-        );
-        let ActionOutputMirrorDecision::Delayed(content) = decision else {
-            panic!("expected delayed mirror");
-        };
-        assert!(!content.stdout.unwrap().contains("yaml-secret"));
-        assert!(!content.stderr.unwrap().contains("yaml-secret"));
-    }
-
-    #[test]
-    fn yaml_numeric_text_is_redacted_before_reserialization() {
-        let schema = json!({
-            "hex": {"type": "string", "secret": true},
-            // YAML 1.2 can preserve underscored scalars as strings.
-            "underscored": {"type": "string", "secret": true}
-        });
-        let decision = mirror(
-            "hex: '0x2A'\nunderscored: 1_000\npublic: ok\n",
-            "hex=42, underscored=1000, public diagnostic\n",
-            OutputFormat::Yaml,
-            &schema,
-            true,
-            true,
-        );
-        let ActionOutputMirrorDecision::Delayed(content) = decision else {
-            panic!("expected delayed mirror");
-        };
-        let stdout = content.stdout.unwrap();
-        assert!(!stdout.contains("0x2A"));
-        assert!(!stdout.contains("1_000"));
-        assert!(!stdout.contains("1000"));
-        let mirrored: Value = serde_yaml_ng::from_str(&stdout).unwrap();
-        assert_eq!(mirrored["hex"], REDACTION);
-        assert_eq!(mirrored["underscored"], REDACTION);
-        assert_eq!(mirrored["public"], "ok");
-        assert_eq!(content.stderr.as_deref(), Some("[REDACTED]\n"));
-    }
-
-    #[test]
-    fn parse_failure_and_text_output_fail_closed() {
-        let schema = json!({"token": {"type": "string", "secret": true}});
-        assert_eq!(
-            mirror(
-                "not json",
-                "secret",
-                OutputFormat::Json,
-                &schema,
-                true,
-                true,
-            ),
-            ActionOutputMirrorDecision::Suppressed(
-                ActionOutputMirrorSuppression::OutputParseFailed
-            )
-        );
-        assert_eq!(
-            mirror("secret", "secret", OutputFormat::Text, &schema, true, true,),
-            ActionOutputMirrorDecision::Suppressed(
-                ActionOutputMirrorSuppression::TextOutputWithSecretSchema
-            )
-        );
-    }
-
-    #[test]
-    fn truncated_or_incomplete_capture_fails_closed() {
-        let schema = json!({"token": {"type": "string", "secret": true}});
-        let schema = attune_common::value_schema::compile_inline(
-            "test.action",
-            attune_common::value_schema::SchemaContext::FlatDocument,
-            &schema,
-        )
+    fn only_requested_public_projections_are_returned() {
+        let schema = schema();
+        let policy = OutputPolicy {
+            stderr: Some(OutputVisibility::Public),
+            ..Default::default()
+        }
+        .resolve(Some(&schema), OutputFormat::Json)
         .unwrap();
-        let base = || ActionOutputMirrorInput {
-            stdout: r#"{"token":"secret"}"#,
-            stderr: "secret",
-            output_format: OutputFormat::Json,
-            out_schema: Some(&schema),
-            stdout_truncated: false,
-            stderr_truncated: false,
-            logs_incomplete: false,
-            mirror_stdout: true,
-            mirror_stderr: true,
-        };
-        assert_eq!(
+        let ActionOutputMirrorDecision::Delayed(content) =
             safe_action_output_mirror(ActionOutputMirrorInput {
-                stdout_truncated: true,
-                ..base()
-            }),
-            ActionOutputMirrorDecision::Suppressed(ActionOutputMirrorSuppression::TruncatedCapture)
-        );
-        assert_eq!(
-            safe_action_output_mirror(ActionOutputMirrorInput {
-                logs_incomplete: true,
-                ..base()
-            }),
-            ActionOutputMirrorDecision::Suppressed(
-                ActionOutputMirrorSuppression::IncompleteCapture
-            )
-        );
-    }
-
-    #[test]
-    fn arbitrary_chunked_stderr_is_redacted_once() {
-        let schema = json!({
-            "short": {"type": "string", "secret": true},
-            "long": {"type": "string", "secret": true}
-        });
-        let stdout_chunks = [r#"{"short":"overlap","long":"overlap-"#, r#"secret"}"#];
-        let stderr_chunks = ["overlap-", "secret overlap"];
-        let decision = mirror(
-            &stdout_chunks.concat(),
-            &stderr_chunks.concat(),
-            OutputFormat::Json,
-            &schema,
-            true,
-            true,
-        );
-        let ActionOutputMirrorDecision::Delayed(content) = decision else {
-            panic!("expected delayed mirror");
+                stdout: r#"{"token":"private"}"#,
+                stderr: "public",
+                output_format: OutputFormat::Json,
+                output_policy: policy,
+                out_schema: Some(&schema),
+                stdout_truncated: false,
+                logs_incomplete: false,
+                mirror_stdout: false,
+                mirror_stderr: true,
+            })
+        else {
+            panic!("expected separate stderr projection")
         };
-        assert_eq!(content.stderr.as_deref(), Some(REDACTION));
-    }
-
-    #[test]
-    fn malformed_scalar_and_nested_secret_outputs_suppress_mirroring() {
-        let schema = json!({
-            "number": {"type": "string", "secret": true},
-            "flag": {"type": "string", "secret": true},
-            "object": {"type": "object", "secret": true},
-            "array": {"type": "array", "secret": true}
-        });
-        let stdout = r#"{"number":7319,"flag":true,"object":{"key":"object-leaf"},"array":["array-leaf",8821]}"#;
-        let stderr =
-            r#"7319 true {"key":"object-leaf"} object-leaf ["array-leaf",8821] array-leaf 8821"#;
-        let decision = mirror(stdout, stderr, OutputFormat::Json, &schema, true, true);
-        assert_eq!(
-            decision,
-            ActionOutputMirrorDecision::Suppressed(
-                ActionOutputMirrorSuppression::OutputParseFailed
-            )
-        );
-    }
-
-    #[test]
-    fn non_empty_diagnostics_are_redacted_even_when_secret_value_is_empty() {
-        let schema = json!({"token": {"type": "string", "secret": true}});
-        let decision = mirror(
-            r#"{"token":"","status":"ok"}"#,
-            "public stderr",
-            OutputFormat::Json,
-            &schema,
-            true,
-            true,
-        );
-        let ActionOutputMirrorDecision::Delayed(content) = decision else {
-            panic!("expected delayed mirror");
-        };
-        assert_eq!(content.stderr.as_deref(), Some(REDACTION));
-    }
-
-    #[test]
-    fn empty_diagnostics_remain_empty() {
-        let schema = json!({"token": {"type": "string", "secret": true}});
-        let decision = mirror(
-            r#"{"token":"secret"}"#,
-            "",
-            OutputFormat::Json,
-            &schema,
-            true,
-            true,
-        );
-        let ActionOutputMirrorDecision::Delayed(content) = decision else {
-            panic!("expected delayed mirror");
-        };
-        assert_eq!(content.stderr.as_deref(), Some(""));
-    }
-
-    #[test]
-    fn unavailable_secret_fields_fail_closed() {
-        let schema = json!({"token": {"type": "string", "secret": true}});
-        assert_eq!(
-            mirror(
-                r#"{"status":"ok"}"#,
-                "diagnostic",
-                OutputFormat::Json,
-                &schema,
-                true,
-                true,
-            ),
-            ActionOutputMirrorDecision::Suppressed(
-                ActionOutputMirrorSuppression::SecretValuesUnavailable
-            )
-        );
+        assert!(content.stdout.is_none());
+        assert_eq!(content.stderr.as_deref(), Some("public"));
     }
 }

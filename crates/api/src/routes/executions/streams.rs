@@ -205,13 +205,18 @@ async fn log_execution(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
     id: i64,
+    channel: Option<&str>,
 ) -> ApiResult<attune_common::models::Execution> {
     if !crate::recorded_consumers::is_recorded(user)? {
         human_live(state, user).await?;
         let execution = ExecutionRepository::find_by_id(&state.db, id)
             .await?
             .ok_or_else(|| ApiError::NotFound("Execution log source unavailable".into()))?;
-        authorize_execution_log_stream(state, user, &execution).await?;
+        authorize_execution_log_stream(state, user, &execution, channel.unwrap_or("stdout"))
+            .await?;
+        if channel.is_none() {
+            authorize_execution_log_stream(state, user, &execution, "stderr").await?;
+        }
         human_live(state, user).await?;
         return Ok(execution);
     }
@@ -223,13 +228,34 @@ async fn log_execution(
         Action::Read,
     )
     .await?;
-    crate::recorded_disclosure::require_target(
+    let binding = attune_common::repositories::schema_contract::SchemaContractRepository::find(
         &mut tx,
-        &authority,
-        RuntimeTarget::Execution(id),
-        &[Action::Decrypt],
+        attune_common::repositories::schema_contract::BindingOwner::Execution,
+        id,
     )
-    .await?;
+    .await?
+    .ok_or_else(|| ApiError::Forbidden("Execution log binding unavailable".into()))?;
+    let protected = match channel {
+        Some("stdout") => crate::secret_disclosure::runtime_log_channel_requires_disclosure(
+            &binding,
+            attune_common::output_classification::OutputChannel::Stdout,
+        ),
+        Some("stderr") => crate::secret_disclosure::runtime_log_channel_requires_disclosure(
+            &binding,
+            attune_common::output_classification::OutputChannel::Stderr,
+        ),
+        Some(_) => return Err(ApiError::BadRequest("Invalid execution log channel".into())),
+        None => crate::secret_disclosure::runtime_log_requires_disclosure(&binding, &[])?,
+    };
+    if protected {
+        crate::recorded_disclosure::require_target(
+            &mut tx,
+            &authority,
+            RuntimeTarget::Execution(id),
+            &[Action::Decrypt],
+        )
+        .await?;
+    }
     let execution = ExecutionRepository::find_by_id(&mut *tx, id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Execution log source unavailable".into()))?;
@@ -250,7 +276,7 @@ pub(super) async fn protected_log(
     start: u64,
     permit: crate::execution_log_streams::ExecutionLogStreamPermit,
 ) -> ApiResult<axum::response::Response> {
-    let execution = log_execution(&state, &user, execution_id).await?;
+    let execution = log_execution(&state, &user, execution_id, Some(&name)).await?;
     let parsed = ExecutionLogStream::parse(&name)?;
     let reference = if Reads::source_admission(&state.db, execution_id)
         .await?
@@ -279,11 +305,11 @@ pub(super) async fn protected_log(
                         .into_data_stream(),
                 )
             } else {
-                log_execution(&state, &user, execution_id).await?;
+                log_execution(&state, &user, execution_id, Some(&name)).await?;
                 None
             }
         } else {
-            log_execution(&state, &user, execution_id).await?;
+            log_execution(&state, &user, execution_id, Some(&name)).await?;
             None
         };
     let lost = permit.lease_lost_token();
@@ -319,7 +345,8 @@ pub(super) async fn protected_log(
                 }
                 let result = async {
                     if body.is_none() {
-                        let execution = log_execution(&state, &user, execution_id).await?;
+                        let execution =
+                            log_execution(&state, &user, execution_id, Some(&name)).await?;
                         if execution.action_ref != action_ref {
                             return Err(ApiError::Forbidden("Execution source changed".into()));
                         }
@@ -375,7 +402,7 @@ pub(super) async fn protected_log(
                             }
                             tokio::time::sleep(Duration::from_millis(250)).await;
                             // The discovery query/sleep is not a reusable permit.
-                            log_execution(&state, &user, execution_id).await?;
+                            log_execution(&state, &user, execution_id, Some(&name)).await?;
                             return Ok((
                                 Event::default()
                                     .event("waiting")
@@ -474,6 +501,7 @@ pub(super) fn guard_legacy_log<S>(
     state: Arc<AppState>,
     user: AuthenticatedUser,
     id: i64,
+    channel: ExecutionLogStream,
     permit: crate::execution_log_streams::ExecutionLogStreamPermit,
 ) -> impl futures::Stream<Item = Result<Event, std::convert::Infallible>>
 where
@@ -487,7 +515,11 @@ where
                 return None;
             }
             let event = inner.next().await?;
-            let checked = log_execution(&state, &user, id).await;
+            let name = match channel {
+                ExecutionLogStream::Stdout => "stdout",
+                ExecutionLogStream::Stderr => "stderr",
+            };
+            let checked = log_execution(&state, &user, id, Some(name)).await;
             let (event, finished) = if checked.is_err() || permit.lease_lost_token().is_cancelled()
             {
                 (

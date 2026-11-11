@@ -172,6 +172,7 @@ impl WorkerLog {
         let row = ArtifactVersionRepository::find_by_id(&fixture.ctx.pool, version)
             .await?
             .unwrap();
+        assert_eq!(row.meta.as_ref().unwrap()["stream"], "stdout");
         let root = ArtifactRepository::find_by_id(&fixture.ctx.pool, row.artifact)
             .await?
             .unwrap();
@@ -335,6 +336,7 @@ impl WorkerLog {
             version.meta.as_ref().unwrap()["encrypted_log_manifest"],
             proof
         );
+        assert_eq!(version.meta.as_ref().unwrap()["stream"], "stdout");
         self.totals = None;
         Ok(())
     }
@@ -812,6 +814,20 @@ async fn foreign_producer(fixture: &Fixture) -> Result<(Id, String)> {
         pack.id,
         &pack.r#ref,
         "foreign_events.live_produce",
+    )
+    .await?;
+    // This fixture tests late Key origins on protected output. Selected SDK
+    // grants alone cannot classify a public channel or expand its frontier.
+    let action = attune_common::repositories::action::ActionRepository::update(
+        &fixture.ctx.pool,
+        action.id,
+        attune_common::repositories::action::UpdateActionInput {
+            output_policy: Some(attune_common::output_policy::OutputPolicy {
+                stdout: Some(attune_common::output_policy::StdoutPolicy::Secret),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
     )
     .await?;
     activate_test_pack_release_with_projections(

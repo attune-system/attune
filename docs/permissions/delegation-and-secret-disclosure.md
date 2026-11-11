@@ -370,10 +370,25 @@ Workflow parameter and result references retain their source execution and path.
 Source execution checks use the same visibility, ancestry, and decrypt rules as direct execution reads.
 Transforms, published variables, and item or batch expansion preserve those references.
 Sensitive workflow variables and output-map values stay encrypted at rest.
-Secret action outputs conservatively inherit all secret input origins because arbitrary code cannot prove a narrower dependency.
-Sensitive actions also encrypt raw stdout and error text, so those fields cannot duplicate protected structured output.
-Runtime-log reads require execution read and decrypt authority plus disclosure rights on every recorded secret origin when inputs or declared outputs are sensitive.
-This check covers direct execution streams and runtime-log artifacts.
+Action output secrecy follows the immutable admitted `out_schema` and
+`output_policy`. Secret inputs, runtime reads, and selected API permission refs
+never expand the set of secret output paths. Public fields can contain author-
+approved derived summaries; executable/schema publication authority controls
+that declaration, and execution callers cannot override it. Source delivery
+still requires its original authorization before action code receives a value.
+
+Declared secret outputs conservatively retain applicable secret input/runtime
+origins for disclosure. Structured public siblings stay visible even when a
+protected sibling's source is unavailable. Sanitized stdout is a public projection;
+its encrypted raw original has a separate channel reference and is never stored
+as a replacement for that public string. Explicit secret channels require
+execution decrypt and recorded-origin access. Input sensitivity alone does not
+require decrypt access to a public output channel. Private runtime-log artifact
+access controls continue to apply independently of public result projections.
+
+See [Schema driven action output secrecy](../plans/action-output-secret-classification.md)
+for the canonical representation, channel defaults, and coordinated development
+reset boundary.
 
 For human Access-token runtime-log browsing, safe artifact headers and visible
 version summaries are metadata, not grants to disclose a body. Content authority

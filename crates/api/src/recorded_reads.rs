@@ -309,6 +309,30 @@ pub(crate) async fn version_with_id(
     if candidate.artifact != artifact || number.is_some_and(|number| candidate.version != number) {
         return Err(read_stage_denied(ReadAcquisitionStage::SelectionChanged));
     }
+    let candidate_artifact = ArtifactRepository::find_by_id(&mut *tx, artifact)
+        .await?
+        .ok_or_else(denied)?;
+    let candidate_is_log = candidate_artifact.classification == ArtifactClassification::RuntimeLog
+        || ArtifactVersionRepository::has_runtime_log_binding(&mut tx, candidate.id).await?;
+    let protected_channel = if candidate_is_log {
+        let execution = candidate.execution.ok_or_else(denied)?;
+        let binding = attune_common::repositories::schema_contract::SchemaContractRepository::find(
+            &mut tx,
+            attune_common::repositories::schema_contract::BindingOwner::Execution,
+            execution,
+        )
+        .await?
+        .ok_or_else(denied)?;
+        crate::secret_disclosure::runtime_log_channel_requires_disclosure(
+            &binding,
+            crate::secret_disclosure::runtime_log_artifact_channel(
+                &candidate_artifact,
+                &candidate,
+            )?,
+        )
+    } else {
+        true
+    };
     let mut origins = Vec::new();
     let mut budget = crate::recorded_disclosure::OriginBudget::with_encryption_key(encryption_key);
     let file_origin = crate::file_origins::reference(&mut tx, candidate.id).await?;
@@ -328,8 +352,19 @@ pub(crate) async fn version_with_id(
     if let Some(rows) = &file_rows {
         budget.prepare_receipts(&mut tx, rows).await?;
     } else if let Some(execution) = candidate.execution {
-        let rows = crate::recorded_disclosure::execution_origins(&mut tx, execution).await?;
-        budget.prepare_receipts(&mut tx, &rows).await?;
+        if protected_channel {
+            origins = crate::recorded_disclosure::execution_origins(&mut tx, execution).await?;
+            if candidate_is_log {
+                origins = crate::secret_disclosure::runtime_log_channel_origins(
+                    &origins,
+                    crate::secret_disclosure::runtime_log_artifact_channel(
+                        &candidate_artifact,
+                        &candidate,
+                    )?,
+                );
+            }
+            budget.prepare_receipts(&mut tx, &origins).await?;
+        }
     }
     RuntimeReadRepository::lock_open(&mut tx, authority.credential_binding().admission_id).await?;
     if let Some(rows) = file_rows {
@@ -342,22 +377,18 @@ pub(crate) async fn version_with_id(
         .await?;
         origins.extend(rows);
     } else if let Some(execution) = candidate.execution {
+        let actions: &[Action] = if protected_channel {
+            &[Action::Read, Action::Decrypt]
+        } else {
+            &[Action::Read]
+        };
         crate::recorded_disclosure::require_target(
             &mut tx,
             &authority,
             RuntimeTarget::Execution(execution),
-            &[Action::Read, Action::Decrypt],
+            actions,
         )
         .await?;
-        let binding = attune_common::repositories::schema_contract::SchemaContractRepository::find(
-            &mut tx,
-            attune_common::repositories::schema_contract::BindingOwner::Execution,
-            execution,
-        )
-        .await?
-        .ok_or_else(denied)?;
-        origins = crate::recorded_disclosure::execution_origins(&mut tx, execution).await?;
-        crate::secret_disclosure::runtime_log_requires_disclosure(&binding, &origins)?;
         crate::recorded_disclosure::authorize_origins_bounded(
             &mut tx,
             &authority,
@@ -370,7 +401,11 @@ pub(crate) async fn version_with_id(
         &mut tx,
         &authority,
         RuntimeTarget::Artifact(artifact),
-        &[Action::Read, Action::Decrypt],
+        if protected_channel {
+            &[Action::Read, Action::Decrypt]
+        } else {
+            &[Action::Read]
+        },
     )
     .await?;
     let artifact = ArtifactRepository::find_by_id(&mut *tx, artifact)
@@ -385,7 +420,11 @@ pub(crate) async fn version_with_id(
         ArtifactVersionRepository::find_pinned_with_content_for_share(&mut tx, candidate.id)
             .await?
             .ok_or_else(|| read_stage_denied(ReadAcquisitionStage::SelectedVersion))?;
-    if selected.id != candidate.id || selected.execution != candidate.execution {
+    if selected.id != candidate.id
+        || selected.execution != candidate.execution
+        || selected.meta.as_ref().and_then(|meta| meta.get("stream"))
+            != candidate.meta.as_ref().and_then(|meta| meta.get("stream"))
+    {
         return Err(read_stage_denied(ReadAcquisitionStage::SelectionChanged));
     }
     if (selected.file_path.is_some() && selected.body_state != Some(ArtifactBodyState::Ready))
@@ -411,15 +450,16 @@ pub(crate) async fn version_with_id(
     if is_log
         && (selected.execution.is_none()
             || selected.body_state != Some(ArtifactBodyState::Ready)
-            || selected
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.get("log_encoding"))
-                .and_then(serde_json::Value::as_str)
-                != Some(attune_common::runtime_read_log::ENCODING)
-            || encrypted_manifest.as_ref().is_none_or(|manifest| {
-                manifest.len() > attune_common::runtime_read_log::MAX_MANIFEST_BYTES
-            })
+            || ((protected_channel || encrypted_manifest.is_some())
+                && (selected
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.get("log_encoding"))
+                    .and_then(serde_json::Value::as_str)
+                    != Some(attune_common::runtime_read_log::ENCODING)
+                    || encrypted_manifest.as_ref().is_none_or(|manifest| {
+                        manifest.len() > attune_common::runtime_read_log::MAX_MANIFEST_BYTES
+                    })))
             || !ArtifactVersionRepository::log_is_sealed(&mut tx, selected.id).await?)
     {
         return Err(read_stage_denied(ReadAcquisitionStage::LogBinding));

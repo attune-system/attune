@@ -43,6 +43,7 @@ mod pending_result;
 mod pending_wait;
 pub(crate) use pending_result::IssuedResultRead;
 mod result_view;
+pub(crate) use result_view::NativeResultSelectionGuard;
 mod wait_completion;
 use completion::CompletionSource;
 pub use completion::{NativeCompletionSource, PreparedNativeCompletionMetadata};
@@ -212,6 +213,7 @@ pub struct NativeSnapshotMetadata {
     source_site: Option<(String, Id, String)>,
     result_mappings: Option<Vec<NativeResultPointerMapping>>,
     result_contract_kind: Option<NativeResultContractKind>,
+    result_selection: Option<String>,
 }
 impl NativeSnapshotMetadata {
     pub fn result_contract_kind(&self) -> Option<NativeResultContractKind> {
@@ -2697,7 +2699,10 @@ impl NativeInputSnapshotRepository {
                     result_view::require_release(conn, snapshot, source).await?;
                 }
                 result_view::validate_value(conn, snapshot, source, &value, key).await?;
-                (source.origins.clone(), source.parents.clone())
+                let (origins, parents, selected_fence) =
+                    result_view::selection_evidence(conn, source, context_path, key).await?;
+                fence = fence.intersect(&selected_fence);
+                (origins, parents)
             }
             Source::Cache(source) => {
                 if !(context_path == "/index"
@@ -2770,7 +2775,14 @@ impl NativeInputSnapshotRepository {
             fence,
             origins,
             parents,
-            metadata: metadata(snapshot, &body),
+            metadata: scoped_metadata(
+                snapshot,
+                &body,
+                match &body.source {
+                    Source::ResultView(_) => Some(context_path),
+                    _ => None,
+                },
+            )?,
             bytes,
         })
     }
@@ -2780,7 +2792,12 @@ impl NativeInputSnapshotRepository {
         key: &str,
     ) -> Result<NativeSourceEvidence> {
         let (body, value, bytes, fresh_until) = load(conn, metadata.snapshot, key).await?;
-        if &self::metadata(metadata.snapshot, &body) != metadata {
+        if &scoped_metadata(
+            metadata.snapshot,
+            &body,
+            metadata.result_selection.as_deref(),
+        )? != metadata
+        {
             return Err(denied());
         }
         match &body.source {
@@ -2956,20 +2973,25 @@ impl NativeInputSnapshotRepository {
                     .await?
                     .ensure_fresh_on(conn)
                     .await?;
+                let selection = metadata.result_selection.as_deref().ok_or_else(denied)?;
+                let (selected_origins, selected_parents, selected_fence) =
+                    result_view::selection_evidence(conn, source, selection, key).await?;
+                selected_fence.ensure_fresh_on(conn).await?;
+                let selected_fields = result_view::selection_fields(source, selection)?;
                 Ok(NativeSourceEvidence {
                     wait_completion: None,
                     success_metadata: None,
                     iteration_outcome: None,
                     completion_sources: Vec::new(),
                     cache_read_policy: None,
-                    contributors: source.contributors.clone(),
+                    contributors: result_view::selection_contributors(source, selection)?,
                     renderer: body.renderer,
                     policy: body.authority.policy_id,
                     approvals: body.authority.approval_ids().into_iter().collect(),
                     admissions: vec![source.admission],
-                    fields: source.fields.iter().map(ArchivedField::stored).collect(),
-                    origins: source.origins.clone(),
-                    parents: source.parents.iter().map(|(id, _)| *id).collect(),
+                    fields: selected_fields.iter().map(ArchivedField::stored).collect(),
+                    origins: selected_origins,
+                    parents: selected_parents.iter().map(|(id, _)| *id).collect(),
                     contract: source
                         .contract
                         .as_ref()
@@ -3184,16 +3206,16 @@ impl NativeInputSnapshotRepository {
                 }
                 (
                     None,
-                    source.contributors.clone(),
+                    result_view::storage_contributors(source),
                     source
                         .contract
                         .as_ref()
                         .map(|value| serde_json::from_value(value.clone()))
                         .transpose()?,
-                    source.parents.clone(),
+                    result_view::storage_receipts(source),
                     vec![source.admission],
                     None,
-                    source.origins.clone(),
+                    result_view::storage_origins(source),
                 )
             }
             Source::Cache(source) => {
@@ -3843,6 +3865,11 @@ fn storage_physical_parents(
                 });
                 let mut nodes = 1usize;
                 for child in &source.children {
+                    result.extend(
+                        result_view::storage_receipts(child)
+                            .into_iter()
+                            .map(|(receipt, _)| NativeStorageParent::Receipt { receipt }),
+                    );
                     result.extend([
                         NativeStorageParent::Execution {
                             execution: child.execution,
@@ -3870,6 +3897,11 @@ fn storage_physical_parents(
             }
             Source::ResultView(source) => {
                 result_view::validate_storage(source)?;
+                result.extend(
+                    result_view::storage_receipts(source)
+                        .into_iter()
+                        .map(|(receipt, _)| NativeStorageParent::Receipt { receipt }),
+                );
                 result.extend([
                     NativeStorageParent::WorkflowExecution {
                         workflow: source.workflow,
@@ -4037,10 +4069,31 @@ fn storage_associations(body: &Body) -> Value {
         }
     }
 }
+fn scoped_metadata(
+    snapshot: Id,
+    body: &Body,
+    selection: Option<&str>,
+) -> Result<NativeSnapshotMetadata> {
+    let mut value = metadata(snapshot, body);
+    if let Some(path) = selection {
+        let Source::ResultView(source) = &body.source else {
+            return Err(denied());
+        };
+        value.result_selection = Some(path.to_owned());
+        value.source_site = Some((
+            "execution_result".into(),
+            source.execution,
+            result_view::selection_source_path(source, path)?,
+        ));
+    }
+    Ok(value)
+}
+
 fn metadata(snapshot: Id, body: &Body) -> NativeSnapshotMetadata {
     match &body.source {
         Source::EmptyIteration(source) => empty_iteration::empty_metadata(snapshot, source),
         Source::SuccessMetadata(source) => NativeSnapshotMetadata {
+            result_selection: None,
             snapshot,
             source_kind: "ordinary_success_metadata".into(),
             target: source.target.clone(),
@@ -4052,6 +4105,7 @@ fn metadata(snapshot: Id, body: &Body) -> NativeSnapshotMetadata {
             result_contract_kind: None,
         },
         Source::WaitCompletion(source) => NativeSnapshotMetadata {
+            result_selection: None,
             snapshot,
             source_kind: "wait_completion_metadata".into(),
             target: source.target.clone(),
@@ -4063,6 +4117,7 @@ fn metadata(snapshot: Id, body: &Body) -> NativeSnapshotMetadata {
             result_contract_kind: None,
         },
         Source::IterationOutcome(source) => NativeSnapshotMetadata {
+            result_selection: None,
             snapshot,
             source_kind: "ordinary_iteration_outcome".into(),
             target: iteration_outcome::target(source).0.clone(),
@@ -4074,6 +4129,7 @@ fn metadata(snapshot: Id, body: &Body) -> NativeSnapshotMetadata {
             result_contract_kind: None,
         },
         Source::Completion(source) => NativeSnapshotMetadata {
+            result_selection: None,
             result_contract_kind: None,
             snapshot,
             source_kind: "workflow_failure_metadata".into(),
@@ -4085,6 +4141,7 @@ fn metadata(snapshot: Id, body: &Body) -> NativeSnapshotMetadata {
             result_mappings: None,
         },
         Source::ResultView(source) => NativeSnapshotMetadata {
+            result_selection: None,
             result_contract_kind: Some(source.contract_kind),
             snapshot,
             source_kind: "execution_result_view".into(),
@@ -4096,6 +4153,7 @@ fn metadata(snapshot: Id, body: &Body) -> NativeSnapshotMetadata {
             result_mappings: Some(source.mappings.clone()),
         },
         Source::Cache(source) => NativeSnapshotMetadata {
+            result_selection: None,
             result_contract_kind: None,
             result_mappings: None,
             snapshot,
@@ -4107,6 +4165,7 @@ fn metadata(snapshot: Id, body: &Body) -> NativeSnapshotMetadata {
             source_site: None,
         },
         Source::Wait(source) => NativeSnapshotMetadata {
+            result_selection: None,
             result_contract_kind: None,
             result_mappings: None,
             snapshot,
@@ -4957,7 +5016,17 @@ async fn load_encrypted_one(conn: &mut PgConnection, id: Id) -> Result<(Body, Va
             || parents
                 .into_iter()
                 .collect::<std::collections::BTreeSet<_>>()
-                != source.parents.iter().map(|(id, _)| *id).collect()
+                != source
+                    .parents
+                    .iter()
+                    .chain(
+                        source
+                            .field_disclosures
+                            .iter()
+                            .flat_map(|field| field.parents.iter()),
+                    )
+                    .map(|(id, _)| *id)
+                    .collect()
         {
             return Err(denied());
         }

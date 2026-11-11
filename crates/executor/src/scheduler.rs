@@ -408,6 +408,10 @@ fn build_workflow_result_payload(
         return marker.clone();
     }
     if !success {
+        if let Some(JsonValue::Object(mut result)) = output_override {
+            result.insert("succeeded".into(), JsonValue::Bool(false));
+            return JsonValue::Object(result);
+        }
         return serde_json::json!({
             "error": error_message.unwrap_or("Workflow failed"),
             "succeeded": false,
@@ -440,74 +444,137 @@ async fn prepare_receipted_workflow_output(
     let mut result = build_workflow_result_payload(true, None, Some(data));
     if let Some(output) = output {
         let contract = attune_common::value_schema::CompiledContract::new(output)?;
-        if let Err(error) = contract.validate(&result) {
-            result["output_validation_warning"] =
-                serde_json::json!({"code":error.code,"path":error.path});
+        if let Some(warning) =
+            attune_common::output_classification::output_validation_warning(&contract, &result)
+        {
+            result["output_validation_warning"] = warning;
         }
     }
     // Every authored output leaf has its own exact prepared Value destination,
     // including public literals controlled by conditions. No whole-result union
     // or schema fallback may relabel these field receipts as a root proof.
     let sources = plan.record_output(conn, output, &result, key).await?;
-    Ok(attune_common::secret_values::redact_secret_path_sources(
-        result, &sources,
-    ))
+    classify_workflow_result(result, output, &sources)
 }
 
 fn prepare_bound_workflow_output(
     output: Option<&attune_common::value_schema::Contract>,
     rendered: RenderedJson,
 ) -> Result<(JsonValue, Vec<SecretValueInput>)> {
-    let mut result = build_workflow_result_payload(true, None, Some(rendered.value));
+    let result = build_workflow_result_payload(true, None, Some(rendered.value));
+    classify_workflow_result(result, output, &rendered.secret_path_sources)
+}
+
+/// Output annotations classify fields. Input receipts are retained only as
+/// disclosure origins for those exact fields; they never expand classification.
+fn classify_workflow_result(
+    mut result: JsonValue,
+    output: Option<&attune_common::value_schema::Contract>,
+    origins: &[SecretPathSource],
+) -> Result<(JsonValue, Vec<SecretValueInput>)> {
     let Some(output) = output else {
-        return Ok(attune_common::secret_values::redact_secret_path_sources(
-            result,
-            &rendered.secret_path_sources,
-        ));
+        return Ok((result, Vec::new()));
     };
     let contract = attune_common::value_schema::CompiledContract::new(output)?;
-    if let Err(error) = contract.validate(&result) {
-        result["output_validation_warning"] =
-            serde_json::json!({"code": error.code, "path": error.path});
-        if contract.declares_secrets() {
-            let mut origins = attune_common::secret_provenance::SecretProvenance::default();
-            for source in &rendered.secret_path_sources {
-                origins.merge(source.source.provenance());
-            }
-            if origins.origins.is_empty() {
-                origins.merge(
-                    SecretSource::ParameterSchema {
-                        path: String::new(),
-                    }
-                    .provenance(),
-                );
-            }
-            return Ok(attune_common::secret_values::redact_secret_path_sources(
-                result,
-                &[SecretPathSource {
-                    path: String::new(),
-                    source: SecretSource::Bound(origins),
-                }],
-            ));
+    if let Some(warning) =
+        attune_common::output_classification::output_validation_warning(&contract, &result)
+    {
+        result["output_validation_warning"] = warning;
+    }
+    let mut classified = Vec::new();
+    for path in contract.secret_paths(&result)? {
+        let mut provenance = attune_common::secret_provenance::SecretProvenance::default();
+        for source in origins.iter().filter(|source| {
+            pointer_covers(&path, &source.path) || pointer_covers(&source.path, &path)
+        }) {
+            provenance.merge(source.source.provenance());
         }
+        if provenance.origins.is_empty() {
+            provenance = SecretSource::ParameterSchema { path: path.clone() }.provenance();
+        }
+        classified.push(SecretPathSource {
+            path,
+            source: SecretSource::Bound(provenance),
+        });
     }
-    let generic_root = rendered.secret_path_sources.iter().any(|source| source.path.is_empty()
-        && source.source.provenance().origins.iter().any(|origin|
-            matches!(origin, attune_common::secret_provenance::SecretOrigin::Entity { entity_type, .. }
-                if entity_type == attune_common::repositories::runtime_read::ENTITY_RUNTIME_READ)));
-    if generic_root || !contract.declares_secrets() {
-        return Ok(attune_common::secret_values::redact_secret_path_sources(
-            result,
-            &rendered.secret_path_sources,
-        ));
+    Ok(attune_common::secret_values::redact_secret_path_sources(
+        result,
+        &classified,
+    ))
+}
+
+fn pointer_covers(parent: &str, child: &str) -> bool {
+    parent.is_empty()
+        || parent == child
+        || child
+            .strip_prefix(parent)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+/// Generated failure diagnostics use the bound error-channel policy. A schema
+/// protected business error already has a structured slot and is not duplicated.
+async fn protect_workflow_error_channel(
+    conn: &mut PgConnection,
+    execution: i64,
+    result: &mut JsonValue,
+    visibility: attune_common::output_policy::OutputVisibility,
+    key: Option<&str>,
+) -> Result<()> {
+    use attune_common::{
+        output_policy::{OutputVisibility, ResolvedOutputPolicy, StdoutPolicy},
+        secret_provenance::{SecretOrigin, SecretProvenance},
+    };
+    if visibility == OutputVisibility::Public {
+        return Ok(());
     }
-    Ok(
-        attune_common::secret_values::merge_contract_secret_redactions(
-            result,
-            &rendered.secret_path_sources,
-            &contract,
-        )?,
+    let Some(error) = result
+        .get("error")
+        .filter(|value| {
+            !value.is_null() && !attune_common::secret_values::is_redaction_marker(value)
+        })
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let mut provenance = SecretProvenance::default();
+    for field in ExecutionSecretValueRepository::find_stored_by_entity(
+        &mut *conn,
+        ENTITY_EXECUTION_CONFIG,
+        execution,
     )
+    .await?
+    {
+        provenance.origins.push(SecretOrigin::Entity {
+            entity_type: ENTITY_EXECUTION_CONFIG.into(),
+            entity_id: execution,
+            path: field.json_path,
+        });
+    }
+    provenance.origins.extend(attune_common::repositories::runtime_read::RuntimeReadRepository::references_for_executions(&mut *conn,&[execution]).await?.remove(&execution).unwrap_or_default());
+    let classified = attune_common::output_classification::classify_action_output(
+        serde_json::json!({"error":error}),
+        None,
+        attune_common::models::OutputFormat::Json,
+        ResolvedOutputPolicy {
+            stdout: StdoutPolicy::Public,
+            stderr: OutputVisibility::Public,
+            error: visibility,
+        },
+        execution,
+        &provenance,
+    )?;
+    result["error"] = classified.public_result["error"].clone();
+    result["output_channels"] = classified.public_result["output_channels"].clone();
+    let key =
+        key.ok_or_else(|| anyhow::anyhow!("Workflow error channel encryption is unavailable"))?;
+    ExecutionSecretValueRepository::replace_entity_with_conn(
+        conn,
+        attune_common::output_classification::ENTITY_EXECUTION_OUTPUT_CHANNEL,
+        execution,
+        &prepare_secret_values(classified.channel_secrets, key)?,
+    )
+    .await?;
+    Ok(())
 }
 
 fn workflow_result_view(result: &JsonValue) -> JsonValue {
@@ -2082,6 +2149,7 @@ impl ExecutionScheduler {
                         true,
                         None,
                         Some(output),
+                        encryption_key,
                     )
                     .await?;
                     let pending =
@@ -2116,6 +2184,7 @@ impl ExecutionScheduler {
                     true,
                     None,
                     None,
+                    encryption_key,
                 )
                 .await?;
                 let pending =
@@ -9505,6 +9574,9 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
                 } else {
                     None
                 };
+                let binding = attune_common::repositories::schema_contract::SchemaContractRepository::find_with_executor(
+                    &mut *conn, attune_common::repositories::schema_contract::BindingOwner::Execution, parent_execution.id,
+                ).await?.ok_or_else(|| anyhow::anyhow!("Workflow is missing its output schema binding"))?;
                 let output_map_result = if let Some(output) = prepared_success_output {
                     let key = encryption_key.ok_or_else(|| {
                         anyhow::anyhow!("Native success output encryption is unavailable")
@@ -9523,7 +9595,7 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
                         warn!(execution_id = parent_execution.id, "Workflow output did not conform to its stored schema; successful status retained");
                     }
                     let (value, secrets) =
-                        attune_common::secret_values::redact_secret_path_sources(actual, &sources);
+                        classify_workflow_result(actual, binding.output.as_ref(), &sources)?;
                     let fields = prepare_secret_values(secrets, key)?;
                     if serde_json::to_vec(&fields)?.len() > 1024 * 1024 {
                         return Err(anyhow::anyhow!(
@@ -9540,9 +9612,6 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
                     output.ensure_fresh_on(conn).await?;
                     Some(value)
                 } else if !has_failures {
-                    let binding = attune_common::repositories::schema_contract::SchemaContractRepository::find_with_executor(
-                    &mut *conn, attune_common::repositories::schema_contract::BindingOwner::Execution, parent_execution.id,
-                ).await?.ok_or_else(|| anyhow::anyhow!("Workflow is missing its output schema binding"))?;
                     let mut rendered_output = output_map_result
                         .unwrap_or_else(|| RenderedJson::plain(serde_json::json!({})));
                     if prepared_output.is_none() {
@@ -9611,7 +9680,7 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
                     })?;
                     let (actual, sources) = output.record(conn, &failed_tasks, key).await?;
                     let (value, secrets) =
-                        attune_common::secret_values::redact_secret_path_sources(actual, &sources);
+                        classify_workflow_result(actual, binding.output.as_ref(), &sources)?;
                     let fields = prepare_secret_values(secrets, key)?;
                     if serde_json::to_vec(&fields)?.len() > 1024 * 1024 {
                         return Err(anyhow::anyhow!(
@@ -9642,11 +9711,11 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
                         }
                     }
                     if !controls.is_empty() {
-                        let (value, secrets) =
-                            attune_common::secret_values::redact_secret_path_sources(
-                                build_workflow_result_payload(false, error_msg.as_deref(), None),
-                                &controls,
-                            );
+                        let (value, secrets) = classify_workflow_result(
+                            build_workflow_result_payload(false, error_msg.as_deref(), None),
+                            binding.output.as_ref(),
+                            &controls,
+                        )?;
                         let key = encryption_key.ok_or_else(|| {
                             anyhow::anyhow!("Workflow output encryption is not configured")
                         })?;
@@ -9677,6 +9746,7 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
                     !has_failures,
                     error_msg.as_deref(),
                     output_map_result,
+                    encryption_key,
                 )
                 .await?;
                 pending_completed_execution =
@@ -9838,6 +9908,7 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
         success: bool,
         error_message: Option<&str>,
         result_override: Option<JsonValue>,
+        encryption_key: Option<&str>,
     ) -> Result<Execution> {
         let status = if success {
             ExecutionStatus::Completed
@@ -9850,6 +9921,29 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
             workflow_execution_id, status, parent_execution_id
         );
 
+        let failure_policy = if !success {
+            Some(
+                attune_common::repositories::schema_contract::SchemaContractRepository::find(
+                    conn,
+                    attune_common::repositories::schema_contract::BindingOwner::Execution,
+                    parent_execution_id,
+                )
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Workflow output binding is unavailable"))?
+                .output_policy
+                .error,
+            )
+        } else {
+            None
+        };
+        let protected_error = failure_policy
+            == Some(attune_common::output_policy::OutputVisibility::Secret)
+            || result_override.as_ref().is_some_and(|value| {
+                attune_common::secret_values::is_redaction_marker(value)
+                    || value
+                        .get("error")
+                        .is_some_and(attune_common::secret_values::is_redaction_marker)
+            });
         WorkflowExecutionRepository::update(
             &mut *conn,
             workflow_execution_id,
@@ -9860,7 +9954,13 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
                 skipped_tasks: None,
                 variables: None,
                 status: Some(status),
-                error_message: error_message.map(|s| s.to_string()),
+                error_message: error_message.map(|message| {
+                    if protected_error {
+                        "[REDACTED]".to_owned()
+                    } else {
+                        message.to_owned()
+                    }
+                }),
                 paused: None,
                 pause_reason: None,
             },
@@ -9870,11 +9970,18 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
         let parent = ExecutionRepository::find_by_id(&mut *conn, parent_execution_id).await?;
         if let Some(mut parent) = parent {
             parent.status = status;
-            parent.result = Some(build_workflow_result_payload(
-                success,
-                error_message,
-                result_override,
-            ));
+            let mut result = build_workflow_result_payload(success, error_message, result_override);
+            if !success {
+                protect_workflow_error_channel(
+                    conn,
+                    parent.id,
+                    &mut result,
+                    failure_policy.expect("failure policy is loaded"),
+                    encryption_key,
+                )
+                .await?;
+            }
+            parent.result = Some(result);
             return ExecutionRepository::update(&mut *conn, parent.id, parent.into())
                 .await
                 .map_err(Into::into);
@@ -11047,7 +11154,19 @@ mod tests {
     }
 
     #[test]
-    fn native_generic_closure_protects_literal_outputs_and_preserves_root_marker() {
+    fn failure_payload_preserves_preclassified_fields_and_channel_metadata() {
+        let protected = serde_json::json!({"succeeded":false,"error":attune_common::secret_values::redaction_marker(),"output_channels":{"error":{"policy":"secret","original":{"execution_id":42,"channel":"error"}}}});
+        let result = build_workflow_result_payload(
+            false,
+            Some("private-original-error"),
+            Some(protected.clone()),
+        );
+        assert_eq!(result, protected);
+        assert!(!result.to_string().contains("private-original-error"));
+    }
+
+    #[test]
+    fn native_generic_closure_provides_origins_without_classifying_public_outputs() {
         let origin = attune_common::secret_provenance::SecretOrigin::Entity {
             entity_type: attune_common::repositories::runtime_read::ENTITY_RUNTIME_READ.into(),
             entity_id: 17,
@@ -11066,20 +11185,15 @@ mod tests {
         let contract = attune_common::value_schema::compile_inline("test.native.generic", attune_common::value_schema::SchemaContext::FlatDocument,
             &serde_json::json!({"decision":{"type":"string"},"token":{"type":"string","secret":true}})).unwrap();
         let (value, secrets) = prepare_bound_workflow_output(Some(&contract), rendered).unwrap();
-        assert!(attune_common::secret_values::is_redaction_marker(&value));
+        assert_eq!(value["decision"], "literal branch result");
+        assert!(attune_common::secret_values::is_redaction_marker(
+            &value["token"]
+        ));
         assert_eq!(secrets.len(), 1);
-        assert_eq!(secrets[0].json_path, "");
+        assert_eq!(secrets[0].json_path, "/token");
         let provenance: attune_common::secret_provenance::SecretProvenance =
             serde_json::from_str(secrets[0].source_ref.as_deref().unwrap()).unwrap();
         assert!(provenance.origins.contains(&origin));
-        assert_eq!(
-            build_workflow_result_payload(true, None, Some(value.clone())),
-            value
-        );
-        assert_eq!(
-            build_workflow_result_payload(false, Some("failed"), Some(value.clone())),
-            value
-        );
     }
 
     #[test]
@@ -11105,10 +11219,10 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(attune_common::secret_values::is_redaction_marker(&value));
-        assert_eq!(secrets[0].json_path, "");
-        assert_eq!(secrets[0].value["succeeded"], true);
-        assert!(secrets[0].value.get("output_validation_warning").is_some());
+        assert_eq!(value["count"], "invalid");
+        assert_eq!(value["succeeded"], true);
+        assert!(value.get("output_validation_warning").is_some());
+        assert_eq!(secrets[0].json_path, "/token");
         let (value, _) = prepare_bound_workflow_output(
             None,
             RenderedJson::plain(serde_json::json!({"count": "unrestricted"})),
@@ -11148,6 +11262,10 @@ mod tests {
         .unwrap();
         let binding = attune_common::repositories::schema_contract::ActionSchemaBinding {
             input,
+            output_policy: attune_common::output_policy::OutputPolicy::default()
+                .resolve(Some(&output), attune_common::models::OutputFormat::Json)
+                .unwrap(),
+            output_format: attune_common::models::OutputFormat::Json,
             output: Some(output),
             static_actions: Default::default(),
         };
@@ -11367,6 +11485,8 @@ tasks:
                 ActionRepository::create(
                     pool,
                     CreateActionInput {
+                        output_policy: Default::default(),
+                        output_format: Default::default(),
                         r#ref: format!("scheduler_inquiry_it.{name}"),
                         pack: pack_id,
                         pack_ref: "scheduler_inquiry_it".to_string(),

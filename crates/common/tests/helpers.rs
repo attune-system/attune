@@ -801,6 +801,8 @@ impl ActionFixture {
         E: sqlx::Acquire<'e, Database = Postgres> + Send + 'e,
     {
         let input = action::CreateActionInput {
+            output_policy: Default::default(),
+            output_format: Default::default(),
             pack: self.pack_id,
             pack_ref: self.pack_ref,
             r#ref: self.r#ref,

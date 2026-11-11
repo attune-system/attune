@@ -312,6 +312,7 @@ CREATE TABLE action (
     parameter_delivery TEXT NOT NULL DEFAULT 'stdin' CHECK (parameter_delivery IN ('stdin', 'file')),
     parameter_format TEXT NOT NULL DEFAULT 'json' CHECK (parameter_format IN ('dotenv', 'json', 'yaml')),
     output_format TEXT NOT NULL DEFAULT 'text' CHECK (output_format IN ('text', 'json', 'yaml', 'jsonl')),
+    output_policy JSONB NOT NULL DEFAULT '{}'::JSONB CHECK (jsonb_typeof(output_policy) = 'object'),
     is_adhoc BOOLEAN NOT NULL DEFAULT FALSE,
     timeout_seconds INTEGER,
     max_retries INTEGER DEFAULT 0,

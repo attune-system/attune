@@ -878,8 +878,10 @@ pub(super) fn compose<'a>(
     if let Some(contract) = contract {
         let compiled =
             crate::value_schema::CompiledContract::new(contract).map_err(|_| denied())?;
-        if let Err(error) = compiled.validate(&candidate) {
-            candidate["output_validation_warning"] = json!({"code":error.code,"path":error.path});
+        if let Some(warning) =
+            crate::output_classification::output_validation_warning(&compiled, &candidate)
+        {
+            candidate["output_validation_warning"] = warning;
         }
     }
     bounded(&candidate)?;
@@ -1271,7 +1273,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             result["output_validation_warning"],
-            json!({"code":error.code,"path":error.path})
+            json!({"code":error.code})
         );
         assert_eq!(result["value"], actual);
         assert_eq!(result["succeeded"], true);

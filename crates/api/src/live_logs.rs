@@ -31,6 +31,8 @@ pub(crate) struct LogPin {
     pub stream: Id,
     pub backend: LogStreamBackend,
     pub file_path: Option<String>,
+    pub encrypted: bool,
+    pub channel: attune_common::output_classification::OutputChannel,
     owner: Option<RuntimeReadOwner>,
 }
 
@@ -50,19 +52,36 @@ impl LogPin {
         let stream = LogStreamRepository::find_by_artifact_version(&state.db, version.id)
             .await?
             .ok_or_else(denied)?;
+        let channel = crate::secret_disclosure::runtime_log_artifact_channel(&artifact, &version)?;
+        let encrypted = match version
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("log_encoding"))
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(ENCODING) => true,
+            None => false,
+            Some(_) => return Err(denied()),
+        };
         if artifact.classification != ArtifactClassification::RuntimeLog
-            || version
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.get("log_encoding"))
-                .and_then(serde_json::Value::as_str)
-                != Some(ENCODING)
             || !matches!(
                 version.body_state,
                 Some(ArtifactBodyState::Pending | ArtifactBodyState::Ready)
             )
         {
             return Err(denied());
+        }
+        if !encrypted {
+            let binding = attune_common::repositories::schema_contract::SchemaContractRepository::find_with_executor(
+                &state.db, attune_common::repositories::schema_contract::BindingOwner::Execution,
+                version.execution.ok_or_else(denied)?,
+            ).await?.ok_or_else(denied)?;
+            if crate::secret_disclosure::runtime_log_channel_requires_disclosure(
+                &binding,
+                crate::secret_disclosure::runtime_log_version_channel(&version)?,
+            ) {
+                return Err(denied());
+            }
         }
         let mut pin = Self {
             artifact: artifact.id,
@@ -71,6 +90,8 @@ impl LogPin {
             stream: stream.id,
             backend: stream.backend,
             file_path: version.file_path,
+            encrypted,
+            channel,
             owner: None,
         };
         pin.owner = Some(pin.authorize_chunk(state, user).await?);
@@ -97,12 +118,16 @@ impl LogPin {
             .validate_recorded_runtime_authority(&mut tx)
             .await?
             .ok_or_else(denied)?;
-        let rows = crate::recorded_consumers::execution_content_origins(
+        let (rows, protected) = crate::recorded_consumers::execution_log_content_origins(
             &mut tx,
             self.execution,
-            (authority.credential_binding().execution_id == self.execution).then_some(self.stream),
+            self.stream,
+            authority.credential_binding().execution_id == self.execution,
         )
         .await?;
+        if protected && !self.encrypted {
+            return Err(denied());
+        }
         let mut prepared = crate::recorded_disclosure::OriginBudget::with_encryption_key(
             state.config.security.encryption_key.as_deref(),
         );
@@ -122,7 +147,11 @@ impl LogPin {
             &mut tx,
             &authority,
             RuntimeTarget::Artifact(self.artifact),
-            &[Action::Read, Action::Decrypt],
+            if protected {
+                &[Action::Read, Action::Decrypt]
+            } else {
+                &[Action::Read]
+            },
         )
         .await?;
         let owner = RuntimeReadOwner::of(&target);
@@ -192,14 +221,19 @@ impl LogPin {
         user: AuthenticatedUser,
     ) -> ApiResult<axum::response::Response> {
         let reader = crate::log_decoder::live_ciphertext(state.clone(), self.clone());
-        let key = state
-            .config
-            .security
-            .encryption_key
-            .clone()
-            .ok_or_else(denied)?;
-        let plaintext =
-            crate::log_decoder::verified_live_plaintext(reader, key, self.execution, self.version);
+        use futures::StreamExt;
+        let plaintext = if self.encrypted {
+            let key = state
+                .config
+                .security
+                .encryption_key
+                .clone()
+                .ok_or_else(denied)?;
+            crate::log_decoder::verified_live_plaintext(reader, key, self.execution, self.version)
+                .boxed()
+        } else {
+            crate::log_decoder::verified_public_live_plaintext(reader).boxed()
+        };
         let plaintext = crate::log_decoder::text_boundaries(plaintext);
         let stream = crate::recorded_reads::guarded_chunks(plaintext, move || {
             let (state, user, pin) = (state.clone(), user.clone(), self.clone());

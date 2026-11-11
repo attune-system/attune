@@ -83,8 +83,10 @@ struct ActionYaml {
     parameters: Option<serde_json::Value>,
 
     /// Output schema (flat format)
-    #[serde(default)]
+    #[serde(default, alias = "out_schema", alias = "output_schema")]
     output: Option<serde_json::Value>,
+    #[serde(default)]
+    output_policy: attune_common::output_policy::OutputPolicy,
 
     /// Tags
     #[serde(default)]
@@ -109,6 +111,7 @@ struct SaveWorkflowFileRequest {
     param_schema: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     out_schema: Option<serde_json::Value>,
+    output_policy: attune_common::output_policy::OutputPolicy,
     #[serde(skip_serializing_if = "Option::is_none")]
     tags: Option<Vec<String>>,
 }
@@ -155,6 +158,7 @@ fn build_upload_request(
         definition: serde_json::Value::Object(definition_map),
         param_schema: action.parameters.clone(),
         out_schema: action.output.clone(),
+        output_policy: action.output_policy.clone(),
         tags: action.tags.clone(),
     })
 }
@@ -856,5 +860,21 @@ tasks:
         let error =
             resolve_workflow_path(&action_path, "workflows/deploy.workflow.yaml").unwrap_err();
         assert!(error.to_string().contains("outside the canonical actions"));
+    }
+    #[test]
+    fn workflow_upload_preserves_output_schema_and_channel_policy() {
+        let action: ActionYaml = serde_yaml_ng::from_str(
+            "ref: example.flow\nworkflow_file: workflows/flow.yaml\nout_schema: {status: {type: string}}\noutput_policy: {stdout: secret, error: public}\n",
+        ).unwrap();
+        let request = build_upload_request(
+            &action,
+            serde_json::json!({"tasks":[]}),
+            "actions/workflows/flow.yaml",
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(request).unwrap();
+        assert_eq!(encoded["out_schema"]["status"]["type"], "string");
+        assert_eq!(encoded["output_policy"]["stdout"], "secret");
+        assert_eq!(encoded["output_policy"]["error"], "public");
     }
 }

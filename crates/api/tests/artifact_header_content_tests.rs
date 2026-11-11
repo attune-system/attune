@@ -58,12 +58,58 @@ fn content_openapi_exposes_optional_immutable_version_id() -> Result<()> {
     Ok(())
 }
 
+/// Origin-admission cases explicitly classify stdout as secret. Input origins
+/// and selected API permissions alone never classify a public channel.
+async fn protected_action_pack(ctx: &TestContext) -> Result<String> {
+    managed_fixture::deploy(ctx, "artifact_perf", &[
+        ("runtimes/native.yaml", "ref: artifact_perf.native\nname: native\nexecution_config: {}\n".into()),
+        ("actions/run.yaml", "ref: artifact_perf.run\nrunner_type: native\nentry_point: run.sh\noutput_policy:\n  stdout: secret\n".into()),
+        ("actions/run.sh", "#!/bin/sh\nprintf '{}\\n'\n".into()),
+    ]).await?;
+    Ok("artifact_perf.run".into())
+}
+
+#[tokio::test]
+async fn secret_input_origin_does_not_protect_public_runtime_log_content() -> Result<()> {
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
+    grant_artifacts(&ctx).await?;
+    let action = managed_fixture::action_pack(&ctx).await?;
+    let producer = execution(&ctx, &action).await?;
+    denied_key_origin(&ctx, producer).await?;
+    let id = artifact(
+        &ctx,
+        "fixture.stdout.log",
+        ArtifactClassification::RuntimeLog,
+        ArtifactType::FileText,
+    )
+    .await?;
+    let selected = version(&ctx, id, Some(producer), "public output").await?;
+    let response = ctx
+        .get(
+            &format!(
+                "/api/v1/artifacts/{id}/versions/{}/download?version_id={}",
+                selected.version, selected.id
+            ),
+            ctx.token(),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&response.bytes().await?)?,
+        json!({"body":"public output"})
+    );
+    ctx.cleanup().await
+}
+
 async fn grant_artifacts(ctx: &TestContext) -> Result<()> {
     let identity = ctx.user.as_ref().ok_or("fixture identity missing")?.id;
     let set = PermissionSetRepository::create(&ctx.pool, CreatePermissionSetInput {
         r#ref: "fixture.headers".into(), pack: None, pack_ref: None, label: None, description: None,
         grants: json!([
-            {"resource":"artifacts","actions":["read"],"constraints":{"refs":["fixture.log","fixture.progress"]}},
+            {"resource":"artifacts","actions":["read"],"constraints":{"refs":["fixture.stdout.log","fixture.progress"]}},
             {"resource":"executions","actions":["read","decrypt"]},
             {"resource":"actions","actions":["read","execute"]}
         ]),
@@ -145,7 +191,7 @@ async fn version(
             content: None,
             content_json: Some(json!({"body":body})),
             file_path: None,
-            meta: Some(json!({"private":"version metadata"})),
+            meta: Some(json!({"private":"version metadata", "stream":"stdout"})),
             created_by: None,
         },
     )
@@ -155,7 +201,7 @@ async fn version(
 async fn assert_safe_header(ctx: &TestContext, id: i64) -> Result<()> {
     for path in [
         format!("/api/v1/artifacts/{id}"),
-        "/api/v1/artifacts/ref/fixture.log".into(),
+        "/api/v1/artifacts/ref/fixture.stdout.log".into(),
     ] {
         let response = ctx.get(&path, ctx.token()).await?;
         assert_eq!(response.status(), StatusCode::OK, "{path}");
@@ -245,7 +291,7 @@ async fn runtime_log_header_at_257_links_exposes_only_allowlisted_metadata() -> 
     let action_ref = managed_fixture::action_pack(&ctx).await?;
     let id = artifact(
         &ctx,
-        "fixture.log",
+        "fixture.stdout.log",
         ArtifactClassification::RuntimeLog,
         ArtifactType::FileText,
     )
@@ -265,13 +311,13 @@ async fn selected_runtime_log_body_ignores_denied_sibling_key_sources() -> Resul
         .with_auth()
         .await?;
     grant_artifacts(&ctx).await?;
-    let action_ref = managed_fixture::action_pack(&ctx).await?;
+    let action_ref = protected_action_pack(&ctx).await?;
     let old_execution = execution(&ctx, &action_ref).await?;
     denied_key_origin(&ctx, old_execution).await?;
     let selected_execution = execution(&ctx, &action_ref).await?;
     let id = artifact(
         &ctx,
-        "fixture.log",
+        "fixture.stdout.log",
         ArtifactClassification::RuntimeLog,
         ArtifactType::FileText,
     )
@@ -319,7 +365,7 @@ async fn immutable_version_id_rejects_recreated_same_number_content() -> Result<
     grant_artifacts(&ctx).await?;
     let id = artifact(
         &ctx,
-        "fixture.log",
+        "fixture.stdout.log",
         ArtifactClassification::General,
         ArtifactType::FileText,
     )
@@ -362,7 +408,7 @@ async fn ordinary_artifact_content_preserves_nonrecorded_execution_credentials()
     grant_artifacts(&ctx).await?;
     let id = artifact(
         &ctx,
-        "fixture.log",
+        "fixture.stdout.log",
         ArtifactClassification::General,
         ArtifactType::FileText,
     )
@@ -441,7 +487,7 @@ async fn nonsensitive_runtime_log_preserves_legacy_execution_reads_through_chunk
     let producer = execution_with_refs(&ctx, &action_ref, &["fixture.headers".into()]).await?;
     let id = artifact(
         &ctx,
-        "fixture.log",
+        "fixture.stdout.log",
         ArtifactClassification::RuntimeLog,
         ArtifactType::FileText,
     )
@@ -459,7 +505,7 @@ async fn nonsensitive_runtime_log_preserves_legacy_execution_reads_through_chunk
             content: None,
             content_json: None,
             file_path: Some(path),
-            meta: None,
+            meta: Some(json!({"stream":"stdout"})),
             created_by: None,
         },
     )
@@ -548,7 +594,7 @@ async fn segment_stream_seal_case(freeze_reader: bool) -> Result<()> {
     let producer = execution(&ctx, &action_ref).await?;
     let id = artifact(
         &ctx,
-        "fixture.log",
+        "fixture.stdout.log",
         ArtifactClassification::RuntimeLog,
         ArtifactType::FileText,
     )
@@ -556,11 +602,11 @@ async fn segment_stream_seal_case(freeze_reader: bool) -> Result<()> {
     let selected = ArtifactVersionRepository::create_log_pending(
         &ctx.pool,
         id,
-        "fixture.log",
+        "fixture.stdout.log",
         LogStreamBackend::ObjectSegments,
         "text/plain".into(),
         Some(producer),
-        None,
+        Some(json!({"stream":"stdout"})),
         None,
     )
     .await?;
@@ -633,7 +679,7 @@ async fn runtime_log_header_does_not_authorize_a_missing_selected_execution() ->
     grant_artifacts(&ctx).await?;
     let id = artifact(
         &ctx,
-        "fixture.log",
+        "fixture.stdout.log",
         ArtifactClassification::RuntimeLog,
         ArtifactType::FileText,
     )
@@ -654,7 +700,7 @@ async fn runtime_log_header_does_not_authorize_a_missing_selected_execution() ->
     .await?;
     for path in [
         format!("/api/v1/artifacts/{id}"),
-        "/api/v1/artifacts/ref/fixture.log".into(),
+        "/api/v1/artifacts/ref/fixture.stdout.log".into(),
     ] {
         let response = ctx.get(&path, ctx.token()).await?;
         assert_eq!(response.status(), StatusCode::OK, "{path}");
@@ -726,7 +772,7 @@ async fn ordinary_progress_detail_keeps_its_protected_data_projection() -> Resul
 }
 
 #[tokio::test]
-async fn running_delegated_logs_enforce_frozen_use_ceiling_before_result_materialization(
+async fn running_secret_logs_require_decrypt_without_inventing_selected_permission_origins(
 ) -> Result<()> {
     use attune_common::{
         auth::jwt::generate_access_token,
@@ -757,7 +803,7 @@ async fn running_delegated_logs_enforce_frozen_use_ceiling_before_result_materia
     )
     .await?;
     attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(owner).await;
-    let action = managed_fixture::action_pack(&ctx).await?;
+    let action = protected_action_pack(&ctx).await?;
     let producer = execution_with_refs(&ctx, &action, &[signer.r#ref]).await?;
     let mut tx = ctx.pool.begin().await?;
     delegated::start(&mut tx, producer).await?;
@@ -777,7 +823,7 @@ async fn running_delegated_logs_enforce_frozen_use_ceiling_before_result_materia
     assert!(attune_common::repositories::execution_key_read::ExecutionKeyReadRepository::origins_for_executions(&ctx.pool, &[producer]).await?.is_empty());
     let log = artifact(
         &ctx,
-        "fixture.log",
+        "fixture.stdout.log",
         ArtifactClassification::RuntimeLog,
         ArtifactType::FileText,
     )
@@ -825,8 +871,16 @@ async fn running_delegated_logs_enforce_frozen_use_ceiling_before_result_materia
             StatusCode::OK,
             "the covered producer can read its early output"
         );
-        let denied = ctx.get(path, Some(&token)).await?;
-        assert_eq!(denied.status(), StatusCode::NOT_FOUND, "log read/decrypt alone cannot disclose an API-capable producer's output before result provenance exists");
+        let readable = ctx.get(path, Some(&token)).await?;
+        assert_eq!(
+            readable.status(),
+            StatusCode::OK,
+            "selected API permissions are not recorded secret origins"
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&readable.bytes().await?)?,
+            json!({"body":"early-approved-operation-assertion"})
+        );
     }
     PermissionAssignmentRepository::create(
         &ctx.pool,
@@ -849,7 +903,7 @@ async fn running_delegated_logs_enforce_frozen_use_ceiling_before_result_materia
             json!({"body":"early-approved-operation-assertion"})
         );
     }
-    // Opaque API-capable output requires execution decrypt even before any
+    // Explicitly secret stdout requires execution decrypt even when no
     // result or runtime Key origin has been materialized.
     let read_only = IdentityRepository::create(
         &ctx.pool,
@@ -864,7 +918,7 @@ async fn running_delegated_logs_enforce_frozen_use_ceiling_before_result_materia
     let read_set = PermissionSetRepository::create(&ctx.pool, CreatePermissionSetInput {
         r#ref: "fixture.live_read_only".into(), pack: None, pack_ref: None, label: None, description: None,
         grants: json!([
-            {"resource":"artifacts","actions":["read"],"constraints":{"refs":["fixture.log"]}},
+            {"resource":"artifacts","actions":["read"],"constraints":{"refs":["fixture.stdout.log"]}},
             {"resource":"executions","actions":["read"]},
             {"resource":"keys","actions":["use"],"constraints":{"owner_types":["system"],"refs":["system.live_signer"]}}
         ]),
@@ -907,11 +961,11 @@ async fn pending_runtime_log_downloads_distinguish_finalizing_incomplete_and_den
         .with_auth()
         .await?;
     grant_artifacts(&ctx).await?;
-    let action_ref = managed_fixture::action_pack(&ctx).await?;
+    let action_ref = protected_action_pack(&ctx).await?;
     let producer = execution(&ctx, &action_ref).await?;
     let id = artifact(
         &ctx,
-        "fixture.log",
+        "fixture.stdout.log",
         ArtifactClassification::RuntimeLog,
         ArtifactType::FileText,
     )
@@ -919,11 +973,11 @@ async fn pending_runtime_log_downloads_distinguish_finalizing_incomplete_and_den
     let selected = ArtifactVersionRepository::create_log_pending(
         &ctx.pool,
         id,
-        "fixture.log",
+        "fixture.stdout.log",
         LogStreamBackend::ObjectSegments,
         "text/plain".into(),
         Some(producer),
-        Some(json!({"log_encoding":"attune_encrypted_log_v1"})),
+        Some(json!({"log_encoding":"attune_encrypted_log_v1", "stream":"stdout"})),
         None,
     )
     .await?;
@@ -1002,7 +1056,7 @@ async fn runtime_log_download_audit_requires_full_authorized_eof() -> Result<()>
     let producer = execution(&ctx, &action_ref).await?;
     let id = artifact(
         &ctx,
-        "fixture.log",
+        "fixture.stdout.log",
         ArtifactClassification::RuntimeLog,
         ArtifactType::FileText,
     )
@@ -1094,7 +1148,7 @@ async fn runtime_log_http1_download_reaches_audited_eof_for_nonempty_and_empty_b
     let producer = execution(&ctx, &action_ref).await?;
     let id = artifact(
         &ctx,
-        "fixture.log",
+        "fixture.stdout.log",
         ArtifactClassification::RuntimeLog,
         ArtifactType::FileText,
     )
@@ -1123,7 +1177,7 @@ async fn runtime_log_http1_download_reaches_audited_eof_for_nonempty_and_empty_b
                     content: Some(payload.to_vec()),
                     content_json: None,
                     file_path: None,
-                    meta: None,
+                    meta: Some(json!({"stream":"stdout"})),
                     created_by: None,
                 },
             )

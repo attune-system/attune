@@ -61,11 +61,11 @@ pub(super) async fn detail(
         for (entity, value) in [
             (
                 attune_common::secret_values::ENTITY_EXECUTION_CONFIG,
-                execution.config,
+                execution.config.clone(),
             ),
             (
                 attune_common::secret_values::ENTITY_EXECUTION_RESULT,
-                execution.result,
+                execution.result.clone(),
             ),
         ] {
             let value = if let Some(value) = value {
@@ -79,6 +79,11 @@ pub(super) async fn detail(
                 response.result = value;
             }
         }
+    }
+    if let Some(content) = content.as_ref() {
+        response.revealed_output_channels = content
+            .restore_output_channels(&mut tx, execution.result.as_ref())
+            .await?;
     }
     // Serialize while the source transaction is still held, before final checks.
     let encoded = serde_json::to_vec(&ApiResponse::new(response))
@@ -104,7 +109,10 @@ pub(super) async fn detail(
     }
     Ok((
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (axum::http::header::CACHE_CONTROL, "private, no-store"),
+        ],
         encoded,
     )
         .into_response())

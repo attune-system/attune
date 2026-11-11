@@ -1565,6 +1565,8 @@ pub mod action {
         pub worker_affinity: JsonDict,
         pub param_schema: Option<JsonSchema>,
         pub out_schema: Option<JsonSchema>,
+        #[sqlx(json)]
+        pub output_policy: crate::output_policy::OutputPolicy,
         pub workflow_def: Option<Id>,
         pub is_adhoc: bool,
         #[sqlx(default)]

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::client::ApiClient;
 use crate::config::CliConfig;
+use crate::execution_disclosure::execution_detail_path;
 use crate::manual_execution::{ManualExecutionOptions, ManualExecutionRequest};
 use crate::output::{self, OutputFormat};
 use crate::wait::{extract_stdout, watch_execution, WaitOptions, WatchOutcome};
@@ -108,6 +109,9 @@ pub enum ExecutionCommands {
     Show {
         /// Execution ID
         execution_id: i64,
+        /// Explicitly reveal values permitted by execution decrypt and source grants.
+        #[arg(long, alias = "decrypt")]
+        include_secret_values: bool,
     },
     /// Show a cross-system activity report for an exact trace tag
     TraceReport {
@@ -140,6 +144,9 @@ pub enum ExecutionCommands {
         /// Output format (json or yaml, default: json)
         #[arg(short = 'f', long, value_enum, default_value = "json")]
         format: ResultFormat,
+        /// Include authorized secret values and separate original output channels.
+        #[arg(long, alias = "decrypt")]
+        include_secret_values: bool,
     },
     /// Re-run an existing execution with the same (or edited) parameters
     Rerun {
@@ -216,6 +223,8 @@ struct ExecutionDetail {
     status: String,
     #[serde(default)]
     result: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revealed_output_channels: Option<serde_json::Value>,
     #[serde(default)]
     parent: Option<i64>,
     #[serde(default)]
@@ -389,8 +398,18 @@ pub async fn handle_execution_command(
                 handle_watch_list(profile, filters, api_url, output_format).await
             }
         }
-        ExecutionCommands::Show { execution_id } => {
-            handle_show(profile, execution_id, api_url, output_format).await
+        ExecutionCommands::Show {
+            execution_id,
+            include_secret_values,
+        } => {
+            handle_show(
+                profile,
+                execution_id,
+                include_secret_values,
+                api_url,
+                output_format,
+            )
+            .await
         }
         ExecutionCommands::TraceReport { trace_tag } => {
             handle_trace_report(profile, trace_tag, api_url, output_format).await
@@ -405,7 +424,17 @@ pub async fn handle_execution_command(
         ExecutionCommands::Result {
             execution_id,
             format,
-        } => handle_result(profile, execution_id, format, api_url).await,
+            include_secret_values,
+        } => {
+            handle_result(
+                profile,
+                execution_id,
+                format,
+                include_secret_values,
+                api_url,
+            )
+            .await
+        }
         ExecutionCommands::Rerun {
             execution_id,
             interactive,
@@ -802,13 +831,14 @@ fn ensure_watch_execution_mode_has_no_list_filters(args: &ExecutionListArgs) -> 
 async fn handle_show(
     profile: &Option<String>,
     execution_id: i64,
+    include_secret_values: bool,
     api_url: &Option<String>,
     output_format: OutputFormat,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
     let mut client = ApiClient::from_config(&config, api_url)?;
 
-    let path = format!("/executions/{}", execution_id);
+    let path = execution_detail_path(execution_id, include_secret_values);
     let execution: ExecutionDetail = client.get(&path).await?;
 
     match output_format {
@@ -866,6 +896,12 @@ async fn handle_show(
                 if !result.is_null() {
                     output::print_section("Result");
                     println!("{}", serde_json::to_string_pretty(&result)?);
+                }
+            }
+            if let Some(channels) = execution.revealed_output_channels {
+                if !channels.is_null() {
+                    output::print_section("Revealed Original Output Channels");
+                    println!("{}", serde_json::to_string_pretty(&channels)?);
                 }
             }
         }
@@ -1054,15 +1090,21 @@ async fn handle_result(
     profile: &Option<String>,
     execution_id: i64,
     format: ResultFormat,
+    include_secret_values: bool,
     api_url: &Option<String>,
 ) -> Result<()> {
     let config = CliConfig::load_with_profile(profile.as_deref())?;
     let mut client = ApiClient::from_config(&config, api_url)?;
 
-    let path = format!("/executions/{}", execution_id);
+    let path = execution_detail_path(execution_id, include_secret_values);
     let execution: ExecutionDetail = client.get(&path).await?;
 
     if let Some(result) = execution.result {
+        let result = if include_secret_values {
+            serde_json::json!({"result": result, "revealed_output_channels": execution.revealed_output_channels})
+        } else {
+            result
+        };
         match format {
             ResultFormat::Json => {
                 println!("{}", serde_json::to_string_pretty(&result)?);
@@ -1503,6 +1545,60 @@ fn normalize_statuses(statuses: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn execution_disclosure_flags_are_explicit_and_accept_decrypt_alias() {
+        use crate::{Cli, Commands};
+        use clap::Parser;
+        for flag in ["--include-secret-values", "--decrypt"] {
+            let show = Cli::try_parse_from(["attune", "execution", "show", "42", flag]).unwrap();
+            assert!(matches!(
+                show.command,
+                Commands::Execution {
+                    command: ExecutionCommands::Show {
+                        execution_id: 42,
+                        include_secret_values: true
+                    }
+                }
+            ));
+            let result =
+                Cli::try_parse_from(["attune", "execution", "result", "42", flag]).unwrap();
+            assert!(matches!(
+                result.command,
+                Commands::Execution {
+                    command: ExecutionCommands::Result {
+                        execution_id: 42,
+                        include_secret_values: true,
+                        ..
+                    }
+                }
+            ));
+        }
+        let show = Cli::try_parse_from(["attune", "execution", "show", "42"]).unwrap();
+        assert!(matches!(
+            show.command,
+            Commands::Execution {
+                command: ExecutionCommands::Show {
+                    include_secret_values: false,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn execution_details_keep_separate_revealed_channels() {
+        let execution: ExecutionDetail = serde_json::from_value(serde_json::json!({
+            "id":42,"action_ref":"example.run","status":"completed","created":"2026-11-09T00:00:00Z","updated":"2026-11-09T00:00:01Z",
+            "result":{"stdout":"sanitized"},"revealed_output_channels":{"stdout":"private original"}
+        })).unwrap();
+        let encoded = serde_json::to_value(execution).unwrap();
+        assert_eq!(encoded["result"]["stdout"], "sanitized");
+        assert_eq!(
+            encoded["revealed_output_channels"]["stdout"],
+            "private original"
+        );
+    }
+
     use super::*;
 
     #[test]

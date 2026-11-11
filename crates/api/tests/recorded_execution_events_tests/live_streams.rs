@@ -202,7 +202,7 @@ impl PendingLog {
             LogStreamBackend::SharedFile,
             "text/plain".into(),
             Some(producer),
-            Some(json!({"log_encoding":ENCODING})),
+            Some(json!({"stream":"stdout","log_encoding":ENCODING})),
             None,
         )
         .await?;
@@ -276,7 +276,7 @@ impl PendingLog {
         Reads::close_execution(&mut tx, self.producer).await?;
         sqlx::query("UPDATE artifact_version SET body_state='ready',size_bytes=$2,sha256=$3,meta=$4 WHERE id=$1")
             .bind(self.version).bind(self.ciphertext as i64).bind(&manifest.ciphertext_sha256)
-            .bind(json!({"log_encoding":ENCODING,"encrypted_log_manifest":proof})).execute(&mut *tx).await?;
+            .bind(json!({"stream":"stdout","log_encoding":ENCODING,"encrypted_log_manifest":proof})).execute(&mut *tx).await?;
         LogStreamRepository::seal_shared_file(&mut tx, self.stream, self.ciphertext as i64, false)
             .await?;
         ExecutionRepository::update(

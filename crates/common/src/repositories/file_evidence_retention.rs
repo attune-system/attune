@@ -622,7 +622,7 @@ impl Closure {
                 }
                 continue;
             }
-            if matches!(origin, SecretOrigin::Entity { entity_type, .. } if ["execution_config", "execution_result", "workflow_variables", "inquiry_response", "queue_item_result"].contains(&entity_type.as_str()))
+            if matches!(origin, SecretOrigin::Entity { entity_type, .. } if ["execution_config", "execution_result", "execution_output_channel", "workflow_variables", "inquiry_response", "queue_item_result", "queue_item_ack_summary", "queue_item_last_error"].contains(&entity_type.as_str()))
             {
                 if !self.discovered_sites.contains(origin) {
                     self.rows(1)?;
@@ -665,7 +665,13 @@ impl Closure {
         }
         let kind = match entity {
             "execution_runtime_read" => "execution_runtime_read_origin",
-            "execution_config" | "execution_result" | "workflow_variables" => "execution",
+            "execution_config"
+            | "execution_result"
+            | "execution_output_channel"
+            | "workflow_variables" => "execution",
+            "queue_item_ack_summary" | "queue_item_last_error" | "queue_item_result" => {
+                "work_queue_item"
+            }
             "component_configuration" => "component_configuration_revision",
             "sensor_generation_config" | "sensor_generation_rule_config" => {
                 "sensor_generation_schema_binding"
@@ -793,9 +799,12 @@ impl Closure {
                 "cache_namespace",
                 "execution_config",
                 "execution_result",
+                "execution_output_channel",
                 "workflow_variables",
                 "inquiry_response",
                 "queue_item_result",
+                "queue_item_ack_summary",
+                "queue_item_last_error",
             ]
             .contains(&parent.entity_type.as_str())
             {

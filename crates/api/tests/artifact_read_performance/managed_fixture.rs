@@ -90,10 +90,20 @@ pub(super) async fn deploy(
     Ok(())
 }
 
+// Shared by independent test executables, some of which only use secret policies.
+#[allow(dead_code)]
 pub(super) async fn action_pack(ctx: &TestContext) -> Result<String> {
+    action_pack_with_secret_channels(ctx, false).await
+}
+
+pub(super) async fn action_pack_with_secret_channels(
+    ctx: &TestContext,
+    secret: bool,
+) -> Result<String> {
+    let visibility = if secret { "secret" } else { "public" };
     deploy(ctx, "artifact_perf", &[
         ("runtimes/native.yaml", "ref: artifact_perf.native\nname: native\nexecution_config: {}\n".into()),
-        ("actions/run.yaml", "ref: artifact_perf.run\nrunner_type: native\nentry_point: run.sh\n".into()),
+        ("actions/run.yaml", format!("ref: artifact_perf.run\nrunner_type: native\nentry_point: run.sh\noutput_policy:\n  stdout: {visibility}\n  stderr: {visibility}\n")),
         ("actions/run.sh", "#!/bin/sh\nprintf '{}\\n'\n".into()),
         ("sensors/sensor.yaml", "ref: artifact_perf.sensor\nrunner_type: native\nentry_point: sensor\ntrigger_types: [artifact_perf.sensor_event]\n".into()),
         ("sensors/sensor", "#!/bin/sh\nexit 0\n".into()),

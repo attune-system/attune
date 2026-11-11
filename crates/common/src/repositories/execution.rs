@@ -1524,7 +1524,7 @@ impl Delete for ExecutionRepository {
             ),
             deleted_result_secrets AS (
                 DELETE FROM execution_secret_value
-                WHERE entity_type IN ('execution_result', 'workflow_variables')
+                WHERE entity_type IN ('execution_result', 'execution_output_channel', 'workflow_variables')
                   AND entity_id IN (SELECT id FROM deleted_execution)
             )
             SELECT

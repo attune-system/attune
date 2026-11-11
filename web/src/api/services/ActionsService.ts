@@ -5,6 +5,8 @@
 import type { ActionReferenceVisibility } from "../models/ActionReferenceVisibility";
 import type { CreateActionRequest } from "../models/CreateActionRequest";
 import type { ExecutionOptionsAuthoritySource } from "../models/ExecutionOptionsAuthoritySource";
+import type { OutputFormat } from "../models/OutputFormat";
+import type { OutputPolicy } from "../models/OutputPolicy";
 import type { PaginatedResponse_ActionSearchHit } from "../models/PaginatedResponse_ActionSearchHit";
 import type { PaginatedResponse_ActionSummary } from "../models/PaginatedResponse_ActionSummary";
 import type { RetentionPolicyType } from "../models/RetentionPolicyType";
@@ -127,6 +129,11 @@ export class ActionsService {
        * Output schema
        */
       out_schema: Record<string, any> | null;
+      output_format: OutputFormat;
+      /**
+       * Authored output channel policy; defaults resolve under the stored schema.
+       */
+      output_policy: OutputPolicy;
       /**
        * Pack ID
        */
@@ -332,6 +339,11 @@ export class ActionsService {
        * Output schema
        */
       out_schema: Record<string, any> | null;
+      output_format: OutputFormat;
+      /**
+       * Authored output channel policy; defaults resolve under the stored schema.
+       */
+      output_policy: OutputPolicy;
       /**
        * Pack ID
        */
@@ -483,6 +495,11 @@ export class ActionsService {
        * Output schema
        */
       out_schema: Record<string, any> | null;
+      output_format: OutputFormat;
+      /**
+       * Authored output channel policy; defaults resolve under the stored schema.
+       */
+      output_policy: OutputPolicy;
       /**
        * Pack ID
        */

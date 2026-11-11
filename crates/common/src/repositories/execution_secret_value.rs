@@ -23,7 +23,7 @@ pub struct ExecutionSecretValue {
 pub struct ExecutionSecretValueRepository;
 
 /// Authorization reads recorded origins, never ciphertext or encryption keys.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct SecretProvenanceRow {
     pub entity_type: String,
     pub entity_id: Id,

@@ -113,6 +113,8 @@ async fn setup_executable_action(pool: &PgPool, suffix: &str) -> TResult<(Pack, 
     let action = ActionRepository::create(
         pool,
         CreateActionInput {
+            output_policy: Default::default(),
+            output_format: Default::default(),
             r#ref: format!("{}.call_api", pack.r#ref),
             pack: pack.id,
             pack_ref: pack.r#ref.clone(),
@@ -184,6 +186,8 @@ async fn create_action_with_default_access(
     Ok(ActionRepository::create(
         pool,
         CreateActionInput {
+            output_policy: Default::default(),
+            output_format: Default::default(),
             r#ref: format!("{}.{}", pack.r#ref, name),
             pack: pack.id,
             pack_ref: pack.r#ref.clone(),

@@ -175,6 +175,11 @@ pub struct ExecutionResponse {
     #[schema(value_type = Object, example = json!({"message_id": "1234567890.123456"}))]
     pub result: Option<JsonValue>,
 
+    /// Explicitly requested original channel values, separate from public projections.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub revealed_output_channels: Option<JsonValue>,
+
     /// Immutable admitted input/output contracts, excluding executable task metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schema_binding: Option<JsonValue>,
@@ -504,6 +509,7 @@ impl From<attune_common::models::execution::Execution> for ExecutionResponse {
                 .map(|r| serde_json::to_value(r).unwrap_or(JsonValue::Null)),
             original_execution: execution.original_execution,
             schema_binding: None,
+            revealed_output_channels: None,
             started_at: execution.started_at,
             workflow_task: execution.workflow_task,
             created: execution.created,

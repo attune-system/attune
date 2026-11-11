@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { ActionReferenceVisibility } from "./ActionReferenceVisibility";
+import type { OutputPolicy } from "./OutputPolicy";
 /**
  * Request DTO for saving a workflow file to disk and syncing to DB
  */
@@ -32,6 +33,10 @@ export type SaveWorkflowFileRequest = {
    * Output schema (flat format)
    */
   out_schema: Record<string, any> | null;
+  /**
+   * Companion action output channel classification.
+   */
+  output_policy?: OutputPolicy;
   /**
    * Pack reference this workflow belongs to
    */

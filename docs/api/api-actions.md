@@ -8,6 +8,14 @@ Actions are the executable units in Attune that perform specific tasks. Each act
 
 **Base Path:** `/api/v1/actions`
 
+`param_schema` and `out_schema` use Attune's flat per-field format. Nested
+`secret: true` annotations in `out_schema` classify structured output paths.
+`output_format` selects `text`, `json`, `yaml`, or `jsonl`; `output_policy`
+controls stdout/stderr/error independently of input secrecy. These fields are
+accepted by action create/update and returned in action responses. See
+[action output secrecy](../action-output-secrecy.md) for authoring examples,
+policy defaults, and publication constraints.
+
 ## Data Model
 
 ### Action
@@ -23,19 +31,14 @@ Actions are the executable units in Attune that perform specific tasks. Each act
   "entrypoint": "/actions/http_get.py",
   "runtime": 1,
   "param_schema": {
-    "type": "object",
-    "properties": {
-      "url": { "type": "string" },
-      "headers": { "type": "object" }
-    },
-    "required": ["url"]
+    "url": { "type": "string", "required": true },
+    "headers": { "type": "object" }
   },
+  "output_format": "json",
+  "output_policy": {},
   "out_schema": {
-    "type": "object",
-    "properties": {
-      "status_code": { "type": "integer" },
-      "body": { "type": "string" }
-    }
+    "status_code": { "type": "integer" },
+    "body": { "type": "string" }
   },
   "created": "2024-01-13T10:00:00Z",
   "updated": "2024-01-13T10:00:00Z"
@@ -194,12 +197,8 @@ Create a new action in the system.
   "entrypoint": "/actions/http_get.py",
   "runtime": 1,
   "param_schema": {
-    "type": "object",
-    "properties": {
-      "url": { "type": "string" },
-      "headers": { "type": "object" }
-    },
-    "required": ["url"]
+    "url": { "type": "string", "required": true },
+    "headers": { "type": "object" }
   },
   "out_schema": {
     "type": "object",
@@ -220,8 +219,11 @@ Create a new action in the system.
 
 **Optional Fields:**
 - `runtime`: Runtime ID for execution environment
-- `param_schema`: JSON Schema defining input parameters
-- `out_schema`: JSON Schema defining expected outputs
+- `param_schema`: Flat field map defining input parameters
+- `out_schema`: Flat field map defining expected outputs and nested secret annotations
+- `output_format`: `text`, `json`, `yaml`, or `jsonl`
+- `output_policy`: Optional `stdout` (`public`, `secret`, `sanitized`), `stderr`
+  (`public`, `secret`), and `error` (`public`, `secret`) choices
 
 **Response:** `201 Created`
 
@@ -504,8 +506,8 @@ curl http://localhost:3000/api/v1/actions/core.http.get/queue-stats
 - Format depends on the runtime environment
 
 ### Schemas (`param_schema`, `out_schema`)
-- Must be valid JSON Schema documents
-- Used for validation during action execution
+- Must use the flat per-field value-schema format; raw JSON Schema roots are rejected
+- Compiled and pinned at admission; output annotations classify secret result paths
 - Helps with auto-generating documentation and UI
 
 ---
@@ -519,8 +521,8 @@ curl http://localhost:3000/api/v1/actions/core.http.get/queue-stats
 
 2. **Schema Definitions**
    - Always provide `param_schema` for clarity
-   - Define `required` fields in schemas
-   - Use appropriate JSON Schema types and formats
+   - Mark required fields with `required: true` in each field definition
+   - Use supported field types and nested schema definitions
    - Document schema fields with descriptions
 
 3. **Entry Points**

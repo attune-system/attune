@@ -329,6 +329,9 @@ jobs:
           POSTGRES_USER: attune
         run: bash scripts/ci-test-db-safety.sh baseline
 
+      - name: S3 storage correctness tests
+        run: make test-runtime-log-correctness
+
       - name: Tests
         env:
           ATTUNE_TEST_S3_ENDPOINT: http://127.0.0.1:59000
@@ -348,9 +351,6 @@ jobs:
         run: >-
           cargo test -p attune-executor --lib service::tests::test_service_creation
           -- --ignored --exact --nocapture --test-threads=4
-
-      - name: S3 storage correctness tests
-        run: make test-runtime-log-correctness
 
       - name: Stop runtime-log test storage
         if: always()

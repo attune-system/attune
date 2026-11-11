@@ -311,6 +311,7 @@ mod tests {
 
     fn make_action(schema: Option<Value>) -> Action {
         Action {
+            output_policy: Default::default(),
             id: 1,
             r#ref: "test.action".to_string(),
             pack: 1,

@@ -4,6 +4,7 @@ import {
   useCancelExecution,
   useRescheduleExecution,
 } from "@/hooks/useExecutions";
+import { useExecutionSecretValues } from "@/hooks/useExecutionSecretValues";
 import { useAction } from "@/hooks/useActions";
 import { useIdentity, usePermissionSets } from "@/hooks/usePermissions";
 import { useEnforcement, useEvent } from "@/hooks/useEvents";
@@ -162,6 +163,7 @@ export default function ExecutionDetailPage() {
   const { id } = useParams<{ id: string }>();
   const { data: executionData, isLoading, error } = useExecution(Number(id));
   const execution = executionData?.data as ExecutionResponse | undefined;
+  const secrets = useExecutionSecretValues(execution);
   const { data: initiatorData } = useIdentity(execution?.executor ?? 0);
   const { data: workerData } = useWorker(execution?.worker);
   const {
@@ -445,6 +447,41 @@ export default function ExecutionDetailPage() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Main Content */}
         <div className="lg:col-span-2 space-y-6">
+          {secrets.canReveal && (
+            <div className="bg-white shadow rounded-lg p-4">
+              <button
+                type="button"
+                onClick={
+                  secrets.isRevealed || secrets.isPending
+                    ? secrets.hide
+                    : secrets.reveal
+                }
+                aria-pressed={secrets.isRevealed}
+                className="px-3 py-2 text-sm font-medium border border-gray-300 rounded hover:bg-gray-50 flex items-center gap-2"
+              >
+                {secrets.isPending && (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                )}
+                {secrets.isPending
+                  ? "Cancel revealing secret values"
+                  : secrets.isRevealed
+                    ? "Hide secret values"
+                    : "Show secret values"}
+              </button>
+              <p className="mt-2 text-xs text-gray-500" role="status">
+                {secrets.isPending
+                  ? "Loading secret values…"
+                  : secrets.isRevealed
+                    ? "Authorized secret parameters and results are shown. Values without source access remain redacted."
+                    : "Reveal secret parameters and results you are authorized to access. This request is audited."}
+              </p>
+              {secrets.error && (
+                <p role="alert" className="mt-2 text-sm text-red-700">
+                  {secrets.error}
+                </p>
+              )}
+            </div>
+          )}
           {/* Status & Timing */}
           <div className="bg-white shadow rounded-lg p-6">
             <h2 className="text-xl font-semibold mb-4">Execution Details</h2>
@@ -578,8 +615,8 @@ export default function ExecutionDetailPage() {
             </dl>
 
             {/* Configuration — merged inline */}
-            {isJsonObject(execution.config) &&
-              Object.keys(execution.config).length > 0 && (
+            {isJsonObject(secrets.config) &&
+              Object.keys(secrets.config).length > 0 && (
                 <div className="mt-6 border-t border-gray-200 pt-4">
                   <h3 className="text-sm font-semibold text-gray-700 mb-2">
                     Configuration
@@ -594,9 +631,9 @@ export default function ExecutionDetailPage() {
                         ? execution.schema_binding.input
                         : undefined
                     }
-                    values={execution.config}
+                    values={secrets.config}
                     emptyMessage="No configuration parameters were captured for this execution."
-                    maskSecrets
+                    maskSecrets={!secrets.isRevealed}
                   />
                 </div>
               )}
@@ -617,8 +654,26 @@ export default function ExecutionDetailPage() {
               />
             )}
 
+          {secrets.channels && Object.keys(secrets.channels).length > 0 && (
+            <div className="bg-white shadow rounded-lg p-6">
+              <h2 className="text-xl font-semibold mb-2">
+                Original output channels
+              </h2>
+              <p className="text-xs text-gray-500 mb-3">
+                Original output revealed with your current permissions. The
+                result below keeps its public projection.
+              </p>
+              {Object.entries(secrets.channels).map(([channel, value]) => (
+                <CompactJsonSection
+                  key={channel}
+                  title={channel}
+                  value={value}
+                />
+              ))}
+            </div>
+          )}
           <ExecutionResultCard
-            result={execution.result}
+            result={secrets.result}
             contract={
               isJsonObject(execution.schema_binding)
                 ? execution.schema_binding.output
@@ -1006,6 +1061,7 @@ function ExecutionResultCard({
         "data",
         "stdout_truncated",
         "stdout_bytes_truncated",
+        "output_channels",
         "stderr_truncated",
         "stderr_bytes_truncated",
       ].includes(key),

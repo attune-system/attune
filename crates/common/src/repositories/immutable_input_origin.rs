@@ -228,7 +228,6 @@ pub async fn prepare_input_receipts(
         if provenance.origins.is_empty() || provenance.origins.len() > 256 {
             return Err(denied());
         }
-        let site = input_value_site(entity_type, execution, &secret.json_path)?;
         let mut ordinary = Vec::new();
         for origin in provenance.origins {
             if !is_input_receipt(&origin) {
@@ -238,6 +237,9 @@ pub async fn prepare_input_receipts(
             if contexts.len() >= 256 {
                 return Err(denied());
             }
+            // Ordinary output origins are not declared input destinations.
+            // Only an actual receipt requires a purpose-qualified input site.
+            let site = input_value_site(entity_type, execution, &secret.json_path)?;
             let receipt = Inputs::prepare_delivery(connection, &site, &origin, encryption_key)
                 .await?
                 .ok_or_else(denied)?;

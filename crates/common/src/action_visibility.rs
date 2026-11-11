@@ -184,6 +184,7 @@ mod tests {
 
     fn action(visibility: ActionReferenceVisibility, allowed: Vec<&str>) -> Action {
         Action {
+            output_policy: Default::default(),
             id: 1,
             r#ref: "owner.do_it".to_string(),
             pack: 1,

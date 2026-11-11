@@ -665,7 +665,68 @@ impl PackChecker {
         }
     }
 
+    fn check_action_output_policy(&mut self, map: &Mapping, rel: &str) {
+        let policy = match yaml_get(map, "output_policy") {
+            Some(value) => match serde_json::to_value(value).ok().and_then(|value| {
+                serde_json::from_value::<crate::output_policy::OutputPolicy>(value).ok()
+            }) {
+                Some(policy) => policy,
+                None => {
+                    self.error_at(
+                        rel,
+                        "output_policy",
+                        "output.invalid_policy",
+                        "Invalid output channel policy",
+                    );
+                    return;
+                }
+            },
+            None => Default::default(),
+        };
+        let Ok(format) = yaml_get(map, "output_format")
+            .and_then(YamlValue::as_str)
+            .unwrap_or("text")
+            .parse::<crate::models::OutputFormat>()
+        else {
+            return;
+        };
+        let output = ["out_schema", "output", "output_schema"]
+            .iter()
+            .find_map(|key| yaml_get(map, key))
+            .and_then(|value| serde_json::to_value(value).ok());
+        let contract = match output {
+            Some(output) => match crate::value_schema::compile(
+                crate::value_schema::SourceIdentity::Authoring {
+                    component_ref: yaml_get(map, "ref")
+                        .and_then(YamlValue::as_str)
+                        .unwrap_or(rel)
+                        .into(),
+                },
+                crate::value_schema::SchemaContext::FlatDocument,
+                &output,
+                &self.type_registry,
+                crate::value_schema::Limits::default(),
+            ) {
+                Ok(contract) => Some(contract),
+                Err(error) if error.code == crate::value_schema::ErrorCode::MissingReference => {
+                    return
+                }
+                Err(_) => return, // Existing schema checks emit the precise diagnostic.
+            },
+            None => None,
+        };
+        if let Err(error) = policy.resolve(contract.as_ref(), format) {
+            self.error_at(
+                rel,
+                "output_policy",
+                "output.invalid_policy",
+                error.to_string(),
+            );
+        }
+    }
+
     fn check_action(&mut self, map: &Mapping, rel: &str) {
+        self.check_action_output_policy(map, rel);
         for (field, allowed) in [
             ("parameter_delivery", &["stdin", "file"][..]),
             ("parameter_format", &["json", "yaml", "dotenv"][..]),
@@ -2205,5 +2266,51 @@ mod tests {
             .diagnostics
             .iter()
             .any(|item| item.code == "action.workflow_path"));
+    }
+    #[test]
+    fn output_policy_rejects_raw_secret_duplicates_and_sanitized_text() {
+        for policy in [
+            "output_format: json\nout_schema: {token: {type: string, secret: true}}\noutput_policy: {stdout: public}\n",
+            "output_format: text\noutput_policy: {stdout: sanitized}\n",
+            "output_format: json\noutput_policy: {stderr: sanitized}\n",
+        ] {
+            let root = TempDir::new().unwrap();
+            write(root.path(), "pack.yaml", "ref: demo\nversion: 1.0.0\n");
+            write(root.path(), "actions/run.yaml", &format!("ref: demo.run\nrunner_type: native\nentry_point: run\n{policy}"));
+            let report = check_pack(root.path());
+            assert!(!report.valid);
+            assert!(report.diagnostics.iter().any(|diagnostic| diagnostic.code == "output.invalid_policy"));
+        }
+    }
+
+    #[test]
+    fn output_policy_checks_inherited_secret_annotations_from_named_types() {
+        let root = TempDir::new().unwrap();
+        write(root.path(), "pack.yaml", "ref: demo\nversion: 1.0.0\n");
+        write(
+            root.path(),
+            "types/credential.yaml",
+            "ref: demo.credential\nlabel: Credential\nschema: {type: string, secret: true}\n",
+        );
+        write(root.path(), "actions/run.yaml", "ref: demo.run\nrunner_type: native\nentry_point: run\noutput_format: json\nout_schema: {token: {type: demo.credential}}\noutput_policy: {stdout: public}\n");
+        let report = check_pack(root.path());
+        assert!(!report.valid);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "output.invalid_policy"),
+            "{:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn secret_parameters_do_not_override_public_output_policy() {
+        let root = TempDir::new().unwrap();
+        write(root.path(), "pack.yaml", "ref: demo\nversion: 1.0.0\n");
+        write(root.path(), "actions/run.yaml", "ref: demo.run\nrunner_type: native\nentry_point: run\nparam_schema: {password: {type: string, secret: true}}\noutput_policy: {stdout: public, stderr: public, error: public}\n");
+        let report = check_pack(root.path());
+        assert!(report.valid, "{:?}", report.diagnostics);
     }
 }

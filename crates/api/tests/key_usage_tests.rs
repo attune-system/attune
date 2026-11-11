@@ -1086,6 +1086,7 @@ async fn disclosure_uses_original_key_bindings_and_requires_every_combined_origi
         "sales",
         json!({"bound":redaction_marker(), "combined":redaction_marker()}),
         &prepared,
+        Default::default(),
     )
     .await?;
     // Unsupported provenance rejects the whole disclosure frontier. Keep that
@@ -1104,6 +1105,7 @@ async fn disclosure_uses_original_key_bindings_and_requires_every_combined_origi
         "unknown_origin",
         json!({"unknown":redaction_marker()}),
         &unknown_fields,
+        Default::default(),
     )
     .await?;
     let pack = PackRepository::find_by_ref(&ctx.pool, "sales")
@@ -1454,7 +1456,7 @@ async fn delegated_key_token(ctx: &TestContext, id: i64, refs: &[String]) -> Res
 }
 
 async fn execution(ctx: &TestContext, pack_ref: &str, parameters: Value) -> Result<i64> {
-    let action = execution_action(ctx, pack_ref).await?;
+    let action = execution_action(ctx, pack_ref, Default::default()).await?;
     let response = ctx.post("/api/v1/executions/execute",json!({"action_ref":action.r#ref,"parameters":parameters,"permission_set_refs":["fixture.key_read"]}),ctx.token()).await?;
     let status = response.status();
     let body: Value = response.json().await?;
@@ -1472,12 +1474,15 @@ async fn execution(ctx: &TestContext, pack_ref: &str, parameters: Value) -> Resu
 async fn execution_action(
     ctx: &TestContext,
     pack_ref: &str,
+    output_policy: attune_common::output_policy::OutputPolicy,
 ) -> Result<attune_common::models::Action> {
     let pack = helpers::create_test_pack(&ctx.pool, pack_ref).await?;
     // These cases exercise active human-owned delegation, not managed admission.
     let action = attune_common::repositories::action::ActionRepository::create(
         &ctx.pool,
         attune_common::repositories::action::CreateActionInput {
+            output_policy,
+            output_format: Default::default(),
             r#ref: format!("{pack_ref}.login"),
             pack: pack.id,
             pack_ref: pack_ref.into(),
@@ -1515,6 +1520,7 @@ async fn execution_with_original_secret_fields(
     pack_ref: &str,
     redacted_config: Value,
     fields: &[attune_common::secret_values::PreparedSecretValue],
+    output_policy: attune_common::output_policy::OutputPolicy,
 ) -> Result<i64> {
     use attune_common::repositories::{
         executable_snapshot::ExecutableSnapshotRepository,
@@ -1522,7 +1528,7 @@ async fn execution_with_original_secret_fields(
         schema_contract::{BindingOwner, SchemaContractRepository},
     };
 
-    let action = execution_action(ctx, pack_ref).await?;
+    let action = execution_action(ctx, pack_ref, output_policy).await?;
     let identity = validate_token(ctx.token().unwrap(), &jwt_config(ctx))?
         .sub
         .parse::<i64>()?;
@@ -1704,6 +1710,11 @@ async fn execution_decrypt_does_not_override_recorded_key_disclosure_authority()
         "sales",
         json!({"signing_key":redaction_marker()}),
         &prepared,
+        // Explicit channel policy, not input secrecy, protects these log reads.
+        attune_common::output_policy::OutputPolicy {
+            stdout: Some(attune_common::output_policy::StdoutPolicy::Secret),
+            ..Default::default()
+        },
     )
     .await?;
     let response = ctx
@@ -1734,7 +1745,7 @@ async fn execution_decrypt_does_not_override_recorded_key_disclosure_authority()
     let artifact = ArtifactRepository::create(
         &ctx.pool,
         CreateArtifactInput {
-            r#ref: format!("execution.{id}.stdout"),
+            r#ref: format!("execution.{id}.stdout.log"),
             scope: OwnerType::Pack,
             owner: "sales".into(),
             r#type: ArtifactType::FileText,
@@ -1758,7 +1769,7 @@ async fn execution_decrypt_does_not_override_recorded_key_disclosure_authority()
             content: None,
             content_json: None,
             file_path: Some(format!("execution/{id}/stdout/1/log.txt")),
-            meta: None,
+            meta: Some(json!({"stream":"stdout"})),
             created_by: None,
         },
     )

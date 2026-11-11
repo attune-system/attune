@@ -358,6 +358,8 @@ async fn test_action_foreign_key_constraint() {
 
     // Try to create action with non-existent pack
     let input = CreateActionInput {
+        output_policy: Default::default(),
+        output_format: Default::default(),
         r#ref: "test.action".to_string(),
         pack: 99999,
         pack_ref: "nonexistent.pack".to_string(),
@@ -515,4 +517,63 @@ async fn test_action_updated_changes_on_update() {
 
     assert_eq!(updated.created, original_created); // Created unchanged
     assert!(updated.updated > original_updated); // Updated changed
+}
+
+#[tokio::test]
+async fn output_policy_roundtrips_and_rejects_secret_stdout_duplicates_atomically() {
+    use attune_common::output_policy::{OutputPolicy, OutputVisibility, StdoutPolicy};
+
+    let mut tx = create_test_transaction().await.unwrap();
+    let pack = PackFixture::new_unique("output_policy")
+        .create(&mut *tx)
+        .await
+        .unwrap();
+    let action = ActionFixture::new_unique(pack.id, &pack.r#ref, "classify")
+        .with_param_schema(json!({"password":{"type":"string","secret":true}}))
+        .create(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(action.output_policy, OutputPolicy::default());
+
+    let selected = OutputPolicy {
+        stdout: Some(StdoutPolicy::Sanitized),
+        stderr: Some(OutputVisibility::Secret),
+        error: Some(OutputVisibility::Public),
+    };
+    let updated = ActionRepository::update(
+        &mut *tx,
+        action.id,
+        UpdateActionInput {
+            output_format: Some("json".into()),
+            out_schema: Some(
+                json!({"status":{"type":"string"}, "token":{"type":"string","secret":true}}),
+            ),
+            output_policy: Some(selected.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(updated.output_policy, selected);
+    let rejected = ActionRepository::update(
+        &mut *tx,
+        action.id,
+        UpdateActionInput {
+            label: Some("Must not persist".into()),
+            output_policy: Some(OutputPolicy {
+                stdout: Some(StdoutPolicy::Public),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(rejected.is_err());
+    let persisted = ActionRepository::find_by_id(&mut *tx, action.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.output_policy, selected);
+    assert_eq!(persisted.label, updated.label);
+    tx.rollback().await.unwrap();
 }

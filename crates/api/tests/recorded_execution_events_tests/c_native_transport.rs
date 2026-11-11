@@ -320,6 +320,108 @@ pub(super) async fn exercise(
         !original_fields.is_empty(),
         "transport must consume the real native receipt chain"
     );
+    let key = fixture
+        .ctx
+        .state
+        .config
+        .security
+        .encryption_key
+        .as_deref()
+        .unwrap();
+    let source = ExecutionRepository::find_by_id(&fixture.ctx.pool, execution)
+        .await?
+        .ok_or("native result execution missing")?;
+    let original_result = source.result.ok_or("native result missing")?;
+    assert!(attune_common::secret_values::is_redaction_marker(
+        &original_result["token"]
+    ));
+    assert!(original_fields
+        .iter()
+        .any(|field| field.json_path == "/token"));
+    let restored = attune_common::secret_values::restore_secret_values(
+        original_result.clone(),
+        &original_fields,
+        key,
+    )?;
+    let native_value = serde_json::to_string(&restored["token"])?;
+    let first_frame = format!("native-transport-prefix:{native_value}").into_bytes();
+    let second_frame = format!("native-unyielded-frame:{native_value}").into_bytes();
+    let original_stdout =
+        String::from_utf8([first_frame.as_slice(), second_frame.as_slice()].concat())?;
+    let binding = SchemaContractRepository::find_with_executor(
+        &fixture.ctx.pool,
+        BindingOwner::Execution,
+        execution,
+    )
+    .await?
+    .ok_or("native schema binding missing")?;
+    assert_ne!(
+        binding.output_policy.stdout,
+        attune_common::output_policy::StdoutPolicy::Public
+    );
+    // This synthetic worker channel deliberately copies the actual protected
+    // native value. Record its channel-specific source through the canonical
+    // classifier, rather than implicitly inheriting every result origin. The
+    // source pointer traverses the existing authenticated native result receipt;
+    // no native proof or original result ciphertext is constructed or replaced.
+    let classified = attune_common::output_classification::classify_action_output(
+        json!({"stdout":original_stdout}),
+        binding.output.as_ref(),
+        binding.output_format,
+        binding.output_policy,
+        execution,
+        &attune_common::secret_provenance::SecretProvenance {
+            origins: vec![attune_common::secret_provenance::SecretOrigin::Entity {
+                entity_type: attune_common::secret_values::ENTITY_EXECUTION_RESULT.into(),
+                entity_id: execution,
+                path: "/token".into(),
+            }],
+            templates: Vec::new(),
+        },
+    )?;
+    assert!(classified.structured_secrets.is_empty());
+    assert_eq!(classified.channel_secrets.len(), 1);
+    assert_eq!(classified.channel_secrets[0].json_path, "/stdout");
+    assert!(ExecutionSecretValueRepository::find_stored_by_entity(
+        &fixture.ctx.pool,
+        attune_common::output_classification::ENTITY_EXECUTION_OUTPUT_CHANNEL,
+        execution,
+    )
+    .await?
+    .is_empty());
+    // Keep the canonical channel reference paired with the protected slot, so
+    // ordinary detail/result-view readers can validate the stored representation.
+    // Every original structured field and native receipt stays unchanged.
+    let mut expected_result = original_result.clone();
+    expected_result
+        .as_object_mut()
+        .unwrap()
+        .extend(classified.public_result.as_object().unwrap().clone());
+    for (name, value) in original_result.as_object().unwrap() {
+        assert_eq!(
+            &expected_result[name], value,
+            "original structured field changed"
+        );
+    }
+    let channels = prepare_secret_values(classified.channel_secrets, key)?;
+    let mut tx = fixture.ctx.pool.begin().await?;
+    ExecutionSecretValueRepository::upsert_many_with_conn(
+        &mut tx,
+        attune_common::output_classification::ENTITY_EXECUTION_OUTPUT_CHANNEL,
+        execution,
+        &channels,
+    )
+    .await?;
+    ExecutionRepository::update(
+        &mut *tx,
+        execution,
+        UpdateExecutionInput {
+            result: Some(expected_result.clone()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    tx.commit().await?;
     // Native workflow renderers selected no process API grants, so do not mint
     // a process JWT. Only worker registration/transport/seal methods are used;
     // the helper's unused process-token field remains empty, never authorized.
@@ -330,8 +432,8 @@ pub(super) async fn exercise(
         LogStreamBackend::ObjectSegments,
     )
     .await?;
-    log.append(fixture, b"native-transport-prefix").await?;
-    log.append(fixture, b"native-unyielded-frame").await?;
+    log.append(fixture, &first_frame).await?;
+    log.append(fixture, &second_frame).await?;
     let eof = matches!(at, Checkpoint::Eof | Checkpoint::DownloadEof);
     if eof {
         // A real authenticated empty append lets both data frames reach the
@@ -520,12 +622,10 @@ pub(super) async fn exercise(
         assert_eq!(response.status(), StatusCode::OK);
         let mut body = response.into_body().into_data_stream();
         if download_body {
-            assert!(
-                next_nonempty(&mut body).await?.unwrap().as_ref() == b"native-transport-prefix"
-            );
+            assert!(next_nonempty(&mut body).await?.unwrap().as_ref() == first_frame.as_slice());
             if eof {
                 assert!(
-                    next_nonempty(&mut body).await?.unwrap().as_ref() == b"native-unyielded-frame"
+                    next_nonempty(&mut body).await?.unwrap().as_ref() == second_frame.as_slice()
                 );
             }
         } else {
@@ -629,6 +729,14 @@ pub(super) async fn exercise(
             )
             .await?,
         "native receipt ciphertext must remain unchanged across actual transport waits"
+    );
+    assert!(
+        ExecutionRepository::find_by_id(&fixture.ctx.pool, execution)
+            .await?
+            .ok_or("native result execution disappeared")?
+            .result
+            == Some(expected_result),
+        "canonical channel projection and original structured fields must remain unchanged across transport waits"
     );
     drop(log);
     Ok(())

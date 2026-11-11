@@ -127,6 +127,22 @@ async fn fixture_on_database(
     RuntimePolicy,
     i64,
 ) {
+    fixture_on_database_with_output_mismatch(db, authored_defaults, empty_workflow, staged, false)
+        .await
+}
+
+async fn fixture_on_database_with_output_mismatch(
+    db: TestDatabase,
+    authored_defaults: bool,
+    empty_workflow: bool,
+    staged: Option<native_staged_completion::Case>,
+    invalid_output: bool,
+) -> (
+    TestDatabase,
+    ExecutionExecutableSnapshot,
+    RuntimePolicy,
+    i64,
+) {
     let mut pack_fixture = PackFixture::new_unique("exec_admission");
     if authored_defaults {
         pack_fixture.conf_schema =
@@ -171,7 +187,7 @@ async fn fixture_on_database(
                     "collision_output":{"type":"string"},
                     "envelope_output":{"type":"integer"},
                     "result_output":{"type":"string"},
-                    "literal_output":{"type":"string"}
+                    "literal_output":{"type":if invalid_output { "integer" } else { "string" }}
                 })),
                 ..Default::default()
             },
@@ -1657,6 +1673,8 @@ async fn recorded_task_schema_ignores_same_ref_release_only_parent_cache() {
     root.static_actions.insert(
         leaf_ref,
         StaticActionSchemaBinding {
+            output_policy: Default::default(),
+            output_format: Default::default(),
             input: other.input.clone(),
             output: other.output,
             executable_snapshot: serde_json::to_value(other_metadata).unwrap(),
@@ -2702,11 +2720,11 @@ async fn run_native_initial_variable_case(case: Option<native_staged_completion:
         .clone();
     output["succeeded"] = json!(true);
     if let Some(contract) = &output_contract.output {
-        if let Err(error) = attune_common::value_schema::CompiledContract::new(contract)
-            .unwrap()
-            .validate(&output)
+        let compiled = attune_common::value_schema::CompiledContract::new(contract).unwrap();
+        if let Some(warning) =
+            attune_common::output_classification::output_validation_warning(&compiled, &output)
         {
-            output["output_validation_warning"] = json!({"code":error.code,"path":error.path});
+            output["output_validation_warning"] = warning;
         }
     }
     let mut wrong = output.clone();
@@ -2821,6 +2839,15 @@ async fn run_native_initial_variable_case(case: Option<native_staged_completion:
 
 #[tokio::test]
 async fn empty_workflow_output_uses_persisted_variables_without_a_synthetic_child_or_outcome() {
+    empty_workflow_output_case(false).await;
+}
+
+#[tokio::test]
+async fn invalid_workflow_output_completes_with_an_advisory_code_only_warning() {
+    empty_workflow_output_case(true).await;
+}
+
+async fn empty_workflow_output_case(invalid_output: bool) {
     use attune_common::repositories::{
         cache::{CacheEntryRepository, CacheTransactionMode},
         declared_input_materialization::DeclaredInputMaterializationRepository as Materialize,
@@ -2842,7 +2869,14 @@ async fn empty_workflow_output_uses_persisted_variables_without_a_synthetic_chil
         prepare_secret_values, redact_secret_path_sources, SecretPathSource, SecretSource,
         ENTITY_EXECUTION_CONFIG, ENTITY_EXECUTION_RESULT, ENTITY_WORKFLOW_VARIABLES,
     };
-    let (db, snapshot, policy, human) = fixture_with_native_shape(true, true).await;
+    let (db, snapshot, policy, human) = fixture_on_database_with_output_mismatch(
+        create_test_pool().await.unwrap(),
+        true,
+        true,
+        None,
+        invalid_output,
+    )
+    .await;
     let key = "empty-workflow-output-owned-encryption-key";
     let selected = helpers::KeyFixture::new_pack(
         policy.owner.pack_id,
@@ -2968,12 +3002,31 @@ async fn empty_workflow_output_uses_persisted_variables_without_a_synthetic_chil
     let mut output = plan.output().unwrap().clone();
     output["succeeded"] = json!(true);
     if let Some(contract) = &schema.output {
-        if let Err(error) = attune_common::value_schema::CompiledContract::new(contract)
-            .unwrap()
-            .validate(&output)
+        let compiled = attune_common::value_schema::CompiledContract::new(contract).unwrap();
+        if let Some(warning) =
+            attune_common::output_classification::output_validation_warning(&compiled, &output)
         {
-            output["output_validation_warning"] = json!({"code":error.code,"path":error.path});
+            output["output_validation_warning"] = warning;
         }
+    }
+    if invalid_output {
+        assert!(output["output_validation_warning"].get("code").is_some());
+        assert_eq!(
+            output["output_validation_warning"]
+                .as_object()
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut forged = output.clone();
+        forged["output_validation_warning"]["path"] = json!("/private-instance-path");
+        assert!(plan
+            .record_output(&mut completion, schema.output.as_ref(), &forged, key)
+            .await
+            .is_err());
+        assert_eq!(output["succeeded"], true);
+    } else {
+        assert!(output.get("output_validation_warning").is_none());
     }
     let output_sources = plan
         .record_output(&mut completion, schema.output.as_ref(), &output, key)
@@ -3009,6 +3062,15 @@ async fn empty_workflow_output_uses_persisted_variables_without_a_synthetic_chil
     )
     .await
     .unwrap();
+    let completed = ExecutionRepository::find_by_id(&mut *completion, parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.status, ExecutionStatus::Completed);
+    assert_eq!(
+        completed.result.as_ref().unwrap()["output_validation_warning"],
+        output["output_validation_warning"]
+    );
     for source in output_sources {
         let SecretSource::Bound(provenance) = source.source else {
             panic!("missing exact empty output receipt")
@@ -3673,7 +3735,7 @@ async fn delegated_authority_is_explicit_immutable_and_attempt_fenced() {
     .await
     .unwrap();
     // Native controls retain scoped standard without granting the human owner
-    // the private body or copying freeform details to ordinary queue columns.
+    // the private body; protected details are projected before queue persistence.
     let output_origin = Delegated::output_origin(&mut tx, execution.id)
         .await
         .unwrap()
@@ -3692,9 +3754,9 @@ async fn delegated_authority_is_explicit_immutable_and_attempt_fenced() {
             Delegated::protected_queue_ack_controls(&mut tx, execution.id, &[10], 1, Some(key))
                 .await
                 .unwrap(),
-            attune_common::repositories::delegated_execution::ProtectedQueueAck::Invalid
+            attune_common::repositories::delegated_execution::ProtectedQueueAck::Unprotected
         ),
-        "missing encrypted output evidence cannot authorize public acknowledgement details"
+        "delegated authority alone must not classify public acknowledgement details"
     );
     let prepared = attune_common::secret_values::prepare_secret_values(vec![attune_common::secret_values::SecretValueInput {
         json_path:"/queue_ack".into(),
@@ -3730,7 +3792,7 @@ async fn delegated_authority_is_explicit_immutable_and_attempt_fenced() {
     else {
         panic!("closed standard controls rejected")
     };
-    assert!(controls.items[0].summary.is_none() && controls.items[0].error.is_none());
+    assert_protected_ack_projection(&mut tx, execution.id, &controls, key).await;
     assert!(Delegated::retain_claims(&mut tx, &claims).await.is_err());
 
     assert!(Delegated::validate_claims(&mut tx, &claims).await.is_err());
@@ -3746,6 +3808,57 @@ async fn delegated_authority_is_explicit_immutable_and_attempt_fenced() {
         .is_err());
     tx.rollback().await.unwrap();
     db.cleanup().await.unwrap();
+}
+
+// Internal consumers retain protected details; only sanitized projections may
+// be copied into ordinary queue columns.
+async fn assert_protected_ack_projection(
+    conn: &mut sqlx::PgConnection,
+    execution: i64,
+    controls: &attune_common::models::WorkQueueAck,
+    key: &str,
+) {
+    use attune_common::repositories::work_queue_output::WorkQueueOutputRepository as Outputs;
+    let item = &controls.items[0];
+    assert_eq!(item.summary, Some(json!({"value":"private"})));
+    assert_eq!(item.error, Some(json!({"value":"private"})));
+    let summary = json!({"status":"completed","summary":item.summary,"error":item.error});
+    assert!(
+        Outputs::prepare_item_metadata(
+            conn,
+            execution,
+            0,
+            attune_common::models::WorkQueueItemStatus::Completed,
+            summary.clone(),
+            item.error.clone(),
+            None,
+        )
+        .await
+        .is_err(),
+        "protected metadata requires encryption"
+    );
+    let projected = Outputs::prepare_item_metadata(
+        conn,
+        execution,
+        0,
+        attune_common::models::WorkQueueItemStatus::Completed,
+        summary,
+        item.error.clone(),
+        Some(key),
+    )
+    .await
+    .unwrap();
+    assert!(attune_common::secret_values::is_redaction_marker(
+        &projected.summary["summary"]
+    ));
+    assert!(attune_common::secret_values::is_redaction_marker(
+        &projected.summary["error"]
+    ));
+    assert!(attune_common::secret_values::is_redaction_marker(
+        projected.error.as_ref().unwrap()
+    ));
+    assert_eq!(projected.summary["status"], "completed");
+    assert!(!projected.summary.to_string().contains("private"));
 }
 
 #[tokio::test]
@@ -3952,7 +4065,7 @@ async fn native_workflow_authority_fences_children_and_private_controls() {
     else {
         panic!("native root ciphertext controls rejected")
     };
-    assert!(controls.items[0].summary.is_none() && controls.items[0].error.is_none());
+    assert_protected_ack_projection(&mut tx, root.id, &controls, key).await;
     // Absence of recorded proof cannot select the delegated callback path.
     let recorded = delegated_fixture_execution(&mut tx, &snapshot, human, vec![], None).await;
     ExecutionRepository::update(

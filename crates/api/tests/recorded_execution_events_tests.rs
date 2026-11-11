@@ -624,6 +624,13 @@ async fn fixture_with_original_input_deadlines(
         action.id,
         attune_common::repositories::action::UpdateActionInput {
             param_schema: Some(json!({"input":{"type":"string","secret":true}})),
+            // This owning fixture deliberately produces protected raw channels.
+            // Inputs and SDK capability no longer classify those channels.
+            output_policy: Some(attune_common::output_policy::OutputPolicy {
+                stdout: Some(attune_common::output_policy::StdoutPolicy::Secret),
+                stderr: Some(attune_common::output_policy::OutputVisibility::Secret),
+                error: Some(attune_common::output_policy::OutputVisibility::Secret),
+            }),
             ..Default::default()
         },
     )
@@ -1225,7 +1232,7 @@ async fn sealed_decoder_fixture(fixture: &Fixture, frames: usize) -> Result<(Id,
     let artifact = ArtifactRepository::create(
         &fixture.ctx.pool,
         CreateArtifactInput {
-            r#ref: "recorded_emitter.sealed_decoder".into(),
+            r#ref: "recorded_emitter.sealed_decoder.stdout.log".into(),
             scope: OwnerType::Pack,
             owner: "recorded_emitter".into(),
             r#type: ArtifactType::FileText,
@@ -1247,7 +1254,7 @@ async fn sealed_decoder_fixture(fixture: &Fixture, frames: usize) -> Result<(Id,
         LogStreamBackend::SharedFile,
         "text/plain".into(),
         Some(source.id),
-        Some(json!({"log_encoding":ENCODING})),
+        Some(json!({"log_encoding":ENCODING,"stream":"stdout"})),
         None,
     )
     .await?;
@@ -1287,7 +1294,7 @@ async fn sealed_decoder_fixture(fixture: &Fixture, frames: usize) -> Result<(Id,
     // separate tests; this seeds a real sealed shared file and exact proof.
     sqlx::query("UPDATE artifact_version SET body_state='ready',size_bytes=$2,sha256=$3,meta=$4 WHERE id=$1")
         .bind(version.id).bind(ciphertext.len() as i64).bind(&manifest.ciphertext_sha256)
-        .bind(json!({"log_encoding":ENCODING,"encrypted_log_manifest":manifest.authenticate(key)?})).execute(&mut *tx).await?;
+        .bind(json!({"log_encoding":ENCODING,"stream":"stdout","encrypted_log_manifest":manifest.authenticate(key)?})).execute(&mut *tx).await?;
     LogStreamRepository::seal_shared_file(&mut tx, stream.id, ciphertext.len() as i64, false)
         .await?;
     tx.commit().await?;
@@ -3831,7 +3838,7 @@ async fn recorded_key_reads_are_scoped_idempotently_tracked_and_forwarded_into_e
     assert_eq!(listed["pagination"]["total_items"], 1, "{listed}");
     assert_eq!(listed["items"][0]["ref"], key.r#ref);
     assert!(!listed.to_string().contains("key value"));
-    // No schema/input secret is needed to classify an SDK-capable log.
+    // Explicit secret channel policy remains protected after removing input rows.
     let mut connection = fixture.ctx.pool.acquire().await?;
     ExecutionSecretValueRepository::replace_entity_with_conn(
         &mut connection,
@@ -3930,7 +3937,7 @@ async fn recorded_key_reads_are_scoped_idempotently_tracked_and_forwarded_into_e
             content: None,
             content_json: None,
             file_path: None,
-            meta: None,
+            meta: Some(json!({"stream":"stdout","execution_id":execution.id})),
             created_by: None,
         },
     )
@@ -3958,7 +3965,8 @@ async fn recorded_key_reads_are_scoped_idempotently_tracked_and_forwarded_into_e
     assert!(attune_api::secret_disclosure::authorize_runtime_log(
         &fixture.ctx.state,
         &viewer,
-        &execution
+        &execution,
+        attune_common::output_classification::OutputChannel::Stdout,
     )
     .await
     .is_err());
@@ -3985,8 +3993,13 @@ async fn recorded_key_reads_are_scoped_idempotently_tracked_and_forwarded_into_e
     .await?;
     attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(viewer.identity_id()?)
         .await;
-    attune_api::secret_disclosure::authorize_runtime_log(&fixture.ctx.state, &viewer, &execution)
-        .await?;
+    attune_api::secret_disclosure::authorize_runtime_log(
+        &fixture.ctx.state,
+        &viewer,
+        &execution,
+        attune_common::output_classification::OutputChannel::Stdout,
+    )
+    .await?;
     assert_eq!(
         fixture
             .ctx

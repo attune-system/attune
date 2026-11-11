@@ -11,7 +11,7 @@ use attune_common::{
         native_failure_materialization::NativeFailureMaterializationRepository as Failures,
         native_input_snapshot::NativeResultContractKind,
     },
-    secret_values::{prepare_secret_values, redact_bound_action_result, SecretSource},
+    secret_values::{prepare_secret_values, SecretSource},
 };
 use serde_json::Value;
 
@@ -309,10 +309,13 @@ async fn custody_case(negatives: bool, compatibility: bool) {
         // Use the worker's actual contract-bound redaction. A schema-local
         // /token origin at the /data/token envelope field is provenance, not a
         // legacy parameter_schema row whose ref must equal its stored path.
-        let (public,original_fields)=redact_bound_action_result(
+        let classified = attune_common::output_classification::classify_action_output(
             json!({"succeeded":false,"data":{"token":format!("original secret child {}",child.id)}}),
-            schema.output.as_ref(),executable.executable.action.output_format,child.id,&[],&[],
+            schema.output.as_ref(), schema.output_format, schema.output_policy, child.id,
+            &attune_common::secret_provenance::SecretProvenance::default(),
         ).unwrap();
+        let public = classified.public_result;
+        let original_fields = classified.structured_secrets;
         assert_eq!(original_fields.len(), 1);
         assert_eq!(original_fields[0].json_path, "/data/token");
         assert_eq!(original_fields[0].source_kind, "provenance");
@@ -321,7 +324,7 @@ async fn custody_case(negatives: bool, compatibility: bool) {
         assert_eq!(
             original_provenance,
             SecretSource::ParameterSchema {
-                path: "/token".into()
+                path: "/data/token".into()
             }
             .provenance()
         );

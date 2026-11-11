@@ -188,10 +188,10 @@ BEGIN
         s:=(b->>'source_id')::BIGINT;
     ELSIF TG_TABLE_NAME IN ('execution_runtime_read_fence','execution_key_read_origin','execution_key_read_origin_fence','runtime_authority_execution_attempt','runtime_authority_execution_fence') THEN k:='runtime_authority_admission'; s:=(b->>'admission')::BIGINT;
     ELSIF TG_TABLE_NAME='execution_secret_value' THEN
-        k:=CASE b->>'entity_type' WHEN 'execution_config' THEN 'execution' WHEN 'execution_result' THEN 'execution'
+        k:=CASE b->>'entity_type' WHEN 'execution_config' THEN 'execution' WHEN 'execution_result' THEN 'execution' WHEN 'execution_output_channel' THEN 'execution'
           WHEN 'workflow_variables' THEN 'execution' WHEN 'component_configuration' THEN 'component_configuration_revision'
           WHEN 'sensor_generation_config' THEN 'sensor_generation_schema_binding' WHEN 'sensor_generation_rule_config' THEN 'sensor_generation_schema_binding'
-          WHEN 'sensor_rule_delivery_config' THEN 'sensor_rule_config_delivery' WHEN 'inquiry_options' THEN 'inquiry' WHEN 'inquiry_response' THEN 'inquiry' WHEN 'queue_item_payload' THEN 'work_queue_item' END;
+          WHEN 'sensor_rule_delivery_config' THEN 'sensor_rule_config_delivery' WHEN 'inquiry_options' THEN 'inquiry' WHEN 'inquiry_response' THEN 'inquiry' WHEN 'queue_item_payload' THEN 'work_queue_item' WHEN 'queue_item_ack_summary' THEN 'work_queue_item' WHEN 'queue_item_last_error' THEN 'work_queue_item' WHEN 'queue_item_result' THEN 'work_queue_item' END;
         s:=(b->>'entity_id')::BIGINT;
     END IF;
     -- Live field replacement is not owner reclamation. C's frozen parents are

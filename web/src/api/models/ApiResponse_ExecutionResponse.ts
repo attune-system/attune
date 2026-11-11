@@ -62,6 +62,10 @@ export type ApiResponse_ExecutionResponse = {
      * Execution result/output
      */
     result: Record<string, any>;
+    /**
+     * Explicitly requested original channel values, separate from public projections.
+     */
+    revealed_output_channels?: Record<string, any> | null;
     schema_binding?: null | Value;
     /**
      * When the execution actually started running (worker picked it up).

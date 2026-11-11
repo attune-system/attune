@@ -93,6 +93,49 @@ impl HumanReceiptGuard {
         Ok(guard)
     }
 
+    /// Prepare exactly one raw channel. Public stderr must not acquire or
+    /// validate a protected stdout source graph (and conversely).
+    pub(crate) async fn for_execution_channel(
+        state: &AppState,
+        user: &AuthenticatedUser,
+        execution: i64,
+        channel: attune_common::output_classification::OutputChannel,
+    ) -> ApiResult<Self> {
+        use attune_common::repositories::schema_contract::{
+            BindingOwner, SchemaContractRepository,
+        };
+        let mut guard = Self::begin(state, user).await?;
+        let binding = SchemaContractRepository::find(
+            &mut guard.transaction,
+            BindingOwner::Execution,
+            execution,
+        )
+        .await?
+        .ok_or_else(|| ApiError::Forbidden("Runtime log binding unavailable".into()))?;
+        let rows =
+            if crate::secret_disclosure::runtime_log_channel_requires_disclosure(&binding, channel)
+            {
+                let rows = crate::recorded_disclosure::execution_origins(
+                    &mut guard.transaction,
+                    execution,
+                )
+                .await?;
+                crate::secret_disclosure::runtime_log_channel_origins(&rows, channel)
+            } else {
+                Vec::new()
+            };
+        guard.retain_execution_origins(&[execution], &rows);
+        guard
+            .frontier
+            .prepare(
+                &mut guard.transaction,
+                &rows,
+                state.config.security.encryption_key.as_deref(),
+            )
+            .await?;
+        Ok(guard)
+    }
+
     pub(crate) async fn for_executions(
         state: &AppState,
         user: &AuthenticatedUser,
