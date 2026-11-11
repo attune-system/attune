@@ -753,8 +753,17 @@ impl<'a> ArtifactReads<'a> {
             }
             self.source_records
                 .seed_executions(executions.values().cloned());
-            self.source_records
-                .seed_execution_provenance(ids, secrets.values().flatten().cloned());
+            // Channel guards retain only the selected channel's authorization
+            // roots. They are not a complete inventory of this execution's
+            // result/config provenance: marking absent kinds known-empty here
+            // would suppress loading a real parent referenced by a channel.
+            if ids
+                .iter()
+                .all(|id| !self.execution_channels.contains_key(id))
+            {
+                self.source_records
+                    .seed_execution_provenance(ids, secrets.values().flatten().cloned());
+            }
             let mut sensitive = HashSet::new();
             for id in ids {
                 if let (Some(_), Some(binding)) = (executions.get(id), bindings.get(id)) {

@@ -1232,7 +1232,7 @@ async fn sealed_decoder_fixture(fixture: &Fixture, frames: usize) -> Result<(Id,
     let artifact = ArtifactRepository::create(
         &fixture.ctx.pool,
         CreateArtifactInput {
-            r#ref: "recorded_emitter.sealed_decoder".into(),
+            r#ref: "recorded_emitter.sealed_decoder.stdout.log".into(),
             scope: OwnerType::Pack,
             owner: "recorded_emitter".into(),
             r#type: ArtifactType::FileText,
@@ -1254,7 +1254,7 @@ async fn sealed_decoder_fixture(fixture: &Fixture, frames: usize) -> Result<(Id,
         LogStreamBackend::SharedFile,
         "text/plain".into(),
         Some(source.id),
-        Some(json!({"log_encoding":ENCODING})),
+        Some(json!({"log_encoding":ENCODING,"stream":"stdout"})),
         None,
     )
     .await?;
@@ -1294,7 +1294,7 @@ async fn sealed_decoder_fixture(fixture: &Fixture, frames: usize) -> Result<(Id,
     // separate tests; this seeds a real sealed shared file and exact proof.
     sqlx::query("UPDATE artifact_version SET body_state='ready',size_bytes=$2,sha256=$3,meta=$4 WHERE id=$1")
         .bind(version.id).bind(ciphertext.len() as i64).bind(&manifest.ciphertext_sha256)
-        .bind(json!({"log_encoding":ENCODING,"encrypted_log_manifest":manifest.authenticate(key)?})).execute(&mut *tx).await?;
+        .bind(json!({"log_encoding":ENCODING,"stream":"stdout","encrypted_log_manifest":manifest.authenticate(key)?})).execute(&mut *tx).await?;
     LogStreamRepository::seal_shared_file(&mut tx, stream.id, ciphertext.len() as i64, false)
         .await?;
     tx.commit().await?;

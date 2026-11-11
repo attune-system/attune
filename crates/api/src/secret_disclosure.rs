@@ -502,7 +502,8 @@ pub(crate) async fn authorize_runtime_log_records(
     })?;
     let mut records = DisclosureRecords::default();
     records.seed_executions([execution.clone()]);
-    records.seed_execution_provenance(&[execution.id], secrets.iter().cloned());
+    // These are selected channel roots, not complete execution provenance.
+    // Let preparation load any referenced result/config parent normally.
     records.load_executions(&state.db, &[execution.id]).await?;
     records
         .prepare(

@@ -406,6 +406,13 @@ async fn metadata_bulk_locked_selection_detects_new_readable_matches_not_private
         let fixture = metadata_fixture(None, None).await?;
         let queue = seed(&fixture, "recorded_emitter.bulk_membership").await?;
         let mut blocker = Some(fixture.ctx.pool.begin().await?);
+        // Replacing ack_summary clears its protected slots. Enter ordered live
+        // replacement admission before locking the item, so the secret-value
+        // trigger cannot request exclusive graph GC admission behind the reader.
+        attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_capture(
+            blocker.as_mut().unwrap(),
+        )
+        .await?;
         let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
             .fetch_one(&mut **blocker.as_mut().unwrap())
             .await?;
