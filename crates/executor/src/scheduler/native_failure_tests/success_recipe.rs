@@ -81,7 +81,7 @@ async fn complete_success(case: NativeResultCase) {
                 .unwrap_err();
             assert_eq!(
                 expected["output_validation_warning"],
-                serde_json::json!({"code":diagnostic.code,"path":diagnostic.path})
+                serde_json::json!({"code":diagnostic.code})
             );
         }
         NativeResultCase::AuthoredFalseStatus | NativeResultCase::AuthoredFalseWithControls => {
@@ -134,9 +134,11 @@ async fn complete_success(case: NativeResultCase) {
         .unwrap()
         .unwrap();
     assert_eq!(actual.status, ExecutionStatus::Completed);
-    assert!(attune_common::secret_values::is_redaction_marker(
-        actual.result.as_ref().unwrap()
-    ));
+    assert_eq!(
+        actual.result.as_ref().unwrap(),
+        &expected,
+        "public authored fields and generated status stay visible despite input receipts"
+    );
     let fields = ExecutionSecretValueRepository::find_stored_by_entity(
         &mut *tx,
         ENTITY_EXECUTION_RESULT,
@@ -144,7 +146,10 @@ async fn complete_success(case: NativeResultCase) {
     )
     .await
     .unwrap();
-    assert_eq!(fields.len(), 1);
+    assert!(
+        fields.is_empty(),
+        "absent schema-secret fields do not create protected output slots"
+    );
     assert_eq!(
         attune_common::secret_values::restore_secret_values(
             actual.result.unwrap(),

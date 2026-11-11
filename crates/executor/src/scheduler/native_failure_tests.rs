@@ -65,7 +65,10 @@ async fn complete(status: ExecutionStatus) {
         .unwrap();
     assert_eq!(actual.status, ExecutionStatus::Failed);
     let redacted = actual.result.unwrap();
-    assert!(attune_common::secret_values::is_redaction_marker(&redacted));
+    assert_eq!(redacted["succeeded"], false);
+    assert!(attune_common::secret_values::is_redaction_marker(
+        &redacted["error"]
+    ));
     let fields = ExecutionSecretValueRepository::find_stored_by_entity(
         &mut *tx,
         ENTITY_EXECUTION_RESULT,
@@ -74,7 +77,7 @@ async fn complete(status: ExecutionStatus) {
     .await
     .unwrap();
     assert_eq!(fields.len(), 1);
-    assert_eq!(fields[0].json_path, "");
+    assert_eq!(fields[0].json_path, "/error");
     // Ciphertext byte check, not a current-reader/GC acceptance claim.
     assert_eq!(
         attune_common::secret_values::restore_secret_values(redacted, &fields, fixture::KEY)
