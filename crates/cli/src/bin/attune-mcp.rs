@@ -204,6 +204,11 @@ impl ToolPolicy {
     }
 }
 
+/// Local denial contains only a registered tool name, never arguments or API data.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("Tool '{0}' is disabled by MCP access policy")]
+struct ToolPolicyDenied(&'static str);
+
 #[derive(Clone)]
 struct ToolDef {
     name: &'static str,
@@ -396,7 +401,14 @@ impl McpServer {
     ) -> Result<Value> {
         let result = self.call_tool_with_reauth_inner(tool_name, args).await;
         if tool_name == "executions_export" {
-            result.map_err(safe_disclosure_error)
+            result.map_err(|error| {
+                if let Some(denied) = error.downcast_ref::<ToolPolicyDenied>() {
+                    // Reconstruct only the local denial, excluding any context.
+                    anyhow::Error::new(*denied)
+                } else {
+                    safe_disclosure_error(error)
+                }
+            })
         } else {
             result
         }
@@ -428,6 +440,9 @@ impl McpServer {
 
     /// Permission denials are normal tool results, never a reason to re-login.
     fn is_auth_error(err: &anyhow::Error) -> bool {
+        if err.is::<ToolPolicyDenied>() {
+            return false;
+        }
         if let Some(error) = err.downcast_ref::<attune_cli::client::ApiRequestError>() {
             return error.status == reqwest::StatusCode::UNAUTHORIZED;
         }
@@ -441,10 +456,9 @@ impl McpServer {
             .iter()
             .find(|tool| tool.name == tool_name)
             .ok_or_else(|| anyhow!("Unknown tool '{tool_name}'"))?;
-        anyhow::ensure!(
-            self.tool_policy.allows(tool),
-            "Tool '{tool_name}' is disabled by MCP access policy"
-        );
+        if !self.tool_policy.allows(tool) {
+            return Err(ToolPolicyDenied(tool.name).into());
+        }
         match tool_name {
             "info_get" => serde_json::to_value(
                 attune_cli::info::get_info("attune-mcp", &self.profile, &mut self.client).await,

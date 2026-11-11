@@ -219,3 +219,26 @@ async fn export_on_unsupported_platform_returns_safe_error_without_fetch_or_file
     assert!(!target.exists());
     assert!(api.received_requests().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn export_policy_denial_precedes_arguments_files_api_and_reauthentication() {
+    let api = MockServer::start().await;
+    let mut server = server(&api);
+    server.tool_policy = ToolPolicy::ReadOnly;
+    server.credentials = Some(LoginCredentials {
+        api_url: api.uri(),
+        login: "fixture-login".into(),
+        password: "fixture-secret-password".into(),
+    });
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("fixture-secret-output.json");
+    for args in [json!({}), json!({"id":42,"output_file":target})] {
+        let response = call(&mut server, "executions_export", args).await;
+        assert_eq!(response["result"]["isError"], true);
+        let encoded = response.to_string();
+        assert!(encoded.contains("disabled by MCP access policy"));
+        assert!(!encoded.contains("fixture-secret"));
+        assert!(!target.exists());
+    }
+    assert!(api.received_requests().await.unwrap().is_empty());
+}
