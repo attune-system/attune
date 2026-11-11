@@ -3735,7 +3735,7 @@ async fn delegated_authority_is_explicit_immutable_and_attempt_fenced() {
     .await
     .unwrap();
     // Native controls retain scoped standard without granting the human owner
-    // the private body or copying freeform details to ordinary queue columns.
+    // the private body; protected details are projected before queue persistence.
     let output_origin = Delegated::output_origin(&mut tx, execution.id)
         .await
         .unwrap()
@@ -3754,9 +3754,9 @@ async fn delegated_authority_is_explicit_immutable_and_attempt_fenced() {
             Delegated::protected_queue_ack_controls(&mut tx, execution.id, &[10], 1, Some(key))
                 .await
                 .unwrap(),
-            attune_common::repositories::delegated_execution::ProtectedQueueAck::Invalid
+            attune_common::repositories::delegated_execution::ProtectedQueueAck::Unprotected
         ),
-        "missing encrypted output evidence cannot authorize public acknowledgement details"
+        "delegated authority alone must not classify public acknowledgement details"
     );
     let prepared = attune_common::secret_values::prepare_secret_values(vec![attune_common::secret_values::SecretValueInput {
         json_path:"/queue_ack".into(),
@@ -3792,7 +3792,7 @@ async fn delegated_authority_is_explicit_immutable_and_attempt_fenced() {
     else {
         panic!("closed standard controls rejected")
     };
-    assert!(controls.items[0].summary.is_none() && controls.items[0].error.is_none());
+    assert_protected_ack_projection(&mut tx, execution.id, &controls, key).await;
     assert!(Delegated::retain_claims(&mut tx, &claims).await.is_err());
 
     assert!(Delegated::validate_claims(&mut tx, &claims).await.is_err());
@@ -3808,6 +3808,57 @@ async fn delegated_authority_is_explicit_immutable_and_attempt_fenced() {
         .is_err());
     tx.rollback().await.unwrap();
     db.cleanup().await.unwrap();
+}
+
+// Internal consumers retain protected details; only sanitized projections may
+// be copied into ordinary queue columns.
+async fn assert_protected_ack_projection(
+    conn: &mut sqlx::PgConnection,
+    execution: i64,
+    controls: &attune_common::models::WorkQueueAck,
+    key: &str,
+) {
+    use attune_common::repositories::work_queue_output::WorkQueueOutputRepository as Outputs;
+    let item = &controls.items[0];
+    assert_eq!(item.summary, Some(json!({"value":"private"})));
+    assert_eq!(item.error, Some(json!({"value":"private"})));
+    let summary = json!({"status":"completed","summary":item.summary,"error":item.error});
+    assert!(
+        Outputs::prepare_item_metadata(
+            conn,
+            execution,
+            0,
+            attune_common::models::WorkQueueItemStatus::Completed,
+            summary.clone(),
+            item.error.clone(),
+            None,
+        )
+        .await
+        .is_err(),
+        "protected metadata requires encryption"
+    );
+    let projected = Outputs::prepare_item_metadata(
+        conn,
+        execution,
+        0,
+        attune_common::models::WorkQueueItemStatus::Completed,
+        summary,
+        item.error.clone(),
+        Some(key),
+    )
+    .await
+    .unwrap();
+    assert!(attune_common::secret_values::is_redaction_marker(
+        &projected.summary["summary"]
+    ));
+    assert!(attune_common::secret_values::is_redaction_marker(
+        &projected.summary["error"]
+    ));
+    assert!(attune_common::secret_values::is_redaction_marker(
+        projected.error.as_ref().unwrap()
+    ));
+    assert_eq!(projected.summary["status"], "completed");
+    assert!(!projected.summary.to_string().contains("private"));
 }
 
 #[tokio::test]
@@ -4014,7 +4065,7 @@ async fn native_workflow_authority_fences_children_and_private_controls() {
     else {
         panic!("native root ciphertext controls rejected")
     };
-    assert!(controls.items[0].summary.is_none() && controls.items[0].error.is_none());
+    assert_protected_ack_projection(&mut tx, root.id, &controls, key).await;
     // Absence of recorded proof cannot select the delegated callback path.
     let recorded = delegated_fixture_execution(&mut tx, &snapshot, human, vec![], None).await;
     ExecutionRepository::update(
