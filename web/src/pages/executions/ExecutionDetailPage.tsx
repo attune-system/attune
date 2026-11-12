@@ -30,6 +30,8 @@ import {
 } from "lucide-react";
 import { JsonValueDisplay } from "@/components/common/CuratedDataPanel";
 import { ContractValueRows } from "@/components/common/ContractDataCard";
+import { contractHasSecrets } from "@/components/common/contractSchema";
+import OnOffSwitch from "@/components/common/OnOffSwitch";
 import { isJsonObject } from "@/components/common/curatedDataUtils";
 import ExecuteActionModal from "@/components/common/ExecuteActionModal";
 import EntityHistoryPanel from "@/components/common/EntityHistoryPanel";
@@ -447,41 +449,6 @@ export default function ExecutionDetailPage() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Main Content */}
         <div className="lg:col-span-2 space-y-6">
-          {secrets.canReveal && (
-            <div className="bg-white shadow rounded-lg p-4">
-              <button
-                type="button"
-                onClick={
-                  secrets.isRevealed || secrets.isPending
-                    ? secrets.hide
-                    : secrets.reveal
-                }
-                aria-pressed={secrets.isRevealed}
-                className="px-3 py-2 text-sm font-medium border border-gray-300 rounded hover:bg-gray-50 flex items-center gap-2"
-              >
-                {secrets.isPending && (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                )}
-                {secrets.isPending
-                  ? "Cancel revealing secret values"
-                  : secrets.isRevealed
-                    ? "Hide secret values"
-                    : "Show secret values"}
-              </button>
-              <p className="mt-2 text-xs text-gray-500" role="status">
-                {secrets.isPending
-                  ? "Loading secret values…"
-                  : secrets.isRevealed
-                    ? "Authorized secret parameters and results are shown. Values without source access remain redacted."
-                    : "Reveal secret parameters and results you are authorized to access. This request is audited."}
-              </p>
-              {secrets.error && (
-                <p role="alert" className="mt-2 text-sm text-red-700">
-                  {secrets.error}
-                </p>
-              )}
-            </div>
-          )}
           {/* Status & Timing */}
           <div className="bg-white shadow rounded-lg p-6">
             <h2 className="text-xl font-semibold mb-4">Execution Details</h2>
@@ -678,6 +645,49 @@ export default function ExecutionDetailPage() {
               isJsonObject(execution.schema_binding)
                 ? execution.schema_binding.output
                 : undefined
+            }
+            secretControl={
+              secrets.canReveal &&
+              isJsonObject(execution.schema_binding) &&
+              (contractHasSecrets(execution.schema_binding.input) ||
+                contractHasSecrets(execution.schema_binding.output)) ? (
+                <div className="flex items-center gap-2">
+                  <span className="text-sm text-gray-600">
+                    Show secret values
+                  </span>
+                  <OnOffSwitch
+                    ariaLabel="Show secret values"
+                    checked={secrets.isRevealed || secrets.isPending}
+                    onChange={(checked) =>
+                      checked ? secrets.reveal() : secrets.hide()
+                    }
+                  />
+                </div>
+              ) : null
+            }
+            secretStatus={
+              <>
+                {secrets.isPending && (
+                  <p
+                    className="mb-3 text-xs text-gray-500 flex items-center gap-2"
+                    role="status"
+                  >
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Loading secret values… Toggle off to cancel.
+                  </p>
+                )}
+                {secrets.isRevealed && (
+                  <p className="mb-3 text-xs text-gray-500" role="status">
+                    Authorized secret parameters and results are shown. Values
+                    without source access remain redacted.
+                  </p>
+                )}
+                {secrets.error && (
+                  <p role="alert" className="mb-3 text-sm text-red-700">
+                    {secrets.error}
+                  </p>
+                )}
+              </>
             }
             isWorkflow={isWorkflow}
           />
@@ -1019,17 +1029,20 @@ function CompactJsonSection({
 }
 
 function ExecutionResultCard({
-  result,
+  result: rawResult,
   contract,
   isWorkflow,
+  secretControl,
+  secretStatus,
 }: {
+  secretControl?: ReactNode;
+  secretStatus?: ReactNode;
   result: unknown;
   contract?: unknown;
   isWorkflow: boolean;
 }) {
-  if (!isJsonObject(result) || Object.keys(result).length === 0) {
-    return null;
-  }
+  const result = isJsonObject(rawResult) ? rawResult : {};
+  if (Object.keys(result).length === 0 && !secretControl) return null;
 
   const exitCode =
     typeof result.exit_code === "number" ? result.exit_code : undefined;
@@ -1069,7 +1082,11 @@ function ExecutionResultCard({
 
   return (
     <div className="bg-white shadow rounded-lg p-6">
-      <h2 className="text-xl font-semibold mb-4">Result</h2>
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+        <h2 className="text-xl font-semibold">Result</h2>
+        {secretControl}
+      </div>
+      {secretStatus}
 
       {hasProcessEnvelope && (
         <div className="mb-4 rounded-lg border border-gray-200 p-3">

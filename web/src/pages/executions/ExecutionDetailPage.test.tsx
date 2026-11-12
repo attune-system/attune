@@ -99,7 +99,7 @@ function Page() {
 }
 
 function show() {
-  fireEvent.click(screen.getByRole("button", { name: "Show secret values" }));
+  fireEvent.click(screen.getByRole("switch", { name: "Show secret values" }));
 }
 
 beforeEach(() => {
@@ -119,10 +119,16 @@ describe("execution secret disclosure", () => {
       .mockResolvedValue({ data: revealed });
     render(<Page />);
     expect(get).not.toHaveBeenCalled();
+    const toggle = screen.getByRole("switch", { name: "Show secret values" });
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    expect(toggle.parentElement?.parentElement).toContainElement(
+      screen.getByRole("heading", { name: "Result" }),
+    );
     expect(screen.getByText("public-sanitized-stdout")).toBeInTheDocument();
     expect(screen.queryByText(/private-token/)).not.toBeInTheDocument();
     show();
     expect(await screen.findByText(/private-token/)).toBeInTheDocument();
+    expect(toggle).toHaveAttribute("aria-checked", "true");
     expect(screen.getByText(/private-password/)).toBeInTheDocument();
     expect(screen.getByText(/private-stdout/)).toBeInTheDocument();
     expect(screen.getAllByText("[REDACTED]").length).toBeGreaterThan(0);
@@ -130,7 +136,7 @@ describe("execution secret disclosure", () => {
       id: 42,
       includeSecretValues: true,
     });
-    fireEvent.click(screen.getByRole("button", { name: "Hide secret values" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Show secret values" }));
     expect(screen.queryByText(/private-token/)).not.toBeInTheDocument();
     expect(screen.queryByText(/private-password/)).not.toBeInTheDocument();
     expect(screen.queryByText(/private-stdout/)).not.toBeInTheDocument();
@@ -141,6 +147,43 @@ describe("execution secret disclosure", () => {
     expect(get).toHaveBeenCalledTimes(2);
   });
 
+  it.each([
+    undefined,
+    {},
+    {
+      input: {
+        annotated_schema: {
+          type: "object",
+          properties: { public: { type: "string" } },
+        },
+      },
+    },
+  ])(
+    "hides the toggle when stored schemas do not declare secrets (%s)",
+    (schema_binding) => {
+      state.execution = { ...execution, schema_binding };
+      render(<Page />);
+      expect(
+        screen.queryByRole("switch", { name: "Show secret values" }),
+      ).not.toBeInTheDocument();
+    },
+  );
+
+  it.each(["input", "output"])(
+    "offers disclosure for %s-only secrets, even before results exist",
+    (side) => {
+      state.execution = {
+        ...execution,
+        result: null,
+        schema_binding: { [side]: execution.schema_binding[side] },
+      };
+      render(<Page />);
+      expect(
+        screen.getByRole("switch", { name: "Show secret values" }),
+      ).toBeInTheDocument();
+    },
+  );
+
   it("does not offer disclosure without execution decrypt permission", () => {
     state.user.effective_permissions = [
       { resource: "executions", actions: ["read"] },
@@ -148,7 +191,7 @@ describe("execution secret disclosure", () => {
     const get = vi.spyOn(ExecutionsService, "getExecution");
     render(<Page />);
     expect(
-      screen.queryByRole("button", { name: "Show secret values" }),
+      screen.queryByRole("switch", { name: "Show secret values" }),
     ).not.toBeInTheDocument();
     expect(get).not.toHaveBeenCalled();
   });
@@ -171,7 +214,7 @@ describe("execution secret disclosure", () => {
       ).not.toBeInTheDocument();
       expect(screen.queryByText(/private-token/)).not.toBeInTheDocument();
       expect(
-        screen.getByRole("button", { name: "Show secret values" }),
+        screen.getByRole("switch", { name: "Show secret values" }),
       ).toBeInTheDocument();
     },
   );
@@ -189,9 +232,7 @@ describe("execution secret disclosure", () => {
     expect(screen.getByRole("status")).toHaveTextContent(
       "Loading secret values",
     );
-    fireEvent.click(
-      screen.getByRole("button", { name: "Cancel revealing secret values" }),
-    );
+    fireEvent.click(screen.getByRole("switch", { name: "Show secret values" }));
     await act(async () => complete({ data: revealed }));
     expect(screen.queryByText(/private-token/)).not.toBeInTheDocument();
   });
