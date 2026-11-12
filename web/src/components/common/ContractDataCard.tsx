@@ -2,65 +2,7 @@ import type { ReactNode } from "react";
 import { JsonValueDisplay } from "./CuratedDataPanel";
 import { isJsonObject } from "./curatedDataUtils";
 
-type SchemaNode = Record<string, unknown>;
-
-/** Read the stored graph without expanding shared definitions or fetching current types. */
-class DisplayGraph {
-  private remaining = 2000;
-  constructor(private readonly bundle: SchemaNode) {}
-
-  visit(depth: number) {
-    if (depth > 32 || --this.remaining < 0)
-      throw new Error("Bound display limit exceeded");
-  }
-
-  resolve(input: unknown): SchemaNode {
-    let node = input;
-    const annotations: SchemaNode = {};
-    for (let hops = 0; hops < 64; hops += 1) {
-      this.visit(0);
-      if (!isJsonObject(node)) return annotations;
-      for (const key of ["title", "description", "position", "secret"]) {
-        if (key === "secret" && node[key] === true) annotations[key] = true;
-        else if (!Object.hasOwn(annotations, key) && Object.hasOwn(node, key))
-          annotations[key] = node[key];
-      }
-      if (typeof node.$ref !== "string") return { ...node, ...annotations };
-      if (!node.$ref.startsWith("#/$defs/"))
-        throw new Error("Invalid bound reference");
-      let target: unknown = this.bundle;
-      for (const escaped of node.$ref.slice(2).split("/")) {
-        const segment = escaped.replace(/~1/g, "/").replace(/~0/g, "~");
-        if (!isJsonObject(target) || !Object.hasOwn(target, segment))
-          throw new Error("Missing bound reference");
-        // Read-only lookup of an own JSON property, never a prototype write.
-        // nosemgrep: javascript.lang.security.audit.prototype-pollution.prototype-pollution-loop.prototype-pollution-loop
-        target = target[segment];
-      }
-      node = target;
-    }
-    throw new Error("Bound reference depth exceeded");
-  }
-
-  views(inputs: unknown[]): SchemaNode[] {
-    const pending = [...inputs];
-    const seen = new Set<unknown>();
-    const result: SchemaNode[] = [];
-    while (pending.length) {
-      const input = pending.pop();
-      if (seen.has(input)) continue;
-      seen.add(input);
-      const node = this.resolve(input);
-      result.push(node);
-      for (const key of ["allOf", "anyOf", "oneOf"]) {
-        const branches = node[key];
-        if (Array.isArray(branches)) pending.push(...branches);
-      }
-      if (node.not !== undefined) pending.push(node.not);
-    }
-    return result;
-  }
-}
+import { DisplayGraph } from "./contractSchema";
 
 function renderBoundValue(
   graph: DisplayGraph,
