@@ -6166,6 +6166,10 @@ mod tests {
         )
         .await
         .unwrap();
+        let before_prepare: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
         let task = tokio::spawn({
             let state = state.clone();
             let user = user.clone();
@@ -6194,6 +6198,14 @@ mod tests {
             attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut tx).await.unwrap();
             tx.rollback().await.unwrap();
         }).await.expect("size-one pool query and both graph modes must finish while GET is paused");
+        let after_prepare: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            before_prepare, after_prepare,
+            "prepare must return its clean session"
+        );
         assert_status_error(
             seal_log_stream(
                 State(state.clone()),
@@ -6210,6 +6222,14 @@ mod tests {
             Delegated::close(&mut tx, execution).await.unwrap();
             tx.commit().await.unwrap();
         }
+        let before_finish: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            after_prepare, before_finish,
+            "acknowledged conflict rollback must preserve reuse"
+        );
         release.notify_one();
         let result = task.await.unwrap();
         if revoke_during_get || mode == 2 {
@@ -6224,6 +6244,14 @@ mod tests {
             return;
         }
         assert_eq!(result.unwrap(), StatusCode::OK);
+        let after_finish: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            before_finish, after_finish,
+            "finish must return its clean session"
+        );
         release.notify_one();
         let mut refreshed = user.clone();
         refreshed.claims.exp += 60;
@@ -6244,6 +6272,14 @@ mod tests {
         assert!(
             futures::FutureExt::now_or_never(entered.notified()).is_none(),
             "published retry must not GET"
+        );
+        let after_retry: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            after_finish, after_retry,
+            "published retry must reuse its session"
         );
         // A published retry must authenticate current authority, not historical JSON.
         let mut tx = state.db.begin().await.unwrap();

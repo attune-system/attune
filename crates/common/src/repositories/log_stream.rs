@@ -36,8 +36,8 @@ impl SelectedLogClose {
 pub struct LogStreamRepository;
 
 impl LogStreamRepository {
-    /// Transaction-local limits; the route owns a pool-accounted socket marked for disposal so a timed-out
-    /// phase/rollback disposes the session instead of returning uncertain state.
+    /// Transaction-local limits; the route retains a cancellation-safe session lease.
+    /// Acknowledged completion permits reuse; interrupted phases dispose the socket.
     pub async fn configure_close_phase(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
         sqlx::query("SELECT set_config('statement_timeout','5s',true),set_config('lock_timeout','5s',true),set_config('jit','off',true)")
             .execute(&mut **tx).await?;

@@ -32,7 +32,9 @@ matched end-to-end observations are recorded below.
   fences per transaction. Preserve final freshness checks after lock/file waits.
 - Preserve canonical lock order and repository-owned database access.
 - Required log settlement precedes terminal completion. Background settlement
-  requires a separate durability design and is outside this plan.
+  requires a separate durability design and is outside this plan. The proposed
+  [completion and log delivery plan](execution-completion-and-log-delivery.md)
+  defines that replacement contract; existing ordering remains until enablement.
 
 ## Implementation sequence
 

@@ -1,6 +1,7 @@
 //! Durable object close. Only immutable selected data crosses the storage phase.
 use super::log_source::{HistoricalBinding, ProofBinding, Source};
 use super::*;
+use attune_common::db::SessionLease;
 use attune_common::repositories::log_stream::SelectedLogClose;
 use sqlx::Connection;
 
@@ -68,11 +69,14 @@ async fn prepare(
     headers: &HeaderMap,
     truncated: bool,
 ) -> Result<Prepared, Failure> {
-    let mut connection = state.db.acquire().await.map_err(map_sqlx_error)?;
-    connection.close_on_drop();
+    // Retain cancellation-safe ownership, but reuse acknowledged clean phases.
+    let mut connection = SessionLease::acquire(&state.db)
+        .await
+        .map_err(map_sqlx_error)?;
     let mut tx = connection.begin().await.map_err(map_sqlx_error)?;
     if let Err(error) = LogStreamRepository::configure_close_phase(&mut tx).await {
         tx.rollback().await.map_err(map_sqlx_error)?;
+        connection.release_clean();
         return Err(map_repository_error(error));
     }
     let mut source = log_source::acquire(state, tx, user, version).await?;
@@ -119,6 +123,7 @@ async fn prepare(
     match result {
         Ok(prepared) => {
             source.commit().await?;
+            connection.release_clean();
             if !prepared.selected.published() && prepared.selected.deadline() <= chrono::Utc::now()
             {
                 return Err(conflict());
@@ -127,6 +132,7 @@ async fn prepare(
         }
         Err(error) => {
             source.rollback().await?;
+            connection.release_clean();
             Err(error)
         }
     }
@@ -181,11 +187,14 @@ async fn finish(
     headers: &HeaderMap,
     verified: &Verified,
 ) -> Result<(), Failure> {
-    let mut connection = state.db.acquire().await.map_err(map_sqlx_error)?;
-    connection.close_on_drop();
+    // Retain cancellation-safe ownership, but reuse acknowledged clean phases.
+    let mut connection = SessionLease::acquire(&state.db)
+        .await
+        .map_err(map_sqlx_error)?;
     let mut tx = connection.begin().await.map_err(map_sqlx_error)?;
     if let Err(error) = LogStreamRepository::configure_close_phase(&mut tx).await {
         tx.rollback().await.map_err(map_sqlx_error)?;
+        connection.release_clean();
         return Err(map_repository_error(error));
     }
     let mut source = log_source::acquire(state, tx, user, initial).await?;
@@ -259,6 +268,7 @@ async fn finish(
     match result {
         Ok(already_published) => {
             source.commit().await?;
+            connection.release_clean();
             // Acknowledged commit followed by pure deadline failure is never
             // relabeled CommitUnknown or blindly retried.
             if !already_published && verified.prepared.selected.deadline() <= chrono::Utc::now() {
@@ -268,6 +278,7 @@ async fn finish(
         }
         Err(error) => {
             source.rollback().await?;
+            connection.release_clean();
             Err(error)
         }
     }
