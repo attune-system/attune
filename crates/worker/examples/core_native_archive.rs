@@ -106,6 +106,9 @@ async fn main() {
     .unwrap();
     // Delete authoring and published source trees: execution must use only archive bytes.
     std::fs::remove_dir_all(&source).unwrap();
+    assert!(publisher
+        .remove_release_tree(&published.digest, published.pack_path.to_str().unwrap())
+        .unwrap());
     std::fs::remove_dir_all(owned.path().join("publisher")).unwrap();
     let message = "雪 '\" \\ newline\nexit_code=9\nseconds=3600\n\n";
     let runtime = NativeRuntime::new();
