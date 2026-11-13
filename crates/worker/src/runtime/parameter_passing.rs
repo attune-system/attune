@@ -365,7 +365,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let probes = HashMap::from([
+        let probes: HashMap<String, String> = HashMap::from([
             ("BASH_ENV".into(), hook.display().to_string()),
             ("ENV".into(), hook.display().to_string()),
             ("PYTHONPATH".into(), root.path().display().to_string()),
