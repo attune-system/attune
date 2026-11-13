@@ -138,7 +138,7 @@ struct OutputWatchTask {
 }
 
 impl OutputWatchTask {
-    async fn finish_or_stop(mut self, grace: Duration) -> (bool, bool) {
+    async fn finish_or_stop(&mut self, grace: Duration) -> (bool, bool) {
         // Terminal status can precede the final SSE chunks. Give active streams
         // a bounded chance to flush, then cancel stale watchers.
         if tokio::time::timeout(grace, &mut self.handle).await.is_err() {
@@ -318,7 +318,8 @@ const RENDER_TICK: Duration = Duration::from_millis(120);
 const WATCH_ROOT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const WATCH_DESCENDANT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const WEBSOCKET_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
-const OUTPUT_WATCH_DRAIN_GRACE: Duration = Duration::from_secs(2);
+// Process completion and verified log delivery have independent deadlines.
+const OUTPUT_WATCH_DRAIN_GRACE: Duration = Duration::from_secs(65);
 const WEBSOCKET_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -687,7 +688,7 @@ pub async fn watch_execution(
         verbose,
     } = opts;
     let mut controls = WatchControls::new()?;
-    let output = spawn_execution_output_watch(
+    let mut output = spawn_execution_output_watch(
         output_client,
         execution_id,
         notifier_ws_url.clone(),
@@ -695,7 +696,7 @@ pub async fn watch_execution(
         true,
         verbose,
     );
-    let interrupted = {
+    let mut interrupted = {
         tokio::select! {
             biased;
             control = controls.next() => WatchEvent::Control(control),
@@ -709,7 +710,19 @@ pub async fn watch_execution(
     } else {
         Duration::ZERO
     };
-    let (delivered_output, root_stdout_completed) = output.finish_or_stop(grace).await;
+    let output_result = tokio::select! {biased;
+        control=controls.next(),if !grace.is_zero()=>{
+            // The action is already terminal. Stop waiting for its logs without
+            // issuing a late cancellation or changing the persisted outcome.
+            if let Err(error)=control {interrupted=WatchEvent::Control(Err(error));}
+            None
+        },
+        result=output.finish_or_stop(grace)=>Some(result),
+    };
+    let (delivered_output, root_stdout_completed) = match output_result {
+        Some(result) => result,
+        None => output.finish_or_stop(Duration::ZERO).await,
+    };
     let restored = controls.close();
     let result = match interrupted {
         WatchEvent::Completion(result) => result.map(|summary| WatchOutcome::Completed {
@@ -2421,7 +2434,7 @@ mod tests {
     #[tokio::test]
     async fn output_watch_drain_grace_cancels_a_stale_notifier_update() {
         let (stop, stopped) = tokio::sync::oneshot::channel();
-        let task = OutputWatchTask {
+        let mut task = OutputWatchTask {
             handle: tokio::spawn(async {
                 let _ = stopped.await;
             }),

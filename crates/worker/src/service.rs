@@ -704,12 +704,25 @@ impl WorkerService {
                 );
             }
 
+            reg.add_capability(
+                "log_delivery_instance".into(),
+                serde_json::json!(self.worker_token_provider.instance_id()),
+            );
             reg.register().await?
         };
         self.worker_id = Some(worker_id);
         self.worker_token_provider
             .set_worker_id(worker_id.to_string());
         self.executor.set_worker_id(worker_id);
+        self.executor
+            .start_log_delivery(
+                self.config
+                    .worker
+                    .as_ref()
+                    .map(|w| w.log_delivery.clone())
+                    .unwrap_or_default(),
+            )
+            .await?;
 
         info!("Worker registered with ID: {}", worker_id);
 
@@ -1384,6 +1397,7 @@ impl WorkerService {
         // join their segmented uploaders; retain them until teardown completes.
         self.runtime_tasks.close();
         self.runtime_tasks.wait().await;
+        self.executor.drain_log_delivery().await;
         self.cancel_tokens.lock().await.clear();
         self.pending_cancellations.lock().await.clear();
 

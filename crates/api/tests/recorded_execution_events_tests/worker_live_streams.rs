@@ -1287,6 +1287,82 @@ async fn worker_live_fixed_reader_cannot_borrow_producers_later_generic_source_g
     Ok(())
 }
 
+#[tokio::test]
+async fn human_live_reader_waits_for_terminal_seal_but_never_invents_success() -> Result<()> {
+    for artifact_route in [false, true] {
+        for finish in [false, true] {
+            let fixture = worker_fixture().await?;
+            let mut log = WorkerLog::allocate(&fixture, LogStreamBackend::ObjectSegments).await?;
+            grant_human(&fixture, exact_log_grants(&log)).await?;
+            log.append(&fixture, b"terminal-before-seal").await?;
+            ExecutionRepository::update(
+                &fixture.ctx.pool,
+                log.execution,
+                UpdateExecutionInput {
+                    status: Some(ExecutionStatus::Completed),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            let mut body = log
+                .reader(
+                    &fixture,
+                    fixture.ctx.token.as_deref().unwrap(),
+                    artifact_route,
+                )
+                .await?;
+            let observation: Result<()> = async {
+                let content = next_data(&mut body).await?;
+                if !content.contains("terminal-before-seal") {
+                    return Err(content.into());
+                }
+                // Observe an actual decoder tick while Completed/Pending. An
+                // immediate incomplete error reproduces the original race.
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    loop {
+                        let bytes = body.try_next().await?.ok_or("reader ended before grace")?;
+                        let text = String::from_utf8_lossy(&bytes);
+                        if text.contains("event: error") || text.contains("event: done") {
+                            return Err(text.into_owned().into());
+                        }
+                        if text.contains("event: waiting") || text.contains(": authorized-wait") {
+                            return Ok::<_, Box<dyn std::error::Error>>(());
+                        }
+                    }
+                })
+                .await??;
+                if finish {
+                    log.seal(&fixture).await?;
+                }
+                let terminal = next_data(&mut body).await?;
+                if finish {
+                    if !terminal.contains("event: done") || terminal.contains("event: error") {
+                        return Err(terminal.into());
+                    }
+                } else if !terminal.contains("event: error") || terminal.contains("event: done") {
+                    return Err(terminal.into());
+                }
+                Ok(())
+            }
+            .await;
+            drop(body);
+            let stopped = log._server.stop().await;
+            drop(log);
+            fixture
+                .ctx
+                .state
+                .execution_log_streams
+                .drain_releases()
+                .await;
+            let cleaned = fixture.ctx.cleanup().await;
+            stopped?;
+            cleaned?;
+            observation?;
+        }
+    }
+    Ok(())
+}
+
 /// Queue a real seal ahead of the human reader's target locks, so discovery
 /// sees Pending and authorization sees publication's new segment descriptor.
 /// A sleep cannot establish this ordering.

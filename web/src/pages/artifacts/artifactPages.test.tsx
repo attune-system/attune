@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   fireEvent,
@@ -91,9 +92,7 @@ describe("artifact browsing through production hooks", () => {
     const fetch = vi.fn();
     vi.stubGlobal("fetch", fetch);
     mount(<ExecutionArtifactsPanel executionId={10} logsIncomplete />);
-    await screen.findByText(
-      "Log delivery was incomplete when this execution finished.",
-    );
+    await screen.findByText("Log delivery is incomplete for this execution.");
     expect(fetch).not.toHaveBeenCalled();
   });
 
@@ -876,5 +875,55 @@ describe("artifact browsing through production hooks", () => {
     expect(fetch.mock.calls[2][0]).toContain(
       "/versions/7/download?version_id=99",
     );
+  });
+});
+
+describe("log delivery after execution completion", () => {
+  it("keeps an open log stream and accepts its final tail after completion", async () => {
+    localStorage.setItem("access_token", "test-token");
+    vi.spyOn(axios, "request").mockResolvedValue({
+      status: 200,
+      data: page([{ ...header, selected_version: selected }]),
+      headers: {},
+    });
+    let source!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        source = controller;
+      },
+    });
+    const fetch = vi.fn().mockResolvedValue(new Response(body));
+    vi.stubGlobal("fetch", fetch);
+    function View() {
+      const [running, setRunning] = useState(true);
+      return (
+        <>
+          <button onClick={() => setRunning(false)}>Complete action</button>
+          <ExecutionArtifactsPanel executionId={10} isRunning={running} />
+        </>
+      );
+    }
+    mount(<View />);
+    fireEvent.click(await screen.findByRole("button", { name: /stdout/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    await waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+    await act(async () => {
+      source.enqueue(
+        new TextEncoder().encode("id: 6\nevent: content\ndata: before\n\n"),
+      );
+    });
+    await screen.findByText("before");
+    fireEvent.click(screen.getByRole("button", { name: "Complete action" }));
+    expect(fetch.mock.calls[0][1].signal.aborted).toBe(false);
+    await act(async () => {
+      source.enqueue(
+        new TextEncoder().encode(
+          "id: 12\nevent: append\ndata:  after\n\nid: 12\nevent: done\ndata: verified\n\n",
+        ),
+      );
+    });
+    await screen.findByText("Stream complete");
+    expect(screen.getByText("before after")).toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledOnce();
   });
 });

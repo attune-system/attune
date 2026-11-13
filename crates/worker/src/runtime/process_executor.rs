@@ -72,6 +72,66 @@ struct CapturedOutput {
     mirror_source: Option<RuntimeLogSource>,
 }
 
+/// Pipe capture and remote log settlement have distinct ownership boundaries.
+/// This remains owned by the tracked capture task until delivery is settled;
+/// returning it is not a durable handoff or authority to complete an execution.
+struct CapturedPipe {
+    writer: BoundedLogWriter,
+    file: Option<BoundedLogFileWriter>,
+    upload_task: Option<attune_common::log_stream::LogWriterTask>,
+    logs_incomplete: bool,
+    mirror_source: Option<RuntimeLogSource>,
+}
+
+impl CapturedPipe {
+    async fn finish_delivery(
+        self,
+        cancel: CancellationToken,
+        stream: RuntimeLogStream,
+    ) -> CapturedOutput {
+        let Self {
+            writer,
+            file,
+            upload_task,
+            mut logs_incomplete,
+            mirror_source,
+        } = self;
+        let seal_error = if let Some(log) = file {
+            let started = TokioInstant::now();
+            tokio::select! {
+                result = log.seal() => {
+                    info!(stream = stream.as_str(), elapsed_ms = started.elapsed().as_millis() as u64,
+                        success = result.is_ok(), "Runtime log capture seal finished");
+                    result.err()
+                },
+                _ = cancel.cancelled() => {
+                    logs_incomplete = true;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let seal_error = if let Some(task) = upload_task {
+            match task.abort_and_join().await {
+                Ok(()) => seal_error,
+                Err(error) => {
+                    logs_incomplete = true;
+                    Some(error)
+                }
+            }
+        } else {
+            seal_error
+        };
+        CapturedOutput {
+            writer,
+            logs_incomplete,
+            seal_error,
+            mirror_source,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ExecutionInterrupt {
     Cancelled,
@@ -124,7 +184,34 @@ async fn write_parameters_to_stdin(
     error
 }
 
+#[cfg(test)]
 async fn capture_output<R>(
+    reader: R,
+    writer: BoundedLogWriter,
+    file: Option<BoundedLogFileWriter>,
+    cancel: CancellationToken,
+    pipe_drain: CancellationToken,
+    stream: RuntimeLogStream,
+    live_mirror: bool,
+) -> CapturedOutput
+where
+    R: AsyncBufRead + Unpin,
+{
+    capture_pipe(
+        reader,
+        writer,
+        file,
+        cancel.clone(),
+        pipe_drain,
+        stream,
+        live_mirror,
+    )
+    .await
+    .finish_delivery(cancel, stream)
+    .await
+}
+
+async fn capture_pipe<R>(
     mut reader: R,
     mut writer: BoundedLogWriter,
     mut file: Option<BoundedLogFileWriter>,
@@ -132,7 +219,7 @@ async fn capture_output<R>(
     pipe_drain: CancellationToken,
     stream: RuntimeLogStream,
     live_mirror: bool,
-) -> CapturedOutput
+) -> CapturedPipe
 where
     R: AsyncBufRead + Unpin,
 {
@@ -216,37 +303,11 @@ where
         }
     }
 
-    let seal_error = if let Some(log) = file {
-        let started = TokioInstant::now();
-        tokio::select! {
-            result = log.seal() => {
-                info!(stream = stream.as_str(), elapsed_ms = started.elapsed().as_millis() as u64,
-                    success = result.is_ok(), "Runtime log capture seal finished");
-                result.err()
-            },
-            _ = cancel.cancelled() => {
-                logs_incomplete = true;
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let seal_error = if let Some(task) = task {
-        match task.abort_and_join().await {
-            Ok(()) => seal_error,
-            Err(error) => {
-                logs_incomplete = true;
-                Some(error)
-            }
-        }
-    } else {
-        seal_error
-    };
-    CapturedOutput {
+    CapturedPipe {
         writer,
+        file,
+        upload_task: task,
         logs_incomplete,
-        seal_error,
         mirror_source,
     }
 }
@@ -495,7 +556,7 @@ pub async fn execute_streaming_cancellable(
     let stderr_cancel = output_cancel.clone();
 
     let stdout_task = spawn_capture(
-        capture_output(
+        capture_pipe(
             stdout_reader,
             stdout_writer,
             stdout_log_writer,
@@ -510,7 +571,7 @@ pub async fn execute_streaming_cancellable(
         )),
     );
     let stderr_task = spawn_capture(
-        capture_output(
+        capture_pipe(
             stderr_reader,
             stderr_writer,
             stderr_log_writer,
@@ -595,7 +656,16 @@ pub async fn execute_streaming_cancellable(
             )
         }
     };
-    let process_wait_elapsed_us = start.elapsed().as_micros() as u64;
+    // Freeze process timing before any post-exit pipe or remote log settlement.
+    let process_duration = start.elapsed();
+    let duration_ms = process_duration.as_millis() as u64;
+    let process_wait_elapsed_us = process_duration.as_micros() as u64;
+    info!(
+        duration_ms,
+        cancelled = wait.1,
+        timed_out = wait.2,
+        "Process wait finished"
+    );
     let settlement_started = Instant::now();
     tracing::debug!(
         phase = "process_wait",
@@ -612,6 +682,13 @@ pub async fn execute_streaming_cancellable(
         let stderr = stderr.map_err(|error| {
             RuntimeError::ExecutionFailed(format!("stderr task failed: {error}"))
         })?;
+        // Capture can finish at EOF before child wait. Accept durable custody
+        // only now, so an early-closed pipe cannot consume its delivery deadline
+        // while the process is still running.
+        let (stdout, stderr) = tokio::join!(
+            stdout.finish_delivery(output_cancel.clone(), RuntimeLogStream::Stdout),
+            stderr.finish_delivery(output_cancel.clone(), RuntimeLogStream::Stderr),
+        );
         Ok::<_, RuntimeError>((stdout, stderr))
     };
     tokio::pin!(output_results);
@@ -686,8 +763,6 @@ pub async fn execute_streaming_cancellable(
             );
         }
     }
-
-    let duration_ms = start.elapsed().as_millis() as u64;
 
     // Get results from bounded writers
     let stdout_result = stdout_output.writer.into_result();
@@ -1953,6 +2028,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pipe_capture_finishes_before_remote_delivery_acknowledgement() {
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let transport = Arc::new(HangingLogTransport {
+            commit_release: Some(release.clone()),
+            ..Default::default()
+        });
+        let config = attune_common::config::ArtifactsConfig::default().log_segment_writer_config();
+        let writer = BoundedLogFileWriter::from_segmented_writer(
+            attune_common::log_stream::SegmentedLogWriter::new(transport.clone(), 4, config)
+                .unwrap(),
+            1024,
+            true,
+        );
+        let captured = timeout(
+            Duration::from_secs(5),
+            capture_pipe(
+                BufReader::new(&b"tail"[..]),
+                BoundedLogWriter::new_stdout(1024),
+                Some(writer),
+                CancellationToken::new(),
+                CancellationToken::new(),
+                RuntimeLogStream::Stdout,
+                false,
+            ),
+        )
+        .await
+        .expect("pipe EOF must not wait for remote acknowledgement");
+        assert!(!captured.logs_incomplete);
+        assert!(captured.file.is_some());
+        assert_eq!(transport.sealed.load(Ordering::SeqCst), 0);
+        let delivery = captured.finish_delivery(CancellationToken::new(), RuntimeLogStream::Stdout);
+        tokio::pin!(delivery);
+        tokio::select! {
+            _ = transport.started.notified() => {},
+            _ = &mut delivery => panic!("delivery completed before upload acknowledgement"),
+            _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("upload did not reach its gate"),
+        }
+        assert_eq!(transport.active.load(Ordering::SeqCst), 1);
+        release.add_permits(1);
+        let settled = timeout(Duration::from_secs(5), delivery).await.unwrap();
+        assert_eq!(settled.writer.into_result().content, "tail");
+        assert!(settled.seal_error.is_none());
+        assert!(!settled.logs_incomplete);
+        assert_eq!(transport.active.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.sealed.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn early_pipe_eof_does_not_begin_delivery_before_child_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("pipe-closed");
+        let child_release = directory.path().join("child-release");
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let transport = Arc::new(HangingLogTransport {
+            commit_release: Some(release.clone()),
+            ..Default::default()
+        });
+        let config = attune_common::config::ArtifactsConfig::default().log_segment_writer_config();
+        let writer = BoundedLogFileWriter::from_segmented_writer(
+            attune_common::log_stream::SegmentedLogWriter::new(transport.clone(), 4, config)
+                .unwrap(),
+            1024,
+            true,
+        );
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("printf tail; exec 1>&- 2>&-; : >\"$1\"; while [ ! -e \"$2\" ]; do sleep 0.01; done")
+            .arg("early-eof").arg(&ready).arg(&child_release);
+        let task = tokio::spawn(async move {
+            execute_streaming_cancellable(
+                cmd,
+                &HashMap::new(),
+                None,
+                Some(10),
+                1024,
+                1024,
+                OutputFormat::Text,
+                ResolvedOutputPolicy::default(),
+                None,
+                None,
+                None,
+                None,
+                Some(writer),
+                None,
+            )
+            .await
+        });
+        let closed = timeout(Duration::from_secs(5), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let premature = if closed.is_ok() {
+            tokio::select! {
+                _ = transport.started.notified() => true,
+                _ = tokio::time::sleep(Duration::from_millis(200)) => false,
+            }
+        } else {
+            false
+        };
+        // Release and join both child and delivery even when the assertion fails.
+        std::fs::write(&child_release, b"release").unwrap();
+        release.add_permits(1);
+        let result = timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        closed.expect("child must reach its explicit closed-pipe barrier");
+        assert!(!premature, "EOF must not start custody before child wait");
+        assert_eq!(result.exit_code, 0);
+        assert!(!result.logs_incomplete);
+        assert_eq!(transport.sealed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn default_finalization_budget_allows_slow_final_upload_and_seal() {
         let transport = Arc::new(HangingLogTransport {
             commit_delay: Some(Duration::from_millis(1_200)),
@@ -1965,11 +2157,15 @@ mod tests {
                 .unwrap();
         let writer = BoundedLogFileWriter::from_segmented_writer(segmented, 1024, true);
         let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c").arg("printf 'tail'");
+        // A fast successful child may close stdin before parameters arrive.
+        // Slow logging must not make that BrokenPipe look like a slow failure.
+        cmd.arg("-c").arg("exec 0<&-; printf 'tail'");
+        let parameters = "x".repeat(1024 * 1024);
+        let lifecycle_started = Instant::now();
         let result = execute_streaming_cancellable(
             cmd,
             &HashMap::new(),
-            None,
+            Some(&parameters),
             Some(10),
             1024,
             1024,
@@ -1984,6 +2180,13 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(
+            lifecycle_started
+                .elapsed()
+                .saturating_sub(Duration::from_millis(result.duration_ms))
+                >= Duration::from_secs(2),
+            "process duration must exclude the delayed upload and seal"
+        );
         assert_eq!(result.exit_code, 0);
         assert!(result.error.is_none());
         assert!(!result.logs_incomplete);

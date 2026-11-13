@@ -1673,6 +1673,23 @@ async fn commit_log_segment(
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
 
+    if let Some(c) =
+        attune_common::log_delivery::credential(&user.claims).map_err(map_transport_error)?
+    {
+        let mut tx = state.db.begin().await.map_err(map_sqlx_error)?;
+        let fence = attune_common::repositories::log_delivery::LogDeliveryRepository::require(
+            &mut tx,
+            artifact_version,
+            c.worker,
+            c.instance,
+        )
+        .await
+        .map_err(map_transport_error)?;
+        fence
+            .append(sequence, bytes.len() as i64, &digest_hex)
+            .map_err(map_transport_error)?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+    }
     let existing = LogStreamRepository::find_segment_by_sequence(&state.db, stream.id, sequence)
         .await
         .map_err(map_repository_error)?;
@@ -1705,11 +1722,28 @@ async fn commit_log_segment(
         return Ok(StatusCode::OK);
     }
     let digest_array: [u8; 32] = digest.into();
-    let stored = match state
-        .blob_store
-        .put(&key, body_from_bytes(bytes.clone()), digest_array)
-        .await
+    // Spool delivery already owns bounded exact bytes. Use one create-only PUT
+    // instead of the generic multipart staging/copy path for these segments.
+    let put = if attune_common::log_delivery::credential(&user.claims)
+        .map_err(map_transport_error)?
+        .is_some()
     {
+        state
+            .blob_store
+            .put_file_atomic(
+                &key,
+                body_from_bytes(bytes.clone()),
+                bytes.len() as u64,
+                digest_array,
+            )
+            .await
+    } else {
+        state
+            .blob_store
+            .put(&key, body_from_bytes(bytes.clone()), digest_array)
+            .await
+    };
+    let stored = match put {
         Ok(stored) => stored,
         Err(BlobStoreError::Conflict) => {
             let stored = state
@@ -1736,6 +1770,11 @@ async fn commit_log_segment(
 
     let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
     let effect = authorize_version_mutation(&state, &mut transaction, &user, &version).await?;
+    if let Some(fence) = &effect.log_delivery {
+        fence
+            .append(sequence, bytes.len() as i64, &digest_hex)
+            .map_err(map_transport_error)?;
+    }
     let locked_version =
         ArtifactVersionRepository::find_by_id_for_update(&mut transaction, artifact_version)
             .await
@@ -1875,6 +1914,11 @@ async fn reserve_proxy_log_upload(
         .map_err(map_repository_error)?
         .ok_or_else(|| (StatusCode::FORBIDDEN, "Artifact version unavailable".into()))?;
     let effect = authorize_version_mutation(state, &mut transaction, user, &initial).await?;
+    if let Some(fence) = &effect.log_delivery {
+        fence
+            .append(sequence, size, sha256)
+            .map_err(map_transport_error)?;
+    }
     let version =
         ArtifactVersionRepository::find_by_id_for_update(&mut transaction, artifact_version)
             .await
@@ -2591,8 +2635,24 @@ async fn encrypted_log_seal_proof(
     }
     if permit.is_none() && user.claims.token_type == TokenType::Worker {
         let execution = version.execution.ok_or_else(denied)?;
-        let worker = pack_candidate_worker_id(user)?;
-        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::require_completion(tx,execution,worker).await.map_err(map_transport_error)?;
+        let worker = effect
+            .log_delivery
+            .as_ref()
+            .map(|f| f.intent.worker)
+            .map(Ok)
+            .unwrap_or_else(|| pack_candidate_worker_id(user))?;
+        if let Some(fence) = &effect.log_delivery {
+            let supplied = headers
+                .get("x-attune-log-final-manifest")
+                .and_then(|v| v.to_str().ok());
+            if fence.intent.execution != execution
+                || supplied != fence.intent.authenticated_manifest.as_deref()
+            {
+                return Err(denied());
+            }
+        } else {
+            attune_common::repositories::delegated_execution::DelegatedExecutionRepository::require_completion(tx,execution,worker).await.map_err(map_transport_error)?;
+        }
         let authenticated = headers
             .get("x-attune-log-final-manifest")
             .and_then(|v| v.to_str().ok())
@@ -2742,6 +2802,17 @@ async fn authorize_log_version(
     user: &AuthenticatedUser,
     artifact_version: i64,
 ) -> Result<attune_common::models::artifact_version::ArtifactVersion, (StatusCode, String)> {
+    let log_credential =
+        attune_common::log_delivery::credential(&user.claims).map_err(map_transport_error)?;
+    if log_credential
+        .as_ref()
+        .is_some_and(|c| c.version != artifact_version)
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Log delivery version mismatch".into(),
+        ));
+    }
     if attune_common::worker_delivery::credential(&user.claims)
         .map_err(map_transport_error)?
         .is_some_and(|credential| credential.version != artifact_version)
@@ -2766,7 +2837,9 @@ async fn authorize_log_version(
             "Log artifact version has no authorization path".to_string(),
         )
     })?;
-    authorize_file_transfer(state, user, file_path, FileOperation::Mutate).await?;
+    if log_credential.is_none() {
+        authorize_file_transfer(state, user, file_path, FileOperation::Mutate).await?;
+    }
     Ok(version)
 }
 
@@ -3830,6 +3903,7 @@ fn mime_from_extension(path: &str) -> &'static str {
 /// These are mounted under `/api/v1/internal/files/` in the main router.
 pub fn routes() -> Router<Arc<AppState>> {
     let delivery = axum::Extension(crate::recorded_files::WorkerDeliveryConsumer);
+    let log_delivery = axum::Extension(crate::recorded_files::LogDeliveryConsumer);
     let recorded =
         axum::Extension(crate::auth::middleware::RecordedRuntimeConsumer::ArtifactDataMutation);
     let recorded_read =
@@ -3866,7 +3940,9 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/internal/logs/{artifact_version}/segments/{sequence}",
-            put(commit_log_segment).layer(delivery),
+            put(commit_log_segment)
+                .layer::<_, std::convert::Infallible>(delivery)
+                .layer(log_delivery),
         )
         .route(
             "/internal/logs/{artifact_version}/segments/{sequence}/direct-upload",
@@ -3878,7 +3954,9 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/internal/logs/{artifact_version}/seal",
-            post(seal_log_stream).layer(delivery),
+            post(seal_log_stream)
+                .layer::<_, std::convert::Infallible>(delivery)
+                .layer(log_delivery),
         )
         .route(
             "/internal/packs/{pack_ref}/archive",
@@ -4754,7 +4832,11 @@ async fn authorize_version_mutation_source(
             .await
             .map_err(map_transport_error)?,
         );
-    } else if user.claims.token_type == TokenType::Worker {
+    } else if attune_common::log_delivery::credential(&user.claims)
+        .map_err(map_transport_error)?
+        .is_none()
+        && user.claims.token_type == TokenType::Worker
+    {
         if let Some(execution) = version.execution {
             let native = user.claims.sub == "0"
                 && user
@@ -4789,7 +4871,29 @@ async fn authorize_version_mutation_source(
     } else {
         None
     };
+    let log_delivery = if let Some(c) =
+        attune_common::log_delivery::credential(&user.claims).map_err(map_transport_error)?
+    {
+        if c.version != version.id {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Log delivery version mismatch".into(),
+            ));
+        }
+        let fence = attune_common::repositories::log_delivery::LogDeliveryRepository::require(
+            tx, version.id, c.worker, c.instance,
+        )
+        .await
+        .map_err(map_transport_error)?;
+        if fence.intent.id != c.intent {
+            return Err((StatusCode::FORBIDDEN, "Log delivery intent mismatch".into()));
+        }
+        Some(fence)
+    } else {
+        None
+    };
     let proof = crate::recorded_files::FileMutationProof {
+        log_delivery,
         credential_deadline: user.claims.exp,
         process,
         process_delivery,
@@ -4943,6 +5047,16 @@ mod tests {
             expected_sha256: [u8; 32],
         ) -> Result<StoredObject, BlobStoreError> {
             self.inner.put(key, body, expected_sha256).await
+        }
+
+        async fn put_file_atomic(
+            &self,
+            key: &ObjectKey,
+            body: BlobBody,
+            size: u64,
+            digest: [u8; 32],
+        ) -> Result<StoredObject, BlobStoreError> {
+            self.inner.put_file_atomic(key, body, size, digest).await
         }
 
         async fn authorize_direct_upload(
@@ -5844,6 +5958,13 @@ mod tests {
     async fn delegated_log_owner(
         pool: &sqlx::PgPool,
     ) -> attune_common::Result<(i64, i64, i64, i64, String)> {
+        delegated_log_owner_with_covering(pool, None).await
+    }
+
+    async fn delegated_log_owner_with_covering(
+        pool: &sqlx::PgPool,
+        covering_role: Option<bool>,
+    ) -> attune_common::Result<(i64, i64, i64, i64, String)> {
         use attune_common::{
             models::{ExecutionStatus, WorkerStatus, WorkerType},
             repositories::{
@@ -5871,6 +5992,72 @@ mod tests {
             },
         )
         .await?;
+        let selected_refs = if let Some(via_role) = covering_role {
+            use attune_common::repositories::identity::{
+                CreateIdentityRoleAssignmentInput, CreatePermissionAssignmentInput,
+                CreatePermissionSetInput, CreatePermissionSetRoleAssignmentInput,
+                IdentityRoleAssignmentRepository, PermissionAssignmentRepository,
+                PermissionSetRepository, PermissionSetRoleAssignmentRepository,
+            };
+            let mut selected_refs = Vec::new();
+            for (name, grants) in [
+                (
+                    "selected",
+                    serde_json::json!([{"resource":"keys","actions":["read"],"constraints":{"refs":["log_binding.token"]}}]),
+                ),
+                (
+                    "covering",
+                    serde_json::json!([{"resource":"keys","actions":["read","decrypt"]}]),
+                ),
+            ] {
+                let set = PermissionSetRepository::create(
+                    &mut *tx,
+                    CreatePermissionSetInput {
+                        r#ref: format!("log_binding.{name}"),
+                        pack: None,
+                        pack_ref: None,
+                        label: None,
+                        description: None,
+                        grants,
+                    },
+                )
+                .await?;
+                if name == "selected" {
+                    selected_refs.push(set.r#ref);
+                } else if via_role {
+                    IdentityRoleAssignmentRepository::create(
+                        &mut *tx,
+                        CreateIdentityRoleAssignmentInput {
+                            identity: owner.id,
+                            role: "log-owners".into(),
+                            source: "manual".into(),
+                            managed: false,
+                        },
+                    )
+                    .await?;
+                    PermissionSetRoleAssignmentRepository::create(
+                        &mut *tx,
+                        CreatePermissionSetRoleAssignmentInput {
+                            permset: set.id,
+                            role: "log-owners".into(),
+                        },
+                    )
+                    .await?;
+                } else {
+                    PermissionAssignmentRepository::create(
+                        &mut *tx,
+                        CreatePermissionAssignmentInput {
+                            identity: owner.id,
+                            permset: set.id,
+                        },
+                    )
+                    .await?;
+                }
+            }
+            selected_refs
+        } else {
+            Vec::new()
+        };
         let pack = PackRepository::create(
             &mut *tx,
             CreatePackInput {
@@ -5956,6 +6143,7 @@ mod tests {
                 action: Some(action.id),
                 action_ref: action.r#ref.clone(),
                 executor: Some(owner.id),
+                permission_set_refs: selected_refs,
                 status: ExecutionStatus::Requested,
                 ..Default::default()
             },
@@ -6038,6 +6226,30 @@ mod tests {
         split_route_case(false, 2).await;
     }
 
+    #[tokio::test]
+    async fn split_route_spooled_delivery_survives_terminal_and_closes_general_authority() {
+        split_route_case(false, 3).await;
+    }
+    #[tokio::test]
+    async fn split_route_spooled_delivery_revoked_during_get_cannot_publish() {
+        split_route_case(true, 3).await;
+    }
+    #[tokio::test]
+    async fn split_route_spooled_deadline_during_get_cannot_publish() {
+        split_route_case(false, 4).await;
+    }
+    #[tokio::test]
+    async fn split_route_spooled_aggregate_digest_mismatch_cannot_publish() {
+        split_route_case(false, 5).await;
+    }
+    #[tokio::test]
+    async fn split_route_spooled_covering_direct_grant_revocation_is_sticky() {
+        split_route_case(true, 6).await;
+    }
+    #[tokio::test]
+    async fn split_route_spooled_covering_role_grant_revocation_is_sticky() {
+        split_route_case(true, 7).await;
+    }
     async fn split_route_case(revoke_during_get: bool, mode: u8) {
         let encrypted = mode > 0;
         use attune_common::repositories::delegated_execution::DelegatedExecutionRepository as Delegated;
@@ -6072,7 +6284,9 @@ mod tests {
         state.blob_store = store;
         let state = Arc::new(state);
         let (identity, execution, worker, _, action) =
-            delegated_log_owner(&state.db).await.unwrap();
+            delegated_log_owner_with_covering(&state.db, (mode >= 6).then_some(mode == 7))
+                .await
+                .unwrap();
         let artifact = ArtifactRepository::create(
             &state.db,
             CreateArtifactInput {
@@ -6131,7 +6345,7 @@ mod tests {
                 claims: attune_common::auth::jwt::validate_token(&token, &jwt).unwrap(),
             }
         };
-        let user = credential(60);
+        let mut user = credential(60);
 
         let mut headers = HeaderMap::new();
         let body = if encrypted {
@@ -6158,14 +6372,198 @@ mod tests {
         } else {
             b"accepted bytes".to_vec()
         };
+        if mode >= 3 {
+            use attune_common::repositories::log_delivery::{
+                DeliverySegment, LogDeliveryRepository as Delivery, PrepareLogDelivery,
+            };
+            let instance = uuid::Uuid::new_v4();
+            let mut tx = state.db.begin().await.unwrap();
+            sqlx::query("UPDATE worker SET capabilities=jsonb_build_object('log_delivery_instance',$2::text) WHERE id=$1").bind(worker).bind(instance.to_string()).execute(&mut *tx).await.unwrap();
+            let stream =
+                LogStreamRepository::find_by_artifact_version_with_conn(&mut tx, version.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let digest = hex_digest(&Sha256::digest(&body).into());
+            let intent = Delivery::prepare(
+                &mut tx,
+                PrepareLogDelivery {
+                    execution,
+                    version: version.id,
+                    stream: stream.id,
+                    worker,
+                    instance,
+                    custody: uuid::Uuid::new_v4(),
+                    segments: vec![DeliverySegment {
+                        sequence: 0,
+                        size_bytes: body.len() as i64,
+                        sha256: digest.clone(),
+                    }],
+                    total_bytes: body.len() as i64,
+                    sha256: if mode == 5 { "0".repeat(64) } else { digest },
+                    truncated: false,
+                    authenticated_manifest: headers
+                        .get("x-attune-log-final-manifest")
+                        .map(|h| h.to_str().unwrap().to_owned()),
+                    finalize_by: Utc::now() + Duration::seconds(if mode == 4 { 15 } else { 60 }),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                Delivery::require(&mut tx, version.id, worker, instance)
+                    .await
+                    .is_err(),
+                "prepared custody must not acquire post-completion delivery authority"
+            );
+            Delegated::close(&mut tx, execution).await.unwrap();
+            use attune_common::repositories::Update;
+            ExecutionRepository::update(
+                &mut *tx,
+                execution,
+                attune_common::repositories::execution::UpdateExecutionInput {
+                    status: Some(attune_common::models::ExecutionStatus::Completed),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+            assert!(
+                !ArtifactVersionRepository::log_finalization_incomplete(&state.db, version.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            );
+            let mut tx = state.db.begin().await.unwrap();
+            assert!(
+                Delegated::require_completion(&mut tx, execution, worker)
+                    .await
+                    .is_err(),
+                "completion must close general worker/action authority"
+            );
+            tx.rollback().await.unwrap();
+            if mode == 3 && !revoke_during_get {
+                // Delivery may span remote I/O. Its incarnation fence must allow
+                // heartbeat writes while still excluding instance replacement.
+                let search_path: String = sqlx::query_scalar("SHOW search_path")
+                    .fetch_one(&state.db)
+                    .await
+                    .unwrap();
+                let mut heartbeat =
+                    <sqlx::PgConnection as sqlx::Connection>::connect(database.database_url())
+                        .await
+                        .unwrap();
+                sqlx::query("SELECT set_config('search_path',$1,false)")
+                    .bind(&search_path)
+                    .execute(&mut heartbeat)
+                    .await
+                    .unwrap();
+                let mut held = state.db.begin().await.unwrap();
+                Delivery::require(&mut held, version.id, worker, instance)
+                    .await
+                    .unwrap();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    sqlx::query("UPDATE worker SET last_heartbeat=clock_timestamp() WHERE id=$1")
+                        .bind(worker)
+                        .execute(&mut heartbeat),
+                )
+                .await
+                .expect("delivery must not block heartbeats")
+                .unwrap();
+                let rotating_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                    .fetch_one(&mut heartbeat)
+                    .await
+                    .unwrap();
+                let rotation = tokio::spawn(async move {
+                    sqlx::query("UPDATE worker SET capabilities=jsonb_set(capabilities,'{log_delivery_instance}',to_jsonb($2::text)) WHERE id=$1")
+                        .bind(worker).bind(uuid::Uuid::new_v4().to_string())
+                        .execute(&mut heartbeat).await.unwrap();
+                    sqlx::Connection::close(heartbeat).await.unwrap();
+                });
+                let mut monitor =
+                    <sqlx::PgConnection as sqlx::Connection>::connect(database.database_url())
+                        .await
+                        .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    loop {
+                        let blocked: bool =
+                            sqlx::query_scalar("SELECT cardinality(pg_blocking_pids($1))>0")
+                                .bind(rotating_pid)
+                                .fetch_one(&mut monitor)
+                                .await
+                                .unwrap();
+                        if blocked {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("instance replacement must wait for in-flight delivery");
+                held.commit().await.unwrap();
+                rotation.await.unwrap();
+                sqlx::Connection::close(monitor).await.unwrap();
+                let mut tx = state.db.begin().await.unwrap();
+                assert!(
+                    Delivery::require(&mut tx, version.id, worker, instance)
+                        .await
+                        .is_err(),
+                    "replaced instance must lose delivery authority"
+                );
+                tx.rollback().await.unwrap();
+                // Restore this test fixture's incarnation for the route checks.
+                sqlx::query("UPDATE worker SET capabilities=jsonb_set(capabilities,'{log_delivery_instance}',to_jsonb($2::text)) WHERE id=$1")
+                    .bind(worker).bind(instance.to_string()).execute(&state.db).await.unwrap();
+            }
+            let token = attune_common::log_delivery::mint(&intent, &jwt).unwrap();
+            user = AuthenticatedUser {
+                claims: attune_common::auth::jwt::validate_token(&token, &jwt).unwrap(),
+            };
+            use tower::ServiceExt;
+            let denied_generic = routes()
+                .with_state(state.clone())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("PUT")
+                        .uri("/internal/files/scope-probe")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                denied_generic.status(),
+                StatusCode::FORBIDDEN,
+                "custody must not authorize generic file mutation"
+            );
+            let mut altered = body.clone();
+            altered[0] ^= 1;
+            assert_status_error(
+                commit_log_segment(
+                    State(state.clone()),
+                    RequireAuth(user.clone()),
+                    Path((version.id, 0)),
+                    Body::from(altered),
+                )
+                .await,
+                StatusCode::FORBIDDEN,
+            );
+        }
         commit_log_segment(
             State(state.clone()),
             RequireAuth(user.clone()),
             Path((version.id, 0)),
-            Body::from(body),
+            Body::from(body.clone()),
         )
         .await
         .unwrap();
+        let before_prepare: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
         let task = tokio::spawn({
             let state = state.clone();
             let user = user.clone();
@@ -6194,6 +6592,14 @@ mod tests {
             attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(&mut tx).await.unwrap();
             tx.rollback().await.unwrap();
         }).await.expect("size-one pool query and both graph modes must finish while GET is paused");
+        let after_prepare: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            before_prepare, after_prepare,
+            "prepare must return its clean session"
+        );
         assert_status_error(
             seal_log_stream(
                 State(state.clone()),
@@ -6203,16 +6609,105 @@ mod tests {
                 headers.clone(),
             )
             .await,
-            StatusCode::CONFLICT,
+            if mode >= 3 {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::CONFLICT
+            },
         );
         if revoke_during_get {
             let mut tx = state.db.begin().await.unwrap();
-            Delegated::close(&mut tx, execution).await.unwrap();
+            if mode >= 6 {
+                let grants: serde_json::Value = sqlx::query_scalar(
+                    "SELECT grants FROM permission_set WHERE ref='log_binding.covering'",
+                )
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+                sqlx::query(
+                    "UPDATE permission_set SET grants='[]'::jsonb WHERE ref='log_binding.covering'",
+                )
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+                sqlx::query("UPDATE permission_set SET grants=$1 WHERE ref='log_binding.covering'")
+                    .bind(grants)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                // Current covering authority is valid again, but a previous
+                // revocation must permanently cancel this exact handoff.
+                Delegated::validate(&mut tx, execution).await.unwrap();
+            } else if mode >= 3 {
+                sqlx::query("UPDATE identity SET frozen=TRUE WHERE id=$1")
+                    .bind(identity)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE identity SET frozen=FALSE WHERE id=$1")
+                    .bind(identity)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            } else {
+                Delegated::close(&mut tx, execution).await.unwrap();
+            }
             tx.commit().await.unwrap();
+            if mode >= 6 {
+                use attune_common::repositories::log_delivery::LogDeliveryRepository as Delivery;
+                let mut tx = state.db.begin().await.unwrap();
+                let intent = Delivery::find(&mut *tx, version.id).await.unwrap().unwrap();
+                assert_eq!(intent.state, "revoked");
+                assert!(
+                    Delivery::claim(
+                        &mut tx,
+                        version.id,
+                        worker,
+                        intent.delivery_instance,
+                        intent.custody
+                    )
+                    .await
+                    .is_err(),
+                    "restored grants must not revive restart custody"
+                );
+                tx.rollback().await.unwrap();
+                assert_status_error(
+                    commit_log_segment(
+                        State(state.clone()),
+                        RequireAuth(user.clone()),
+                        Path((version.id, 0)),
+                        Body::from(body.clone()),
+                    )
+                    .await,
+                    StatusCode::FORBIDDEN,
+                );
+            }
         }
+        if mode == 4 {
+            tokio::time::timeout(std::time::Duration::from_secs(20),async{
+                loop {
+                    let expired:bool=sqlx::query_scalar("SELECT finalize_by<=clock_timestamp() FROM log_delivery_intent WHERE artifact_version=$1").bind(version.id).fetch_one(&state.db).await.unwrap();
+                    if expired{break;}tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }).await.expect("real delivery deadline must expire while verifier is paused");
+            assert!(
+                ArtifactVersionRepository::log_finalization_incomplete(&state.db, version.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            );
+        }
+        let before_finish: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            after_prepare, before_finish,
+            "acknowledged conflict rollback must preserve reuse"
+        );
         release.notify_one();
         let result = task.await.unwrap();
-        if revoke_during_get || mode == 2 {
+        if revoke_during_get || mode == 2 || mode == 4 || mode == 5 {
             assert!(result.is_err());
             let current = ArtifactVersionRepository::find_by_id(&state.db, version.id)
                 .await
@@ -6224,6 +6719,14 @@ mod tests {
             return;
         }
         assert_eq!(result.unwrap(), StatusCode::OK);
+        let after_finish: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            before_finish, after_finish,
+            "finish must return its clean session"
+        );
         release.notify_one();
         let mut refreshed = user.clone();
         refreshed.claims.exp += 60;
@@ -6245,9 +6748,25 @@ mod tests {
             futures::FutureExt::now_or_never(entered.notified()).is_none(),
             "published retry must not GET"
         );
+        let after_retry: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            after_finish, after_retry,
+            "published retry must reuse its session"
+        );
         // A published retry must authenticate current authority, not historical JSON.
         let mut tx = state.db.begin().await.unwrap();
-        Delegated::close(&mut tx, execution).await.unwrap();
+        if mode >= 3 {
+            sqlx::query("UPDATE identity SET frozen=TRUE WHERE id=$1")
+                .bind(identity)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        } else {
+            Delegated::close(&mut tx, execution).await.unwrap();
+        }
         tx.commit().await.unwrap();
         assert!(seal_log_stream(
             State(state.clone()),

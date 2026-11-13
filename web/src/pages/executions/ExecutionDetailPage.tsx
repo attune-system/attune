@@ -805,12 +805,24 @@ export default function ExecutionDetailPage() {
             eventError={eventError}
           />
 
-          {/* Artifacts */}
+          {/* Log delivery can outlive the action result. */}
+          {!isRunning &&
+            Object.values(execution.log_delivery ?? {}).some(
+              (delivery) => delivery.state === "finalizing",
+            ) && (
+              <p className="text-sm text-gray-600" role="status">
+                Execution finished. Logs are still finalizing.
+              </p>
+            )}
           <ExecutionArtifactsPanel
             executionId={execution.id}
             isRunning={isRunning}
             logsIncomplete={
-              !isRunning && execution.result?.logs_incomplete === true
+              !isRunning &&
+              (execution.result?.logs_incomplete === true ||
+                Object.values(execution.log_delivery ?? {}).some(
+                  (delivery) => delivery.state === "incomplete",
+                ))
             }
           />
         </div>

@@ -114,13 +114,23 @@ struct LogEncryption {
 }
 
 enum RuntimeLogWriter {
+    #[cfg(unix)]
+    Spooling(crate::log_delivery::SpoolingLogWriter),
     Segmented(attune_common::log_stream::SegmentedLogWriter),
     SharedFile(attune_common::log_stream::SharedFileLogWriter),
 }
 
 impl RuntimeLogWriter {
+    fn begin_finalization(&self) {
+        #[cfg(unix)]
+        if let Self::Spooling(writer) = self {
+            writer.begin_finalization();
+        }
+    }
     async fn write_all(&self, bytes: &[u8]) -> std::io::Result<()> {
         match self {
+            #[cfg(unix)]
+            Self::Spooling(writer) => writer.write_all(bytes).await,
             Self::Segmented(writer) => writer.write_all(bytes).await,
             Self::SharedFile(writer) => writer.write_all(bytes).await,
         }
@@ -128,6 +138,8 @@ impl RuntimeLogWriter {
 
     async fn seal(self, truncated: bool, manifest: Option<String>) -> attune_common::Result<()> {
         match self {
+            #[cfg(unix)]
+            Self::Spooling(writer) => writer.seal(truncated, manifest).await,
             Self::Segmented(writer) => writer.seal_with_manifest(truncated, manifest).await,
             Self::SharedFile(writer) => writer.seal_with_manifest(truncated, manifest).await,
         }
@@ -294,6 +306,30 @@ impl BoundedLogFileWriter {
         }
     }
 
+    #[cfg(unix)]
+    pub fn from_spooling_writer(
+        writer: crate::log_delivery::SpoolingLogWriter,
+        max_bytes: usize,
+        is_stdout: bool,
+        finalization_timeout_ms: u64,
+    ) -> Self {
+        Self {
+            writer: Some(RuntimeLogWriter::Spooling(writer)),
+            initializer: None,
+            initialization_failed: false,
+            encryption: None,
+            mirror_source: None,
+            finalization_timeout_ms,
+            max_bytes,
+            truncated: false,
+            data_bytes_written: 0,
+            truncation_notice: if is_stdout {
+                TRUNCATION_NOTICE_STDOUT
+            } else {
+                TRUNCATION_NOTICE_STDERR
+            },
+        }
+    }
     pub fn from_shared_file_writer(
         writer: attune_common::log_stream::SharedFileLogWriter,
         max_bytes: usize,
@@ -443,6 +479,10 @@ impl BoundedLogFileWriter {
         if self.initializer.is_some() {
             return Ok(());
         }
+        self.writer
+            .as_ref()
+            .expect("initialized log writer")
+            .begin_finalization();
         if let Some(encryption) = &mut self.encryption {
             if !encryption.pending.is_empty() {
                 let frame = attune_common::runtime_read_log::encode(
@@ -481,6 +521,8 @@ impl BoundedLogFileWriter {
     pub fn task_handle(&self) -> Option<attune_common::log_stream::LogWriterTask> {
         match self.writer.as_ref()? {
             RuntimeLogWriter::Segmented(writer) => Some(writer.task_handle()),
+            #[cfg(unix)]
+            RuntimeLogWriter::Spooling(_) => None,
             RuntimeLogWriter::SharedFile(_) => None,
         }
     }

@@ -1,4 +1,4 @@
-import { artifactContentError } from "@/lib/artifact-preview";
+import { fetchArtifactDownload } from "@/lib/artifact-preview";
 import {
   FileText,
   FileImage,
@@ -156,17 +156,14 @@ export async function downloadArtifact(
   const token = localStorage.getItem("access_token");
   const url = `${OpenAPI.BASE}/api/v1/artifacts/${artifactId}${versionNumber === undefined ? "" : `/versions/${versionNumber}`}/download${versionNumber === undefined ? "" : `?version_id=${versionId}`}`;
 
-  const response = await fetch(url, {
+  const { headers, blob } = await fetchArtifactDownload(url, {
+    signal: new AbortController().signal,
     headers: {
       Authorization: `Bearer ${token}`,
     },
   });
 
-  if (!response.ok) {
-    throw await artifactContentError(response);
-  }
-
-  const disposition = response.headers.get("Content-Disposition");
+  const disposition = headers.get("Content-Disposition");
   let filename =
     artifactRef.replace(/\./g, "_") +
     (versionNumber === undefined ? "" : `_v${versionNumber}`) +
@@ -176,7 +173,6 @@ export async function downloadArtifact(
     if (match) filename = match[1];
   }
 
-  const blob = await response.blob();
   const blobUrl = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = blobUrl;

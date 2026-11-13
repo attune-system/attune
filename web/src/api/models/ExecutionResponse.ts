@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { ExecutionStatus } from "./ExecutionStatus";
+import type { LogAvailability } from "./LogAvailability";
 import type { RetentionPolicyType } from "./RetentionPolicyType";
 import type { Value } from "./Value";
 /**
@@ -42,6 +43,10 @@ export type ExecutionResponse = {
    * Execution ID
    */
   id: number;
+  /**
+   * Per-stream delivery availability; terminal execution status does not imply Ready logs.
+   */
+  log_delivery?: Record<string, LogAvailability> | null;
   /**
    * ID of the original execution if this execution is a retry.
    */

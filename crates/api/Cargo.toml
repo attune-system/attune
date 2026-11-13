@@ -64,9 +64,6 @@ validator = { workspace = true }
 # CLI
 clap = { workspace = true }
 
-# JSON Schema
-schemars = { workspace = true }
-
 # HTTP client
 reqwest = { workspace = true, features = ["stream"] }
 openidconnect = { version = "4.0", default-features = false }

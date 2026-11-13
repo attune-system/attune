@@ -25,7 +25,8 @@ import { formatJsonValue } from "@/lib/format-utils";
 import {
   artifactContentErrorMessage,
   ARTIFACT_PREVIEW_BYTES,
-  readArtifactPreview,
+  fetchArtifactPreview,
+  LOG_FINALIZING_MESSAGE,
 } from "@/lib/artifact-preview";
 import { OpenAPI } from "@/api/core/OpenAPI";
 import {
@@ -71,15 +72,18 @@ function TextContentViewer({
       ? `${OpenAPI.BASE}/api/v1/artifacts/${artifactId}/versions/${versionNumber}/download?version_id=${versionId}`
       : `${OpenAPI.BASE}/api/v1/artifacts/${artifactId}/download`;
 
-    fetch(url, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Range: `bytes=0-${ARTIFACT_PREVIEW_BYTES - 1}`,
+    fetchArtifactPreview(
+      url,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Range: `bytes=0-${ARTIFACT_PREVIEW_BYTES - 1}`,
+        },
+        signal: controller.signal,
       },
-      signal: controller.signal,
-    })
-      .then(async (response) => {
-        const preview = await readArtifactPreview(response);
+      { onFinalizing: () => setLoadError(LOG_FINALIZING_MESSAGE) },
+    )
+      .then((preview) => {
         if (controller.signal.aborted) return;
         setContent(preview.text);
         setTruncated(preview.truncated);
@@ -104,13 +108,21 @@ function TextContentViewer({
     return (
       <div className="flex items-center gap-2 py-4 text-sm text-gray-500">
         <Loader2 className="h-4 w-4 animate-spin" />
-        Loading {label}...
+        {loadError === LOG_FINALIZING_MESSAGE
+          ? LOG_FINALIZING_MESSAGE
+          : `Loading ${label}...`}
       </div>
     );
   }
 
   if (loadError) {
-    return <div className="py-4 text-sm text-red-600">{loadError}</div>;
+    return (
+      <div
+        className={`py-4 text-sm ${loadError === LOG_FINALIZING_MESSAGE ? "text-gray-600" : "text-red-600"}`}
+      >
+        {loadError}
+      </div>
+    );
   }
 
   return (

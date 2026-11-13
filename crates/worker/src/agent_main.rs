@@ -150,6 +150,7 @@ async fn async_main(
             worker_config.name = Some(name);
         } else {
             config.worker = Some(attune_common::config::WorkerConfig {
+                log_delivery: Default::default(),
                 passthrough_env: Vec::new(),
                 name: Some(name),
                 worker_type: None,

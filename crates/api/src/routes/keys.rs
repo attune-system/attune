@@ -2003,13 +2003,9 @@ mod tests {
                 return false;
             }
         }
-        if !filter.owner_scoped
-            && key.owner_type == OwnerType::Identity
-            && key.owner_identity != Some(identity_id)
-        {
-            return false;
-        }
-        true
+        filter.owner_scoped
+            || key.owner_type != OwnerType::Identity
+            || key.owner_identity == Some(identity_id)
     }
 
     fn filters_allow(filters: &[KeyGrantFilter], identity_id: i64, key: &Key) -> bool {

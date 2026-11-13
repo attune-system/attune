@@ -3419,3 +3419,64 @@ mod tests {
         }
     }
 }
+
+/// Log availability is independent of the frozen execution outcome.
+pub mod log_availability {
+    use super::*;
+    use utoipa::ToSchema;
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum LogAvailabilityState {
+        Empty,
+        Finalizing,
+        Ready,
+        Incomplete,
+        Unknown,
+    }
+    #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+    pub struct LogAvailability {
+        pub state: LogAvailabilityState,
+        pub artifact_version: Option<Id>,
+        pub stream: Option<Id>,
+        pub revision: Option<i64>,
+        pub finalize_by: Option<DateTime<Utc>>,
+        pub retry_after_ms: Option<u64>,
+    }
+}
+
+/// Immutable, exact-byte custody accepted from a worker before completion.
+pub mod log_delivery {
+    use super::*;
+    use uuid::Uuid;
+    #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub struct DeliverySegment {
+        pub sequence: i64,
+        pub size_bytes: i64,
+        pub sha256: String,
+    }
+    #[derive(Clone, Debug, sqlx::FromRow)]
+    pub struct LogDeliveryIntent {
+        pub id: i64,
+        pub execution: i64,
+        pub artifact_version: i64,
+        pub stream: i64,
+        pub worker: i64,
+        pub source_instance: Uuid,
+        pub delivery_instance: Uuid,
+        pub attempt: Uuid,
+        pub owner: i64,
+        pub custody: Uuid,
+        pub state: String,
+        pub revision: i64,
+        pub segments: sqlx::types::Json<Vec<DeliverySegment>>,
+        pub total_bytes: i64,
+        pub sha256: String,
+        pub truncated: bool,
+        pub authenticated_manifest: Option<String>,
+        pub finalize_by: DateTime<Utc>,
+        pub failure: Option<String>,
+        pub created: DateTime<Utc>,
+        pub updated: DateTime<Utc>,
+    }
+}

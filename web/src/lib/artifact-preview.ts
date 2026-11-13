@@ -4,7 +4,26 @@ export const LOG_INCOMPLETE_MESSAGE =
   "Log is incomplete because delivery did not finish.";
 const CONTENT_UNAVAILABLE = "Content unavailable or access denied";
 
-class ArtifactDeliveryError extends Error {}
+export class ArtifactDeliveryError extends Error {
+  constructor(
+    public readonly code: "LOG_FINALIZING" | "LOG_INCOMPLETE",
+    public readonly retryAfterMs?: number,
+  ) {
+    super(
+      code === "LOG_FINALIZING"
+        ? LOG_FINALIZING_MESSAGE
+        : LOG_INCOMPLETE_MESSAGE,
+    );
+  }
+}
+
+export function isArtifactFinalizing(
+  error: unknown,
+): error is ArtifactDeliveryError {
+  return (
+    error instanceof ArtifactDeliveryError && error.code === "LOG_FINALIZING"
+  );
+}
 
 export function artifactContentErrorMessage(error: unknown): string {
   return error instanceof ArtifactDeliveryError
@@ -56,9 +75,12 @@ export async function artifactContentError(response: Response): Promise<Error> {
     await response.body?.cancel();
   }
   if (code === "LOG_FINALIZING")
-    return new ArtifactDeliveryError(LOG_FINALIZING_MESSAGE);
+    return new ArtifactDeliveryError(
+      "LOG_FINALIZING",
+      retryAfterMilliseconds(response.headers.get("Retry-After")),
+    );
   if (code === "LOG_INCOMPLETE")
-    return new ArtifactDeliveryError(LOG_INCOMPLETE_MESSAGE);
+    return new ArtifactDeliveryError("LOG_INCOMPLETE");
   return new Error(`HTTP ${response.status}: ${response.statusText}`);
 }
 
@@ -113,5 +135,114 @@ export async function readArtifactPreview(response: Response) {
     } finally {
       reader.releaseLock();
     }
+  }
+}
+
+function retryAfterMilliseconds(value: string | null): number | undefined {
+  if (value === null || !/^[0-9]+$/.test(value)) return undefined;
+  const milliseconds = Number(value) * 1000;
+  return Number.isSafeInteger(milliseconds)
+    ? Math.min(milliseconds, 2000)
+    : undefined;
+}
+
+function waitForDeliveryRetry(
+  milliseconds: number,
+  signal: AbortSignal,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const abort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
+      reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", abort);
+      resolve();
+    }, milliseconds);
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+  });
+}
+
+/** Wait only for an authorized finalizing response for one immutable version.
+ * A mutable latest selector and all other HTTP failures remain single attempts.
+ */
+type DeliveryWaitOptions = { onFinalizing?: () => void; maxWaitMs?: number };
+export function fetchArtifactPreview(
+  url: string,
+  request: RequestInit & { signal: AbortSignal },
+  options: DeliveryWaitOptions = {},
+) {
+  return waitForArtifactDelivery(url, request, readArtifactPreview, options);
+}
+export function fetchArtifactDownload(
+  url: string,
+  request: RequestInit & { signal: AbortSignal },
+  options: DeliveryWaitOptions = {},
+) {
+  return waitForArtifactDelivery(
+    url,
+    request,
+    async (response) => {
+      if (!response.ok) throw await artifactContentError(response);
+      // Consume the body while the request owns its cancellation lifetime.
+      // Returning a Response here would abort an unread download in finally.
+      return { headers: response.headers, blob: await response.blob() };
+    },
+    options,
+  );
+}
+async function waitForArtifactDelivery<T>(
+  url: string,
+  request: RequestInit & { signal: AbortSignal },
+  consume: (response: Response) => Promise<T>,
+  options: DeliveryWaitOptions,
+) {
+  const maxWaitMs = options.maxWaitMs ?? 65_000;
+  if (!Number.isFinite(maxWaitMs) || maxWaitMs <= 0 || maxWaitMs > 300_000)
+    throw new Error("Invalid log availability wait budget");
+  const version = new URL(url, "http://local.invalid").searchParams.get(
+    "version_id",
+  );
+  const immutable = version !== null && /^[1-9][0-9]*$/.test(version);
+  const controller = new AbortController();
+  const abort = () => controller.abort(request.signal.reason);
+  request.signal.addEventListener("abort", abort, { once: true });
+  if (request.signal.aborted) abort();
+  const timer = setTimeout(() => controller.abort(), maxWaitMs);
+  let finalizing: ArtifactDeliveryError | undefined;
+  try {
+    for (let attempt = 0; ; attempt++) {
+      controller.signal.throwIfAborted();
+      try {
+        const response = await fetch(url, {
+          ...request,
+          signal: controller.signal,
+        });
+        // The availability budget ends when content is available. Large
+        // downloads may take longer; caller cancellation still owns the body.
+        if (response.ok) clearTimeout(timer);
+        return await consume(response);
+      } catch (error) {
+        if (!immutable || !isArtifactFinalizing(error)) throw error;
+        finalizing = error;
+        options.onFinalizing?.();
+        const backoff = Math.min(500 * 2 ** Math.min(attempt, 3), 2000);
+        const delay =
+          error.retryAfterMs ??
+          Math.round(backoff * (0.8 + Math.random() * 0.2));
+        await waitForDeliveryRetry(Math.max(500, delay), controller.signal);
+      }
+    }
+  } catch (error) {
+    // An exhausted client wait is still pending, not evidence of lost logs.
+    if (controller.signal.aborted && !request.signal.aborted && finalizing)
+      throw finalizing;
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    request.signal.removeEventListener("abort", abort);
+    controller.abort();
   }
 }

@@ -594,9 +594,34 @@ fn default_ldap_group_attr() -> String {
     "memberOf".to_string()
 }
 
+/// Bounded persistent worker spool. Node/volume loss makes pending logs incomplete.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LogDeliveryConfig {
+    pub enabled: bool,
+    /// Optional private persistent root; defaults below runtime_envs_dir.
+    pub spool_dir: Option<String>,
+    pub max_spool_bytes: u64,
+    pub max_finalizers: usize,
+}
+impl Default for LogDeliveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            spool_dir: None,
+            max_spool_bytes: 1024 * 1024 * 1024,
+            max_finalizers: 64,
+        }
+    }
+}
 /// Worker configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerConfig {
+    /// Persistent local custody for asynchronous object logs. Shared-file logs
+    /// retain synchronous delivery. The worker encryption key is required.
+    #[serde(default)]
+    pub log_delivery: LogDeliveryConfig,
+
     /// Exact parent environment names to expose to actions and dependency installers.
     #[serde(default)]
     pub passthrough_env: Vec<String>,

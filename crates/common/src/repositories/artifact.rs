@@ -1979,7 +1979,7 @@ impl ArtifactVersionRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        sqlx::query_scalar("SELECT CASE WHEN av.body_state = 'ready' THEN FALSE ELSE COALESCE(e.status::text IN ('completed','failed','timeout','cancelled','abandoned'), TRUE) END FROM artifact_version av LEFT JOIN execution e ON e.id = av.execution WHERE av.id = $1")
+        sqlx::query_scalar("SELECT CASE WHEN av.body_state = 'ready' THEN FALSE WHEN EXISTS(SELECT 1 FROM log_delivery_intent i WHERE i.artifact_version=av.id AND i.state IN ('prepared','active') AND i.finalize_by>clock_timestamp()) THEN FALSE ELSE COALESCE(e.status::text IN ('completed','failed','timeout','cancelled','abandoned'), TRUE) END FROM artifact_version av LEFT JOIN execution e ON e.id = av.execution WHERE av.id = $1")
             .bind(version).fetch_optional(executor).await.map_err(Into::into)
     }
 

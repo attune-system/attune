@@ -48,6 +48,16 @@ storage coverage follow [running tests](../testing/running-tests.md) and
 | Parallel prerequisite; complete before operational acceptance | Metrics and alerts, starting with provenance/config verification. | Scrape every API replica; verify finalizing/incomplete counters, worker retry/deadline/finalization and shutdown outcomes, pending age, recovery backlog, outstanding-write/cleanup age, pool waits/lock duration. Use bounded labels without log content/secrets. Establish workload denominators and measured thresholds; exercise alert and resolution on disposable faults. Counters alone are not alert coverage. |
 | Separate lane | Broader DB/maintenance work in the [DB implementation record](database-lock-reduction-implementation.md), [transaction reuse plan](database-transaction-reuse-remediation.md), and [bounded-retention plan](bounded-retention-query-optimization.md). | Per-plan gates for cancellation/socket quarantine, admission/retention ordering, fairness and production-scale workloads. Preserve unclassified failures and deferred optimization targets; do not count merged runtime-log close tests as universal DB/performance acceptance. |
 
+## Execution completion and delayed logs
+
+The proposed [execution completion and asynchronous log delivery plan](execution-completion-and-log-delivery.md)
+separates terminal results from log availability and specifies client retry/SSE
+behavior for completed executions whose logs are still finalizing. It extends
+the recovery/custody and authority work above to delegated worker delivery; the
+existing recovery first slice does not already authorize that handoff. Enable
+earlier completion only after the scoped delivery protocol and all consumers
+are validated together.
+
 ## First implementation and review wave
 
 The immediate implementation wave adds isolated post-merge log acceptance

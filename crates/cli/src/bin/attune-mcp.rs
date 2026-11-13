@@ -1526,7 +1526,7 @@ fn tool_defs() -> &'static [ToolDef] {
         ToolDef {
             name: "executions_get", read_only: true,
             title: "Get execution",
-            description: "Fetch a single execution by numeric ID with secrets redacted. Use executions_export with an explicit output_file for authorized decryption to a private file.",
+            description: "Execution completion reports the action result; log_delivery may still be finalizing. Fetch a single execution by numeric ID with secrets redacted. Use executions_export with an explicit output_file for authorized decryption to a private file.",
             input_schema: id_schema,
         },
         ToolDef {

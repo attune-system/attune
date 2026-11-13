@@ -3,6 +3,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ExecutionStatus,
+  LogAvailabilityState,
   ExecutionsService,
   type ExecutionResponse,
 } from "@/api";
@@ -291,5 +292,35 @@ describe("execution secret disclosure", () => {
     view.unmount();
     render(<Page />);
     expect(screen.queryByText(/private-token/)).not.toBeInTheDocument();
+  });
+});
+
+describe("completed executions with delayed logs", () => {
+  it("keeps the action result visible while log availability settles", () => {
+    const delivery = {
+      state: LogAvailabilityState.FINALIZING,
+      artifact_version: 71,
+      stream: 72,
+      revision: 2,
+      finalize_by: "2026-11-12T10:00:00Z",
+      retry_after_ms: 500,
+    };
+    state.execution = { ...execution, log_delivery: { stdout: delivery } };
+    const view = render(<Page />);
+    expect(
+      screen.getByText("Execution finished. Logs are still finalizing."),
+    ).toBeInTheDocument();
+    expect(screen.getByText("public-sanitized-stdout")).toBeInTheDocument();
+    state.execution = {
+      ...state.execution,
+      log_delivery: {
+        stdout: { ...delivery, state: LogAvailabilityState.READY },
+      },
+    };
+    view.rerender(<Page />);
+    expect(
+      screen.queryByText("Execution finished. Logs are still finalizing."),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("public-sanitized-stdout")).toBeInTheDocument();
   });
 });

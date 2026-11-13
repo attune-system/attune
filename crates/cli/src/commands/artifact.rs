@@ -944,7 +944,14 @@ async fn handle_download(
     let mut client = ApiClient::from_config(&config, api_url)?;
 
     let path = match version {
-        Some(v) => format!("/artifacts/{}/versions/{}/download", id, v),
+        Some(v) => {
+            let selected: VersionResponse =
+                client.get(&format!("/artifacts/{id}/versions/{v}")).await?;
+            format!(
+                "/artifacts/{id}/versions/{v}/download?version_id={}",
+                selected.id
+            )
+        }
         None => format!("/artifacts/{}/download", id),
     };
 

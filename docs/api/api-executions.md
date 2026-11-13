@@ -543,6 +543,31 @@ The `config` field contains the parameters passed to the action:
 
 ### Result Field
 
+For worker process runtimes, `result.duration_ms` measures process execution
+through child wait completion, including stdin delivery and timeout/cancellation
+termination. It excludes post-exit log draining, uploads, and sealing. Execution
+lifecycle timestamps also include preparation and terminal-result persistence;
+use them for time spent in the Running state. Workflow elapsed time measures
+orchestration rather than an OS process.
+
+For API-backed delegated process logs, completion follows bounded capture,
+classified result persistence, and an encrypted worker-spool handoff. Upload and
+sealing run asynchronously. Shared-file and recorded-action delivery retain their
+existing settlement order. See [runtime log operations](../deployment/runtime-log-verification.md).
+
+Execution detail responses include `log_delivery.stdout` and `log_delivery.stderr`.
+Each reports `state` (`empty`, `finalizing`, `ready`, `incomplete`, or `unknown`),
+immutable version/stream IDs when available, a revision and deadline when custody
+exists, and a retry hint while finalizing. This is independent of `status` and the
+frozen `result`: a completed action can have finalizing or incomplete logs.
+
+Clients should keep open log subscriptions until verified EOF, or retry a finite
+read of the same immutable version after HTTP 409 `LOG_FINALIZING` and `Retry-After`.
+Do not retry a mutable latest selector into another execution. Stop on access
+denial or `LOG_INCOMPLETE`; a client wait timeout alone is not proof of log loss.
+The UI and CLI use a bounded 65-second delivery wait. MCP `executions_get` exposes
+the same delivery projection without waiting for logs.
+
 The `result` field contains the output from the action execution:
 
 ```json
@@ -658,7 +683,8 @@ When investigating issues:
 
 Track execution patterns:
 
-- Monitor average execution duration via `created` and `updated` timestamps
+- Monitor worker process duration via `result.duration_ms`; use `started_at` and
+  `completed_at` for execution lifecycle latency (`created` also includes queueing)
 - Track failure rates by status counts
 - Identify slow actions by filtering and analyzing durations
 - Monitor timeout frequency to adjust limits

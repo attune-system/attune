@@ -162,8 +162,18 @@ pub(crate) fn live_ciphertext(
             0u64,
             None::<attune_common::blob_store::BlobReader>,
             false,
+            None,
         ),
-        |(state, pin, mut next_segment, mut offset, mut end, mut reader, finished)| async move {
+        |(
+            state,
+            pin,
+            mut next_segment,
+            mut offset,
+            mut end,
+            mut reader,
+            finished,
+            mut terminal_since,
+        )| async move {
             if finished {
                 return Ok(None);
             }
@@ -176,7 +186,16 @@ pub(crate) fn live_ciphertext(
                             .ok_or_else(invalid)?;
                         return Ok(Some((
                             LiveInput::Data(bytes),
-                            (state, pin, next_segment, offset, end, reader, false),
+                            (
+                                state,
+                                pin,
+                                next_segment,
+                                offset,
+                                end,
+                                reader,
+                                false,
+                                terminal_since,
+                            ),
                         )));
                     }
                     if offset != end {
@@ -298,7 +317,16 @@ pub(crate) fn live_ciphertext(
                                 bytes: offset,
                                 sha256,
                             },
-                            (state, pin, next_segment, offset, end, None, true),
+                            (
+                                state,
+                                pin,
+                                next_segment,
+                                offset,
+                                end,
+                                None,
+                                true,
+                                terminal_since,
+                            ),
                         )));
                     }
                     let key = state
@@ -326,13 +354,49 @@ pub(crate) fn live_ciphertext(
                     }
                     return Ok(Some((
                         LiveInput::Seal(manifest),
-                        (state, pin, next_segment, offset, end, None, true),
+                        (
+                            state,
+                            pin,
+                            next_segment,
+                            offset,
+                            end,
+                            None,
+                            true,
+                            terminal_since,
+                        ),
                     )));
+                }
+                let incomplete =
+                    ArtifactVersionRepository::log_finalization_incomplete(&state.db, pin.version)
+                        .await
+                        .map_err(|_| invalid())?
+                        .unwrap_or(true);
+                // Completion can precede the seal, including recorded delivery
+                // already in flight when this reader selected Pending. Retain
+                // the same bounded grace as the other live-reader path, then
+                // resnapshot; only a verified seal may produce successful EOF.
+                let (since, expired) = crate::routes::executions::advance_terminal_grace(
+                    incomplete,
+                    terminal_since,
+                    tokio::time::Instant::now(),
+                );
+                terminal_since = since;
+                if expired {
+                    return Err(invalid());
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 return Ok(Some((
                     LiveInput::Tick,
-                    (state, pin, next_segment, offset, end, None, false),
+                    (
+                        state,
+                        pin,
+                        next_segment,
+                        offset,
+                        end,
+                        None,
+                        false,
+                        terminal_since,
+                    ),
                 )));
             }
         },

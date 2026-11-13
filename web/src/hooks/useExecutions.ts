@@ -105,7 +105,13 @@ export function useExecution(id: number) {
     enabled: !!id,
     staleTime: 30000,
     refetchInterval: (query) =>
-      isExecutionActive(query.state.data?.data?.status) ? 3000 : false,
+      isExecutionActive(query.state.data?.data?.status)
+        ? 3000
+        : Object.values(query.state.data?.data?.log_delivery ?? {}).some(
+              (delivery) => delivery.state === "finalizing",
+            )
+          ? 1000
+          : false,
   });
 }
 
