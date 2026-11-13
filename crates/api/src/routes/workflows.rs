@@ -849,6 +849,31 @@ pub async fn save_workflow_file(
     Path(pack_ref): Path<String>,
     Json(request): Json<SaveWorkflowFileRequest>,
 ) -> ApiResult<impl IntoResponse> {
+    let lease = state
+        .file_transfers
+        .upload(Some(request.definition.to_string().len() as u64))
+        .map_err(ApiError::BadRequest)?;
+    let transfers = state.file_transfers.clone();
+    let handle = transfers.prepare_publication(lease, move |lease| async move {
+        save_workflow_file_owned(state, user, pack_ref, request, lease).await
+    });
+    tokio_util::task::AbortOnDropHandle::new(handle)
+        .await
+        .map_err(|error| {
+            ApiError::InternalServerError(format!("Workflow preparation owner failed: {error}"))
+        })?
+        .ok_or_else(|| {
+            ApiError::InternalServerError("Workflow preparation canceled during shutdown".into())
+        })?
+}
+
+async fn save_workflow_file_owned(
+    state: Arc<AppState>,
+    user: AuthenticatedUser,
+    pack_ref: String,
+    request: SaveWorkflowFileRequest,
+    lease: crate::file_transfers::FileUploadLease,
+) -> ApiResult<(StatusCode, Json<ApiResponse<WorkflowResponse>>)> {
     request.validate()?;
 
     // Verify pack exists
@@ -882,10 +907,6 @@ pub async fn save_workflow_file(
         )));
     }
 
-    let lease = state
-        .file_transfers
-        .upload(Some(request.definition.to_string().len() as u64))
-        .map_err(ApiError::BadRequest)?;
     let graph = serde_yaml_ng::to_string(&strip_action_level_fields(&request.definition)).map_err(
         |error| ApiError::BadRequest(format!("Cannot serialize workflow graph: {error}")),
     )?;

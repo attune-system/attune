@@ -405,6 +405,12 @@ async fn canceled_file_request_before_commit_cleans_stage_and_rolls_back_rows() 
     request.abort();
     assert!(request.await.unwrap_err().is_cancelled());
     blocker.rollback().await?;
+    assert!(
+        ctx.state
+            .file_transfers
+            .drain(Duration::from_secs(20))
+            .await
+    );
     assert!(!ctx.test_packs_dir.join("cancel_file").exists());
     assert!(
         WorkflowDefinitionRepository::find_by_ref(&ctx.pool, "cancel_file.canceled")

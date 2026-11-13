@@ -123,6 +123,24 @@ impl FileTransfers {
             tokio::select! {value=work=>Some(value),_=cancel.cancelled()=>None}
         })
     }
+    /// Preparation can be canceled and joined; its lease can be handed to the
+    /// non-cancelable acknowledged COMMIT owner without releasing admission.
+    pub(crate) fn prepare_publication<F, W, T>(
+        &self,
+        lease: FileUploadLease,
+        work: F,
+    ) -> JoinHandle<Option<T>>
+    where
+        F: FnOnce(FileUploadLease) -> W + Send + 'static,
+        W: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let cancel = self.cancel.clone();
+        self.tasks.spawn(async move {
+            tokio::select! { value=work(lease)=>Some(value), _=cancel.cancelled()=>None }
+        })
+    }
+
     /// A SQL COMMIT plus local publication must run to acknowledgement even if
     /// its HTTP waiter disconnects or shutdown cancellation begins. The admitted
     /// lease bounds outstanding work; drain joins this tracked critical section.
