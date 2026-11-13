@@ -126,6 +126,16 @@ async fn acquire_binding(
 ) -> Result<(Producer, crate::recorded_files::FileMutationProof), (StatusCode, String)> {
     attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_capture(tx)
         .await.map_err(map_transport_error)?;
+    if attune_common::log_delivery::credential(&user.claims)
+        .map_err(map_transport_error)?
+        .is_some()
+    {
+        // One source proof owns all custody locks in this transaction. Reuse its
+        // producer binding; reacquiring it would repeat full grant/schema checks.
+        let effect = authorize_version_mutation_source(state, tx, user, version).await?;
+        let binding = effect.log_delivery.as_ref().ok_or_else(denied)?.producer();
+        return Ok((Producer::Delegated { binding }, effect));
+    }
     let sensor = if user.claims.token_type == TokenType::Sensor {
         let reference = scoped_metadata_value(user, "sensor_ref", "Sensor")?;
         let row = SensorRepository::find_by_ref(&mut **tx, reference)
@@ -341,6 +351,36 @@ impl<'db> Source<'db> {
     }
 
     /// Access only this phase's transaction for target row locks/reloads.
+    pub(super) fn check_custody_bytes(
+        &self,
+        bytes: i64,
+        sha256: &str,
+    ) -> Result<(), (StatusCode, String)> {
+        if self
+            .effect
+            .log_delivery
+            .as_ref()
+            .is_some_and(|f| f.intent.total_bytes != bytes || f.intent.sha256 != sha256)
+        {
+            return Err(denied());
+        }
+        Ok(())
+    }
+    pub(super) fn check_custody_seal(
+        &self,
+        stream: &LogStream,
+        truncated: bool,
+    ) -> Result<(), (StatusCode, String)> {
+        if let Some(fence) = &self.effect.log_delivery {
+            fence
+                .seal(stream.next_sequence, stream.total_bytes)
+                .map_err(map_transport_error)?;
+            if fence.intent.truncated != truncated {
+                return Err(denied());
+            }
+        }
+        Ok(())
+    }
     pub fn transaction(&mut self) -> &mut sqlx::Transaction<'db, sqlx::Postgres> {
         &mut self.tx
     }

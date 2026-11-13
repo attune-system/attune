@@ -95,6 +95,14 @@ impl CreateExecutionRequest {
 /// Response DTO for execution information
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ExecutionResponse {
+    /// Per-stream delivery availability; terminal execution status does not imply Ready logs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_delivery: Option<
+        std::collections::BTreeMap<
+            String,
+            attune_common::models::log_availability::LogAvailability,
+        >,
+    >,
     /// Execution ID
     #[schema(example = 1)]
     pub id: i64,
@@ -508,6 +516,7 @@ impl From<attune_common::models::execution::Execution> for ExecutionResponse {
                 .result
                 .map(|r| serde_json::to_value(r).unwrap_or(JsonValue::Null)),
             original_execution: execution.original_execution,
+            log_delivery: None,
             schema_binding: None,
             revealed_output_channels: None,
             started_at: execution.started_at,

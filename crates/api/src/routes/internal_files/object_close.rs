@@ -82,6 +82,7 @@ async fn prepare(
     let mut source = log_source::acquire(state, tx, user, version).await?;
     let result = async {
         let (version, stream) = targets(&mut source, user, version, stream_id).await?;
+        source.check_custody_seal(&stream, truncated)?;
         let history = source
             .bind(state, user, &version, &stream, headers, None)
             .await?;
@@ -201,6 +202,7 @@ async fn finish(
     let result = async {
         let p = &verified.prepared;
         let (version, stream) = targets(&mut source, user, initial, p.stream.id).await?;
+        source.check_custody_bytes(verified.bytes.size(), verified.bytes.sha256())?;
         source
             .bind(state, user, &version, &stream, headers, Some(&p.history))
             .await?;

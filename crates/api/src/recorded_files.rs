@@ -11,6 +11,7 @@ use attune_common::{
 use sqlx::PgConnection;
 
 pub(crate) struct FileMutationProof {
+    pub log_delivery: Option<attune_common::repositories::log_delivery::LogDeliveryFence>,
     pub credential_deadline: i64,
     pub process: Option<ValidatedRuntimeAuthority>,
     pub process_delivery: Option<DeliveryEffectFence>,
@@ -26,6 +27,9 @@ impl FileMutationProof {
         self.ensure_fresh()
     }
     pub(crate) fn ensure_fresh(&self) -> ApiResult<()> {
+        if let Some(fence) = &self.log_delivery {
+            fence.ensure_fresh()?;
+        }
         if let Some(authority) = &self.process {
             authority.ensure_fresh()?;
         }
@@ -41,6 +45,9 @@ impl FileMutationProof {
         require_credential_fresh(self.credential_deadline)
     }
     pub async fn ensure_fresh_on(&self, conn: &mut PgConnection) -> ApiResult<()> {
+        if let Some(fence) = &self.log_delivery {
+            fence.ensure_fresh_on(conn).await?;
+        }
         if let Some(authority) = &self.process {
             authority.ensure_fresh_on(conn).await?;
         }
@@ -139,6 +146,10 @@ use crate::{
 /// Trusted marker on append/seal/complete endpoints only, never reads/deletes.
 #[derive(Clone, Copy)]
 pub(crate) struct WorkerDeliveryConsumer;
+
+/// Exact object-log append and seal only; excludes generic file APIs.
+#[derive(Clone, Copy)]
+pub(crate) struct LogDeliveryConsumer;
 
 /// Arbitrary version metadata is a second unstructured payload channel. Until
 /// it has a distinct encrypted/provenance-bound projection, admitted file APIs

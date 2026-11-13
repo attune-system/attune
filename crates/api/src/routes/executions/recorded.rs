@@ -57,6 +57,12 @@ pub(super) async fn detail(
         .await?
         .ok_or_else(|| ApiError::NotFound("Execution unavailable".into()))?;
     let mut response = metadata(execution.clone());
+    response.log_delivery = Some(
+        attune_common::repositories::log_delivery::LogDeliveryRepository::availability(
+            &mut tx, &execution,
+        )
+        .await?,
+    );
     if let Some(content) = content.as_ref() {
         for (entity, value) in [
             (

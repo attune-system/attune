@@ -952,24 +952,61 @@ impl ApiClient {
         &mut self,
         path: &str,
     ) -> Result<(Vec<u8>, String, Option<String>)> {
-        // First attempt
-        let req = self.build_request(Method::GET, path);
-        let response = req.send().await.context("Failed to send request to API")?;
-
-        if response.status() == StatusCode::UNAUTHORIZED
-            && self.refresh_token.is_some()
-            && self.refresh_auth_token().await?
-        {
-            // Retry with new token
-            let req = self.build_request(Method::GET, path);
-            let response = req
-                .send()
+        // Only an exact version may be retried. A mutable latest selector can
+        // resolve to another execution while a previous log is finalizing.
+        let immutable = path.split_once('?').is_some_and(|(_, query)| {
+            query.split('&').any(|field| {
+                field
+                    .strip_prefix("version_id=")
+                    .is_some_and(|id| id.parse::<i64>().is_ok_and(|id| id > 0))
+            })
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(65);
+        let mut attempt = 0u32;
+        loop {
+            let request = self.build_request(Method::GET, path);
+            let response = tokio::time::timeout_at(deadline, request.send())
                 .await
-                .context("Failed to send request to API (retry)")?;
-            return self.handle_bytes_response(response).await;
+                .context("Log availability wait expired; logs may still be finalizing")?
+                .context("Failed to send request to API")?;
+            let response = if response.status() == StatusCode::UNAUTHORIZED
+                && attempt == 0
+                && self.refresh_token.is_some()
+                && self.refresh_auth_token().await?
+            {
+                self.build_request(Method::GET, path)
+                    .send()
+                    .await
+                    .context("Failed to send authenticated request")?
+            } else {
+                response
+            };
+            let retry_after = response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|seconds| Duration::from_secs(seconds.clamp(1, 2)));
+            let result = self.handle_bytes_response(response).await;
+            let pending = result
+                .as_ref()
+                .err()
+                .and_then(|e| e.downcast_ref::<ApiRequestError>())
+                .is_some_and(|e| {
+                    e.status == StatusCode::CONFLICT && e.code.as_deref() == Some("LOG_FINALIZING")
+                });
+            if !immutable || !pending || tokio::time::Instant::now() >= deadline {
+                return result;
+            }
+            let backoff = retry_after
+                .unwrap_or_else(|| Duration::from_millis((500_u64 << attempt.min(2)).min(2000)));
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::sleep(backoff.min(remaining)).await;
+            attempt = attempt.saturating_add(1);
+            if tokio::time::Instant::now() >= deadline {
+                return result;
+            }
         }
-
-        self.handle_bytes_response(response).await
     }
 
     /// Parse a binary response, extracting content type and optional filename.
@@ -1011,12 +1048,7 @@ impl ApiClient {
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
 
-            anyhow::bail!(api_error_message(
-                "API error",
-                status,
-                request_id.as_deref(),
-                &error_text
-            ));
+            Err(ApiRequestError::from_response(status, request_id.as_deref(), &error_text).into())
         }
     }
 
@@ -1309,5 +1341,74 @@ mod credential_refresh_tests {
         assert!(loaded.tokens().unwrap().access_token.is_none());
         loaded.select_profile("other").unwrap();
         assert_eq!(loaded.auth_token().unwrap().as_deref(), Some("new-access"));
+    }
+}
+
+#[cfg(test)]
+mod log_delivery_tests {
+    use super::*;
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+    #[tokio::test]
+    async fn immutable_download_waits_for_finalizing_then_uses_same_version() {
+        let server = MockServer::start().await;
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        Mock::given(method("GET"))
+            .and(path("/api/v1/artifacts/1/versions/2/download"))
+            .respond_with(move |request: &wiremock::Request| {
+                assert_eq!(request.url.query(), Some("version_id=3"));
+                if seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                    ResponseTemplate::new(409).set_body_json(
+                        serde_json::json!({"error":"Log is finalizing","code":"LOG_FINALIZING"}),
+                    )
+                } else {
+                    ResponseTemplate::new(200).set_body_string("echo output")
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let mut client = ApiClient::new(server.uri(), None);
+        let result = client
+            .download_bytes("/artifacts/1/versions/2/download?version_id=3")
+            .await
+            .unwrap();
+        assert_eq!(result.0, b"echo output");
+    }
+    #[tokio::test]
+    async fn mutable_latest_and_incomplete_and_auth_failures_are_not_retried() {
+        for (status, code, exact) in [
+            (409, "LOG_FINALIZING", false),
+            (409, "LOG_INCOMPLETE", true),
+            (403, "forbidden", true),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .set_body_json(serde_json::json!({"error":"unavailable","code":code})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut client = ApiClient::new(server.uri(), None);
+            let target = if exact {
+                "/artifacts/1/versions/2/download?version_id=3"
+            } else {
+                "/artifacts/1/download"
+            };
+            let error = client.download_bytes(target).await.unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<ApiRequestError>()
+                    .unwrap()
+                    .code
+                    .as_deref(),
+                Some(code)
+            );
+        }
     }
 }

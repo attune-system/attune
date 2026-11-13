@@ -9,6 +9,10 @@ pub mod dynamic_runtime;
 pub mod env_setup;
 pub mod executor;
 pub mod heartbeat;
+#[cfg(unix)]
+pub mod log_delivery;
+#[cfg(unix)]
+pub mod log_delivery_spool;
 pub mod recorded_credentials;
 pub mod registration;
 pub mod runtime;

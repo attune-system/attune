@@ -1398,6 +1398,13 @@ pub async fn get_execution(
     };
 
     let mut response = ExecutionResponse::from(execution.clone());
+    response.log_delivery = Some(
+        attune_common::repositories::log_delivery::LogDeliveryRepository::availability(
+            &mut *state.db.acquire().await?,
+            &execution,
+        )
+        .await?,
+    );
     if let Some(binding) =
         attune_common::repositories::schema_contract::SchemaContractRepository::find(
             &mut *state.db.acquire().await?,
@@ -3137,7 +3144,8 @@ pub async fn stream_execution_log(
                         )),
                         Ok(ExecutionLogRead::Idle { .. }) => {
                             let terminal =
-                                execution_log_execution_terminal(&stream_state, execution_id).await;
+                                execution_log_execution_terminal(&stream_state, execution_id).await
+                                && attune_common::repositories::artifact::ArtifactVersionRepository::log_finalization_incomplete(&stream_state.db,session.stream.artifact_version).await.ok().flatten().unwrap_or(true);
                             let now = tokio::time::Instant::now();
                             let (terminal_since, expired) =
                                 advance_terminal_grace(terminal, terminal_since, now);

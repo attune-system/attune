@@ -167,6 +167,7 @@ For more detail, use:
 - File artifacts live on the shared artifact storage volume; metadata stays in PostgreSQL.
 - Artifact transport supports shared-volume and API-backed modes.
 - Runtime logs are classified as private `runtime_log` artifacts.
+- Delegated Unix object-log delivery uses worker-persistent encrypted custody: execution completion can precede log readiness. Preserve the scoped delivery intent, deadline and revocation fences; clients must tolerate `finalizing` after completion. Node/volume loss marks undelivered logs incomplete. See `docs/deployment/runtime-log-verification.md`.
 
 ## Core Domain Notes
 

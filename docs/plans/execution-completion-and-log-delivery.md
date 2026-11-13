@@ -1,6 +1,11 @@
 # Execution completion and asynchronous log delivery
 
-Status: proposed implementation plan, 2026-11-12. Runtime behavior is unchanged.
+Implementation and local validation complete, 2026-11-12. Merge status: work in
+progress pending required CI. Worker-persistent encrypted custody, scoped delivery,
+independent availability and tolerant clients are implemented for delegated Unix
+object logs. Shared-file and recorded-action paths retain settlement before
+terminal publication. The proposed 250 ms lifecycle p95 target was narrowly
+missed; measured results and the remaining timing gap are recorded below.
 This plan extends the existing
 [worker lifecycle plan](worker-execution-lifecycle-performance.md), whose current
 contract requires log settlement before terminal publication.
@@ -26,13 +31,14 @@ This changes completion semantics and post-completion delivery authority. The
 [recovery proposal](runtime-log-worker-loss-recovery.md) supplies related custody
 and revocation requirements, but its first slice only covers fully selected
 recorded-action closes. It does not already authorize this broader delegated
-worker handoff. Complete that protocol review before enabling the new path.
+worker handoff. The selected delegated-worker custody and authority contract is implemented below.
 
-## Current dependencies to replace
+## Original dependency chain
 
 - `crates/worker/src/runtime/process_executor.rs`: `capture_output` drains pipes
   and seals a stream in the same task. The executor joins both tasks before
-  returning; its reported `duration_ms` includes remote log finalization.
+  returning. The initial timing change freezes `duration_ms` at child wait
+  completion; remote finalization remains awaited while handoff is developed.
 - `crates/worker/src/executor.rs`: output classification and terminal persistence
   run after that return. Completion notifications and workflow/queue progress
   follow the persisted terminal row.
@@ -44,6 +50,32 @@ worker handoff. Complete that protocol review before enabling the new path.
   terminal execution state currently contributes to the incomplete diagnosis.
   Execution log SSE also applies a two-second terminal grace period. Both rules
   must change before earlier terminal publication is enabled.
+
+## Historical preparation slice
+
+- Checkpoint `1276fa0a` saves the connection reuse fix and this plan.
+- Freeze the process clock at child wait completion and emit a separate process
+  timing event. Preserve preparation and terminal-persistence lifecycle timing.
+- Split pipe capture into an owned `CapturedPipe` and explicit delivery
+  settlement. The tracked capture task still owns and joins remote work; this
+  boundary does not yet provide a durable handoff or earlier terminal reporting.
+  Streaming writes retain bounded transport backpressure until durable custody
+  is implemented; this first split isolates post-EOF delivery.
+- Add a gated remote-delivery regression and strengthen the slow upload/seal
+  test so remote settlement cannot inflate process duration.
+- Keep scoped authorization, durable custody, per-stream availability, and
+  tolerant clients as remaining enablement gates. No broader post-completion
+  capability is enabled by this preparatory refactor.
+
+Local validation of the initial slice uses checkpoint `1276fa0a` plus the
+uncommitted worker/runtime and documentation changes: `cargo test --locked -p
+attune-worker --lib runtime:: -- --nocapture --test-threads=4` passed all 123
+selected tests, and `cargo clippy --locked -p attune-worker --all-targets -- -D
+warnings`, Rust formatting, and diff whitespace checks passed. The runtime suite
+covers capture, output protection, cancellation, deadlines, and owned shutdown.
+No asynchronous handoff or earlier-terminal acceptance is claimed by these checks.
+Full consumer/contract validation, API generation, durable custody and authority
+acceptance, and required CI remain before merge/enablement readiness.
 
 ## Separate timing and state
 
@@ -166,7 +198,8 @@ origin-based disclosure. Runtime references retain independent-retention and
 dangling-ID semantics; do not add execution/admission retention foreign keys.
 
 Keep the existing 60-second finalization budget as the initial proposed hard
-bound, measured from process exit, subject to any earlier security deadline.
+bound, measured from accepted stream custody after bounded EOF capture, subject
+to any earlier security deadline.
 Publish the effective deadline rather than making clients guess it. An expired
 worker JWT is different from expired security approval. Shutdown stops admission,
 drains owned finalizers within its budget, then leaves recoverable custody or an
@@ -313,3 +346,98 @@ Enable consumers before enabling earlier terminal publication. On rollback,
 stop new asynchronous handoffs and drain or explicitly settle existing intents;
 do not strand them by reverting to the old two-second reader rule or revoking
 finalizer custody while work remains outstanding.
+
+## Selected durability and implementation
+
+The selected guarantee is a worker-persistent encrypted spool. Recovery survives
+process/container restart when the same worker identity, encryption key and volume
+persist. Node/volume loss produces incomplete logs. There is no API-owned custody
+transfer or implied node-loss guarantee.
+
+Implementation uses `log_delivery_intent` to bind an immutable exact-byte manifest
+to the original worker attempt, instance and active delegated owner. Terminal
+publication activates prepared custody in the same database transaction. A new
+instance may claim matching local custody without extending its deadline. The
+purpose-specific `log_delivery` credential is accepted only by object-log append
+and seal routes; action API and general file authority remain closed. Source and
+owner revocation is sticky. Retention protects the pending version and stream
+without adding runtime execution/admission retention dependencies.
+
+The deadline is 60 seconds from accepted stream custody, after child wait and
+bounded EOF capture. Capture runs concurrently with the process, but an early
+closed pipe does not start custody while the process is still running. Process
+duration freezes at child wait. Both boundaries are observed separately in
+workload validation.
+
+See [runtime log operations](../deployment/runtime-log-verification.md) for
+configuration, capacity, restart, node-loss and client behavior. The historical preparation
+validation above is historical evidence only; it does not certify the expanded
+implementation. Final validation must identify the expanded tested diff.
+
+
+## Final local validation
+
+Tested checkpoint `1276fa0a` plus the expanded implementation in this change.
+The connection reuse fix remains in that checkpoint; asynchronous delivery is
+saved separately. Required CI and the full repository suite remain outstanding,
+so these results are local acceptance evidence rather than merge readiness.
+
+- PostgreSQL 16 and 18: all eight `internal_files::tests::split_route_` cases
+  passed on each version after the final API optimization. These include terminal
+  custody, generic-file denial, changed bytes, sticky revocation, expiry during
+  verification, aggregate hash rejection, heartbeat progress and instance fencing.
+- Worker: all 124 runtime cases and five encrypted-spool cases passed, including
+  the explicit early-EOF/child-exit boundary. CLI: two immutable download retry
+  cases and 18 wait/control cases passed. Web: all 646 tests in 86 files passed
+  under Node 22, matching the CI major version.
+- Workspace all-target Clippy with `-D warnings`, Rust formatting, frontend
+  type checking/lint/formatting, API generation and `check:api` passed. API and
+  client versions remain 0.10.4. SQLx preparation passed for the new table/model
+  shape (no query macros found); subsequent migration work added the worker
+  fence trigger without changing that shape, and both final database migrations
+  were exercised by the repository/API cases.
+- Results were reused only for unchanged covered source. After the final API-only
+  optimization, source/binary hashes verified the unchanged optimized worker,
+  executor, sensor, notifier and timer. The final paired cohorts used exactly the
+  same binary set, with only `worker.log_delivery.enabled` changed.
+
+The final RustFS workload used versioned S3 storage and API artifact transport,
+separate service artifact directories, 30-second warm-ups, and one `core.echo`
+per second for 120 seconds per cohort. All 120 executions in each cohort completed
+successfully with exactly one sealed object log. No measured execution was
+excluded. Database transition timestamps mark transaction entry; the worker's
+completion observation occurs after terminal persistence.
+
+| Measurement | Synchronous median / p95 | Asynchronous median / p95 |
+| --- | --- | --- |
+| Running to database Completed | 392.6 / 486.0 ms | 187.9 / 265.3 ms |
+| Child exit to worker completion observation | 289.6 / 355.6 ms | 75.3 / 143.3 ms |
+| Post-exit capture and settlement/custody | 244 / 300 ms | 52 / 86 ms |
+| Child exit to sealed log | 214.8 / 272.6 ms | 308.6 / 390.3 ms |
+| Database Completed to sealed log | -48.8 / -34.6 ms | 232.9 / 312.5 ms |
+
+Process duration p95 was 4 ms in both cohorts. Asynchronous lifecycle p95 missed
+250 ms by 15.3 ms; 11 of 120 executions exceeded 250 ms. The remaining work is
+preparation and metadata/custody persistence: the pre-process estimate had p95
+154.5 ms, custody/capture p95 86 ms, and post-capture terminal observation p95
+79.7 ms. These are separate distributions and must not be added as percentiles.
+Remote sealing no longer gates terminal publication. The longest asynchronous
+child-exit-to-seal observation was 554.9 ms, comfortably within the independent
+60-second delivery deadline.
+
+Both warmed cohorts retained the same nine API backends: PostgreSQL logged zero
+API connection opens/closes and SQLx logged zero unclean-session rejections.
+The real RustFS fault probes passed persistent-spool restart after SIGKILL,
+missing-volume incomplete diagnosis, lost successful seal acknowledgement,
+60-second deadline expiry with no late publication, and bounded independent
+retention (including the supervisor's cleanup admission). Action results stayed
+unchanged. RustFS inventory contained 628 versioned log objects, including sensor
+logs. All native services were joined and the owned containers, networks and
+volumes were removed.
+
+Earlier workload failures exposed and led to fixes for worker heartbeat starvation
+from broad row locks, preterminal delivery locks, and multipart staging overhead.
+The final design uses a dedicated incarnation fence, waits for terminal activation,
+and writes bounded spooled segments through the existing atomic create-only PUT.
+The final measurements above follow those fixes; earlier failed cohorts are not
+used to claim the final performance improvement.

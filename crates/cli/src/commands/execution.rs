@@ -214,6 +214,13 @@ struct ExecutionSummaryRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExecutionDetail {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    log_delivery: Option<
+        std::collections::BTreeMap<
+            String,
+            attune_common::models::log_availability::LogAvailability,
+        >,
+    >,
     id: i64,
     #[serde(default)]
     action: Option<i64>,

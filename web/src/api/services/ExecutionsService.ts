@@ -5,6 +5,7 @@
 import type { CreateExecutionRequest } from "../models/CreateExecutionRequest";
 import type { ExecutionResponse } from "../models/ExecutionResponse";
 import type { ExecutionStatus } from "../models/ExecutionStatus";
+import type { LogAvailability } from "../models/LogAvailability";
 import type { PaginatedResponse_ExecutionSummary } from "../models/PaginatedResponse_ExecutionSummary";
 import type { RetentionPolicyType } from "../models/RetentionPolicyType";
 import type { Value } from "../models/Value";
@@ -320,6 +321,10 @@ export class ExecutionsService {
        */
       id: number;
       /**
+       * Per-stream delivery availability; terminal execution status does not imply Ready logs.
+       */
+      log_delivery?: Record<string, LogAvailability> | null;
+      /**
        * ID of the original execution if this execution is a retry.
        */
       original_execution?: number | null;
@@ -462,6 +467,10 @@ export class ExecutionsService {
        * Execution ID
        */
       id: number;
+      /**
+       * Per-stream delivery availability; terminal execution status does not imply Ready logs.
+       */
+      log_delivery?: Record<string, LogAvailability> | null;
       /**
        * ID of the original execution if this execution is a retry.
        */

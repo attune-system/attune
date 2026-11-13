@@ -248,6 +248,17 @@ impl axum::extract::FromRequestParts<crate::state::SharedState> for RequireAuth<
             extract_claims(&parts.headers, &state.jwt_config)?
         };
 
+        if claims.scope.as_deref() == Some("log_delivery") {
+            attune_common::log_delivery::credential(&claims)
+                .map_err(|_| AuthError::InvalidToken)?;
+            if parts
+                .extensions
+                .get::<crate::recorded_files::LogDeliveryConsumer>()
+                .is_none()
+            {
+                return Err(AuthError::Unauthorized);
+            }
+        }
         // Allow access, sensor, execution, and worker tokens
         if claims.scope.as_deref() == Some("worker_delivery") {
             attune_common::worker_delivery::credential(&claims)

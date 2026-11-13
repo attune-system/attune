@@ -37,7 +37,8 @@ import {
   artifactContentErrorMessage,
   artifactStreamErrorMessage,
   ARTIFACT_PREVIEW_BYTES,
-  readArtifactPreview,
+  fetchArtifactPreview,
+  LOG_FINALIZING_MESSAGE,
 } from "@/lib/artifact-preview";
 import { downloadArtifact } from "@/pages/artifacts/artifactHelpers";
 import { Link } from "react-router-dom";
@@ -134,12 +135,15 @@ function TextFileDetail({
           artifact.ref.slice(artifact.owner.length + 1),
         )?.[1]
       : undefined;
-  const liveStream = isRunning && !!stream;
+  // Execution completion does not end an already-open log subscription.
+  const [followUntilLogSettles] = useState(isRunning && !!stream);
+  const liveStream = followUntilLogSettles && !!stream;
   const [content, setContent] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [isLoadingContent, setIsLoadingContent] = useState(true);
   const [isStreaming, setIsStreaming] = useState(false);
   const [isWaiting, setIsWaiting] = useState(false);
+  const [isFinalizing, setIsFinalizing] = useState(false);
   const [streamDone, setStreamDone] = useState(false);
   const [truncated, setTruncated] = useState(false);
   const preRef = useRef<HTMLPreElement>(null);
@@ -311,9 +315,10 @@ function TextFileDetail({
     };
 
     void (async () => {
+      let reconnectUntil: number | undefined;
       for (
         let attempt = 0;
-        attempt < 2 && !controller.signal.aborted;
+        attempt < 128 && !controller.signal.aborted;
         attempt++
       ) {
         let retryable = true;
@@ -366,7 +371,8 @@ function TextFileDetail({
           // reconnect. Each new transport is independently authorized by the API.
         }
         if (controller.signal.aborted) return;
-        if (!retryable || attempt === 1) {
+        reconnectUntil ??= Date.now() + 65_000;
+        if (!retryable || Date.now() >= reconnectUntil) {
           handleStreamEvent("error", "");
           return;
         }
@@ -404,18 +410,30 @@ function TextFileDetail({
       const token = localStorage.getItem("access_token");
       const url = `${OpenAPI.BASE}/api/v1/artifacts/${artifactId}/versions/${versionNumber}/download?version_id=${versionId}`;
       try {
-        const response = await fetch(url, {
-          headers: {
-            Authorization: `Bearer ${token}`,
-            Range: `bytes=0-${ARTIFACT_PREVIEW_BYTES - 1}`,
+        const preview = await fetchArtifactPreview(
+          url,
+          {
+            headers: {
+              Authorization: `Bearer ${token}`,
+              Range: `bytes=0-${ARTIFACT_PREVIEW_BYTES - 1}`,
+            },
+            signal,
           },
-          signal,
-        });
-        const preview = await readArtifactPreview(response);
+          {
+            onFinalizing: () => {
+              if (!signal.aborted) {
+                setIsWaiting(true);
+                setIsFinalizing(true);
+                setIsLoadingContent(false);
+              }
+            },
+          },
+        );
         if (signal.aborted) return;
         setContent(preview.text);
         setTruncated(preview.truncated);
         setLoadError(null);
+        setIsFinalizing(false);
       } catch (error) {
         if (!signal.aborted) setLoadError(artifactContentErrorMessage(error));
       } finally {
@@ -429,8 +447,8 @@ function TextFileDetail({
   );
 
   // When NOT running (execution completed), use download endpoint to get final content.
-  // This also handles the transition from running → completed (stream was aborted,
-  // now fetch the full file).
+  // Finite previews wait for their exact version; an open stream keeps its
+  // subscription through execution completion until delivery settles.
   useEffect(() => {
     if (liveStream) return;
     const controller = new AbortController();
@@ -470,7 +488,9 @@ function TextFileDetail({
             {isWaiting && (
               <div className="flex items-center gap-1 text-xs text-amber-600">
                 <Loader2 className="h-3 w-3 animate-spin" />
-                <span>Waiting for file…</span>
+                <span>
+                  {isFinalizing ? LOG_FINALIZING_MESSAGE : "Waiting for file…"}
+                </span>
               </div>
             )}
             <button
@@ -750,7 +770,7 @@ function ExecutionArtifactsView({
             role="status"
             className="mb-3 rounded bg-amber-50 p-3 text-sm text-amber-900"
           >
-            Log delivery was incomplete when this execution finished.
+            Log delivery is incomplete for this execution.
           </p>
         )}
         {downloadError && (

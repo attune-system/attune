@@ -26,6 +26,66 @@ and pins later reads and deletes to that version. API replicas may use separate
 provider clients, but they must use the same bucket, prefix, credentials policy,
 and PostgreSQL database.
 
+## Asynchronous worker log custody
+
+On Unix workers, delegated object logs use a persistent encrypted spool by
+default. After EOF and bounded capture, the worker synchronizes an immutable
+entry and registers its exact segment hashes and final proof before publishing
+the action result. A separately bounded uploader completes the same versions.
+Live segment upload remains available while the action runs. Log availability
+is independent of execution completion; later delivery failures do not rewrite
+the action result.
+
+```yaml
+worker:
+  name: stable-worker-name
+  log_delivery:
+    enabled: true
+    # Optional private persistent worker-local directory. Default:
+    # runtime_envs_dir/.log-delivery/<database-worker-id>
+    spool_dir: /var/lib/attune/log-spool
+    max_spool_bytes: 1073741824
+    max_finalizers: 64
+```
+
+Persist the spool volume and keep the worker name and encryption key stable
+across process/container restarts. Each database worker has its own locked
+subdirectory. Entries are authenticated and encrypted at rest, contain the exact
+on-wire bytes and final proof, and contain no bearer credentials or encryption
+keys. Entry and total-byte budgets and the concurrent finalizer limit bound
+resource use. If custody cannot be accepted, capture is marked incomplete and
+the classified action outcome can still settle. This local spool is not the log
+artifact backend: `artifacts.transport: api` and the configured object store
+continue to own delivery and published logs.
+
+A restarted worker claims only matching custody under its original attempt and
+active source authority. The new process instance fences old delivery tokens.
+A dedicated incarnation lock fences replacement without blocking heartbeat or
+active/busy updates. Background uploads wait for terminal publication to activate
+custody, so their source locks cannot hold the execution open.
+Bounded spooled segments use the provider's atomic create-only PUT, avoiding
+multipart staging/copy while retaining exact size/hash and provider-version
+verification. The source proof is reused within each transaction; a new phase
+still reacquires authority and checks freshness.
+
+The purpose-specific credential authorizes exact segment append and seal only;
+completion closes action API access. General file operations, other log versions,
+changed segment bytes, replaced attempts and revoked sources are denied.
+Restoring a revoked source does not revive an old handoff.
+
+Each accepted stream has a 60-second deadline. Reads report `finalizing` only
+while custody remains active and before that deadline; verified Ready publication
+wins concurrent expiry diagnosis. Process/container restart is recoverable when
+the spool volume persists. **Node or volume loss can lose undelivered logs**:
+restarting the same worker without the custody marks them incomplete immediately;
+otherwise the deadline bounds the finalizing period. No API-owned custody or
+node-loss durability guarantee is implied. The action result remains unchanged.
+
+Graceful shutdown stops action admission and drains delivery before heartbeat
+shutdown/deregistration. A forced stop retains synchronized entries for recovery.
+Shared-file and recorded-action logs keep their existing settlement order; this
+handoff does not enable recorded credentials or broaden their readiness gate.
+
 ## Empty execution output
 
 Execution stdout and stderr allocate independently on their first nonempty write.
@@ -265,6 +325,45 @@ make runtime-log-test-storage-clean \
 
 The cleanup script refuses prefixes outside
 `runtime-log-tests/$RUNTIME_LOG_HARNESS_OWNER`.
+
+## Compare completion and log delivery on RustFS
+
+The paired collector runs native API/executor/worker/sensor/notifier binaries
+against exclusively owned Docker PostgreSQL, RabbitMQ and versioned RustFS. It
+uses random host ports and removes only its own project. Build the service
+binaries before running it; keep all compilation and other test workloads out
+of the measured interval.
+
+```bash
+cargo build --locked --release --bin attune-api --bin attune-executor \
+  --bin attune-worker --bin attune-sensor --bin attune-notifier
+CARGO_TARGET_DIR=target/core-timer \
+  cargo build --locked --manifest-path crates/core-timer-sensor/Cargo.toml
+python3 scripts/benchmark-async-log-delivery.py \
+  --output /tmp/attune-log-delivery-new-run \
+  --bin-dir target/release \
+  --timer-bin target/core-timer/debug/attune-core-timer-sensor \
+  --seconds 120
+```
+
+The output directory must be new. Python needs PyYAML, and Docker needs the
+images pinned in the collector. Both cohorts use the same optimized binaries,
+rule, storage and retention settings; only asynchronous handoff changes. Each
+cohort warms for 30 seconds and runs a one-second `core.intervaltimer` rule calling
+`core.echo`. The collector records database Running/Completed history timestamps,
+observed child-wait timestamps, sealed timestamps, results, immutable object-log
+counts and warmed API backend PID continuity. Database transition timestamps
+mark their transaction entry rather than a client-visible commit acknowledgement.
+The report separately records the worker completion observation after terminal
+persistence, monotonic process duration, and post-exit capture/handoff cost. Its
+pre-process estimate subtracts process duration from Running-to-child-wait time;
+it includes preparation and timing/observation overhead.
+
+After the timed cohorts, it checks persistent-spool process restart, missing-volume
+custody, lost seal acknowledgement, deadline expiry, and unchanged action results.
+These fault probes are not included in the latency comparison. Source/binary
+hashes, raw cohort rows, service logs and a JSON summary remain in the private
+output directory. A failed assertion exits nonzero and retains its evidence.
 
 ## Capture a concurrent load report
 

@@ -258,7 +258,8 @@ pub struct ExecutionResult {
     /// Execution result data (parsed from stdout or returned by action)
     pub result: Option<serde_json::Value>,
 
-    /// Execution duration in milliseconds
+    /// Process execution duration in milliseconds, excluding post-exit log delivery.
+    /// Execution lifecycle timestamps also include preparation and result persistence.
     pub duration_ms: u64,
 
     /// Error message if execution failed

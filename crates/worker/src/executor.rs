@@ -70,6 +70,8 @@ pub(crate) struct ExecutionOutcome {
 
 /// Action executor that orchestrates execution flow
 pub struct ActionExecutor {
+    #[cfg(unix)]
+    log_delivery: tokio::sync::OnceCell<Arc<crate::log_delivery::LogDeliveryManager>>,
     pool: PgPool,
     runtime_registry: RuntimeRegistry,
     artifact_manager: ArtifactManager,
@@ -353,6 +355,8 @@ impl ActionExecutor {
     ) -> Self {
         let api_url = normalize_api_url(&api_url);
         Self {
+            #[cfg(unix)]
+            log_delivery: tokio::sync::OnceCell::new(),
             pool,
             runtime_registry,
             artifact_manager,
@@ -399,6 +403,56 @@ impl ActionExecutor {
         }
     }
 
+    pub async fn start_log_delivery(
+        &self,
+        config: attune_common::config::LogDeliveryConfig,
+    ) -> Result<()> {
+        #[cfg(unix)]
+        if config.enabled && self.transport.transport_mode() != "volume" {
+            if config.max_finalizers == 0 || config.max_spool_bytes == 0 {
+                return Err(Error::validation("Log delivery budgets must be positive"));
+            }
+            let key = self
+                .secret_manager
+                .encryption_key()
+                .ok_or_else(|| Error::validation("Asynchronous logs require an encryption key"))?
+                .to_owned();
+            let worker = self.worker_id.load(Ordering::Acquire);
+            let root = config
+                .spool_dir
+                .as_ref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| self.runtime_envs_dir.join(".log-delivery"))
+                .join(worker.to_string());
+            let max_plain = self.max_stdout_bytes.max(self.max_stderr_bytes) as u64;
+            let max_payload = attune_common::runtime_read_log::maximum_encoded_bytes(max_plain)?;
+            let manager = crate::log_delivery::LogDeliveryManager::open(
+                self.pool.clone(),
+                root,
+                key,
+                worker,
+                self.worker_instance,
+                self.jwt_config.clone(),
+                self.api_url.clone(),
+                config,
+                max_payload,
+                self.log_segment_config.max_segment_bytes,
+            )
+            .await?;
+            self.log_delivery
+                .set(manager)
+                .map_err(|_| Error::invalid_state("Log delivery started twice"))?;
+        }
+        #[cfg(not(unix))]
+        let _ = config;
+        Ok(())
+    }
+    pub async fn drain_log_delivery(&self) {
+        #[cfg(unix)]
+        if let Some(manager) = self.log_delivery.get() {
+            manager.drain().await;
+        }
+    }
     pub fn set_worker_id(&self, worker_id: i64) {
         self.worker_id.store(worker_id, Ordering::Release);
     }
@@ -1678,6 +1732,15 @@ impl ActionExecutor {
                 self.max_stderr_bytes
             };
             let initialized_mirror = mirror_source.clone();
+            #[cfg(unix)]
+            let async_delivery = if delivery.is_none()
+                && protected_delegation
+                && backend == LogStreamBackend::ObjectSegments
+            {
+                self.log_delivery.get().cloned()
+            } else {
+                None
+            };
             BoundedLogFileWriter::lazy(
                 move || async move {
                     let (file_path, version, transport) = if let Some(context) = &delivery {
@@ -1734,6 +1797,23 @@ impl ActionExecutor {
                             config.finalization_timeout_ms,
                         )
                     } else {
+                        #[cfg(unix)]
+                        if let Some(manager) = async_delivery {
+                            let writer = BoundedLogFileWriter::from_spooling_writer(
+                                manager.writer(execution.id, version, transport).await?,
+                                max_bytes,
+                                is_stdout,
+                                config.finalization_timeout_ms,
+                            )
+                            .with_encryption(encryption_key.as_deref(), execution.id, version)
+                            .with_mirror_source(initialized_mirror);
+                            let relative = ValidatedRelativePath::new(&file_path)?;
+                            path.set(artifacts_dir.join(relative.as_path()))
+                                .map_err(|_| {
+                                    Error::invalid_state("Log writer initialized twice")
+                                })?;
+                            return Ok(writer);
+                        }
                         BoundedLogFileWriter::from_segmented_writer(
                             attune_common::log_stream::SegmentedLogWriter::new(
                                 transport, version, config,

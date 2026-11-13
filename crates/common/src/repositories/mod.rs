@@ -75,6 +75,7 @@ pub mod integration_token;
 pub mod interoperability_inspection;
 pub mod key;
 pub mod key_schema;
+pub mod log_delivery;
 pub mod log_stream;
 pub mod maintenance;
 pub mod maintenance_admission;

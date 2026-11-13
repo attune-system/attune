@@ -329,6 +329,13 @@ pub(crate) fn live_ciphertext(
                         (state, pin, next_segment, offset, end, None, true),
                     )));
                 }
+                if ArtifactVersionRepository::log_finalization_incomplete(&state.db, pin.version)
+                    .await
+                    .map_err(|_| invalid())?
+                    .unwrap_or(true)
+                {
+                    return Err(invalid());
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 return Ok(Some((
                     LiveInput::Tick,
