@@ -655,16 +655,6 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
     )
     .await?;
     helpers::activate_test_pack_release(&ctx.pool, &pack).await?;
-    attune_common::repositories::runtime::RuntimeRepository::update(
-        &ctx.pool,
-        runtime.id,
-        attune_common::repositories::runtime::UpdateRuntimeInput {
-            execution_config: Some(json!({"permitted_caller_env":["AUTHORING_ONLY"]})),
-            ..Default::default()
-        },
-    )
-    .await?;
-
     let parent_execution = create_pinned_ad_hoc_parent(&ctx.pool, &action, &identity, &[]).await?;
 
     let runtime_read_ref = format!("test.exec_token_runtime_read_{}", suffix);
@@ -895,8 +885,107 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
         stored.env_vars,
         Some(json!({"LOG_LEVEL":"debug", "EMPTY":""}))
     );
+    assert_eq!(
+        stored
+            .executable_snapshot
+            .as_ref()
+            .unwrap()
+            .executable
+            .runtime
+            .as_ref()
+            .unwrap()
+            .execution_config["permitted_caller_env"],
+        json!(["LOG_LEVEL", "EMPTY"])
+    );
+
+    // Ad hoc invocations capture current authoring at selection time. Changing
+    // authoring affects a NEW invocation, never the execution already selected.
+    attune_common::repositories::runtime::RuntimeRepository::update(
+        &ctx.pool,
+        runtime.id,
+        attune_common::repositories::runtime::UpdateRuntimeInput {
+            execution_config: Some(json!({"permitted_caller_env":["AUTHORING_ONLY"]})),
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    let persisted = ExecutionRepository::find_by_id(&ctx.pool, stored.id)
+        .await?
+        .unwrap();
+    assert_eq!(
+        persisted
+            .executable_snapshot
+            .as_ref()
+            .unwrap()
+            .executable
+            .runtime
+            .as_ref()
+            .unwrap()
+            .execution_config["permitted_caller_env"],
+        json!(["LOG_LEVEL", "EMPTY"])
+    );
+    assert_eq!(persisted.env_vars, stored.env_vars);
+
+    let mut fresh_body = execute_body(&action, Some(Vec::new()));
+    fresh_body["env_vars"] = json!({"AUTHORING_ONLY":"fresh-authoring-value"});
+    let fresh = ctx
+        .post(
+            "/api/v1/executions/execute",
+            fresh_body,
+            Some(&execute_only_token),
+        )
+        .await?;
+    assert_eq!(fresh.status(), StatusCode::CREATED);
+    let fresh_body: Value = fresh.json().await?;
+    let fresh =
+        ExecutionRepository::find_by_id(&ctx.pool, fresh_body["data"]["id"].as_i64().unwrap())
+            .await?
+            .unwrap();
+    assert_eq!(
+        fresh.env_vars,
+        Some(json!({"AUTHORING_ONLY":"fresh-authoring-value"}))
+    );
+    assert_eq!(
+        fresh
+            .executable_snapshot
+            .as_ref()
+            .unwrap()
+            .executable
+            .runtime
+            .as_ref()
+            .unwrap()
+            .execution_config["permitted_caller_env"],
+        json!(["AUTHORING_ONLY"])
+    );
+    for name in ["LOG_LEVEL", "EMPTY"] {
+        let mut body = execute_body(&action, Some(Vec::new()));
+        body["env_vars"] = json!({name:"old-policy-value"});
+        let response = ctx
+            .post(
+                "/api/v1/executions/execute",
+                body,
+                Some(&execute_only_token),
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{name}");
+        let diagnostic = response.text().await?;
+        assert!(diagnostic.contains(name));
+        assert!(!diagnostic.contains("old-policy-value"));
+    }
+
     // Every producer must revalidate inherited caller values against its target.
     let original_snapshot = stored.executable_snapshot.as_ref().unwrap();
+    assert!(attune_common::execution_env::validate_snapshot_environment(
+        Some(original_snapshot),
+        stored.env_vars.as_ref()
+    )
+    .is_ok());
+    assert!(attune_common::execution_env::validate_snapshot_environment(
+        Some(original_snapshot),
+        fresh.env_vars.as_ref()
+    )
+    .is_err());
     let mut versioned = original_snapshot.clone();
     versioned.executable.runtime_versions.push(RuntimeVersion {
         id: 1,
@@ -959,6 +1048,21 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
         env_vars: stored.env_vars.clone(),
         ..Default::default()
     };
+    let inherited =
+        ExecutionRepository::create_pinned(&ctx.pool, copied.clone(), original_snapshot).await?;
+    assert_eq!(inherited.env_vars, stored.env_vars);
+    assert_eq!(
+        inherited
+            .executable_snapshot
+            .as_ref()
+            .unwrap()
+            .executable
+            .runtime
+            .as_ref()
+            .unwrap()
+            .execution_config["permitted_caller_env"],
+        json!(["LOG_LEVEL", "EMPTY"])
+    );
     let mut narrower = original_snapshot.clone();
     narrower
         .executable
