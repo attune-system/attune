@@ -561,3 +561,106 @@ async fn missing_action_or_binding_without_admission_is_rejected_before_worker_c
     directory.close().unwrap();
     fixture.db.cleanup().await.unwrap();
 }
+
+#[tokio::test]
+async fn delivery_mode_probe_never_downgrades_revoked_recorded_authority() {
+    use attune_common::repositories::{worker_delivery::WorkerDeliveryRepository, FindById};
+    let fixture = fixture(true).await;
+    let execution = ExecutionRepository::find_by_id(&fixture.db, fixture.execution)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut tx = fixture.db.begin().await.unwrap();
+    Authority::revoke_admission(&mut tx, fixture.admission)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(attune_worker::completion::register(
+        fixture.db.pool(),
+        &execution,
+        123,
+        uuid::Uuid::new_v4(),
+    )
+    .await
+    .is_err());
+    let mut tx = fixture.db.begin().await.unwrap();
+    assert!(
+        WorkerDeliveryRepository::for_execution(&mut tx, execution.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    tx.rollback().await.unwrap();
+    fixture.db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn delegated_delivery_mode_probe_has_no_effect_and_does_not_authorize_launch() {
+    use attune_common::repositories::{
+        delegated_execution::DelegatedExecutionRepository as Delegated,
+        worker_delivery::WorkerDeliveryRepository, FindById,
+    };
+    let fixture = fixture(true).await;
+    let source = ExecutionRepository::find_by_id(&fixture.db, fixture.execution)
+        .await
+        .unwrap()
+        .unwrap();
+    let snapshot = source.executable_snapshot.as_ref().unwrap();
+    let owner = fixture.humans[0];
+    let mut tx = fixture.db.begin().await.unwrap();
+    let execution = ExecutionRepository::create_pinned(
+        &mut *tx,
+        CreateExecutionInput {
+            action: source.action,
+            action_ref: source.action_ref.clone(),
+            executor: Some(owner),
+            ..Default::default()
+        },
+        snapshot,
+    )
+    .await
+    .unwrap();
+    let binding = SchemaContractRepository::materialize_action(&mut tx, snapshot)
+        .await
+        .unwrap();
+    SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, execution.id, &binding)
+        .await
+        .unwrap();
+    Delegated::select(&mut tx, execution.id, None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    IdentityRepository::update(
+        &fixture.db,
+        owner,
+        UpdateIdentityInput {
+            frozen: Some(true),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    // Classification may still say "delegated" after revocation. It grants no
+    // delivery context and must never replace the worker's live launch check.
+    assert!(attune_worker::completion::register(
+        fixture.db.pool(),
+        &execution,
+        123,
+        uuid::Uuid::new_v4(),
+    )
+    .await
+    .unwrap()
+    .is_none());
+    let mut tx = fixture.db.begin().await.unwrap();
+    assert!(Admission::existing_authority(&mut tx, execution.id)
+        .await
+        .is_err());
+    assert!(
+        WorkerDeliveryRepository::for_execution(&mut tx, execution.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    tx.rollback().await.unwrap();
+    fixture.db.cleanup().await.unwrap();
+}

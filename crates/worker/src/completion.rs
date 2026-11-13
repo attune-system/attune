@@ -29,7 +29,10 @@ pub async fn register(
     instance: Uuid,
 ) -> Result<Option<DeliveryContext>> {
     let mut tx = pool.begin().await?;
-    if ExecutionAdmissionRepository::existing_authority(&mut tx, execution.id).await?
+    // This branch only discovers whether recorded delivery has work. It grants
+    // nothing to delegated code. Recorded registration below validates the live
+    // admission, assignment, attempt and approval fence before creating context.
+    if ExecutionAdmissionRepository::selected_authority(&mut tx, execution.id).await?
         == attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Delegated
     {
         return Ok(None);
