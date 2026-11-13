@@ -84,6 +84,20 @@ async fn delegated_mutations_require_target_grants_even_with_admin_sponsor() -> 
         {"resource":"triggers","actions":["read","update"],"constraints":{"refs":["mutation_authz.trigger"]}},
         {"resource":"packs","actions":["read"]}
     ])).await?;
+    assign(
+        &ctx,
+        identity.id,
+        "test.mutation_trigger_id",
+        json!([
+            {"resource":"triggers","actions":["read","update"],"constraints":{"ids":[trigger.id]}}
+        ]),
+    )
+    .await?;
+    let trigger_id_token =
+        helpers::delegated_source::token(&ctx, identity.id, &["test.mutation_trigger_id".into()])
+            .await?;
+    let adjacent_trigger =
+        create_test_trigger(&ctx.pool, pack.id, "mutation_authz.adjacent").await?;
     let narrow =
         helpers::delegated_source::token(&ctx, identity.id, &["test.mutation_narrow".into()])
             .await?;
@@ -250,6 +264,29 @@ async fn delegated_mutations_require_target_grants_even_with_admin_sponsor() -> 
         if operation == "regenerate" {
             assert_ne!(changed.webhook_key, before.webhook_key);
         }
+    }
+    // IDs select the actual trigger, while association pack metadata must
+    // neither widen the grant nor prevent a correctly scoped mutation.
+    for operation in ["enable", "regenerate", "disable"] {
+        let path = format!("/api/v1/triggers/{}/webhooks/{operation}", trigger.r#ref);
+        ctx.post(&path, json!({}), Some(&trigger_id_token))
+            .await?
+            .assert_status(StatusCode::OK);
+        let before = TriggerRepository::find_by_ref(&ctx.pool, &adjacent_trigger.r#ref)
+            .await?
+            .unwrap();
+        let adjacent_path = format!(
+            "/api/v1/triggers/{}/webhooks/{operation}",
+            adjacent_trigger.r#ref,
+        );
+        ctx.post(&adjacent_path, json!({}), Some(&trigger_id_token))
+            .await?
+            .assert_status(StatusCode::FORBIDDEN);
+        let after = TriggerRepository::find_by_ref(&ctx.pool, &adjacent_trigger.r#ref)
+            .await?
+            .unwrap();
+        assert_eq!(before.webhook_enabled, after.webhook_enabled);
+        assert_eq!(before.webhook_key, after.webhook_key);
     }
     ctx.delete("/api/v1/actions/mutation_authz.new", Some(&target))
         .await?

@@ -204,6 +204,14 @@ pub async fn enable_webhook(
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
     let authz = state.authorization_service();
     let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.target_id = Some(trigger.id);
+    ctx.managing_pack_id =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+            &state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Trigger,
+            trigger.id,
+        )
+        .await?;
     ctx.target_ref = Some(trigger.r#ref.clone());
     ctx.pack_ref = trigger.pack_ref.clone();
     authz
@@ -280,6 +288,14 @@ pub async fn disable_webhook(
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
     let authz = state.authorization_service();
     let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.target_id = Some(trigger.id);
+    ctx.managing_pack_id =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+            &state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Trigger,
+            trigger.id,
+        )
+        .await?;
     ctx.target_ref = Some(trigger.r#ref.clone());
     ctx.pack_ref = trigger.pack_ref.clone();
     authz
@@ -357,6 +373,14 @@ pub async fn regenerate_webhook_key(
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
     let authz = state.authorization_service();
     let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.target_id = Some(trigger.id);
+    ctx.managing_pack_id =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+            &state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Trigger,
+            trigger.id,
+        )
+        .await?;
     ctx.target_ref = Some(trigger.r#ref.clone());
     ctx.pack_ref = trigger.pack_ref.clone();
     authz
