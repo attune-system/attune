@@ -325,7 +325,7 @@ async fn behavioral_edits_require_actual_editor_authority_even_for_same_subject_
     seed_input_key(&ctx).await?;
     let privileged = create_test_action(
         &ctx.pool,
-        rule.pack.unwrap(),
+        rule.pack,
         &rule.pack_ref,
         &format!("{}.privileged", rule.pack_ref),
     )
@@ -341,7 +341,8 @@ async fn behavioral_edits_require_actual_editor_authority_even_for_same_subject_
             grants: json!([
                 {"resource":"rules","actions":["update"]},
                 {"resource":"actions","actions":["execute"]},
-                {"resource":"keys","actions":["read","decrypt"]}
+                {"resource":"keys","actions":["read","decrypt"]},
+                {"resource":"packs","actions":["read","decrypt"]}
             ]),
         },
     )
@@ -385,6 +386,51 @@ async fn behavioral_edits_require_actual_editor_authority_even_for_same_subject_
     )
     .await?;
     attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
+    use attune_common::repositories::{
+        delegated_execution::DelegatedExecutionRepository,
+        event::{CreateEnforcementInput, EnforcementRepository},
+        executable_snapshot::ExecutableSnapshotRepository,
+        schema_contract::{BindingOwner, SchemaContractRepository},
+    };
+    let pack =
+        attune_common::repositories::pack::PackRepository::find_by_ref(&ctx.pool, &rule.pack_ref)
+            .await?
+            .unwrap();
+    helpers::activate_test_pack_release_with_projections(
+        &ctx.pool,
+        &pack,
+        &attune_common::repositories::component_lifecycle::PackProjectionIds {
+            actions: vec![rule.action.unwrap(), privileged.id],
+            triggers: vec![rule.trigger.unwrap()],
+            ..Default::default()
+        },
+    )
+    .await?;
+    let mut tx = ctx.pool.begin().await?;
+    let snapshot =
+        ExecutableSnapshotRepository::resolve_for_action(&mut *tx, rule.action.unwrap()).await?;
+    let binding = SchemaContractRepository::materialize_action(&mut tx, &snapshot).await?;
+    let pending = EnforcementRepository::create_or_get_by_rule_event_pinned(
+        &mut tx,
+        CreateEnforcementInput {
+            rule: Some(rule.id),
+            rule_ref: rule_ref.clone(),
+            trigger_ref: rule.trigger_ref.clone(),
+            config: Some(json!({})),
+            event: None,
+            status: attune_common::models::EnforcementStatus::Created,
+            payload: json!({}),
+            condition: attune_common::models::EnforcementCondition::All,
+            conditions: json!({}),
+        },
+        &snapshot,
+    )
+    .await?
+    .enforcement;
+    SchemaContractRepository::attach(&mut tx, BindingOwner::Enforcement, pending.id, &binding)
+        .await?;
+    DelegatedExecutionRepository::accept_enforcement(&mut tx, &pending, owner, &[]).await?;
+    tx.commit().await?;
     let tokens = [
         generate_token(
             editor.id,
@@ -450,6 +496,16 @@ async fn behavioral_edits_require_actual_editor_authority_even_for_same_subject_
         .await?
         .assert_status(StatusCode::OK);
     }
+    // Retained configuration, not current conf_schema, supplies input metadata.
+    let pack =
+        attune_common::repositories::pack::PackRepository::find_by_ref(&ctx.pool, &rule.pack_ref)
+            .await?
+            .unwrap();
+    let mut tx = ctx.pool.begin().await?;
+    attune_common::repositories::component_configuration::ComponentConfigurationRepository::bind_pack(
+        &mut tx, &pack, Some(&json!({"public_name":"fixture"})), ctx.state.config.security.encryption_key.as_deref(),
+    ).await?;
+    tx.commit().await?;
     let owner_token = generate_token(
         owner,
         "rule_authz_sponsor",
@@ -464,11 +520,119 @@ async fn behavioral_edits_require_actual_editor_authority_even_for_same_subject_
     )
     .await?
     .assert_status(StatusCode::OK);
+    for expression in [
+        "{{ pack.config.public_name }}",
+        "{{ pack['config']['public_name'] }}",
+    ] {
+        ctx.put(
+            &format!("/api/v1/rules/{rule_ref}"),
+            json!({"action_params":{"message":expression}}),
+            Some(&owner_token),
+        )
+        .await?
+        .assert_status(StatusCode::OK);
+    }
+    for expression in [
+        "{{ keystore[pack.config.key_ref] }}",
+        "{{ keystore[event.payload.key_ref] }}",
+    ] {
+        ctx.put(
+            &format!("/api/v1/rules/{rule_ref}"),
+            json!({"action_params":{"message":expression}}),
+            Some(&owner_token),
+        )
+        .await?
+        .assert_status(StatusCode::FORBIDDEN);
+    }
+    // Labels stay editable even when the existing input needs stronger grants.
+    ctx.put(
+        &format!("/api/v1/rules/{rule_ref}"),
+        json!({"label":"Public config retained"}),
+        Some(&tokens[0]),
+    )
+    .await?
+    .assert_status(StatusCode::OK);
     let stored = RuleRepository::find_by_ref(&ctx.pool, &rule_ref)
         .await?
         .unwrap();
     assert_eq!(stored.owner_identity, Some(owner));
     assert_eq!(stored.permission_set_refs, Some(vec![admin.r#ref]));
+    let mut tx = ctx.pool.begin().await?;
+    let retained = <EnforcementRepository as attune_common::repositories::FindById>::find_by_id(
+        &mut *tx, pending.id,
+    )
+    .await?
+    .unwrap();
+    assert_eq!(retained.executable_snapshot, pending.executable_snapshot);
+    assert_eq!(
+        DelegatedExecutionRepository::enforcement_selection(&mut tx, &retained).await?,
+        (owner, vec![])
+    );
+    tx.commit().await?;
+    // Managed input coverage comes from the retained deployment capture, even
+    // after the live permission-set definition no longer contains these grants.
+    use attune_common::repositories::rule_authority::RuleAuthorityRepository;
+    RuleRepository::update(
+        &ctx.pool,
+        rule.id,
+        UpdateRuleInput {
+            is_adhoc: Some(false),
+            permission_set_refs: Some(Patch::Set(vec![])),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let mut tx = ctx.pool.begin().await?;
+    RuleAuthorityRepository::set_input_refs(&mut tx, rule.id, &[admin.r#ref.clone()]).await?;
+    RuleAuthorityRepository::capture_deployment(&mut tx, rule.pack).await?;
+    let managed = RuleRepository::find_by_ref(&mut *tx, &rule_ref)
+        .await?
+        .unwrap();
+    let captured = RuleAuthorityRepository::current(&mut tx, &managed)
+        .await?
+        .unwrap();
+    tx.commit().await?;
+    PermissionSetRepository::update(
+        &ctx.pool,
+        admin.id,
+        attune_common::repositories::identity::UpdatePermissionSetInput {
+            grants: Some(json!([])),
+            ..Default::default()
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
+    for token in &tokens {
+        ctx.put(
+            &format!("/api/v1/rules/{rule_ref}"),
+            json!({"label":"Managed label"}),
+            Some(token),
+        )
+        .await?
+        .assert_status(StatusCode::OK);
+        ctx.put(
+            &format!("/api/v1/rules/{rule_ref}"),
+            json!({"action_ref":rule.action_ref,
+            "action_params":{},"conditions":{}}),
+            Some(token),
+        )
+        .await?
+        .assert_status(StatusCode::FORBIDDEN);
+    }
+    let mut tx = ctx.pool.begin().await?;
+    let after = RuleRepository::find_by_ref(&mut *tx, &rule_ref)
+        .await?
+        .unwrap();
+    assert_eq!(after.owner_identity, managed.owner_identity);
+    assert_eq!(
+        serde_json::to_value(
+            RuleAuthorityRepository::current(&mut tx, &after)
+                .await?
+                .unwrap()
+        )?,
+        serde_json::to_value(captured)?
+    );
+    tx.commit().await?;
     ctx.cleanup().await?;
     Ok(())
 }

@@ -894,15 +894,6 @@ pub async fn update_rule(
         || request.trigger_params.is_some()
         || request.trace_tag_template.is_some()
         || request.permission_set_refs.is_some();
-    let editor_snapshot =
-        if behavioral_edit {
-            Some(authz.load_snapshot(&user).await?.ok_or_else(|| {
-                ApiError::Forbidden("Rule editing authority is unavailable".into())
-            })?)
-        } else {
-            None
-        };
-
     let authorized_rule_id = existing_rule.id;
     let authorized_rule_pack = existing_rule.pack;
     let authorized_rule_updated = existing_rule.updated;
@@ -956,18 +947,42 @@ pub async fn update_rule(
         "rule",
         &existing_rule.r#ref,
     )?;
-    if let Some(snapshot) = editor_snapshot {
-        let snapshot = if user.claims.token_type == TokenType::Execution {
-            // Retain the credential's own caps, including its attempt fence;
-            // same-subject execution credentials never borrow sponsor IAM.
+    let snapshot = if user.claims.token_type == TokenType::Execution {
+        Some(
             crate::authz::AuthorizationService::retain_legacy_execution_snapshot_on(&mut tx, &user)
                 .await?
-                .0
+                .0,
+        )
+    } else {
+        None
+    };
+    let mut context = AuthorizationContext::new(identity_id);
+    context.target_id = Some(existing_rule.id);
+    context.target_ref = Some(existing_rule.r#ref.clone());
+    context.pack_ref = Some(existing_rule.pack_ref.clone());
+    context.managing_pack_id = current_managing_pack;
+    let check = AuthorizationCheck {
+        resource: Resource::Rules,
+        action: Action::Update,
+        context,
+    };
+    if let Some(snapshot) = &snapshot {
+        authz.authorize_with_snapshot(&user, Some(snapshot), check)?;
+    } else {
+        authz.authorize_access_fresh(&mut tx, &user, check).await?;
+    }
+    if behavioral_edit {
+        let caller = if let Some(snapshot) = &snapshot {
+            attune_common::delegation::DelegationAuthority::new(
+                identity_id,
+                snapshot.identity_attributes.clone(),
+                snapshot.grants.clone(),
+            )
         } else {
-            snapshot
+            attune_common::delegation::DelegationAuthority::load_for_share(&mut tx, identity_id)
+                .await?
         };
         let mut context = AuthorizationContext::new(identity_id);
-        context.identity_attributes = snapshot.identity_attributes.clone();
         context.target_id = Some(action.id);
         context.target_ref = Some(action.r#ref.clone());
         context.pack_ref = Some(action.pack_ref.clone());
@@ -978,15 +993,16 @@ pub async fn update_rule(
                 action.id,
             )
             .await?;
-        authz.authorize_with_snapshot(
-            &user,
-            Some(&snapshot),
-            AuthorizationCheck {
-                resource: Resource::Actions,
-                action: Action::Execute,
-                context,
-            },
-        )?;
+        let check = AuthorizationCheck {
+            resource: Resource::Actions,
+            action: Action::Execute,
+            context,
+        };
+        if let Some(snapshot) = &snapshot {
+            authz.authorize_with_snapshot(&user, Some(snapshot), check)?;
+        } else {
+            authz.authorize_access_fresh(&mut tx, &user, check).await?;
+        }
         let refs = request
             .permission_set_refs
             .as_ref()
@@ -1009,11 +1025,6 @@ pub async fn update_rule(
                 "Rule execution permissions exceed editor authority".into(),
             ));
         }
-        let caller = attune_common::delegation::DelegationAuthority::new(
-            identity_id,
-            snapshot.identity_attributes.clone(),
-            snapshot.grants.clone(),
-        );
         attune_common::repositories::rule_authority::RuleAuthorityRepository::require_mutation_authority(
             &mut tx, &existing_rule, &caller,
         ).await?;
@@ -1035,13 +1046,26 @@ pub async fn update_rule(
                 .as_ref()
                 .unwrap_or(&existing_rule.trace_tag_template),
         ]);
-        // Configuration may contain indirect selectors or protected values. A
-        // write must not render/decrypt it, or infer retained authority from the
-        // current authoring schema. Such edits need an explicit admission path.
+        // Direct config sources retain their configuration contract. Match
+        // runtime Pack Read/Decrypt authority without restoring any values.
         if attune_common::template_resolver::references_pack_configuration(&inputs) {
-            return Err(ApiError::Forbidden(
-                "Rule edits with pack configuration inputs require explicit input admission".into(),
-            ));
+            let pack_id = existing_rule.pack;
+            let revision = attune_common::repositories::component_configuration::ComponentConfigurationRepository::current(
+                &mut *tx, "pack", pack_id,
+            ).await?.ok_or_else(|| ApiError::Forbidden("Rule configuration binding is unavailable".into()))?;
+            revision.contract()?;
+            let mut context = AuthorizationContext::new(identity_id);
+            context.target_id = Some(pack_id);
+            context.target_ref = Some(existing_rule.pack_ref.clone());
+            context.pack_ref = Some(existing_rule.pack_ref.clone());
+            context.managing_pack_id = Some(pack_id);
+            if !caller.allows(Resource::Packs, Action::Read, context.clone())
+                || !caller.allows(Resource::Packs, Action::Decrypt, context)
+            {
+                return Err(ApiError::Forbidden(
+                    "Rule configuration inputs exceed editor authority".into(),
+                ));
+            }
         }
         let expressions = attune_common::template_resolver::referenced_keystore_expressions(
             &inputs,
