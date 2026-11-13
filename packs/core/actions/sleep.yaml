@@ -15,6 +15,8 @@ entry_point: sleep.sh
 # Parameter delivery: stdin for secure parameter passing (no env vars)
 parameter_delivery: stdin
 parameter_format: json
+required_worker_runtimes:
+  python: ">=3.11,<4.0"
 
 # Output format: text (no structured data parsing)
 output_format: text

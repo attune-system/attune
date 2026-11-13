@@ -11,6 +11,8 @@ entry_point: run_agent_command.sh
 
 parameter_delivery: stdin
 parameter_format: json
+required_worker_runtimes:
+  python: ">=3.11,<4.0"
 
 output_format: text
 

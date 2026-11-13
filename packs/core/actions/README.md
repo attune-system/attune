@@ -4,10 +4,12 @@ Core actions receive one flat JSON object on stdin (`parameter_delivery: stdin`,
 `parameter_format: json`). Values are never parsed as physical `key=value` lines
 or expanded into environment variables. There is no dotenv fallback.
 
-The shell entrypoints require Python 3 (standard library only). `http_request`
-also requires curl. These dependencies must exist in the selected worker image;
-selecting the shell runtime alone does not install them. The pack API actions use
-the same shell-wrapper/Python-helper pattern.
+The shell entrypoints require Python 3.11 or newer (standard library only).
+`http_request` also requires curl. These dependencies must exist in the selected worker image;
+the actions declare `required_worker_runtimes` so a shell-only worker is not
+eligible. The bundled Compose shell and Node workers install Python during
+bootstrap; custom workers must advertise a verified matching Python runtime.
+The pack API actions use the same shell-wrapper/Python-helper pattern.
 
 ```sh
 printf '%s' '{"message":"First line\nSecond line"}' | ./echo.sh
@@ -31,10 +33,11 @@ permission refs, or fall back to another credential. `require_mcp_binary` defaul
 to true. Execution authority and the reserved scoped `standard` permission set
 retain their platform contracts.
 
-Run the real-entrypoint regressions and owned local HTTP smoke tests with:
+From the core pack root, run the real-entrypoint regressions and owned local
+HTTP smoke tests with:
 
 ```sh
-python3 -m unittest packs.core.tests.test_stdin_json packs.core.tests.test_actions -v
+./tests/run_tests.sh
 ```
 
 The fixtures use dummy context credentials, a local fake curl, and an ephemeral

@@ -16,6 +16,8 @@ entry_point: http_request.sh
 # Use a flat JSON object on stdin to preserve parameter boundaries
 parameter_delivery: stdin
 parameter_format: json
+required_worker_runtimes:
+  python: ">=3.11,<4.0"
 
 # Output format: json (structured data parsing enabled)
 output_format: json

@@ -633,7 +633,11 @@ class TestYAMLSchemas(CorePackTestCase):
                 self.assertIsNotNone(data)
                 self.assertIn("label", data)
                 self.assertIn("ref", data)
-                self.assertIn("runner_type", data)
+                if "workflow_file" in data:
+                    self.assertNotIn("workflow", data)
+                    self.assertTrue((self.actions_dir / data["workflow_file"]).is_file())
+                else:
+                    self.assertIn("runner_type", data)
 
 
 def main():
