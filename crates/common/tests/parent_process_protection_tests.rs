@@ -1,4 +1,4 @@
-//! Standalone driver: protection is NEVER applied to the Cargo/test harness.
+//! The normal test harness never applies protection; only clean owned subprocesses do.
 #[cfg(target_os = "linux")]
 mod linux {
     use std::io::{Read, Write};
@@ -74,7 +74,7 @@ mod linux {
             )
             .collect();
         println!(
-            "{}",
+            "PROBE:{}",
             json!({"input": input, "has_dummy": has_dummy, "probes": results})
         );
     }
@@ -92,13 +92,23 @@ mod linux {
         ChildProcessEnvironment::capture(&[])
             .unwrap()
             .apply(&mut command);
-        command.args([
-            "reader",
-            &std::process::id().to_string(),
-            &getuid().as_raw().to_string(),
-        ]);
+        command
+            .args(["--exact", "linux::subprocess_helper", "--nocapture"])
+            .env("ATTUNE_PARENT_PROTECTION_TEST_MODE", "reader")
+            .env(
+                "ATTUNE_PARENT_PROTECTION_TEST_PID",
+                std::process::id().to_string(),
+            )
+            .env(
+                "ATTUNE_PARENT_PROTECTION_TEST_UID",
+                getuid().as_raw().to_string(),
+            );
         let output = invoke(&mut command, INPUT);
-        let result: Value = serde_json::from_str(&output).unwrap();
+        let probe = output
+            .lines()
+            .find_map(|line| line.split_once("PROBE:").map(|(_, value)| value))
+            .expect("reader report");
+        let result: Value = serde_json::from_str(probe).unwrap();
         assert_eq!(result["input"], INPUT);
         if protected {
             for probe in result["probes"].as_array().unwrap() {
@@ -119,31 +129,31 @@ mod linux {
         );
     }
 
-    pub fn run() {
-        let args: Vec<String> = std::env::args().collect();
-        match args.get(1).map(String::as_str) {
-            Some("reader") => reader(&args[2], &args[3]),
-            Some("baseline") => parent(false),
-            Some("protected") => parent(true),
-            _ => {
-                let before = dumpable_behavior().unwrap();
-                for mode in ["baseline", "protected"] {
-                    let mut command = Command::new(std::env::current_exe().unwrap());
-                    command
-                        .env_clear()
-                        .env("ATTUNE_PARENT_DUMMY", "owned-not-a-real-secret")
-                        .arg(mode);
-                    print!("{}", invoke(&mut command, ""));
-                }
-                assert_eq!(dumpable_behavior().unwrap(), before, "driver state changed");
-            }
+    #[test]
+    fn subprocess_helper() {
+        match std::env::var("ATTUNE_PARENT_PROTECTION_TEST_MODE").as_deref() {
+            Ok("reader") => reader(
+                &std::env::var("ATTUNE_PARENT_PROTECTION_TEST_PID").unwrap(),
+                &std::env::var("ATTUNE_PARENT_PROTECTION_TEST_UID").unwrap(),
+            ),
+            Ok("baseline") => parent(false),
+            Ok("protected") => parent(true),
+            _ => {} // Normal test discovery/execution does not change process state.
         }
     }
-}
 
-fn main() {
-    #[cfg(target_os = "linux")]
-    linux::run();
-    #[cfg(not(target_os = "linux"))]
-    eprintln!("Linux parent protection is unsupported on this platform");
+    #[test]
+    fn owned_parent_procfs_and_stdin() {
+        let before = dumpable_behavior().unwrap();
+        for mode in ["baseline", "protected"] {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .env_clear()
+                .env("ATTUNE_PARENT_DUMMY", "owned-not-a-real-secret")
+                .env("ATTUNE_PARENT_PROTECTION_TEST_MODE", mode)
+                .args(["--exact", "linux::subprocess_helper", "--nocapture"]);
+            print!("{}", invoke(&mut command, ""));
+        }
+        assert_eq!(dumpable_behavior().unwrap(), before, "driver state changed");
+    }
 }
