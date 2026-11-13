@@ -772,6 +772,12 @@ pub async fn delete_workflow(
     let authorized_companion =
         authorize_workflow_action(&state, &user, &workflow, Action::Delete).await?;
     let mut tx = state.db.begin().await?;
+    // Pin cascades acquire admission before any workflow/companion protection.
+    attune_common::repositories::cache::CacheEntryRepository::protect_transaction(
+        &mut tx,
+        attune_common::repositories::cache::CacheTransactionMode::PinMutation,
+    )
+    .await?;
     check_authorized_companion(&mut tx, workflow.id, authorized_companion).await?;
 
     if let Some((action_id, _, _, _)) = authorized_companion {

@@ -487,9 +487,18 @@ async fn sync_cannot_mutate_a_workflow_structurally_owned_by_an_adjacent_pack() 
         &ctx.pool,
         adjacent.id,
         &adjacent.r#ref,
-        "sync_allowed.foreign",
+        "sync_adjacent.foreign",
     )
     .await?;
+    // Deliberate historical/corrupt association: production repository creation
+    // rejects cross-pack refs. Test the importer against an existing bad row.
+    sqlx::query("UPDATE workflow_definition SET ref = 'sync_allowed.foreign' WHERE id = $1")
+        .bind(foreign.id)
+        .execute(&ctx.pool)
+        .await?;
+    let foreign = WorkflowDefinitionRepository::find_by_ref(&ctx.pool, "sync_allowed.foreign")
+        .await?
+        .unwrap();
     let (_,_,bearer)=actor(&ctx,"sync_installer",json!([{ "resource":"packs", "actions":["install"], "constraints":{"refs":[allowed.r#ref]} }])).await?;
     let directory = ctx.test_packs_dir.join("sync_allowed/workflows");
     std::fs::create_dir_all(&directory)?;
@@ -512,6 +521,105 @@ async fn sync_cannot_mutate_a_workflow_structurally_owned_by_an_adjacent_pack() 
     assert_eq!(unchanged.pack, adjacent.id);
     assert_eq!(unchanged.updated, foreign.updated);
     assert_eq!(unchanged.definition, foreign.definition);
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_workflow_deletes_wait_for_pin_admission_before_companion_locks() -> Result<()> {
+    use attune_common::repositories::{
+        action::ActionRepository,
+        cache::{CacheEntryRepository, CacheTransactionMode},
+        workflow::WorkflowDefinitionRepository,
+    };
+    let ctx = TestContext::new().await?;
+    let pack = helpers::create_test_pack(&ctx.pool, "delete_order").await?;
+    let (_,_,bearer)=actor(&ctx,"delete_actor",json!([{ "resource":"actions", "actions":["create","delete"], "constraints":{"pack_refs":[pack.r#ref]} }])).await?;
+    let created=ctx.post("/api/v1/workflows",json!({"ref":"delete_order.target","pack_ref":pack.r#ref,"label":"Target","version":"1.0.0","definition":{"tasks":[]}}),Some(&bearer)).await?;
+    assert_eq!(
+        created.status(),
+        StatusCode::CREATED,
+        "{}",
+        created.text().await?
+    );
+    let workflow = WorkflowDefinitionRepository::find_by_ref(&ctx.pool, "delete_order.target")
+        .await?
+        .unwrap();
+    let companion = ActionRepository::find_by_workflow_def(&ctx.pool, workflow.id)
+        .await?
+        .unwrap();
+    let mut blocker = ctx.pool.begin().await?;
+    CacheEntryRepository::protect_transaction(&mut blocker, CacheTransactionMode::PinMutation)
+        .await?;
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await?;
+    let mut requests = Vec::new();
+    for _ in 0..2 {
+        let app = ctx.app.clone();
+        let request = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/workflows/delete_order.target")
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(Body::empty())
+            .unwrap();
+        requests.push(tokio::spawn(
+            async move { app.oneshot(request).await.unwrap() },
+        ));
+    }
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity a WHERE $1 = ANY(pg_blocking_pids(a.pid))",
+            )
+            .bind(pid)
+            .fetch_one(&ctx.pool)
+            .await?;
+            if waiting == 2 {
+                return Ok::<_, sqlx::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| "Both delete requests did not reach owned pin-admission blocker")??;
+    // With the old order, both waiters already held FOR SHARE on this action.
+    // NOWAIT proves the new admission waiters protect no companion rows yet.
+    let mut probe = ctx.pool.begin().await?;
+    sqlx::query("SELECT id FROM action WHERE id = $1 FOR UPDATE NOWAIT")
+        .bind(companion.id)
+        .fetch_one(&mut *probe)
+        .await?;
+    probe.rollback().await?;
+    blocker.rollback().await?;
+    let mut statuses = Vec::new();
+    for request in requests {
+        statuses.push(
+            tokio::time::timeout(Duration::from_secs(20), request)
+                .await??
+                .status(),
+        );
+    }
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::OK)
+            .count(),
+        1,
+        "{statuses:?}"
+    );
+    assert!(
+        statuses.iter().all(|status| matches!(
+            *status,
+            StatusCode::OK | StatusCode::NOT_FOUND | StatusCode::CONFLICT
+        )),
+        "{statuses:?}"
+    );
+    assert!(
+        WorkflowDefinitionRepository::find_by_ref(&ctx.pool, "delete_order.target")
+            .await?
+            .is_none()
+    );
     ctx.cleanup().await?;
     Ok(())
 }
