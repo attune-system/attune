@@ -76,11 +76,24 @@ class BootstrapCorePackTests(unittest.TestCase):
                 for name, machine in (("linux-amd64", 62), ("linux-arm64", 183)):
                     data = bytearray(64)
                     data[:7] = b"\x7fELF\x02\x01\x01"
+                    data[16:18] = (2).to_bytes(2, "little")
                     data[18:20] = machine.to_bytes(2, "little")
                     path = target / name
                     path.write_bytes(data)
                     path.chmod(0o755)
             bootstrap.validate_native_payload(root)
+            # A structurally valid target must still reject a dynamic interpreter.
+            dynamic = bytearray((root / "actions/bin/echo/linux-arm64").read_bytes()) + bytearray(56)
+            dynamic[32:40] = (64).to_bytes(8, "little")
+            dynamic[54:56] = (56).to_bytes(2, "little")
+            dynamic[56:58] = (1).to_bytes(2, "little")
+            dynamic[64:68] = (3).to_bytes(4, "little")
+            path = root / "actions/bin/echo/linux-arm64"
+            original = path.read_bytes()
+            path.write_bytes(dynamic)
+            with self.assertRaisesRegex(RuntimeError, "dynamic interpreter"):
+                bootstrap.validate_native_payload(root)
+            path.write_bytes(original)
             missing = root / "actions/bin/echo/linux-arm64"
             missing.unlink()
             with self.assertRaisesRegex(RuntimeError, "publication mode"):

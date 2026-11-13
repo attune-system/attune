@@ -116,6 +116,7 @@ def validate_native_payload(pack_dir):
                 raise RuntimeError("native core variant must be a regular executable")
             data = path.read_bytes()
             if (len(data) < 64 or data[:7] != b"\x7fELF\x02\x01\x01"
+                    or int.from_bytes(data[16:18], "little") not in {2, 3}
                     or int.from_bytes(data[18:20], "little") != targets[variant]):
                 raise RuntimeError("native core variant has wrong ELF architecture")
             offset = int.from_bytes(data[32:40], "little")
