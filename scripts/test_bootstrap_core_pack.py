@@ -102,6 +102,13 @@ class BootstrapCorePackTests(unittest.TestCase):
             missing.chmod(0o755)
             with self.assertRaisesRegex(RuntimeError, "ELF architecture"):
                 bootstrap.validate_native_payload(root)
+            # Host-only mode is explicit and cannot satisfy the official mode.
+            for action in ("echo", "sleep", "noop"):
+                (root / "actions/bin" / action / "linux-arm64").unlink()
+            with mock.patch.dict(os.environ, {"ATTUNE_BOOTSTRAP_MODE": "volume"}), mock.patch.object(bootstrap.platform, "machine", return_value="x86_64"), mock.patch.object(bootstrap.platform, "system", return_value="Linux"):
+                bootstrap.validate_native_payload(root)
+            with self.assertRaisesRegex(RuntimeError, "publication mode"):
+                bootstrap.validate_native_payload(root)
 
     def test_authenticated_publication_does_not_enable_managed_runtime_exemptions(self):
         ready = {

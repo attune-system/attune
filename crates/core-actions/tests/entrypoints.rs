@@ -17,13 +17,15 @@ fn run(binary: &str, input: &[u8]) -> Output {
 #[test]
 fn echo_preserves_every_message_byte_without_tools_or_credentials() {
     let message = "-n \\ quotes '\" 雪\nmessage=changed\nexit_code=9\n\0\n";
-    let result = run(
-        env!("CARGO_BIN_EXE_attune-core-echo"),
-        &serde_json::to_vec(&serde_json::json!({"message":message})).unwrap(),
-    );
-    assert!(result.status.success());
-    assert_eq!(result.stdout, message.as_bytes());
-    assert!(result.stderr.is_empty());
+    for message in [message, "-n", "no trailing newline", ""] {
+        let result = run(
+            env!("CARGO_BIN_EXE_attune-core-echo"),
+            &serde_json::to_vec(&serde_json::json!({"message":message})).unwrap(),
+        );
+        assert!(result.status.success());
+        assert_eq!(result.stdout, message.as_bytes());
+        assert!(result.stderr.is_empty());
+    }
 }
 
 #[test]

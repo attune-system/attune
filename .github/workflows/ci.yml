@@ -358,6 +358,7 @@ jobs:
           rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
           python3 -m pip install --user --break-system-packages 'ziglang==0.16.0'
           cargo install --locked --version 0.23.4 cargo-zigbuild
+          export PATH="$(python3 -c 'import os,ziglang; print(os.path.dirname(ziglang.__file__))'):$PATH"
           cargo zigbuild --locked --release --manifest-path crates/core-actions/Cargo.toml --target x86_64-unknown-linux-musl --bins
           cargo zigbuild --locked --release --manifest-path crates/core-actions/Cargo.toml --target aarch64-unknown-linux-musl --bins
 
