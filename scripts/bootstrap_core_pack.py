@@ -7,6 +7,8 @@ import io
 import json
 import os
 import platform
+import re
+import sys
 import struct
 import tarfile
 import time
@@ -51,10 +53,18 @@ def request(url, *, data=None, headers=None, method=None):
     if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username is not None or parsed.password is not None:
         raise ValueError("API URL must use HTTP or HTTPS without embedded credentials")
     opener = urllib.request.build_opener(NoApiRedirects())
-    return opener.open(
-        urllib.request.Request(url, data=data, headers=headers or {}, method=method),
-        timeout=10,
-    )
+    try:
+        return opener.open(
+            urllib.request.Request(url, data=data, headers=headers or {}, method=method),
+            timeout=10,
+        )
+    except urllib.error.HTTPError as error:
+        error.bootstrap_operation = {
+            "/health/ready": "readiness", "/auth/token-login": "login",
+            "/api/v1/packs/core/releases": "releases", "/api/v1/packs/upload": "upload",
+            "/health/bootstrap": "admission",
+        }.get(parsed.path, "unknown")
+        raise
 
 
 def wait_for_api(base_url, deadline):
@@ -271,15 +281,19 @@ def wait_for_core(base_url, deadline):
 def publish_core(base_url, pack_dir):
     """Common admission call path for API, volume and former direct-loader jobs."""
     timeout = min(300, max(1, int(os.environ.get("ATTUNE_BOOTSTRAP_TIMEOUT_SECONDS", "300"))))
+    print("ATTUNE_BOOTSTRAP_DIAGNOSTIC stage=readiness outcome=started", file=sys.stderr)
     wait_for_api(base_url, time.monotonic() + timeout)
     expected_version = os.environ.get("ATTUNE_CORE_PACK_VERSION", bundled_pack_version(pack_dir))
     expected_digest = os.environ.get("ATTUNE_CORE_PACK_DIGEST") or None
     integration_token = os.environ.get("ATTUNE_BOOTSTRAP_TOKEN")
     if not integration_token:
         raise RuntimeError("ATTUNE_BOOTSTRAP_TOKEN is required: supply an existing deployment credential; bootstrap never creates identities or grants")
+    print("ATTUNE_BOOTSTRAP_DIAGNOSTIC stage=payload-validation outcome=started", file=sys.stderr)
     validate_native_payload(pack_dir)
-    return reconcile(base_url, token_login(base_url, integration_token), pack_dir,
-                     expected_version, expected_digest)
+    print("ATTUNE_BOOTSTRAP_DIAGNOSTIC stage=login outcome=started", file=sys.stderr)
+    access_token = token_login(base_url, integration_token)
+    print("ATTUNE_BOOTSTRAP_DIAGNOSTIC stage=reconcile outcome=started", file=sys.stderr)
+    return reconcile(base_url, access_token, pack_dir, expected_version, expected_digest)
 
 
 def main():
@@ -299,5 +313,36 @@ def main():
         wait_for_core(base_url, deadline)
 
 
+def diagnostic_failure(error):
+    # Never print URLs, headers, exception text or response bodies: they may
+    # contain credentials or authored secrets. Only bounded protocol codes.
+    fields = ["stage=publisher", "outcome=failed", f"error={type(error).__name__}"]
+    if isinstance(error, urllib.error.HTTPError):
+        fields.append(f"http={error.code}")
+        fields.append(f"operation={getattr(error, 'bootstrap_operation', 'unknown')}")
+        try:
+            body = json.loads(error.read(65536))
+            details = body.get("details") or {}
+            if isinstance(details, dict):
+                stage = details.get("stage", "")
+                if isinstance(stage, str) and re.fullmatch(r"[a-z_]{1,64}", stage):
+                    fields.append(f"api_stage={stage}")
+                diagnostics = details.get("diagnostics", [])
+                if isinstance(diagnostics, list):
+                    for diagnostic in diagnostics[:8]:
+                        code = diagnostic.get("code", "") if isinstance(diagnostic, dict) else ""
+                        if isinstance(code, str) and re.fullmatch(r"[a-z_.]{1,96}", code):
+                            fields.append(f"code={code}")
+        except (ValueError, AttributeError, OSError):
+            pass
+        finally:
+            error.close()
+    print("ATTUNE_BOOTSTRAP_DIAGNOSTIC " + " ".join(fields), file=sys.stderr)
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as error:
+        diagnostic_failure(error)
+        sys.exit(1)

@@ -365,8 +365,21 @@ if [[ "$DO_STARTUP" == true ]]; then
     IFS= read -r ATTUNE_BOOTSTRAP_TOKEN < "$BOOTSTRAP_ROOT/token"
     export ATTUNE_BOOTSTRAP_TOKEN
   fi
-  compose up -d init-packs
-  compose wait init-packs
+  bootstrap_status=0
+  compose up -d init-packs || bootstrap_status=$?
+  if [[ "$bootstrap_status" -eq 0 ]]; then
+    compose wait init-packs || bootstrap_status=$?
+  fi
+  if [[ "$bootstrap_status" -ne 0 ]]; then
+    log_error "Core bootstrap failed (exit ${bootstrap_status}); bounded safe diagnostics follow"
+    # Read only this project's initializer logs before EXIT revokes credentials
+    # and removes containers. Never forward raw logs or dump Compose env/config.
+    timeout 30 docker compose --project-name "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILES[@]}" \
+      logs --no-color --no-log-prefix --tail 80 init-packs init-pack-binaries 2>/dev/null \
+      | python3 "$PROJECT_ROOT/scripts/bootstrap_failure_diagnostics.py" || \
+      log_error "Bootstrap diagnostic collection unavailable"
+    exit "$bootstrap_status"
+  fi
   SERVICES=(
     postgres rabbitmq
     migrations init-user init-pack-binaries init-packs init-agent
