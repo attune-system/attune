@@ -1325,7 +1325,7 @@ async fn human_live_reader_waits_for_terminal_seal_but_never_invents_success() -
                         if text.contains("event: error") || text.contains("event: done") {
                             return Err(text.into_owned().into());
                         }
-                        if text.contains("event: waiting") {
+                        if text.contains("event: waiting") || text.contains(": authorized-wait") {
                             return Ok::<_, Box<dyn std::error::Error>>(());
                         }
                     }
