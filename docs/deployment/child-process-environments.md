@@ -113,6 +113,10 @@ this protection stops Linux startup. The API is included because pack handling
 can launch setup/test/runtime verification commands. Shared library constructors
 and in-process tests do not change process dumpability.
 
+Protection takes effect only after the entrypoint call succeeds. It does not
+prevent inspection before that point or revoke inspection access already acquired
+by an existing same-UID attacker.
+
 This blocks unprivileged same-UID ptrace and ptrace-gated procfs reads of the
 protected parent (including initial environment and memory), and disables its
 core dumps. It does not hide all procfs metadata. Privileged tracers with the
