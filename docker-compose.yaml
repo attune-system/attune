@@ -890,12 +890,11 @@ services:
     environment:
       RUST_LOG: info
       ATTUNE_API_URL: http://api:8080
-      ATTUNE_LOGIN: ${ATTUNE_MCP_LOGIN:-test@attune.local}
-      ATTUNE_PASSWORD: ${ATTUNE_MCP_PASSWORD:-TestPass123!}
+      ATTUNE_MCP_HTTP_HOSTS: ${ATTUNE_MCP_HTTP_HOSTS:-localhost:8090,127.0.0.1:8090}
       ATTUNE_MCP_TRANSPORT: http
       ATTUNE_MCP_LISTEN_ADDR: 0.0.0.0:8090
     ports:
-      - "8090:8090"
+      - "127.0.0.1:8090:8090"
     depends_on:
       api:
         condition: service_healthy
