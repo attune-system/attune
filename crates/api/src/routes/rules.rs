@@ -1363,7 +1363,7 @@ pub async fn delete_rule(
 )]
 pub async fn enable_rule(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(rule_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let mut tx = state.db.begin().await?;
@@ -1372,6 +1372,18 @@ pub async fn enable_rule(
     let existing_rule = RuleRepository::find_by_ref(&mut *tx, &rule_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Rule '{}' not found", rule_ref)))?;
+
+    super::lifecycle_authorization::existing(
+        &state,
+        &mut tx,
+        &user,
+        attune_common::repositories::runtime_target::RuntimeTarget::Component(
+            attune_common::repositories::runtime_target::ComponentTarget::Rule,
+            existing_rule.id,
+        ),
+        Action::Update,
+    )
+    .await?;
 
     // Update rule to enabled
     let update_input = UpdateRuleInput {
@@ -1445,7 +1457,7 @@ pub async fn enable_rule(
 )]
 pub async fn disable_rule(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(rule_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let mut tx = state.db.begin().await?;
@@ -1454,6 +1466,18 @@ pub async fn disable_rule(
     let existing_rule = RuleRepository::find_by_ref(&mut *tx, &rule_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Rule '{}' not found", rule_ref)))?;
+
+    super::lifecycle_authorization::existing(
+        &state,
+        &mut tx,
+        &user,
+        attune_common::repositories::runtime_target::RuntimeTarget::Component(
+            attune_common::repositories::runtime_target::ComponentTarget::Rule,
+            existing_rule.id,
+        ),
+        Action::Update,
+    )
+    .await?;
 
     // Update rule to disabled
     let update_input = UpdateRuleInput {

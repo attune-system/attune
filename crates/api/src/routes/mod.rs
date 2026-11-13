@@ -21,6 +21,7 @@ pub mod inquiries;
 pub mod inquiry_callbacks;
 pub mod internal_files;
 pub mod keys;
+mod lifecycle_authorization;
 mod pack_request;
 pub mod packs;
 pub mod permissions;

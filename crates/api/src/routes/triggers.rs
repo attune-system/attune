@@ -893,7 +893,7 @@ pub async fn get_trigger(
 )]
 pub async fn create_trigger(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Json(request): Json<CreateTriggerRequest>,
 ) -> ApiResult<impl IntoResponse> {
     // Validate request
@@ -919,6 +919,15 @@ pub async fn create_trigger(
     } else {
         (None, None)
     };
+
+    super::lifecycle_authorization::create(
+        &state,
+        &user,
+        Resource::Triggers,
+        &request.r#ref,
+        pack_ref.as_deref(),
+    )
+    .await?;
 
     let reference_visibility = request.reference_visibility.unwrap_or_default();
     validate_trigger_reference_visibility_config(
@@ -1205,7 +1214,7 @@ pub async fn update_trigger(
 )]
 pub async fn delete_trigger(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(trigger_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let mut tx = state.db.begin().await?;
@@ -1214,6 +1223,17 @@ pub async fn delete_trigger(
     let trigger = TriggerRepository::find_by_ref(&mut *tx, &trigger_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Trigger '{}' not found", trigger_ref)))?;
+    super::lifecycle_authorization::existing(
+        &state,
+        &mut tx,
+        &user,
+        attune_common::repositories::runtime_target::RuntimeTarget::Component(
+            attune_common::repositories::runtime_target::ComponentTarget::Trigger,
+            trigger.id,
+        ),
+        Action::Delete,
+    )
+    .await?;
 
     // Delete the trigger
     let deleted = TriggerRepository::delete(&mut *tx, trigger.id).await?;
@@ -1249,7 +1269,7 @@ pub async fn delete_trigger(
 )]
 pub async fn enable_trigger(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(trigger_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let mut tx = state.db.begin().await?;
@@ -1258,6 +1278,17 @@ pub async fn enable_trigger(
     let existing_trigger = TriggerRepository::find_by_ref(&mut *tx, &trigger_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Trigger '{}' not found", trigger_ref)))?;
+    super::lifecycle_authorization::existing(
+        &state,
+        &mut tx,
+        &user,
+        attune_common::repositories::runtime_target::RuntimeTarget::Component(
+            attune_common::repositories::runtime_target::ComponentTarget::Trigger,
+            existing_trigger.id,
+        ),
+        Action::Update,
+    )
+    .await?;
 
     // Update trigger to enabled
     let update_input = UpdateTriggerInput {
@@ -1306,7 +1337,7 @@ pub async fn enable_trigger(
 )]
 pub async fn disable_trigger(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(trigger_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let mut tx = state.db.begin().await?;
@@ -1315,6 +1346,17 @@ pub async fn disable_trigger(
     let existing_trigger = TriggerRepository::find_by_ref(&mut *tx, &trigger_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Trigger '{}' not found", trigger_ref)))?;
+    super::lifecycle_authorization::existing(
+        &state,
+        &mut tx,
+        &user,
+        attune_common::repositories::runtime_target::RuntimeTarget::Component(
+            attune_common::repositories::runtime_target::ComponentTarget::Trigger,
+            existing_trigger.id,
+        ),
+        Action::Update,
+    )
+    .await?;
 
     // Update trigger to disabled
     let update_input = UpdateTriggerInput {
@@ -1560,7 +1602,7 @@ pub async fn get_sensor(
 )]
 pub async fn create_sensor(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Json(request): Json<CreateSensorRequest>,
 ) -> ApiResult<impl IntoResponse> {
     // Validate request
@@ -1581,6 +1623,15 @@ pub async fn create_sensor(
     let pack = PackRepository::find_by_ref(&state.db, &request.pack_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", request.pack_ref)))?;
+
+    super::lifecycle_authorization::create(
+        &state,
+        &user,
+        Resource::Triggers,
+        &request.r#ref,
+        Some(pack.r#ref.as_str()),
+    )
+    .await?;
 
     // Verify runtime exists and get its ID
     let runtime = RuntimeRepository::find_by_ref(&state.db, &request.runtime_ref)
@@ -1826,7 +1877,7 @@ pub async fn revoke_sensor_runtime(
 )]
 pub async fn delete_sensor(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(sensor_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let mut tx = state.db.begin().await?;
@@ -1840,6 +1891,17 @@ pub async fn delete_sensor(
     let sensor = SensorRepository::find_by_ref(&mut *tx, &sensor_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Sensor '{}' not found", sensor_ref)))?;
+    super::lifecycle_authorization::existing(
+        &state,
+        &mut tx,
+        &user,
+        attune_common::repositories::runtime_target::RuntimeTarget::Component(
+            attune_common::repositories::runtime_target::ComponentTarget::Sensor,
+            sensor.id,
+        ),
+        Action::Delete,
+    )
+    .await?;
 
     let tombstoned_caches =
         CacheNamespaceRepository::tombstone_for_sensor_deletion(&mut tx, sensor.id).await?;
@@ -1882,7 +1944,7 @@ pub async fn delete_sensor(
 )]
 pub async fn enable_sensor(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(sensor_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let mut tx = state.db.begin().await?;
@@ -1891,6 +1953,17 @@ pub async fn enable_sensor(
     let existing_sensor = SensorRepository::find_by_ref(&mut *tx, &sensor_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Sensor '{}' not found", sensor_ref)))?;
+    super::lifecycle_authorization::existing(
+        &state,
+        &mut tx,
+        &user,
+        attune_common::repositories::runtime_target::RuntimeTarget::Component(
+            attune_common::repositories::runtime_target::ComponentTarget::Sensor,
+            existing_sensor.id,
+        ),
+        Action::Update,
+    )
+    .await?;
 
     // Update sensor to enabled
     let update_input = UpdateSensorInput {
@@ -1948,7 +2021,7 @@ pub async fn enable_sensor(
 )]
 pub async fn disable_sensor(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(sensor_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let mut tx = state.db.begin().await?;
@@ -1957,6 +2030,17 @@ pub async fn disable_sensor(
     let existing_sensor = SensorRepository::find_by_ref(&mut *tx, &sensor_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Sensor '{}' not found", sensor_ref)))?;
+    super::lifecycle_authorization::existing(
+        &state,
+        &mut tx,
+        &user,
+        attune_common::repositories::runtime_target::RuntimeTarget::Component(
+            attune_common::repositories::runtime_target::ComponentTarget::Sensor,
+            existing_sensor.id,
+        ),
+        Action::Update,
+    )
+    .await?;
 
     // Update sensor to disabled
     let update_input = UpdateSensorInput {

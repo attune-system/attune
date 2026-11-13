@@ -12,6 +12,29 @@ use serde_json::{json, Value};
 mod helpers;
 use helpers::*;
 
+async fn grant_lifecycle_fixture(ctx: &TestContext, pack_ref: &str, action: &str) {
+    use attune_common::repositories::{
+        identity::{
+            CreatePermissionAssignmentInput, CreatePermissionSetInput,
+            PermissionAssignmentRepository, PermissionSetRepository,
+        },
+        Create,
+    };
+    let set = PermissionSetRepository::create(&ctx.pool, CreatePermissionSetInput {
+        r#ref: format!("test.{action}"), pack: None, pack_ref: None, label: None, description: None,
+        grants: json!([{ "resource":"actions", "actions":[action], "constraints":{"pack_refs":[pack_ref]} }]),
+    }).await.unwrap();
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: ctx.user.as_ref().unwrap().id,
+            permset: set.id,
+        },
+    )
+    .await
+    .unwrap();
+}
+
 /// Generate a unique pack name for testing to avoid conflicts
 fn unique_pack_name() -> String {
     format!(
@@ -27,6 +50,7 @@ async fn test_create_workflow_success() {
     // Create a pack first
     let pack_name = unique_pack_name();
     let pack = create_test_pack(&ctx.pool, &pack_name).await.unwrap();
+    grant_lifecycle_fixture(&ctx, &pack.r#ref, "create").await;
     activate_test_pack_release(&ctx.pool, &pack).await.unwrap();
     let action_ref = format!("{}.echo", pack.r#ref);
     let workflow_ref = format!("{}.test_workflow", pack.r#ref);
@@ -487,6 +511,7 @@ async fn test_delete_workflow() {
     // Create a pack and workflow
     let pack_name = unique_pack_name();
     let pack = create_test_pack(&ctx.pool, &pack_name).await.unwrap();
+    grant_lifecycle_fixture(&ctx, &pack.r#ref, "delete").await;
     let input = CreateWorkflowDefinitionInput {
         r#ref: format!("{}.delete_test", pack.r#ref),
         pack: pack.id,
