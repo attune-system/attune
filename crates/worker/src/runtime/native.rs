@@ -407,16 +407,40 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn execution_env_reaches_native_processes_and_preserves_internal_context() {
+        let root = tempfile::TempDir::new().unwrap();
+        let binary = write_executable(&root, "printf started > started");
+        let mut rejected = ExecutionContext::test_context("test.env".into(), None);
+        rejected.code_path = Some(binary);
+        rejected.env.insert("ATTUNE_EXEC_ID".into(), "42".into());
+        rejected.execution_env = std::collections::HashMap::from([
+            ("EXECUTION_ENV_TEST".into(), "visible".into()),
+            ("ATTUNE_EXEC_ID".into(), "caller-reserved-value".into()),
+        ]);
+        let error = NativeRuntime::with_work_dir(root.path().into())
+            .execute(rejected)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RuntimeError::InvalidAction(_)));
+        assert!(error.to_string().contains("ATTUNE_EXEC_ID"));
+        assert!(!error.to_string().contains("caller-reserved-value"));
+        assert!(!root.path().join("started").exists());
+
         let mut context = ExecutionContext::test_context("test.env".into(), None);
         context.code_path = Some(PathBuf::from("/usr/bin/env"));
         context.env.insert("ATTUNE_EXEC_ID".into(), "42".into());
         context
             .env
             .insert("ATTUNE_TEST_OVERRIDE".into(), "internal".into());
-        context.execution_env = std::collections::HashMap::from([
-            ("EXECUTION_ENV_TEST".into(), "visible".into()),
-            ("ATTUNE_EXEC_ID".into(), "bad".into()),
-        ]);
+        context.execution_env =
+            std::collections::HashMap::from([("EXECUTION_ENV_TEST".into(), "visible".into())]);
+        // Dispatch validates the selected raw declaration before handing caller
+        // values to the native runtime; worker-owned context is separate.
+        let selected_config = serde_json::json!({"permitted_caller_env":["EXECUTION_ENV_TEST"]});
+        attune_common::execution_env::validate_caller_environment(
+            &selected_config,
+            &serde_json::to_value(&context.execution_env).unwrap(),
+        )
+        .unwrap();
         let result = NativeRuntime::new().execute(context).await.unwrap();
         assert_eq!(result.exit_code, 0);
         assert!(result
