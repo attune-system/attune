@@ -2,7 +2,7 @@
 
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, State},
     http::HeaderMap,
     response::IntoResponse,
     routing::post,
@@ -27,8 +27,7 @@ use crate::{
     auth::middleware::RequireAuth,
     authz::AuthorizationCheck,
     dto::{
-        trigger::TriggerResponse,
-        webhook::{WebhookReceiverRequest, WebhookReceiverResponse},
+        webhook::{WebhookManagementResponse, WebhookReceiverRequest, WebhookReceiverResponse},
         ApiResponse,
     },
     middleware::{ApiError, ApiResult},
@@ -165,7 +164,7 @@ fn get_webhook_config_array(
         ("ref" = String, Path, description = "Trigger reference (pack.name)")
     ),
     responses(
-        (status = 200, description = "Webhooks enabled", body = TriggerResponse),
+        (status = 200, description = "Webhooks enabled", body = ApiResponse<WebhookManagementResponse>),
         (status = 404, description = "Trigger not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -221,7 +220,7 @@ pub async fn enable_webhook(
         .map_err(|e| ApiError::InternalServerError(e.to_string()))?
         .ok_or_else(|| ApiError::NotFound("Trigger not found after update".to_string()))?;
 
-    let response = TriggerResponse::from(updated_trigger);
+    let response = WebhookManagementResponse::from(updated_trigger);
     Ok(Json(ApiResponse::new(response)))
 }
 
@@ -234,7 +233,7 @@ pub async fn enable_webhook(
         ("ref" = String, Path, description = "Trigger reference (pack.name)")
     ),
     responses(
-        (status = 200, description = "Webhooks disabled", body = TriggerResponse),
+        (status = 200, description = "Webhooks disabled", body = ApiResponse<WebhookManagementResponse>),
         (status = 404, description = "Trigger not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -290,8 +289,61 @@ pub async fn disable_webhook(
         .map_err(|e| ApiError::InternalServerError(e.to_string()))?
         .ok_or_else(|| ApiError::NotFound("Trigger not found after update".to_string()))?;
 
-    let response = TriggerResponse::from(updated_trigger);
+    let response = WebhookManagementResponse::from(updated_trigger);
     Ok(Json(ApiResponse::new(response)))
+}
+
+/// Explicitly reveal the webhook bearer credential to an authorized manager.
+#[utoipa::path(post, path = "/api/v1/triggers/{ref}/webhooks/reveal", tag = "webhooks",
+    params(("ref" = String, Path, description = "Trigger reference")),
+    responses((status = 200, body = ApiResponse<WebhookManagementResponse>)), security(("jwt" = [])))]
+pub async fn reveal_webhook_key(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path(trigger_ref): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    if user.claims.token_type != crate::auth::jwt::TokenType::Access {
+        return Err(ApiError::Forbidden(
+            "Webhook credentials require an access token".into(),
+        ));
+    }
+    let mut tx = state.db.begin().await?;
+    let trigger = TriggerRepository::find_by_ref_for_share(&mut tx, &trigger_ref)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Trigger not found".into()))?;
+    let mut ctx = AuthorizationContext::new(
+        user.identity_id()
+            .map_err(|_| ApiError::Unauthorized("Invalid identity".into()))?,
+    );
+    ctx.target_id = Some(trigger.id);
+    ctx.target_ref = Some(trigger.r#ref.clone());
+    ctx.pack_ref = trigger.pack_ref.clone();
+    ctx.managing_pack_id =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_packs(
+            &mut *tx,
+            attune_common::repositories::runtime_target::ComponentTarget::Trigger,
+            &[trigger.id],
+        )
+        .await?
+        .get(&trigger.id)
+        .copied();
+    state
+        .authorization_service()
+        .authorize_access_fresh(
+            &mut tx,
+            &user,
+            AuthorizationCheck {
+                resource: Resource::Triggers,
+                action: Action::Update,
+                context: ctx,
+            },
+        )
+        .await?;
+    tx.commit().await?;
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(ApiResponse::new(WebhookManagementResponse::from(trigger))),
+    ))
 }
 
 /// Regenerate webhook key for a trigger
@@ -303,7 +355,7 @@ pub async fn disable_webhook(
         ("ref" = String, Path, description = "Trigger reference (pack.name)")
     ),
     responses(
-        (status = 200, description = "Webhook key regenerated", body = TriggerResponse),
+        (status = 200, description = "Webhook key regenerated", body = ApiResponse<WebhookManagementResponse>),
         (status = 400, description = "Webhooks not enabled for this trigger"),
         (status = 404, description = "Trigger not found"),
         (status = 500, description = "Internal server error")
@@ -367,7 +419,7 @@ pub async fn regenerate_webhook_key(
         .map_err(|e| ApiError::InternalServerError(e.to_string()))?
         .ok_or_else(|| ApiError::NotFound("Trigger not found after update".to_string()))?;
 
-    let response = TriggerResponse::from(updated_trigger);
+    let response = WebhookManagementResponse::from(updated_trigger);
     Ok(Json(ApiResponse::new(response)))
 }
 
@@ -394,17 +446,21 @@ pub async fn regenerate_webhook_key(
 pub async fn receive_webhook(
     State(state): State<Arc<AppState>>,
     Path(webhook_key): Path<String>,
+    peer: Option<axum::Extension<ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<impl IntoResponse> {
     let start_time = Instant::now();
 
-    // Extract metadata from headers
-    let source_ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
-        .map(|s| s.to_string());
+    let source_ip = Some(
+        webhook_security::canonical_client_ip(
+            peer.map(|axum::Extension(ConnectInfo(peer))| peer.ip()),
+            &headers,
+            &state.config.server.webhook_trusted_proxies,
+        )
+        .map_err(|_| ApiError::Forbidden("Invalid webhook source address".into()))?
+        .to_string(),
+    );
 
     let user_agent = headers
         .get("user-agent")
@@ -503,6 +559,9 @@ pub async fn receive_webhook(
         ));
     }
 
+    webhook_security::validate_receiver_security(trigger.webhook_config.as_ref())
+        .map_err(|_| ApiError::Forbidden("Invalid webhook security configuration".into()))?;
+
     // Phase 3: Check payload size limit
     if let Some(limit_kb) = get_webhook_config_i64(&trigger, "payload_size_limit_kb") {
         let limit_bytes = limit_kb * 1024;
@@ -536,42 +595,32 @@ pub async fn receive_webhook(
     // Phase 3: Check IP whitelist
     let ip_whitelist_enabled = get_webhook_config_bool(&trigger, "ip_whitelist/enabled", false);
     let ip_allowed = if ip_whitelist_enabled {
-        if let Some(ref ip) = source_ip {
-            if let Some(whitelist) = get_webhook_config_array(&trigger, "ip_whitelist/ips") {
-                match webhook_security::check_ip_in_whitelist(ip, &whitelist) {
-                    Ok(allowed) => {
-                        if !allowed {
-                            let _ = log_webhook_event(
-                                &state,
-                                &trigger,
-                                &webhook_key,
-                                None,
-                                source_ip.clone(),
-                                user_agent.clone(),
-                                payload_size_bytes,
-                                403,
-                                Some("IP address not in whitelist".to_string()),
-                                start_time,
-                                None,
-                                false,
-                                Some(false),
-                            )
-                            .await;
-                            return Err(ApiError::Forbidden("IP address not allowed".to_string()));
-                        }
-                        Some(true)
-                    }
-                    Err(e) => {
-                        tracing::warn!("IP whitelist check error: {}", e);
-                        Some(false)
-                    }
-                }
-            } else {
-                Some(false)
-            }
-        } else {
-            Some(false)
+        let allowed = get_webhook_config_array(&trigger, "ip_whitelist/ips")
+            .and_then(|ips| {
+                webhook_security::check_ip_in_whitelist(source_ip.as_deref().unwrap_or(""), &ips)
+                    .ok()
+            })
+            .unwrap_or(false);
+        if !allowed {
+            let _ = log_webhook_event(
+                &state,
+                &trigger,
+                &webhook_key,
+                None,
+                source_ip.clone(),
+                user_agent.clone(),
+                payload_size_bytes,
+                403,
+                Some("IP address not allowed".into()),
+                start_time,
+                None,
+                false,
+                Some(false),
+            )
+            .await;
+            return Err(ApiError::Forbidden("IP address not allowed".into()));
         }
+        Some(true)
     } else {
         None
     };
@@ -659,7 +708,7 @@ pub async fn receive_webhook(
                         }
                         Some(true)
                     }
-                    Err(e) => {
+                    Err(_) => {
                         let _ = log_webhook_event(
                             &state,
                             &trigger,
@@ -669,17 +718,16 @@ pub async fn receive_webhook(
                             user_agent.clone(),
                             payload_size_bytes,
                             401,
-                            Some(format!("HMAC verification error: {}", e)),
+                            Some("HMAC verification failed".to_string()),
                             start_time,
                             Some(false),
                             false,
                             ip_allowed,
                         )
                         .await;
-                        return Err(ApiError::Unauthorized(format!(
-                            "Signature verification failed: {}",
-                            e
-                        )));
+                        return Err(ApiError::Unauthorized(
+                            "Signature verification failed".into(),
+                        ));
                     }
                 }
             } else {
@@ -962,6 +1010,7 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/triggers/{ref}/webhooks/regenerate",
             post(regenerate_webhook_key),
         )
+        .route("/triggers/{ref}/webhooks/reveal", post(reveal_webhook_key))
         // TODO: Add Phase 3 management endpoints for HMAC, rate limiting, IP whitelist
         // Webhook receiver route (public - no auth required)
         .route("/webhooks/{webhook_key}", post(receive_webhook))

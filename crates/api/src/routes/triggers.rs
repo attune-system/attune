@@ -195,12 +195,54 @@ async fn publish_rule_lifecycle_messages(
     Ok(())
 }
 
+async fn authorize_trigger_reference_context(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    referencing_pack_ref: Option<&str>,
+) -> ApiResult<()> {
+    if let Some(pack_ref) = referencing_pack_ref {
+        if user.claims.token_type != crate::auth::jwt::TokenType::Access {
+            return Err(ApiError::Forbidden(
+                "Pack reference context requires an access token".into(),
+            ));
+        }
+        let pack = PackRepository::find_by_ref(&state.db, pack_ref)
+            .await?
+            .ok_or_else(|| ApiError::Forbidden("Pack reference context unavailable".into()))?;
+        let mut ctx = AuthorizationContext::new(
+            user.identity_id()
+                .map_err(|_| ApiError::Unauthorized("Invalid identity".into()))?,
+        );
+        ctx.target_id = Some(pack.id);
+        ctx.target_ref = Some(pack.r#ref.clone());
+        ctx.pack_ref = Some(pack.r#ref.clone());
+        ctx.managing_pack_id = Some(pack.id);
+        ctx.owner_identity_id = pack.installed_by;
+        if !pack.is_standard {
+            ctx.pack_owner_identity_id = pack.installed_by;
+        }
+        state
+            .authorization_service()
+            .authorize(
+                user,
+                AuthorizationCheck {
+                    resource: Resource::Packs,
+                    action: Action::Configure,
+                    context: ctx,
+                },
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 async fn filter_api_visible_triggers(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
     triggers: Vec<TriggerModel>,
     referencing_pack_ref: Option<&str>,
 ) -> ApiResult<Vec<TriggerModel>> {
+    authorize_trigger_reference_context(state, user, referencing_pack_ref).await?;
     let authz = state.authorization_service();
     let snapshot = authz.load_snapshot(user).await?;
     let grants = snapshot
@@ -351,6 +393,7 @@ async fn visible_trigger_page(
     pagination: &PaginationParams,
     referencing_pack_ref: Option<&str>,
 ) -> ApiResult<PaginatedResponse<TriggerSummary>> {
+    authorize_trigger_reference_context(state, user, referencing_pack_ref).await?;
     // Fail closed: without a resolvable identity there is no basis for
     // pack/ref/id-scoped access, so only `public` rows (enforced in SQL
     // below) would ever be visible; without an identity at all, return

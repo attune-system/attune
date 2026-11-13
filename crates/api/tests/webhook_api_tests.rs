@@ -85,6 +85,19 @@ async fn create_test_trigger(
 
 /// Helper to create a user with webhook-management access.
 async fn get_auth_token(app: &axum::Router, pool: &PgPool) -> String {
+    get_auth_token_with_grants(
+        app,
+        pool,
+        json!([{"resource": "triggers", "actions": ["read", "update"]}]),
+    )
+    .await
+}
+
+async fn get_auth_token_with_grants(
+    app: &axum::Router,
+    pool: &PgPool,
+    grants: serde_json::Value,
+) -> String {
     let login = format!("webhook_test_{}", uuid::Uuid::new_v4().simple());
     let register_request = json!({
         "login": login,
@@ -96,6 +109,11 @@ async fn get_auth_token(app: &axum::Router, pool: &PgPool) -> String {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri("/auth/register")
                 .header("content-type", "application/json")
@@ -127,9 +145,7 @@ async fn get_auth_token(app: &axum::Router, pool: &PgPool) -> String {
             pack_ref: None,
             label: Some("Webhook test grants".to_string()),
             description: None,
-            grants: json!([
-                {"resource": "triggers", "actions": ["read", "update"]}
-            ]),
+            grants,
         },
     )
     .await
@@ -167,6 +183,11 @@ async fn test_enable_webhook() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri("/api/v1/triggers/webhook_test.trigger/webhooks/enable")
                 .header("authorization", format!("Bearer {}", token))
@@ -218,6 +239,11 @@ async fn test_disable_webhook() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri("/api/v1/triggers/webhook_disable_test.trigger/webhooks/disable")
                 .header("authorization", format!("Bearer {}", token))
@@ -267,6 +293,11 @@ async fn test_regenerate_webhook_key() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri("/api/v1/triggers/webhook_regen_test.trigger/webhooks/regenerate")
                 .header("authorization", format!("Bearer {}", token))
@@ -312,6 +343,11 @@ async fn test_regenerate_webhook_key_not_enabled() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri("/api/v1/triggers/webhook_not_enabled_test.trigger/webhooks/regenerate")
                 .header("authorization", format!("Bearer {}", token))
@@ -365,6 +401,11 @@ async fn test_receive_webhook() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri(format!("/api/v1/webhooks/{}", webhook_info.webhook_key))
                 .header("content-type", "application/json")
@@ -444,6 +485,11 @@ async fn test_receive_webhook_invalid_key() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri("/api/v1/webhooks/wh_invalid_key_12345")
                 .header("content-type", "application/json")
@@ -491,6 +537,11 @@ async fn test_receive_webhook_disabled() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri(format!("/api/v1/webhooks/{}", webhook_info.webhook_key))
                 .header("content-type", "application/json")
@@ -524,6 +575,11 @@ async fn test_webhook_requires_auth_for_management() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri("/api/v1/triggers/webhook_auth_test.trigger/webhooks/enable")
                 .body(Body::empty())
@@ -566,6 +622,11 @@ async fn test_receive_webhook_minimal_payload() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri(format!("/api/v1/webhooks/{}", webhook_info.webhook_key))
                 .header("content-type", "application/json")
@@ -576,4 +637,149 @@ async fn test_receive_webhook_minimal_payload() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn metadata_redacts_credentials_and_reveal_requires_management() {
+    let ctx = setup_test_context().await;
+    let pack = create_test_pack(&ctx.pool, "disclosure").await;
+    let id = create_test_trigger(&ctx.pool, pack, "disclosure", "disclosure.trigger").await;
+    let credential = TriggerRepository::enable_webhook(&ctx.pool, id)
+        .await
+        .unwrap();
+    let token = get_auth_token(&ctx.app, &ctx.pool).await;
+    for path in ["/api/v1/triggers/disclosure.trigger", "/api/v1/triggers"] {
+        let response = ctx
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains(&credential.webhook_key));
+        assert!(!String::from_utf8_lossy(&bytes).contains("webhook_key"));
+    }
+    let path = "/api/v1/triggers/disclosure.trigger/webhooks/reveal";
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["data"]["webhook_key"], credential.webhook_key);
+    // The trigger grant does not authorize acting as its pack.
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/triggers/disclosure.trigger?referencing_pack_ref=disclosure")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    ctx.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn reference_context_requires_scoped_pack_authoring_authority() {
+    let ctx = setup_test_context().await;
+    let pack = create_test_pack(&ctx.pool, "authoring").await;
+    create_test_pack(&ctx.pool, "adjacent").await;
+    let id = create_test_trigger(&ctx.pool, pack, "authoring", "authoring.private").await;
+    let mut input = attune_common::repositories::trigger::UpdateTriggerInput::default();
+    input.reference_visibility =
+        Some(attune_common::models::enums::ActionReferenceVisibility::Private);
+    TriggerRepository::update(&ctx.pool, id, input)
+        .await
+        .unwrap();
+    let token = get_auth_token_with_grants(&ctx.app, &ctx.pool,
+        json!([{"resource":"packs", "actions":["configure"], "constraints":{"refs":["authoring"]}}])).await;
+    for (context, expected) in [
+        ("authoring", StatusCode::OK),
+        ("adjacent", StatusCode::FORBIDDEN),
+        ("fabricated", StatusCode::FORBIDDEN),
+    ] {
+        for route in ["/api/v1/triggers/authoring.private", "/api/v1/triggers"] {
+            let response = ctx
+                .app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("{route}?referencing_pack_ref={context}"))
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{route} context={context}");
+        }
+    }
+    let reader = get_auth_token_with_grants(&ctx.app, &ctx.pool, json!([])).await;
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/triggers/authoring.private")
+                .header("authorization", format!("Bearer {reader}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/triggers/authoring.private/webhooks/reveal")
+                .header("authorization", format!("Bearer {reader}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    ctx.cleanup().await.unwrap();
 }

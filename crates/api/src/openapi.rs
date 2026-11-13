@@ -455,6 +455,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::webhooks::disable_webhook,
         crate::routes::webhooks::regenerate_webhook_key,
         crate::routes::webhooks::receive_webhook,
+        crate::routes::webhooks::reveal_webhook_key,
 
         // Agent
         crate::routes::agent::download_agent_binary,

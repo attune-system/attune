@@ -210,6 +210,10 @@ fn default_true() -> bool {
 /// Server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
+    /// Networks of operator-controlled proxies allowed to supply X-Forwarded-For.
+    #[serde(default, deserialize_with = "string_or_vec::deserialize")]
+    pub webhook_trusted_proxies: Vec<String>,
+
     /// Host to bind to
     #[serde(default = "default_host")]
     pub host: String,
@@ -2281,6 +2285,7 @@ impl Default for NotifierConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            webhook_trusted_proxies: Vec::new(),
             host: default_host(),
             port: default_port(),
             request_timeout: default_request_timeout(),
