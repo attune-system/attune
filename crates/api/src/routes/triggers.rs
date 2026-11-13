@@ -97,7 +97,7 @@ async fn sensor_update_authority(
 
 use crate::{
     auth::middleware::{AuthenticatedUser, RequireAuth},
-    authz::AuthorizationService,
+    authz::{AuthorizationCheck, AuthorizationService},
     dto::{
         common::{PaginatedResponse, PaginationParams, PaginationSearchParams},
         trigger::{
