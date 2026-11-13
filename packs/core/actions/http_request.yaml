@@ -13,9 +13,9 @@ runner_type: shell
 entry_point: http_request.sh
 
 # Parameter delivery configuration (for security)
-# Use stdin + DOTENV for secure parameter passing (credentials won't appear in process list)
+# Use a flat JSON object on stdin to preserve parameter boundaries
 parameter_delivery: stdin
-parameter_format: dotenv
+parameter_format: json
 
 # Output format: json (structured data parsing enabled)
 output_format: json

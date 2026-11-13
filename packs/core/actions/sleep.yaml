@@ -14,7 +14,7 @@ entry_point: sleep.sh
 
 # Parameter delivery: stdin for secure parameter passing (no env vars)
 parameter_delivery: stdin
-parameter_format: dotenv
+parameter_format: json
 
 # Output format: text (no structured data parsing)
 output_format: text

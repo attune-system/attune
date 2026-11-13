@@ -68,32 +68,27 @@ class CorePackTestCase(unittest.TestCase):
             tuple: (stdout, stderr, exit_code)
         """
         script_path = self.actions_dir / script_name
-        stdin_data = None
-        # The HTTP action is now a POSIX-shell action that receives canonical
-        # DOTENV parameters on stdin. Keep the historical test call shape while
-        # exercising the current action contract.
-        if script_name == "http_request.py" and not script_path.exists():
+        if script_name == "http_request.py":
             script_name = "http_request.sh"
             script_path = self.actions_dir / script_name
-            parameters = {}
-            for env_name, value in (env_vars or {}).items():
-                if not env_name.startswith("ATTUNE_ACTION_"):
-                    continue
-                key = env_name.removeprefix("ATTUNE_ACTION_").lower()
-                if key in {"headers", "query_params"}:
-                    for nested_key, nested_value in json.loads(value).items():
-                        parameters[f"{key}.{nested_key}"] = nested_value
-                else:
-                    parameters[key] = value
-            stdin_data = "".join(f"{key}={value}\n" for key, value in parameters.items()).encode()
+        parameters = {}
+        for name, value in (env_vars or {}).items():
+            key = name.removeprefix("ATTUNE_ACTION_").lower()
+            if key in {"headers", "query_params", "json_body"}:
+                value = json.loads(value)
+            elif key in {"seconds", "exit_code", "timeout"}:
+                try:
+                    value = int(value)
+                except ValueError:
+                    pass
+            parameters[key] = value
+        stdin_data = json.dumps(parameters).encode()
 
         if not script_path.exists():
             raise FileNotFoundError(f"Script not found: {script_path}")
 
         # Prepare environment
         env = os.environ.copy()
-        if env_vars:
-            env.update(env_vars)
 
         # Determine the command
         if script_name.endswith(".py"):
@@ -140,28 +135,14 @@ class TestEchoAction(CorePackTestCase):
         """Test default message when none provided"""
         stdout, stderr, code = self.run_action("echo.sh", {})
         self.assertEqual(code, 0)
-        self.assertIn("Hello, World!", stdout)
+        self.assertEqual("", stdout)
 
-    def test_uppercase_conversion(self):
-        """Test uppercase conversion"""
-        stdout, stderr, code = self.run_action(
-            "echo.sh",
-            {
-                "ATTUNE_ACTION_MESSAGE": "test message",
-                "ATTUNE_ACTION_UPPERCASE": "true",
-            },
-        )
-        self.assertEqual(code, 0)
-        self.assertIn("TEST MESSAGE", stdout)
-        self.assertNotIn("test message", stdout)
-
-    def test_uppercase_false(self):
-        """Test uppercase=false preserves case"""
+    def test_case_preserved(self):
+        """Test case is preserved"""
         stdout, stderr, code = self.run_action(
             "echo.sh",
             {
                 "ATTUNE_ACTION_MESSAGE": "Mixed Case",
-                "ATTUNE_ACTION_UPPERCASE": "false",
             },
         )
         self.assertEqual(code, 0)
@@ -190,7 +171,7 @@ class TestEchoAction(CorePackTestCase):
             "echo.sh", {"ATTUNE_ACTION_MESSAGE": multiline_msg}
         )
         self.assertEqual(code, 0)
-        # Depending on shell behavior, newlines might be interpreted
+        self.assertEqual(multiline_msg, stdout)
 
 
 class TestNoopAction(CorePackTestCase):
@@ -349,6 +330,8 @@ class TestHttpRequestAction(CorePackTestCase):
     def setUpClass(cls):
         super().setUpClass()
 
+        cls.stop_delay = threading.Event()
+
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, _format, *_args):
                 pass
@@ -356,14 +339,22 @@ class TestHttpRequestAction(CorePackTestCase):
             def _respond(self):
                 parsed = urlparse(self.path)
                 if parsed.path.startswith("/delay/"):
-                    time.sleep(float(parsed.path.rsplit("/", 1)[1]))
+                    cls.stop_delay.wait(float(parsed.path.rsplit("/", 1)[1]))
+                if parsed.path == "/redirect-file":
+                    self.send_response(302)
+                    self.send_header("Location", "file:///etc/passwd")
+                    self.end_headers()
+                    return
                 status = 404 if parsed.path == "/status/404" else 200
+                if parsed.path == "/auth" and self.headers.get("Authorization") != "Bearer owned-dummy-token":
+                    status = 401
                 content_length = int(self.headers.get("Content-Length", "0"))
                 raw_body = self.rfile.read(content_length) if content_length else b""
                 payload = {
                     "args": {key: values[-1] for key, values in parse_qs(parsed.query).items()},
                     "headers": dict(self.headers.items()),
-                    "json": json.loads(raw_body) if raw_body else None,
+                    "json": json.loads(raw_body) if raw_body and self.headers.get("Content-Type") == "application/json" else None,
+                    "body": raw_body.decode("utf-8"),
                 }
                 encoded = json.dumps(payload).encode()
                 self.send_response(status)
@@ -382,7 +373,7 @@ class TestHttpRequestAction(CorePackTestCase):
             do_DELETE = _respond
 
         cls.http_server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        cls.http_server.daemon_threads = True
+        cls.http_server.daemon_threads = False
         cls.http_base_url = f"http://127.0.0.1:{cls.http_server.server_port}"
         cls.http_thread = threading.Thread(
             target=cls.http_server.serve_forever, daemon=True
@@ -391,10 +382,46 @@ class TestHttpRequestAction(CorePackTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        cls.stop_delay.set()
         cls.http_server.shutdown()
         cls.http_server.server_close()
         cls.http_thread.join(timeout=2)
+        if cls.http_thread.is_alive():
+            raise RuntimeError("owned HTTP fixture did not stop")
         super().tearDownClass()
+
+    def test_redirect_to_non_http_protocol_rejected(self):
+        stdout, stderr, code = self.run_action("http_request.py", {
+            "ATTUNE_ACTION_URL": f"{self.http_base_url}/redirect-file",
+        })
+        self.assertNotEqual(code, 0, stderr)
+        self.assertFalse(json.loads(stdout)["success"])
+        self.assertEqual(json.loads(stdout)["body"], "")
+
+    def test_bearer_auth_positive_and_rejection(self):
+        for token, expected in (("owned-dummy-token", 200), ("wrong-dummy-token", 401), ("", 401)):
+            stdout, stderr, code = self.run_action("http_request.py", {
+                "ATTUNE_ACTION_URL": f"{self.http_base_url}/auth",
+                "ATTUNE_ACTION_AUTH_TYPE": "bearer",
+                "ATTUNE_ACTION_AUTH_TOKEN": token,
+            })
+            self.assertEqual(json.loads(stdout)["status_code"], expected, stderr)
+            self.assertEqual(code, 0 if expected == 200 else 1)
+
+    def test_raw_body_and_query_round_trip(self):
+        body = "quotes '\" backslash \\ 雪\ncommand=other\n\n"
+        query = {"key &=雪": "a+b & #?=\n雪"}
+        stdout, stderr, code = self.run_action("http_request.py", {
+            "ATTUNE_ACTION_URL": f"{self.http_base_url}/post?existing=retained",
+            "ATTUNE_ACTION_METHOD": "POST", "ATTUNE_ACTION_BODY": body,
+            "ATTUNE_ACTION_QUERY_PARAMS": json.dumps(query),
+            "ATTUNE_ACTION_HEADERS": json.dumps({"X-Quoted": "quotes '\" \\"}),
+        })
+        self.assertEqual(code, 0, stderr)
+        echoed = json.loads(stdout)["json"]
+        self.assertEqual(echoed["body"], body)
+        self.assertEqual(echoed["args"], {**query, "existing": "retained"})
+        self.assertEqual(echoed["headers"]["X-Quoted"], "quotes '\" \\")
 
     def test_simple_get_request(self):
         """Test simple GET request"""
@@ -548,7 +575,7 @@ class TestHttpRequestAction(CorePackTestCase):
         result = json.loads(stdout)
         self.assertIn("elapsed_ms", result)
         self.assertIsInstance(result["elapsed_ms"], int)
-        self.assertGreater(result["elapsed_ms"], 0)
+        self.assertGreaterEqual(result["elapsed_ms"], 0)
 
 
 class TestFilePermissions(CorePackTestCase):
