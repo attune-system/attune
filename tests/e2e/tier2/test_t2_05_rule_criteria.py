@@ -50,7 +50,7 @@ def test_rule_criteria_basic(client: AttuneClient, test_pack):
     trigger_ref = trigger["ref"]
     webhook_url = trigger["webhook_url"]
     print(f"✓ Created webhook trigger: {trigger_ref}")
-    print(f"  Webhook URL: {webhook_url}")
+    print("  Webhook URL: /api/v1/webhooks/<redacted>")
 
     # ========================================================================
     # STEP 2: Create echo action

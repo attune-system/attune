@@ -76,7 +76,7 @@ class TestWebhookDisable:
         data = resp["data"]
 
         assert data["webhook_enabled"] is False
-        assert data["webhook_key"] is None
+        assert data.get("webhook_key") is None
 
 
 @pytest.mark.api

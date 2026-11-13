@@ -6,7 +6,11 @@ bearer key. Schema metadata visibility remains public for public triggers.
 current `triggers:update` authority for that exact target. The response is
 credential-bearing and uses `Cache-Control: no-store`. The UI's “Reveal and copy
 URL” invokes this explicit operation. API clients can call the same endpoint;
-ordinary CLI trigger output no longer prints a key. Existing enable/regenerate
+ordinary CLI trigger output no longer prints a key. The Python E2E
+`fire_webhook` helper requests explicit reveal for an already-enabled trigger;
+auto-enable uses its management response. Both operations retain the caller's
+existing grants, and denial stops delivery. Credential-bearing URLs are redacted
+in helper diagnostics while the original transport target is preserved. Existing enable/regenerate
 operations return a credential-bearing management response.
 
 `referencing_pack_ref` is an authoring context, not an assertion clients may make

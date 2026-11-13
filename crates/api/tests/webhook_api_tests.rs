@@ -724,9 +724,12 @@ async fn reference_context_requires_scoped_pack_authoring_authority() {
     let pack = create_test_pack(&ctx.pool, "authoring").await;
     create_test_pack(&ctx.pool, "adjacent").await;
     let id = create_test_trigger(&ctx.pool, pack, "authoring", "authoring.private").await;
-    let mut input = attune_common::repositories::trigger::UpdateTriggerInput::default();
-    input.reference_visibility =
-        Some(attune_common::models::enums::ActionReferenceVisibility::Private);
+    let input = attune_common::repositories::trigger::UpdateTriggerInput {
+        reference_visibility: Some(
+            attune_common::models::enums::ActionReferenceVisibility::Private,
+        ),
+        ..Default::default()
+    };
     TriggerRepository::update(&ctx.pool, id, input)
         .await
         .unwrap();
