@@ -438,7 +438,7 @@ async fn behavioral_edits_require_actual_editor_authority_even_for_same_subject_
             &jwt_config(),
             TokenType::Access,
         )?,
-        helpers::delegated_source::token(&ctx, owner, &[narrow.r#ref.clone()]).await?,
+        helpers::delegated_source::token(&ctx, owner, std::slice::from_ref(&narrow.r#ref)).await?,
     ];
     for token in &tokens {
         for change in [
@@ -639,7 +639,8 @@ async fn behavioral_edits_require_actual_editor_authority_even_for_same_subject_
     )
     .await?;
     let mut tx = ctx.pool.begin().await?;
-    RuleAuthorityRepository::set_input_refs(&mut tx, rule.id, &[admin.r#ref.clone()]).await?;
+    RuleAuthorityRepository::set_input_refs(&mut tx, rule.id, std::slice::from_ref(&admin.r#ref))
+        .await?;
     RuleAuthorityRepository::capture_deployment(&mut tx, rule.pack).await?;
     let managed = RuleRepository::find_by_ref(&mut *tx, &rule_ref)
         .await?
