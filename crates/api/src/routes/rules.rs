@@ -543,6 +543,15 @@ pub async fn create_rule(
     RequireAuth(user): RequireAuth,
     Json(request): Json<CreateRuleRequest>,
 ) -> ApiResult<impl IntoResponse> {
+    if !matches!(
+        user.claims.token_type,
+        crate::auth::jwt::TokenType::Access | crate::auth::jwt::TokenType::Execution
+    ) {
+        return Err(ApiError::Forbidden(
+            "This token type cannot administer rules".into(),
+        ));
+    }
+
     // Validate request
     request.validate()?;
 
@@ -565,25 +574,23 @@ pub async fn create_rule(
         })?;
     ensure_trigger_reference_allowed(&trigger, Some(&pack.r#ref), "rule", &request.r#ref)?;
 
-    if user.claims.token_type == crate::auth::jwt::TokenType::Access {
-        let identity_id = user
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = state.authorization_service();
-        let mut ctx = AuthorizationContext::new(identity_id);
-        ctx.pack_ref = Some(pack.r#ref.clone());
-        ctx.target_ref = Some(request.r#ref.clone());
-        authz
-            .authorize(
-                &user,
-                AuthorizationCheck {
-                    resource: Resource::Rules,
-                    action: Action::Create,
-                    context: ctx,
-                },
-            )
-            .await?;
-    }
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    let authz = state.authorization_service();
+    let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.pack_ref = Some(pack.r#ref.clone());
+    ctx.target_ref = Some(request.r#ref.clone());
+    authz
+        .authorize(
+            &user,
+            AuthorizationCheck {
+                resource: Resource::Rules,
+                action: Action::Create,
+                context: ctx,
+            },
+        )
+        .await?;
 
     // Validate trigger parameters against schema
     validate_trigger_params_with_registry(&state.db, &trigger, &request.trigger_params).await?;
@@ -606,11 +613,8 @@ pub async fn create_rule(
         ));
     }
 
-    // Capture the authenticated identity to attribute rule-triggered
-    // executions back to the user who registered the rule. For service-account
-    // / token flows where `identity_id()` is not available we fall back to
-    // None, which defers to the system identity at execution-creation time.
-    let owner_identity = user.identity_id().ok();
+    // Attribute future executions to the already authorized active owner.
+    let owner_identity = Some(identity_id);
     let trace_tag_template = request.trace_tag_template.clone();
     let authorized_component_ids = (pack.id, action.id, trigger.id);
     let mut tx = state.db.begin().await?;
@@ -1262,38 +1266,45 @@ pub async fn delete_rule(
     RequireAuth(user): RequireAuth,
     Path(rule_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    if !matches!(
+        user.claims.token_type,
+        crate::auth::jwt::TokenType::Access | crate::auth::jwt::TokenType::Execution
+    ) {
+        return Err(ApiError::Forbidden(
+            "This token type cannot administer rules".into(),
+        ));
+    }
+
     // Check if rule exists
     let rule = RuleRepository::find_by_ref(&state.db, &rule_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Rule '{}' not found", rule_ref)))?;
 
-    if user.claims.token_type == crate::auth::jwt::TokenType::Access {
-        let identity_id = user
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = state.authorization_service();
-        let mut ctx = AuthorizationContext::new(identity_id);
-        ctx.target_id = Some(rule.id);
-        ctx.managing_pack_id =
-            attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
-                &state.db,
-                attune_common::repositories::runtime_target::ComponentTarget::Rule,
-                rule.id,
-            )
-            .await?;
-        ctx.target_ref = Some(rule.r#ref.clone());
-        ctx.pack_ref = Some(rule.pack_ref.clone());
-        authz
-            .authorize(
-                &user,
-                AuthorizationCheck {
-                    resource: Resource::Rules,
-                    action: Action::Delete,
-                    context: ctx,
-                },
-            )
-            .await?;
-    }
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    let authz = state.authorization_service();
+    let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.target_id = Some(rule.id);
+    ctx.managing_pack_id =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+            &state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Rule,
+            rule.id,
+        )
+        .await?;
+    ctx.target_ref = Some(rule.r#ref.clone());
+    ctx.pack_ref = Some(rule.pack_ref.clone());
+    authz
+        .authorize(
+            &user,
+            AuthorizationCheck {
+                resource: Resource::Rules,
+                action: Action::Delete,
+                context: ctx,
+            },
+        )
+        .await?;
 
     let mut tx = state.db.begin().await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
