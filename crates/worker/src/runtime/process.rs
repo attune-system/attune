@@ -1562,6 +1562,21 @@ mod tests {
             root.path().into(),
             root.path().join("envs"),
         );
+        for name in [
+            "BASH_ENV",
+            "PYTHONPATH",
+            "NODE_OPTIONS",
+            "LD_PRELOAD",
+            "PATH",
+            "ATTUNE_EXEC_ID",
+        ] {
+            let mut rejected =
+                ExecutionContext::test_context("test.env".into(), Some("printf fixed".into()));
+            rejected
+                .execution_env
+                .insert(name.into(), root.path().display().to_string());
+            assert!(runtime.execute(rejected).await.is_err(), "{name}");
+        }
         let mut context = ExecutionContext::test_context(
             "test.env".into(),
             Some("printf '%s|%s|%s' \"$LOG_LEVEL\" \"$REGION\" \"$ATTUNE_EXEC_ID\"".into()),
@@ -1570,7 +1585,6 @@ mod tests {
         context.execution_env = HashMap::from([
             ("LOG_LEVEL".into(), "debug".into()),
             ("REGION".into(), "eu-west-1".into()),
-            ("ATTUNE_EXEC_ID".into(), "bad".into()),
         ]);
         let result = runtime.execute(context).await.unwrap();
         assert_eq!(result.exit_code, 0);
