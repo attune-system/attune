@@ -145,6 +145,12 @@ async fn lifecycle_routes_deny_before_effects_and_respect_scopes() -> Result<()>
         },
     )
     .await?;
+    let original_trigger = TriggerRepository::find_by_ref(&ctx.pool, &trigger.r#ref)
+        .await?
+        .unwrap();
+    let original_sensor = SensorRepository::find_by_ref(&ctx.pool, "lifecycle.sensor")
+        .await?
+        .unwrap();
     let denied = token(&ctx, "lifecycle_denied", json!([])).await?;
     let wrong = token(&ctx, "lifecycle_wrong", json!([
         {"resource":"actions","actions":["create","update","delete"],"constraints":{"refs":["other.unrelated"]}},
@@ -399,6 +405,34 @@ async fn lifecycle_routes_deny_before_effects_and_respect_scopes() -> Result<()>
             .is_none()
     );
     assert!(!ctx.test_packs_dir.join("lifecycle/actions").exists());
+    assert_eq!(
+        TriggerRepository::find_by_ref(&ctx.pool, &trigger.r#ref)
+            .await?
+            .unwrap()
+            .updated,
+        original_trigger.updated
+    );
+    assert_eq!(
+        SensorRepository::find_by_ref(&ctx.pool, "lifecycle.sensor")
+            .await?
+            .unwrap()
+            .updated,
+        original_sensor.updated
+    );
+    assert_eq!(
+        RuleRepository::find_by_ref(&ctx.pool, &rule.r#ref)
+            .await?
+            .unwrap()
+            .updated,
+        rule.updated
+    );
+    assert_eq!(
+        WorkflowDefinitionRepository::find_by_ref(&ctx.pool, &workflow.r#ref)
+            .await?
+            .unwrap()
+            .updated,
+        workflow.updated
+    );
     let scoped = token(&ctx, "lifecycle_scoped", json!([
         {"resource":"triggers","actions":["create","update","delete"],"constraints":{"refs":["lifecycle.allowed","lifecycle.trigger","lifecycle.sensor","lifecycle.rule","lifecycle.workflow","lifecycle.positive","lifecycle.newfile"]}},
         {"resource":"actions","actions":["create","update","delete"],"constraints":{"refs":["lifecycle.allowed","lifecycle.trigger","lifecycle.sensor","lifecycle.rule","lifecycle.workflow","lifecycle.positive","lifecycle.newfile"]}},
