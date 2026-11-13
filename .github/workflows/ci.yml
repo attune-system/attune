@@ -358,7 +358,8 @@ jobs:
           rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
           python3 -m pip install --user --break-system-packages 'ziglang==0.16.0'
           cargo install --locked --version 0.23.4 cargo-zigbuild
-          export PATH="$(python3 -c 'import os,ziglang; print(os.path.dirname(ziglang.__file__))'):$PATH"
+          zig_directory=$(python3 -c 'import os,ziglang; print(os.path.dirname(ziglang.__file__))')
+          export PATH="$zig_directory:$PATH"
           cargo zigbuild --locked --release --manifest-path crates/core-actions/Cargo.toml --target x86_64-unknown-linux-musl --bins
           cargo zigbuild --locked --release --manifest-path crates/core-actions/Cargo.toml --target aarch64-unknown-linux-musl --bins
 
@@ -478,7 +479,8 @@ jobs:
         id: deny-core-actions
         if: ${{ !cancelled() }}
         continue-on-error: ${{ github.ref != 'refs/heads/main' && github.head_ref != 'main' && github.event.merge_group.base_ref != 'refs/heads/main' }}
-        run: cargo deny --manifest-path crates/core-actions/Cargo.toml --config deny.toml --locked check
+        # Both cached 0.19 and 0.20 read deny.toml from this repository-root cwd.
+        run: cargo deny --manifest-path crates/core-actions/Cargo.toml --locked check
 
       - name: Cargo Deny (timer)
         id: deny-timer
