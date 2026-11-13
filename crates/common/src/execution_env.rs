@@ -47,6 +47,7 @@ pub fn validate_caller_env_name(name: &str) -> crate::Result<()> {
         || matches!(
             upper.as_str(),
             "GOENV"
+                | "GOCACHEPROG"
                 | "GOFLAGS"
                 | "GOROOT"
                 | "GOPATH"
@@ -396,6 +397,7 @@ mod tests {
             "PYTHONPATH",
             "PYTHONSTARTUP",
             "GOFLAGS",
+            "GOCACHEPROG",
             "R_PROFILE_USER",
             "CGO_CFLAGS",
             "COMPILER_PATH",
@@ -448,6 +450,14 @@ mod tests {
                 validate_caller_environment(&config, &serde_json::json!({name:"probe"})).is_err()
             );
         }
+        let error = validate_caller_environment(
+            &serde_json::json!({"permitted_caller_env":["GOCACHEPROG"]}),
+            &serde_json::json!({"GOCACHEPROG":"owned-helper-value-not-for-diagnostics"}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("GOCACHEPROG"));
+        assert!(!error.contains("owned-helper-value-not-for-diagnostics"));
         let vars = serde_json::json!({"APP_REGION":"west", "EMPTY":""});
         assert!(validate_caller_environment(&serde_json::json!({}), &vars).is_err());
         assert!(validate_caller_environment(
