@@ -336,61 +336,11 @@ class Probe:
         return self.native.inspect("version", execution)
 
     def begin(self):
-        require(not self.state_path.exists(), "probe state already exists; do not redispatch")
-        source = Path(__file__).with_name("storage_probe_producer.py").read_bytes()
-        encoded = base64.b64encode(source).decode()
-        marker = "f-storage-probe-" + self.c["run_id"]
-        # argv marker remains visible through exec; no tokens appear in command.
-        require(re.fullmatch(r"[A-Za-z0-9_./-]+", self.b["python"]), "Python executable must be an unquoted path without whitespace")
-        # core.run_agent_command's dotenv shim strips the outer quotes but does
-        # not interpret embedded single-quote escapes. Use no apostrophes here.
-        command = (self.b["python"] + ' -c "import base64;exec(base64.b64decode(\\"' + encoded
-                   + '\\"))" ' + self.c["run_id"] + " " + str(self.b["hold_seconds"]) + " " + marker)
-        execution = self.api.call("/api/v1/executions/execute", self.invoker, {
-            "action_ref": "core.run_agent_command", "config": {"command": command, "require_mcp_binary": False},
-            "permission_set_refs": ["standard"], "timeout_seconds": self.b["hold_seconds"],
-        }, "POST", (200, 201, 202))["data"]
-        identifier = execution["id"]
-        state = {"schema_version": 1, "project": self.c["project"], "run_id": self.c["run_id"],
-                 "backend": self.c["backend"], "execution_id": identifier, "phase": "dispatched", "observations": {}}
-        save(self.state_path, state)  # Preserve ownership even if later observation fails.
-        running = self.wait("real worker start", lambda: (e if (e := self.execution(identifier))["status"] == "running" and e.get("worker") else None))
-        require(running["executor"] == self.invoker_id, "dispatch did not use ordinary invoker")
-        pins = self.pins(identifier)
-        fresh = self.c["expected_pins"]["fresh"]
-        require(all(pins[k] == fresh[k] for k in ("release_id", "digest", "policy_revision")), "execution did not pin exact fresh release and policy")
-        version = self.wait("actual file PUT Ready", lambda: (v if (v := self.owned_version(identifier)) and v["body_state"] == "ready" else None))
-        require(version["provider_version"] and version["object_key"] and version["staging_path"], "known file request lacks exact provider/staging identities")
-        protected = self.native.inspect("protected", identifier, identity=version["_inspection_identity"])
-        require(protected["body"] and not protected["unsettled"], "known successful PUT lacks authenticated body or still has unsettled operations")
-        require(self.native.writer_processes(), "actual producer process marker was not observed")
-        backend = self.native.inspect("backend", identifier)
-        require(backend == {"SharedFile": "shared_file", "ObjectSegments": "object_segments"}[self.c["backend"]], "actual worker log backend differs from requested backend")
-        staging = self.native.physical(self.b["artifacts_root"], version["staging_path"])
-        require(staging, "producer staging file missing before cleanup")
-        state.update(pins=pins, version=version, phase="begin", staging=staging, worker=running["worker"])
-        state["observations"].update(real_worker_dispatch={"execution": identifier, "worker": running["worker"], "executor": running["executor"]}, backend_observed=backend)
-        if self.c["backend"] == "ObjectSegments":
-            require(self.provider.call("get-bucket-versioning").get("Status") == "Enabled", "actual provider bucket versioning is not Enabled")
-            obj = self.native.container(self.b["provider_service"])
-            endpoint = urllib.parse.urlsplit(self.b["provider_endpoint"])
-            ports = obj["NetworkSettings"]["Ports"].get(str(self.b["provider_port"]) + "/tcp") or []
-            require(endpoint.scheme in ("http", "https") and endpoint.hostname in ("127.0.0.1", "localhost")
-                    and any(int(p["HostPort"]) == endpoint.port for p in ports), "provider endpoint is not the owned service's explicit loopback published port")
-            require(version["provider_version"].startswith("v:") and version["provider_version"][2:] not in ("", "null"), "provider did not return immutable S3 version ID")
-            inventory = self.provider.versions(version["object_key"])
-            require(version["provider_version"][2:] in inventory["versions"] and not inventory["uploads"], "exact provider version not present or multipart work outstanding")
-            state["observations"]["provider_before"] = inventory
-        else:
-            state["physical"] = self.native.physical(self.b["blob_root"], version["object_key"])
-            require(state["physical"], "actual owned filesystem blob missing")
-            # The shipped object_store LocalFileSystem uses the inode/mtime/size
-            # ETag, not an assumed name-based generation or the current HEAD.
-            physical = state["physical"]
-            exact = f'e:"{physical["inode"]:x}-{physical["mtime_micros"]:x}-{physical["size"]:x}"'
-            require(version["provider_version"] == exact, "recorded filesystem provider identity differs from actual inode/mtime/size ETag")
-        save(self.state_path, state)
-        return {"backend": self.c["backend"], "execution_id": identifier}
+        raise ProbeError(
+            "Deferred coverage (#142): legacy storage invocation depended on the "
+            "removed core.run_agent_command action. No producer was dispatched. "
+            "Use the supported independent native controller fixture."
+        )
 
     def load(self):
         state = json.loads(private(self.state_path))

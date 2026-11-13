@@ -150,6 +150,16 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry
     cargo zigbuild --release --target "${TARGET}" --bin attune-core-timer-sensor && \
     cp "target/${TARGET}/release/attune-core-timer-sensor" /build/pack-binaries/attune-core-timer-sensor
 
+# Core actions are independent of the sensor crate and have no runtime dependencies.
+COPY crates/core-actions/ ./crates/core-actions/
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry-v2,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,id=attune-cargo-git-v2,sharing=locked \
+    --mount=type=cache,id=target-core-actions-static,target=/build/crates/core-actions/target,sharing=locked \
+    TARGET="$(resolve-rust-target)" && \
+    cd /build/crates/core-actions && \
+    cargo zigbuild --locked --release --target "${TARGET}" --bins && \
+    cp target/${TARGET}/release/attune-core-echo target/${TARGET}/release/attune-core-noop target/${TARGET}/release/attune-core-sleep /build/pack-binaries/
+
 # Strip the binary to minimize size.
 # When cross-compiling for a different architecture, the host strip may not
 # understand the foreign binary format. In that case we skip stripping — the
@@ -163,6 +173,14 @@ RUN ls -lh /build/pack-binaries/ && \
     file /build/pack-binaries/attune-core-timer-sensor && \
     (ldd /build/pack-binaries/attune-core-timer-sensor 2>&1 || echo "statically linked (no dynamic dependencies)") && \
     /build/pack-binaries/attune-core-timer-sensor --version || echo "Built successfully"
+
+# Static action executables must never need an interpreter or shared library.
+RUN for action in echo sleep noop; do \
+      binary="/build/pack-binaries/attune-core-$action"; \
+      test -x "$binary" || exit 1; \
+      if readelf -W -l "$binary" | grep -q INTERP; then exit 1; fi; \
+      if readelf -W -d "$binary" | grep -q '(NEEDED)'; then exit 1; fi; \
+    done
 
 # ============================================================================
 # Stage 2: Output - Minimal image with just the binaries

@@ -175,6 +175,12 @@ def native_receipt(root):
         with binary.open("rb") as source:
             header = source.read(20)
         require(len(header) == 20 and header[:6] == b"\x7fELF\x02\x01" and int.from_bytes(header[18:20], "little") == machine and binary.stat().st_mode & 0o111, "Missing actual architecture-specific executable timer")
+    for arch, machine in (("amd64", 62), ("arm64", 183)):
+        for action in ("echo", "sleep", "noop"):
+            binary = root / "core/actions/bin" / action / ("linux-" + arch)
+            with binary.open("rb") as source:
+                header = source.read(20)
+            require(len(header) == 20 and header[:6] == b"\x7fELF\x02\x01" and int.from_bytes(header[18:20], "little") == machine and binary.stat().st_mode & 0o111, "Missing actual architecture-specific core action")
     machine = {"x86_64": 62, "aarch64": 183}[platform.machine()]
     binaries = {}
     for family, names in (("services", ["attune-" + name for name in IMAGES[:4]]), ("agents", ["attune", "attune-mcp", "attune-agent", "attune-sensor-agent"]), ("tools", ["bootstrap_acceptance_archive", "storage_probe_inspector", "interoperability_acceptance_archive", "interoperability_inspector", "legacy_native_writer", "native_settlement_adapter", "native_producer_acceptance_archive"])):

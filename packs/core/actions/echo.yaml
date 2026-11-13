@@ -7,16 +7,14 @@ description: "Echo a message to stdout"
 enabled: true
 
 # Runner type determines how the action is executed
-runner_type: shell
+runner_type: native
 
-# Entry point is the shell command or script to execute
-entry_point: echo.sh
+# Native directory: worker selects its own Linux architecture
+entry_point: bin/echo
 
-# Parameter delivery: stdin for secure parameter passing (no env vars)
+# Flat stdin JSON preserves parameter boundaries
 parameter_delivery: stdin
 parameter_format: json
-required_worker_runtimes:
-  python: ">=3.11,<4.0"
 
 # Output format: text (no structured data parsing)
 output_format: text

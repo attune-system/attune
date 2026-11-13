@@ -67,6 +67,29 @@ class BootstrapTransportTests(unittest.TestCase):
 
 
 class BootstrapCorePackTests(unittest.TestCase):
+    def test_native_payload_requires_complete_official_static_variants(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {"ATTUNE_BOOTSTRAP_MODE": "api"}):
+            root = Path(directory)
+            for action in ("echo", "sleep", "noop"):
+                target = root / "actions/bin" / action
+                target.mkdir(parents=True)
+                for name, machine in (("linux-amd64", 62), ("linux-arm64", 183)):
+                    data = bytearray(64)
+                    data[:7] = b"\x7fELF\x02\x01\x01"
+                    data[18:20] = machine.to_bytes(2, "little")
+                    path = target / name
+                    path.write_bytes(data)
+                    path.chmod(0o755)
+            bootstrap.validate_native_payload(root)
+            missing = root / "actions/bin/echo/linux-arm64"
+            missing.unlink()
+            with self.assertRaisesRegex(RuntimeError, "publication mode"):
+                bootstrap.validate_native_payload(root)
+            missing.write_bytes(b"#!/bin/sh\nexit 0\n")
+            missing.chmod(0o755)
+            with self.assertRaisesRegex(RuntimeError, "ELF architecture"):
+                bootstrap.validate_native_payload(root)
+
     def test_authenticated_publication_does_not_enable_managed_runtime_exemptions(self):
         ready = {
             "pack_publication": {
@@ -102,6 +125,7 @@ class BootstrapCorePackTests(unittest.TestCase):
         with mock.patch.object(bootstrap, "request", return_value=response) as request, mock.patch.object(bootstrap, "deterministic_archive", return_value=b"archive"):
             bootstrap.upload("http://api", "access", Path("/owned/core"), "a" * 64)
         body = request.call_args.kwargs["data"]
+        self.assertIn(b'name="absent_metadata_policy"\r\n\r\nremove', body)
         self.assertIn(b'name="expected_release_digest"', body)
         self.assertIn(b"a" * 64, body)
 
@@ -132,6 +156,7 @@ class BootstrapCorePackTests(unittest.TestCase):
     def test_common_publisher_uses_existing_credential_without_db_mutation(self):
         with mock.patch.dict(os.environ, {"ATTUNE_BOOTSTRAP_TOKEN": "existing"}, clear=True), \
              mock.patch.object(bootstrap, "wait_for_api"), \
+             mock.patch.object(bootstrap, "validate_native_payload"), \
              mock.patch.object(bootstrap, "bundled_pack_version", return_value="1.0.2"), \
              mock.patch.object(bootstrap, "token_login", return_value="access") as login, \
              mock.patch.object(bootstrap, "reconcile", side_effect=RuntimeError("admission denied")), \

@@ -95,3 +95,6 @@ graphify-out
 .session-openapi.json
 .scratch
 .scratch/
+
+# Architecture-specific native core actions (assembled by pack-binary builds)
+packs/core/actions/bin/

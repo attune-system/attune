@@ -6,6 +6,8 @@ import gzip
 import io
 import json
 import os
+import platform
+import struct
 import tarfile
 import time
 import urllib.error
@@ -89,6 +91,52 @@ def bundled_pack_version(pack_dir):
     return str(metadata["version"])
 
 
+def validate_native_payload(pack_dir):
+    """Fail before publication if native core artifacts are absent or incomplete."""
+    targets = {"linux-amd64": 62, "linux-arm64": 183}
+    mode = os.environ.get("ATTUNE_BOOTSTRAP_MODE", "api")
+    if mode not in {"api", "volume"}:
+        raise RuntimeError("unknown core publication mode")
+    required = set(targets)
+    if mode == "volume":
+        host = {"x86_64": "linux-amd64", "aarch64": "linux-arm64"}.get(platform.machine())
+        if platform.system() != "Linux" or host is None:
+            raise RuntimeError("unsupported local core platform")
+        required = {host}
+    for action in ("echo", "sleep", "noop"):
+        directory = pack_dir / "actions/bin" / action
+        for path in (pack_dir, pack_dir / "actions", pack_dir / "actions/bin", directory):
+            if path.is_symlink() or not path.is_dir():
+                raise RuntimeError("native core directory must be a real directory")
+        if {path.name for path in directory.iterdir()} != required:
+            raise RuntimeError("native core variants do not match publication mode")
+        for variant in required:
+            path = directory / variant
+            if path.is_symlink() or not path.is_file() or not path.stat().st_mode & 0o111:
+                raise RuntimeError("native core variant must be a regular executable")
+            data = path.read_bytes()
+            if (len(data) < 64 or data[:7] != b"\x7fELF\x02\x01\x01"
+                    or int.from_bytes(data[18:20], "little") != targets[variant]):
+                raise RuntimeError("native core variant has wrong ELF architecture")
+            offset = int.from_bytes(data[32:40], "little")
+            size = int.from_bytes(data[54:56], "little")
+            count = int.from_bytes(data[56:58], "little")
+            if count and (size < 56 or offset + size * count > len(data)):
+                raise RuntimeError("native core program headers are invalid")
+            for index in range(count):
+                entry = offset + size * index
+                kind = int.from_bytes(data[entry:entry + 4], "little")
+                if kind == 3:
+                    raise RuntimeError("native core must not require a dynamic interpreter")
+                if kind == 2:
+                    start = int.from_bytes(data[entry + 8:entry + 16], "little")
+                    length = int.from_bytes(data[entry + 32:entry + 40], "little")
+                    if start + length > len(data) or length % 16:
+                        raise RuntimeError("native core dynamic table is invalid")
+                    if any(struct.unpack_from("<q", data, position)[0] == 1 for position in range(start, start + length, 16)):
+                        raise RuntimeError("native core must not require shared libraries")
+
+
 def get_active_release(base_url, token):
     try:
         with request(
@@ -148,6 +196,7 @@ def upload(base_url, token, pack_dir, expected_digest=None):
 
     field("force", "true")
     field("skip_tests", "true")
+    field("absent_metadata_policy", "remove")
     if expected_digest:
         field("expected_release_digest", expected_digest)
     parts.extend(
@@ -227,6 +276,7 @@ def publish_core(base_url, pack_dir):
     integration_token = os.environ.get("ATTUNE_BOOTSTRAP_TOKEN")
     if not integration_token:
         raise RuntimeError("ATTUNE_BOOTSTRAP_TOKEN is required: supply an existing deployment credential; bootstrap never creates identities or grants")
+    validate_native_payload(pack_dir)
     return reconcile(base_url, token_login(base_url, integration_token), pack_dir,
                      expected_version, expected_digest)
 

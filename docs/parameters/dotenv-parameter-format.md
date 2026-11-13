@@ -221,7 +221,7 @@ password='hunter2'
 
 **Action Configuration:**
 ```yaml
-ref: core.http_request
+ref: example.http_request
 parameter_delivery: stdin
 parameter_format: dotenv
 ```

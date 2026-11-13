@@ -3,8 +3,6 @@
 import importlib.util
 import io
 from pathlib import Path
-import re
-import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -33,42 +31,21 @@ class CoreCompositionTests(unittest.TestCase):
             self.assertEqual(actual, expected)
             for relative in expected:
                 self.assertEqual((CORE / relative).stat().st_mode & 0o111, (owned / relative).stat().st_mode & 0o111, relative)
-            for folder, count in (("actions", 11), ("triggers", 7), ("sensors", 1), ("runtimes", 9), ("permission_sets", 5)):
+            for folder, count in (("actions", 3), ("triggers", 7), ("sensors", 1), ("runtimes", 9), ("permission_sets", 5)):
                 self.assertEqual(len(list((owned / folder).glob("*.yaml"))), count, folder)
 
-    def test_candidate_archive_launcher_works_without_repository_layout(self):
-        archive = publisher.deterministic_archive(CORE)
-        with tempfile.TemporaryDirectory(prefix="core-candidate-") as directory:
-            attempt = Path(directory) / ".pack-test-attempts" / "owned-attempt"
-            attempt.mkdir(parents=True)
-            # Only our deterministic local archive is extracted, with safe filtering.
-            # nosemgrep: trailofbits.python.tarfile-extractall-traversal.tarfile-extractall-traversal
-            with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as source:
-                source.extractall(attempt, filter="data")
-            result = subprocess.run(
-                ["/bin/sh", str(attempt / "core/tests/run_tests.sh")],
-                cwd=directory, text=True, capture_output=True, timeout=60,
-            )
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("test_agent_command_is_fixed_despite_multiline_state", result.stderr)
-            self.assertIn("test_curl_argv_and_body_are_not_line_encoded", result.stderr)
-
-    def test_json_shell_actions_declare_verified_python_capability(self):
-        runtime = yaml.safe_load((CORE / "runtimes/python.yaml").read_text())
-        verified_commands = {
-            command["binary"]
-            for config in [runtime, *runtime["versions"]]
-            for command in config["distributions"]["verification"]["commands"]
-        }
-        launcher = (CORE / "actions/core_json.sh").read_text()
-        alternatives = re.search(r"for interpreter in (.+); do", launcher).group(1).split()
-        self.assertTrue(verified_commands.issubset(alternatives))
-        for name in ("echo", "sleep", "noop", "http_request", "run_agent_command"):
+    def test_core_actions_need_only_native_and_have_no_script_fallback(self):
+        self.assertFalse(yaml.safe_load((CORE / "pack.yaml").read_text())["testing"]["enabled"])
+        self.assertFalse(list((CORE / "actions").glob("*.py")))
+        self.assertFalse(list((CORE / "actions").glob("*.sh")))
+        for name in ("echo", "sleep", "noop"):
             action = yaml.safe_load((CORE / "actions" / (name + ".yaml")).read_text())
-            with self.subTest(action=action["ref"]):
-                self.assertEqual(action["required_worker_runtimes"]["python"], ">=3.11,<4.0")
-                self.assertEqual(action["parameter_delivery"], "stdin")
-                self.assertEqual(action["parameter_format"], "json")
+            self.assertEqual(action["runner_type"], "native")
+            self.assertEqual(action["entry_point"], "bin/" + name)
+            self.assertNotIn("required_worker_runtimes", action)
+            self.assertEqual(action["parameter_delivery"], "stdin")
+            self.assertEqual(action["parameter_format"], "json")
+            self.assertNotIn("permission_set_refs", action)
 
     def test_reserved_platform_policy_definitions_match_catalog_without_local_rescoping(self):
         catalog = ROOT / "crates/common/src/platform_catalog/permission_sets"
@@ -85,17 +62,15 @@ class CoreCompositionTests(unittest.TestCase):
         self.assertEqual(yaml.safe_load((CORE / "permission_sets/key_creator.yaml").read_text())["ref"], "core.key_creator")
 
     def test_shipped_refs_and_canonical_installer_are_explicit(self):
-        self.assertEqual(publisher.bundled_pack_version(CORE), "1.0.6")
+        self.assertEqual(publisher.bundled_pack_version(CORE), "1.0.7")
         actions = {yaml.safe_load(path.read_text())["ref"] for path in (CORE / "actions").glob("*.yaml")}
-        self.assertEqual(actions, {"core.echo", "core.noop", "core.sleep", "core.http_request", "core.generate_ssh_key_pair", "core.run_agent_command", "core.download_packs", "core.register_packs", "core.get_pack_dependencies", "core.build_pack_envs", "core.install_packs"})
+        self.assertEqual(actions, {"core.echo", "core.noop", "core.sleep"})
         sensor = yaml.safe_load((CORE / "sensors/timer_sensor.yaml").read_text())
         triggers = {yaml.safe_load(path.read_text())["ref"] for path in (CORE / "triggers").glob("*.yaml")}
         self.assertTrue(set(sensor["trigger_types"]).issubset(triggers))
         self.assertTrue((CORE / "sensors" / sensor["entry_point"]).is_file())
         self.assertFalse(list((CORE / "workflows").glob("*.yaml")))
-        installer = yaml.safe_load((CORE / "actions/install_packs.yaml").read_text())
-        self.assertEqual(installer["workflow_file"], "workflows/install_packs.workflow.yaml")
-        self.assertTrue((CORE / "actions" / installer["workflow_file"]).is_file())
+        self.assertFalse((CORE / "actions/workflows").exists())
         self.assertFalse(list((CORE / "queues").glob("*.yaml")))
 
     def test_real_action_entrypoints_and_runtime_grant_refs_resolve_in_shipped_tree(self):
@@ -103,12 +78,8 @@ class CoreCompositionTests(unittest.TestCase):
         for path in (CORE / "actions").glob("*.yaml"):
             action = yaml.safe_load(path.read_text())
             with self.subTest(action=action["ref"]):
-                self.assertTrue((CORE / "actions" / action.get("entry_point", action.get("workflow_file"))).is_file())
+                self.assertEqual(action["entry_point"], "bin/" + path.stem)
                 self.assertTrue(set(action.get("default_execution_permission_set_refs", [])).issubset(policies))
-        creator = yaml.safe_load((CORE / "actions/generate_ssh_key_pair.yaml").read_text())
-        self.assertEqual(creator["default_execution_permission_set_refs"], ["core.key_creator"])
-        self.assertTrue(creator["parameters"]["local_ref"]["required"])
-
     def test_distributable_selects_actual_core_version_and_existing_api_credential(self):
         version = publisher.bundled_pack_version(CORE)
         manifest = ROOT / "docker/distributable/docker-compose.yaml"
@@ -133,6 +104,9 @@ class CoreCompositionTests(unittest.TestCase):
         dockerfile = (ROOT / "docker/Dockerfile.init-packs-package").read_text()
         self.assertIn("COPY packs/ /source/packs/", dockerfile)
         self.assertIn("COPY dist/core-timer-sensor/ /source/packs/core/sensors/bin/", dockerfile)
+        self.assertIn("COPY dist/core-actions/ /source/packs/core/actions/bin/", dockerfile)
+        self.assertIn("crates/core-actions/Cargo.toml", workflow)
+        self.assertIn("verify_static \"$action_binary\"", workflow)
         for architecture in ("linux-amd64", "linux-arm64"):
             self.assertIn("/source/packs/core/sensors/bin/" + architecture + "/attune-core-timer-sensor", dockerfile)
         for text in (workflow, dockerfile, (ROOT / "scripts/bootstrap_core_pack.py").read_text()):

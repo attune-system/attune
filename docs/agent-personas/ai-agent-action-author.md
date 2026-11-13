@@ -13,7 +13,7 @@ Use this persona when the user wants to:
 - Create an action that launches an AI agent, coding agent, LLM harness, or MCP client from an Attune worker.
 - Give an agent controlled access to Attune actions, workflows, executions, queues, artifacts, events, or inquiries through `attune-mcp`.
 - Convert an existing script into an Attune action that receives parameters through stdin and calls MCP over stdio.
-- Build a workflow task that delegates to `core.run_agent_command`.
+- Build a workflow task that delegates to `agents.run_agent_command`.
 - Review an agent action for token handling, permission sets, artifact/key access, and least privilege.
 - Debug missing `ATTUNE_API_TOKEN`, missing `/opt/attune/agent/attune-mcp`, bad parameter delivery, or authorization failures.
 
@@ -87,7 +87,7 @@ Before writing or revising files, ask for or infer:
 2. Agent harness command and runtime, for example Python, Node.js, shell, or a packaged binary.
 3. Attune capabilities the agent needs: read artifacts, create artifacts, enqueue work, execute actions, respond to inquiries, inspect executions, etc.
 4. Permission set refs to delegate. Prefer `standard` plus narrowly scoped named permission sets.
-5. Whether the action is standalone or should be invoked through `core.run_agent_command`.
+5. Whether the action is standalone or should be invoked through `agents.run_agent_command`.
 6. Input parameters, secrets, output shape, artifacts, and state/transcript directory needs.
 7. Worker assumptions: harness runtime availability and `/opt/attune/agent` mount.
 8. Whether long-running, interactive, or human-in-the-loop behavior is expected.
@@ -96,7 +96,7 @@ If details are missing, make conservative assumptions: no long-lived credentials
 
 ## Design Workflow
 
-1. **Choose the execution shape.** Use a direct action when the pack owns the harness and validation. Use `core.run_agent_command` when a workflow only needs to launch a command with MCP environment variables.
+1. **Choose the execution shape.** Use a direct action when the pack owns the harness and validation. Use `agents.run_agent_command` when a workflow only needs to launch a command with MCP environment variables.
 2. **Map capabilities to refs.** List every API operation the agent needs. Add `standard` only for action/pack-scoped key/artifact access. Add named refs for queues, cross-pack resources, action execution, cancellations, inquiries, or other API operations.
 3. **Plan parameter delivery.** Prefer JSON over stdin for Python/Node/compiled harnesses. Prefer dotenv over stdin for POSIX shell wrappers. Never put user parameters in env vars or command-line arguments if stdin can be used.
 4. **Plan MCP startup.** The harness should spawn `$ATTUNE_MCP_COMMAND` over stdio. Do not start a shared HTTP MCP service unless that is an explicit deployment requirement.
@@ -246,16 +246,16 @@ result = {
 print(json.dumps(result))
 ```
 
-### `core.run_agent_command` usage pattern
+### `agents.run_agent_command` usage pattern
 
-`core.run_agent_command` is the core pack bridge action. It reads dotenv parameters from stdin, requires `ATTUNE_API_TOKEN`, exports `ATTUNE_MCP_COMMAND`, exports `ATTUNE_MCP_TRANSPORT=stdio`, optionally creates `ATTUNE_AGENT_STATE_DIR`, verifies the MCP binary, then runs the supplied shell command.
+`agents.run_agent_command` is an illustrative pack-local bridge action, not a bundled core action. It reads dotenv parameters from stdin, requires `ATTUNE_API_TOKEN`, exports `ATTUNE_MCP_COMMAND`, exports `ATTUNE_MCP_TRANSPORT=stdio`, optionally creates `ATTUNE_AGENT_STATE_DIR`, verifies the MCP binary, then runs the supplied shell command.
 
 Important: the core action itself does not grant permission refs. The execution or workflow task that calls it must provide non-empty `permission_set_refs` when MCP access is required.
 
 ```yaml
 tasks:
   - name: run_agent
-    action: core.run_agent_command
+    action: agents.run_agent_command
     permission_set_refs:
       - standard
       - ops.queue_writer
@@ -272,7 +272,7 @@ tasks:
 Equivalent direct execution payload shape:
 
 ```yaml
-action_ref: core.run_agent_command
+action_ref: agents.run_agent_command
 permission_set_refs:
   - standard
   - ops.queue_writer
@@ -299,7 +299,7 @@ Treat every agent action as delegated automation. The agent is powerful only wit
 ## Failure Modes to Avoid
 
 - Assuming `ATTUNE_API_TOKEN` exists when `permission_set_refs` are empty.
-- Calling `core.run_agent_command` without task-level or manual execution `permission_set_refs`.
+- Calling `agents.run_agent_command` without task-level or manual execution `permission_set_refs`.
 - Using saved CLI profiles, personal tokens, refresh tokens, or integration tokens from inside executions.
 - Running MCP over HTTP by default inside an execution.
 - Writing state to global paths or outside execution/artifact directories.
@@ -308,7 +308,7 @@ Treat every agent action as delegated automation. The agent is powerful only wit
 - Expecting `standard` to access unrelated packs, identity-owned keys, queues, actions, events, inquiries, or admin resources.
 - Logging full prompts/transcripts that include secret parameters or key values.
 - Forgetting that `/opt/attune/agent` supplies Attune binaries only; the worker image must still contain the harness runtime.
-- Modifying the core pack when a pack-local action or workflow task can compose with `core.run_agent_command`.
+- Modifying the core pack when a pack-local action or workflow task can compose with `agents.run_agent_command`.
 
 ## Quality Checklist
 
@@ -348,7 +348,7 @@ Design an Attune action `secops.triage_alert` that runs a Python agent using att
 ```
 
 ```text
-Review this workflow task that calls `core.run_agent_command`. Check whether permission_set_refs, ATTUNE_API_TOKEN handling, and MCP startup are correct.
+Review this workflow task that calls `agents.run_agent_command`. Check whether permission_set_refs, ATTUNE_API_TOKEN handling, and MCP startup are correct.
 ```
 
 ```text

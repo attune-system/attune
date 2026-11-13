@@ -154,17 +154,17 @@ Shows enforcements from a specific webhook event.
 
 **See all executions of an action:**
 ```
-http://localhost:3000/executions?action_ref=core.http_request
+http://localhost:3000/executions?action_ref=example.http_request
 ```
 
 **See failures:**
 ```
-http://localhost:3000/executions?action_ref=core.http_request&status=failed
+http://localhost:3000/executions?action_ref=example.http_request&status=failed
 ```
 
 **See currently running:**
 ```
-http://localhost:3000/executions?action_ref=core.http_request&status=running
+http://localhost:3000/executions?action_ref=example.http_request&status=running
 ```
 
 ### Auditing Webhook Activity

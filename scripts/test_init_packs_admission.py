@@ -18,6 +18,13 @@ class InitPacksAdmissionTests(unittest.TestCase):
             (target / "sensors").mkdir(parents=True)
             (target / "pack.yaml").write_text("ref: core\nversion: 1.0.0\n")
             (target / "sensors" / "attune-core-timer-sensor").write_text("owned-binary")
+            import platform
+            native_target = {"x86_64": "linux-amd64", "aarch64": "linux-arm64"}[platform.machine()]
+            for action in ("echo", "sleep", "noop"):
+                native = target / "actions/bin" / action / native_target
+                native.parent.mkdir(parents=True)
+                native.write_text("owned-action")
+                native.chmod(0o755)
             binaries = root / "bin"
             binaries.mkdir()
             for name in ("pip", "chown"):

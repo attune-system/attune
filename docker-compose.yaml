@@ -128,7 +128,7 @@ services:
       [
         "/bin/sh",
         "-c",
-        "mkdir -p /opt/attune/packs/core/sensors && cp /pack-binaries/attune-core-timer-sensor /opt/attune/packs/core/sensors/attune-core-timer-sensor && chmod +x /opt/attune/packs/core/sensors/attune-core-timer-sensor && echo 'Pack binaries copied successfully'",
+        "case $$(uname -m) in x86_64) target=linux-amd64;; aarch64) target=linux-arm64;; *) exit 1;; esac; mkdir -p /opt/attune/packs/core/sensors; cp /pack-binaries/attune-core-timer-sensor /opt/attune/packs/core/sensors/attune-core-timer-sensor; chmod +x /opt/attune/packs/core/sensors/attune-core-timer-sensor; for action in echo sleep noop; do mkdir -p /opt/attune/packs/core/actions/bin/$$action; cp /pack-binaries/attune-core-$$action /opt/attune/packs/core/actions/bin/$$action/$$target; chmod +x /opt/attune/packs/core/actions/bin/$$action/$$target; done",
       ]
     restart: "no"
     networks:
@@ -474,16 +474,15 @@ services:
       - /bin/sh
       - -c
       - |
-        if ! command -v curl >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+        if ! command -v curl >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then
           installed=false
           for attempt in 1 2 3; do
-            if DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates git python3 >/dev/null 2>&1; then installed=true; break; fi
+            if DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates git >/dev/null 2>&1; then installed=true; break; fi
             sleep 2
           done
           [ "$$installed" = true ] || exit 1
         fi
         command -v git >/dev/null 2>&1 || exit 1
-        command -v python3 >/dev/null 2>&1 || exit 1
         exec setpriv --reuid=1000 --regid=1000 --clear-groups /opt/attune/agent/attune-agent
     stop_grace_period: 45s
     environment:
@@ -615,16 +614,15 @@ services:
       - /bin/sh
       - -c
       - |
-        if ! command -v curl >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+        if ! command -v curl >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then
           installed=false
           for attempt in 1 2 3; do
-            if DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates git python3 >/dev/null 2>&1; then installed=true; break; fi
+            if DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates git >/dev/null 2>&1; then installed=true; break; fi
             sleep 2
           done
           [ "$$installed" = true ] || exit 1
         fi
         command -v git >/dev/null 2>&1 || exit 1
-        command -v python3 >/dev/null 2>&1 || exit 1
         exec setpriv --reuid=1000 --regid=1000 --clear-groups /opt/attune/agent/attune-agent
     stop_grace_period: 45s
     environment:
