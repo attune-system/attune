@@ -57,6 +57,14 @@ mod linux {
         std::io::stdin().read_to_string(&mut input).unwrap();
         let _: Value = serde_json::from_str(&input).unwrap();
         let environ = std::fs::read(format!("/proc/{parent}/environ"));
+        if let Ok(bytes) = &environ {
+            assert!(
+                bytes
+                    .split(|byte| *byte == 0)
+                    .any(|entry| entry == DUMMY.as_bytes()),
+                "readable owned initial environment must contain the dummy"
+            );
+        }
         let has_dummy = environ.as_ref().is_ok_and(|bytes| {
             bytes
                 .split(|byte| *byte == 0)
