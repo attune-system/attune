@@ -1146,7 +1146,7 @@ impl Runtime for ProcessRuntime {
         };
         let prepared_params =
             parameter_passing::prepare_parameters(&merged_parameters, &mut env, param_config)?;
-        parameter_passing::merge_execution_environment(&mut env, &context.execution_env);
+        parameter_passing::merge_execution_environment(&mut env, &context.execution_env)?;
         let mut parameters_stdin = prepared_params.stdin_content();
 
         // Determine working directory: use context override, or pack dir

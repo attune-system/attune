@@ -806,6 +806,9 @@ pub mod runtime {
     /// Configuration for how a runtime executes actions.
     ///
     /// Stored as JSONB in the `runtime.execution_config` column.
+    /// Caller admission metadata `permitted_caller_env` is validated separately
+    /// by `execution_env` against the raw immutable runtime/version snapshot;
+    /// it is not a process-construction or template-expansion setting.
     /// Uses template variables that are resolved at execution time:
     /// - `{pack_dir}` — absolute path to the pack directory
     /// - `{env_dir}` — resolved environment directory

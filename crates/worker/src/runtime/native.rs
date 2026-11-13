@@ -176,7 +176,7 @@ impl Runtime for NativeRuntime {
 
         let prepared_params =
             parameter_passing::prepare_parameters(&merged_parameters, &mut env, config)?;
-        parameter_passing::merge_execution_environment(&mut env, &context.execution_env);
+        parameter_passing::merge_execution_environment(&mut env, &context.execution_env)?;
 
         // Get stdin content if parameters are delivered via stdin
         let parameters_stdin = prepared_params.stdin_content();

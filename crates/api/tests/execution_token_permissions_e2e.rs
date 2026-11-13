@@ -628,7 +628,43 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
     .await?;
     let action =
         create_action_with_default_access(&ctx.pool, &pack, "call_api", Vec::new()).await?;
+    let runtime = attune_common::repositories::runtime::RuntimeRepository::create(
+        &ctx.pool,
+        attune_common::repositories::runtime::CreateRuntimeInput {
+            r#ref: format!("{}.app", pack.r#ref),
+            pack: Some(pack.id),
+            pack_ref: Some(pack.r#ref.clone()),
+            name: "App".into(),
+            description: None,
+            aliases: vec![],
+            distributions: json!({}),
+            installation: None,
+            execution_config: json!({"permitted_caller_env":["LOG_LEVEL", "EMPTY"]}),
+            auto_detected: false,
+            detection_config: json!({}),
+        },
+    )
+    .await?;
+    let action = ActionRepository::update(
+        &ctx.pool,
+        action.id,
+        attune_common::repositories::action::UpdateActionInput {
+            runtime: Some(runtime.id),
+            ..Default::default()
+        },
+    )
+    .await?;
     helpers::activate_test_pack_release(&ctx.pool, &pack).await?;
+    attune_common::repositories::runtime::RuntimeRepository::update(
+        &ctx.pool,
+        runtime.id,
+        attune_common::repositories::runtime::UpdateRuntimeInput {
+            execution_config: Some(json!({"permitted_caller_env":["AUTHORING_ONLY"]})),
+            ..Default::default()
+        },
+    )
+    .await?;
+
     let parent_execution = create_pinned_ad_hoc_parent(&ctx.pool, &action, &identity, &[]).await?;
 
     let runtime_read_ref = format!("test.exec_token_runtime_read_{}", suffix);
@@ -810,6 +846,28 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
         .contains("reserved ATTUNE_ prefix"));
     assert!(!rejected_body.to_string().contains("hidden-value"));
 
+    for name in [
+        "BASH_ENV",
+        "PYTHONPATH",
+        "NODE_OPTIONS",
+        "LD_PRELOAD",
+        "PATH",
+        "UNDECLARED",
+        "AUTHORING_ONLY",
+    ] {
+        let mut body = execute_body(&action, Some(Vec::new()));
+        body["env_vars"] = json!({name: "owned-probe-value"});
+        let response = ctx
+            .post(
+                "/api/v1/executions/execute",
+                body,
+                Some(&execute_only_token),
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{name}");
+        assert!(!response.text().await?.contains("owned-probe-value"));
+    }
+
     let mut execution_body = execute_body(&action, Some(Vec::new()));
     execution_body["env_vars"] = json!({"LOG_LEVEL":"debug", "EMPTY":""});
     let execute_only_success = ctx
@@ -837,6 +895,127 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
         stored.env_vars,
         Some(json!({"LOG_LEVEL":"debug", "EMPTY":""}))
     );
+    // Every producer must revalidate inherited caller values against its target.
+    let original_snapshot = stored.executable_snapshot.as_ref().unwrap();
+    let mut versioned = original_snapshot.clone();
+    versioned.executable.runtime_versions.push(RuntimeVersion {
+        id: 1,
+        runtime: runtime.id,
+        runtime_ref: runtime.r#ref.clone(),
+        version: "1.0.0".into(),
+        version_major: Some(1),
+        version_minor: Some(0),
+        version_patch: Some(0),
+        execution_config: json!({"permitted_caller_env":["LOG_LEVEL"]}),
+        distributions: json!({}),
+        is_default: true,
+        available: true,
+        verified_at: None,
+        meta: json!({}),
+        retired_at: None,
+        created: runtime.created,
+        updated: runtime.updated,
+    });
+    assert!(attune_common::execution_env::validate_snapshot_environment(
+        Some(&versioned),
+        stored.env_vars.as_ref()
+    )
+    .is_err());
+    versioned.executable.action.runtime_version_constraint = Some(">=2".into());
+    assert!(attune_common::execution_env::validate_snapshot_environment(
+        Some(&versioned),
+        stored.env_vars.as_ref()
+    )
+    .is_ok());
+    // Exact selected-version validation cannot borrow the wider parent list.
+    assert!(attune_common::execution_env::validate_caller_environment(
+        &versioned.executable.runtime_versions[0].execution_config,
+        stored.env_vars.as_ref().unwrap()
+    )
+    .is_err());
+    assert!(attune_common::execution_env::validate_selected_environment(
+        Some(&versioned),
+        Some("1.0.0"),
+        stored.env_vars.as_ref()
+    )
+    .is_err());
+    assert!(attune_common::execution_env::validate_selected_environment(
+        Some(&versioned),
+        Some("missing"),
+        stored.env_vars.as_ref()
+    )
+    .is_err());
+    assert!(attune_common::execution_env::validate_selected_environment(
+        Some(original_snapshot),
+        None,
+        stored.env_vars.as_ref()
+    )
+    .is_ok());
+    let copied = CreateExecutionInput {
+        action: stored.action,
+        action_ref: stored.action_ref.clone(),
+        parent: Some(stored.id),
+        executor: stored.executor,
+        env_vars: stored.env_vars.clone(),
+        ..Default::default()
+    };
+    let mut narrower = original_snapshot.clone();
+    narrower
+        .executable
+        .runtime
+        .as_mut()
+        .unwrap()
+        .execution_config = json!({});
+    assert!(
+        ExecutionRepository::create_pinned(&ctx.pool, copied.clone(), &narrower)
+            .await
+            .is_err()
+    );
+    assert!(ExecutionRepository::create_retry(
+        &ctx.pool,
+        copied.clone(),
+        &narrower,
+        1,
+        Some(1),
+        None,
+        stored.id
+    )
+    .await
+    .is_err());
+    let mut conn = ctx.pool.acquire().await?;
+    assert!(
+        ExecutionRepository::create_top_level_for_enforcement_if_absent(
+            &mut conn,
+            copied.clone(),
+            0,
+            &narrower
+        )
+        .await
+        .is_err()
+    );
+    drop(conn);
+    let retry = ExecutionRepository::create_retry(
+        &ctx.pool,
+        copied,
+        original_snapshot,
+        1,
+        Some(1),
+        None,
+        stored.id,
+    )
+    .await?;
+    assert_eq!(retry.env_vars, stored.env_vars);
+    assert_eq!(
+        retry
+            .executable_snapshot
+            .unwrap()
+            .executable
+            .runtime
+            .unwrap()
+            .execution_config["permitted_caller_env"],
+        json!(["LOG_LEVEL", "EMPTY"])
+    );
+
     assert_eq!(
         no_permission_body["data"]["parent"].as_i64(),
         Some(execute_only_parent.id)

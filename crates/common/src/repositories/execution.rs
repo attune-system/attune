@@ -602,6 +602,7 @@ impl ExecutionRepository {
                 Utc::now().timestamp_millis(),
             )?);
         }
+        crate::execution_env::validate_snapshot_environment(snapshot, input.env_vars.as_ref())?;
         validate_execution_placement(&input)?;
         let sql = format!(
             "INSERT INTO execution \
@@ -684,6 +685,10 @@ impl ExecutionRepository {
                 Utc::now().timestamp_millis(),
             )?);
         }
+        crate::execution_env::validate_snapshot_environment(
+            Some(snapshot),
+            input.env_vars.as_ref(),
+        )?;
         validate_execution_placement(&input)?;
         let sql = format!(
             "INSERT INTO execution \
@@ -763,6 +768,10 @@ impl ExecutionRepository {
                 Utc::now().timestamp_millis(),
             )?);
         }
+        crate::execution_env::validate_snapshot_environment(
+            Some(snapshot),
+            input.env_vars.as_ref(),
+        )?;
         validate_execution_placement(&input)?;
         let inserted = sqlx::query_as::<_, Execution>(&format!(
             "INSERT INTO execution \
