@@ -612,7 +612,7 @@ async fn behavioral_edits_require_actual_editor_authority_even_for_same_subject_
         .await?
         .unwrap();
     assert_eq!(stored.owner_identity, Some(owner));
-    assert_eq!(stored.permission_set_refs, Some(vec![admin.r#ref]));
+    assert_eq!(stored.permission_set_refs, Some(vec![admin.r#ref.clone()]));
     let mut tx = ctx.pool.begin().await?;
     let retained = <EnforcementRepository as attune_common::repositories::FindById>::find_by_id(
         &mut *tx, pending.id,
