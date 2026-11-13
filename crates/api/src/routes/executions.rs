@@ -3454,7 +3454,7 @@ async fn execution_log_terminal_state(
     })
 }
 
-fn advance_terminal_grace(
+pub(crate) fn advance_terminal_grace(
     terminal: bool,
     terminal_since: Option<tokio::time::Instant>,
     now: tokio::time::Instant,
