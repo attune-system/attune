@@ -158,12 +158,12 @@ async fn lifecycle_routes_deny_before_effects_and_respect_scopes() -> Result<()>
         {"resource":"rules","actions":["update"],"constraints":{"refs":["other.unrelated"]}},
         {"resource":"packs","actions":["read","install"],"constraints":{"refs":["other"]}}
     ])).await?;
-    let file = json!({"name":"newfile","pack_ref":"lifecycle","label":"File", "version":"1", "definition":{"tasks":[]}});
+    let file = json!({"name":"newfile","pack_ref":"lifecycle","label":"File", "version":"1.0.0", "definition":{"tasks":[{"name":"run","action":"lifecycle.action"}]}});
     for bearer in [&denied, &wrong] {
         for (path, body) in [
             (
                 "/api/v1/workflows",
-                json!({"ref":"lifecycle.new", "pack_ref":"lifecycle", "label":"New", "version":"1", "definition":{"tasks":[]}}),
+                json!({"ref":"lifecycle.new", "pack_ref":"lifecycle", "label":"New", "version":"1.0.0", "definition":{"tasks":[]}}),
             ),
             ("/api/v1/packs/lifecycle/workflow-files", file.clone()),
             (
@@ -332,7 +332,7 @@ async fn lifecycle_routes_deny_before_effects_and_respect_scopes() -> Result<()>
             }),
             (
                 "/api/v1/workflows",
-                json!({"ref":"lifecycle.credential", "pack_ref":"lifecycle", "label":"Denied", "version":"1", "definition":{"tasks":[]}}),
+                json!({"ref":"lifecycle.credential", "pack_ref":"lifecycle", "label":"Denied", "version":"1.0.0", "definition":{"tasks":[]}}),
             ),
             ("/api/v1/packs/lifecycle/workflow-files", file.clone()),
             ("/api/v1/packs/lifecycle/workflows/sync", json!({})),
@@ -541,7 +541,7 @@ async fn lifecycle_routes_deny_before_effects_and_respect_scopes() -> Result<()>
             .status(),
         StatusCode::OK
     );
-    let created_workflow = ctx.post("/api/v1/workflows", json!({"ref":"lifecycle.positive", "pack_ref":"lifecycle", "label":"Positive", "version":"1", "definition":{"tasks":[]}}), Some(&scoped)).await?;
+    let created_workflow = ctx.post("/api/v1/workflows", json!({"ref":"lifecycle.positive", "pack_ref":"lifecycle", "label":"Positive", "version":"1.0.0", "definition":{"tasks":[]}}), Some(&scoped)).await?;
     assert_eq!(
         created_workflow.status(),
         StatusCode::CREATED,

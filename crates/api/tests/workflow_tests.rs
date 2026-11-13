@@ -33,6 +33,10 @@ async fn grant_lifecycle_fixture(ctx: &TestContext, pack_ref: &str, action: &str
     )
     .await
     .unwrap();
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(
+        ctx.user.as_ref().unwrap().id,
+    )
+    .await;
 }
 
 /// Generate a unique pack name for testing to avoid conflicts
