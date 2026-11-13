@@ -31,13 +31,34 @@ pub fn validate_caller_env_name(name: &str) -> crate::Result<()> {
     let forbidden = [
         "ATTUNE_", "LD_", "DYLD_", "PYTHON", "NODE_", "BASH", "PERL", "RUBY", "GEM_", "BUNDLE_",
         "JAVA_", "JDK_", "JRE_", "DOTNET_", "COMPLUS_", "GCONV_", "LC_", "LDR_", "_RLD_",
-        "MALLOC_",
+        "MALLOC_", "R_", "CGO_",
     ]
     .iter()
     .any(|prefix| upper.starts_with(prefix))
         || matches!(
             upper.as_str(),
-            "GLIBC_TUNABLES"
+            "GOENV"
+                | "GOFLAGS"
+                | "GOROOT"
+                | "GOPATH"
+                | "GOTOOLCHAIN"
+                | "GOWORK"
+                | "GOMODCACHE"
+                | "GOCACHE"
+                | "GOTMPDIR"
+                | "GODEBUG"
+                | "CC"
+                | "CXX"
+                | "AR"
+                | "PKG_CONFIG"
+                | "PKG_CONFIG_PATH"
+                | "COMPILER_PATH"
+                | "GCC_EXEC_PREFIX"
+                | "LIBRARY_PATH"
+                | "CPATH"
+                | "C_INCLUDE_PATH"
+                | "CPLUS_INCLUDE_PATH"
+                | "GLIBC_TUNABLES"
                 | "LIBPATH"
                 | "SHLIB_PATH"
                 | "PS0"
@@ -351,12 +372,37 @@ mod tests {
             "ENV",
             "PYTHONPATH",
             "PYTHONSTARTUP",
+            "GOFLAGS",
+            "R_PROFILE_USER",
+            "CGO_CFLAGS",
+            "COMPILER_PATH",
             "NODE_OPTIONS",
             "NODE_PATH",
             "LD_PRELOAD",
             "LD_LIBRARY_PATH",
             "DYLD_INSERT_LIBRARIES",
-            "GLIBC_TUNABLES"
+            "GOENV"
+                | "GOFLAGS"
+                | "GOROOT"
+                | "GOPATH"
+                | "GOTOOLCHAIN"
+                | "GOWORK"
+                | "GOMODCACHE"
+                | "GOCACHE"
+                | "GOTMPDIR"
+                | "GODEBUG"
+                | "CC"
+                | "CXX"
+                | "AR"
+                | "PKG_CONFIG"
+                | "PKG_CONFIG_PATH"
+                | "COMPILER_PATH"
+                | "GCC_EXEC_PREFIX"
+                | "LIBRARY_PATH"
+                | "CPATH"
+                | "C_INCLUDE_PATH"
+                | "CPLUS_INCLUDE_PATH"
+                | "GLIBC_TUNABLES"
                 | "LIBPATH"
                 | "SHLIB_PATH"
                 | "PS0"
