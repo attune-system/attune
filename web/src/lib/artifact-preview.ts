@@ -176,7 +176,7 @@ export function fetchArtifactPreview(
 ) {
   return waitForArtifactDelivery(url, request, readArtifactPreview, options);
 }
-export function fetchArtifactResponse(
+export function fetchArtifactDownload(
   url: string,
   request: RequestInit & { signal: AbortSignal },
   options: DeliveryWaitOptions = {},
@@ -186,7 +186,9 @@ export function fetchArtifactResponse(
     request,
     async (response) => {
       if (!response.ok) throw await artifactContentError(response);
-      return response;
+      // Consume the body while the request owns its cancellation lifetime.
+      // Returning a Response here would abort an unread download in finally.
+      return { headers: response.headers, blob: await response.blob() };
     },
     options,
   );
@@ -214,9 +216,14 @@ async function waitForArtifactDelivery<T>(
     for (let attempt = 0; ; attempt++) {
       controller.signal.throwIfAborted();
       try {
-        return await consume(
-          await fetch(url, { ...request, signal: controller.signal }),
-        );
+        const response = await fetch(url, {
+          ...request,
+          signal: controller.signal,
+        });
+        // The availability budget ends when content is available. Large
+        // downloads may take longer; caller cancellation still owns the body.
+        if (response.ok) clearTimeout(timer);
+        return await consume(response);
       } catch (error) {
         if (!immutable || !isArtifactFinalizing(error)) throw error;
         finalizing = error;

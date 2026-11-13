@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fetchArtifactPreview, isArtifactFinalizing } from "./artifact-preview";
+import {
+  fetchArtifactDownload,
+  fetchArtifactPreview,
+  isArtifactFinalizing,
+} from "./artifact-preview";
 const exact =
   "http://local/api/v1/artifacts/42/versions/7/download?version_id=71";
 const pending = () =>
@@ -12,6 +16,52 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 describe("waiting for an immutable log version", () => {
+  it.each([false, true])(
+    "keeps the streamed download alive after availability (delayed=%s)",
+    async (delayed) => {
+      vi.useFakeTimers();
+      let body!: ReadableStreamDefaultController<Uint8Array>;
+      let requestSignal!: AbortSignal;
+      const fetch = vi.fn().mockImplementation((_url, request: RequestInit) => {
+        if (delayed && fetch.mock.calls.length === 1)
+          return Promise.resolve(pending());
+        requestSignal = request.signal!;
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            body = controller;
+            controller.enqueue(new TextEncoder().encode("first "));
+            requestSignal.addEventListener("abort", () => {
+              controller.error(new DOMException("Aborted", "AbortError"));
+            });
+          },
+        });
+        return Promise.resolve(
+          new Response(stream, {
+            headers: {
+              "Content-Disposition": 'attachment; filename="log.txt"',
+            },
+          }),
+        );
+      });
+      vi.stubGlobal("fetch", fetch);
+      const work = fetchArtifactDownload(
+        exact,
+        { signal: new AbortController().signal },
+        { maxWaitMs: 2500 },
+      );
+      // Fetch headers have arrived, but the response body is still incomplete.
+      await vi.advanceTimersByTimeAsync(2501);
+      expect(fetch).toHaveBeenCalledTimes(delayed ? 2 : 1);
+      expect(requestSignal.aborted).toBe(false);
+      body.enqueue(new TextEncoder().encode("last"));
+      body.close();
+      const download = await work;
+      expect(await download.blob.text()).toBe("first last");
+      expect(download.headers.get("Content-Disposition")).toContain("log.txt");
+      expect(requestSignal.aborted).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
   it("retries finalizing for the same version and returns its eventual content", async () => {
     vi.useFakeTimers();
     const fetch = vi
