@@ -3089,11 +3089,7 @@ async fn http_mcp(
     let response = match server.handle_request(&request).await {
         Ok(Some(response)) => response,
         Ok(None) => return (StatusCode::NO_CONTENT, Json(Value::Null)),
-        Err(_) => error_response(
-            request.get("id").cloned(),
-            -32603,
-            "MCP request failed".into(),
-        ),
+        Err(_) => error_response(request.get("id").cloned(), -32603, "MCP request failed"),
     };
     (StatusCode::OK, Json(response))
 }
