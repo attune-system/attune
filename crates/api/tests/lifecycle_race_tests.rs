@@ -326,7 +326,7 @@ async fn failed_file_publication_rolls_back_rows_and_removes_only_owned_files() 
     let directory = ctx.test_packs_dir.join("file_failure/actions");
     std::fs::create_dir_all(&directory)?;
     std::fs::write(directory.join("conflict.yaml"), "unrelated existing file")?;
-    let response=ctx.post("/api/v1/packs/file_failure/workflow-files",json!({"name":"conflict","pack_ref":pack.r#ref,"label":"Conflict","version":"1.0.0","definition":{"tasks":[]}}),Some(&bearer)).await?;
+    let response=ctx.post("/api/v1/packs/file_failure/workflow-files",json!({"name":"conflict","pack_ref":pack.r#ref,"label":"Conflict","version":"1.0.0","definition":{"version":"1.0.0","tasks":[]}}),Some(&bearer)).await?;
     assert_eq!(
         response.status(),
         StatusCode::CONFLICT,
@@ -361,7 +361,7 @@ async fn server_rejected_file_commit_cleans_publication_and_database_rows() -> R
     let pack = helpers::create_test_pack(&ctx.pool, "commit_failure").await?;
     let (_,_,bearer)=actor(&ctx,"commit_actor",json!([{ "resource":"actions", "actions":["create"], "constraints":{"pack_refs":[pack.r#ref]} }])).await?;
     sqlx::raw_sql("CREATE FUNCTION reject_workflow_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'owned injected commit rejection'; END $$; CREATE CONSTRAINT TRIGGER reject_workflow_commit AFTER INSERT ON workflow_definition DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_workflow_commit();").execute(&ctx.pool).await?;
-    let response=ctx.post("/api/v1/packs/commit_failure/workflow-files",json!({"name":"rejected","pack_ref":pack.r#ref,"label":"Rejected","version":"1.0.0","definition":{"tasks":[]}}),Some(&bearer)).await?;
+    let response=ctx.post("/api/v1/packs/commit_failure/workflow-files",json!({"name":"rejected","pack_ref":pack.r#ref,"label":"Rejected","version":"1.0.0","definition":{"version":"1.0.0","tasks":[]}}),Some(&bearer)).await?;
     assert_eq!(
         response.status(),
         StatusCode::BAD_REQUEST,
@@ -400,7 +400,7 @@ async fn canceled_file_request_before_commit_cleans_stage_and_rolls_back_rows() 
         &ctx,
         "/api/v1/packs/cancel_file/workflow-files",
         &bearer,
-        json!({"name":"canceled","pack_ref":pack.r#ref,"label":"Canceled","version":"1.0.0","definition":{"tasks":[]}}),
+        json!({"name":"canceled","pack_ref":pack.r#ref,"label":"Canceled","version":"1.0.0","definition":{"version":"1.0.0","tasks":[]}}),
     );
     wait_for_blocked(&ctx, pid).await?;
     request.abort();
@@ -442,7 +442,7 @@ async fn disconnected_file_waiter_does_not_cancel_commit_owner() -> Result<()> {
         &ctx,
         "/api/v1/packs/commit_disconnect/workflow-files",
         &bearer,
-        json!({"name":"accepted","pack_ref":pack.r#ref,"label":"Accepted","version":"1.0.0","definition":{"tasks":[]}}),
+        json!({"name":"accepted","pack_ref":pack.r#ref,"label":"Accepted","version":"1.0.0","definition":{"version":"1.0.0","tasks":[]}}),
     );
     wait_for_blocked(&ctx, pid).await?;
     assert!(ctx
@@ -536,7 +536,7 @@ async fn concurrent_workflow_deletes_wait_for_pin_admission_before_companion_loc
     let ctx = TestContext::new().await?;
     let pack = helpers::create_test_pack(&ctx.pool, "delete_order").await?;
     let (_,_,bearer)=actor(&ctx,"delete_actor",json!([{ "resource":"actions", "actions":["create","delete"], "constraints":{"pack_refs":[pack.r#ref]} }])).await?;
-    let created=ctx.post("/api/v1/workflows",json!({"ref":"delete_order.target","pack_ref":pack.r#ref,"label":"Target","version":"1.0.0","definition":{"tasks":[]}}),Some(&bearer)).await?;
+    let created=ctx.post("/api/v1/workflows",json!({"ref":"delete_order.target","pack_ref":pack.r#ref,"label":"Target","version":"1.0.0","definition":{"version":"1.0.0","tasks":[]}}),Some(&bearer)).await?;
     assert_eq!(
         created.status(),
         StatusCode::CREATED,
@@ -570,8 +570,15 @@ async fn concurrent_workflow_deletes_wait_for_pin_admission_before_companion_loc
     }
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
+            // The first delete waits on pin admission while holding exclusive graph
+            // admission; the second waits on that graph holder. Follow the actual
+            // wait chain so both requests must be blocked before probing the action.
             let waiting: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM pg_stat_activity a WHERE $1 = ANY(pg_blocking_pids(a.pid))",
+                "WITH RECURSIVE waiters(pid) AS (\
+                 SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)) \
+                 UNION SELECT a.pid FROM pg_stat_activity a JOIN waiters w \
+                 ON w.pid = ANY(pg_blocking_pids(a.pid))) \
+                 SELECT count(*) FROM waiters",
             )
             .bind(pid)
             .fetch_one(&ctx.pool)
@@ -583,7 +590,7 @@ async fn concurrent_workflow_deletes_wait_for_pin_admission_before_companion_loc
         }
     })
     .await
-    .map_err(|_| "Both delete requests did not reach owned pin-admission blocker")??;
+    .map_err(|_| "Both delete requests did not reach the owned admission wait chain")??;
     // With the old order, both waiters already held FOR SHARE on this action.
     // NOWAIT proves the new admission waiters protect no companion rows yet.
     let mut probe = ctx.pool.begin().await?;

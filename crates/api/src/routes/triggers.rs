@@ -1221,6 +1221,9 @@ pub async fn delete_trigger(
     Path(trigger_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let mut tx = state.db.begin().await?;
+    // Deletion must enter exclusively before authorization takes shared graph admission.
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     // Check if trigger exists
     let trigger = TriggerRepository::find_by_ref(&mut *tx, &trigger_ref)
@@ -1885,6 +1888,9 @@ pub async fn delete_sensor(
     Path(sensor_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let mut tx = state.db.begin().await?;
+    // Graph admission precedes cache protection and authorization's owner locks.
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await?;
     attune_common::repositories::cache::CacheEntryRepository::protect_transaction(
         &mut tx,
         attune_common::repositories::cache::CacheTransactionMode::Write,

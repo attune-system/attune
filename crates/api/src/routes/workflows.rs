@@ -772,6 +772,9 @@ pub async fn delete_workflow(
     let authorized_companion =
         authorize_workflow_action(&state, &user, &workflow, Action::Delete).await?;
     let mut tx = state.db.begin().await?;
+    // Companion deletion needs exclusive graph admission before cache/owner locks.
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await?;
     // Pin cascades acquire admission before any workflow/companion protection.
     attune_common::repositories::cache::CacheEntryRepository::protect_transaction(
         &mut tx,
