@@ -82,7 +82,11 @@ CREATE FUNCTION revoke_log_delivery_grants() RETURNS trigger LANGUAGE plpgsql AS
 BEGIN
     IF TG_TABLE_NAME='permission_set' THEN
         UPDATE log_delivery_intent i SET state='revoked',failure='authority_revoked'
-        WHERE i.state IN ('prepared','active') AND EXISTS(SELECT 1 FROM execution_authority_selection s WHERE s.execution=i.execution AND OLD.ref=ANY(s.selected_refs));
+        WHERE i.state IN ('prepared','active') AND (
+            EXISTS(SELECT 1 FROM execution_authority_selection s WHERE s.execution=i.execution AND OLD.ref=ANY(s.selected_refs)) OR
+            EXISTS(SELECT 1 FROM permission_assignment a WHERE a.identity=i.owner AND a.permset=OLD.id) OR
+            EXISTS(SELECT 1 FROM identity_role_assignment a JOIN permission_set_role_assignment r ON r.role=a.role WHERE a.identity=i.owner AND r.permset=OLD.id)
+        );
     ELSE
         UPDATE log_delivery_intent i SET state='revoked',failure='authority_revoked'
         WHERE i.state IN ('prepared','active') AND EXISTS(SELECT 1 FROM identity_role_assignment a WHERE a.identity=i.owner AND a.role=OLD.role);

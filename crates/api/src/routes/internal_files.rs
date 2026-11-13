@@ -5958,6 +5958,13 @@ mod tests {
     async fn delegated_log_owner(
         pool: &sqlx::PgPool,
     ) -> attune_common::Result<(i64, i64, i64, i64, String)> {
+        delegated_log_owner_with_covering(pool, None).await
+    }
+
+    async fn delegated_log_owner_with_covering(
+        pool: &sqlx::PgPool,
+        covering_role: Option<bool>,
+    ) -> attune_common::Result<(i64, i64, i64, i64, String)> {
         use attune_common::{
             models::{ExecutionStatus, WorkerStatus, WorkerType},
             repositories::{
@@ -5985,6 +5992,72 @@ mod tests {
             },
         )
         .await?;
+        let selected_refs = if let Some(via_role) = covering_role {
+            use attune_common::repositories::identity::{
+                CreateIdentityRoleAssignmentInput, CreatePermissionAssignmentInput,
+                CreatePermissionSetInput, CreatePermissionSetRoleAssignmentInput,
+                IdentityRoleAssignmentRepository, PermissionAssignmentRepository,
+                PermissionSetRepository, PermissionSetRoleAssignmentRepository,
+            };
+            let mut selected_refs = Vec::new();
+            for (name, grants) in [
+                (
+                    "selected",
+                    serde_json::json!([{"resource":"keys","actions":["read"],"constraints":{"refs":["log_binding.token"]}}]),
+                ),
+                (
+                    "covering",
+                    serde_json::json!([{"resource":"keys","actions":["read","decrypt"]}]),
+                ),
+            ] {
+                let set = PermissionSetRepository::create(
+                    &mut *tx,
+                    CreatePermissionSetInput {
+                        r#ref: format!("log_binding.{name}"),
+                        pack: None,
+                        pack_ref: None,
+                        label: None,
+                        description: None,
+                        grants,
+                    },
+                )
+                .await?;
+                if name == "selected" {
+                    selected_refs.push(set.r#ref);
+                } else if via_role {
+                    IdentityRoleAssignmentRepository::create(
+                        &mut *tx,
+                        CreateIdentityRoleAssignmentInput {
+                            identity: owner.id,
+                            role: "log-owners".into(),
+                            source: "manual".into(),
+                            managed: false,
+                        },
+                    )
+                    .await?;
+                    PermissionSetRoleAssignmentRepository::create(
+                        &mut *tx,
+                        CreatePermissionSetRoleAssignmentInput {
+                            permset: set.id,
+                            role: "log-owners".into(),
+                        },
+                    )
+                    .await?;
+                } else {
+                    PermissionAssignmentRepository::create(
+                        &mut *tx,
+                        CreatePermissionAssignmentInput {
+                            identity: owner.id,
+                            permset: set.id,
+                        },
+                    )
+                    .await?;
+                }
+            }
+            selected_refs
+        } else {
+            Vec::new()
+        };
         let pack = PackRepository::create(
             &mut *tx,
             CreatePackInput {
@@ -6070,6 +6143,7 @@ mod tests {
                 action: Some(action.id),
                 action_ref: action.r#ref.clone(),
                 executor: Some(owner.id),
+                permission_set_refs: selected_refs,
                 status: ExecutionStatus::Requested,
                 ..Default::default()
             },
@@ -6168,6 +6242,14 @@ mod tests {
     async fn split_route_spooled_aggregate_digest_mismatch_cannot_publish() {
         split_route_case(false, 5).await;
     }
+    #[tokio::test]
+    async fn split_route_spooled_covering_direct_grant_revocation_is_sticky() {
+        split_route_case(true, 6).await;
+    }
+    #[tokio::test]
+    async fn split_route_spooled_covering_role_grant_revocation_is_sticky() {
+        split_route_case(true, 7).await;
+    }
     async fn split_route_case(revoke_during_get: bool, mode: u8) {
         let encrypted = mode > 0;
         use attune_common::repositories::delegated_execution::DelegatedExecutionRepository as Delegated;
@@ -6202,7 +6284,9 @@ mod tests {
         state.blob_store = store;
         let state = Arc::new(state);
         let (identity, execution, worker, _, action) =
-            delegated_log_owner(&state.db).await.unwrap();
+            delegated_log_owner_with_covering(&state.db, (mode >= 6).then_some(mode == 7))
+                .await
+                .unwrap();
         let artifact = ArtifactRepository::create(
             &state.db,
             CreateArtifactInput {
@@ -6472,7 +6556,7 @@ mod tests {
             State(state.clone()),
             RequireAuth(user.clone()),
             Path((version.id, 0)),
-            Body::from(body),
+            Body::from(body.clone()),
         )
         .await
         .unwrap();
@@ -6533,7 +6617,28 @@ mod tests {
         );
         if revoke_during_get {
             let mut tx = state.db.begin().await.unwrap();
-            if mode >= 3 {
+            if mode >= 6 {
+                let grants: serde_json::Value = sqlx::query_scalar(
+                    "SELECT grants FROM permission_set WHERE ref='log_binding.covering'",
+                )
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+                sqlx::query(
+                    "UPDATE permission_set SET grants='[]'::jsonb WHERE ref='log_binding.covering'",
+                )
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+                sqlx::query("UPDATE permission_set SET grants=$1 WHERE ref='log_binding.covering'")
+                    .bind(grants)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                // Current covering authority is valid again, but a previous
+                // revocation must permanently cancel this exact handoff.
+                Delegated::validate(&mut tx, execution).await.unwrap();
+            } else if mode >= 3 {
                 sqlx::query("UPDATE identity SET frozen=TRUE WHERE id=$1")
                     .bind(identity)
                     .execute(&mut *tx)
@@ -6548,6 +6653,35 @@ mod tests {
                 Delegated::close(&mut tx, execution).await.unwrap();
             }
             tx.commit().await.unwrap();
+            if mode >= 6 {
+                use attune_common::repositories::log_delivery::LogDeliveryRepository as Delivery;
+                let mut tx = state.db.begin().await.unwrap();
+                let intent = Delivery::find(&mut *tx, version.id).await.unwrap().unwrap();
+                assert_eq!(intent.state, "revoked");
+                assert!(
+                    Delivery::claim(
+                        &mut tx,
+                        version.id,
+                        worker,
+                        intent.delivery_instance,
+                        intent.custody
+                    )
+                    .await
+                    .is_err(),
+                    "restored grants must not revive restart custody"
+                );
+                tx.rollback().await.unwrap();
+                assert_status_error(
+                    commit_log_segment(
+                        State(state.clone()),
+                        RequireAuth(user.clone()),
+                        Path((version.id, 0)),
+                        Body::from(body.clone()),
+                    )
+                    .await,
+                    StatusCode::FORBIDDEN,
+                );
+            }
         }
         if mode == 4 {
             tokio::time::timeout(std::time::Duration::from_secs(20),async{

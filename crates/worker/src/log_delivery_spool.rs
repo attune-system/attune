@@ -269,6 +269,16 @@ impl LogDeliverySpool {
                 .serialization
                 .lock()
                 .map_err(|_| Error::invalid_state("Log spool owner failed"))?;
+            // A prior removal may have completed after its awaiting caller was
+            // cancelled. Re-acknowledge directory durability without requiring
+            // the already removed entry to be readable again.
+            match fs::symlink_metadata(owned.path(version)) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return sync_directory(&owned.root);
+                }
+                Err(error) => return Err(io(error)),
+                Ok(_) => {}
+            }
             if owned.read(version)?.custody != custody {
                 return Err(Error::invalid_state("Log spool custody mismatch"));
             }
@@ -398,6 +408,7 @@ mod tests {
         let owner = spool(root.path()).await;
         assert!(owner.load(2).await.unwrap() == entry);
         assert!(owner.remove(2, Uuid::new_v4()).await.is_err());
+        owner.remove(2, entry.custody).await.unwrap();
         owner.remove(2, entry.custody).await.unwrap();
         assert!(owner.versions().await.unwrap().is_empty());
     }

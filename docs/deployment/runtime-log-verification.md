@@ -72,6 +72,9 @@ The purpose-specific credential authorizes exact segment append and seal only;
 completion closes action API access. General file operations, other log versions,
 changed segment bytes, replaced attempts and revoked sources are denied.
 Restoring a revoked source does not revive an old handoff.
+Changes to an owner's directly or role-assigned covering permission sets also
+cancel pending handoffs, even when that set differs from the selected execution
+permission set.
 
 Each accepted stream has a 60-second deadline. Reads report `finalizing` only
 while custody remains active and before that deadline; verified Ready publication
@@ -80,6 +83,15 @@ the spool volume persists. **Node or volume loss can lose undelivered logs**:
 restarting the same worker without the custody marks them incomplete immediately;
 otherwise the deadline bounds the finalizing period. No API-owned custody or
 node-loss durability guarantee is implied. The action result remains unchanged.
+
+Settlement becomes manager-owned before spool persistence, so canceling its
+caller cannot abandon a persisted entry or an uncertain database commit.
+Database preparation has a ten-second bound. Failed preparation is reconciled
+under exclusive graph admission before absence permits orphan removal.
+After the upload deadline, the manager retains its bounded finalizer slot and
+retries terminal bookkeeping and custody cleanup when database access recovers;
+this does not permit late upload or extend the deadline. Shutdown can leave that
+custody for restart recovery after its bounded drain.
 
 Graceful shutdown stops action admission and drains delivery before heartbeat
 shutdown/deregistration. A forced stop retains synchronized entries for recovery.

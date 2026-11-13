@@ -369,6 +369,15 @@ closed pipe does not start custody while the process is still running. Process
 duration freezes at child wait. Both boundaries are observed separately in
 workload validation.
 
+Custody settlement is manager-owned before persistence begins and remains owned
+through an acknowledged or uncertain preparation result. Preparation is bounded
+to ten seconds; a canceled caller cannot cancel its settlement task. Orphan
+reconciliation fences outstanding producer transactions before proving absence.
+Expired upload authority never ends cleanup responsibility: bounded finalizers
+retry canonical terminal settlement and spool reclamation after database outages,
+without renewing upload authority. Owner covering permission definitions, whether
+assigned directly or through roles, participate in sticky revocation.
+
 See [runtime log operations](../deployment/runtime-log-verification.md) for
 configuration, capacity, restart, node-loss and client behavior. The historical preparation
 validation above is historical evidence only; it does not certify the expanded

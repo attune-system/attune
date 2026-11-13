@@ -5,6 +5,7 @@ use attune_common::{
     auth::jwt::JwtConfig,
     repositories::{
         delegated_execution::DelegatedExecutionRepository,
+        file_evidence_retention::FileEvidenceRetentionRepository,
         log_delivery::{DeliverySegment, LogDeliveryRepository, PrepareLogDelivery},
         log_stream::LogStreamRepository,
     },
@@ -18,6 +19,10 @@ use std::{
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use uuid::Uuid;
+
+#[cfg(test)]
+#[path = "log_delivery_tests.rs"]
+mod tests;
 
 pub struct LogDeliveryManager {
     pool: sqlx::PgPool,
@@ -39,8 +44,9 @@ struct Capture {
     ready: Option<SpoolDelivery>,
     finalizing: bool,
 }
-/// Owns the live producer until durable custody is acknowledged. Dropping before
-/// handoff cancels its uploader; after handoff the manager owns it through drain.
+/// Owns the live producer until settlement starts. Dropping before `seal`
+/// cancels its uploader; `seal` transfers settlement to the manager before any
+/// persistence await, including failed and ambiguously acknowledged handoffs.
 pub struct SpoolingLogWriter {
     manager: Arc<LogDeliveryManager>,
     execution: i64,
@@ -268,7 +274,10 @@ impl LogDeliveryManager {
                     "Log delivery retry; encrypted custody retained"
                 ),
             }
-            if self.stop.is_cancelled() || entry.finalize_by <= chrono::Utc::now() {
+            // Expiry ends upload authority, not responsibility for custody.
+            // A database outage may span the deadline; keep the bounded slot
+            // until canonical terminal/absence evidence permits reclamation.
+            if self.stop.is_cancelled() {
                 return;
             }
             tokio::select! {_=self.stop.cancelled()=>return,_=tokio::time::sleep(Duration::from_millis(500))=>{}}
@@ -444,7 +453,18 @@ impl SpoolingLogWriter {
         self.changed.notify_one();
         Ok(())
     }
-    pub async fn seal(mut self, truncated: bool, manifest: Option<String>) -> Result<()> {
+    pub async fn seal(self, truncated: bool, manifest: Option<String>) -> Result<()> {
+        // Once settlement starts, caller cancellation must not strand a file
+        // published by spawn_blocking or an ambiguously committed DB handoff.
+        let manager = self.manager.clone();
+        manager
+            .tasks
+            .spawn(async move { self.seal_owned(truncated, manifest).await })
+            .await
+            .map_err(|_| Error::execution("Log custody settlement task failed"))?
+    }
+
+    async fn seal_owned(mut self, truncated: bool, manifest: Option<String>) -> Result<()> {
         let segments = std::mem::take(&mut self.capture.lock().unwrap().segments);
         if segments.is_empty() {
             return Err(Error::invalid_state("Empty allocated log custody"));
@@ -462,6 +482,17 @@ impl SpoolingLogWriter {
             authenticated_manifest: manifest,
             segments,
         };
+        let result = self.prepare_custody(&entry).await;
+        // Reconcile even a failed save/prepare or a lost COMMIT acknowledgement.
+        // The preparation future has ended before the consumer can prove
+        // absence under exclusive graph admission and remove an orphan.
+        self.capture.lock().unwrap().ready = Some(entry);
+        self.handed_off = true;
+        self.changed.notify_one();
+        result
+    }
+
+    async fn prepare_custody(&self, entry: &SpoolDelivery) -> Result<()> {
         self.manager.spool.save(entry.clone()).await?;
         let mut digest = Sha256::new();
         let mut total = 0i64;
@@ -478,30 +509,35 @@ impl SpoolingLogWriter {
                 }
             })
             .collect();
-        let mut tx = self.manager.pool.begin().await?;
-        attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_capture(&mut tx).await?;
-        LogDeliveryRepository::prepare(
-            &mut tx,
-            PrepareLogDelivery {
-                execution: entry.execution,
-                version: entry.version,
-                stream: entry.stream,
-                worker: entry.worker,
-                instance: entry.source_instance,
-                custody: entry.custody,
-                segments: descriptors,
-                total_bytes: total,
-                sha256: hex(&digest.finalize()),
-                truncated,
-                authenticated_manifest: entry.authenticated_manifest.clone(),
-                finalize_by: entry.finalize_by,
-            },
-        )
-        .await?;
-        tx.commit().await?;
-        self.capture.lock().unwrap().ready = Some(entry);
-        self.handed_off = true;
-        self.changed.notify_one();
-        Ok(())
+        // Bound settlement independently of the upload deadline. SQLx owns a
+        // cancelled transaction; reconciliation fences its eventual rollback
+        // or COMMIT before treating missing custody as deletion evidence.
+        let preparation = async {
+            let mut tx = self.manager.pool.begin().await?;
+            FileEvidenceRetentionRepository::lock_capture(&mut tx).await?;
+            LogDeliveryRepository::prepare(
+                &mut tx,
+                PrepareLogDelivery {
+                    execution: entry.execution,
+                    version: entry.version,
+                    stream: entry.stream,
+                    worker: entry.worker,
+                    instance: entry.source_instance,
+                    custody: entry.custody,
+                    segments: descriptors,
+                    total_bytes: total,
+                    sha256: hex(&digest.finalize()),
+                    truncated: entry.truncated,
+                    authenticated_manifest: entry.authenticated_manifest.clone(),
+                    finalize_by: entry.finalize_by,
+                },
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(())
+        };
+        tokio::time::timeout(Duration::from_secs(10), preparation)
+            .await
+            .map_err(|_| Error::execution("Log custody preparation timed out"))?
     }
 }
