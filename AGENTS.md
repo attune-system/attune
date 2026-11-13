@@ -108,6 +108,7 @@ attune/
 - Attune runs primarily via **Docker Compose** (`docker-compose.yaml`).
 - Main named volumes:
   - `packs_data` for packs
+  - `pack_binaries` for local compiled core inputs, mounted read-only only by bootstrap
   - `runtime_envs` for generated runtime environments
   - `artifacts_data` for file-backed artifacts
   - `blobs_data` for immutable object bodies and log segments

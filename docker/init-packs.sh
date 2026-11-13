@@ -22,7 +22,8 @@ fi
 candidate=$(mktemp -d)
 trap 'rm -rf "$candidate"' EXIT HUP INT TERM
 cp -R "${SOURCE_PACKS_DIR:-/source/packs}/core" "$candidate/core"
-binary="${TARGET_PACKS_DIR:-/opt/attune/packs}/core/sensors/attune-core-timer-sensor"
+binary_root="${PACK_BINARIES_DIR:-/opt/attune/pack-binaries}/core"
+binary="$binary_root/sensors/attune-core-timer-sensor"
 if [ "${ATTUNE_BOOTSTRAP_MODE:-volume}" = volume ] && [ -f "$binary" ]; then
     cp "$binary" "$candidate/core/sensors/attune-core-timer-sensor"
 fi
@@ -35,7 +36,7 @@ if [ "${ATTUNE_BOOTSTRAP_MODE:-volume}" = volume ]; then
         *) echo 'Unsupported local core action architecture' >&2; exit 1 ;;
     esac
     for action in echo sleep noop; do
-        binary="${TARGET_PACKS_DIR:-/opt/attune/packs}/core/actions/bin/$action/$target"
+        binary="$binary_root/actions/bin/$action/$target"
         test -x "$binary" || { echo 'Missing local native core action' >&2; exit 1; }
         rm -rf "$candidate/core/actions/bin/$action"
         mkdir -p "$candidate/core/actions/bin/$action"

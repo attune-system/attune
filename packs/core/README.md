@@ -30,6 +30,9 @@ Ordinary native file entrypoints retain their existing behavior.
 Official init-packs images include **both** static variants and publish identical
 core bytes on both architectures. Local Compose builds contain exactly the host
 variant and assemble a private candidate without copying old action metadata.
+Local binary initialization stages under a separate `pack_binaries` volume, mounted
+read-only by the publisher and absent from workers, outside the active core projection; bootstrap copies only fresh binary files into its
+private candidate.
 Do not publish a local host-only archive as the official cross-architecture release.
 Binaries are built using `docker/Dockerfile.pack-binaries` / cargo-zigbuild, as with
 the timer sensor. Source checkout alone is not an executable pack: build artifacts
