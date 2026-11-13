@@ -959,14 +959,8 @@ impl Runtime for ProcessRuntime {
         }
 
         // Check entry_point extension
-        if self
-            .config
+        self.config
             .matches_file_extension(Path::new(&context.entry_point))
-        {
-            return true;
-        }
-
-        false
     }
 
     async fn execute(&self, context: ExecutionContext) -> RuntimeResult<ExecutionResult> {
