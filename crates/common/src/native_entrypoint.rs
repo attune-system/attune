@@ -78,7 +78,7 @@ mod tests {
 
     #[test]
     fn target_selection_is_exact_and_regular_files_are_unchanged() {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         variant(root.path(), "linux-amd64");
         assert_eq!(
             resolve(root.path(), "linux", "x86_64").unwrap(),
@@ -97,7 +97,7 @@ mod tests {
 
     #[test]
     fn directory_rejects_unknown_entries_links_and_parent_traversal() {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let directory = root.path().join("action");
         std::fs::create_dir(&directory).unwrap();
         assert!(validate_directory(&directory).is_err());

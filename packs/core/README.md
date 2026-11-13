@@ -40,7 +40,8 @@ must be assembled before publication; there is no interpreter/source fallback.
 
 Core 1.0.7 has a new immutable version/digest binding. Normal bootstrap explicitly
 requests the existing **pack-wide** `absent_metadata_policy=remove`. Complete retained
-nonaction definitions remain in the candidate; omitted actions retire and cannot
+nonaction definitions remain in the candidate; omitted actions and the installer's
+owned workflow definition retire. Omitted actions cannot
 be resolved for new work. Historical records and already-admitted pinned executions
 retain their original immutable release. Do not reset databases, delete retained
 release trees, or republish changed bytes under an existing stable version.
