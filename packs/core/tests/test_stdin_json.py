@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -29,6 +30,38 @@ class TestStdinJson(unittest.TestCase):
         result = self.run_action("sleep", {"message": message, "seconds": 0})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(message, result.stdout)
+
+    def test_versioned_python_without_unversioned_alias(self):
+        for name in ("python3.11", "python3.12", "python3.13", "python"):
+            with self.subTest(interpreter=name), tempfile.TemporaryDirectory() as directory:
+                # This owned PATH has one runnable interpreter, no python3 alias
+                # and no external shell utilities. Python checks its real version.
+                (Path(directory) / name).symlink_to(sys.executable)
+                env = {**os.environ, "PATH": directory,
+                       "ATTUNE_API_TOKEN": "dummy", "ATTUNE_API_URL": "http://unused.invalid"}
+                cases = {
+                    "echo": {"message": "versioned interpreter\n"},
+                    "noop": {}, "sleep": {"seconds": 0},
+                    "run_agent_command": {"command": "printf reached", "require_mcp_binary": False},
+                    "http_request": {},
+                }
+                for action, params in cases.items():
+                    result = self.run_action(action, params, env)
+                    self.assertEqual(result.returncode, 1 if action == "http_request" else 0,
+                                     (action, result.stdout, result.stderr))
+                    if action == "echo":
+                        self.assertEqual(result.stdout, params["message"])
+                    if action == "http_request":
+                        self.assertEqual(json.loads(result.stdout)["error"], "url parameter is required")
+
+    def test_no_suitable_python_fails_before_reading_parameters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = {**os.environ, "PATH": directory}
+            result = self.run_action("echo", {"message": "private value"}, env)
+            self.assertEqual(result.returncode, 126)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("runnable Python", result.stderr)
+            self.assertNotIn("private value", result.stderr)
 
     def test_agent_command_is_fixed_despite_multiline_state(self):
         with tempfile.TemporaryDirectory() as directory:

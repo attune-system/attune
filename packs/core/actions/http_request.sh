@@ -1,4 +1,8 @@
 #!/bin/sh
-# Canonical flat stdin JSON; keep the public shell entrypoint.
+# Canonical flat stdin JSON through a checked Python runtime executable.
 set -eu
-exec python3 "$(dirname "$0")/core_actions.py" http_request
+case "$0" in
+    */*) action_dir=${0%/*} ;;
+    *) action_dir=. ;;
+esac
+exec /bin/sh "$action_dir/core_json.sh" http_request

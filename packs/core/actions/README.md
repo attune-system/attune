@@ -7,7 +7,10 @@ or expanded into environment variables. There is no dotenv fallback.
 The shell entrypoints require Python 3.11 or newer (standard library only).
 `http_request` also requires curl. These dependencies must exist in the selected worker image;
 the actions declare `required_worker_runtimes` so a shell-only worker is not
-eligible. The bundled Compose shell and Node workers install Python during
+eligible. The shared launcher checks the executable alternatives in the bundled
+Python runtime (`python3.11`, `python3.12`, `python3.13`, `python3`, `python`)
+without consuming stdin, and uses one whose actual version satisfies the requirement.
+An unversioned `python3` alias is not required. The bundled Compose shell and Node workers install Python during
 bootstrap; custom workers must advertise a verified matching Python runtime.
 The pack API actions use the same shell-wrapper/Python-helper pattern.
 

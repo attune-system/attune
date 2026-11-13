@@ -3,6 +3,7 @@
 import importlib.util
 import io
 from pathlib import Path
+import re
 import subprocess
 import tarfile
 import tempfile
@@ -53,6 +54,15 @@ class CoreCompositionTests(unittest.TestCase):
             self.assertIn("test_curl_argv_and_body_are_not_line_encoded", result.stderr)
 
     def test_json_shell_actions_declare_verified_python_capability(self):
+        runtime = yaml.safe_load((CORE / "runtimes/python.yaml").read_text())
+        verified_commands = {
+            command["binary"]
+            for config in [runtime, *runtime["versions"]]
+            for command in config["distributions"]["verification"]["commands"]
+        }
+        launcher = (CORE / "actions/core_json.sh").read_text()
+        alternatives = re.search(r"for interpreter in (.+); do", launcher).group(1).split()
+        self.assertTrue(verified_commands.issubset(alternatives))
         for name in ("echo", "sleep", "noop", "http_request", "run_agent_command"):
             action = yaml.safe_load((CORE / "actions" / (name + ".yaml")).read_text())
             with self.subTest(action=action["ref"]):
