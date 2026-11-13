@@ -24,7 +24,9 @@ must overwrite or append the actual upstream peer to a single X-Forwarded-For
 header. The receiver validates the entire chain and walks right to left through
 trusted hops, stopping at the first untrusted address. The resulting canonical IP
 (including normalization of IPv4-mapped IPv6) drives both whitelist and rate-limit
-checks. A trusted socket peer must supply a valid chain. Invalid proxy networks,
+checks. New webhook audit rows store only SHA-256 credential fingerprints; old
+raw-key rows are not rewritten. Rate accounting starts a new window at rollout.
+A trusted socket peer must supply a valid chain. Invalid proxy networks,
 malformed security sections, unknown security sections, and enabled security
 features with missing/invalid settings reject requests before event creation.
 

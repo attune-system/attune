@@ -1278,6 +1278,16 @@ async fn trusted_proxy_boundary_and_canonical_rate_limit() {
         attune_common::repositories::event::EventRepository::find_by_trigger(&ctx.pool, id)
             .await
             .unwrap();
+    let logged: Vec<String> =
+        sqlx::query_scalar("SELECT webhook_key FROM webhook_event_log WHERE trigger_id = $1")
+            .bind(id)
+            .fetch_all(&ctx.pool)
+            .await
+            .unwrap();
+    assert!(!logged.is_empty());
+    assert!(logged
+        .iter()
+        .all(|key| key.len() == 64 && key != &info.webhook_key));
     assert_eq!(events.len(), 1);
     assert_eq!(
         events[0].config.as_ref().unwrap()["source_ip"],

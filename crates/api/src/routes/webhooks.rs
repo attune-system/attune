@@ -643,7 +643,7 @@ pub async fn receive_webhook(
                 let recent_requests = TriggerRepository::count_recent_webhook_requests(
                     &state.db,
                     trigger.id,
-                    &webhook_key,
+                    &webhook_security::credential_fingerprint(&webhook_key),
                     source_ip.as_deref(),
                     window_seconds as i32,
                 )
@@ -953,7 +953,7 @@ async fn log_webhook_event(
     let log_input = WebhookEventLogInput {
         trigger_id: trigger.id,
         trigger_ref: trigger.r#ref.clone(),
-        webhook_key: webhook_key.to_string(),
+        webhook_key: webhook_security::credential_fingerprint(webhook_key),
         event_id,
         source_ip,
         user_agent,

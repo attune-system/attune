@@ -459,3 +459,9 @@ mod boundary_tests {
         .is_err());
     }
 }
+
+/// Correlate requests without retaining bearer credentials in the audit trail.
+pub fn credential_fingerprint(key: &str) -> String {
+    use sha2::Digest;
+    hex::encode(Sha256::digest(key.as_bytes()))
+}
