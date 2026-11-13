@@ -3658,7 +3658,24 @@ mod tests {
         for reply in &replies[3..] {
             assert_eq!(reply["result"]["isError"], true);
         }
-        assert_eq!(api.received_requests().await.unwrap().len(), 2);
+        let requests = api.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 7);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.url.path() == "/auth/me")
+                .count(),
+            replies.len(),
+            "Every HTTP request authenticates, including policy-denied calls"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.url.path() != "/auth/me")
+                .count(),
+            2,
+            "Only the two allowed tools may reach API operations"
+        );
     }
 
     #[tokio::test]
