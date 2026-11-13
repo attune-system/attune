@@ -577,12 +577,14 @@ pub async fn create_workflow(
     let pack = PackRepository::find_by_ref(&state.db, &request.pack_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", request.pack_ref)))?;
+    let mut tx = state.db.begin().await?;
     super::lifecycle_authorization::create(
         &state,
+        &mut tx,
         &user,
         Resource::Actions,
         &request.r#ref,
-        Some(&pack.r#ref),
+        Some((&pack.r#ref, pack.id)),
     )
     .await?;
     validate_workflow_action_references(&state, &pack.r#ref, &request.r#ref, &request.definition)
@@ -602,12 +604,11 @@ pub async fn create_workflow(
         tags: request.tags.clone().unwrap_or_default(),
     };
 
-    let workflow = WorkflowDefinitionRepository::create(&state.db, workflow_input).await?;
+    let workflow = WorkflowDefinitionRepository::create(&mut *tx, workflow_input).await?;
 
     // Create a companion action record so the workflow appears in action lists
-    let mut connection = state.db.acquire().await?;
     create_companion_action(
-        &mut connection,
+        &mut tx,
         &workflow.r#ref,
         pack.id,
         &pack.r#ref,
@@ -622,6 +623,8 @@ pub async fn create_workflow(
         workflow.id,
     )
     .await?;
+
+    tx.commit().await?;
 
     let response = ApiResponse::with_message(
         WorkflowResponse::from(workflow),
@@ -854,12 +857,14 @@ pub async fn save_workflow_file(
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", pack_ref)))?;
 
     let workflow_ref = format!("{}.{}", pack_ref, request.name);
+    let mut tx = state.db.begin().await?;
     super::lifecycle_authorization::create(
         &state,
+        &mut tx,
         &user,
         Resource::Actions,
         &workflow_ref,
-        Some(&pack.r#ref),
+        Some((&pack.r#ref, pack.id)),
     )
     .await?;
     validate_reference_visibility_request(&request)?;
@@ -877,9 +882,20 @@ pub async fn save_workflow_file(
         )));
     }
 
-    // Write YAML file to disk
-    let packs_base_dir = PathBuf::from(&state.config.packs_base_dir);
-    write_workflow_yaml(&packs_base_dir, &pack_ref, &request).await?;
+    let lease = state
+        .file_transfers
+        .upload(Some(request.definition.to_string().len() as u64))
+        .map_err(ApiError::BadRequest)?;
+    let graph = serde_yaml_ng::to_string(&strip_action_level_fields(&request.definition)).map_err(
+        |error| ApiError::BadRequest(format!("Cannot serialize workflow graph: {error}")),
+    )?;
+    let mut files = super::workflow_file_publication::PreparedWorkflowFiles::stage(
+        std::path::Path::new(&state.config.packs_base_dir),
+        &pack_ref,
+        &request.name,
+        &graph,
+        &build_action_yaml(&pack_ref, &request),
+    )?;
 
     // Create workflow in database
     let definition_json = serde_json::to_value(&request.definition).map_err(|e| {
@@ -899,13 +915,12 @@ pub async fn save_workflow_file(
         tags: request.tags.clone().unwrap_or_default(),
     };
 
-    let workflow = WorkflowDefinitionRepository::create(&state.db, workflow_input).await?;
+    let workflow = WorkflowDefinitionRepository::create(&mut *tx, workflow_input).await?;
 
     // Create a companion action record so the workflow appears in action lists and palettes
     let entrypoint = format!("workflows/{}.workflow.yaml", request.name);
-    let mut connection = state.db.acquire().await?;
     create_companion_action(
-        &mut connection,
+        &mut tx,
         &workflow_ref,
         pack.id,
         &pack.r#ref,
@@ -922,6 +937,30 @@ pub async fn save_workflow_file(
         workflow.id,
     )
     .await?;
+
+    files.publish()?;
+    let workflow_id = workflow.id;
+    state
+        .file_transfers
+        .finish_publication(lease, async move {
+            match tx.commit().await {
+                Ok(()) => {
+                    files.committed();
+                    Ok(())
+                }
+                Err(error) => {
+                    if error.as_database_error().is_none() {
+                        files.uncertain(workflow_id);
+                    }
+                    // A server-rejected commit drops the owner and cleans its files.
+                    Err(ApiError::from(error))
+                }
+            }
+        })
+        .await
+        .map_err(|error| {
+            ApiError::InternalServerError(format!("Workflow publication owner failed: {error}"))
+        })??;
 
     let response = ApiResponse::with_message(
         WorkflowResponse::from(workflow),

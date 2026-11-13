@@ -39,6 +39,7 @@ pub mod visibility;
 pub mod webhooks;
 pub mod work_queues;
 pub mod workers;
+mod workflow_file_publication;
 pub mod workflows;
 
 pub use actions::routes as action_routes;

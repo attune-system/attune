@@ -20,9 +20,19 @@ pub(super) async fn existing(
     let identity = user
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid identity".into()))?;
+    let associated_pack_ref = match target {
+        RuntimeTarget::Component(kind, id) => {
+            RuntimeTargetRepository::component_associated_pack_ref(connection, kind, id).await?
+        }
+        _ => None,
+    };
     let target = RuntimeTargetRepository::resolve(connection, target, identity)
         .await?
         .ok_or_else(|| ApiError::NotFound("Lifecycle target is unavailable".into()))?;
+    let mut context = target.context().clone();
+    if associated_pack_ref.is_some() {
+        context.pack_ref = associated_pack_ref;
+    }
     state
         .authorization_service()
         .authorize_access_fresh(
@@ -31,7 +41,7 @@ pub(super) async fn existing(
             AuthorizationCheck {
                 resource: target.resource(),
                 action,
-                context: target.context().clone(),
+                context,
             },
         )
         .await
@@ -39,23 +49,44 @@ pub(super) async fn existing(
 
 pub(super) async fn create(
     state: &AppState,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     user: &AuthenticatedUser,
     resource: Resource,
     reference: &str,
-    pack_ref: Option<&str>,
+    pack: Option<(&str, i64)>,
 ) -> ApiResult<()> {
     let identity = user
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid identity".into()))?;
     let mut context = AuthorizationContext::new(identity);
     context.target_ref = Some(reference.to_owned());
-    context.pack_ref = pack_ref.map(str::to_owned);
+    context.pack_ref = pack.map(|(reference, _)| reference.to_owned());
     // API-created definitions are ad hoc: association is not managed ownership.
-    let mut tx = state.db.begin().await?;
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(transaction)
+        .await?;
+    if let Some((reference, expected_id)) = pack {
+        attune_common::repositories::pack::PackRepository::acquire_mutation_lock(
+            transaction,
+            reference,
+        )
+        .await?;
+        let pack = attune_common::repositories::pack::PackRepository::find_by_ref_locked(
+            transaction,
+            reference,
+        )
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Creation pack is unavailable".into()))?;
+        if pack.id != expected_id {
+            return Err(ApiError::Conflict(
+                "Creation pack changed during authorization".into(),
+            ));
+        }
+        context.pack_ref = Some(pack.r#ref);
+    }
     state
         .authorization_service()
         .authorize_access_fresh(
-            &mut tx,
+            transaction,
             user,
             AuthorizationCheck {
                 resource,
@@ -64,6 +95,5 @@ pub(super) async fn create(
             },
         )
         .await?;
-    tx.commit().await?;
     Ok(())
 }

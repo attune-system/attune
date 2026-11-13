@@ -920,12 +920,14 @@ pub async fn create_trigger(
         (None, None)
     };
 
+    let mut tx = state.db.begin().await?;
     super::lifecycle_authorization::create(
         &state,
+        &mut tx,
         &user,
         Resource::Triggers,
         &request.r#ref,
-        pack_ref.as_deref(),
+        pack_ref.as_deref().zip(pack_id),
     )
     .await?;
 
@@ -953,7 +955,8 @@ pub async fn create_trigger(
         reference_allowed_pack_refs: request.reference_allowed_pack_refs,
     };
 
-    let trigger = TriggerRepository::create(&state.db, trigger_input).await?;
+    let trigger = TriggerRepository::create(&mut *tx, trigger_input).await?;
+    tx.commit().await?;
     publish_trigger_metadata_change(&state, &trigger, "created", trigger.updated).await;
 
     let response = ApiResponse::with_message(
@@ -1624,12 +1627,14 @@ pub async fn create_sensor(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", request.pack_ref)))?;
 
+    let mut tx = state.db.begin().await?;
     super::lifecycle_authorization::create(
         &state,
+        &mut tx,
         &user,
         Resource::Triggers,
         &request.r#ref,
-        Some(pack.r#ref.as_str()),
+        Some((&pack.r#ref, pack.id)),
     )
     .await?;
 
@@ -1673,7 +1678,6 @@ pub async fn create_sensor(
         log_retention_limit: request.log_retention_limit,
     };
 
-    let mut tx = state.db.begin().await?;
     attune_common::repositories::component_configuration::ComponentConfigurationRepository::lock_selection(&mut tx).await?;
     let mut sensor = SensorRepository::create(&mut *tx, sensor_input).await?;
     let revision = attune_common::repositories::component_configuration::ComponentConfigurationRepository::bind_sensor(

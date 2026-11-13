@@ -31,3 +31,22 @@ Authorization precedes row changes, cache tombstoning, file writes and lifecycle
 notifications. Enabling still runs placement admission; sensor configuration
 binding and workflow companion ownership checks remain intact. Security audit
 records for rejected requests remain intentional.
+
+Creation retains the fresh actor, permission-assignment and role locks in the
+caller's SQLx transaction through publication. The exact associated pack is
+resolved again under its transaction-scoped namespace lock. Workflow sync uses
+that same owning transaction for filesystem loading and registrar writes; it
+never publishes through an independent pool transaction. Association supplies
+`pack_refs` scoping independently of `managing_pack_id` and cannot confer
+`pack_owner` eligibility.
+
+New workflow files use private owned staging and no-clobber links. A pre-commit
+failure or cancellation removes only files and empty directories created by
+that request. A tracked, resource-admitted owner finishes SQL COMMIT after file
+publication, even if the HTTP waiter disconnects; service shutdown joins it.
+A server-rejected commit cleans the files. A transport failure with an unknown
+commit outcome conservatively retains the publication and a private
+`uncertain-commit.json` manifest in its `.workflow-publication-*` directory for
+operator reconciliation. PostgreSQL and the filesystem do not form one atomic
+transaction; a process/host loss or an uncertain commit requires reconciliation,
+not an assumption that SQL rollback removed files.

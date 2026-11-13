@@ -434,9 +434,9 @@ async fn lifecycle_routes_deny_before_effects_and_respect_scopes() -> Result<()>
         workflow.updated
     );
     let scoped = token(&ctx, "lifecycle_scoped", json!([
-        {"resource":"triggers","actions":["create","update","delete"],"constraints":{"refs":["lifecycle.allowed","lifecycle.trigger","lifecycle.sensor","lifecycle.rule","lifecycle.workflow","lifecycle.positive","lifecycle.newfile"]}},
-        {"resource":"actions","actions":["create","update","delete"],"constraints":{"refs":["lifecycle.allowed","lifecycle.trigger","lifecycle.sensor","lifecycle.rule","lifecycle.workflow","lifecycle.positive","lifecycle.newfile"]}},
-        {"resource":"rules","actions":["update"],"constraints":{"refs":["lifecycle.allowed","lifecycle.trigger","lifecycle.sensor","lifecycle.rule","lifecycle.workflow","lifecycle.positive","lifecycle.newfile"]}}
+        {"resource":"triggers","actions":["create","update","delete"],"constraints":{"pack_refs":["lifecycle"]}},
+        {"resource":"actions","actions":["create","update","delete"],"constraints":{"pack_refs":["lifecycle"]}},
+        {"resource":"rules","actions":["update"],"constraints":{"pack_refs":["lifecycle"]}}
     ])).await?;
     let response = ctx
         .post(
@@ -529,7 +529,7 @@ async fn lifecycle_routes_deny_before_effects_and_respect_scopes() -> Result<()>
         ctx.put(
             "/api/v1/sensors/lifecycle.sensor",
             json!({"label":"Updated"}),
-            Some(&scoped)
+            Some(&creator)
         )
         .await?
         .status(),

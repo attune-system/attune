@@ -4936,6 +4936,16 @@ pub async fn sync_pack_workflows(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", pack_ref)))?;
     let mut tx = state.db.begin().await?;
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx).await?;
+    PackRepository::acquire_mutation_lock(&mut tx, &pack_ref).await?;
+    let current = PackRepository::find_by_ref_locked(&mut tx, &pack_ref)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Pack is unavailable".into()))?;
+    if current.id != pack.id {
+        return Err(ApiError::Conflict(
+            "Pack changed during sync authorization".into(),
+        ));
+    }
     super::lifecycle_authorization::existing(
         &state,
         &mut tx,
@@ -4944,7 +4954,6 @@ pub async fn sync_pack_workflows(
         Action::Install,
     )
     .await?;
-    tx.commit().await?;
 
     // Get packs base directory from config
     let packs_base_dir = PathBuf::from(&state.config.packs_base_dir);
@@ -4960,7 +4969,10 @@ pub async fn sync_pack_workflows(
     let service = PackWorkflowService::new(state.db.clone(), service_config);
 
     // Sync workflows
-    let result = service.sync_pack_workflows(&pack_ref).await?;
+    let result = service
+        .sync_pack_workflows_in_transaction(&mut tx, &pack_ref)
+        .await?;
+    tx.commit().await?;
 
     // Convert to response DTO
     let response = PackWorkflowSyncResponse {
@@ -5021,7 +5033,6 @@ pub async fn validate_pack_workflows(
         Action::Read,
     )
     .await?;
-    tx.commit().await?;
 
     // Get packs base directory from config
     let packs_base_dir = PathBuf::from(&state.config.packs_base_dir);
@@ -5038,6 +5049,7 @@ pub async fn validate_pack_workflows(
 
     // Validate workflows
     let result = service.validate_pack_workflows(&pack_ref).await?;
+    tx.commit().await?;
 
     // Convert to response DTO
     let response = PackWorkflowValidationResponse {

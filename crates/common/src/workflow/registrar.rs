@@ -106,6 +106,19 @@ impl WorkflowRegistrar {
 
     /// Register a single workflow
     pub async fn register_workflow(&self, loaded: &LoadedWorkflow) -> Result<RegistrationResult> {
+        let mut tx = self.pool.begin().await?;
+        let result = self
+            .register_workflow_in_transaction(&mut tx, loaded)
+            .await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    pub async fn register_workflow_in_transaction(
+        &self,
+        connection: &mut sqlx::PgConnection,
+        loaded: &LoadedWorkflow,
+    ) -> Result<RegistrationResult> {
         debug!("Registering workflow: {}", loaded.file.ref_name);
 
         // Check for validation errors
@@ -119,13 +132,14 @@ impl WorkflowRegistrar {
         }
 
         // Verify pack exists
-        let pack = PackRepository::find_by_ref(&self.pool, &loaded.file.pack)
+        let pack = PackRepository::find_by_ref(&mut *connection, &loaded.file.pack)
             .await?
             .ok_or_else(|| Error::not_found("pack", "ref", &loaded.file.pack))?;
 
         // Check if workflow already exists
         let existing_workflow =
-            WorkflowDefinitionRepository::find_by_ref(&self.pool, &loaded.file.ref_name).await?;
+            WorkflowDefinitionRepository::find_by_ref(&mut *connection, &loaded.file.ref_name)
+                .await?;
 
         let mut warnings = Vec::new();
 
@@ -166,6 +180,7 @@ impl WorkflowRegistrar {
             info!("Updating existing workflow: {}", loaded.file.ref_name);
             let workflow_def_id = self
                 .update_workflow(
+                    &mut *connection,
                     &existing.id,
                     &loaded.workflow,
                     &pack.r#ref,
@@ -176,6 +191,7 @@ impl WorkflowRegistrar {
 
             // Update or create the companion action record
             self.ensure_companion_action(
+                &mut *connection,
                 workflow_def_id,
                 &loaded.workflow,
                 pack.id,
@@ -191,8 +207,8 @@ impl WorkflowRegistrar {
             info!("Creating new workflow: {}", loaded.file.ref_name);
             let workflow_def_id = self
                 .create_workflow(
+                    &mut *connection,
                     &loaded.workflow,
-                    &loaded.file.pack,
                     pack.id,
                     &pack.r#ref,
                     &effective_ref,
@@ -202,6 +218,7 @@ impl WorkflowRegistrar {
 
             // Create a companion action record so the workflow appears in action lists
             self.create_companion_action(
+                &mut *connection,
                 workflow_def_id,
                 &loaded.workflow,
                 pack.id,
@@ -254,6 +271,21 @@ impl WorkflowRegistrar {
         Ok(results)
     }
 
+    pub async fn register_workflows_in_transaction(
+        &self,
+        connection: &mut sqlx::PgConnection,
+        workflows: &HashMap<String, LoadedWorkflow>,
+    ) -> Result<Vec<RegistrationResult>> {
+        let mut results = Vec::new();
+        for loaded in workflows.values() {
+            results.push(
+                self.register_workflow_in_transaction(&mut *connection, loaded)
+                    .await?,
+            );
+        }
+        Ok(results)
+    }
+
     /// Unregister a workflow by reference
     pub async fn unregister_workflow(&self, ref_name: &str) -> Result<()> {
         debug!("Unregistering workflow: {}", ref_name);
@@ -281,6 +313,7 @@ impl WorkflowRegistrar {
     #[allow(clippy::too_many_arguments)]
     async fn create_companion_action(
         &self,
+        connection: &mut sqlx::PgConnection,
         workflow_def_id: i64,
         workflow: &WorkflowYaml,
         pack_id: i64,
@@ -321,10 +354,10 @@ impl WorkflowRegistrar {
             timeout_seconds: None,
         };
 
-        let action = ActionRepository::create(&self.pool, action_input).await?;
+        let action = ActionRepository::create(&mut *connection, action_input).await?;
 
         // Link the action to the workflow definition (sets workflow_def FK)
-        ActionRepository::link_workflow_def(&self.pool, action.id, workflow_def_id).await?;
+        ActionRepository::link_workflow_def(&mut *connection, action.id, workflow_def_id).await?;
 
         info!(
             "Created companion action '{}' (ID: {}) for workflow definition (ID: {})",
@@ -344,6 +377,7 @@ impl WorkflowRegistrar {
     #[allow(clippy::too_many_arguments)]
     async fn ensure_companion_action(
         &self,
+        connection: &mut sqlx::PgConnection,
         workflow_def_id: i64,
         workflow: &WorkflowYaml,
         pack_id: i64,
@@ -353,7 +387,7 @@ impl WorkflowRegistrar {
         effective_label: &str,
     ) -> Result<()> {
         let existing_action =
-            ActionRepository::find_by_workflow_def(&self.pool, workflow_def_id).await?;
+            ActionRepository::find_by_workflow_def(&mut *connection, workflow_def_id).await?;
 
         if let Some(action) = existing_action {
             // Update the existing companion action to stay in sync
@@ -388,7 +422,7 @@ impl WorkflowRegistrar {
                 timeout_seconds: None,
             };
 
-            ActionRepository::update(&self.pool, action.id, update_input).await?;
+            ActionRepository::update(&mut *connection, action.id, update_input).await?;
 
             debug!(
                 "Updated companion action '{}' (ID: {}) for workflow definition (ID: {})",
@@ -397,6 +431,7 @@ impl WorkflowRegistrar {
         } else {
             // Backfill: create companion action for pre-fix workflows
             self.create_companion_action(
+                &mut *connection,
                 workflow_def_id,
                 workflow,
                 pack_id,
@@ -417,8 +452,8 @@ impl WorkflowRegistrar {
     /// have been derived from the filename when the workflow YAML omits them).
     async fn create_workflow(
         &self,
+        connection: &mut sqlx::PgConnection,
         workflow: &WorkflowYaml,
-        _pack_name: &str,
         pack_id: i64,
         pack_ref: &str,
         effective_ref: &str,
@@ -441,7 +476,7 @@ impl WorkflowRegistrar {
             tags: workflow.tags.clone(),
         };
 
-        let created = WorkflowDefinitionRepository::create(&self.pool, input).await?;
+        let created = WorkflowDefinitionRepository::create(&mut *connection, input).await?;
 
         Ok(created.id)
     }
@@ -452,6 +487,7 @@ impl WorkflowRegistrar {
     /// have been derived from the filename when the workflow YAML omits them).
     async fn update_workflow(
         &self,
+        connection: &mut sqlx::PgConnection,
         workflow_id: &i64,
         workflow: &WorkflowYaml,
         _pack_ref: &str,
@@ -472,7 +508,8 @@ impl WorkflowRegistrar {
             tags: Some(workflow.tags.clone()),
         };
 
-        let updated = WorkflowDefinitionRepository::update(&self.pool, *workflow_id, input).await?;
+        let updated =
+            WorkflowDefinitionRepository::update(&mut *connection, *workflow_id, input).await?;
 
         Ok(updated.id)
     }
