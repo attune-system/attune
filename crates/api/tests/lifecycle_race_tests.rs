@@ -362,8 +362,9 @@ async fn server_rejected_file_commit_cleans_publication_and_database_rows() -> R
     let (_,_,bearer)=actor(&ctx,"commit_actor",json!([{ "resource":"actions", "actions":["create"], "constraints":{"pack_refs":[pack.r#ref]} }])).await?;
     sqlx::raw_sql("CREATE FUNCTION reject_workflow_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'owned injected commit rejection'; END $$; CREATE CONSTRAINT TRIGGER reject_workflow_commit AFTER INSERT ON workflow_definition DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_workflow_commit();").execute(&ctx.pool).await?;
     let response=ctx.post("/api/v1/packs/commit_failure/workflow-files",json!({"name":"rejected","pack_ref":pack.r#ref,"label":"Rejected","version":"1.0.0","definition":{"tasks":[]}}),Some(&bearer)).await?;
-    assert!(
-        response.status().is_server_error(),
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
         "{}",
         response.text().await?
     );

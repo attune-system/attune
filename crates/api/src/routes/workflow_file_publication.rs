@@ -83,6 +83,13 @@ impl PreparedWorkflowFiles {
         self.retained = true;
     }
 
+    pub(super) fn failed_commit(self, error: &sqlx::Error, workflow: i64) {
+        if !commit_was_rejected(error) {
+            self.uncertain(workflow);
+        }
+        // Only an established rejection drops the owner and removes its files.
+    }
+
     pub(super) fn uncertain(mut self, workflow: i64) {
         // Transport failure during COMMIT cannot prove rollback. Keep the files
         // and a private owned manifest for reconciliation instead of deleting a
@@ -128,6 +135,107 @@ impl Drop for PreparedWorkflowFiles {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Only explicitly recognized, ordinary PostgreSQL transaction rejections
+/// justify destructive cleanup. A Database ErrorResponse can also be FATAL or
+/// report an unknown transaction outcome, so its Rust variant is not proof.
+pub(super) fn commit_was_rejected(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|error| error.try_downcast_ref::<sqlx::postgres::PgDatabaseError>())
+        .is_some_and(|error| known_rejection_fields(error.severity(), error.code()))
+}
+
+fn known_rejection_fields(severity: sqlx::postgres::PgSeverity, code: &str) -> bool {
+    matches!(severity, sqlx::postgres::PgSeverity::Error)
+        && matches!(
+            code,
+            // Deferred integrity constraints.
+            "23502" | "23503" | "23505" | "23514" | "23P01"
+            // Recognized transaction rollback causes. In particular, do NOT
+            // include the whole class 40: 40003 means completion is unknown.
+            | "40001" | "40P01"
+            // Ordinary RAISE EXCEPTION from a deferred constraint trigger.
+            | "P0001"
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::postgres::PgSeverity;
+
+    #[test]
+    fn only_known_ordinary_transaction_rejections_allow_cleanup() {
+        for code in [
+            "23502", "23503", "23505", "23514", "23P01", "40001", "40P01", "P0001",
+        ] {
+            assert!(known_rejection_fields(PgSeverity::Error, code), "{code}");
+            assert!(
+                !known_rejection_fields(PgSeverity::Fatal, code),
+                "fatal {code}"
+            );
+            assert!(
+                !known_rejection_fields(PgSeverity::Panic, code),
+                "panic {code}"
+            );
+        }
+        for code in [
+            "08000", "08003", "08006", "08007", "08P01", "40003", "57P01", "57P02", "XX000",
+            "ZZZZZ",
+        ] {
+            assert!(!known_rejection_fields(PgSeverity::Error, code), "{code}");
+            assert!(
+                !known_rejection_fields(PgSeverity::Fatal, code),
+                "fatal {code}"
+            );
+        }
+        assert!(!known_rejection_fields(PgSeverity::Warning, "23505"));
+    }
+
+    #[test]
+    fn transport_uncertainty_preserves_published_files_and_private_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let mut files = PreparedWorkflowFiles::stage(
+            root.path(),
+            "pack",
+            "flow",
+            "tasks: []",
+            "workflow_file: workflows/flow.workflow.yaml",
+        )
+        .unwrap();
+        let stage = files.stage.as_ref().unwrap().path().to_owned();
+        files.publish().unwrap();
+        let error = sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "owned synthetic acknowledgement loss",
+        ));
+        assert!(!commit_was_rejected(&error));
+        files.failed_commit(&error, 42);
+        assert!(root.path().join("pack/actions/flow.yaml").exists());
+        assert!(root
+            .path()
+            .join("pack/actions/workflows/flow.workflow.yaml")
+            .exists());
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(stage.join("uncertain-commit.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["workflow_id"], 42);
+        assert_eq!(manifest["files"].as_array().unwrap().len(), 2);
+        root.close().unwrap();
+    }
+
+    #[test]
+    fn protocol_or_pool_errors_do_not_establish_transaction_rejection() {
+        for error in [
+            sqlx::Error::Protocol("owned uncertain completion".into()),
+            sqlx::Error::PoolTimedOut,
+            sqlx::Error::PoolClosed,
+        ] {
+            assert!(!commit_was_rejected(&error));
         }
     }
 }

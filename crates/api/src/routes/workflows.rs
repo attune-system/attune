@@ -976,10 +976,7 @@ async fn save_workflow_file_owned(
                     Ok(())
                 }
                 Err(error) => {
-                    if error.as_database_error().is_none() {
-                        files.uncertain(workflow_id);
-                    }
-                    // A server-rejected commit drops the owner and cleans its files.
+                    files.failed_commit(&error, workflow_id);
                     Err(ApiError::from(error))
                 }
             }

@@ -44,7 +44,7 @@ New workflow files use private owned staging and no-clobber links. A pre-commit
 failure or cancellation removes only files and empty directories created by
 that request. A tracked, resource-admitted owner finishes SQL COMMIT after file
 publication, even if the HTTP waiter disconnects; service shutdown joins it.
-A server-rejected commit cleans the files. A transport failure with an unknown
+Only recognized ordinary PostgreSQL transaction-rejection SQLSTATEs permit file cleanup; fatal or unfamiliar database responses retain custody too. A transport failure with an unknown
 commit outcome conservatively retains the publication and a private
 `uncertain-commit.json` manifest in its `.workflow-publication-*` directory for
 operator reconciliation. PostgreSQL and the filesystem do not form one atomic
