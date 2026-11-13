@@ -35,7 +35,10 @@ class CoreCompositionTests(unittest.TestCase):
                 self.assertEqual(len(list((owned / folder).glob("*.yaml"))), count, folder)
 
     def test_core_actions_need_only_native_and_have_no_script_fallback(self):
-        self.assertFalse(yaml.safe_load((CORE / "pack.yaml").read_text())["testing"]["enabled"])
+        manifest = yaml.safe_load((CORE / "pack.yaml").read_text())
+        self.assertEqual(manifest["runtime_deps"], ["native"])
+        self.assertFalse(manifest["testing"]["enabled"])
+        self.assertFalse(manifest["testing"].get("runners"))
         self.assertFalse(list((CORE / "actions").glob("*.py")))
         self.assertFalse(list((CORE / "actions").glob("*.sh")))
         for name in ("echo", "sleep", "noop"):

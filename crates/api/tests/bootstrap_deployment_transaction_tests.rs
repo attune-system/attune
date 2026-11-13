@@ -1279,3 +1279,132 @@ async fn bootstrap_fixed_approval_expiry_denies_readiness_and_replacement_withou
     ctx.cleanup().await?;
     Ok(())
 }
+
+/// Normal upload/admission metadata, without skip_tests and without any
+/// interpreter-capable worker. Compiled byte execution is exercised separately
+/// by the owned core_native_archive lane, not by an executable stand-in here.
+#[tokio::test]
+async fn core_native_only_worker_upload_admits_without_interpreter_test_dispatch() -> Result<()> {
+    use attune_common::{
+        models::{WorkerStatus, WorkerType},
+        repositories::{
+            action::ActionRepository,
+            identity::{
+                CreatePermissionAssignmentInput, PermissionAssignmentRepository,
+                PermissionSetRepository,
+            },
+            pack_install::PackInstallRepository,
+            runtime::{CreateWorkerInput, WorkerRepository},
+        },
+    };
+    let ctx = TestContext::new().await?.with_auth().await?;
+    PlatformCatalogRepository::reconcile(&ctx.pool).await?;
+    let administrator = PermissionSetRepository::find_by_ref(&ctx.pool, "core.admin")
+        .await?
+        .unwrap();
+    let identity = ctx.user.as_ref().unwrap();
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: identity.id,
+            permset: administrator.id,
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(identity.id).await;
+    let worker = WorkerRepository::create(
+        &ctx.pool,
+        CreateWorkerInput {
+            name: "owned-core-native-only".into(),
+            worker_type: WorkerType::Local,
+            runtime: None,
+            host: None,
+            port: None,
+            status: Some(WorkerStatus::Active),
+            capabilities: Some(json!({"runtimes":["native"]})),
+            meta: None,
+        },
+    )
+    .await?;
+    assert_eq!(
+        worker.capabilities.as_ref().unwrap()["runtimes"],
+        json!(["native"])
+    );
+    let source = actual_core_tree(&ctx.test_packs_dir.join("native-only-upload"))?;
+    let metadata: serde_json::Value =
+        serde_yaml_ng::from_str(&std::fs::read_to_string(source.join("pack.yaml"))?)?;
+    assert_eq!(metadata["runtime_deps"], json!(["native"]));
+    assert_eq!(metadata["testing"]["enabled"], false);
+    assert!(metadata["testing"].get("runners").is_none());
+    let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut archive = tar::Builder::new(gzip);
+    archive.append_dir_all("core", &source)?;
+    let archive = archive.into_inner()?.finish()?;
+    let boundary = "core-native-only-upload";
+    let mut body = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"absent_metadata_policy\"\r\n\r\nremove\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"pack\"; filename=\"core.tar.gz\"\r\nContent-Type: application/gzip\r\n\r\n").into_bytes();
+    body.extend_from_slice(&archive);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/v1/packs/upload")
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .header("authorization", format!("Bearer {}", ctx.token().unwrap()))
+        .body(axum::body::Body::from(body))?;
+    let response = helpers::TestResponse::new(ctx.app.clone().oneshot(request).await?);
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::CREATED,
+        "{}",
+        response.text().await?
+    );
+    let installed = PackRepository::find_by_ref(&ctx.pool, "core")
+        .await?
+        .unwrap();
+    assert_eq!(installed.runtime_deps, vec!["native"]);
+    assert_eq!(installed.version, "1.0.7");
+    let install = PackInstallRepository::new(ctx.pool.clone())
+        .find_latest_by_pack_ref("core")
+        .await?;
+    assert!(install.as_ref().is_none_or(
+        |install| install.assigned_worker_id.is_none() && install.test_execution_id.is_none()
+    ));
+    for reference in ["core.echo", "core.sleep", "core.noop"] {
+        let action = ActionRepository::find_by_ref(&ctx.pool, reference)
+            .await?
+            .unwrap();
+        assert_eq!(action.required_worker_runtimes, json!({}));
+        assert!(action.default_execution_permission_set_refs.is_empty());
+    }
+    for reference in [
+        "core.http_request",
+        "core.run_agent_command",
+        "core.install_packs",
+        "core.generate_ssh_key_pair",
+        "core.download_packs",
+        "core.get_pack_dependencies",
+        "core.build_pack_envs",
+        "core.register_packs",
+    ] {
+        assert!(ActionRepository::find_by_ref(&ctx.pool, reference)
+            .await?
+            .is_none());
+        let denied = ctx
+            .post(
+                "/api/v1/executions/execute",
+                json!({"action_ref":reference, "parameters":{}}),
+                ctx.token(),
+            )
+            .await?;
+        assert_eq!(
+            denied.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "{}",
+            denied.text().await?
+        );
+    }
+    ctx.cleanup().await?;
+    Ok(())
+}
