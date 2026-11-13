@@ -141,6 +141,21 @@ impl WorkflowRegistrar {
             WorkflowDefinitionRepository::find_by_ref(&mut *connection, &loaded.file.ref_name)
                 .await?;
 
+        let effective_ref = Self::effective_ref(loaded);
+        if !effective_ref.starts_with(&format!("{}.", pack.r#ref)) {
+            return Err(Error::validation(
+                "Workflow reference does not belong to its actual registration pack",
+            ));
+        }
+        if existing_workflow
+            .as_ref()
+            .is_some_and(|workflow| workflow.pack != pack.id || workflow.pack_ref != pack.r#ref)
+        {
+            return Err(Error::validation(
+                "Workflow structural pack differs from the authorized registration pack",
+            ));
+        }
+
         let mut warnings = Vec::new();
 
         // Add validation warning if present
@@ -165,7 +180,6 @@ impl WorkflowRegistrar {
         // Resolve effective ref/label — prefer workflow YAML values, fall
         // back to filename-derived values for action-linked workflow files
         // that omit action-level metadata.
-        let effective_ref = Self::effective_ref(loaded);
         let effective_label = Self::effective_label(loaded);
 
         let (workflow_def_id, created) = if let Some(existing) = existing_workflow {
@@ -390,6 +404,15 @@ impl WorkflowRegistrar {
             ActionRepository::find_by_workflow_def(&mut *connection, workflow_def_id).await?;
 
         if let Some(action) = existing_action {
+            if action.pack != pack_id
+                || action.pack_ref != pack_ref
+                || action.r#ref != effective_ref
+            {
+                return Err(Error::validation(
+                    "Workflow companion differs from the authorized registration target",
+                ));
+            }
+
             // Update the existing companion action to stay in sync
             let update_input = UpdateActionInput {
                 output_policy: Default::default(),

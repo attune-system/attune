@@ -468,3 +468,44 @@ async fn disconnected_file_waiter_does_not_cancel_commit_owner() -> Result<()> {
     ctx.cleanup().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn sync_cannot_mutate_a_workflow_structurally_owned_by_an_adjacent_pack() -> Result<()> {
+    use attune_common::repositories::workflow::WorkflowDefinitionRepository;
+    let ctx = TestContext::new().await?;
+    let allowed = helpers::create_test_pack(&ctx.pool, "sync_allowed").await?;
+    let adjacent = helpers::create_test_pack(&ctx.pool, "sync_adjacent").await?;
+    helpers::create_test_action(&ctx.pool, allowed.id, &allowed.r#ref, "sync_allowed.action")
+        .await?;
+    let foreign = helpers::create_test_workflow(
+        &ctx.pool,
+        adjacent.id,
+        &adjacent.r#ref,
+        "sync_allowed.foreign",
+    )
+    .await?;
+    let (_,_,bearer)=actor(&ctx,"sync_installer",json!([{ "resource":"packs", "actions":["install"], "constraints":{"refs":[allowed.r#ref]} }])).await?;
+    let directory = ctx.test_packs_dir.join("sync_allowed/workflows");
+    std::fs::create_dir_all(&directory)?;
+    std::fs::write(directory.join("foreign.yaml"),"ref: sync_allowed.foreign\nlabel: Must not replace foreign owner\nversion: '1.0.0'\ntasks:\n  - name: run\n    action: sync_allowed.action\n")?;
+    let response = ctx
+        .post(
+            "/api/v1/packs/sync_allowed/workflows/sync",
+            json!({}),
+            Some(&bearer),
+        )
+        .await?;
+    assert!(
+        response.status().is_client_error(),
+        "{}",
+        response.text().await?
+    );
+    let unchanged = WorkflowDefinitionRepository::find_by_ref(&ctx.pool, "sync_allowed.foreign")
+        .await?
+        .unwrap();
+    assert_eq!(unchanged.pack, adjacent.id);
+    assert_eq!(unchanged.updated, foreign.updated);
+    assert_eq!(unchanged.definition, foreign.definition);
+    ctx.cleanup().await?;
+    Ok(())
+}
