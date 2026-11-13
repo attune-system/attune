@@ -381,39 +381,39 @@ mod tests {
             "LD_PRELOAD",
             "LD_LIBRARY_PATH",
             "DYLD_INSERT_LIBRARIES",
-            "GOENV"
-                | "GOFLAGS"
-                | "GOROOT"
-                | "GOPATH"
-                | "GOTOOLCHAIN"
-                | "GOWORK"
-                | "GOMODCACHE"
-                | "GOCACHE"
-                | "GOTMPDIR"
-                | "GODEBUG"
-                | "CC"
-                | "CXX"
-                | "AR"
-                | "PKG_CONFIG"
-                | "PKG_CONFIG_PATH"
-                | "COMPILER_PATH"
-                | "GCC_EXEC_PREFIX"
-                | "LIBRARY_PATH"
-                | "CPATH"
-                | "C_INCLUDE_PATH"
-                | "CPLUS_INCLUDE_PATH"
-                | "GLIBC_TUNABLES"
-                | "LIBPATH"
-                | "SHLIB_PATH"
-                | "PS0"
-                | "PS1"
-                | "PS2"
-                | "PS3"
-                | "PS4"
-                | "PROMPT_COMMAND"
-                | "INPUTRC"
-                | "HISTFILE"
-                | "PATH",
+            "GOENV",
+            "GOFLAGS",
+            "GOROOT",
+            "GOPATH",
+            "GOTOOLCHAIN",
+            "GOWORK",
+            "GOMODCACHE",
+            "GOCACHE",
+            "GOTMPDIR",
+            "GODEBUG",
+            "CC",
+            "CXX",
+            "AR",
+            "PKG_CONFIG",
+            "PKG_CONFIG_PATH",
+            "COMPILER_PATH",
+            "GCC_EXEC_PREFIX",
+            "LIBRARY_PATH",
+            "CPATH",
+            "C_INCLUDE_PATH",
+            "CPLUS_INCLUDE_PATH",
+            "GLIBC_TUNABLES",
+            "LIBPATH",
+            "SHLIB_PATH",
+            "PS0",
+            "PS1",
+            "PS2",
+            "PS3",
+            "PS4",
+            "PROMPT_COMMAND",
+            "INPUTRC",
+            "HISTFILE",
+            "PATH",
             "HOME",
             "ATTUNE_API_TOKEN",
             "attune_api_token",
