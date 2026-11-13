@@ -19,6 +19,15 @@ pub fn validate_execution_env_var(name: &str, value: &str) -> crate::Result<()> 
     Ok(())
 }
 
+/// Admission metadata alone must not turn a native runtime into a shell wrapper.
+/// Preserve the existing treatment of all actual/unknown process configuration.
+pub fn has_runtime_process_configuration(config: &serde_json::Value) -> bool {
+    config
+        .as_object()
+        .map(|config| config.keys().any(|key| key != "permitted_caller_env"))
+        .unwrap_or(true)
+}
+
 /// Caller values may never change runtime startup, code loading or worker context.
 /// Case folding also protects Windows' case-insensitive environment namespace.
 pub fn validate_caller_env_name(name: &str) -> crate::Result<()> {
@@ -328,6 +337,20 @@ fn inspect_tasks(tasks: Option<&serde_json::Value>, path: &str, errors: &mut Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caller_policy_metadata_does_not_reclassify_native_runtimes() {
+        assert!(!has_runtime_process_configuration(&serde_json::json!({})));
+        assert!(!has_runtime_process_configuration(
+            &serde_json::json!({"permitted_caller_env":["APP_REGION"]})
+        ));
+        assert!(has_runtime_process_configuration(
+            &serde_json::json!({"permitted_caller_env":["APP_REGION"], "interpreter":{"binary":"python3"}})
+        ));
+        assert!(has_runtime_process_configuration(
+            &serde_json::json!({"env_vars":{"PYTHONPATH":"operator/lib"}})
+        ));
+    }
 
     #[test]
     fn pack_preflight_validates_caller_policy_in_parent_and_version_metadata() {

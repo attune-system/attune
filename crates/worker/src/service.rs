@@ -383,7 +383,7 @@ impl WorkerService {
         // Load runtimes from the database and create ProcessRuntime instances.
         // Each runtime row's `execution_config` JSONB drives how the ProcessRuntime
         // invokes interpreters, manages environments, and installs dependencies.
-        // We skip runtimes with empty execution_config (e.g., core.native) since
+        // We skip empty or admission-metadata-only configs (e.g., core.native) since
         // they execute binaries directly and don't need a ProcessRuntime wrapper.
         match RuntimeRepository::list(&pool).await {
             Ok(db_runtimes) => {
@@ -397,7 +397,9 @@ impl WorkerService {
                         // empty JSON object that deserializes to defaults with no
                         // file_extension — those are not real process runtimes).
                         config.interpreter.file_extension.is_some()
-                            || r.execution_config != serde_json::json!({})
+                            || attune_common::execution_env::has_runtime_process_configuration(
+                                &r.execution_config,
+                            )
                     })
                     .collect();
 
