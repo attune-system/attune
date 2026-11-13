@@ -885,36 +885,23 @@ pub async fn update_rule(
         .await?;
     }
 
-    let permission_refs_to_validate = match &request.permission_set_refs {
-        Some(Some(refs)) => Some(refs.clone()),
-        Some(None) => Some(action.default_execution_permission_set_refs.clone()),
-        None if request.action_ref.is_some() => {
-            // Action is changing — re-validate the effective permissions (either the
-            // rule's explicit override or the new action's defaults) to prevent a user
-            // from redirecting privileged permissions to an action they control.
-            Some(
-                existing_rule
-                    .permission_set_refs
-                    .clone()
-                    .unwrap_or_else(|| action.default_execution_permission_set_refs.clone()),
-            )
-        }
-        None => None,
-    };
-    if let Some(permission_refs_to_validate) = permission_refs_to_validate {
-        if existing_rule.is_adhoc
-            && !permission_refs_to_validate.is_empty()
-            && !state
-                .authorization_service()
-                .can_delegate_permission_sets(&user, &permission_refs_to_validate)
-                .await?
-        {
-            return Err(ApiError::Forbidden(
-                "Cannot update rule with execution permission sets beyond current access"
-                    .to_string(),
-            ));
-        }
-    }
+    // Behavioral edits can spend the retained owner's authority even when neither
+    // the action nor the selected refs changes. Attribution is never authority.
+    let behavioral_edit = request.action_ref.is_some()
+        || request.trigger_ref.is_some()
+        || request.conditions.is_some()
+        || request.action_params.is_some()
+        || request.trigger_params.is_some()
+        || request.trace_tag_template.is_some()
+        || request.permission_set_refs.is_some();
+    let editor_snapshot =
+        if behavioral_edit {
+            Some(authz.load_snapshot(&user).await?.ok_or_else(|| {
+                ApiError::Forbidden("Rule editing authority is unavailable".into())
+            })?)
+        } else {
+            None
+        };
 
     let authorized_rule_id = existing_rule.id;
     let authorized_rule_pack = existing_rule.pack;
@@ -969,6 +956,127 @@ pub async fn update_rule(
         "rule",
         &existing_rule.r#ref,
     )?;
+    if let Some(snapshot) = editor_snapshot {
+        let snapshot = if user.claims.token_type == TokenType::Execution {
+            // Retain the credential's own caps, including its attempt fence;
+            // same-subject execution credentials never borrow sponsor IAM.
+            crate::authz::AuthorizationService::retain_legacy_execution_snapshot_on(&mut tx, &user)
+                .await?
+                .0
+        } else {
+            snapshot
+        };
+        let mut context = AuthorizationContext::new(identity_id);
+        context.identity_attributes = snapshot.identity_attributes.clone();
+        context.target_id = Some(action.id);
+        context.target_ref = Some(action.r#ref.clone());
+        context.pack_ref = Some(action.pack_ref.clone());
+        context.managing_pack_id =
+            attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+                &mut *tx,
+                attune_common::repositories::runtime_target::ComponentTarget::Action,
+                action.id,
+            )
+            .await?;
+        authz.authorize_with_snapshot(
+            &user,
+            Some(&snapshot),
+            AuthorizationCheck {
+                resource: Resource::Actions,
+                action: Action::Execute,
+                context,
+            },
+        )?;
+        let refs = request
+            .permission_set_refs
+            .as_ref()
+            .unwrap_or(&existing_rule.permission_set_refs)
+            .clone()
+            .unwrap_or_else(|| action.default_execution_permission_set_refs.clone());
+        if user.claims.token_type == TokenType::Execution
+            && refs.iter().any(|reference| reference == "standard")
+            && !crate::authz::execution_has_standard_access(&user)
+        {
+            return Err(ApiError::Forbidden(
+                "Rule cannot acquire standard access absent from editor credential".into(),
+            ));
+        }
+        if !authz
+            .can_delegate_permission_sets_on(&mut tx, &user, &refs)
+            .await?
+        {
+            return Err(ApiError::Forbidden(
+                "Rule execution permissions exceed editor authority".into(),
+            ));
+        }
+        let caller = attune_common::delegation::DelegationAuthority::new(
+            identity_id,
+            snapshot.identity_attributes.clone(),
+            snapshot.grants.clone(),
+        );
+        attune_common::repositories::rule_authority::RuleAuthorityRepository::require_mutation_authority(
+            &mut tx, &existing_rule, &caller,
+        ).await?;
+        let inputs = serde_json::json!([
+            request
+                .conditions
+                .as_ref()
+                .unwrap_or(&existing_rule.conditions),
+            request
+                .action_params
+                .as_ref()
+                .unwrap_or(&existing_rule.action_params),
+            request
+                .trigger_params
+                .as_ref()
+                .unwrap_or(&existing_rule.trigger_params),
+            request
+                .trace_tag_template
+                .as_ref()
+                .unwrap_or(&existing_rule.trace_tag_template),
+        ]);
+        // Configuration may contain indirect selectors or protected values. A
+        // write must not render/decrypt it, or infer retained authority from the
+        // current authoring schema. Such edits need an explicit admission path.
+        if attune_common::template_resolver::references_pack_configuration(&inputs) {
+            return Err(ApiError::Forbidden(
+                "Rule edits with pack configuration inputs require explicit input admission".into(),
+            ));
+        }
+        let expressions = attune_common::template_resolver::referenced_keystore_expressions(
+            &inputs,
+            &attune_common::template_resolver::TemplateContext::new(
+                serde_json::json!({}),
+                serde_json::json!({}),
+                serde_json::json!({}),
+            ),
+        )
+        .map_err(|_| {
+            ApiError::Forbidden("Rule input selectors cannot be authorized statically".into())
+        })?;
+        let refs = expressions
+            .into_values()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let (keys, ownership) =
+            attune_common::repositories::iam_ownership::VerifiedKeyOrigins::keys_by_refs(
+                &mut *tx, &refs,
+            )
+            .await?;
+        if keys.len() != refs.len()
+            || keys.iter().any(|key| {
+                let origin = attune_common::key_access::key_origin(key);
+                !caller.key_allows_verified(&origin, Action::Read, &ownership)
+                    || key.encrypted
+                        && !caller.key_allows_verified(&origin, Action::Decrypt, &ownership)
+            })
+        {
+            return Err(ApiError::Forbidden(
+                "Rule input sources exceed editor authority".into(),
+            ));
+        }
+    }
     if existing_rule.is_adhoc && (request.action_params.is_some() || request.action_ref.is_some()) {
         validate_rule_params_with_registry(
             &mut tx,

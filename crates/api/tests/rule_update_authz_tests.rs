@@ -115,7 +115,8 @@ async fn rule_writes_store_key_templates_and_reject_literal_secret_parameters() 
                 {"resource":"rules","actions":["read","create","update"]},
                 {"resource":"actions","actions":["read","execute"]},
                 {"resource":"triggers","actions":["read"]},
-                {"resource":"packs","actions":["read"]}
+                {"resource":"packs","actions":["read"]},
+                {"resource":"keys","actions":["read","decrypt"]}
             ]),
         },
     )
@@ -152,6 +153,7 @@ async fn rule_writes_store_key_templates_and_reject_literal_secret_parameters() 
         assert_eq!(unchanged.action_params, json!({}));
         assert_eq!(unchanged.trigger_params, json!({}));
     }
+    seed_input_key(&ctx).await?;
     let selector = json!({"credential":"{{ keystore['system.api_token'] }}"});
     ctx.put(
         &format!("/api/v1/rules/{rule_ref}"),
@@ -242,7 +244,7 @@ async fn execution_token_with_rules_update_permission_can_update_trace_tag_templ
             pack_ref: None,
             label: Some("Rule update".to_string()),
             description: None,
-            grants: json!([{ "resource": "rules", "actions": ["update"] }]),
+            grants: json!([{ "resource": "rules", "actions": ["update"] }, {"resource":"actions","actions":["execute"]}]),
         },
     )
     .await?;
@@ -276,6 +278,197 @@ async fn execution_token_with_rules_update_permission_can_update_trace_tag_templ
         Some("authorized-change")
     );
 
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+async fn seed_input_key(ctx: &TestContext) -> Result<()> {
+    use attune_common::{
+        models::OwnerType,
+        repositories::key::{CreateKeyInput, KeyRepository},
+    };
+    KeyRepository::create(
+        &ctx.pool,
+        CreateKeyInput {
+            local_ref: "api_token".into(),
+            owner_type: OwnerType::System,
+            owner_identity: None,
+            owner_pack: None,
+            owner_pack_ref: None,
+            owner_action: None,
+            owner_action_ref: None,
+            owner_sensor: None,
+            owner_sensor_ref: None,
+            name: "Input fixture".into(),
+            encrypted: true,
+            encryption_key_hash: Some("fixture-unusable".into()),
+            // Intentionally not decryptable: write admission must inspect metadata only.
+            value: json!("not-ciphertext"),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn behavioral_edits_require_actual_editor_authority_even_for_same_subject_tokens(
+) -> Result<()> {
+    use attune_common::{
+        auth::jwt::{generate_token, TokenType},
+        repositories::{rule::UpdateRuleInput, Patch, Update},
+    };
+    let ctx = TestContext::new().await?;
+    let (rule_ref, owner) = seed_rule_and_identity(&ctx, "sponsor").await?;
+    let rule = RuleRepository::find_by_ref(&ctx.pool, &rule_ref)
+        .await?
+        .unwrap();
+    seed_input_key(&ctx).await?;
+    let privileged = create_test_action(
+        &ctx.pool,
+        rule.pack.unwrap(),
+        &rule.pack_ref,
+        &format!("{}.privileged", rule.pack_ref),
+    )
+    .await?;
+    let admin = PermissionSetRepository::create(
+        &ctx.pool,
+        CreatePermissionSetInput {
+            r#ref: "test.sponsor_admin".into(),
+            pack: None,
+            pack_ref: None,
+            label: None,
+            description: None,
+            grants: json!([
+                {"resource":"rules","actions":["update"]},
+                {"resource":"actions","actions":["execute"]},
+                {"resource":"keys","actions":["read","decrypt"]}
+            ]),
+        },
+    )
+    .await?;
+    let narrow = PermissionSetRepository::create(&ctx.pool, CreatePermissionSetInput {
+        r#ref: "test.narrow_editor".into(), pack: None, pack_ref: None, label: None, description: None,
+        grants: json!([
+            {"resource":"rules","actions":["update"]},
+            {"resource":"actions","actions":["execute"],"constraints":{"refs":[rule.action_ref]}}
+        ]),
+    }).await?;
+    let editor = IdentityRepository::create(
+        &ctx.pool,
+        CreateIdentityInput {
+            login: "different_editor".into(),
+            display_name: None,
+            attributes: json!({}),
+            password_hash: None,
+        },
+    )
+    .await?;
+    for (identity, permset) in [
+        (owner, admin.id),
+        (owner, narrow.id),
+        (editor.id, narrow.id),
+    ] {
+        PermissionAssignmentRepository::create(
+            &ctx.pool,
+            CreatePermissionAssignmentInput { identity, permset },
+        )
+        .await?;
+    }
+    RuleRepository::update(
+        &ctx.pool,
+        rule.id,
+        UpdateRuleInput {
+            owner_identity: Some(Patch::Set(owner)),
+            permission_set_refs: Some(Patch::Set(vec![])),
+            ..Default::default()
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
+    let tokens = [
+        generate_token(
+            editor.id,
+            "different_editor",
+            &jwt_config(),
+            TokenType::Access,
+        )?,
+        helpers::delegated_source::token(&ctx, owner, &[narrow.r#ref.clone()]).await?,
+    ];
+    for token in &tokens {
+        for change in [
+            json!({"action_ref":privileged.r#ref}),
+            json!({"action_params":{"credential":"{{ keystore['system.api_token'] }}"}}),
+            json!({"trigger_params":{"credential":"{{ keystore['system.api_token'] }}"}}),
+            json!({"trace_tag_template":"{{ keystore['system.api_token'] }}"}),
+            json!({"permission_set_refs":[admin.r#ref]}),
+        ] {
+            ctx.put(&format!("/api/v1/rules/{rule_ref}"), change, Some(token))
+                .await?
+                .assert_status(StatusCode::FORBIDDEN);
+        }
+        ctx.put(
+            &format!("/api/v1/rules/{rule_ref}"),
+            json!({"label":"Editorial change"}),
+            Some(token),
+        )
+        .await?
+        .assert_status(StatusCode::OK);
+        ctx.put(
+            &format!("/api/v1/rules/{rule_ref}"),
+            json!({"action_params":{"message":"covered"},"conditions":{}}),
+            Some(token),
+        )
+        .await?
+        .assert_status(StatusCode::OK);
+    }
+    // A retained named selection is checked for every behavioral edit, including
+    // conditions and trace, even when the request does not mention the selection.
+    RuleRepository::update(
+        &ctx.pool,
+        rule.id,
+        UpdateRuleInput {
+            permission_set_refs: Some(Patch::Set(vec![admin.r#ref.clone()])),
+            ..Default::default()
+        },
+    )
+    .await?;
+    for token in &tokens {
+        for change in [
+            json!({"conditions":{}}),
+            json!({"trace_tag_template":"changed"}),
+            json!({"action_params":{}}),
+        ] {
+            ctx.put(&format!("/api/v1/rules/{rule_ref}"), change, Some(token))
+                .await?
+                .assert_status(StatusCode::FORBIDDEN);
+        }
+        ctx.put(
+            &format!("/api/v1/rules/{rule_ref}"),
+            json!({"label":"Still editable"}),
+            Some(token),
+        )
+        .await?
+        .assert_status(StatusCode::OK);
+    }
+    let owner_token = generate_token(
+        owner,
+        "rule_authz_sponsor",
+        &jwt_config(),
+        TokenType::Access,
+    )?;
+    ctx.put(
+        &format!("/api/v1/rules/{rule_ref}"),
+        json!({"action_ref":privileged.r#ref,
+        "action_params":{"credential":"{{ keystore['system.api_token'] }}"}}),
+        Some(&owner_token),
+    )
+    .await?
+    .assert_status(StatusCode::OK);
+    let stored = RuleRepository::find_by_ref(&ctx.pool, &rule_ref)
+        .await?
+        .unwrap();
+    assert_eq!(stored.owner_identity, Some(owner));
+    assert_eq!(stored.permission_set_refs, Some(vec![admin.r#ref]));
     ctx.cleanup().await?;
     Ok(())
 }
