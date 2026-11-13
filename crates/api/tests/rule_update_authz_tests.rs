@@ -496,16 +496,72 @@ async fn behavioral_edits_require_actual_editor_authority_even_for_same_subject_
         .await?
         .assert_status(StatusCode::OK);
     }
-    // Retained configuration, not current conf_schema, supplies input metadata.
-    let pack =
+    // A mixed public/protected retained binding lets public selectors pass with
+    // Read alone; secret selectors require Decrypt without restoring the value.
+    let mut pack =
         attune_common::repositories::pack::PackRepository::find_by_ref(&ctx.pool, &rule.pack_ref)
             .await?
             .unwrap();
+    pack.conf_schema =
+        json!({"public_name":{"type":"string"},"private_name":{"type":"string","secret":true}});
     let mut tx = ctx.pool.begin().await?;
     attune_common::repositories::component_configuration::ComponentConfigurationRepository::bind_pack(
-        &mut tx, &pack, Some(&json!({"public_name":"fixture"})), ctx.state.config.security.encryption_key.as_deref(),
+        &mut tx, &pack, Some(&json!({"public_name":"fixture","private_name":"test-only-config"})), ctx.state.config.security.encryption_key.as_deref(),
     ).await?;
     tx.commit().await?;
+    let config_read = PermissionSetRepository::create(&ctx.pool,CreatePermissionSetInput {
+        r#ref: "test.config_read".into(),pack: None,pack_ref: None,label: None,description: None,
+        grants: json!([{"resource":"packs","actions":["read"],"constraints":{"refs":[rule.pack_ref]}}]),
+    }).await?;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: editor.id,
+            permset: config_read.id,
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
+    let config_token = generate_token(
+        editor.id,
+        "different_editor",
+        &jwt_config(),
+        TokenType::Access,
+    )?;
+    for expression in [
+        "{{ pack.config.public_name }}",
+        "{{ pack['config']['public_name'] }}",
+    ] {
+        ctx.put(
+            &format!("/api/v1/rules/{rule_ref}"),
+            json!({"action_ref":rule.action_ref,"permission_set_refs":[],
+            "action_params":{"message":expression}}),
+            Some(&config_token),
+        )
+        .await?
+        .assert_status(StatusCode::OK);
+    }
+    for expression in ["{{ pack.config.private_name }}", "{{ pack.config }}"] {
+        ctx.put(
+            &format!("/api/v1/rules/{rule_ref}"),
+            json!({"action_params":{"message":expression}}),
+            Some(&config_token),
+        )
+        .await?
+        .assert_status(StatusCode::FORBIDDEN);
+    }
+    // Standard on an unrelated source credential cannot widen to this rule's
+    // action/pack, even when that credential can Execute the action itself.
+    let standard_token =
+        helpers::delegated_source::token(&ctx, owner, &[narrow.r#ref.clone(), "standard".into()])
+            .await?;
+    ctx.put(
+        &format!("/api/v1/rules/{rule_ref}"),
+        json!({"permission_set_refs":["standard"]}),
+        Some(&standard_token),
+    )
+    .await?
+    .assert_status(StatusCode::FORBIDDEN);
     let owner_token = generate_token(
         owner,
         "rule_authz_sponsor",
@@ -514,7 +570,7 @@ async fn behavioral_edits_require_actual_editor_authority_even_for_same_subject_
     )?;
     ctx.put(
         &format!("/api/v1/rules/{rule_ref}"),
-        json!({"action_ref":privileged.r#ref,
+        json!({"action_ref":privileged.r#ref,"permission_set_refs":[admin.r#ref],
         "action_params":{"credential":"{{ keystore['system.api_token'] }}"}}),
         Some(&owner_token),
     )

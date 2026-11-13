@@ -1017,6 +1017,16 @@ pub async fn update_rule(
                 "Rule cannot acquire standard access absent from editor credential".into(),
             ));
         }
+        if user.claims.token_type == TokenType::Execution
+            && refs.iter().any(|reference| reference == "standard")
+        {
+            let owners = crate::authz::execution_standard_owner_refs(&user);
+            if !owners.contains(&action.r#ref) || !owners.contains(&action.pack_ref) {
+                return Err(ApiError::Forbidden(
+                    "Rule standard scope exceeds editor credential".into(),
+                ));
+            }
+        }
         if !authz
             .can_delegate_permission_sets_on(&mut tx, &user, &refs)
             .await?
@@ -1047,20 +1057,50 @@ pub async fn update_rule(
                 .unwrap_or(&existing_rule.trace_tag_template),
         ]);
         // Direct config sources retain their configuration contract. Match
-        // runtime Pack Read/Decrypt authority without restoring any values.
+        // Pack Read, plus Decrypt for selected protected paths, without restoring values.
         if attune_common::template_resolver::references_pack_configuration(&inputs) {
             let pack_id = existing_rule.pack;
             let revision = attune_common::repositories::component_configuration::ComponentConfigurationRepository::current(
                 &mut *tx, "pack", pack_id,
             ).await?.ok_or_else(|| ApiError::Forbidden("Rule configuration binding is unavailable".into()))?;
-            revision.contract()?;
+            let contract = revision.contract()?;
+            let compiled =
+                attune_common::value_schema::CompiledContract::new(&contract).map_err(|_| {
+                    ApiError::Forbidden("Rule configuration contract is unavailable".into())
+                })?;
+            let mut secret_paths = compiled.secret_paths(&revision.config).map_err(|_| {
+                ApiError::Forbidden("Rule configuration projection is unavailable".into())
+            })?;
+            let stored = attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::find_stored_by_entity(
+                &mut *tx,
+                attune_common::repositories::component_configuration::ENTITY_COMPONENT_CONFIGURATION,
+                revision.id,
+            ).await?;
+            secret_paths.extend(stored.into_iter().map(|secret| secret.json_path));
+            // Analyze selector sensitivity using only path metadata and an empty
+            // context. Never restore or evaluate actual configuration values.
+            let source_context = attune_common::template_resolver::TemplateContext::new(
+                serde_json::json!({}),
+                serde_json::json!({}),
+                serde_json::json!({}),
+            )
+            .with_bound_pack_config_secret_paths(revision.id, secret_paths);
+            let protected = !attune_common::template_resolver::resolve_templates_with_sensitivity(
+                &inputs,
+                &source_context,
+            )
+            .map_err(|_| {
+                ApiError::Forbidden("Rule configuration selectors cannot be authorized".into())
+            })?
+            .secret_paths
+            .is_empty();
             let mut context = AuthorizationContext::new(identity_id);
             context.target_id = Some(pack_id);
             context.target_ref = Some(existing_rule.pack_ref.clone());
             context.pack_ref = Some(existing_rule.pack_ref.clone());
             context.managing_pack_id = Some(pack_id);
             if !caller.allows(Resource::Packs, Action::Read, context.clone())
-                || !caller.allows(Resource::Packs, Action::Decrypt, context)
+                || protected && !caller.allows(Resource::Packs, Action::Decrypt, context)
             {
                 return Err(ApiError::Forbidden(
                     "Rule configuration inputs exceed editor authority".into(),
