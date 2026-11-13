@@ -47,6 +47,50 @@ pub async fn assert_service_iam_rejected(
         authz.can_delegate_permission_sets(&recorded, &[]).await,
         Err(ApiError::Unauthorized(_))
     ));
+    recorded.claims.metadata = Some(json!({
+        "authority_source":"pack", "execution_id":7, "action_ref":"fixture.action",
+        "runtime_authority": {"execution_id":7, "admission_id":8,
+            "sponsor_identity_id":snapshot.identity_id, "action_ref":"fixture.action",
+            "attempt":uuid::Uuid::new_v4()}
+    }));
+    assert!(matches!(
+        authz.authorize(&recorded, check()).await,
+        Err(ApiError::Forbidden(_))
+    ));
+    assert!(matches!(
+        authz.load_snapshot(&recorded).await,
+        Err(ApiError::Forbidden(_))
+    ));
+    assert!(matches!(
+        authz.authorize_with_snapshot(&recorded, Some(&snapshot), check()),
+        Err(ApiError::Forbidden(_))
+    ));
+    assert!(matches!(
+        authz.effective_grants(&recorded).await,
+        Err(ApiError::Forbidden(_))
+    ));
+    assert!(matches!(
+        authz.resolved_grants(&recorded).await,
+        Err(ApiError::Forbidden(_))
+    ));
+    assert!(matches!(
+        authz.can_delegate_permission_sets(&recorded, &[]).await,
+        Err(ApiError::Forbidden(_))
+    ));
+    assert!(matches!(
+        authz
+            .can_delegate_permission_sets_with_snapshot(&recorded, Some(&snapshot), &[])
+            .await,
+        Err(ApiError::Forbidden(_))
+    ));
+    let mut tx = ctx.pool.begin().await?;
+    assert!(matches!(
+        authz
+            .can_delegate_permission_sets_on(&mut tx, &recorded, &[])
+            .await,
+        Err(ApiError::Forbidden(_))
+    ));
+    tx.rollback().await?;
     let mut other = access_user.clone();
     other.claims.sub = (snapshot.identity_id + 1).to_string();
     assert!(matches!(
