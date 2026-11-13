@@ -1656,14 +1656,15 @@ impl ActionExecutor {
         preparation: &ExecutionPreparation,
         authority: attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority,
     ) -> Result<ExecutionLogArtifacts> {
-        // Recorded registration establishes delivery authority even for silent
-        // code. The delegated attempt was started before preparation.
+        // Revalidate live launch authority after runtime/worker lookup awaits,
+        // including silent tokenless actions. Mode reuse only selects a validator.
         // Per-stream metadata is deferred to the first nonempty write.
-        let delivery = crate::completion::register(
+        let delivery = crate::completion::register_for_launch(
             &self.pool,
             execution,
             self.worker_id.load(Ordering::Acquire),
             self.worker_instance,
+            Some(authority),
         )
         .await?;
         // Mode is immutable metadata, not a grant. existing_authority checked

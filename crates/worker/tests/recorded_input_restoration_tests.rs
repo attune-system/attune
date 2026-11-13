@@ -595,7 +595,7 @@ async fn delivery_mode_probe_never_downgrades_revoked_recorded_authority() {
 }
 
 #[tokio::test]
-async fn delegated_delivery_mode_probe_has_no_effect_and_does_not_authorize_launch() {
+async fn delegated_registration_requires_live_owner_even_without_delivery() {
     use attune_common::repositories::{
         delegated_execution::DelegatedExecutionRepository as Delegated,
         worker_delivery::WorkerDeliveryRepository, FindById,
@@ -640,8 +640,7 @@ async fn delegated_delivery_mode_probe_has_no_effect_and_does_not_authorize_laun
     )
     .await
     .unwrap();
-    // Classification may still say "delegated" after revocation. It grants no
-    // delivery context and must never replace the worker's live launch check.
+    // The recorded-delivery no-op must still check live launch authority.
     assert!(attune_worker::completion::register(
         fixture.db.pool(),
         &execution,
@@ -649,8 +648,7 @@ async fn delegated_delivery_mode_probe_has_no_effect_and_does_not_authorize_laun
         uuid::Uuid::new_v4(),
     )
     .await
-    .unwrap()
-    .is_none());
+    .is_err());
     let mut tx = fixture.db.begin().await.unwrap();
     assert!(Admission::existing_authority(&mut tx, execution.id)
         .await
@@ -664,3 +662,8 @@ async fn delegated_delivery_mode_probe_has_no_effect_and_does_not_authorize_laun
     tx.rollback().await.unwrap();
     fixture.db.cleanup().await.unwrap();
 }
+
+// These launch-boundary cases execute a real POSIX shell child.
+#[cfg(unix)]
+#[path = "support/preparation_revocation.rs"]
+mod preparation_revocation;
