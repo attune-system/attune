@@ -1122,7 +1122,6 @@ impl Default for ArtifactsConfig {
     fn default() -> Self {
         Self {
             legacy_audit_controller: None,
-            local_source_roots: Vec::new(),
             transport: crate::artifact_transport::TransportMode::Auto,
             max_upload_size: default_max_upload_size(),
             protected_file_memory_budget_bytes: default_protected_file_memory_budget_bytes(),

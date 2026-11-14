@@ -1033,15 +1033,7 @@ async fn pack_create_cannot_bypass_namespace_claim_authority() -> Result<()> {
     assert_eq!(pack.installed_by, Some(identity));
     let (other, _) = register_pack_role_user(&ctx, "core.editor").await?;
     let source = create_test_pack_dir("created_claim", "1.0.0")?;
-    let response = ctx
-        .post(
-            "/api/v1/packs/register",
-            json!({
-                "path": source.path().to_string_lossy(), "force": true, "skip_tests": true,
-            }),
-            Some(&other),
-        )
-        .await?;
+    let response = upload_test_pack_with_token(&ctx, source.path(), true, &other).await?;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     ctx.cleanup().await?;
     Ok(())
@@ -5099,6 +5091,39 @@ async fn missing_legacy_pack_bytes_fail_closed_without_a_fake_release() -> Resul
 async fn local_source_ingestion_requires_operator_roots_and_global_authority() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let source = create_test_pack_dir("local_confinement", "1.0.0")?;
+    assert!(attune_common::config::PacksConfig::default()
+        .local_source_roots
+        .is_empty());
+    let ctx = ctx.with_local_source_roots(Vec::new()).await?;
+    assert_eq!(
+        ctx.post(
+            "/api/v1/packs/register",
+            json!({"path": source.path(), "skip_tests": true}),
+            ctx.token()
+        )
+        .await?
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    let archive_root = TempDir::new()?;
+    let archive_path = archive_root.path().join("local.tar.gz");
+    let gzip = flate2::write::GzEncoder::new(
+        fs::File::create(&archive_path)?,
+        flate2::Compression::default(),
+    );
+    let mut archive = tar::Builder::new(gzip);
+    archive.append_dir_all(".", source.path())?;
+    archive.into_inner()?.finish()?;
+    assert_eq!(
+        ctx.post(
+            "/api/v1/packs/install",
+            json!({"source":archive_path, "skip_tests":true}),
+            ctx.token()
+        )
+        .await?
+        .status(),
+        StatusCode::FORBIDDEN
+    );
     let approved = TempDir::new()?;
     let ctx = ctx
         .with_local_source_roots(vec![approved.path().into()])
@@ -5190,6 +5215,29 @@ async fn local_source_ingestion_requires_operator_roots_and_global_authority() -
         PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "local_confinement")
             .await?
             .is_some()
+    );
+    let ctx = ctx
+        .with_local_source_roots(vec![archive_root.path().into()])
+        .await?;
+    let downloaded: serde_json::Value = ctx
+        .post(
+            "/api/v1/packs/download",
+            json!({"packs":[archive_path]}),
+            ctx.token(),
+        )
+        .await?
+        .json()
+        .await?;
+    assert_eq!(downloaded["data"]["success_count"], 1);
+    // Download creates only staging, not another release.
+    let pack = PackRepository::find_by_ref(&ctx.pool, "local_confinement")
+        .await?
+        .unwrap();
+    assert_eq!(
+        PackReleaseRepository::list_by_pack(&ctx.pool, pack.id)
+            .await?
+            .len(),
+        1
     );
     ctx.cleanup().await?;
     Ok(())

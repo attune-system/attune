@@ -5591,7 +5591,7 @@ pub async fn get_pack_dependencies(
     let installed_refs: std::collections::HashSet<String> =
         installed_packs_list.into_iter().map(|p| p.r#ref).collect();
 
-    for pack_path in &approved_paths {
+    for pack_path in &request.pack_paths {
         let pack_yaml_path = std::path::Path::new(pack_path).join("pack.yaml");
 
         if !pack_yaml_path.exists() {
@@ -5738,7 +5738,7 @@ pub async fn build_pack_envs(
     let python_envs_built = 0;
     let nodejs_envs_built = 0;
 
-    for pack_path in &approved_paths {
+    for pack_path in &request.pack_paths {
         let pack_path_obj = Path::new(pack_path);
         let pack_start = std::time::Instant::now();
 
