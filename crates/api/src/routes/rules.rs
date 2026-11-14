@@ -865,7 +865,15 @@ pub async fn update_rule(
         &existing_rule.r#ref,
     )?;
 
-    if existing_rule.is_adhoc && (request.action_params.is_some() || request.action_ref.is_some()) {
+    if existing_rule.is_adhoc
+        && (request
+            .action_params
+            .as_ref()
+            .is_some_and(|value| value != &existing_rule.action_params)
+            || request.action_ref.is_some()
+                && (action.r#ref != existing_rule.action_ref
+                    || existing_rule.action != Some(action.id)))
+    {
         validate_action_params_with_registry(
             &state.db,
             &action,
@@ -877,7 +885,14 @@ pub async fn update_rule(
         .await?;
     }
 
-    if request.trigger_params.is_some() || request.trigger_ref.is_some() {
+    if request
+        .trigger_params
+        .as_ref()
+        .is_some_and(|value| value != &existing_rule.trigger_params)
+        || request.trigger_ref.is_some()
+            && (trigger.r#ref != existing_rule.trigger_ref
+                || existing_rule.trigger != Some(trigger.id))
+    {
         validate_trigger_params_with_registry(
             &state.db,
             &trigger,
@@ -887,37 +902,6 @@ pub async fn update_rule(
                 .unwrap_or(&existing_rule.trigger_params),
         )
         .await?;
-    }
-
-    let permission_refs_to_validate = match &request.permission_set_refs {
-        Some(Some(refs)) => Some(refs.clone()),
-        Some(None) => Some(action.default_execution_permission_set_refs.clone()),
-        None if request.action_ref.is_some() => {
-            // Action is changing — re-validate the effective permissions (either the
-            // rule's explicit override or the new action's defaults) to prevent a user
-            // from redirecting privileged permissions to an action they control.
-            Some(
-                existing_rule
-                    .permission_set_refs
-                    .clone()
-                    .unwrap_or_else(|| action.default_execution_permission_set_refs.clone()),
-            )
-        }
-        None => None,
-    };
-    if let Some(permission_refs_to_validate) = permission_refs_to_validate {
-        if existing_rule.is_adhoc
-            && !permission_refs_to_validate.is_empty()
-            && !state
-                .authorization_service()
-                .can_delegate_permission_sets(&user, &permission_refs_to_validate)
-                .await?
-        {
-            return Err(ApiError::Forbidden(
-                "Cannot update rule with execution permission sets beyond current access"
-                    .to_string(),
-            ));
-        }
     }
 
     let authorized_rule_id = existing_rule.id;
@@ -993,7 +977,265 @@ pub async fn update_rule(
         "rule",
         &existing_rule.r#ref,
     )?;
-    if existing_rule.is_adhoc && (request.action_params.is_some() || request.action_ref.is_some()) {
+    // Compare against the transactionally reread row. Full-form metadata saves
+    // carry unchanged behavior fields; their presence alone spends no authority.
+    // Rebinding a recreated ref to a new row ID is still a behavioral change.
+    let action_changed = request.action_ref.is_some()
+        && (action.r#ref != existing_rule.action_ref || existing_rule.action != Some(action.id));
+    let trigger_ref_changed = request.trigger_ref.is_some()
+        && (trigger.r#ref != existing_rule.trigger_ref
+            || existing_rule.trigger != Some(trigger.id));
+    let action_params_changed = request
+        .action_params
+        .as_ref()
+        .is_some_and(|value| value != &existing_rule.action_params);
+    let trigger_params_changed = request
+        .trigger_params
+        .as_ref()
+        .is_some_and(|value| value != &existing_rule.trigger_params);
+    let conditions_changed = request
+        .conditions
+        .as_ref()
+        .is_some_and(|value| value != &existing_rule.conditions);
+    let trace_changed = request
+        .trace_tag_template
+        .as_ref()
+        .is_some_and(|value| value != &existing_rule.trace_tag_template);
+    let permission_selection_changed = request
+        .permission_set_refs
+        .as_ref()
+        .is_some_and(|value| value != &existing_rule.permission_set_refs);
+    let placement_changed = request
+        .sensor_worker_selector
+        .as_ref()
+        .is_some_and(|value| value != &existing_rule.sensor_worker_selector)
+        || request
+            .sensor_worker_tolerations
+            .as_ref()
+            .is_some_and(|value| value != &existing_rule.sensor_worker_tolerations)
+        || request
+            .sensor_worker_affinity
+            .as_ref()
+            .is_some_and(|value| value != &existing_rule.sensor_worker_affinity);
+    let input_fields_changed = action_changed
+        || trigger_ref_changed
+        || action_params_changed
+        || trigger_params_changed
+        || conditions_changed
+        || trace_changed;
+    let behavioral_edit = input_fields_changed || permission_selection_changed || placement_changed;
+    let snapshot = if user.claims.token_type == TokenType::Execution {
+        Some(
+            crate::authz::AuthorizationService::retain_legacy_execution_snapshot_on(&mut tx, &user)
+                .await?
+                .0,
+        )
+    } else {
+        None
+    };
+    let mut context = AuthorizationContext::new(identity_id);
+    context.target_id = Some(existing_rule.id);
+    context.target_ref = Some(existing_rule.r#ref.clone());
+    context.pack_ref = Some(existing_rule.pack_ref.clone());
+    context.managing_pack_id = current_managing_pack;
+    let check = AuthorizationCheck {
+        resource: Resource::Rules,
+        action: Action::Update,
+        context,
+    };
+    if let Some(snapshot) = &snapshot {
+        authz.authorize_with_snapshot(&user, Some(snapshot), check)?;
+    } else {
+        authz.authorize_access_fresh(&mut tx, &user, check).await?;
+    }
+    if behavioral_edit {
+        let caller = if let Some(snapshot) = &snapshot {
+            attune_common::delegation::DelegationAuthority::new(
+                identity_id,
+                snapshot.identity_attributes.clone(),
+                snapshot.grants.clone(),
+            )
+        } else {
+            attune_common::delegation::DelegationAuthority::load_for_share(&mut tx, identity_id)
+                .await?
+        };
+        let mut context = AuthorizationContext::new(identity_id);
+        context.target_id = Some(action.id);
+        context.target_ref = Some(action.r#ref.clone());
+        context.pack_ref = Some(action.pack_ref.clone());
+        context.managing_pack_id =
+            attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+                &mut *tx,
+                attune_common::repositories::runtime_target::ComponentTarget::Action,
+                action.id,
+            )
+            .await?;
+        let check = AuthorizationCheck {
+            resource: Resource::Actions,
+            action: Action::Execute,
+            context,
+        };
+        if let Some(snapshot) = &snapshot {
+            authz.authorize_with_snapshot(&user, Some(snapshot), check)?;
+        } else {
+            authz.authorize_access_fresh(&mut tx, &user, check).await?;
+        }
+        let refs = request
+            .permission_set_refs
+            .as_ref()
+            .unwrap_or(&existing_rule.permission_set_refs)
+            .clone()
+            .unwrap_or_else(|| action.default_execution_permission_set_refs.clone());
+        if user.claims.token_type == TokenType::Execution
+            && refs.iter().any(|reference| reference == "standard")
+            && !crate::authz::execution_has_standard_access(&user)
+        {
+            return Err(ApiError::Forbidden(
+                "Rule cannot acquire standard access absent from editor credential".into(),
+            ));
+        }
+        if user.claims.token_type == TokenType::Execution
+            && refs.iter().any(|reference| reference == "standard")
+        {
+            let owners = crate::authz::execution_standard_owner_refs(&user);
+            if !owners.contains(&action.r#ref) || !owners.contains(&action.pack_ref) {
+                return Err(ApiError::Forbidden(
+                    "Rule standard scope exceeds editor credential".into(),
+                ));
+            }
+        }
+        if !authz
+            .can_delegate_permission_sets_on(&mut tx, &user, &refs)
+            .await?
+        {
+            return Err(ApiError::Forbidden(
+                "Rule execution permissions exceed editor authority".into(),
+            ));
+        }
+        attune_common::repositories::rule_authority::RuleAuthorityRepository::require_mutation_authority(
+            &mut tx, &existing_rule, &caller,
+        ).await?;
+        let inputs = serde_json::json!([
+            request
+                .conditions
+                .as_ref()
+                .unwrap_or(&existing_rule.conditions),
+            request
+                .action_params
+                .as_ref()
+                .unwrap_or(&existing_rule.action_params),
+            request
+                .trigger_params
+                .as_ref()
+                .unwrap_or(&existing_rule.trigger_params),
+            request
+                .trace_tag_template
+                .as_ref()
+                .unwrap_or(&existing_rule.trace_tag_template),
+        ]);
+        // Direct config sources retain their configuration contract. Match
+        // Pack Read, plus Decrypt for selected protected paths, without restoring values.
+        if attune_common::template_resolver::references_pack_configuration(&inputs) {
+            let pack_id = existing_rule.pack;
+            let revision = attune_common::repositories::component_configuration::ComponentConfigurationRepository::current(
+                &mut *tx, "pack", pack_id,
+            ).await?.ok_or_else(|| ApiError::Forbidden("Rule configuration binding is unavailable".into()))?;
+            let contract = revision.contract()?;
+            let compiled =
+                attune_common::value_schema::CompiledContract::new(&contract).map_err(|_| {
+                    ApiError::Forbidden("Rule configuration contract is unavailable".into())
+                })?;
+            let mut secret_paths = compiled.secret_paths(&revision.config).map_err(|_| {
+                ApiError::Forbidden("Rule configuration projection is unavailable".into())
+            })?;
+            let stored = attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::find_stored_by_entity(
+                &mut *tx,
+                attune_common::repositories::component_configuration::ENTITY_COMPONENT_CONFIGURATION,
+                revision.id,
+            ).await?;
+            secret_paths.extend(stored.into_iter().map(|secret| secret.json_path));
+            // Analyze selector sensitivity using only path metadata and an empty
+            // context. Never restore or evaluate actual configuration values.
+            let source_context = attune_common::template_resolver::TemplateContext::new(
+                serde_json::json!({}),
+                serde_json::json!({}),
+                serde_json::json!({}),
+            )
+            .with_bound_pack_config_secret_paths(revision.id, secret_paths);
+            let protected = !attune_common::template_resolver::resolve_templates_with_sensitivity(
+                &inputs,
+                &source_context,
+            )
+            .map_err(|_| {
+                ApiError::Forbidden("Rule configuration selectors cannot be authorized".into())
+            })?
+            .secret_paths
+            .is_empty();
+            let target =
+                attune_common::repositories::runtime_target::RuntimeTargetRepository::resolve(
+                    &mut tx,
+                    attune_common::repositories::runtime_target::RuntimeTarget::Pack(pack_id),
+                    identity_id,
+                )
+                .await?
+                .ok_or_else(|| {
+                    ApiError::Forbidden("Rule configuration owner is unavailable".into())
+                })?;
+            let source_actions = if protected {
+                vec![Action::Read, Action::Decrypt]
+            } else {
+                vec![Action::Read]
+            };
+            for source_action in source_actions {
+                let check = AuthorizationCheck {
+                    resource: Resource::Packs,
+                    action: source_action,
+                    context: target.context().clone(),
+                };
+                if let Some(snapshot) = &snapshot {
+                    authz.authorize_with_snapshot(&user, Some(snapshot), check)?;
+                } else {
+                    // Fresh Access matching resolves actual ownership and current
+                    // owner-role membership; Execution snapshots never borrow it.
+                    authz.authorize_access_fresh(&mut tx, &user, check).await?;
+                }
+            }
+        }
+        let expressions = attune_common::template_resolver::referenced_keystore_expressions(
+            &inputs,
+            &attune_common::template_resolver::TemplateContext::new(
+                serde_json::json!({}),
+                serde_json::json!({}),
+                serde_json::json!({}),
+            ),
+        )
+        .map_err(|_| {
+            ApiError::Forbidden("Rule input selectors cannot be authorized statically".into())
+        })?;
+        let refs = expressions
+            .into_values()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let (keys, ownership) =
+            attune_common::repositories::iam_ownership::VerifiedKeyOrigins::keys_by_refs(
+                &mut *tx, &refs,
+            )
+            .await?;
+        if keys.len() != refs.len()
+            || keys.iter().any(|key| {
+                let origin = attune_common::key_access::key_origin(key);
+                !caller.key_allows_verified(&origin, Action::Read, &ownership)
+                    || key.encrypted
+                        && !caller.key_allows_verified(&origin, Action::Decrypt, &ownership)
+            })
+        {
+            return Err(ApiError::Forbidden(
+                "Rule input sources exceed editor authority".into(),
+            ));
+        }
+    }
+    if existing_rule.is_adhoc && (action_params_changed || action_changed) {
         validate_rule_params_with_registry(
             &mut tx,
             &action.r#ref,
@@ -1006,7 +1248,7 @@ pub async fn update_rule(
         )
         .await?;
     }
-    if request.trigger_params.is_some() || request.trigger_ref.is_some() {
+    if trigger_params_changed || trigger_ref_changed {
         validate_rule_params_with_registry(
             &mut tx,
             &trigger.r#ref,
@@ -1020,22 +1262,11 @@ pub async fn update_rule(
         .await?;
     }
 
-    let trigger_ref_changed = request
-        .trigger_ref
-        .as_ref()
-        .is_some_and(|value| value != &existing_rule.trigger_ref);
-    let trigger_params_changed = request
-        .trigger_params
-        .as_ref()
-        .is_some_and(|value| value != &existing_rule.trigger_params);
     let enabled_after_update = request.enabled.unwrap_or(existing_rule.enabled);
     let was_enabled = existing_rule.enabled;
     let became_enabled = !was_enabled && enabled_after_update;
     let became_disabled = was_enabled && !enabled_after_update;
-    let sensor_placement = if request.sensor_worker_selector.is_some()
-        || request.sensor_worker_tolerations.is_some()
-        || request.sensor_worker_affinity.is_some()
-    {
+    let sensor_placement = if placement_changed {
         let placement = RuleSensorPlacementInput {
             selector: request
                 .sensor_worker_selector
@@ -1062,17 +1293,8 @@ pub async fn update_rule(
     let trigger_config_changed =
         trigger_ref_changed || trigger_params_changed || sensor_placement.is_some();
     let admission_changed = trigger_ref_changed || sensor_placement.is_some() || became_enabled;
-    let authority_change = !existing_rule.is_adhoc
-        && (request.action_ref.is_some() || request.permission_set_refs.is_some());
-    let input_change = !existing_rule.is_adhoc
-        && (request.action_ref.is_some()
-            || request.conditions.is_some()
-            || request.action_params.is_some()
-            || request.trigger_ref.is_some()
-            || request.trigger_params.is_some()
-            || request.trace_tag_template.is_some());
-    let policy_change =
-        !existing_rule.is_adhoc && (authority_change || input_change || sensor_placement.is_some());
+    let input_change = !existing_rule.is_adhoc && input_fields_changed;
+    let policy_change = !existing_rule.is_adhoc && behavioral_edit;
     if input_change {
         // An authorized managed behavior edit retains this purpose-specific
         // ceiling. It neither borrows the editor's Key grants nor recaptures

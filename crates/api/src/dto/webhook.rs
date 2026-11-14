@@ -39,3 +39,22 @@ pub struct WebhookReceiverResponse {
     /// Success message
     pub message: String,
 }
+
+/// Credential-bearing response, returned only by explicit management operations.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct WebhookManagementResponse {
+    #[serde(flatten)]
+    pub trigger: super::trigger::TriggerResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webhook_key: Option<String>,
+}
+
+impl From<attune_common::models::trigger::Trigger> for WebhookManagementResponse {
+    fn from(trigger: attune_common::models::trigger::Trigger) -> Self {
+        let webhook_key = trigger.webhook_key.clone();
+        Self {
+            trigger: trigger.into(),
+            webhook_key,
+        }
+    }
+}

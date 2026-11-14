@@ -53,7 +53,10 @@ class TestWebhookTrigger:
         trigger = create_webhook_trigger(client=client, pack_ref=pack_ref)
         print(f"✓ Created trigger: {trigger['label']} (ID: {trigger['id']})")
         print(f"  Ref: {trigger['ref']}")
-        print(f"  Webhook URL: /api/v1/webhooks/{trigger['id']}")
+        print("  Webhook URL: /api/v1/webhooks/<redacted>")
+        metadata = client.get_trigger_by_ref(trigger["ref"])
+        assert metadata["webhook_enabled"] is True
+        assert "webhook_key" not in metadata
         assert "webhook" in trigger["ref"].lower() or trigger.get(
             "webhook_enabled", False
         )

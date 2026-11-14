@@ -13,6 +13,7 @@ import tempfile
 from typing import Any, Optional
 from urllib.parse import quote
 
+import httpx
 import requests
 
 from generated_client import AuthenticatedClient, Client
@@ -255,6 +256,19 @@ def _json_or_empty(response: Any) -> Any:
     return response.json()
 
 
+class _WebhookCredentialURL(httpx.URL):
+    """Keep the transport target intact while hiding bearer paths in HTTPX logs."""
+
+    def __str__(self) -> str:
+        public = httpx.URL(self).copy_with(
+            path="/api/v1/webhooks/<redacted>", query=None, fragment=None
+        )
+        return str(public)
+
+    def __repr__(self) -> str:
+        return f"URL({str(self)!r})"
+
+
 class TestResponse:
     """Response facade that exposes parsed API JSON consistently in tests."""
 
@@ -276,12 +290,6 @@ class TestResponse:
             if isinstance(data, dict) and "key" not in data and "ref" in data:
                 data = dict(data)
                 data["key"] = data["ref"]
-                if data.get("webhook_enabled") is False and "webhook_key" not in data:
-                    data["webhook_key"] = None
-                body["data"] = data
-            elif isinstance(data, dict) and data.get("webhook_enabled") is False and "webhook_key" not in data:
-                data = dict(data)
-                data["webhook_key"] = None
                 body["data"] = data
             if isinstance(data, dict):
                 data = self._normalize_item(data)
@@ -1115,8 +1123,8 @@ class AttuneClient:
             else:
                 trigger = data
             return trigger
-        raise Exception(
-            f"Failed to enable webhook: {response.status_code} {response.text}"
+        raise RuntimeError(
+            f"Failed to enable webhook (HTTP {response.status_code})"
         )
 
     def disable_webhook(
@@ -1139,8 +1147,22 @@ class AttuneClient:
             if "data" in data:
                 return data["data"]
             return data
-        raise Exception(
-            f"Failed to disable webhook: {response.status_code} {response.text}"
+        raise RuntimeError(
+            f"Failed to disable webhook (HTTP {response.status_code})"
+        )
+
+    def reveal_webhook(self, trigger_ref: str) -> dict:
+        """Explicitly request credentials using the caller's management authority."""
+        if not trigger_ref:
+            raise ValueError("trigger_ref is required")
+        response = self._request(
+            "POST", f"/api/v1/triggers/{quote(trigger_ref, safe='')}/webhooks/reveal"
+        )
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("data", data)
+        raise RuntimeError(
+            f"Failed to reveal webhook (HTTP {response.status_code})"
         )
 
     def fire_webhook(
@@ -1152,6 +1174,8 @@ class AttuneClient:
         """Fire a webhook trigger
 
         Requires a trigger reference.
+        Already-enabled triggers require the caller's explicit credential-reveal
+        authority. Auto-enabling retains the dedicated enable response credential.
 
         Args:
             trigger_ref: Trigger reference
@@ -1166,28 +1190,38 @@ class AttuneClient:
         if not trigger:
             raise Exception(f"Trigger {trigger_ref} not found")
 
-        # Enable webhooks if not enabled and auto_enable is True
-        if not trigger.get("webhook_enabled") and auto_enable:
-            trigger = self.enable_webhook(trigger_ref=trigger_ref)
+        if not trigger.get("webhook_enabled"):
+            if not auto_enable:
+                raise RuntimeError(f"Webhooks are disabled for trigger {trigger_ref}")
+            # Enable is an explicit management operation and returns its credential.
+            credential = self.enable_webhook(trigger_ref=trigger_ref)
+        else:
+            # Ordinary metadata never contains bearer credentials. Do not fall back
+            # to enable/rotation or cached keys if explicit disclosure is denied.
+            credential = self.reveal_webhook(trigger_ref=trigger_ref)
 
-        # Check if we have a webhook_key now
-        if not trigger.get("webhook_key"):
-            raise Exception(f"Trigger {trigger_ref} does not have a webhook_key")
+        if not credential.get("webhook_enabled"):
+            raise RuntimeError(f"Webhooks are disabled for trigger {trigger_ref}")
+        webhook_key = credential.get("webhook_key")
+        if not isinstance(webhook_key, str) or not webhook_key:
+            raise RuntimeError("Webhook management credential is unavailable")
 
-        # Use plain POST request instead of generated client to handle API response structure
-        webhook_key = trigger["webhook_key"]
-        response = self._request(
-            "POST",
-            f"/api/v1/webhooks/{webhook_key}",
-            json={"payload": payload},
-        )
+        try:
+            response = self._request(
+                "POST",
+                f"/api/v1/webhooks/{webhook_key}",
+                json={"payload": payload},
+            )
+        except httpx.HTTPError:
+            # Transport exceptions include the credential-bearing request URL.
+            raise RuntimeError("Webhook delivery failed") from None
         if response.status_code in (200, 201):
             data = response.json()
             if "data" in data:
                 return data["data"]
             return data
-        raise Exception(
-            f"Failed to fire webhook: {response.status_code} {response.text}"
+        raise RuntimeError(
+            f"Failed to fire webhook (HTTP {response.status_code})"
         )
 
     # ========================================================================
@@ -1748,11 +1782,14 @@ class AttuneClient:
             path = webhook_url
 
         body = payload if isinstance(payload, dict) and "payload" in payload else {"payload": payload or {}}
-        response = self._request("POST", path, json=body)
+        try:
+            response = self._request("POST", path, json=body)
+        except httpx.HTTPError:
+            raise RuntimeError("Webhook delivery failed") from None
         if response.status_code in (200, 201, 202):
             return response.json() if response.text else {}
-        raise Exception(
-            f"Webhook POST failed: {response.status_code} {response.text}"
+        raise RuntimeError(
+            f"Webhook POST failed (HTTP {response.status_code})"
         )
 
     # ========================================================================
@@ -2327,8 +2364,18 @@ class AttuneClient:
 
     def _request(self, method: str, path: str, **kwargs):
         """Raw request method for tests that need endpoint-level access."""
-        client = self._get_client()
-        response = client.get_httpx_client().request(method, path, **kwargs)
+        client = self._get_client().get_httpx_client()
+        if path.startswith("/api/v1/webhooks/"):
+            send_options = {
+                key: kwargs.pop(key)
+                for key in ("auth", "follow_redirects")
+                if key in kwargs
+            }
+            request = client.build_request(method, path, **kwargs)
+            request.url = _WebhookCredentialURL(request.url)
+            response = client.send(request, **send_options)
+        else:
+            response = client.request(method, path, **kwargs)
         return TestResponse(response)
 
     def get(self, path: str, **kwargs):

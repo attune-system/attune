@@ -55,7 +55,7 @@ def test_webhook_fires_multiple_rules(client: AttuneClient, test_pack):
         trigger_response.get("webhook_url") or f"/api/v1/webhooks/{trigger_ref}"
     )
     print(f"✓ Webhook trigger created: {trigger_ref}")
-    print(f"  Webhook URL: {webhook_url}")
+    print("  Webhook URL: /api/v1/webhooks/<redacted>")
 
     # Step 2: Create 3 different actions
     print("\n[STEP 2] Creating 3 actions...")

@@ -52,6 +52,7 @@ pub mod pack_format;
 pub mod pack_ownership;
 pub mod pack_registry;
 pub mod pack_transport;
+pub mod parent_process_protection;
 pub mod platform_catalog;
 mod policy_control;
 pub mod queue_definition;
