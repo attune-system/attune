@@ -2,6 +2,7 @@
 //! Exercises the same admission service called by normal upload/core bootstrap.
 mod helpers;
 
+use anyhow::Context;
 use tower::ServiceExt;
 
 use attune_common::{
@@ -328,9 +329,15 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
             .count(),
         3
     );
-    // Explicit test-only grant consumer replaces the withdrawn SSH helper.
-    // It is never copied to the shipped core tree or installed by bootstrap.
-    std::fs::write(source.join("actions/acceptance_key_creator.yaml"), "ref: core.acceptance_key_creator\nlabel: Explicit fixture key grant consumer\nrunner_type: native\nentry_point: bin/noop\ndefault_execution_permission_set_refs: [core.key_creator]\nparameters:\n  local_ref:\n    type: string\n")?;
+    // Preserve the retained, inert shipped definition byte-for-byte. Its
+    // withdrawn SSH owner is not a valid owner for a new synthetic consumer.
+    let retained_key_creator = std::fs::read(source.join("permission_sets/key_creator.yaml"))?;
+    let retained_key_grants =
+        serde_yaml_ng::from_slice::<serde_json::Value>(&retained_key_creator)?;
+    // The admission-only consumer and its local key policy both belong to this
+    // owned fixture. No shipped policy or callable is changed or reintroduced.
+    std::fs::write(source.join("permission_sets/acceptance_key_access.yaml"), "ref: core.acceptance_key_access\nlabel: Owned fixture key-create policy\ngrants:\n  - resource: keys\n    actions: [create]\n    constraints:\n      owner_types: [action]\n      owner_refs: [core.acceptance_key_creator]\n      encrypted: true\n")?;
+    std::fs::write(source.join("actions/acceptance_key_creator.yaml"), "ref: core.acceptance_key_creator\nlabel: Explicit fixture key grant consumer\nrunner_type: native\nentry_point: bin/noop\ndefault_execution_permission_set_refs: [core.acceptance_key_access]\nparameters:\n  local_ref:\n    type: string\n")?;
     let ceiling = actual_core_global_ceiling(&source, "executor")?;
     assert_eq!(
         PermissionSetRepository::find_by_ref(&ctx.pool, "core.executor")
@@ -341,7 +348,7 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
     );
     // Pre-provision fixed, explicit consent for the shipped global ceiling. The
     // shipped actions select no API authority; the explicit test consumer
-    // selects local key_creator and the supplementary
+    // selects its explicit fixture-owned key policy and the supplementary
     // queue below deliberately selects this real platform definition at upgrade.
     let initial_approval = explicitly_approve_core_ceiling(&ctx, &ceiling).await?;
     assert_eq!(initial_approval.subject_pack_id, pack.id);
@@ -351,6 +358,48 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
         .await?
         .unwrap();
     let original_policy_body = serde_json::to_value(&policy.policy)?;
+    assert!(
+        ActionRepository::find_by_ref(&mut *fresh, "core.generate_ssh_key_pair")
+            .await?
+            .is_none()
+    );
+    assert_eq!(
+        PermissionSetRepository::find_by_ref(&mut *fresh, "core.key_creator")
+            .await?
+            .unwrap()
+            .grants,
+        retained_key_grants["grants"]
+    );
+    let fixture_invocation = policy
+        .policy
+        .invocations
+        .iter()
+        .find(|entry| {
+            entry.binding
+                == InvocationBinding::Action {
+                    action_ref: "core.acceptance_key_creator".into(),
+                }
+        })
+        .unwrap();
+    let fixture_grants = &fixture_invocation.permission_sets["core.acceptance_key_access"].grants;
+    assert_eq!(fixture_grants.len(), 1);
+    assert!(fixture_grants[0].approval_id().is_none());
+    let fixture_grant = fixture_grants[0].grant();
+    assert_eq!(fixture_grant.resource, attune_common::rbac::Resource::Keys);
+    assert_eq!(
+        fixture_grant.actions,
+        vec![attune_common::rbac::Action::Create]
+    );
+    let fixture_constraints = fixture_grant.constraints.as_ref().unwrap();
+    assert_eq!(
+        serde_json::to_value(&fixture_constraints.owner_refs)?,
+        json!(["core.acceptance_key_creator"])
+    );
+    assert_eq!(
+        serde_json::to_value(&fixture_constraints.owner_types)?,
+        json!(["action"])
+    );
+    assert_eq!(fixture_constraints.encrypted, Some(true));
     for reference in [
         "core.echo",
         "core.noop",
@@ -424,7 +473,7 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
     let selected = policy.policy.select(
         policy.id,
         &binding,
-        &["core.key_creator".into()],
+        &["core.acceptance_key_access".into()],
         RequestAttribution::Human {
             actor: HumanAttribution {
                 identity_id: installer.id,
@@ -438,7 +487,7 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
             action: Some(executable.executable.action.id),
             action_ref: "core.acceptance_key_creator".into(),
             executor: Some(installer.id),
-            permission_set_refs: vec!["core.key_creator".into()],
+            permission_set_refs: vec!["core.acceptance_key_access".into()],
             status: attune_common::models::ExecutionStatus::Running,
             config: Some(json!({"local_ref":"acceptance-only"})),
             ..Default::default()
@@ -451,7 +500,8 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
         RuntimeOwner::Execution(execution.id),
         &selected,
     )
-    .await?;
+    .await
+    .context("record explicitly owned fixture key-create admission")?;
     let credential = RuntimeCredentialBinding {
         execution_id: execution.id,
         admission_id: admission.id,
@@ -503,7 +553,7 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
         serde_yaml_ng::to_string(&metadata)?,
     )?;
     // Revoke only the test's explicit pre-provisioned approval. The original
-    // shipped policy is local and remains pinned; queue dispatch now requests
+    // fixture key policy is local and remains pinned; queue dispatch now requests
     // the actual core.executor global ceiling, never a synthetic action/policy.
     let revoked = ctx
         .post(
@@ -813,6 +863,17 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
     assert_eq!(ready.release_id, release_id);
     assert_eq!(ready.policy_revision, rollback_policy.id);
     assert_eq!(ready.digest, original_release.digest);
+    assert_eq!(
+        std::fs::read(source.join("permission_sets/key_creator.yaml"))?,
+        retained_key_creator
+    );
+    assert_eq!(
+        PermissionSetRepository::find_by_ref(&ctx.pool, "core.key_creator")
+            .await?
+            .unwrap()
+            .grants,
+        retained_key_grants["grants"]
+    );
     ctx.cleanup().await?;
     Ok(())
 }
