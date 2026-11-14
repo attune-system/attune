@@ -4,6 +4,7 @@ use attune_common::pack_registry::{extract_archive, PackStorage, SafeExtractionL
 use attune_worker::runtime::{ExecutionContext, NativeRuntime, Runtime};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 fn context(action_ref: String, code: Option<String>) -> ExecutionContext {
@@ -133,6 +134,52 @@ async fn main() {
             assert_eq!(result.stdout, message);
         }
     }
+    // Exercise the HTTP artifact from the materialized archive as well, with no
+    // interpreter or curl available and no external network dependency.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                assert!(request.len() < 8192);
+                request.push(stream.read_u8().await.unwrap());
+            }
+            assert!(request.starts_with(b"GET /native HTTP/1.1\r\n"));
+            let body = r#"{"message":"native archive HTTP"}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    });
+    let mut http = context("core.http_request".into(), None);
+    http.code_path = Some(materialized.join("core/actions/bin/http_request"));
+    http.runtime_name = Some("native".into());
+    http.parameters.insert(
+        "url".into(),
+        serde_json::json!(format!("http://{address}/native")),
+    );
+    http.env
+        .insert("PATH".into(), "/no-interpreters-or-tools".into());
+    http.parameter_delivery = ParameterDelivery::Stdin;
+    http.parameter_format = ParameterFormat::Json;
+    let result = runtime.execute(http).await.unwrap();
+    server.await.unwrap();
+    assert_eq!(result.exit_code, 0, "{}", result.stderr);
+    let response: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+    assert_eq!(response["status_code"], 200);
+    assert_eq!(response["json"]["message"], "native archive HTTP");
+    assert_eq!(response["success"], true);
     for cancelled in [false, true] {
         let mut context = context("core.sleep".into(), None);
         context.code_path = Some(materialized.join("core/actions/bin/sleep"));
