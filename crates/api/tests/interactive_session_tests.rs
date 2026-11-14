@@ -20,6 +20,12 @@ async fn login(ctx: &TestContext) -> Value {
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response.json().await.unwrap();
     assert!(body["data"]["expires_in"].as_i64().unwrap() <= 300);
+    let access = attune_common::auth::jwt::validate_token(
+        body["data"]["access_token"].as_str().unwrap(),
+        &ctx.state.jwt_config,
+    )
+    .unwrap();
+    assert!(access.exp - access.iat <= 300);
     body["data"].clone()
 }
 async fn refresh(ctx: &TestContext, token: &str) -> helpers::TestResponse {
@@ -57,13 +63,20 @@ async fn logout_and_password_update_revoke_refresh_but_new_login_works() {
     let ctx = TestContext::new().await.unwrap();
     let tokens = login(&ctx).await;
     let old = tokens["refresh_token"].as_str().unwrap();
-    assert_eq!(refresh(&ctx, old).await.status(), StatusCode::OK);
+    let rotated = refresh(&ctx, old).await;
+    assert_eq!(rotated.status(), StatusCode::OK);
+    let successor: Value = rotated.json().await.unwrap();
     let response = ctx
         .post("/auth/session/logout", json!({"refresh_token":old}), None)
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(refresh(&ctx, old).await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        refresh(&ctx, successor["data"]["refresh_token"].as_str().unwrap())
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
     let response = ctx
         .post(
             "/auth/login",
@@ -298,6 +311,35 @@ async fn integration_refresh_retains_provenance_and_credential_revocation() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(refresh(&ctx, &machine).await.status(), StatusCode::OK);
+    IdentityRepository::update(
+        &ctx.pool,
+        identity.id,
+        UpdateIdentityInput {
+            display_name: None,
+            password_hash: None,
+            attributes: None,
+            frozen: Some(true),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        refresh(&ctx, &machine).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    IdentityRepository::update(
+        &ctx.pool,
+        identity.id,
+        UpdateIdentityInput {
+            display_name: None,
+            password_hash: None,
+            attributes: None,
+            frozen: Some(false),
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(refresh(&ctx, &machine).await.status(), StatusCode::OK);
     IntegrationTokenRepository::delete(&ctx.pool, record.id)
         .await
