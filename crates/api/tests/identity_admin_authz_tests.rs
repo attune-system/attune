@@ -142,7 +142,7 @@ async fn profile_editor_cannot_take_over_admin_or_change_authorization() {
     assert_ne!(after.password_hash, before.password_hash);
     let recovered = ctx
         .post(
-            "/api/v1/auth/login",
+            "/auth/login",
             json!({"login":after.login,"password":"RecoveredPass123!"}),
             None,
         )
@@ -164,7 +164,7 @@ async fn profile_editor_cannot_take_over_admin_or_change_authorization() {
     let token_id = body["data"]["integration_token"]["id"].as_i64().unwrap();
     assert_eq!(
         ctx.post(
-            "/api/v1/auth/token-login",
+            "/auth/token-login",
             json!({"token":body["data"]["token"]}),
             None
         )
