@@ -130,12 +130,12 @@ Delivery checks vary by entity family:
 | `enforcement` | Enforcement grants and the related rule visibility |
 | `artifact` | Artifact scope, owner, visibility, and grants; only access and execution tokens qualify |
 | `rule_lifecycle` | Rule read grants after the notifier refetches the rule |
-| `work_queue` | Explicit queues read grant against the persisted queue ID/ref/pack |
-| `work_queue_item` | Explicit queue-items read grant against its persisted parent queue; private queues require an explicit queue scope |
-| `inquiry` | Explicit inquiries read grant against its ID/ref and creating execution's pack/owner |
+| `work_queue` | Queues read grant against the persisted queue ID/ref/pack, plus reference visibility or queue management authority |
+| `work_queue_item` | Queue-items or queues read grant against its persisted parent queue; private queues require an explicit item scope or queue management authority |
+| `inquiry` | Persisted assignee/creator participation or inquiries read grant against its ID/ref and creating execution's pack/owner |
 | Unknown or mismatched stream/entity pairs | Denied, including through `all` and `user` filters |
 
-Unknown entity and notification types are denied at subscription time. Known queue/item/inquiry streams accept scoped read grants and check each concrete target before delivery. These streams do not gain the Access-token baseline reads used by existing operational streams.
+Unknown entity and notification types are denied at subscription time. Known queue/item/inquiry streams accept scoped read grants and check each concrete target before delivery. Inquiry stream admission also allows Access-token participants; each delivered target must still satisfy the persisted participant or read-grant check. These streams do not gain the Access-token baseline reads used by existing operational streams.
 
 The notifier captures roles and grants when the connection opens for dispatch filtering. Access-token frames recheck current identity and permission assignments after socket readiness, so revocation prevents queued delivery. Recorded credentials retain their separate current source and target fences; sensor subscriptions remain restricted to admitted trigger refs.
 

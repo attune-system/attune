@@ -1,7 +1,10 @@
 //! Real repository targets exercised through subscription, dispatch and dequeue.
 use super::*;
 use attune_common::{
-    models::*,
+    models::{
+        ActionReferenceVisibility, ExecutionStatus, InquiryStatus, WorkQueueBatchMode,
+        WorkQueueItemStatus, WorkQueueUpdateStrategy,
+    },
     repositories::{
         execution::CreateExecutionInput,
         identity::{
@@ -57,6 +60,16 @@ async fn notifier_targets_scope_unknown_and_revocation() -> Result<()> {
         },
     )
     .await?;
+    let neighbor = IdentityRepository::create(
+        pool,
+        CreateIdentityInput {
+            login: "notifier_neighbor".into(),
+            display_name: None,
+            password_hash: None,
+            attributes: json!({}),
+        },
+    )
+    .await?;
     let queue = WorkQueueRepository::create(
         pool,
         CreateWorkQueueInput {
@@ -79,7 +92,7 @@ async fn notifier_targets_scope_unknown_and_revocation() -> Result<()> {
             trace_tag_template: None,
             permission_set_refs: None,
             config: json!({}),
-            reference_visibility: ActionReferenceVisibility::Private,
+            reference_visibility: ActionReferenceVisibility::Public,
             reference_allowed_pack_refs: vec![],
         },
     )
@@ -91,7 +104,7 @@ async fn notifier_targets_scope_unknown_and_revocation() -> Result<()> {
             queue_ref: queue.r#ref.clone(),
             item_key: None,
             priority: 0,
-            status: WorkQueueItemStatus::Pending,
+            status: WorkQueueItemStatus::Queued,
             payload: json!({}),
             metadata: json!({}),
             trace_tag: None,
@@ -159,7 +172,7 @@ async fn notifier_targets_scope_unknown_and_revocation() -> Result<()> {
             vec![scoped(resource, &reference)],
         );
         let denied = WebSocketAuthContext::test_context(
-            owner.id,
+            neighbor.id,
             TokenType::Access,
             vec![scoped(resource, "neighbor.other")],
         );
@@ -195,7 +208,7 @@ async fn notifier_targets_scope_unknown_and_revocation() -> Result<()> {
         assert!(
             !notification_allowed_for_identity(
                 &n,
-                &WebSocketAuthContext::test_context(owner.id, TokenType::Access, vec![]),
+                &WebSocketAuthContext::test_context(neighbor.id, TokenType::Access, vec![]),
                 pool
             )
             .await
@@ -208,6 +221,35 @@ async fn notifier_targets_scope_unknown_and_revocation() -> Result<()> {
         dispatch_notification(&manager, pool, n.clone()).await;
         assert!(rx.try_recv().is_err());
     }
+    // Persisted inquiry participants need no ambient inquiry read grant.
+    let participant = WebSocketAuthContext::test_context(owner.id, TokenType::Access, vec![]);
+    assert!(
+        notification_allowed_for_identity(&notification("inquiry", inquiry.id), &participant, pool)
+            .await
+    );
+    assert!(
+        human_delivery::allowed(
+            pool,
+            &participant,
+            &ClientMessage::Notification(notification("inquiry", inquiry.id))
+        )
+        .await
+    );
+    let mut mismatched = notification("work_queue", queue.id);
+    mismatched.notification_type = "inquiry_created".into();
+    let global = WebSocketAuthContext::test_context(
+        owner.id,
+        TokenType::Access,
+        vec![Grant {
+            resource: Resource::Queues,
+            actions: vec![Action::Read],
+            constraints: None,
+        }],
+    );
+    assert!(!notification_allowed_for_identity(&mismatched, &global, pool).await);
+    assert!(
+        !notification_allowed_for_identity(&notification("future", queue.id), &global, pool).await
+    );
     let grant = scoped(Resource::Queues, &queue.r#ref);
     let set = PermissionSetRepository::create(
         pool,
@@ -261,6 +303,188 @@ async fn notifier_targets_scope_unknown_and_revocation() -> Result<()> {
             .await
         );
     }
+    // Private queue discovery requires management, not just ambient read.
+    use attune_common::repositories::{work_queue::UpdateWorkQueueInput, Update};
+    WorkQueueRepository::update(
+        pool,
+        queue.id,
+        UpdateWorkQueueInput {
+            reference_visibility: Some(ActionReferenceVisibility::Private),
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert!(
+        !notification_allowed_for_identity(&notification("work_queue", queue.id), &global, pool)
+            .await
+    );
+    let mut manager = global.clone();
+    manager.grants[0].actions.push(Action::Update);
+    manager.grants.push(Grant {
+        resource: Resource::QueueItems,
+        actions: vec![Action::Read],
+        constraints: None,
+    });
+    assert!(
+        notification_allowed_for_identity(&notification("work_queue", queue.id), &manager, pool)
+            .await
+    );
+    assert!(
+        notification_allowed_for_identity(
+            &notification("work_queue_item", item.id),
+            &manager,
+            pool
+        )
+        .await
+    );
+    let only_items = WebSocketAuthContext::test_context(
+        owner.id,
+        TokenType::Access,
+        vec![Grant {
+            resource: Resource::QueueItems,
+            actions: vec![Action::Read],
+            constraints: None,
+        }],
+    );
+    assert!(
+        !notification_allowed_for_identity(
+            &notification("work_queue_item", item.id),
+            &only_items,
+            pool
+        )
+        .await
+    );
+    use attune_common::repositories::inquiry::UpdateInquiryInput;
+    InquiryRepository::update(
+        pool,
+        inquiry.id,
+        UpdateInquiryInput {
+            assigned_to: Some(neighbor.id),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let assignee = WebSocketAuthContext::test_context(neighbor.id, TokenType::Access, vec![]);
+    assert!(
+        notification_allowed_for_identity(&notification("inquiry", inquiry.id), &assignee, pool)
+            .await
+    );
+    assert!(
+        filter_allowed_for_identity(
+            &SubscriptionFilter::Entity {
+                entity_type: "inquiry".into(),
+                entity_id: inquiry.id
+            },
+            neighbor.id,
+            &TokenType::Access,
+            &[],
+            &[],
+            &[],
+            pool
+        )
+        .await
+    );
+    // Structural pack ownership and current declared-role membership.
+    use attune_common::repositories::{
+        identity::CreateIdentityRoleAssignmentInput,
+        pack::{CreatePackInput, PackRepository},
+        Patch,
+    };
+    let pack = PackRepository::create(
+        pool,
+        CreatePackInput {
+            r#ref: "targets".into(),
+            label: "Targets".into(),
+            description: None,
+            version: "1.0.0".into(),
+            conf_schema: json!({}),
+            config: json!({}),
+            meta: json!({}),
+            tags: vec![],
+            runtime_deps: vec![],
+            dependencies: vec![],
+            is_standard: false,
+            installers: json!({}),
+        },
+    )
+    .await?;
+    PackRepository::set_installed_by(pool, pack.id, owner.id).await?;
+    WorkQueueRepository::update(
+        pool,
+        queue.id,
+        UpdateWorkQueueInput {
+            pack: Some(Patch::Set(pack.id)),
+            pack_ref: Some(Patch::Set(pack.r#ref.clone())),
+            is_adhoc: Some(false),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let owner_grant: Grant = serde_json::from_value(
+        json!({"resource":"queues", "actions":["read","update"], "constraints":{"pack_owner":"self"}}),
+    )?;
+    let owned =
+        WebSocketAuthContext::test_context(owner.id, TokenType::Access, vec![owner_grant.clone()]);
+    let member = WebSocketAuthContext::test_context(
+        neighbor.id,
+        TokenType::Access,
+        vec![owner_grant.clone()],
+    );
+    let queue_notification = notification("work_queue", queue.id);
+    assert!(notification_allowed_for_identity(&queue_notification, &owned, pool).await);
+    assert!(!notification_allowed_for_identity(&queue_notification, &member, pool).await);
+    let mut connection = pool.acquire().await?;
+    PackRepository::set_owner_roles(&mut connection, pack.id, vec!["target-maintainers".into()])
+        .await?;
+    drop(connection);
+    let membership = IdentityRoleAssignmentRepository::create(
+        pool,
+        CreateIdentityRoleAssignmentInput {
+            identity: neighbor.id,
+            role: "target-maintainers".into(),
+            source: "local".into(),
+            managed: false,
+        },
+    )
+    .await?;
+    let member_set = PermissionSetRepository::create(
+        pool,
+        CreatePermissionSetInput {
+            r#ref: "targets.owner".into(),
+            pack: None,
+            pack_ref: None,
+            label: None,
+            description: None,
+            grants: serde_json::to_value(vec![owner_grant])?,
+        },
+    )
+    .await?;
+    PermissionAssignmentRepository::create(
+        pool,
+        CreatePermissionAssignmentInput {
+            identity: neighbor.id,
+            permset: member_set.id,
+        },
+    )
+    .await?;
+    assert!(notification_allowed_for_identity(&queue_notification, &member, pool).await);
+    assert!(
+        human_delivery::allowed(
+            pool,
+            &member,
+            &ClientMessage::Notification(queue_notification.clone())
+        )
+        .await
+    );
+    IdentityRoleAssignmentRepository::delete(pool, membership.id).await?;
+    assert!(
+        !human_delivery::allowed(
+            pool,
+            &member,
+            &ClientMessage::Notification(queue_notification)
+        )
+        .await
+    );
     db.cleanup().await?;
     Ok(())
 }

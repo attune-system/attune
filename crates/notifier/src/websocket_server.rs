@@ -478,12 +478,26 @@ async fn filter_allowed_for_identity(
             if allows_baseline_collection_read(token_type, resource) {
                 return true;
             }
-            let Some(ctx) =
-                operational_entity_context(db_pool, identity_id, entity_type, *entity_id).await
+            let Some(ctx) = operational_entity_context(
+                db_pool,
+                identity_id,
+                token_type,
+                entity_type,
+                *entity_id,
+            )
+            .await
             else {
                 return false;
             };
-            has_operational_read(grants, resource, ctx)
+            if entity_type == "inquiry"
+                && *token_type == TokenType::Access
+                && inquiry_participant(db_pool, identity_id, *entity_id).await
+            {
+                return true;
+            }
+            has_operational_read(grants, resource, ctx.clone())
+                || (resource == Resource::QueueItems
+                    && has_operational_read(grants, Resource::Queues, ctx))
         }
         SubscriptionFilter::NotificationType(notification_type) => {
             notification_type_resource(notification_type).is_some_and(|resource| {
@@ -508,7 +522,11 @@ fn has_stream_read_access(
     resource: Resource,
     identity_id: i64,
 ) -> bool {
-    allows_baseline_collection_read(token_type, resource)
+    // Admission to an inquiry stream is not a read grant: Access identities
+    // may be participants; each delivered inquiry checks persisted membership.
+    (*token_type == TokenType::Access && resource == Resource::Inquiries)
+        || (resource == Resource::QueueItems && resource_action_grant_exists(grants, Resource::Queues, Action::Read))
+        || allows_baseline_collection_read(token_type, resource)
         // A stream may select many targets; scoped grants are checked again for
         // each concrete notification, never against an empty target context.
         || (matches!(resource, Resource::Queues | Resource::QueueItems | Resource::Inquiries)
@@ -565,6 +583,7 @@ fn notification_type_resource(notification_type: &str) -> Option<Resource> {
 async fn operational_entity_context(
     db_pool: &PgPool,
     identity_id: i64,
+    token_type: &TokenType,
     entity_type: &str,
     entity_id: i64,
 ) -> Option<AuthorizationContext> {
@@ -648,6 +667,24 @@ async fn operational_entity_context(
             ctx.target_id = Some(queue.id);
             ctx.target_ref = Some(queue.r#ref);
             ctx.pack_ref = queue.pack_ref;
+            use attune_common::repositories::{
+                iam_ownership::IamOwnershipRepository, runtime_target::ComponentTarget,
+            };
+            ctx.managing_pack_id =
+                IamOwnershipRepository::component_pack(db_pool, ComponentTarget::Queue, queue.id)
+                    .await
+                    .ok()?;
+            IamOwnershipRepository::populate_pack_owner(db_pool, Resource::Queues, &mut ctx)
+                .await
+                .ok()?;
+            IamOwnershipRepository::populate_pack_role_membership(
+                db_pool,
+                Resource::Queues,
+                &mut ctx,
+                *token_type == TokenType::Access,
+            )
+            .await
+            .ok()?;
         }
         "inquiry" => {
             let inquiry = InquiryRepository::find_by_id(db_pool, entity_id)
@@ -859,6 +896,7 @@ async fn notification_allowed_for_identity(
             let Some(mut ctx) = operational_entity_context(
                 db_pool,
                 auth.identity_id,
+                &auth.token_type,
                 &notification.entity_type,
                 notification.entity_id,
             )
@@ -867,7 +905,16 @@ async fn notification_allowed_for_identity(
                 return false;
             };
             ctx.identity_attributes = auth.identity_attributes.clone();
-            if notification.entity_type == "work_queue_item" {
+            if notification.entity_type == "inquiry"
+                && auth.token_type == TokenType::Access
+                && inquiry_participant(db_pool, auth.identity_id, notification.entity_id).await
+            {
+                return true;
+            }
+            if matches!(
+                notification.entity_type.as_str(),
+                "work_queue" | "work_queue_item"
+            ) {
                 let Some(queue) = WorkQueueRepository::find_by_id(db_pool, ctx.target_id.unwrap())
                     .await
                     .ok()
@@ -877,18 +924,25 @@ async fn notification_allowed_for_identity(
                 };
                 // Private queue discovery is not authorized by ambient item read.
                 // Match the API's explicit queue-scoped item exception.
+                let management = [Action::Update, Action::Delete].into_iter().any(|action| {
+                    auth.grants
+                        .iter()
+                        .any(|grant| grant.allows(Resource::Queues, action, &ctx))
+                });
                 if !attune_common::action_visibility::queue_reference_allowed(&queue, None)
-                    && !auth.grants.iter().any(|grant| {
-                        grant.constraints.as_ref().is_some_and(|c| {
-                            c.ids.as_ref().is_some_and(|ids| ids.contains(&queue.id))
-                                || c.refs
-                                    .as_ref()
-                                    .is_some_and(|refs| refs.contains(&queue.r#ref))
-                                || c.pack_refs.as_ref().is_some_and(|refs| {
-                                    queue.pack_ref.as_ref().is_some_and(|p| refs.contains(p))
-                                })
-                        }) && grant.allows(Resource::QueueItems, Action::Read, &ctx)
-                    })
+                    && !management
+                    && !(notification.entity_type == "work_queue_item"
+                        && auth.grants.iter().any(|grant| {
+                            grant.constraints.as_ref().is_some_and(|c| {
+                                c.ids.as_ref().is_some_and(|ids| ids.contains(&queue.id))
+                                    || c.refs
+                                        .as_ref()
+                                        .is_some_and(|refs| refs.contains(&queue.r#ref))
+                                    || c.pack_refs.as_ref().is_some_and(|refs| {
+                                        queue.pack_ref.as_ref().is_some_and(|p| refs.contains(p))
+                                    })
+                            }) && grant.allows(Resource::QueueItems, Action::Read, &ctx)
+                        }))
                 {
                     return false;
                 }
@@ -896,10 +950,26 @@ async fn notification_allowed_for_identity(
             let Some(resource) = entity_type_resource(&notification.entity_type) else {
                 return false;
             };
-            has_operational_read(&auth.grants, resource, ctx)
+            has_operational_read(&auth.grants, resource, ctx.clone())
+                || (resource == Resource::QueueItems
+                    && has_operational_read(&auth.grants, Resource::Queues, ctx))
         }
         _ => false,
     }
+}
+
+async fn inquiry_participant(pool: &PgPool, identity_id: i64, inquiry_id: i64) -> bool {
+    let Ok(Some(inquiry)) = InquiryRepository::find_by_id(pool, inquiry_id).await else {
+        return false;
+    };
+    if inquiry.assigned_to == Some(identity_id) {
+        return true;
+    }
+    ExecutionRepository::find_by_id(pool, inquiry.created_by_execution)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|execution| execution.executor == Some(identity_id))
 }
 
 fn resource_action_grant_exists(grants: &[Grant], resource: Resource, action: Action) -> bool {
