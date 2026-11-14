@@ -36,11 +36,10 @@ def grants(pack):
             {"resource": "queues", "actions": ["read", "update"], "constraints": {"refs": [pack + ".inbox", pack + ".input_inbox"]}},
             {"resource":"queue_items","actions":["read","decrypt","delete"],"constraints":{"refs":[pack + ".inbox",pack + ".input_inbox"]}},
             {"resource":"executions","actions":["read","decrypt","cancel"],"constraints":{"pack_refs":[pack],"owner":"any"}},
-            # These routes currently authorize without a target context. This
-            # account is restricted to the disposable owned deployment, and is
+            # This credential-administration account is restricted to the disposable owned deployment, and is
             # never used as an installer/invoker/sponsor fallback.
             {"resource": "permissions", "actions": ["manage"]},
-            {"resource": "identities", "actions": ["update"]},
+            {"resource": "identities", "actions": ["manage"]},
         ],
     }
 
