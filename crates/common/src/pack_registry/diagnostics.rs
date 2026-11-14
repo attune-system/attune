@@ -299,6 +299,31 @@ pub fn validate_metadata(root: &std::path::Path) -> crate::Result<Vec<PackDiagno
 mod tests {
     use super::*;
     #[test]
+    fn shipped_core_disabled_testing_satisfies_typed_metadata_contract() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest = include_str!("../../../../packs/core/pack.yaml");
+        std::fs::write(root.path().join("pack.yaml"), manifest).unwrap();
+        let metadata = read_manifest(root.path()).unwrap();
+        let testing: crate::test_executor::TestConfig =
+            decode_yaml_value("pack.yaml", "/testing", metadata["testing"].clone()).unwrap();
+        assert!(!testing.enabled);
+        assert!(testing.runners.is_empty());
+        validate_metadata(root.path()).unwrap();
+
+        // Disabling execution never bypasses the typed metadata contract.
+        let mut incomplete = metadata;
+        let block = incomplete["testing"].as_mapping_mut().unwrap();
+        block.remove(serde_yaml_ng::Value::String("discovery".into()));
+        block.remove(serde_yaml_ng::Value::String("runners".into()));
+        std::fs::write(
+            root.path().join("pack.yaml"),
+            serde_yaml_ng::to_string(&incomplete).unwrap(),
+        )
+        .unwrap();
+        assert!(validate_metadata(root.path()).is_err());
+    }
+
+    #[test]
     fn typed_field_errors_keep_nested_paths_without_values() {
         let value = serde_yaml_ng::from_str("enabled: true\nrunners:\n  python:\n    type: script\n    entry_point: run.sh\n    timeout: SECRET_CANARY\n").unwrap();
         let error =

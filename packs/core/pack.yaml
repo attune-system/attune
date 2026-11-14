@@ -60,3 +60,6 @@ enabled: true
 # Candidate test runners currently require an interpreter; core actions do not.
 testing:
   enabled: false
+  discovery:
+    method: directory
+  runners: {}

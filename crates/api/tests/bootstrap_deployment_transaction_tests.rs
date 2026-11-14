@@ -1335,7 +1335,12 @@ async fn core_native_only_worker_upload_admits_without_interpreter_test_dispatch
         serde_yaml_ng::from_str(&std::fs::read_to_string(source.join("pack.yaml"))?)?;
     assert_eq!(metadata["runtime_deps"], json!(["native"]));
     assert_eq!(metadata["testing"]["enabled"], false);
-    assert!(metadata["testing"].get("runners").is_none());
+    assert_eq!(metadata["testing"]["runners"], json!({}));
+    let testing: attune_common::test_executor::TestConfig =
+        serde_json::from_value(metadata["testing"].clone())?;
+    assert!(!testing.enabled);
+    assert!(testing.runners.is_empty());
+    attune_common::pack_registry::diagnostics::validate_metadata(&source)?;
     let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let mut archive = tar::Builder::new(gzip);
     archive.append_dir_all("core", &source)?;
