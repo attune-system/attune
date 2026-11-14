@@ -495,6 +495,11 @@ async fn filter_allowed_for_identity(
             {
                 return true;
             }
+            if matches!(entity_type.as_str(), "work_queue" | "work_queue_item")
+                && !queue_notification_visible(db_pool, grants, &ctx, entity_type).await
+            {
+                return false;
+            }
             has_operational_read(grants, resource, ctx.clone())
                 || (resource == Resource::QueueItems
                     && has_operational_read(grants, Resource::Queues, ctx))
@@ -914,38 +919,15 @@ async fn notification_allowed_for_identity(
             if matches!(
                 notification.entity_type.as_str(),
                 "work_queue" | "work_queue_item"
-            ) {
-                let Some(queue) = WorkQueueRepository::find_by_id(db_pool, ctx.target_id.unwrap())
-                    .await
-                    .ok()
-                    .flatten()
-                else {
-                    return false;
-                };
-                // Private queue discovery is not authorized by ambient item read.
-                // Match the API's explicit queue-scoped item exception.
-                let management = [Action::Update, Action::Delete].into_iter().any(|action| {
-                    auth.grants
-                        .iter()
-                        .any(|grant| grant.allows(Resource::Queues, action, &ctx))
-                });
-                if !attune_common::action_visibility::queue_reference_allowed(&queue, None)
-                    && !management
-                    && !(notification.entity_type == "work_queue_item"
-                        && auth.grants.iter().any(|grant| {
-                            grant.constraints.as_ref().is_some_and(|c| {
-                                c.ids.as_ref().is_some_and(|ids| ids.contains(&queue.id))
-                                    || c.refs
-                                        .as_ref()
-                                        .is_some_and(|refs| refs.contains(&queue.r#ref))
-                                    || c.pack_refs.as_ref().is_some_and(|refs| {
-                                        queue.pack_ref.as_ref().is_some_and(|p| refs.contains(p))
-                                    })
-                            }) && grant.allows(Resource::QueueItems, Action::Read, &ctx)
-                        }))
-                {
-                    return false;
-                }
+            ) && !queue_notification_visible(
+                db_pool,
+                &auth.grants,
+                &ctx,
+                &notification.entity_type,
+            )
+            .await
+            {
+                return false;
             }
             let Some(resource) = entity_type_resource(&notification.entity_type) else {
                 return false;
@@ -956,6 +938,40 @@ async fn notification_allowed_for_identity(
         }
         _ => false,
     }
+}
+
+// Subscription admission and delivery must use the same private-queue predicate:
+// otherwise success/error at entity subscription is an existence oracle.
+async fn queue_notification_visible(
+    pool: &PgPool,
+    grants: &[Grant],
+    ctx: &AuthorizationContext,
+    entity_type: &str,
+) -> bool {
+    let Some(queue_id) = ctx.target_id else {
+        return false;
+    };
+    let Ok(Some(queue)) = WorkQueueRepository::find_by_id(pool, queue_id).await else {
+        return false;
+    };
+    attune_common::action_visibility::queue_reference_allowed(&queue, None)
+        || [Action::Update, Action::Delete].into_iter().any(|action| {
+            grants
+                .iter()
+                .any(|grant| grant.allows(Resource::Queues, action, ctx))
+        })
+        || (entity_type == "work_queue_item"
+            && grants.iter().any(|grant| {
+                grant.constraints.as_ref().is_some_and(|c| {
+                    c.ids.as_ref().is_some_and(|ids| ids.contains(&queue.id))
+                        || c.refs
+                            .as_ref()
+                            .is_some_and(|refs| refs.contains(&queue.r#ref))
+                        || c.pack_refs.as_ref().is_some_and(|refs| {
+                            queue.pack_ref.as_ref().is_some_and(|p| refs.contains(p))
+                        })
+                }) && grant.allows(Resource::QueueItems, Action::Read, ctx)
+            }))
 }
 
 async fn inquiry_participant(pool: &PgPool, identity_id: i64, inquiry_id: i64) -> bool {

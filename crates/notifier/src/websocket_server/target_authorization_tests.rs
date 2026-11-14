@@ -323,6 +323,21 @@ async fn notifier_targets_scope_unknown_and_revocation() -> Result<()> {
         !notification_allowed_for_identity(&notification("work_queue", queue.id), &global, pool)
             .await
     );
+    assert!(
+        !filter_allowed_for_identity(
+            &SubscriptionFilter::Entity {
+                entity_type: "work_queue".into(),
+                entity_id: queue.id
+            },
+            owner.id,
+            &TokenType::Access,
+            &[],
+            &[],
+            &global.grants,
+            pool
+        )
+        .await
+    );
     let mut manager = global.clone();
     manager.grants[0].actions.push(Action::Update);
     manager.grants.push(Grant {
