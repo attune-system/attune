@@ -37,3 +37,7 @@ remains a no-op for stored component content; its bootstrap source snapshot stay
 consistent. Custom profile/editor grants gain no administration permission.
 Both shipped admin YAML definitions intentionally include the new action; all
 other platform definition bytes remain unchanged.
+
+The bundled core version for this policy change is `1.0.6`, independently of
+platform/API `0.10.4`. Its existing action, trigger, sensor, and runtime inventory
+is unchanged.
