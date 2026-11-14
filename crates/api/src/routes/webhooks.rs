@@ -177,6 +177,15 @@ pub async fn enable_webhook(
     RequireAuth(user): RequireAuth,
     Path(trigger_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    if !matches!(
+        user.claims.token_type,
+        crate::auth::jwt::TokenType::Access | crate::auth::jwt::TokenType::Execution
+    ) {
+        return Err(ApiError::Forbidden(
+            "This token type cannot administer webhooks".into(),
+        ));
+    }
+
     // First, find the trigger by ref to get its ID
     let trigger = TriggerRepository::find_by_ref(&state.db, &trigger_ref)
         .await
@@ -189,25 +198,31 @@ pub async fn enable_webhook(
         )));
     }
 
-    if user.claims.token_type == crate::auth::jwt::TokenType::Access {
-        let identity_id = user
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = state.authorization_service();
-        let mut ctx = AuthorizationContext::new(identity_id);
-        ctx.target_ref = Some(trigger.r#ref.clone());
-        ctx.pack_ref = trigger.pack_ref.clone();
-        authz
-            .authorize(
-                &user,
-                AuthorizationCheck {
-                    resource: Resource::Triggers,
-                    action: Action::Update,
-                    context: ctx,
-                },
-            )
-            .await?;
-    }
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    let authz = state.authorization_service();
+    let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.target_id = Some(trigger.id);
+    ctx.managing_pack_id =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+            &state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Trigger,
+            trigger.id,
+        )
+        .await?;
+    ctx.target_ref = Some(trigger.r#ref.clone());
+    ctx.pack_ref = trigger.pack_ref.clone();
+    authz
+        .authorize(
+            &user,
+            AuthorizationCheck {
+                resource: Resource::Triggers,
+                action: Action::Update,
+                context: ctx,
+            },
+        )
+        .await?;
 
     // Enable webhooks for this trigger
     let _webhook_info = TriggerRepository::enable_webhook(&state.db, trigger.id)
@@ -246,6 +261,15 @@ pub async fn disable_webhook(
     RequireAuth(user): RequireAuth,
     Path(trigger_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    if !matches!(
+        user.claims.token_type,
+        crate::auth::jwt::TokenType::Access | crate::auth::jwt::TokenType::Execution
+    ) {
+        return Err(ApiError::Forbidden(
+            "This token type cannot administer webhooks".into(),
+        ));
+    }
+
     // First, find the trigger by ref to get its ID
     let trigger = TriggerRepository::find_by_ref(&state.db, &trigger_ref)
         .await
@@ -258,25 +282,31 @@ pub async fn disable_webhook(
         )));
     }
 
-    if user.claims.token_type == crate::auth::jwt::TokenType::Access {
-        let identity_id = user
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = state.authorization_service();
-        let mut ctx = AuthorizationContext::new(identity_id);
-        ctx.target_ref = Some(trigger.r#ref.clone());
-        ctx.pack_ref = trigger.pack_ref.clone();
-        authz
-            .authorize(
-                &user,
-                AuthorizationCheck {
-                    resource: Resource::Triggers,
-                    action: Action::Update,
-                    context: ctx,
-                },
-            )
-            .await?;
-    }
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    let authz = state.authorization_service();
+    let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.target_id = Some(trigger.id);
+    ctx.managing_pack_id =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+            &state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Trigger,
+            trigger.id,
+        )
+        .await?;
+    ctx.target_ref = Some(trigger.r#ref.clone());
+    ctx.pack_ref = trigger.pack_ref.clone();
+    authz
+        .authorize(
+            &user,
+            AuthorizationCheck {
+                resource: Resource::Triggers,
+                action: Action::Update,
+                context: ctx,
+            },
+        )
+        .await?;
 
     // Disable webhooks for this trigger
     TriggerRepository::disable_webhook(&state.db, trigger.id)
@@ -369,6 +399,15 @@ pub async fn regenerate_webhook_key(
     RequireAuth(user): RequireAuth,
     Path(trigger_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    if !matches!(
+        user.claims.token_type,
+        crate::auth::jwt::TokenType::Access | crate::auth::jwt::TokenType::Execution
+    ) {
+        return Err(ApiError::Forbidden(
+            "This token type cannot administer webhooks".into(),
+        ));
+    }
+
     // First, find the trigger by ref to get its ID
     let trigger = TriggerRepository::find_by_ref(&state.db, &trigger_ref)
         .await
@@ -381,25 +420,31 @@ pub async fn regenerate_webhook_key(
         )));
     }
 
-    if user.claims.token_type == crate::auth::jwt::TokenType::Access {
-        let identity_id = user
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = state.authorization_service();
-        let mut ctx = AuthorizationContext::new(identity_id);
-        ctx.target_ref = Some(trigger.r#ref.clone());
-        ctx.pack_ref = trigger.pack_ref.clone();
-        authz
-            .authorize(
-                &user,
-                AuthorizationCheck {
-                    resource: Resource::Triggers,
-                    action: Action::Update,
-                    context: ctx,
-                },
-            )
-            .await?;
-    }
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    let authz = state.authorization_service();
+    let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.target_id = Some(trigger.id);
+    ctx.managing_pack_id =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+            &state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Trigger,
+            trigger.id,
+        )
+        .await?;
+    ctx.target_ref = Some(trigger.r#ref.clone());
+    ctx.pack_ref = trigger.pack_ref.clone();
+    authz
+        .authorize(
+            &user,
+            AuthorizationCheck {
+                resource: Resource::Triggers,
+                action: Action::Update,
+                context: ctx,
+            },
+        )
+        .await?;
 
     // Check if webhooks are enabled
     if !trigger.webhook_enabled {

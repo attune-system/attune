@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Cog } from "lucide-react";
-import { loadPackIconSrc } from "@/utils/packIcons";
+import { packIconUrl } from "@/utils/packIcons";
 
 type PackIconProps = {
   packRef?: string | null;
@@ -29,37 +29,15 @@ export default function PackIcon({
   className = "",
   title,
 }: PackIconProps) {
-  const [resolvedIcon, setResolvedIcon] = useState<{
-    packRef: string;
-    src: string | null;
-  } | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    if (!packRef) {
-      return () => {
-        cancelled = true;
-      };
-    }
-
-    void loadPackIconSrc(packRef).then((resolvedSrc) => {
-      if (!cancelled) {
-        setResolvedIcon({ packRef, src: resolvedSrc });
-      }
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [packRef]);
-
-  const src =
-    packRef && resolvedIcon?.packRef === packRef ? resolvedIcon.src : null;
+  const normalizedPackRef = packRef?.trim();
+  // Navigate to the HTTP response even when opened as a document: blob URLs
+  // discard the API's sandbox CSP and inherit the UI's origin and policy.
+  const src = normalizedPackRef ? packIconUrl(normalizedPackRef) : null;
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
 
   const wrapperClass = `${SIZE_CLASSES[size]} ${className} inline-flex flex-shrink-0 items-center justify-center overflow-hidden rounded bg-gray-100 text-gray-500`;
 
-  if (!src) {
+  if (!src || src === failedSrc) {
     return (
       <span className={wrapperClass} title={title || packRef || "Pack icon"}>
         <Cog className={FALLBACK_ICON_CLASSES[size]} />
@@ -69,7 +47,12 @@ export default function PackIcon({
 
   return (
     <span className={wrapperClass} title={title || packRef || "Pack icon"}>
-      <img src={src} alt="" className="h-full w-full object-contain" />
+      <img
+        src={src}
+        alt=""
+        className="h-full w-full object-contain"
+        onError={() => setFailedSrc(src)}
+      />
     </span>
   );
 }

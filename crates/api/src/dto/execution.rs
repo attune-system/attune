@@ -30,7 +30,7 @@ pub struct CreateExecutionRequest {
     #[schema(value_type = Option<Object>, example = json!({"channel": "#alerts", "message": "Manual test"}))]
     pub parameters: Option<JsonValue>,
 
-    /// Environment overrides for this execution. ATTUNE_ names are reserved for internal use.
+    /// Caller environment values; names must be declared in the captured runtime execution_config.permitted_caller_env. Startup, search-path and ATTUNE_ controls are forbidden.
     #[serde(default)]
     #[schema(example = json!({"DEBUG": "true", "LOG_LEVEL": "info"}))]
     pub env_vars: Option<HashMap<String, String>>,

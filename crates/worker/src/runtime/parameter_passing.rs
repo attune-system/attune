@@ -27,14 +27,13 @@ pub fn is_reserved_runtime_env_var(name: &str) -> bool {
 pub fn merge_execution_environment(
     env: &mut HashMap<String, String>,
     execution_env: &HashMap<String, String>,
-) {
+) -> Result<(), RuntimeError> {
     for (key, value) in execution_env {
-        if is_reserved_runtime_env_var(key) {
-            tracing::warn!("Ignoring execution environment variable {key}: ATTUNE_ is reserved");
-            continue;
-        }
-        env.insert(key.clone(), value.clone());
+        attune_common::execution_env::validate_execution_env_var(key, value)
+            .map_err(|error| RuntimeError::InvalidAction(error.to_string()))?;
     }
+    env.extend(execution_env.clone());
+    Ok(())
 }
 
 /// Apply only the selected baseline and the explicit execution environment.
@@ -345,6 +344,90 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn caller_startup_probes_cannot_replace_fixed_actions() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("taken-over");
+        let hook = root.path().join("startup");
+        std::fs::write(&hook, format!("touch '{}'\n", marker.display())).unwrap();
+        std::fs::write(
+            root.path().join("sitecustomize.py"),
+            format!("open({:?}, 'w').close()", marker.to_str().unwrap()),
+        )
+        .unwrap();
+        let node_hook = root.path().join("hook.js");
+        std::fs::write(
+            &node_hook,
+            format!(
+                "require('fs').writeFileSync({:?}, '')",
+                marker.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let probes: HashMap<String, String> = HashMap::from([
+            ("BASH_ENV".into(), hook.display().to_string()),
+            ("ENV".into(), hook.display().to_string()),
+            ("PYTHONPATH".into(), root.path().display().to_string()),
+            (
+                "NODE_OPTIONS".into(),
+                format!("--require={}", node_hook.display()),
+            ),
+            ("LD_PRELOAD".into(), hook.display().to_string()),
+            ("PATH".into(), root.path().display().to_string()),
+            ("ATTUNE_API_TOKEN".into(), "caller-token".into()),
+            ("APP_REGION".into(), "west".into()),
+        ]);
+        for (key, value) in &probes {
+            if key != "APP_REGION" {
+                assert!(
+                    merge_execution_environment(
+                        &mut HashMap::new(),
+                        &HashMap::from([(key.clone(), value.clone())])
+                    )
+                    .is_err(),
+                    "{key}"
+                );
+            }
+        }
+        for (binary, args) in [
+            ("/bin/bash", vec!["-c", r#"printf '%s' "$APP_REGION""#]),
+            (
+                "/usr/bin/python3",
+                vec!["-c", "import os; print(os.environ['APP_REGION'], end='')"],
+            ),
+            (
+                "/usr/bin/node",
+                vec!["-e", "process.stdout.write(process.env.APP_REGION)"],
+            ),
+        ] {
+            if binary == "/usr/bin/node" && !std::path::Path::new(binary).exists() {
+                eprintln!("Node subprocess probe unavailable: {binary} is not installed; policy rejection assertions still ran");
+                continue;
+            }
+            let mut env = HashMap::new();
+            assert!(merge_execution_environment(&mut env, &probes).is_err());
+            assert!(env.is_empty());
+            merge_execution_environment(
+                &mut env,
+                &HashMap::from([("APP_REGION".into(), "west".into())]),
+            )
+            .unwrap();
+            assert_eq!(env.len(), 1);
+            let mut cmd = Command::new(binary);
+            cmd.args(args);
+            apply_runtime_environment(&mut cmd, &env, &ChildProcessEnvironment::default());
+            let output = cmd.output().await.expect("probe runtime must be installed");
+            assert!(output.status.success(), "{binary}: {:?}", output.stderr);
+            assert_eq!(output.stdout, b"west");
+            assert!(
+                output.stderr.is_empty(),
+                "linker/startup probe reached {binary}"
+            );
+            assert!(!marker.exists());
+        }
+    }
+
     #[test]
     fn test_format_dotenv() {
         let mut params = HashMap::new();
@@ -508,7 +591,11 @@ mod tests {
             ("ATTUNE_API_URL".to_string(), "http://untrusted".to_string()),
         ]);
 
-        merge_execution_environment(&mut env, &execution_env);
+        assert!(merge_execution_environment(&mut env, &execution_env).is_err());
+        assert_eq!(env["LOG_LEVEL"], "info");
+        let mut allowed = execution_env.clone();
+        allowed.remove("ATTUNE_API_URL");
+        merge_execution_environment(&mut env, &allowed).unwrap();
 
         assert_eq!(env["LOG_LEVEL"], "debug");
         assert_eq!(env["REGION"], "eu-west-1");

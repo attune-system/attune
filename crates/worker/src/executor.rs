@@ -1178,6 +1178,10 @@ impl ActionExecutor {
             }
         }
 
+        attune_common::execution_env::validate_snapshot_environment(
+            execution.executable_snapshot.as_ref(),
+            execution.env_vars.as_ref(),
+        )?;
         let execution_env = if let Some(env_vars) = &execution.env_vars {
             serde_json::from_value::<HashMap<String, String>>(env_vars.clone()).map_err(|_| {
                 Error::Validation(
@@ -1241,6 +1245,13 @@ impl ActionExecutor {
         let (runtime_config_override, runtime_env_dir_suffix, selected_runtime_version) = self
             .resolve_runtime_version(&runtime_record, execution, action)
             .await;
+
+        // Recheck the exact captured config selected after worker placement.
+        attune_common::execution_env::validate_selected_environment(
+            execution.executable_snapshot.as_ref(),
+            selected_runtime_version.as_deref(),
+            execution.env_vars.as_ref(),
+        )?;
 
         // Determine the pack directory for this action
         let pack_dir = execution

@@ -229,10 +229,11 @@ fn workflow_editor(user: &AuthenticatedUser) -> ApiResult<i64> {
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".into()))
 }
 
-async fn authorize_workflow_update(
+async fn authorize_workflow_action(
     state: &Arc<AppState>,
     user: &AuthenticatedUser,
     workflow: &attune_common::models::workflow::WorkflowDefinition,
+    action: Action,
 ) -> ApiResult<Option<(i64, i64, bool, Option<i64>)>> {
     let companion = ActionRepository::find_by_workflow_def(&state.db, workflow.id).await?;
     if companion.as_ref().is_some_and(|action| {
@@ -266,7 +267,7 @@ async fn authorize_workflow_update(
             user,
             crate::authz::AuthorizationCheck {
                 resource: Resource::Actions,
-                action: Action::Update,
+                action,
                 context,
             },
         )
@@ -555,7 +556,7 @@ pub async fn get_workflow(
 )]
 pub async fn create_workflow(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Json(request): Json<CreateWorkflowRequest>,
 ) -> ApiResult<impl IntoResponse> {
     // Validate request
@@ -576,6 +577,16 @@ pub async fn create_workflow(
     let pack = PackRepository::find_by_ref(&state.db, &request.pack_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", request.pack_ref)))?;
+    let mut tx = state.db.begin().await?;
+    super::lifecycle_authorization::create(
+        &state,
+        &mut tx,
+        &user,
+        Resource::Actions,
+        &request.r#ref,
+        Some((&pack.r#ref, pack.id)),
+    )
+    .await?;
     validate_workflow_action_references(&state, &pack.r#ref, &request.r#ref, &request.definition)
         .await?;
 
@@ -593,12 +604,11 @@ pub async fn create_workflow(
         tags: request.tags.clone().unwrap_or_default(),
     };
 
-    let workflow = WorkflowDefinitionRepository::create(&state.db, workflow_input).await?;
+    let workflow = WorkflowDefinitionRepository::create(&mut *tx, workflow_input).await?;
 
     // Create a companion action record so the workflow appears in action lists
-    let mut connection = state.db.acquire().await?;
     create_companion_action(
-        &mut connection,
+        &mut tx,
         &workflow.r#ref,
         pack.id,
         &pack.r#ref,
@@ -613,6 +623,8 @@ pub async fn create_workflow(
         workflow.id,
     )
     .await?;
+
+    tx.commit().await?;
 
     let response = ApiResponse::with_message(
         WorkflowResponse::from(workflow),
@@ -651,7 +663,8 @@ pub async fn update_workflow(
     let existing_workflow = WorkflowDefinitionRepository::find_by_ref(&state.db, &workflow_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Workflow '{}' not found", workflow_ref)))?;
-    let authorized_companion = authorize_workflow_update(&state, &user, &existing_workflow).await?;
+    let authorized_companion =
+        authorize_workflow_action(&state, &user, &existing_workflow, Action::Update).await?;
     if let Some(definition) = &request.definition {
         validate_workflow_action_references(
             &state,
@@ -743,16 +756,65 @@ pub async fn update_workflow(
 )]
 pub async fn delete_workflow(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(workflow_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    if user.claims.token_type != crate::auth::jwt::TokenType::Access {
+        return Err(ApiError::Forbidden(
+            "Workflow deletion requires an access token".into(),
+        ));
+    }
     // Check if workflow exists
     let workflow = WorkflowDefinitionRepository::find_by_ref(&state.db, &workflow_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Workflow '{}' not found", workflow_ref)))?;
 
+    let authorized_companion =
+        authorize_workflow_action(&state, &user, &workflow, Action::Delete).await?;
+    let mut tx = state.db.begin().await?;
+    // Companion deletion needs exclusive graph admission before cache/owner locks.
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await?;
+    // Pin cascades acquire admission before any workflow/companion protection.
+    attune_common::repositories::cache::CacheEntryRepository::protect_transaction(
+        &mut tx,
+        attune_common::repositories::cache::CacheTransactionMode::PinMutation,
+    )
+    .await?;
+    check_authorized_companion(&mut tx, workflow.id, authorized_companion).await?;
+
+    if let Some((action_id, _, _, _)) = authorized_companion {
+        super::lifecycle_authorization::existing(
+            &state,
+            &mut tx,
+            &user,
+            attune_common::repositories::runtime_target::RuntimeTarget::Component(
+                attune_common::repositories::runtime_target::ComponentTarget::Action,
+                action_id,
+            ),
+            Action::Delete,
+        )
+        .await?;
+    } else {
+        let mut context = AuthorizationContext::new(workflow_editor(&user)?);
+        context.target_ref = Some(workflow.r#ref.clone());
+        context.pack_ref = Some(workflow.pack_ref.clone());
+        state
+            .authorization_service()
+            .authorize_access_fresh(
+                &mut tx,
+                &user,
+                crate::authz::AuthorizationCheck {
+                    resource: Resource::Actions,
+                    action: Action::Delete,
+                    context,
+                },
+            )
+            .await?;
+    }
+
     // Delete the workflow (companion action is cascade-deleted via FK on action.workflow_def)
-    let deleted = WorkflowDefinitionRepository::delete(&state.db, workflow.id).await?;
+    let deleted = WorkflowDefinitionRepository::delete(&mut *tx, workflow.id).await?;
 
     if !deleted {
         return Err(ApiError::NotFound(format!(
@@ -761,6 +823,7 @@ pub async fn delete_workflow(
         )));
     }
 
+    tx.commit().await?;
     let response =
         SuccessResponse::new(format!("Workflow '{}' deleted successfully", workflow_ref));
 
@@ -791,10 +854,35 @@ pub async fn delete_workflow(
 )]
 pub async fn save_workflow_file(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(pack_ref): Path<String>,
     Json(request): Json<SaveWorkflowFileRequest>,
 ) -> ApiResult<impl IntoResponse> {
+    let lease = state
+        .file_transfers
+        .upload(Some(request.definition.to_string().len() as u64))
+        .map_err(ApiError::BadRequest)?;
+    let transfers = state.file_transfers.clone();
+    let handle = transfers.prepare_publication(lease, move |lease| async move {
+        save_workflow_file_owned(state, user, pack_ref, request, lease).await
+    });
+    tokio_util::task::AbortOnDropHandle::new(handle)
+        .await
+        .map_err(|error| {
+            ApiError::InternalServerError(format!("Workflow preparation owner failed: {error}"))
+        })?
+        .ok_or_else(|| {
+            ApiError::InternalServerError("Workflow preparation canceled during shutdown".into())
+        })?
+}
+
+async fn save_workflow_file_owned(
+    state: Arc<AppState>,
+    user: AuthenticatedUser,
+    pack_ref: String,
+    request: SaveWorkflowFileRequest,
+    lease: crate::file_transfers::FileUploadLease,
+) -> ApiResult<(StatusCode, Json<ApiResponse<WorkflowResponse>>)> {
     request.validate()?;
 
     // Verify pack exists
@@ -803,6 +891,16 @@ pub async fn save_workflow_file(
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", pack_ref)))?;
 
     let workflow_ref = format!("{}.{}", pack_ref, request.name);
+    let mut tx = state.db.begin().await?;
+    super::lifecycle_authorization::create(
+        &state,
+        &mut tx,
+        &user,
+        Resource::Actions,
+        &workflow_ref,
+        Some((&pack.r#ref, pack.id)),
+    )
+    .await?;
     validate_reference_visibility_request(&request)?;
     validate_workflow_action_references(&state, &pack.r#ref, &workflow_ref, &request.definition)
         .await?;
@@ -818,9 +916,16 @@ pub async fn save_workflow_file(
         )));
     }
 
-    // Write YAML file to disk
-    let packs_base_dir = PathBuf::from(&state.config.packs_base_dir);
-    write_workflow_yaml(&packs_base_dir, &pack_ref, &request).await?;
+    let graph = serde_yaml_ng::to_string(&strip_action_level_fields(&request.definition)).map_err(
+        |error| ApiError::BadRequest(format!("Cannot serialize workflow graph: {error}")),
+    )?;
+    let mut files = super::workflow_file_publication::PreparedWorkflowFiles::stage(
+        std::path::Path::new(&state.config.packs_base_dir),
+        &pack_ref,
+        &request.name,
+        &graph,
+        &build_action_yaml(&pack_ref, &request),
+    )?;
 
     // Create workflow in database
     let definition_json = serde_json::to_value(&request.definition).map_err(|e| {
@@ -840,13 +945,12 @@ pub async fn save_workflow_file(
         tags: request.tags.clone().unwrap_or_default(),
     };
 
-    let workflow = WorkflowDefinitionRepository::create(&state.db, workflow_input).await?;
+    let workflow = WorkflowDefinitionRepository::create(&mut *tx, workflow_input).await?;
 
     // Create a companion action record so the workflow appears in action lists and palettes
     let entrypoint = format!("workflows/{}.workflow.yaml", request.name);
-    let mut connection = state.db.acquire().await?;
     create_companion_action(
-        &mut connection,
+        &mut tx,
         &workflow_ref,
         pack.id,
         &pack.r#ref,
@@ -863,6 +967,27 @@ pub async fn save_workflow_file(
         workflow.id,
     )
     .await?;
+
+    files.publish()?;
+    let workflow_id = workflow.id;
+    state
+        .file_transfers
+        .finish_publication(lease, async move {
+            match tx.commit().await {
+                Ok(()) => {
+                    files.committed();
+                    Ok(())
+                }
+                Err(error) => {
+                    files.failed_commit(&error, workflow_id);
+                    Err(ApiError::from(error))
+                }
+            }
+        })
+        .await
+        .map_err(|error| {
+            ApiError::InternalServerError(format!("Workflow publication owner failed: {error}"))
+        })??;
 
     let response = ApiResponse::with_message(
         WorkflowResponse::from(workflow),
@@ -901,7 +1026,8 @@ pub async fn update_workflow_file(
     let existing_workflow = WorkflowDefinitionRepository::find_by_ref(&state.db, &workflow_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Workflow '{}' not found", workflow_ref)))?;
-    let authorized_companion = authorize_workflow_update(&state, &user, &existing_workflow).await?;
+    let authorized_companion =
+        authorize_workflow_action(&state, &user, &existing_workflow, Action::Update).await?;
     if request.pack_ref != existing_workflow.pack_ref
         || format!("{}.{}", request.pack_ref, request.name) != workflow_ref
     {

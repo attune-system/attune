@@ -383,21 +383,16 @@ impl WorkerService {
         // Load runtimes from the database and create ProcessRuntime instances.
         // Each runtime row's `execution_config` JSONB drives how the ProcessRuntime
         // invokes interpreters, manages environments, and installs dependencies.
-        // We skip runtimes with empty execution_config (e.g., core.native) since
+        // We skip empty or admission-metadata-only configs (e.g., core.native) since
         // they execute binaries directly and don't need a ProcessRuntime wrapper.
         match RuntimeRepository::list(&pool).await {
             Ok(db_runtimes) => {
                 let executable_runtimes: Vec<_> = db_runtimes
                     .into_iter()
                     .filter(|r| {
-                        let config = r.parsed_execution_config();
-                        // A runtime is executable if it has a non-default interpreter
-                        // (the default is "/bin/sh" from InterpreterConfig::default,
-                        // but runtimes with no execution_config at all will have an
-                        // empty JSON object that deserializes to defaults with no
-                        // file_extension — those are not real process runtimes).
-                        config.interpreter.file_extension.is_some()
-                            || r.execution_config != serde_json::json!({})
+                        attune_common::execution_env::has_runtime_process_configuration(
+                            &r.execution_config,
+                        )
                     })
                     .collect();
 
@@ -2617,6 +2612,45 @@ async fn mark_pack_install_failed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn caller_policy_metadata_preserves_native_runtime_selection() {
+        use crate::runtime::ExecutionContext;
+        let root = tempfile::tempdir().unwrap();
+        let binary = root.path().join("fixed-native-action");
+        std::fs::copy("/bin/echo", &binary).unwrap();
+        let config = serde_json::json!({"permitted_caller_env":["APP_REGION"]});
+        let mut registry = RuntimeRegistry::new();
+        // Use the startup classification with the real registration order. A
+        // shell wrapper here would try to interpret the owned ELF and fail.
+        if attune_common::execution_env::has_runtime_process_configuration(&config) {
+            registry.register(Box::new(ProcessRuntime::new(
+                "native".into(),
+                serde_json::from_value(config).unwrap(),
+                root.path().into(),
+                root.path().join("envs"),
+            )));
+        }
+        registry.register(Box::new(NativeRuntime::with_work_dir(root.path().into())));
+        let mut context = ExecutionContext::test_context("test.native_policy".into(), None);
+        context.code_path = Some(binary);
+        context.runtime_name = Some("native".into());
+        context
+            .execution_env
+            .insert("APP_REGION".into(), "west".into());
+        let runtime = registry.get_runtime(&context).unwrap();
+        let result = runtime.execute(context).await.unwrap();
+        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        assert_eq!(result.stdout.trim(), "");
+        for config in [
+            serde_json::json!({"permitted_caller_env":["APP_REGION"], "interpreter":{"binary":"python3"}}),
+            serde_json::json!({"env_vars":{"PYTHONPATH":"operator/lib"}}),
+        ] {
+            assert!(attune_common::execution_env::has_runtime_process_configuration(&config));
+        }
+    }
+
     use attune_common::repositories::runtime::WorkerRepository;
 
     #[tokio::test]

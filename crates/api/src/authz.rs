@@ -241,6 +241,30 @@ impl AuthorizationService {
         Self::invalidate_identity_authz_cache(payload.identity_id).await;
     }
 
+    /// Generic IAM accepts human access and delegated execution credentials only.
+    /// Recorded credentials require a dedicated, target-aware consumer instead.
+    fn require_iam_credential(user: &AuthenticatedUser) -> Result<(), ApiError> {
+        if !matches!(
+            user.claims.token_type,
+            TokenType::Access | TokenType::Execution
+        ) {
+            return Err(ApiError::Forbidden(
+                "This credential cannot use identity authorization".into(),
+            ));
+        }
+        if user
+            .claims
+            .admitted_execution_credential()
+            .map_err(|_| ApiError::Unauthorized("Invalid recorded execution credential".into()))?
+            .is_some()
+        {
+            return Err(ApiError::Forbidden(
+                "Recorded runtime authority requires target-aware matching".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn authorize(
         &self,
         user: &AuthenticatedUser,
@@ -372,36 +396,13 @@ impl AuthorizationService {
     /// for the same request can reuse them via [`Self::authorize_with_snapshot`]
     /// instead of re-querying identity/grants per check.
     ///
-    /// Returns `None` for token types that are not subject to identity-based
-    /// RBAC (e.g. sensor/refresh tokens), matching [`Self::authorize`]'s bypass
-    /// behavior for those token types.
+    /// Unsupported credentials are rejected. Successful loads always return a
+    /// snapshot; the optional return type does not grant a bypass to consumers.
     pub async fn load_snapshot(
         &self,
         user: &AuthenticatedUser,
     ) -> Result<Option<AuthorizationSnapshot>, ApiError> {
-        if user
-            .claims
-            .admitted_execution_credential()
-            .map_err(|_| ApiError::Unauthorized("Invalid recorded execution credential".into()))?
-            .is_some()
-        {
-            // Never flatten a recorded pack envelope into mutable named IAM
-            // grants. Consumers must perform target-aware transaction checks.
-            return Err(ApiError::Forbidden(
-                "This resource consumer has not been converted to recorded runtime authority"
-                    .into(),
-            ));
-        }
-        // Sensor and Refresh tokens have dedicated scope checks elsewhere and
-        // are not subject to identity-based RBAC.
-        //
-        // Access tokens use identity/role assignments. Execution tokens are
-        // constrained to permission set refs embedded by the worker at token
-        // mint time; they never inherit the triggering identity's full RBAC.
-        match user.claims.token_type {
-            TokenType::Access | TokenType::Execution => {}
-            _ => return Ok(None),
-        }
+        Self::require_iam_credential(user)?;
 
         let identity_id = user.identity_id().map_err(|_| {
             ApiError::Unauthorized("Invalid authentication subject in token".to_string())
@@ -497,18 +498,22 @@ impl AuthorizationService {
     }
 
     /// Evaluates `check` against a snapshot previously loaded via
-    /// [`Self::load_snapshot`]. A `None` snapshot means the caller's token
-    /// type is not subject to identity-based RBAC, so the check passes (same
-    /// bypass behavior as [`Self::authorize`]).
+    /// [`Self::load_snapshot`]. Missing snapshots and unsupported credentials
+    /// fail closed, even if a consumer supplies a snapshot from another caller.
     pub fn authorize_with_snapshot(
         &self,
         user: &AuthenticatedUser,
         snapshot: Option<&AuthorizationSnapshot>,
         mut check: AuthorizationCheck,
     ) -> Result<(), ApiError> {
-        let Some(snapshot) = snapshot else {
-            return Ok(());
-        };
+        Self::require_iam_credential(user)?;
+        let snapshot = snapshot
+            .ok_or_else(|| ApiError::Forbidden("Authorization snapshot is required".into()))?;
+        if user.identity_id().ok() != Some(snapshot.identity_id) {
+            return Err(ApiError::Forbidden(
+                "Authorization snapshot subject does not match".into(),
+            ));
+        }
 
         check.context.identity_id = snapshot.identity_id;
         check.context.identity_attributes = snapshot.identity_attributes.clone();
@@ -538,10 +543,7 @@ impl AuthorizationService {
     }
 
     pub async fn effective_grants(&self, user: &AuthenticatedUser) -> Result<Vec<Grant>, ApiError> {
-        match user.claims.token_type {
-            TokenType::Access | TokenType::Execution => {}
-            _ => return Ok(Vec::new()),
-        }
+        Self::require_iam_credential(user)?;
 
         let identity_id = user.identity_id().map_err(|_| {
             ApiError::Unauthorized("Invalid authentication subject in token".to_string())
@@ -580,6 +582,7 @@ impl AuthorizationService {
         snapshot: Option<&AuthorizationSnapshot>,
         permission_set_refs: &[String],
     ) -> Result<bool, ApiError> {
+        Self::require_iam_credential(user)?;
         let permission_set_refs = named_execution_permission_set_refs(permission_set_refs);
         if permission_set_refs.is_empty() {
             return Ok(true);
@@ -628,6 +631,7 @@ impl AuthorizationService {
         user: &AuthenticatedUser,
         permission_set_refs: &[String],
     ) -> Result<bool, ApiError> {
+        Self::require_iam_credential(user)?;
         if user.claims.token_type == TokenType::Execution {
             attune_common::repositories::delegated_execution::DelegatedExecutionRepository::validate_claims(conn, &user.claims)
                 .await.map_err(|_| ApiError::Unauthorized("Delegated execution authority is unavailable".into()))?;
@@ -635,16 +639,6 @@ impl AuthorizationService {
         let permission_set_refs = named_execution_permission_set_refs(permission_set_refs);
         if permission_set_refs.is_empty() {
             return Ok(true);
-        }
-        if user
-            .claims
-            .admitted_execution_credential()
-            .map_err(|_| ApiError::Unauthorized("Invalid recorded execution credential".into()))?
-            .is_some()
-        {
-            return Err(ApiError::Forbidden(
-                "Recorded runtime authority requires target-aware matching".into(),
-            ));
         }
         let identity_id = user.identity_id().map_err(|_| {
             ApiError::Unauthorized("Invalid authentication subject in token".into())
