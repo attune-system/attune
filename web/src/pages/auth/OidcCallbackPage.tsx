@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 
@@ -12,20 +12,35 @@ export default function OidcCallbackPage() {
   const { completeLogin } = useAuth();
   const [error, setError] = useState<string | null>(null);
 
+  const started = useRef(false);
   useEffect(() => {
+    if (started.current) return;
+    started.current = true;
     const finalizeLogin = async () => {
       const params = parseHashParams(window.location.hash);
-      const accessToken = params.get("access_token");
-      const refreshToken = params.get("refresh_token");
-      const redirectTo = params.get("redirect_to") || "/";
+      const code = params.get("code");
+      window.history.replaceState(null, "", window.location.pathname);
 
-      if (!accessToken || !refreshToken) {
-        setError("Missing login tokens in OIDC callback response.");
+      if (!code) {
+        setError("Missing login exchange code.");
         return;
       }
 
       try {
-        await completeLogin({ accessToken, refreshToken });
+        const response = await fetch("/auth/exchange", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ code }),
+        });
+        if (!response.ok)
+          throw new Error("Login exchange expired or already used.");
+        const { data } = await response.json();
+        const redirectTo = data.redirect_to;
+        await completeLogin({
+          accessToken: data.tokens.access_token,
+          refreshToken: data.tokens.refresh_token,
+        });
         sessionStorage.removeItem("redirect_after_login");
         navigate(redirectTo, { replace: true });
       } catch (err) {

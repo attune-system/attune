@@ -25,10 +25,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::sync::LazyLock;
-use url::{form_urlencoded::byte_serialize, Url};
+use url::Url;
 
 use crate::{
-    auth::jwt::{generate_access_token, generate_refresh_token, validate_token},
+    auth::jwt::validate_token,
     dto::{CurrentUserResponse, TokenResponse},
     middleware::error::ApiError,
     state::SharedState,
@@ -378,19 +378,13 @@ pub(super) async fn complete_provider_login(
     }
 
     let identity = upsert_identity(state, &oidc_claims).await?;
-    let access_token = generate_access_token(identity.id, &identity.login, &state.jwt_config)?;
-    let refresh_token = generate_refresh_token(identity.id, &identity.login, &state.jwt_config)?;
-
-    let token_response = TokenResponse::new(
-        access_token,
-        refresh_token,
-        state.jwt_config.access_token_expiration,
-    )
-    .with_user(
-        identity.id,
-        identity.login.clone(),
-        identity.display_name.clone(),
-    );
+    let token_response = crate::auth::session::issue(state, &identity)
+        .await?
+        .with_user(
+            identity.id,
+            identity.login.clone(),
+            identity.display_name.clone(),
+        );
 
     Ok(OidcAuthenticatedIdentity {
         current_user: CurrentUserResponse {
@@ -506,24 +500,60 @@ pub fn apply_cookies_to_headers(
     Ok(())
 }
 
-pub fn oidc_callback_redirect_response(
+pub const LOGIN_EXCHANGE_COOKIE: &str = "attune_login_exchange";
+
+pub async fn oidc_callback_redirect_response(
     state: &SharedState,
     token_response: &TokenResponse,
     redirect_to: Option<String>,
     id_token: &str,
 ) -> Result<Response, ApiError> {
-    // Web mode: redirect to the SPA callback page with tokens in the URL fragment.
     let redirect_target = sanitize_redirect_target(redirect_to.as_deref());
-    let redirect_url = format!(
-        "{LOGIN_CALLBACK_PATH}#access_token={}&refresh_token={}&expires_in={}&redirect_to={}",
-        encode_fragment_value(&token_response.access_token),
-        encode_fragment_value(&token_response.refresh_token),
-        token_response.expires_in,
-        encode_fragment_value(&redirect_target),
-    );
-
+    let code = uuid::Uuid::new_v4().to_string();
+    let browser = uuid::Uuid::new_v4().to_string();
+    let claims = validate_token(&token_response.refresh_token, &state.jwt_config)?;
+    let identity_id = claims
+        .sub
+        .parse::<i64>()
+        .map_err(|_| ApiError::Unauthorized("Invalid login identity".into()))?;
+    let key = state
+        .config
+        .security
+        .encryption_key
+        .as_deref()
+        .ok_or_else(|| {
+            ApiError::InternalServerError("Login exchange encryption is not configured".into())
+        })?;
+    let payload = serde_json::to_string(token_response)
+        .map_err(|_| ApiError::InternalServerError("Login exchange serialization failed".into()))?;
+    let encrypted = attune_common::crypto::encrypt(&payload, key)?;
+    attune_common::repositories::interactive_session::InteractiveSessionRepository::create_exchange(
+        &state.db, identity_id, &code, &browser, &encrypted, &redirect_target, &token_response.refresh_token).await?;
+    let redirect_url = format!("{LOGIN_CALLBACK_PATH}#code={code}");
     let mut response = Redirect::temporary(&redirect_url).into_response();
-    let mut cookies = build_auth_cookies(state, token_response, id_token);
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    let mut cookies = vec![build_cookie(
+        state,
+        LOGIN_EXCHANGE_COOKIE,
+        browser,
+        60,
+        true,
+    )];
+    if !id_token.is_empty() {
+        cookies.push(build_cookie(
+            state,
+            OIDC_ID_TOKEN_COOKIE_NAME,
+            id_token.to_string(),
+            state.jwt_config.refresh_token_expiration,
+            true,
+        ));
+    }
     cookies.push(remove_cookie(state, OIDC_STATE_COOKIE_NAME));
     cookies.push(remove_cookie(state, OIDC_NONCE_COOKIE_NAME));
     cookies.push(remove_cookie(state, OIDC_PKCE_COOKIE_NAME));
@@ -903,10 +933,6 @@ pub fn unauthorized_redirect(location: &str) -> Response {
     let mut response = Redirect::to(location).into_response();
     *response.status_mut() = StatusCode::FOUND;
     response
-}
-
-fn encode_fragment_value(value: &str) -> String {
-    byte_serialize(value.as_bytes()).collect()
 }
 
 #[cfg(test)]

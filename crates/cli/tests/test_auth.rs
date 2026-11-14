@@ -437,6 +437,16 @@ async fn test_logout() {
     let fixture = TestFixture::new().await;
     fixture.write_authenticated_config("valid_token", "refresh_token");
 
+    Mock::given(method("POST"))
+        .and(path("/auth/session/logout"))
+        .and(body_json(json!({"refresh_token": "refresh_token"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"message": "Session revoked"}
+        })))
+        .expect(1)
+        .mount(&fixture.mock_server)
+        .await;
+
     // Verify tokens exist before logout
     let config_before =
         std::fs::read_to_string(&fixture.config_path).expect("Failed to read config");
@@ -457,6 +467,57 @@ async fn test_logout() {
     let config_after =
         std::fs::read_to_string(&fixture.config_path).expect("Failed to read config");
     assert!(!config_after.contains("valid_token"));
+    let profile = load_test_config(&fixture);
+    assert!(profile.profiles["default"].auth_token.is_none());
+    assert!(profile.profiles["default"].refresh_token.is_none());
+    let requests = fixture.mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method.as_str(), "POST");
+    assert_eq!(requests[0].url.path(), "/auth/session/logout");
+    assert!(requests[0].url.query().is_none());
+    assert!(
+        requests[0].body_json::<serde_json::Value>().unwrap()
+            == json!({"refresh_token": "refresh_token"}),
+        "Logout must submit the stored refresh credential in JSON"
+    );
+}
+
+#[tokio::test]
+async fn test_logout_rejection_retains_credentials() {
+    let fixture = TestFixture::new().await;
+    fixture.write_authenticated_config("valid_token", "refresh_token");
+    let before = std::fs::read(&fixture.config_path).unwrap();
+    Mock::given(method("POST"))
+        .and(path("/auth/session/logout"))
+        .and(body_json(json!({"refresh_token": "refresh_token"})))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": "Revocation route unavailable"
+        })))
+        .expect(1)
+        .mount(&fixture.mock_server)
+        .await;
+    Command::cargo_bin("attune")
+        .unwrap()
+        .env("XDG_CONFIG_HOME", fixture.config_dir_path())
+        .env("HOME", fixture.config_dir_path())
+        .args(["auth", "logout"])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(predicate::str::contains("404"));
+    assert!(
+        std::fs::read(&fixture.config_path).unwrap() == before,
+        "Failed revocation must retain the complete saved configuration"
+    );
+    let requests = fixture.mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method.as_str(), "POST");
+    assert_eq!(requests[0].url.path(), "/auth/session/logout");
+    assert!(
+        requests[0].body_json::<serde_json::Value>().unwrap()
+            == json!({"refresh_token": "refresh_token"}),
+        "Failed revocation must still submit the stored refresh credential"
+    );
 }
 
 #[tokio::test]

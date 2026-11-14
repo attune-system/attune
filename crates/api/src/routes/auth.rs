@@ -8,6 +8,7 @@ use axum::{
     Json, Router,
 };
 
+use attune_common::repositories::interactive_session::InteractiveSessionRepository;
 use validator::Validate;
 
 use attune_common::auth::{
@@ -146,6 +147,8 @@ pub fn routes() -> Router<SharedState> {
         .route("/logout", get(logout))
         .route("/register", post(register))
         .route("/refresh", post(refresh_token))
+        .route("/session/logout", post(logout_session))
+        .route("/exchange", post(login_exchange))
         .route("/me", get(get_current_user).put(update_current_user))
         .route("/change-password", post(change_password))
         .route("/internal/sensor-token", post(create_sensor_token_internal))
@@ -512,19 +515,13 @@ pub async fn login(
     }
 
     // Generate tokens
-    let access_token = generate_access_token(identity.id, &identity.login, &state.jwt_config)?;
-    let refresh_token = generate_refresh_token(identity.id, &identity.login, &state.jwt_config)?;
-
-    let response = TokenResponse::new(
-        access_token,
-        refresh_token,
-        state.jwt_config.access_token_expiration,
-    )
-    .with_user(
-        identity.id,
-        identity.login.clone(),
-        identity.display_name.clone(),
-    );
+    let response = crate::auth::session::issue(&state, &identity)
+        .await?
+        .with_user(
+            identity.id,
+            identity.login.clone(),
+            identity.display_name.clone(),
+        );
 
     // Audit success
     state.audit_emitter.emit(
@@ -736,19 +733,13 @@ pub async fn register(
     let identity = IdentityRepository::create(&state.db, input).await?;
 
     // Generate tokens
-    let access_token = generate_access_token(identity.id, &identity.login, &state.jwt_config)?;
-    let refresh_token = generate_refresh_token(identity.id, &identity.login, &state.jwt_config)?;
-
-    let response = TokenResponse::new(
-        access_token,
-        refresh_token,
-        state.jwt_config.access_token_expiration,
-    )
-    .with_user(
-        identity.id,
-        identity.login.clone(),
-        identity.display_name.clone(),
-    );
+    let response = crate::auth::session::issue(&state, &identity)
+        .await?
+        .with_user(
+            identity.id,
+            identity.login.clone(),
+            identity.display_name.clone(),
+        );
 
     Ok(Json(ApiResponse::new(response)))
 }
@@ -796,6 +787,12 @@ pub async fn refresh_token(
         return refresh_integration_token(state, claims, browser_cookie_refresh).await;
     }
 
+    // Keep an opted-in browser's cookie and JSON credential in sync, without
+    // replacing a different cookie session or adding cookies to CLI refreshes.
+    let rotate_browser_cookies = browser_cookie_refresh
+        || get_cookie_value(&headers, REFRESH_COOKIE_NAME).as_deref()
+            == Some(refresh_token.as_str());
+
     // Parse identity ID
     let identity_id: i64 = claims
         .sub
@@ -813,18 +810,23 @@ pub async fn refresh_token(
         ));
     }
 
-    // Generate new tokens
     let access_token = generate_access_token(identity.id, &identity.login, &state.jwt_config)?;
-    let refresh_token = generate_refresh_token(identity.id, &identity.login, &state.jwt_config)?;
-
+    let new_refresh = generate_refresh_token(identity.id, &identity.login, &state.jwt_config)?;
+    if !InteractiveSessionRepository::rotate(&state.db, identity.id, &refresh_token, &new_refresh)
+        .await?
+    {
+        return Err(ApiError::Unauthorized(
+            "Refresh session expired, revoked or reused".into(),
+        ));
+    }
     let response = TokenResponse::new(
         access_token,
-        refresh_token,
-        state.jwt_config.access_token_expiration,
+        new_refresh,
+        state.jwt_config.access_token_expiration.min(300),
     );
     let response_body = Json(ApiResponse::new(response.clone()));
 
-    if browser_cookie_refresh {
+    if rotate_browser_cookies {
         let mut http_response = response_body.into_response();
         apply_cookies_to_headers(
             http_response.headers_mut(),
@@ -1057,6 +1059,7 @@ pub async fn oidc_callback(
         redirect_to,
         &authenticated.id_token,
     )
+    .await
 }
 
 #[utoipa::path(
@@ -1152,6 +1155,9 @@ pub async fn logout(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    if let Some(token) = get_cookie_value(&headers, REFRESH_COOKIE_NAME) {
+        InteractiveSessionRepository::revoke(&state.db, &token).await?;
+    }
     let oidc_enabled = state
         .config
         .security
@@ -2073,4 +2079,60 @@ mod tests {
         assert_eq!(permissions[0].actions, vec!["read"]);
         assert_eq!(permissions[0].constraints, None);
     }
+}
+
+/// Revoke a local/CLI session using its refresh credential, including a previously rotated token.
+#[utoipa::path(post, path="/auth/session/logout", tag="auth", request_body=RefreshTokenRequest,
+    responses((status=200, description="Session revoked")))]
+pub async fn logout_session(
+    State(state): State<SharedState>,
+    Json(payload): Json<RefreshTokenRequest>,
+) -> Result<Json<ApiResponse<SuccessResponse>>, ApiError> {
+    InteractiveSessionRepository::revoke(&state.db, &payload.refresh_token).await?;
+    Ok(Json(ApiResponse::new(SuccessResponse::new(
+        "Session revoked",
+    ))))
+}
+
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub struct LoginExchangeRequest {
+    pub code: String,
+}
+
+#[utoipa::path(post, path="/auth/exchange", tag="auth", request_body=LoginExchangeRequest,
+    responses((status=200, description="Browser login exchanged", body=serde_json::Value), (status=401,description="Invalid exchange")))]
+pub async fn login_exchange(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(payload): Json<LoginExchangeRequest>,
+) -> Result<Response, ApiError> {
+    let browser = get_cookie_value(&headers, crate::auth::oidc::LOGIN_EXCHANGE_COOKIE)
+        .ok_or_else(|| ApiError::Unauthorized("Missing browser login binding".into()))?;
+    let (encrypted, redirect_to) =
+        InteractiveSessionRepository::consume_exchange(&state.db, &payload.code, &browser)
+            .await?
+            .ok_or_else(|| ApiError::Unauthorized("Invalid or expired login exchange".into()))?;
+    let key = state
+        .config
+        .security
+        .encryption_key
+        .as_deref()
+        .ok_or_else(|| {
+            ApiError::InternalServerError("Login exchange encryption is not configured".into())
+        })?;
+    let response: TokenResponse =
+        serde_json::from_str(&attune_common::crypto::decrypt(&encrypted, key)?)
+            .map_err(|_| ApiError::InternalServerError("Invalid login exchange payload".into()))?;
+    let mut http =
+        Json(serde_json::json!({"data": {"tokens": response, "redirect_to": redirect_to}}))
+            .into_response();
+    apply_cookies_to_headers(
+        http.headers_mut(),
+        &crate::auth::oidc::build_auth_cookies(&state, &response, ""),
+    )?;
+    http.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(http)
 }

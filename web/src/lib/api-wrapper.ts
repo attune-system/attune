@@ -1,3 +1,4 @@
+import { refreshSession } from "./session-refresh";
 import axios, { type InternalAxiosRequestConfig } from "axios";
 
 /**
@@ -20,18 +21,6 @@ import axios, { type InternalAxiosRequestConfig } from "axios";
  */
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "";
-
-// A bare axios instance with NO interceptors, used exclusively for token refresh
-// requests. This prevents infinite loops when the refresh endpoint returns 401.
-const refreshClient = axios.create({
-  baseURL: API_BASE_URL || undefined,
-  timeout: 10000,
-  headers: { "Content-Type": "application/json" },
-});
-
-function getRefreshUrl(): string {
-  return API_BASE_URL ? `${API_BASE_URL}/auth/refresh` : "/auth/refresh";
-}
 
 // Clear auth state and redirect to the login page.
 // Safe to call multiple times — only the first redirect takes effect.
@@ -95,37 +84,10 @@ export function isTokenExpired(token: string): boolean {
 // Returns true on success, false on failure.
 // On failure, clears session and redirects to login.
 async function attemptTokenRefresh(): Promise<boolean> {
-  const currentRefreshToken = localStorage.getItem("refresh_token");
-  if (!currentRefreshToken) {
-    console.warn("No refresh token available, redirecting to login");
-    clearSessionAndRedirect();
-    return false;
-  }
-
   try {
-    const response = await refreshClient.post(getRefreshUrl(), {
-      refresh_token: currentRefreshToken,
-    });
-
-    const { access_token, refresh_token: newRefreshToken } = response.data.data;
-
-    localStorage.setItem("access_token", access_token);
-    if (newRefreshToken) {
-      localStorage.setItem("refresh_token", newRefreshToken);
-    }
-    // Notify subscribers (e.g. WebSocketProvider) that the token has changed
-    // in-tab so they can reconnect with the fresh credential.
-    try {
-      window.dispatchEvent(new CustomEvent("auth:token-changed"));
-    } catch {
-      // Older browsers — best-effort.
-    }
-
+    await refreshSession();
     return true;
   } catch {
-    console.error(
-      "Token refresh failed, clearing session and redirecting to login",
-    );
     clearSessionAndRedirect();
     return false;
   }
@@ -141,7 +103,7 @@ export async function ensureValidToken(): Promise<void> {
   }
 
   // Check if token is expiring soon (within 5 minutes)
-  if (isTokenExpiringSoon(token, 300)) {
+  if (isTokenExpiringSoon(token, 60)) {
     await attemptTokenRefresh();
   }
 }
