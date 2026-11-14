@@ -5263,3 +5263,178 @@ async fn local_source_ingestion_requires_operator_roots_and_global_authority() -
     ctx.cleanup().await?;
     Ok(())
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn host_pack_inspection_confines_all_paths_and_preserves_read_authority() -> Result<()> {
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let approved = TempDir::new()?;
+    let outside = create_test_pack_dir("outside_inspection", "1.0.0")?;
+    let allowed = approved.path().join("allowed");
+    fs::create_dir(&allowed)?;
+    fs::write(allowed.join("pack.yaml"), "ref: allowed_inspection\nversion: 1.0.0\npython: '3.11'\ndependencies: [missing_inspection@1.0.0]\n")?;
+    fs::write(allowed.join("requirements.txt"), "")?;
+    let reader =
+        register_pack_index_user(&ctx, json!([{"resource":"packs","actions":["read"]}])).await?;
+    let installer =
+        register_pack_index_user(&ctx, json!([{"resource":"packs","actions":["install"]}])).await?;
+    let ctx = ctx.with_local_source_roots(Vec::new()).await?;
+    for (route, token) in [("dependencies", &reader), ("build-envs", &installer)] {
+        assert_eq!(
+            ctx.post(
+                &format!("/api/v1/packs/{route}"),
+                json!({"pack_paths":[allowed]}),
+                Some(token)
+            )
+            .await?
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    let ctx = ctx
+        .with_local_source_roots(vec![approved.path().into()])
+        .await?;
+    std::os::unix::fs::symlink(outside.path(), approved.path().join("escape"))?;
+    let manifest_escape = approved.path().join("manifest-escape");
+    fs::create_dir(&manifest_escape)?;
+    std::os::unix::fs::symlink(
+        outside.path().join("pack.yaml"),
+        manifest_escape.join("pack.yaml"),
+    )?;
+    let traversal = approved
+        .path()
+        .join("..")
+        .join(outside.path().file_name().unwrap());
+    for (route, token) in [("dependencies", &reader), ("build-envs", &installer)] {
+        for paths in [
+            json!([outside.path()]), // Absolute outside path.
+            json!([traversal]),
+            json!([approved.path().join("escape")]),
+            json!([manifest_escape]),
+            json!([allowed, outside.path()]), // No partial success/probes.
+            json!([outside.path(), allowed]),
+        ] {
+            let response = ctx
+                .post(
+                    &format!("/api/v1/packs/{route}"),
+                    json!({"pack_paths":paths}),
+                    Some(token),
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{route}");
+            let body: serde_json::Value = response.json().await?;
+            assert!(
+                body.get("data").is_none(),
+                "no partial metadata or detection result"
+            );
+        }
+        for name in ["requirements.txt", "package.json", "venv", "node_modules"] {
+            let probe = approved.path().join(format!("{route}-link-{name}"));
+            fs::create_dir(&probe)?;
+            fs::write(
+                probe.join("pack.yaml"),
+                fs::read(allowed.join("pack.yaml"))?,
+            )?;
+            std::os::unix::fs::symlink(outside.path(), probe.join(name))?;
+            assert_eq!(
+                ctx.post(
+                    &format!("/api/v1/packs/{route}"),
+                    json!({"pack_paths":[probe]}),
+                    Some(token)
+                )
+                .await?
+                .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+    }
+    let response = ctx
+        .post(
+            "/api/v1/packs/dependencies",
+            json!({"pack_paths":[allowed]}),
+            Some(&reader),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await?;
+    assert_eq!(
+        body["data"]["analyzed_packs"][0]["pack_ref"],
+        "allowed_inspection"
+    );
+    assert_eq!(
+        body["data"]["missing_dependencies"][0]["pack_ref"],
+        "missing_inspection"
+    );
+    assert_eq!(
+        ctx.post(
+            "/api/v1/packs/build-envs",
+            json!({"pack_paths":[allowed]}),
+            Some(&reader)
+        )
+        .await?
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        ctx.post(
+            "/api/v1/packs/dependencies",
+            json!({"pack_paths":[allowed]}),
+            Some(&installer)
+        )
+        .await?
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    let response = ctx
+        .post(
+            "/api/v1/packs/build-envs",
+            json!({"pack_paths":[allowed], "skip_nodejs":true}),
+            Some(&installer),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await?;
+    assert_eq!(
+        body["data"]["built_environments"][0]["pack_ref"],
+        "allowed_inspection"
+    );
+    // Detection only: no environment installation or release publication.
+    assert!(!allowed.join("venv").exists());
+    assert!(!allowed.join("node_modules").exists());
+    assert!(
+        PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "allowed_inspection")
+            .await?
+            .is_none()
+    );
+    assert!(
+        PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "outside_inspection")
+            .await?
+            .is_none()
+    );
+
+    // Upload remains independent of source approval. An operator may then
+    // explicitly approve its installed projection for metadata inspection.
+    let uploaded = create_test_pack_dir("uploaded_inspection", "1.0.0")?;
+    let response = upload_test_pack(&ctx, uploaded.path(), false).await?;
+    assert!(response.status().is_success(), "{}", response.text().await?);
+    let projection = ctx.test_packs_dir.join("uploaded_inspection");
+    let projection_root = ctx.test_packs_dir.clone();
+    let ctx = ctx.with_local_source_roots(vec![projection_root]).await?;
+    for (route, token) in [("dependencies", &reader), ("build-envs", &installer)] {
+        let response = ctx
+            .post(
+                &format!("/api/v1/packs/{route}"),
+                json!({"pack_paths":[projection], "skip_python":true, "skip_nodejs":true}),
+                Some(token),
+            )
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{route}: {}",
+            response.text().await?
+        );
+    }
+    ctx.cleanup().await?;
+    Ok(())
+}

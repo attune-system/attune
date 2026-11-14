@@ -78,3 +78,26 @@ Directory copying and release publication reject symlinks within pack trees.
 Test runner entrypoints must be relative existing files resolving inside the
 owned pack root; traversal, absolute paths and symlink escapes are rejected by
 the executor as well as metadata validation.
+
+The host-path dependency and environment-inspection endpoints also preflight
+**every** requested path under these approved roots before reading any manifest,
+examining environment paths or running version probes. Dependency inspection
+requires global Access `packs:read`; environment detection requires global Access
+`packs:install`. Neither grant replaces the approved-root policy. Inspection
+rejects symlinked manifests, requirements/package files and environment paths.
+`build-envs` detects API-host runtimes and environment presence; it does not
+execute pack scripts or install dependencies.
+
+Direct upload and remote/managed installation use their existing private candidate
+staging and publication paths and do not need approved host source roots. If an
+operator separately inspects an installed upload/remote pack through these
+host-path endpoints, explicitly approve its operator-owned projection root. The
+staged `download` → `dependencies` → `build-envs` → `register-batch` flow (including
+`core.pack_api` callers using an operator Access token) requires an explicitly
+approved service-owned staging root, currently `/tmp/attune-pack-downloads`, for
+its returned `pack_path` values. Precreate that dedicated directory with service
+ownership and permissions, protect its ancestors, and approve that directory
+only, never all of `/tmp`. Caller `destination_dir`/`packs_base_dir` values do not
+establish trust. No automatic trust is inferred from an ambient temporary path
+or a client-supplied pack name. The UI/CLI direct install/upload flows do not call
+these inspection endpoints or require that additional staging-root approval.
