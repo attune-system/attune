@@ -130,9 +130,14 @@ Delivery checks vary by entity family:
 | `enforcement` | Enforcement grants and the related rule visibility |
 | `artifact` | Artifact scope, owner, visibility, and grants; only access and execution tokens qualify |
 | `rule_lifecycle` | Rule read grants after the notifier refetches the rule |
-| `inquiry`, `work_queue`, `work_queue_item` | No entity-specific delivery check for authenticated non-sensor clients |
+| `work_queue` | Queues read grant against the persisted queue ID/ref/pack, plus reference visibility or queue management authority |
+| `work_queue_item` | Queue-items or queues read grant against its persisted parent queue; private queues require an explicit item scope or queue management authority |
+| `inquiry` | Persisted assignee/creator participation or inquiries read grant against its ID/ref and creating execution's pack/owner |
+| Unknown or mismatched stream/entity pairs | Denied, including through `all` and `user` filters |
 
-The notifier captures roles and grants when the connection opens. Permission changes take effect on a new connection, not an existing one.
+Unknown entity and notification types are denied at subscription time. Known queue/item/inquiry streams accept scoped read grants and check each concrete target before delivery. Inquiry stream admission also allows Access-token participants; each delivered target must still satisfy the persisted participant or read-grant check. These streams do not gain the Access-token baseline reads used by existing operational streams.
+
+The notifier captures roles and grants when the connection opens for dispatch filtering. Access-token frames recheck current identity and permission assignments after socket readiness, so revocation prevents queued delivery. Recorded credentials retain their separate current source and target fences; sensor subscriptions remain restricted to admitted trigger refs.
 
 Sources: [`SubscriptionFilter::matches()`](../../crates/notifier/src/subscriber_manager.rs#L17-L61), [filter authorization](../../crates/notifier/src/websocket_server.rs#L405-L467), [delivery authorization](../../crates/notifier/src/websocket_server.rs#L701-L730), [filter parser](../../crates/notifier/src/websocket_server.rs#L1454-L1486).
 
