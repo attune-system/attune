@@ -10,6 +10,14 @@ pub(super) async fn allowed(
         let mut tx = pool.begin().await?;
         attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
             .await?;
+        if matches!(message, ClientMessage::Notification(notification)
+            if matches!(notification.entity_type.as_str(), "work_queue" | "work_queue_item")) {
+            // A directly assigned pack_owner grant can depend on a declared
+            // role even when that role has no permission-set assignment.
+            attune_common::repositories::iam_ownership::IamOwnershipRepository::lock_pack_owner_memberships(
+                &mut tx, auth.identity_id,
+            ).await?;
+        }
         let identity = IdentityRepository::find_by_id_for_share(&mut tx, auth.identity_id)
             .await?
             .filter(|identity| !identity.frozen)
@@ -42,6 +50,12 @@ pub(super) async fn allowed(
             let target = match notification.entity_type.as_str() {
                 "execution" => Some(RuntimeTarget::Execution(notification.entity_id)),
                 "artifact" => Some(RuntimeTarget::Artifact(notification.entity_id)),
+                "work_queue" => Some(RuntimeTarget::Component(
+                    attune_common::repositories::runtime_target::ComponentTarget::Queue,
+                    notification.entity_id,
+                )),
+                "work_queue_item" => Some(RuntimeTarget::QueueItem(notification.entity_id)),
+                "inquiry" => Some(RuntimeTarget::Inquiry(notification.entity_id)),
                 _ => None,
             };
             if let Some(target) = target {
