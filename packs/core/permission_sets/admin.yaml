@@ -39,7 +39,7 @@ grants:
   - resource: retention
     actions: [read, update]
   - resource: identities
-    actions: [read, create, update, delete]
+    actions: [read, create, update, delete, manage]
   - resource: permissions
     actions: [read, manage]
   - resource: audit_log

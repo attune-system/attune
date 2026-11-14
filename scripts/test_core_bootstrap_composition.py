@@ -59,6 +59,11 @@ class CoreCompositionTests(unittest.TestCase):
             self.assertEqual(actual, canonical, source.name)
             self.assertNotIn("scope", actual)
             self.assertTrue(all("scope" not in grant and "managing_pack_id" not in grant.get("constraints", {}) for grant in actual["grants"]))
+        # PR54's identity administration grant must survive core action removal.
+        admin = yaml.safe_load((CORE / "permission_sets/admin.yaml").read_text())
+        identity_grants = [grant for grant in admin["grants"] if grant["resource"] == "identities"]
+        self.assertEqual(len(identity_grants), 1)
+        self.assertIn("manage", identity_grants[0]["actions"])
         # key_creator is an actual pack-owned runtime policy, NOT a reserved
         # platform role. Its local envelope must survive independently.
         self.assertFalse((catalog / "key_creator.yaml").exists())

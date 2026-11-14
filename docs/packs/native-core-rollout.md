@@ -39,7 +39,10 @@ substitution.
 ## Preserve release and omission semantics
 
 Bootstrap uses the existing scalar **pack-wide** `absent_metadata_policy=remove`.
-The candidate retains all unrelated nonaction definitions byte-for-byte. Eight
+The candidate retains unrelated nonaction definitions byte-for-byte against the
+current main baseline. Relative to the original security-report baseline, PR54
+intentionally adds `identities:manage` to the shipped and platform admin policies
+(catalog revision4, epoch1); preserve that precise exception. Seven
 omitted action rows and the removed installer's owned workflow definition retire;
 unrelated sensor/runtime/IAM/dashboard definitions and operator relationships are
 not intentionally changed. Normal projection bookkeeping may update during

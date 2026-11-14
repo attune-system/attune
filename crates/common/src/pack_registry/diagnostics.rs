@@ -259,13 +259,7 @@ pub fn validate_metadata(root: &std::path::Path) -> crate::Result<Vec<PackDiagno
                     "Only the simple test result format is supported",
                 ));
             }
-            let entry = std::path::Path::new(&runner.entry_point);
-            if entry.is_absolute()
-                || entry
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir))
-                || !root.join(entry).is_file()
-            {
+            if crate::test_executor::confined_test_entrypoint(root, &runner.entry_point).is_err() {
                 return Err(metadata_error(
                     "pack.yaml",
                     &format!("{base}/entry_point"),

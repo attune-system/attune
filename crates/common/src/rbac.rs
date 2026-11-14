@@ -85,11 +85,10 @@ impl Resource {
         match self {
             Self::Packs => &[Read, Create, Install, Configure, Delete, Decrypt],
             Self::Actions => &[Read, Create, Update, Delete, Execute],
-            Self::Policies
-            | Self::Caches
-            | Self::Runtimes
-            | Self::Dashboards
-            | Self::Identities => &[Read, Create, Update, Delete],
+            Self::Policies | Self::Caches | Self::Runtimes | Self::Dashboards => {
+                &[Read, Create, Update, Delete]
+            }
+            Self::Identities => &[Read, Create, Update, Delete, Manage],
             Self::Queues | Self::QueueItems | Self::Rules | Self::Triggers | Self::Artifacts => {
                 &[Read, Create, Update, Delete, Decrypt]
             }
