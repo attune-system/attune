@@ -548,6 +548,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
             LoginRequest,
             TokenLoginRequest,
             crate::routes::auth::LdapLoginRequest,
+            crate::routes::auth::LoginExchangeRequest,
             RegisterRequest,
             RefreshTokenRequest,
             ChangePasswordRequest,
