@@ -1295,3 +1295,124 @@ async fn trusted_proxy_boundary_and_canonical_rate_limit() {
     );
     ctx.cleanup().await.unwrap();
 }
+
+#[tokio::test]
+async fn dual_stack_whitelists_allow_both_families_in_any_order_and_reject_invalid_networks() {
+    use std::net::{IpAddr, SocketAddr};
+
+    let ctx = setup_test_context().await;
+    let pack = create_test_pack(&ctx.pool, "dual_stack").await;
+    let id = create_test_trigger(&ctx.pool, pack, "dual_stack", "dual_stack.trigger").await;
+    let info = TriggerRepository::enable_webhook(&ctx.pool, id)
+        .await
+        .unwrap();
+    let body = r#"{"payload": {"message": "dual-stack"}}"#;
+    let secret = "test-owned-dual-stack-secret";
+    let signature = generate_hmac_signature(body.as_bytes(), secret, "sha256");
+    let mut accepted = 0;
+
+    for networks in [
+        json!(["192.0.2.0/24", "2001:db8::/32"]),
+        json!(["2001:db8::/32", "192.0.2.0/24"]),
+    ] {
+        TriggerRepository::update_webhook_config(
+            &ctx.pool,
+            id,
+            json!({
+                "ip_whitelist": {"enabled": true, "ips": networks},
+                "hmac": {"enabled": true, "secret": secret, "algorithm": "sha256"}
+            }),
+        )
+        .await
+        .unwrap();
+        for (peer, expected) in [
+            ("192.0.2.7", StatusCode::OK),
+            ("2001:db8::7", StatusCode::OK),
+            ("198.51.100.7", StatusCode::FORBIDDEN),
+            ("2001:db9::7", StatusCode::FORBIDDEN),
+        ] {
+            let peer: IpAddr = peer.parse().unwrap();
+            let response = ctx
+                .app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/webhooks/{}", info.webhook_key))
+                        .extension(axum::extract::ConnectInfo(SocketAddr::new(peer, 1234)))
+                        // An untrusted sender cannot replace its real peer with either
+                        // whitelisted address, even while HMAC is independently valid.
+                        .header("x-forwarded-for", "192.0.2.7, 2001:db8::7")
+                        .header("x-webhook-signature", &signature)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "peer {peer}");
+            if expected == StatusCode::OK {
+                accepted += 1;
+            }
+            let events =
+                attune_common::repositories::event::EventRepository::find_by_trigger(&ctx.pool, id)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                events.len(),
+                accepted,
+                "denied peers must not create events"
+            );
+            if expected == StatusCode::OK {
+                assert!(events
+                    .iter()
+                    .any(|event| event.config.as_ref().unwrap()["source_ip"] == peer.to_string()));
+            }
+        }
+    }
+
+    // Invalid networks still reject the whole configuration, even after an
+    // otherwise matching entry and with a valid signature.
+    for (networks, peer) in [
+        (json!(["192.0.2.0/24", "2001:db8::/129"]), "192.0.2.7"),
+        (json!(["2001:db8::/32", "192.0.2.0/33"]), "2001:db8::7"),
+        (json!(["192.0.2.0/24", "not-a-network"]), "192.0.2.7"),
+    ] {
+        TriggerRepository::update_webhook_config(
+            &ctx.pool,
+            id,
+            json!({
+                "ip_whitelist": {"enabled": true, "ips": networks},
+                "hmac": {"enabled": true, "secret": secret, "algorithm": "sha256"}
+            }),
+        )
+        .await
+        .unwrap();
+        let response = ctx
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/webhooks/{}", info.webhook_key))
+                    .extension(axum::extract::ConnectInfo(SocketAddr::new(
+                        peer.parse().unwrap(),
+                        1234,
+                    )))
+                    .header("x-webhook-signature", &signature)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let events =
+            attune_common::repositories::event::EventRepository::find_by_trigger(&ctx.pool, id)
+                .await
+                .unwrap();
+        assert_eq!(events.len(), accepted);
+    }
+    assert_eq!(accepted, 4);
+    ctx.cleanup().await.unwrap();
+}

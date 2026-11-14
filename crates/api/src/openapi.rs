@@ -1042,13 +1042,31 @@ mod tests {
             .sum();
 
         assert_eq!(
-            path_count, 213,
+            path_count, 214,
             "Expected every mounted API path in the OpenAPI spec"
         );
 
         assert_eq!(
-            operation_count, 277,
+            operation_count, 278,
             "Expected every mounted API operation in the OpenAPI spec"
+        );
+
+        let spec = serde_json::to_value(&doc).unwrap();
+        let reveal = &spec["paths"]["/api/v1/triggers/{ref}/webhooks/reveal"]["post"];
+        assert!(
+            reveal.is_object(),
+            "Expected explicit webhook credential reveal POST"
+        );
+        assert_eq!(
+            reveal["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ApiResponse_WebhookManagementResponse"
+        );
+        assert!(spec["components"]["schemas"]["TriggerResponse"]["properties"].is_object());
+        assert!(
+            spec["components"]["schemas"]["TriggerResponse"]["properties"]
+                .get("webhook_key")
+                .is_none(),
+            "Ordinary trigger metadata must not expose credentials"
         );
 
         assert!(

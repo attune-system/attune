@@ -156,12 +156,21 @@ pub fn check_ip_in_cidr(ip: &str, cidr: &str) -> Result<bool, String> {
         .parse()
         .map_err(|e| format!("Invalid prefix length: {}", e))?;
 
+    // Validate the network independently of the sender family. A valid network
+    // of the other family is a nonmatch; malformed prefixes remain errors.
+    match network_addr {
+        IpAddr::V4(_) if prefix_len > 32 => {
+            return Err("IPv4 prefix length must be <= 32".to_string());
+        }
+        IpAddr::V6(_) if prefix_len > 128 => {
+            return Err("IPv6 prefix length must be <= 128".to_string());
+        }
+        _ => {}
+    }
+
     // Convert to bytes for comparison
     match (ip_addr, network_addr) {
         (IpAddr::V4(ip), IpAddr::V4(network)) => {
-            if prefix_len > 32 {
-                return Err("IPv4 prefix length must be <= 32".to_string());
-            }
             let ip_bits = u32::from(ip);
             let network_bits = u32::from(network);
             let mask = if prefix_len == 0 {
@@ -172,9 +181,6 @@ pub fn check_ip_in_cidr(ip: &str, cidr: &str) -> Result<bool, String> {
             Ok((ip_bits & mask) == (network_bits & mask))
         }
         (IpAddr::V6(ip), IpAddr::V6(network)) => {
-            if prefix_len > 128 {
-                return Err("IPv6 prefix length must be <= 128".to_string());
-            }
             let ip_bits = u128::from(ip);
             let network_bits = u128::from(network);
             let mask = if prefix_len == 0 {
@@ -184,7 +190,7 @@ pub fn check_ip_in_cidr(ip: &str, cidr: &str) -> Result<bool, String> {
             };
             Ok((ip_bits & mask) == (network_bits & mask))
         }
-        _ => Err("IP address and CIDR must be same version (IPv4 or IPv6)".to_string()),
+        _ => Ok(false),
     }
 }
 
@@ -272,6 +278,15 @@ mod tests {
     fn test_check_ip_in_cidr_ipv6() {
         assert!(check_ip_in_cidr("2001:db8::1", "2001:db8::/32").unwrap());
         assert!(!check_ip_in_cidr("2001:db9::1", "2001:db8::/32").unwrap());
+    }
+
+    #[test]
+    fn dual_stack_networks_are_nonmatches_but_malformed_prefixes_are_errors() {
+        assert!(!check_ip_in_cidr("2001:db8::1", "192.0.2.0/24").unwrap());
+        assert!(!check_ip_in_cidr("192.0.2.1", "2001:db8::/32").unwrap());
+        assert!(check_ip_in_cidr("2001:db8::1", "192.0.2.0/33").is_err());
+        assert!(check_ip_in_cidr("192.0.2.1", "2001:db8::/129").is_err());
+        assert!(check_ip_in_cidr("2001:db8::1", "not-a-network").is_err());
     }
 
     #[test]
