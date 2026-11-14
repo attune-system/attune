@@ -563,20 +563,17 @@ async fn direct_managed_edits_readmit_but_labels_need_no_key_or_runtime_grants()
             tx.rollback().await?;
         }
     }
-    // Grant precisely the retained deployment input ceiling, rather than
-    // borrowing the pack owner's IAM or recapturing a live authoring definition.
-    let inputs = PermissionSetRepository::create(
-        &ctx.pool,
-        CreatePermissionSetInput {
-            r#ref: "managed_api.rule_editor_inputs".into(),
-            pack: Some(pack.id),
-            pack_ref: Some(pack.r#ref.clone()),
-            label: None,
-            description: None,
-            grants: serde_json::to_value(&captured_inputs.input_grants)?,
-        },
-    )
-    .await?;
+    // Assign the existing deployed set only after proving its effective grants
+    // equal the retained input ceiling. Structural IDs in captured grants are
+    // server-owned and must not be copied into a new authored policy definition.
+    let inputs = PermissionSetRepository::find_by_ref(&ctx.pool, "managed_api.inputs")
+        .await?
+        .ok_or("deployed input permission set missing")?;
+    assert_eq!(
+        inputs.grants,
+        serde_json::to_value(&captured_inputs.input_grants)?,
+        "fixture assignment must cover exactly the retained input grants"
+    );
     PermissionAssignmentRepository::create(
         &ctx.pool,
         CreatePermissionAssignmentInput {
