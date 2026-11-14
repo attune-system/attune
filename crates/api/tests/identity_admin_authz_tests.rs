@@ -386,9 +386,7 @@ async fn identity_administration_scopes_are_authorable_via_api() {
 async fn installed_revision_three_admin_receives_explicit_administration() {
     use attune_common::{
         models::ManagementOrigin,
-        platform_catalog::{
-            definitions, ManagedComponentKind, CATALOG_REVISION, COMPATIBILITY_EPOCH,
-        },
+        platform_catalog::{ManagedComponentKind, CATALOG_REVISION, COMPATIBILITY_EPOCH},
         repositories::{
             identity::{
                 CreateIdentityRoleAssignmentInput, CreatePermissionSetRoleAssignmentInput,
@@ -421,7 +419,7 @@ async fn installed_revision_three_admin_receives_explicit_administration() {
     // Fixture SQL only: seed an installed platform row without violating the
     // production prohibition on downgrading existing platform-owned rows.
     let old: Value =
-        serde_yaml::from_str(include_str!("fixtures/catalog-revision-3-admin.yaml")).unwrap();
+        serde_yaml_ng::from_str(include_str!("fixtures/catalog-revision-3-admin.yaml")).unwrap();
     let old_identity = old["grants"]
         .as_array()
         .unwrap()
@@ -530,12 +528,10 @@ async fn installed_revision_three_admin_receives_explicit_administration() {
         .await
         .unwrap()
         .unwrap();
-    let expected = definitions()
-        .unwrap()
-        .into_iter()
-        .find(|(_, d)| d["ref"] == "core.admin")
-        .unwrap()
-        .1;
+    let expected: Value = serde_yaml_ng::from_str(include_str!(
+        "../../common/src/platform_catalog/permission_sets/admin.yaml"
+    ))
+    .unwrap();
     assert_eq!(upgraded.id, admin.id);
     assert_eq!(
         Catalog::origin(&ctx.pool, ManagedComponentKind::PermissionSet, "core.admin")
