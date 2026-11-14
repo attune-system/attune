@@ -95,7 +95,9 @@ async fn logout_and_password_update_revoke_refresh_but_new_login_works() {
         &ctx.pool,
         identity.id,
         UpdateIdentityInput {
-            password_hash: Some(attune_common::auth::hash_password("NewPassword123!").unwrap()),
+            password_hash: Some(
+                attune_api::auth::password::hash_password("NewPassword123!").unwrap(),
+            ),
             display_name: None,
             attributes: None,
             frozen: None,
