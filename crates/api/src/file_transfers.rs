@@ -123,6 +123,38 @@ impl FileTransfers {
             tokio::select! {value=work=>Some(value),_=cancel.cancelled()=>None}
         })
     }
+    /// Preparation can be canceled and joined; its lease can be handed to the
+    /// non-cancelable acknowledged COMMIT owner without releasing admission.
+    pub(crate) fn prepare_publication<F, W, T>(
+        &self,
+        lease: FileUploadLease,
+        work: F,
+    ) -> JoinHandle<Option<T>>
+    where
+        F: FnOnce(FileUploadLease) -> W + Send + 'static,
+        W: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let cancel = self.cancel.clone();
+        self.tasks.spawn(async move {
+            tokio::select! { value=work(lease)=>Some(value), _=cancel.cancelled()=>None }
+        })
+    }
+
+    /// A SQL COMMIT plus local publication must run to acknowledgement even if
+    /// its HTTP waiter disconnects or shutdown cancellation begins. The admitted
+    /// lease bounds outstanding work; drain joins this tracked critical section.
+    pub(crate) fn finish_publication<F, T>(&self, lease: FileUploadLease, work: F) -> JoinHandle<T>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.tasks.spawn(async move {
+            let _lease = lease;
+            work.await
+        })
+    }
+
     pub fn begin_shutdown(&self) {
         let mut closed = self.closed.lock().expect("file admission lock poisoned");
         *closed = true;
@@ -131,7 +163,8 @@ impl FileTransfers {
         self.tasks.close();
     }
     /// Grace expiry cancels and JOINS local work; unresolved native operations
-    /// stay durable for provider fencing. It does not release evidence pins.
+    /// stay durable for provider fencing. Critical COMMIT owners finish rather
+    /// than cancel; shutdown joins them too. It does not release evidence pins.
     pub async fn drain(&self, grace: Duration) -> bool {
         self.begin_shutdown();
         if tokio::time::timeout(grace, self.tasks.wait()).await.is_ok() {

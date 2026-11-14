@@ -8,7 +8,7 @@ use attune_cli::{
 };
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
 };
@@ -18,9 +18,7 @@ use serde_json::{json, Map, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
 
 #[path = "attune-mcp/interoperability.rs"]
 mod interoperability;
@@ -28,6 +26,10 @@ mod interoperability;
 #[cfg(test)]
 #[path = "attune-mcp/execution_export_tests.rs"]
 mod execution_export_tests;
+
+#[cfg(test)]
+#[path = "attune-mcp/http_auth_tests.rs"]
+mod http_auth_tests;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -67,6 +69,14 @@ struct Cli {
     /// Listen address for the HTTP transport
     #[arg(long, env = "ATTUNE_MCP_LISTEN_ADDR", default_value = "0.0.0.0:8090")]
     listen_addr: String,
+
+    /// Exact HTTP Host authorities accepted (repeatable, including port).
+    #[arg(long, env = "ATTUNE_MCP_HTTP_HOSTS", value_delimiter = ',')]
+    http_host: Vec<String>,
+
+    /// Exact browser Origins accepted; absent means browser access is denied.
+    #[arg(long, env = "ATTUNE_MCP_HTTP_ORIGINS", value_delimiter = ',')]
+    http_origin: Vec<String>,
 
     /// Root allowed for HTTP packs_check access (repeatable; env is comma-separated)
     #[arg(
@@ -2863,6 +2873,27 @@ fn selected_auth_mode(cli: &Cli, config: &CliConfig) -> Result<AuthMode> {
 
 async fn build_server(cli: &Cli) -> Result<McpServer> {
     let tool_policy = build_tool_policy(cli)?;
+    // HTTP must never load or unlock a CLI credential store, even at startup.
+    if matches!(cli.transport, Transport::Http) {
+        anyhow::ensure!(cli.auth_token.is_none() && cli.execution_token.is_none()
+            && cli.refresh_token.is_none() && cli.login.is_none() && cli.password.is_none()
+            && cli.profile.is_none(),
+            "HTTP MCP accepts only per-request bearer credentials; remove startup credentials/profile");
+        let client = ApiClient::for_caller(
+            cli.api_url
+                .as_deref()
+                .context("HTTP MCP requires an explicit --api-url")?,
+            None,
+        )?;
+        let mut server = McpServer::new(
+            client,
+            "http-caller".into(),
+            None,
+            http_packs_check_access(&cli.packs_check_roots)?,
+        );
+        server.tool_policy = tool_policy;
+        return Ok(server);
+    }
     let mut config = build_config(cli)?;
     let effective_api_url = config.effective_api_url(&cli.api_url);
     let auth_mode = selected_auth_mode(cli, &config)?;
@@ -2984,30 +3015,107 @@ async fn http_health() -> StatusCode {
     StatusCode::OK
 }
 
+fn http_packs_check_access(roots: &[PathBuf]) -> Result<PacksCheckAccess> {
+    if roots.is_empty() {
+        return Ok(PacksCheckAccess::Disabled);
+    }
+    let roots = roots
+        .iter()
+        .map(|root| {
+            let root = root
+                .canonicalize()
+                .context("Invalid HTTP packs_check root")?;
+            anyhow::ensure!(root.is_dir(), "HTTP packs_check root must be a directory");
+            Ok(root)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(PacksCheckAccess::Allowlisted(roots))
+}
+
+#[derive(Clone)]
+struct HttpState {
+    api_url: String,
+    tool_policy: ToolPolicy,
+    packs_check_access: PacksCheckAccess,
+    hosts: Vec<String>,
+    origins: Vec<String>,
+}
+
 async fn http_mcp(
-    State(server): State<Arc<Mutex<McpServer>>>,
+    State(state): State<HttpState>,
+    headers: HeaderMap,
     Json(request): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
-    let mut server = server.lock().await;
+    let denied = |status| (status, Json(json!({"error": "MCP request denied"})));
+    // Exact authorities/origins, no forwarded-header trust or wildcard matching.
+    let allowed_header = |name: &str, allowed: &[String]| {
+        headers.get_all(name).iter().count() == 1
+            && headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| allowed.iter().any(|a| a == v))
+    };
+    if !allowed_header("host", &state.hosts)
+        || (headers.contains_key("origin") && !allowed_header("origin", &state.origins))
+    {
+        return denied(StatusCode::FORBIDDEN);
+    }
+    if headers.get_all("authorization").iter().count() != 1 {
+        return denied(StatusCode::UNAUTHORIZED);
+    }
+    let Some(token) = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split_once(' '))
+        .filter(|(scheme, token)| {
+            scheme.eq_ignore_ascii_case("bearer")
+                && !token.is_empty()
+                && !token.chars().any(char::is_whitespace)
+        })
+        .map(|(_, token)| token.to_owned())
+    else {
+        return denied(StatusCode::UNAUTHORIZED);
+    };
+    let Ok(mut client) = ApiClient::for_caller(&state.api_url, Some(token)) else {
+        return denied(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    // Authenticate even initialize/list/local-only tools. API target operations
+    // independently authorize this same caller. No login/refresh fallback exists.
+    if client.get::<Value>("/auth/me").await.is_err() {
+        return denied(StatusCode::UNAUTHORIZED);
+    }
+    let mut server = McpServer::new(client, "http-caller".into(), None, state.packs_check_access);
+    server.tool_policy = state.tool_policy;
     let response = match server.handle_request(&request).await {
         Ok(Some(response)) => response,
         Ok(None) => return (StatusCode::NO_CONTENT, Json(Value::Null)),
-        Err(error) => error_response(request.get("id").cloned(), -32603, error.to_string()),
+        Err(_) => error_response(request.get("id").cloned(), -32603, "MCP request failed"),
     };
-
     (StatusCode::OK, Json(response))
 }
 
-async fn run_http(server: McpServer, listen_addr: &str) -> Result<()> {
-    let app = Router::new()
+fn http_router(server: McpServer, hosts: Vec<String>, origins: Vec<String>) -> Result<Router> {
+    anyhow::ensure!(
+        !hosts.is_empty() && hosts.iter().all(|h| !h.is_empty() && !h.contains('*')),
+        "HTTP MCP requires explicit --http-host authorities (no wildcards)"
+    );
+    Ok(Router::new()
         .route("/health", get(http_health))
         .route("/mcp", post(http_mcp))
-        .with_state(Arc::new(Mutex::new(server)));
+        .with_state(HttpState {
+            api_url: server.client.base_url().to_owned(),
+            tool_policy: server.tool_policy,
+            packs_check_access: server.packs_check_access,
+            hosts,
+            origins,
+        }))
+}
 
-    let listener = tokio::net::TcpListener::bind(listen_addr)
+async fn run_http(server: McpServer, cli: &Cli) -> Result<()> {
+    let app = http_router(server, cli.http_host.clone(), cli.http_origin.clone())?;
+    let listener = tokio::net::TcpListener::bind(&cli.listen_addr)
         .await
-        .with_context(|| format!("Failed to bind MCP HTTP listener at {listen_addr}"))?;
-
+        .context("Failed to bind MCP HTTP listener")?;
     axum::serve(listener, app)
         .await
         .context("MCP HTTP server exited unexpectedly")
@@ -3051,7 +3159,7 @@ async fn main() -> Result<()> {
 
     match cli.transport {
         Transport::Stdio => run_stdio(&mut server).await,
-        Transport::Http => run_http(server, &cli.listen_addr).await,
+        Transport::Http => run_http(server, &cli).await,
     }
 }
 
@@ -3490,11 +3598,18 @@ mod tests {
         server.tool_policy = serde_yaml_ng::from_str::<AccessPolicies>(
             "default_policy: observer\npolicies:\n  observer: [events_get, actions_execute, packs_check]\n"
         ).unwrap().select(None).unwrap();
-        let app = Router::new()
-            .route("/mcp", post(http_mcp))
-            .with_state(Arc::new(Mutex::new(server)));
+        Mock::given(method("GET"))
+            .and(path("/auth/me"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer mock-http-caller",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{"id":1}})))
+            .mount(&api)
+            .await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let app = http_router(server, vec![addr.to_string()], vec![]).unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {
             axum::serve(listener, app)
@@ -3525,6 +3640,7 @@ mod tests {
             replies.push(
                 client
                     .post(format!("http://{addr}/mcp"))
+                    .bearer_auth("mock-http-caller")
                     .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
                     .send()
                     .await
@@ -3542,7 +3658,24 @@ mod tests {
         for reply in &replies[3..] {
             assert_eq!(reply["result"]["isError"], true);
         }
-        assert_eq!(api.received_requests().await.unwrap().len(), 2);
+        let requests = api.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 7);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.url.path() == "/auth/me")
+                .count(),
+            replies.len(),
+            "Every HTTP request authenticates, including policy-denied calls"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.url.path() != "/auth/me")
+                .count(),
+            2,
+            "Only the two allowed tools may reach API operations"
+        );
     }
 
     #[tokio::test]
@@ -5083,6 +5216,8 @@ mod tests {
             access_policy: None,
             listen_addr: "127.0.0.1:8090".to_string(),
             packs_check_roots: Vec::new(),
+            http_host: Vec::new(),
+            http_origin: Vec::new(),
             auth_token: Some("access".to_string()),
             execution_token: None,
             refresh_token: Some("refresh".to_string()),
@@ -5109,6 +5244,8 @@ mod tests {
             access_policy: None,
             listen_addr: "127.0.0.1:8090".to_string(),
             packs_check_roots: Vec::new(),
+            http_host: Vec::new(),
+            http_origin: Vec::new(),
             auth_token: None,
             execution_token: Some("execution-token".to_string()),
             refresh_token: Some("refresh".to_string()),
@@ -5135,6 +5272,8 @@ mod tests {
             access_policy: None,
             listen_addr: "127.0.0.1:8090".to_string(),
             packs_check_roots: Vec::new(),
+            http_host: Vec::new(),
+            http_origin: Vec::new(),
             auth_token: Some("explicit".to_string()),
             execution_token: Some("execution".to_string()),
             refresh_token: None,

@@ -5,6 +5,9 @@
 //! fail-closed token handling, cursor integrity, conflict/precondition, and
 //! quota behavior.
 
+#[path = "helpers/service_credentials.rs"]
+mod service_credentials;
+
 use anyhow::Context;
 use axum::http::StatusCode;
 use helpers::*;
@@ -2565,6 +2568,8 @@ async fn registered_sensor_tokens_use_exact_signed_read_only_authority() -> Resu
     assert_eq!(body["data"]["pack_ref"], pack.r#ref);
     assert_eq!(body["data"]["permission_set_refs"], json!(["standard"]));
     let sensor_token = body["data"]["token"].as_str().unwrap();
+    service_credentials::assert_service_iam_rejected(&ctx, &[&worker_token, sensor_token], &writer)
+        .await?;
 
     let encryption_key = ctx
         .state
