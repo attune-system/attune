@@ -49,10 +49,16 @@ Use `scripts/acceptance/artifact-build.example.json` as the input shape. Supply:
 One way for the integration owner to capture committed source after the freeze:
 
 ```sh
-git -C /owned/integrated archive --format=tar --output=/owned/source/integrated-source.tar ACTUAL_REVISION
+git -C /owned/integrated archive --format=tar --output=/owned/source/integrated-source.tar ACTUAL_REVISION -- . ":!web/.env.development"
 sha256sum /owned/source/integrated-source.tar
 git -C /owned/integrated show -s --format=%ct ACTUAL_REVISION
 ```
+
+The excluded tracked `web/.env.development` is local development configuration,
+not a production build input. Record this exclusion in the source receipt; the
+archive hash binds the exact exported bytes. The source validator continues to
+reject operational `.env` files rather than weakening its secret-input boundary.
+The production frontend uses its production build mode and retained templates.
 
 For staged/uncommitted combined source, use the integration owner's reviewed
 snapshot procedure and hash its actual output instead. Do not commit primary to
