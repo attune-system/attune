@@ -1279,6 +1279,8 @@ pub async fn enable_trigger(
     Path(trigger_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let mut tx = state.db.begin().await?;
+    // Graph admission must precede the sensor fence and lifecycle owner locks.
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx).await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     // Check if trigger exists
     let existing_trigger = TriggerRepository::find_by_ref(&mut *tx, &trigger_ref)
@@ -1347,6 +1349,8 @@ pub async fn disable_trigger(
     Path(trigger_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let mut tx = state.db.begin().await?;
+    // Graph admission must precede the sensor fence and lifecycle owner locks.
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx).await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     // Check if trigger exists
     let existing_trigger = TriggerRepository::find_by_ref(&mut *tx, &trigger_ref)
@@ -1958,6 +1962,8 @@ pub async fn enable_sensor(
     Path(sensor_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let mut tx = state.db.begin().await?;
+    // Graph admission must precede the sensor fence and lifecycle owner locks.
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx).await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     // Check if sensor exists
     let existing_sensor = SensorRepository::find_by_ref(&mut *tx, &sensor_ref)
@@ -2035,6 +2041,8 @@ pub async fn disable_sensor(
     Path(sensor_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let mut tx = state.db.begin().await?;
+    // Graph admission must precede the sensor fence and lifecycle owner locks.
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx).await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     // Check if sensor exists
     let existing_sensor = SensorRepository::find_by_ref(&mut *tx, &sensor_ref)

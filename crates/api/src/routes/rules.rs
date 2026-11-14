@@ -1296,6 +1296,9 @@ pub async fn delete_rule(
     }
 
     let mut tx = state.db.begin().await?;
+    // The delete trigger requires exclusive graph admission before sensor admission.
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     let deleted = RuleRepository::delete(&mut *tx, rule.id).await?;
 
@@ -1367,6 +1370,8 @@ pub async fn enable_rule(
     Path(rule_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let mut tx = state.db.begin().await?;
+    // Graph admission must precede the sensor fence and lifecycle owner locks.
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx).await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     // Check if rule exists
     let existing_rule = RuleRepository::find_by_ref(&mut *tx, &rule_ref)
@@ -1461,6 +1466,8 @@ pub async fn disable_rule(
     Path(rule_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let mut tx = state.db.begin().await?;
+    // Graph admission must precede the sensor fence and lifecycle owner locks.
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx).await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     // Check if rule exists
     let existing_rule = RuleRepository::find_by_ref(&mut *tx, &rule_ref)

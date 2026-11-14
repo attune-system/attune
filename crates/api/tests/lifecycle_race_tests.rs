@@ -631,3 +631,197 @@ async fn concurrent_workflow_deletes_wait_for_pin_admission_before_companion_loc
     ctx.cleanup().await?;
     Ok(())
 }
+
+// Hold graph admission before starting real lifecycle requests. Their observed
+// graph wait must leave sensor admission free, even for different target rows.
+// The previous sensor-first order deterministically fails the try-lock probe.
+async fn lifecycle_admission_order(kind: &str, operation: &str) -> Result<()> {
+    use attune_common::repositories::{
+        rule::{CreateRuleInput, RuleRepository},
+        runtime::{CreateRuntimeInput, RuntimeRepository},
+        schema_type::SchemaTypeRepository,
+    };
+    let ctx = TestContext::new().await?;
+    let pack = helpers::create_test_pack(&ctx.pool, "admission_order").await?;
+    let target = helpers::create_test_trigger(&ctx.pool, pack.id, "admission_order.target").await?;
+    helpers::create_test_trigger(&ctx.pool, pack.id, "admission_order.deleted").await?;
+    let (_, _, bearer) = actor(
+        &ctx,
+        "admission_actor",
+        json!([
+            {"resource":"triggers","actions":["create","update","delete"]},
+            {"resource":"rules","actions":["update","delete"]}
+        ]),
+    )
+    .await?;
+    if kind == "sensors" {
+        let runtime = RuntimeRepository::create(
+            &ctx.pool,
+            CreateRuntimeInput {
+                r#ref: "admission_order.native".into(),
+                pack: Some(pack.id),
+                pack_ref: Some(pack.r#ref.clone()),
+                description: None,
+                name: "native".into(),
+                aliases: vec![],
+                distributions: json!({}),
+                installation: None,
+                execution_config: json!({}),
+                auto_detected: false,
+                detection_config: json!({}),
+            },
+        )
+        .await?;
+        let created = ctx.post("/api/v1/sensors", json!({"ref":"admission_order.sensor","pack_ref":pack.r#ref,"label":"Sensor","entrypoint":"sensor.sh","runtime_ref":runtime.r#ref,"trigger_ref":target.r#ref,"enabled":false}), Some(&bearer)).await?;
+        assert_eq!(
+            created.status(),
+            StatusCode::CREATED,
+            "{}",
+            created.text().await?
+        );
+    } else if kind == "rules" {
+        let action =
+            helpers::create_test_action(&ctx.pool, pack.id, &pack.r#ref, "admission_order.action")
+                .await?;
+        RuleRepository::create(
+            &ctx.pool,
+            CreateRuleInput {
+                r#ref: "admission_order.rule".into(),
+                pack: pack.id,
+                pack_ref: pack.r#ref.clone(),
+                label: "Rule".into(),
+                description: None,
+                action: action.id,
+                action_ref: action.r#ref,
+                trigger: target.id,
+                trigger_ref: target.r#ref,
+                conditions: json!({}),
+                action_params: json!({}),
+                trigger_params: json!({}),
+                trace_tag_template: None,
+                permission_set_refs: None,
+                enabled: false,
+                is_adhoc: true,
+                owner_identity: None,
+            },
+        )
+        .await?;
+    }
+    let target_ref = match kind {
+        "triggers" => "admission_order.target",
+        "sensors" => "admission_order.sensor",
+        "rules" => "admission_order.rule",
+        _ => unreachable!(),
+    };
+    let (method, path) = if operation == "delete" {
+        ("DELETE", format!("/api/v1/{kind}/{target_ref}"))
+    } else {
+        ("POST", format!("/api/v1/{kind}/{target_ref}/{operation}"))
+    };
+    let expected = if kind == "sensors" && operation == "enable" {
+        // No live sensor worker is provisioned; placement admission still runs.
+        StatusCode::UNPROCESSABLE_ENTITY
+    } else {
+        StatusCode::OK
+    };
+    let mut blocker = ctx.pool.begin().await?;
+    SchemaTypeRepository::lock_reclamation(&mut blocker).await?;
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await?;
+    let mut requests = tokio::task::JoinSet::new();
+    let observation: Result<bool> = async {
+        let app = ctx.app.clone();
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(Body::from("{}"))?;
+        requests.spawn(async move { (false, app.oneshot(request).await.unwrap().status()) });
+        wait_for_blocked(&ctx, pid).await?;
+        let app = ctx.app.clone();
+        let request = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/triggers/admission_order.deleted")
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(Body::empty())?;
+        requests.spawn(async move { (true, app.oneshot(request).await.unwrap().status()) });
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity a WHERE $1 = ANY(pg_blocking_pids(a.pid))").bind(pid).fetch_one(&ctx.pool).await?;
+                if waiting == 2 { return Ok::<_, sqlx::Error>(()); }
+                tokio::task::yield_now().await;
+            }
+        }).await.map_err(|_| "Lifecycle requests did not both reach the owned graph blocker")??;
+        let mut probe = ctx.pool.begin().await?;
+        let available: bool = sqlx::query_scalar(
+            "SELECT pg_try_advisory_xact_lock(hashtext('sensor_rule_admission')::BIGINT)",
+        )
+        .fetch_one(&mut *probe)
+        .await?;
+        probe.rollback().await?;
+        Ok(available)
+    }
+    .await;
+    // Release the barrier and join every request even when observation fails.
+    let rollback = blocker.rollback().await;
+    if observation.is_err() || rollback.is_err() {
+        requests.abort_all();
+    }
+    let joined = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut responses = Vec::new();
+        while let Some(response) = requests.join_next().await {
+            responses.push(response);
+        }
+        responses
+    })
+    .await;
+    if joined.is_err() {
+        requests.abort_all();
+        while requests.join_next().await.is_some() {}
+    }
+    ctx.cleanup().await?;
+    rollback?;
+    let available = observation?;
+    let responses = joined?;
+    assert!(
+        available,
+        "{kind}/{operation} held sensor admission while blocked on graph admission"
+    );
+    assert_eq!(responses.len(), 2);
+    for response in responses {
+        let (deletion, status) = response?;
+        assert_eq!(status, if deletion { StatusCode::OK } else { expected });
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn trigger_enable_enters_graph_before_sensor_admission() -> Result<()> {
+    lifecycle_admission_order("triggers", "enable").await
+}
+#[tokio::test]
+async fn trigger_disable_enters_graph_before_sensor_admission() -> Result<()> {
+    lifecycle_admission_order("triggers", "disable").await
+}
+#[tokio::test]
+async fn sensor_enable_enters_graph_before_sensor_admission() -> Result<()> {
+    lifecycle_admission_order("sensors", "enable").await
+}
+#[tokio::test]
+async fn sensor_disable_enters_graph_before_sensor_admission() -> Result<()> {
+    lifecycle_admission_order("sensors", "disable").await
+}
+#[tokio::test]
+async fn rule_enable_enters_graph_before_sensor_admission() -> Result<()> {
+    lifecycle_admission_order("rules", "enable").await
+}
+#[tokio::test]
+async fn rule_disable_enters_graph_before_sensor_admission() -> Result<()> {
+    lifecycle_admission_order("rules", "disable").await
+}
+#[tokio::test]
+async fn rule_delete_enters_graph_before_sensor_admission() -> Result<()> {
+    lifecycle_admission_order("rules", "delete").await
+}
