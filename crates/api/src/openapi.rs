@@ -1040,17 +1040,23 @@ mod tests {
                 if path_item.head.is_some() {
                     count += 1;
                 }
+                if path_item.options.is_some() {
+                    count += 1;
+                }
+                if path_item.trace.is_some() {
+                    count += 1;
+                }
                 count
             })
             .sum();
 
         assert_eq!(
-            path_count, 214,
+            path_count, 216,
             "Expected every mounted API path in the OpenAPI spec"
         );
 
         assert_eq!(
-            operation_count, 278,
+            operation_count, 280,
             "Expected every mounted API operation in the OpenAPI spec"
         );
 
@@ -1453,6 +1459,48 @@ mod tests {
     }
 
     #[test]
+    fn test_interactive_session_operations_have_typed_requests() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        for (path, operation_id, component, field) in [
+            (
+                "/auth/session/logout",
+                "logout_session",
+                "RefreshTokenRequest",
+                "refresh_token",
+            ),
+            (
+                "/auth/exchange",
+                "login_exchange",
+                "LoginExchangeRequest",
+                "code",
+            ),
+        ] {
+            let item = spec["paths"][path]
+                .as_object()
+                .expect("Session path must be documented");
+            assert_eq!(
+                item.len(),
+                1,
+                "Session credential exchange must expose POST only"
+            );
+            let post = &item["post"];
+            assert_eq!(post["operationId"], operation_id);
+            assert_eq!(post["requestBody"]["required"], true);
+            assert_eq!(
+                post["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+                format!("#/components/schemas/{component}")
+            );
+            let schema = &spec["components"]["schemas"][component];
+            assert_eq!(schema["type"], "object");
+            assert_eq!(schema["properties"][field]["type"], "string");
+            assert!(schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::Value::String(field.into())));
+        }
+    }
+
+    #[test]
     fn test_previously_unregistered_mounted_operations_are_documented() {
         let spec = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI spec should serialize");
 
@@ -1460,6 +1508,8 @@ mod tests {
             ("get", "/auth/oidc/login"),
             ("get", "/auth/callback"),
             ("get", "/auth/logout"),
+            ("post", "/auth/session/logout"),
+            ("post", "/auth/exchange"),
             ("post", "/auth/internal/sensor-token"),
             ("post", "/api/v1/packs/register-batch"),
             ("post", "/api/v1/packs/upload"),
