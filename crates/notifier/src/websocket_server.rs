@@ -1850,6 +1850,14 @@ fn parse_subscription_filter(filter_str: &str) -> Result<SubscriptionFilter> {
         anyhow::bail!("Invalid filter format: {}", filter_str);
     }
 
+    // This parser precedes both identity IAM and recorded-credential filter
+    // admission. Neither credential family can subscribe to a future stream
+    // before it has an explicit catalog mapping.
+    if (matches!(parts[0], "entity_type" | "entity") && entity_type_resource(parts[1]).is_none())
+        || (parts[0] == "notification_type" && notification_type_resource(parts[1]).is_none())
+    {
+        anyhow::bail!("Unknown subscription entity or notification type");
+    }
     match parts[0] {
         "entity_type" => Ok(SubscriptionFilter::EntityType(parts[1].to_string())),
         "notification_type" => Ok(SubscriptionFilter::NotificationType(parts[1].to_string())),

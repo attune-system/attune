@@ -508,3 +508,23 @@ async fn notifier_targets_scope_unknown_and_revocation() -> Result<()> {
     db.cleanup().await?;
     Ok(())
 }
+
+#[test]
+fn unknown_subscription_catalog_is_rejected_before_credential_specific_admission() {
+    for filter in [
+        "entity:future:1",
+        "entity_type:future",
+        "notification_type:future_execution_created",
+    ] {
+        assert!(parse_subscription_filter(filter).is_err(), "{filter}");
+    }
+    for filter in [
+        "entity:work_queue:1",
+        "entity_type:inquiry",
+        "notification_type:work_queue_item_updated",
+        "trigger_ref:custom.trigger",
+        "all",
+    ] {
+        assert!(parse_subscription_filter(filter).is_ok(), "{filter}");
+    }
+}
