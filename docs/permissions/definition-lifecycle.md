@@ -10,6 +10,7 @@ prefix does not establish managed pack ownership.
 | Workflow delete | Actions / Delete on companion action, or workflow ref if absent | Access |
 | Trigger and sensor create/delete | Triggers / Create or Delete | Access |
 | Trigger, sensor and rule enable/disable | Triggers or Rules / Update | Access |
+| Rule enabled-state transition through PUT | Rules / Update on locked current target | Access |
 | Pack workflow sync | Packs / Install on actual pack | Access |
 | Pack workflow validation | Packs / Read on actual pack | Access |
 | Server-path dependency inspection | Packs / global Read | Access |
@@ -22,10 +23,16 @@ confinement remains a separate requirement.
 
 The new lifecycle controls reject delegated Execution and service credentials,
 even if the attributable identity has human grants. Recorded execution authority
-remains disabled and missing admissions fail closed. Existing workflow, rule and
-trigger update routes retain their current IAM credential contracts; sensor
-metadata update remains Access-only. Dedicated service operations retain their
-own typed credential contracts.
+remains disabled and missing admissions fail closed. Existing workflow and trigger
+update routes retain their current IAM credential contracts; sensor metadata
+update remains Access-only. Rule PUT preserves its existing Access/Execution IAM
+and token ceilings for metadata edits and unchanged full-form enabled values.
+Only an actual enabled-state transition, compared against the locked current row,
+requires the same fresh Access Rules/Update check as the dedicated toggle routes.
+Mixed enabled/behavior updates must also satisfy the independent behavior,
+delegation and input-authority requirements; toggling alone neither requires
+Actions/Execute nor recaptures runtime authority. Enabling retains live placement
+admission. Dedicated service operations retain their own typed credential contracts.
 
 Authorization precedes row changes, cache tombstoning, file writes and lifecycle
 notifications. Enabling still runs placement admission; sensor configuration
