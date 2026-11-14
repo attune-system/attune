@@ -313,8 +313,8 @@ mod tests {
         // Disabling execution never bypasses the typed metadata contract.
         let mut incomplete = metadata;
         let block = incomplete["testing"].as_mapping_mut().unwrap();
-        block.remove(serde_yaml_ng::Value::String("discovery".into()));
-        block.remove(serde_yaml_ng::Value::String("runners".into()));
+        block.remove(serde_yaml_ng::Value::from("discovery"));
+        block.remove(serde_yaml_ng::Value::from("runners"));
         std::fs::write(
             root.path().join("pack.yaml"),
             serde_yaml_ng::to_string(&incomplete).unwrap(),

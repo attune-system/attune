@@ -912,10 +912,18 @@ fn release_source(
         ),
     )?;
     std::fs::write(source.join("actions/leaf.yaml"), "ref: core.leaf\nrunner_type: shell\nentry_point: leaf.sh\ndefault_execution_permission_set_refs: [core.effects]\n")?;
-    std::fs::copy(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs/core/actions/echo.sh"),
-        source.join("actions/leaf.sh"),
+    // This synthetic admission fixture owns its executable independently of
+    // the shipped core inventory; policy/pin tests do not execute the leaf.
+    let leaf = source.join("actions/leaf.sh");
+    std::fs::write(
+        &leaf,
+        b"#!/bin/sh\nprintf '%s\\n' 'owned admission fixture'\n",
     )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o755))?;
+    }
     std::fs::write(
         source.join("actions/flow.yaml"),
         "ref: core.flow\nworkflow_file: workflows/flow.workflow.yaml\n",
