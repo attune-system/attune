@@ -8,6 +8,9 @@ ENV DEBIAN_FRONTEND=noninteractive CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake musl-tools pkg-config libssl-dev ca-certificates \
     curl git file binutils python3 python3-pip && rm -rf /var/lib/apt/lists/*
+COPY docker/acceptance/cargo-with-budget.sh /opt/attune-budget/bin/cargo
+RUN chmod +x /opt/attune-budget/bin/cargo
+ENV PATH="/opt/attune-budget/bin:${PATH}"
 RUN python3 -m pip install --break-system-packages --no-cache-dir 'ziglang==0.16.0' && \
     cargo install --locked --version 0.23.4 cargo-zigbuild && \
     rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl && \
