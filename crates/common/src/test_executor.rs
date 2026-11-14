@@ -333,21 +333,19 @@ impl TestExecutor {
     ) -> Result<TestSuiteResult> {
         let start_time = Instant::now();
 
-        // Resolve entry point path
-        let entry_point = pack_dir.join(&runner_config.entry_point);
-        if !entry_point.exists() {
-            return Err(crate::pack_registry::diagnostics::metadata_error("pack.yaml",
-                &format!("/testing/runners{}/entry_point", crate::pack_registry::diagnostics::pointer(runner_name)),
-                "Test entrypoint is missing. Add the declared file to the pack or adjust entry_point."));
-        }
-
-        // Determine command based on runner type
-        // Use relative path from pack directory for the entry point
-        let relative_entry_point = entry_point
-            .strip_prefix(pack_dir)
-            .unwrap_or(&entry_point)
-            .to_string_lossy()
-            .to_string();
+        let entry_point =
+            confined_test_entrypoint(pack_dir, &runner_config.entry_point).map_err(|_| {
+                crate::pack_registry::diagnostics::metadata_error(
+                    "pack.yaml",
+                    &format!(
+                        "/testing/runners{}/entry_point",
+                        crate::pack_registry::diagnostics::pointer(runner_name)
+                    ),
+                    "Test entrypoint must name an existing file within the pack",
+                )
+            })?;
+        // Absolute canonical paths also prevent a leading '-' from becoming an option.
+        let relative_entry_point = entry_point.to_string_lossy().into_owned();
 
         let (command, args) = match runner_config.r#type.as_str() {
             "script" => {
@@ -697,9 +695,92 @@ struct CommandOutput {
     duration_ms: u64,
 }
 
+/// Resolve only ordinary relative file paths inside the owned pack tree.
+/// Pack sources must remain immutable while tests run.
+pub(crate) fn confined_test_entrypoint(root: &Path, entry: &str) -> Result<PathBuf> {
+    let path = Path::new(entry);
+    if entry.is_empty()
+        || path.components().any(|part| {
+            !matches!(
+                part,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(Error::Validation("Unsafe test entrypoint".into()));
+    }
+    let root = root
+        .canonicalize()
+        .map_err(|error| Error::Io(error.to_string()))?;
+    let resolved = root
+        .join(path)
+        .canonicalize()
+        .map_err(|error| Error::Io(error.to_string()))?;
+    if !resolved.starts_with(&root) || !resolved.is_file() {
+        return Err(Error::Validation(
+            "Test entrypoint escapes pack root".into(),
+        ));
+    }
+    Ok(resolved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runner_entrypoints_are_confined_before_execution() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("pack");
+        std::fs::create_dir(&root).unwrap();
+        let marker = temp.path().join("executed");
+        let outside = temp.path().join("outside.sh");
+        std::fs::write(&outside, format!("touch '{}'\n", marker.display())).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escape.sh")).unwrap();
+        std::os::unix::fs::symlink(temp.path(), root.join("escape-dir")).unwrap();
+        std::fs::write(
+            root.join("safe.sh"),
+            "printf 'Total Tests: 1\nPassed: 1\nFailed: 0\n'\n",
+        )
+        .unwrap();
+        let executor = TestExecutor::new(root.clone());
+        for entry in [
+            "../outside.sh",
+            outside.to_str().unwrap(),
+            "escape.sh",
+            "escape-dir/outside.sh",
+        ] {
+            let runner = RunnerConfig {
+                r#type: "script".into(),
+                entry_point: entry.into(),
+                timeout: Some(5),
+                result_format: None,
+            };
+            assert!(
+                executor
+                    .execute_test_suite(&root, "escape", &runner, None)
+                    .await
+                    .is_err(),
+                "{entry}"
+            );
+            assert!(!marker.exists());
+        }
+        let runner = RunnerConfig {
+            r#type: "script".into(),
+            entry_point: "safe.sh".into(),
+            timeout: Some(5),
+            result_format: None,
+        };
+        assert_eq!(
+            executor
+                .execute_test_suite(&root, "safe", &runner, None)
+                .await
+                .unwrap()
+                .passed,
+            1
+        );
+    }
 
     #[tokio::test]
     async fn candidate_credentials_are_explicit_and_not_general_execution_credentials() {

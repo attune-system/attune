@@ -1040,6 +1040,10 @@ pub struct LegacyAuditControllerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PacksConfig {
+    /// Operator-trusted API-host sources. Empty disables HTTP local ingestion.
+    #[serde(default)]
+    pub local_source_roots: Vec<std::path::PathBuf>,
+
     /// Transport mode: "auto" for local compatibility, "volume", or "api".
     #[serde(default)]
     pub transport: crate::artifact_transport::TransportMode,
@@ -1052,6 +1056,7 @@ pub struct PacksConfig {
 impl Default for PacksConfig {
     fn default() -> Self {
         Self {
+            local_source_roots: Vec::new(),
             transport: crate::artifact_transport::TransportMode::Auto,
             republish: PackRepublishConfig::default(),
         }
@@ -1117,6 +1122,7 @@ impl Default for ArtifactsConfig {
     fn default() -> Self {
         Self {
             legacy_audit_controller: None,
+            local_source_roots: Vec::new(),
             transport: crate::artifact_transport::TransportMode::Auto,
             max_upload_size: default_max_upload_size(),
             protected_file_memory_budget_bytes: default_protected_file_memory_budget_bytes(),

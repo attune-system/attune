@@ -151,6 +151,25 @@ impl TestContext {
         Ok(self)
     }
 
+    /// Explicit operator policy for local-source fixtures.
+    #[allow(dead_code)]
+    pub async fn with_local_source_roots(mut self, roots: Vec<std::path::PathBuf>) -> Result<Self> {
+        self.state
+            .reclamation_cancellation
+            .shutdown(tokio::time::Instant::now() + std::time::Duration::from_secs(10))
+            .await?;
+        let mut config = self.state.config.as_ref().clone();
+        config.packs.local_source_roots = roots;
+        let state = Arc::new(attune_api::state::AppState::new_with_audit(
+            self.pool.clone(),
+            config,
+            self.audit_writer.as_ref().unwrap().emitter.clone(),
+        ));
+        self.app = attune_api::server::Server::new(state.clone()).router();
+        self.state = state;
+        Ok(self)
+    }
+
     #[allow(dead_code)]
     pub async fn with_webhook_trusted_proxies(mut self, proxies: Vec<String>) -> Result<Self> {
         self.state
@@ -295,6 +314,8 @@ impl TestContext {
         };
         config.cache_admission = cache_admission;
         config.packs.republish = republish.unwrap_or_default();
+        // Existing pack fixtures explicitly trust their generated temporary sources.
+        config.packs.local_source_roots = vec![std::env::temp_dir()];
         if let Some((global, per_identity)) = stream_limits {
             config.server.execution_log_stream_global_limit = global;
             config.server.execution_log_stream_per_identity_limit = per_identity;

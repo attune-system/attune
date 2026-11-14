@@ -57,3 +57,24 @@ commit outcome conservatively retains the publication and a private
 operator reconciliation. PostgreSQL and the filesystem do not form one atomic
 transaction; a process/host loss or an uncertain commit requires reconciliation,
 not an assumption that SQL rollback removed files.
+
+## Operator-approved local pack sources
+
+HTTP registration (single and batch), installation and staged download may read
+API-host paths only for Access credentials with unconstrained `packs:install`
+and only under canonical roots explicitly configured in
+`packs.local_source_roots`. The default empty list disables local ingestion.
+Candidate namespace authorization still applies. Scoped upload/remote deployers
+must use upload or remote sources; deployment authority alone does not disclose
+API-host files. Upload and remote staging do not require local-source approval.
+
+For operator local registration, configure a dedicated, operator-owned source
+mount, for example `packs: {local_source_roots: [/srv/attune-pack-sources]}`,
+and register a pack directory beneath that mount using an operator credential.
+Keep the mount and its ancestors immutable to untrusted writers while ingestion
+runs; canonical path checks are not a sandbox against concurrent host filesystem
+mutation. Do not approve `/`, home directories, or shared temporary roots.
+Directory copying and release publication reject symlinks within pack trees.
+Test runner entrypoints must be relative existing files resolving inside the
+owned pack root; traversal, absolute paths and symlink escapes are rejected by
+the executor as well as metadata validation.
