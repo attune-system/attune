@@ -3066,6 +3066,24 @@ async fn test_register_pack_rolls_back_when_component_loading_fails() -> Result<
     let fixture =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pack_load_failure");
 
+    // Confirm that the default temporary-source fixture policy rejects this
+    // repository source before malformed component metadata is read.
+    let denied = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({"path": fixture, "skip_tests": true}),
+            ctx.token(),
+        )
+        .await?;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let denied: serde_json::Value = denied.json().await?;
+    assert_eq!(
+        denied["error"],
+        "Local pack source is outside operator-approved roots"
+    );
+    // Trust only this immutable repository fixture, never the repository root.
+    let ctx = ctx.with_local_source_roots(vec![fixture.clone()]).await?;
+
     let response = ctx
         .post(
             "/api/v1/packs/register",
@@ -3172,6 +3190,7 @@ async fn test_register_pack_rolls_back_when_component_loading_fails() -> Result<
         "cache definition preflight must prevent partial existing-pack component updates"
     );
 
+    ctx.cleanup().await?;
     Ok(())
 }
 
