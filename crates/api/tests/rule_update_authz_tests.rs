@@ -812,6 +812,65 @@ async fn full_form_metadata_retains_update_semantics_but_placement_spends_editor
         },
     )
     .await?;
+    // Placement is valid only for triggers backed by a managed sensor. Keep
+    // this test sensor disabled: positive writes prove structural authoring
+    // admission and persistence, without claiming live-worker dispatch coverage.
+    use attune_common::repositories::{
+        runtime::{CreateRuntimeInput, RuntimeRepository},
+        trigger::{CreateSensorInput, SensorRepository, TriggerRepository, UpdateTriggerInput},
+    };
+    let runtime = RuntimeRepository::create(
+        &ctx.pool,
+        CreateRuntimeInput {
+            r#ref: format!("{}.native", rule.pack_ref),
+            pack: Some(rule.pack),
+            pack_ref: Some(rule.pack_ref.clone()),
+            description: None,
+            name: "native".into(),
+            aliases: vec![],
+            distributions: json!({}),
+            installation: None,
+            execution_config: json!({}),
+            auto_detected: false,
+            detection_config: json!({}),
+        },
+    )
+    .await?;
+    let sensor = SensorRepository::create(
+        &ctx.pool,
+        CreateSensorInput {
+            r#ref: format!("{}.source", rule.pack_ref),
+            pack: Some(rule.pack),
+            pack_ref: Some(rule.pack_ref.clone()),
+            label: "Placement fixture".into(),
+            description: None,
+            entrypoint: "source".into(),
+            runtime: runtime.id,
+            runtime_ref: runtime.r#ref,
+            runtime_version_constraint: None,
+            enabled: false,
+            param_schema: None,
+            config: Some(json!({})),
+            worker_selector: json!({}),
+            worker_tolerations: json!([]),
+            worker_affinity: json!({}),
+            log_retention_policy: None,
+            log_retention_limit: None,
+            artifact_retention_policy: None,
+            artifact_retention_limit: None,
+        },
+    )
+    .await?;
+    TriggerRepository::update(
+        &ctx.pool,
+        rule.trigger.unwrap(),
+        UpdateTriggerInput {
+            sensor: Some(Patch::Set(sensor.id)),
+            sensor_ref: Some(Patch::Set(sensor.r#ref)),
+            ..Default::default()
+        },
+    )
+    .await?;
     attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
     let tokens = [
         generate_token(
@@ -896,6 +955,19 @@ async fn full_form_metadata_retains_update_semantics_but_placement_spends_editor
             body["error"]
         );
     }
+    let placed = RuleRepository::find_by_ref(&ctx.pool, &rule_ref)
+        .await?
+        .unwrap();
+    assert_eq!(placed.sensor_worker_selector, json!({"zone":"other"}));
+    assert_eq!(
+        placed.sensor_worker_tolerations,
+        json!([{"key":"dedicated","operator":"exists"}])
+    );
+    assert_eq!(
+        placed.sensor_worker_affinity,
+        json!({"required":[{"match_labels":{"zone":"other"}}]})
+    );
+    assert_eq!(placed.owner_identity, Some(sponsor));
     ctx.cleanup().await?;
     Ok(())
 }
