@@ -15,12 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::{
-    auth::jwt::{generate_access_token, generate_refresh_token},
-    dto::TokenResponse,
-    middleware::error::ApiError,
-    state::SharedState,
-};
+use crate::{dto::TokenResponse, middleware::error::ApiError, state::SharedState};
 
 /// Claims extracted from the LDAP directory for an authenticated user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,19 +66,13 @@ pub async fn authenticate(
             "Identity is frozen and cannot authenticate".to_string(),
         ));
     }
-    let access_token = generate_access_token(identity.id, &identity.login, &state.jwt_config)?;
-    let refresh_token = generate_refresh_token(identity.id, &identity.login, &state.jwt_config)?;
-
-    let token_response = TokenResponse::new(
-        access_token,
-        refresh_token,
-        state.jwt_config.access_token_expiration,
-    )
-    .with_user(
-        identity.id,
-        identity.login.clone(),
-        identity.display_name.clone(),
-    );
+    let token_response = crate::auth::session::issue(&state, &identity)
+        .await?
+        .with_user(
+            identity.id,
+            identity.login.clone(),
+            identity.display_name.clone(),
+        );
 
     Ok(LdapAuthenticatedIdentity { token_response })
 }

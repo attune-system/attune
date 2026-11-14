@@ -144,6 +144,8 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::auth::ldap_login,
         crate::routes::auth::register,
         crate::routes::auth::refresh_token,
+        crate::routes::auth::logout_session,
+        crate::routes::auth::login_exchange,
         crate::routes::auth::get_current_user,
         crate::routes::auth::update_current_user,
         crate::routes::auth::change_password,

@@ -66,6 +66,7 @@ pub mod file_native_setup;
 pub mod file_origin;
 pub mod health;
 pub mod identity;
+pub mod interactive_session;
 pub mod immutable_input_origin;
 pub mod inherited_input;
 pub mod inquiry;

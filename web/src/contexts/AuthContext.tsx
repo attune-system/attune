@@ -84,7 +84,17 @@ export function AuthProvider({ children }: AuthProviderProps) {
     window.location.href = `/auth/oidc/login${redirectParam}`;
   };
 
-  const logout = () => {
+  const logout = async () => {
+    const refreshToken = localStorage.getItem("refresh_token");
+    if (refreshToken) {
+      const response = await fetch("/auth/session/logout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refresh_token: refreshToken }),
+      });
+      if (!response.ok)
+        throw new Error("Session revocation failed; retry logout.");
+    }
     localStorage.removeItem("access_token");
     localStorage.removeItem("refresh_token");
     stopTokenRefreshMonitor();

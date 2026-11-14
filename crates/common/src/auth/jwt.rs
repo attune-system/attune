@@ -339,7 +339,7 @@ pub fn generate_token(
 ) -> Result<String, JwtError> {
     let now = Utc::now();
     let expiration = match token_type {
-        TokenType::Access => config.access_token_expiration,
+        TokenType::Access => config.access_token_expiration.min(300),
         TokenType::Refresh => config.refresh_token_expiration,
         // Sensor and Execution tokens are generated via their own dedicated functions
         // with explicit TTLs; this fallback should not normally be reached.
@@ -355,9 +355,10 @@ pub fn generate_token(
         login: login.to_string(),
         iat: now.timestamp(),
         exp,
+        metadata: (token_type == TokenType::Refresh)
+            .then(|| serde_json::json!({"nonce": Uuid::new_v4()})),
         token_type,
         scope: None,
-        metadata: None,
     };
 
     encode(
