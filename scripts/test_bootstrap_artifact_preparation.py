@@ -31,6 +31,16 @@ class Preparation(unittest.TestCase):
             with self.assertRaises(artifacts.InputError):
                 artifacts.require_local_builder(info, manifest, "unix:///unit/docker.sock")
 
+    def test_builder_inventory_selects_exact_name_and_rejects_conflicting_records(self):
+        builder = {"Name": "central", "Driver": "docker", "Nodes": [{"Endpoint": "default", "Status": "running"}]}
+        raw = json.dumps(builder)
+        self.assertEqual(artifacts.select_builder_inventory(raw + "\n" + raw, "central"), builder)
+        with self.assertRaisesRegex(artifacts.InputError, "absent"):
+            artifacts.select_builder_inventory(raw, "other")
+        conflicting = dict(builder, Nodes=[{"Endpoint": "ssh://foreign", "Status": "running"}])
+        with self.assertRaisesRegex(artifacts.InputError, "ambiguous"):
+            artifacts.select_builder_inventory(raw + "\n" + json.dumps(conflicting), "central")
+
     def test_existing_running_single_local_node_is_required_not_created(self):
         manifest = {"buildx_builder": "central", "docker_context": "default"}
         artifacts.require_local_builder({"Name": "central", "Driver": "docker-container", "Nodes": [{"Endpoint": "default", "Status": "running"}]}, manifest, "unix:///unit/docker.sock")

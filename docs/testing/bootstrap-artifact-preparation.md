@@ -33,7 +33,7 @@ Use `scripts/acceptance/artifact-build.example.json` as the input shape. Supply:
 - An explicit local Docker context and existing central permissioned BuildKit
   builder slot. The script neither creates nor prunes that builder. Its scheduler
   must enforce at most two build jobs and serialize this job with other heavy work.
-  Preflight uses Buildx's JSON inspect format and requires exactly one already
+  Preflight selects the exact named builder from Buildx's JSON inventory and requires exactly one already
   running docker/docker-container node attached to that validated local context.
   A local Docker context cannot authorize a remote/Kubernetes or inactive builder.
   Run on the selected native Linux amd64 or arm64 host. No QEMU fallback is inferred.

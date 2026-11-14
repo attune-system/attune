@@ -244,6 +244,16 @@ def native_receipt(root):
     return {"core": {"version": result["version"], "digest": result["digest"], "archive_path": str(archive), "archive_size": archive.stat().st_size}, "binaries": binaries, "native_controller_files": modules, "native_producer_release": producer}
 
 
+def select_builder_inventory(raw, name):
+    matches = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    matches = [entry for entry in matches if entry.get("Name") == name]
+    require(bool(matches), "Selected builder is absent from local inventory")
+    # Buildx can list the same context-backed builder twice. Only identical
+    # records are acceptable; conflicting endpoint/state records fail closed.
+    require(len({json.dumps(entry, sort_keys=True) for entry in matches}) == 1, "Selected builder inventory is ambiguous")
+    return matches[0]
+
+
 def require_local_builder(info, manifest, endpoint):
     require(info.get("Name") == manifest["buildx_builder"] and info.get("Driver") in ("docker", "docker-container"), "Use an explicitly selected existing local Docker builder, not a remote/Kubernetes builder")
     nodes = info.get("Nodes", [])
@@ -259,7 +269,7 @@ def execute(args, manifest):
     docker = ["docker", "--context", manifest["docker_context"]]
     inspected = json.loads(driver.command([*docker, "context", "inspect", manifest["docker_context"]]))[0]
     require(inspected["Endpoints"]["docker"]["Host"].startswith("unix://"), "Only an explicit local Docker socket is supported")
-    builder = json.loads(driver.command([*docker, "buildx", "inspect", manifest["buildx_builder"], "--format", "{{json .}}"]))
+    builder = select_builder_inventory(driver.command([*docker, "buildx", "ls", "--format", "{{json .}}"]), manifest["buildx_builder"])
     require_local_builder(builder, manifest, inspected["Endpoints"]["docker"]["Host"])
     args.work_root.mkdir(mode=0o700)
     receipt = {"status": "INCOMPLETE", "source_revision": manifest["source_revision"], "source_sha256": manifest["source_sha256"], "build_jobs": 2, "completed": [], "images": {}, "acceptance": "NOT_RUN", "admission_gates": "UNCHANGED"}
