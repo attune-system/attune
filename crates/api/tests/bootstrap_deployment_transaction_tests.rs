@@ -332,8 +332,14 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
     // Preserve the retained, inert shipped definition byte-for-byte. Its
     // withdrawn SSH owner is not a valid owner for a new synthetic consumer.
     let retained_key_creator = std::fs::read(source.join("permission_sets/key_creator.yaml"))?;
-    let retained_key_grants =
-        serde_yaml_ng::from_slice::<serde_json::Value>(&retained_key_creator)?;
+    let retained_key_definition: attune_common::runtime_authority::PermissionSetDefinition =
+        serde_yaml_ng::from_slice(&retained_key_creator)?;
+    // IAM storage binds authored local grants to the installing pack. Compare
+    // the complete canonical form, including its managing_pack_id envelope.
+    let retained_key_grants = attune_common::runtime_authority::normalize_iam_grants(
+        retained_key_definition.authored_grants()?,
+        Some(pack.id),
+    )?;
     // The admission-only consumer and its local key policy both belong to this
     // owned fixture. No shipped policy or callable is changed or reintroduced.
     std::fs::write(source.join("permission_sets/acceptance_key_access.yaml"), "ref: core.acceptance_key_access\nlabel: Owned fixture key-create policy\ngrants:\n  - resource: keys\n    actions: [create]\n    constraints:\n      owner_types: [action]\n      owner_refs: [core.acceptance_key_creator]\n      encrypted: true\n")?;
@@ -368,7 +374,7 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
             .await?
             .unwrap()
             .grants,
-        retained_key_grants["grants"]
+        retained_key_grants
     );
     let fixture_invocation = policy
         .policy
@@ -872,7 +878,7 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
             .await?
             .unwrap()
             .grants,
-        retained_key_grants["grants"]
+        retained_key_grants
     );
     ctx.cleanup().await?;
     Ok(())
