@@ -1,8 +1,8 @@
 # Local acceptance inputs only. Supply measured immutable upstream references;
 # export and hash each derived OCI image before using it in a build manifest.
-ARG RUST_BASE
-ARG SERVICE_BASE
-ARG PYTHON_BASE
+ARG RUST_BASE=docker.io/library/rust@sha256:198cd28b4ba92b20fe849d5d8b119ace1bd28423d9e82e9c4de5ee1300d453a0
+ARG SERVICE_BASE=debian@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
+ARG PYTHON_BASE=python@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
 FROM ${RUST_BASE} AS toolchain
 ENV DEBIAN_FRONTEND=noninteractive CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 CMAKE_BUILD_PARALLEL_LEVEL=2 MAKEFLAGS=-j2
 RUN apt-get update && apt-get install -y --no-install-recommends \
