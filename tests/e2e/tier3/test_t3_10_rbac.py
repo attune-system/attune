@@ -480,7 +480,7 @@ def test_role_permissions_summary():
             "inquiries": ["read", "create", "update", "delete", "respond"],
             "keys": ["create", "read", "update", "delete", "decrypt"],
             "artifacts": ["create", "read", "update", "delete"],
-            "identities": ["create", "read", "update", "delete"],
+            "identities": ["create", "read", "update", "delete", "manage"],
             "permissions": ["create", "read", "update", "delete", "manage"],
         },
         "editor": {

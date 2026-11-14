@@ -20,6 +20,6 @@ grants:
   - {resource: workers, actions: [read, manage]}
   - {resource: dashboards, actions: [read, create, update, delete]}
   - {resource: retention, actions: [read, update]}
-  - {resource: identities, actions: [read, create, update, delete]}
+  - {resource: identities, actions: [read, create, update, delete, manage]}
   - {resource: permissions, actions: [read, manage]}
   - {resource: audit_log, actions: [read]}

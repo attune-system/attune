@@ -372,7 +372,7 @@ impl TestContext {
                 label: Some("Admin".to_string()),
                 description: Some("Test admin permission set".to_string()),
                 grants: json!([
-                    {"resource": "identities", "actions": ["read", "create", "update", "delete"]},
+                    {"resource": "identities", "actions": ["read", "create", "update", "delete", "manage"]},
                     {"resource": "permissions", "actions": ["read", "create", "update", "delete", "manage"]},
                     {"resource": "packs", "actions": ["read", "create", "install", "update", "configure", "delete"]}
                 ]),
@@ -392,6 +392,7 @@ impl TestContext {
         AuthorizationService::invalidate_identity_authz_cache(identity.id).await;
         AuthorizationService::invalidate_permission_set_caches().await;
 
+        self.user = Some(identity);
         self.token = Some(token);
         Ok(self)
     }
@@ -437,7 +438,7 @@ impl TestContext {
     }
 
     /// Create a test user and return access token
-    async fn create_test_user(&self, login: &str) -> Result<String> {
+    pub async fn create_test_user(&self, login: &str) -> Result<String> {
         // Register via API to get real token
         let response = self
             .post(

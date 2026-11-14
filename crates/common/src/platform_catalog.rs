@@ -5,7 +5,7 @@ use serde_json::Value;
 use crate::{Error, Result};
 
 pub const COMPATIBILITY_EPOCH: i32 = 1;
-pub const CATALOG_REVISION: i32 = 3;
+pub const CATALOG_REVISION: i32 = 4;
 
 /// Platform component namespaces are reserved even without an installed pack.
 pub fn reserved_pack_namespace(reference: &str) -> bool {

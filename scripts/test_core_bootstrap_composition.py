@@ -49,7 +49,7 @@ class CoreCompositionTests(unittest.TestCase):
         self.assertEqual(yaml.safe_load((CORE / "permission_sets/key_creator.yaml").read_text())["ref"], "core.key_creator")
 
     def test_shipped_refs_and_canonical_installer_are_explicit(self):
-        self.assertEqual(publisher.bundled_pack_version(CORE), "1.0.5")
+        self.assertEqual(publisher.bundled_pack_version(CORE), "1.0.6")
         actions = {yaml.safe_load(path.read_text())["ref"] for path in (CORE / "actions").glob("*.yaml")}
         self.assertEqual(actions, {"core.echo", "core.noop", "core.sleep", "core.http_request", "core.generate_ssh_key_pair", "core.run_agent_command", "core.download_packs", "core.register_packs", "core.get_pack_dependencies", "core.build_pack_envs", "core.install_packs"})
         sensor = yaml.safe_load((CORE / "sensors/timer_sensor.yaml").read_text())

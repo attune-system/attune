@@ -44,7 +44,7 @@ export const RESOURCE_ACTIONS: Record<string, string[]> = {
   workers: ["read", "manage"],
   dashboards: ["read", "create", "update", "delete"],
   retention: ["read", "update"],
-  identities: ["read", "create", "update", "delete"],
+  identities: ["read", "create", "update", "delete", "manage"],
   permissions: ["read", "manage"],
   audit_log: ["read"],
 } satisfies Record<RbacResource, string[]>;
@@ -76,8 +76,14 @@ export const COMPONENT_SCOPED_RESOURCES = new Set([
   "queue_items",
   "events",
   "inquiries",
+  "identities",
 ]);
-export const OWNER_SCOPED_RESOURCES = new Set(["packs", "keys", "artifacts"]);
+export const OWNER_SCOPED_RESOURCES = new Set([
+  "packs",
+  "keys",
+  "artifacts",
+  "identities",
+]);
 export const OWNER_TYPE_RESOURCES = new Set(["keys", "artifacts", "caches"]);
 // Owner-reference selectors narrow structural ownership; they never establish it.
 export const OWNER_REF_RESOURCES = new Set(["caches", "keys", "artifacts"]);
@@ -85,14 +91,17 @@ export const OWNER_REF_RESOURCES = new Set(["caches", "keys", "artifacts"]);
 // Cache namespaces are the "component" being scoped, so this resource gets
 // cache-specific copy instead of the generic "Component scoped" wording.
 export function componentScopeOptionLabel(resource: string): string {
+  if (resource === "identities") return "Identity scoped";
   return resource === "caches" ? "Namespace scoped" : "Component scoped";
 }
 
 export function componentScopeFieldLabel(resource: string): string {
+  if (resource === "identities") return "Identity logins";
   return resource === "caches" ? "Namespace refs" : "Component refs";
 }
 
 export function componentScopePlaceholder(resource: string): string {
+  if (resource === "identities") return "alice, deploy-bot";
   return resource === "caches"
     ? "users, locations"
     : "core.echo, slack.post_message";
