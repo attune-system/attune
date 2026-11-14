@@ -137,7 +137,12 @@ async fn notifier_targets_scope_unknown_and_revocation() -> Result<()> {
             created_by_execution: execution.id,
             prompt: "test".into(),
             response_schema: None,
-            response_options: vec![],
+            response_options: vec![attune_common::models::inquiry::InquiryResponseOption {
+                r#ref: "continue".into(),
+                label: "Continue".into(),
+                style: attune_common::models::inquiry::InquiryResponseOptionStyle::Default,
+                response: json!({}),
+            }],
             assigned_to: None,
             status: InquiryStatus::Pending,
             response: None,
