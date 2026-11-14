@@ -1656,6 +1656,7 @@ fn validate_grant_constraints(
                 | Resource::Caches
                 | Resource::Artifacts
                 | Resource::Dashboards
+                | Resource::Identities
         )
     {
         return Err(ApiError::BadRequest(format!(
@@ -1672,6 +1673,7 @@ fn validate_grant_constraints(
                 | Resource::Caches
                 | Resource::Artifacts
                 | Resource::Dashboards
+                | Resource::Identities
         )
     {
         return Err(ApiError::BadRequest(format!(
