@@ -140,6 +140,17 @@ async fn profile_editor_cannot_take_over_admin_or_change_authorization() {
         .unwrap()
         .unwrap();
     assert_ne!(after.password_hash, before.password_hash);
+    assert_eq!(
+        ctx.post(
+            "/api/v1/auth/login",
+            json!({"login":after.login,"password":"RecoveredPass123!"}),
+            None
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::OK
+    );
     let response = ctx
         .post(
             &format!("{path}/integration-tokens"),
@@ -151,6 +162,17 @@ async fn profile_editor_cannot_take_over_admin_or_change_authorization() {
     assert_eq!(response.status(), StatusCode::CREATED);
     let body: Value = response.json().await.unwrap();
     let token_id = body["data"]["integration_token"]["id"].as_i64().unwrap();
+    assert_eq!(
+        ctx.post(
+            "/api/v1/auth/token-login",
+            json!({"token":body["data"]["token"]}),
+            None
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::OK
+    );
     let token_path = format!("{path}/integration-tokens/{token_id}");
     assert_eq!(
         ctx.post(
@@ -288,5 +310,28 @@ async fn identity_scopes_use_actual_target_for_profile_and_administration() {
         .status(),
         StatusCode::FORBIDDEN
     );
+    ctx.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn identity_administration_scopes_are_authorable_via_api() {
+    let ctx = TestContext::new()
+        .await
+        .unwrap()
+        .with_admin_auth()
+        .await
+        .unwrap();
+    for (index, constraints) in [
+        json!({"owner":"self"}),
+        json!({"refs":[ctx.user.as_ref().unwrap().login]}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(ctx.post("/api/v1/permissions/sets",
+            json!({"ref":format!("test.identity{index}"),
+                "grants":[{"resource":"identities","actions":["read","update","manage"],"constraints":constraints}]}),
+            ctx.token()).await.unwrap().status(), StatusCode::CREATED);
+    }
     ctx.cleanup().await.unwrap();
 }
