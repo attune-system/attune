@@ -239,3 +239,72 @@ async fn frozen_deleted_and_pre_session_credentials_fail_closed() {
     );
     ctx.cleanup().await.unwrap();
 }
+
+#[tokio::test]
+async fn integration_refresh_retains_provenance_and_credential_revocation() {
+    use attune_common::repositories::{
+        integration_token::{CreateIntegrationTokenInput, IntegrationTokenRepository},
+        Create, Delete,
+    };
+    let ctx = TestContext::new().await.unwrap();
+    login(&ctx).await;
+    let identity = IdentityRepository::find_by_login(&ctx.pool, "session-user")
+        .await
+        .unwrap()
+        .unwrap();
+    let record = IntegrationTokenRepository::create(
+        &ctx.pool,
+        CreateIntegrationTokenInput {
+            identity: identity.id,
+            label: "machine".into(),
+            description: None,
+            token_hash: "unused-test-hash".into(),
+            token_prefix: "test".into(),
+            token_suffix: "test".into(),
+            created_by: Some(identity.id),
+            expires_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    let machine = attune_common::auth::jwt::generate_integration_refresh_token(
+        record.id,
+        identity.id,
+        &identity.login,
+        &ctx.state.jwt_config,
+    )
+    .unwrap();
+    let response = refresh(&ctx, &machine).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    let claims = attune_common::auth::jwt::validate_token(
+        body["data"]["access_token"].as_str().unwrap(),
+        &ctx.state.jwt_config,
+    )
+    .unwrap();
+    assert_eq!(
+        claims
+            .integration_access_provenance()
+            .unwrap()
+            .integration_token_id,
+        record.id
+    );
+    let response = ctx
+        .post(
+            "/auth/session/logout",
+            json!({"refresh_token":machine}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(refresh(&ctx, &machine).await.status(), StatusCode::OK);
+    IntegrationTokenRepository::delete(&ctx.pool, record.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        refresh(&ctx, &machine).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    ctx.cleanup().await.unwrap();
+}

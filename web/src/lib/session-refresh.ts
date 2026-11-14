@@ -25,11 +25,15 @@ export function refreshSession(): Promise<string> {
     window.dispatchEvent(new CustomEvent("auth:token-changed"));
     return tokens.access_token as string;
   };
-  inFlight = (
-    navigator.locks
-      ? navigator.locks.request("attune-interactive-refresh", rotate)
-      : rotate()
-  ).finally(() => {
+  const run = async (): Promise<string> => {
+    if (navigator.locks)
+      return await navigator.locks.request(
+        "attune-interactive-refresh",
+        rotate,
+      );
+    return await rotate();
+  };
+  inFlight = run().finally(() => {
     inFlight = undefined;
   });
   return inFlight;
