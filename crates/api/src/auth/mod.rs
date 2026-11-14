@@ -6,6 +6,7 @@ pub mod middleware;
 pub mod oidc;
 pub mod oidc_device;
 pub mod password;
+pub mod session;
 
 pub use jwt::{generate_token, validate_token, Claims};
 pub use middleware::{AuthMiddleware, RequireAuth};

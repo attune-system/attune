@@ -299,6 +299,7 @@ export default function MainLayout() {
     const saved = localStorage.getItem("sidebar-collapsed");
     return saved === "true";
   });
+  const [logoutError, setLogoutError] = useState<string | null>(null);
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [isNavScrolling, setIsNavScrolling] = useState(false);
   const [canNavScrollUp, setCanNavScrollUp] = useState(false);
@@ -395,8 +396,15 @@ export default function MainLayout() {
     });
   };
 
-  const handleLogout = () => {
-    logout();
+  const handleLogout = async () => {
+    setLogoutError(null);
+    try {
+      await logout();
+    } catch {
+      setLogoutError(
+        "Could not revoke your session. Check your connection and retry signing out.",
+      );
+    }
   };
 
   const revealNavScrollbar = () => {
@@ -413,6 +421,14 @@ export default function MainLayout() {
 
   return (
     <div className="h-full bg-gray-100 flex overflow-hidden">
+      {logoutError && (
+        <div
+          role="alert"
+          className="fixed top-4 right-4 z-50 rounded bg-red-100 p-4 text-red-900"
+        >
+          {logoutError}
+        </div>
+      )}
       {/* Sidebar */}
       <div
         className={`w-20 ${

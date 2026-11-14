@@ -14,12 +14,14 @@ import {
 } from "@/lib/api-wrapper";
 import { safeErrorSummary } from "@/lib/safe-error-summary";
 
+import { revokeBrowserSession } from "@/lib/session-refresh";
+
 interface AuthContextType {
   user: CurrentUserResponse | null;
   isAuthenticated: boolean;
   isLoading: boolean;
   login: (redirectTo?: string) => void;
-  logout: () => void;
+  logout: () => Promise<void>;
   refreshUser: () => Promise<void>;
   getToken: () => string | null;
   completeLogin: (params: {
@@ -84,12 +86,13 @@ export function AuthProvider({ children }: AuthProviderProps) {
     window.location.href = `/auth/oidc/login${redirectParam}`;
   };
 
-  const logout = () => {
+  const logout = async () => {
+    await revokeBrowserSession();
     localStorage.removeItem("access_token");
     localStorage.removeItem("refresh_token");
     stopTokenRefreshMonitor();
     setUser(null);
-    window.location.href = "/auth/logout";
+    window.location.href = `${import.meta.env.VITE_API_BASE_URL || ""}/auth/logout`;
   };
 
   const refreshUser = async () => {

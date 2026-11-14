@@ -251,6 +251,7 @@ Use docs for specifics instead of expanding this file:
 ## Authentication / Security Essentials
 
 - Access auth is JWT-based; integration tokens, OIDC, and LDAP are supported.
+- Preserve persisted interactive refresh rotation/replay and logout/password-change revocation, bounded access lifetime, and browser-bound login exchange; see [Interactive sessions](docs/permissions/interactive-sessions.md).
 - Follow the protected-route authentication requirement in [Critical Guardrails](#critical-guardrails-read-first).
 - Secrets encryption/decryption goes through shared `attune_common::crypto` helpers.
 - Never put raw secrets, token values, decrypted key material, or artifact content into audit-event details.

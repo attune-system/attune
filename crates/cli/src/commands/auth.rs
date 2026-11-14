@@ -739,6 +739,16 @@ async fn handle_token_login(
 
 async fn handle_logout(profile: &Option<String>, output_format: OutputFormat) -> Result<()> {
     let mut config = CliConfig::load_with_profile(profile.as_deref())?;
+    let tokens = config.tokens().context("Cannot unlock credentials; server session was not revoked and local credentials were retained")?;
+    if let Some(refresh) = &tokens.refresh_token {
+        let mut client = ApiClient::from_config(&config, &None)?;
+        let _: serde_json::Value = client
+            .post(
+                "/auth/session/logout",
+                &serde_json::json!({"refresh_token": refresh}),
+            )
+            .await?;
+    }
     config.clear_auth()?;
 
     match output_format {

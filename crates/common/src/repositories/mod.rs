@@ -72,6 +72,7 @@ pub mod inquiry;
 pub mod inquiry_callback_delivery;
 pub mod inquiry_schema;
 pub mod integration_token;
+pub mod interactive_session;
 pub mod interoperability_inspection;
 pub mod key;
 pub mod key_schema;
