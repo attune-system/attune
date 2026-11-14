@@ -28,10 +28,44 @@ pub async fn register(
     worker: i64,
     instance: Uuid,
 ) -> Result<Option<DeliveryContext>> {
+    register_for_launch(pool, execution, worker, instance, None).await
+}
+
+/// Retain the final live launch check after preparation's intervening awaits.
+/// The optional immutable mode selects a validator, never supplies authority.
+pub(crate) async fn register_for_launch(
+    pool: &PgPool,
+    execution: &Execution,
+    worker: i64,
+    instance: Uuid,
+    mode: Option<
+        attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority,
+    >,
+) -> Result<Option<DeliveryContext>> {
     let mut tx = pool.begin().await?;
-    if ExecutionAdmissionRepository::existing_authority(&mut tx, execution.id).await?
-        == attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Delegated
-    {
+    use attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority;
+    let current = match mode {
+        Some(ExistingExecutionAuthority::Delegated) => {
+            // Full validation reacquires current owner/grant/schema/source checks.
+            // Reusing only the mode avoids repeating mode-discovery reads.
+            let selection = attune_common::repositories::delegated_execution::DelegatedExecutionRepository::validate(
+                &mut tx, execution.id,
+            ).await?;
+            if !selection.explicit || selection.admission.is_some() {
+                return Err(Error::PermissionDenied(
+                    "Conflicting execution authority selection".into(),
+                ));
+            }
+            ExistingExecutionAuthority::Delegated
+        }
+        _ => ExecutionAdmissionRepository::existing_authority(&mut tx, execution.id).await?,
+    };
+    if mode.is_some_and(|expected| expected != current) {
+        return Err(Error::PermissionDenied(
+            "Execution authority mode changed".into(),
+        ));
+    }
+    if current == ExistingExecutionAuthority::Delegated {
         return Ok(None);
     }
     let execution = ExecutionRepository::find_by_id(&mut *tx, execution.id)

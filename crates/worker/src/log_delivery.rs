@@ -18,6 +18,7 @@ use std::{
 };
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tracing::Instrument;
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -459,7 +460,10 @@ impl SpoolingLogWriter {
         let manager = self.manager.clone();
         manager
             .tasks
-            .spawn(async move { self.seal_owned(truncated, manifest).await })
+            .spawn(
+                async move { self.seal_owned(truncated, manifest).await }
+                    .instrument(tracing::Span::current()),
+            )
             .await
             .map_err(|_| Error::execution("Log custody settlement task failed"))?
     }

@@ -999,11 +999,13 @@ impl ActionExecutor {
             execution.id
         );
 
-        let mut authority_connection = self.pool.acquire().await?;
+        // Retain locking reads in one owned transaction: autocommit FOR SHARE
+        // otherwise pays a durable transaction completion for each read.
+        let mut authority_connection = self.pool.begin().await?;
         let authority = attune_common::repositories::execution_runtime_admission::ExecutionAdmissionRepository::existing_authority(
             &mut authority_connection, execution.id,
         ).await?;
-        drop(authority_connection);
+        authority_connection.commit().await?;
         if authority == attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Recorded {
             self.recorded_readiness.require_ready()?;
         }
@@ -1106,8 +1108,8 @@ impl ActionExecutor {
             let recorded = attune_common::repositories::execution_runtime_admission::ExecutionAdmissionRepository::existing_authority(
                 &mut admission_tx, execution.id,
             ).await? == attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Recorded;
-            admission_tx.commit().await?;
             if recorded {
+                admission_tx.commit().await?;
                 let token = crate::recorded_credentials::mint_recorded_execution_token(
                     &self.pool,
                     execution,
@@ -1125,9 +1127,10 @@ impl ActionExecutor {
                 })?;
                 env.insert("ATTUNE_API_TOKEN".to_string(), token);
             } else {
-                attune_common::repositories::delegated_execution::DelegatedExecutionRepository::validate(&mut *self.pool.acquire().await?,execution.id).await?;
+                attune_common::repositories::delegated_execution::DelegatedExecutionRepository::validate(&mut admission_tx,execution.id).await?;
                 {
-                    let attempt = attune_common::repositories::delegated_execution::DelegatedExecutionRepository::current_attempt(&mut *self.pool.acquire().await?,execution.id).await?;
+                    let attempt = attune_common::repositories::delegated_execution::DelegatedExecutionRepository::current_attempt(&mut admission_tx,execution.id).await?;
+                    admission_tx.commit().await?;
                     let standard = self.standard_access_action_refs(execution).await;
                     let token = attune_common::auth::jwt::generate_delegated_execution_token(
                         resolve_execution_identity(persisted.executor, execution.id)?,
@@ -1149,13 +1152,12 @@ impl ActionExecutor {
 
         // Add rule and trigger context if execution was triggered by enforcement
         if let Some(enforcement_id) = execution.enforcement {
-            if let Ok(Some(enforcement)) = sqlx::query_as::<
-                _,
-                attune_common::models::event::Enforcement,
-            >("SELECT * FROM enforcement WHERE id = $1")
-            .bind(enforcement_id)
-            .fetch_optional(&self.pool)
-            .await
+            if let Ok(Some(enforcement)) =
+                attune_common::repositories::event::EnforcementRepository::find_by_id(
+                    &self.pool,
+                    enforcement_id,
+                )
+                .await
             {
                 env.insert("ATTUNE_RULE".to_string(), enforcement.rule_ref);
                 env.insert("ATTUNE_TRIGGER".to_string(), enforcement.trigger_ref);
@@ -1334,7 +1336,7 @@ impl ActionExecutor {
             None
         };
         let log_artifacts = self
-            .allocate_execution_log_artifacts(execution, action, preparation)
+            .allocate_execution_log_artifacts(execution, action, preparation, authority)
             .await?;
 
         let context = ExecutionContext {
@@ -1663,25 +1665,24 @@ impl ActionExecutor {
         execution: &Execution,
         action: &Action,
         preparation: &ExecutionPreparation,
+        authority: attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority,
     ) -> Result<ExecutionLogArtifacts> {
-        // Registration establishes the attempt's authority even for silent code.
+        // Revalidate live launch authority after runtime/worker lookup awaits,
+        // including silent tokenless actions. Mode reuse only selects a validator.
         // Per-stream metadata is deferred to the first nonempty write.
-        let delivery = crate::completion::register(
+        let delivery = crate::completion::register_for_launch(
             &self.pool,
             execution,
             self.worker_id.load(Ordering::Acquire),
             self.worker_instance,
+            Some(authority),
         )
         .await?;
-        let mut connection = self.pool.acquire().await?;
-        let protected_delegation =
-            attune_common::repositories::delegated_execution::DelegatedExecutionRepository::find(
-                &mut connection,
-                execution.id,
-            )
-            .await?
-            .explicit;
-        drop(connection);
+        // Mode is immutable metadata, not a grant. existing_authority checked
+        // the explicit selection above; allocation and custody still validate
+        // their live source/attempt independently at their effect boundaries.
+        let protected_delegation = authority
+            == attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Delegated;
         let policy = preparation.binding.output_policy;
         let protected_stdout = policy.stdout != attune_common::output_policy::StdoutPolicy::Public;
         let protected_stderr =
