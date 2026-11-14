@@ -42,6 +42,12 @@ pub(super) async fn allowed(
             let target = match notification.entity_type.as_str() {
                 "execution" => Some(RuntimeTarget::Execution(notification.entity_id)),
                 "artifact" => Some(RuntimeTarget::Artifact(notification.entity_id)),
+                "work_queue" => Some(RuntimeTarget::Component(
+                    attune_common::repositories::runtime_target::ComponentTarget::Queue,
+                    notification.entity_id,
+                )),
+                "work_queue_item" => Some(RuntimeTarget::QueueItem(notification.entity_id)),
+                "inquiry" => Some(RuntimeTarget::Inquiry(notification.entity_id)),
                 _ => None,
             };
             if let Some(target) = target {
