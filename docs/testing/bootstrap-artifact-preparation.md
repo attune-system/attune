@@ -111,7 +111,7 @@ The fixed sequence is one foreground BuildKit invocation at a time:
    client only inside the isolated build image using that exact API document and
    npm's lockfile. No primary SDK/web/generated files are modified.
 4. Package API, executor, notifier, supervisor, injected agent, native-inclusive
-   init-packs, migrations and web into eight local OCI tar archives. Source and
+   init-packs, migrations, web and the init-user bootstrap companion into nine local OCI tar archives. Source and
    fixed-time inputs are recorded. Init-packs uses an API-only offline-dependency
    entrypoint: no runtime pip, old flat-binary adoption or mutable projection copy.
 
@@ -197,3 +197,13 @@ No DB/provider volume is at risk while collecting these filesystem artifacts.
 Compilation, image imports and service lifecycle are intentionally separate
 permissions. The source release gates are compiled unchanged; no build receipt
 claims that admission is enabled or the full user SOW has passed.
+
+
+The init-user companion uses the measured PostgreSQL18 Alpine base plus argon2
+and the unchanged `docker/init-user.sh` used by the existing release image. Its
+receipt binds the script SHA256 and PostgreSQL base; the image carries psql/APK
+version and source receipts. Verify real psql/argon2, a nondefault dummy password
+hash and `docker/test-init-user.sh` before consuming it in chart bootstrap.
+This is an artifact capability check, not proof of live Helm seeding. The
+lifecycle acceptance runner still rejects SQL init-user as its operator credential
+fixture; no bootstrap/session/authority policy is bypassed.

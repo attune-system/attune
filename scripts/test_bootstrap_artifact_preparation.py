@@ -199,6 +199,20 @@ class Preparation(unittest.TestCase):
         self.assertNotIn("cp ", init)
         self.assertNotIn("BOOTSTRAP_ADMISSION_ENABLED", recipe)
 
+    def test_init_user_companion_keeps_service_inventory_and_existing_bootstrap_source(self):
+        self.assertEqual(artifacts.IMAGES[:4], ("api", "executor", "notifier", "supervisor"))
+        self.assertEqual(len(artifacts.IMAGES), 9)
+        self.assertIn("init-user", artifacts.IMAGES)
+        recipe = (ROOT / artifacts.DOCKERFILE).read_text()
+        self.assertIn("FROM ${POSTGRES_IMAGE} AS init-user", recipe)
+        self.assertIn("apk add --no-cache argon2", recipe)
+        self.assertIn("COPY docker/init-user.sh /init-user.sh", recipe)
+        published = (ROOT / "docker/Dockerfile.init-user-package").read_text()
+        self.assertIn("COPY docker/init-user.sh /init-user.sh", published)
+        self.assertIn("docker/init-user.sh", artifacts.REQUIRED)
+        lifecycle = (ROOT / "scripts/run-bootstrap-lifecycle-acceptance.py").read_text()
+        self.assertIn('require("init-user" not in selected', lifecycle)
+
     def test_acceptance_producer_assembles_native_actions_before_canonical_publication(self):
         recipe = (ROOT / artifacts.DOCKERFILE).read_text()
         build = recipe.index("--manifest-path crates/core-actions/Cargo.toml")

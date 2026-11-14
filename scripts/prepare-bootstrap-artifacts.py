@@ -14,7 +14,7 @@ import sys
 import tarfile
 
 BASES = ("toolchain", "node", "service", "python", "busybox", "postgres", "nginx")
-IMAGES = ("api", "executor", "notifier", "supervisor", "agent", "init-packs", "migrations", "web")
+IMAGES = ("api", "executor", "notifier", "supervisor", "agent", "init-packs", "migrations", "web", "init-user")
 DOCKERFILE = "docker/Dockerfile.acceptance-artifacts"
 REQUIRED = (DOCKERFILE, DOCKERFILE + ".dockerignore", "Cargo.lock", "crates/core-timer-sensor/Cargo.lock", "crates/common/examples/storage_probe_inspector.rs", "crates/common/examples/bootstrap_acceptance_archive.rs", "crates/common/examples/interoperability_acceptance_archive.rs", "web/package-lock.json", "scripts/bootstrap_core_pack.py", "docker/acceptance/init-packs.sh")
 NATIVE_MODULES = ("main.py", "controller.py", "journal.py", "native.py", "protocol.py", "http_input.py")
@@ -22,7 +22,7 @@ REQUIRED += ("crates/common/examples/interoperability_inspector.rs", "crates/com
 REQUIRED += ("crates/common/examples/legacy_native_writer.rs", "docker/acceptance/attune-native-legacy@.service", *["scripts/legacy_storage_controller/" + name for name in NATIVE_MODULES])
 REQUIRED += ("scripts/acceptance/native-controller-source-pins.json", "crates/common/examples/native_settlement_adapter.rs", "crates/common/examples/native_producer_acceptance_archive.rs", "crates/common/src/repositories/file_native_setup.rs", "crates/common/src/repositories/native_generation_origin.rs", "migrations/20261016006015_controlled_native_file_operations.sql", "scripts/legacy_storage_controller/producer-context.example.json", "scripts/legacy_storage_controller/config.example.json", *["scripts/legacy_storage_controller/producer_pack/" + name for name in ("pack.yaml", "actions/producer.yaml", "actions/producer.py")])
 REQUIRED += ("scripts/acceptance/native_controller_lifecycle.py", "scripts/acceptance/native_producer_fixture.py")
-REQUIRED += ("crates/core-actions/Cargo.toml", "crates/core-actions/Cargo.lock")
+REQUIRED += ("crates/core-actions/Cargo.toml", "crates/core-actions/Cargo.lock", "docker/init-user.sh")
 
 
 class InputError(RuntimeError):
@@ -91,7 +91,7 @@ def commands(args, manifest):
 
 
 def plan(args, manifest):
-    return {"mode": "EXECUTE" if args.execute else "DRY_RUN", "work_root": str(args.work_root), "build_jobs": 2, "build_invocations_concurrent": 1, "commands": commands(args, manifest), "creates": ["new private filesystem work root", "native binaries and measured canonical core archive", "eight measured OCI archives and build receipts"], "does_not_create": ["running application/database/provider containers", "Docker networks or volumes", "registry/release publication", "Kubernetes cluster/namespace", "admission gate changes"], "builder": "Explicit pre-existing central-owned BuildKit slot; never create/remove/prune it. Scheduler must bound its parallelism and drain cancelled builds.", "readiness": "Unchanged compiled gates. Artifact production is not admission, startup or lifecycle acceptance.", "next": "Import actual OCI bytes into an explicitly authorized owned registry, preserving or remeasuring manifest digests; use real repo@sha256 references in Compose/Helm acceptance. No image reference or core digest is invented by a plan."}
+    return {"mode": "EXECUTE" if args.execute else "DRY_RUN", "work_root": str(args.work_root), "build_jobs": 2, "build_invocations_concurrent": 1, "commands": commands(args, manifest), "creates": ["new private filesystem work root", "native binaries and measured canonical core archive", "nine measured OCI archives and build receipts"], "does_not_create": ["running application/database/provider containers", "Docker networks or volumes", "registry/release publication", "Kubernetes cluster/namespace", "admission gate changes"], "builder": "Explicit pre-existing central-owned BuildKit slot; never create/remove/prune it. Scheduler must bound its parallelism and drain cancelled builds.", "readiness": "Unchanged compiled gates. Artifact production is not admission, startup or lifecycle acceptance.", "next": "Import actual OCI bytes into an explicitly authorized owned registry, preserving or remeasuring manifest digests; use real repo@sha256 references in Compose/Helm acceptance. No image reference or core digest is invented by a plan."}
 
 
 def validate(args, manifest):
@@ -318,6 +318,8 @@ def execute(args, manifest):
                 receipt.update(native_receipt(args.work_root / "native"))
             elif name in IMAGES:
                 receipt["images"][name] = oci_receipt(args.work_root / (name + ".oci.tar"))
+                if name == "init-user":
+                    receipt["init_user_source"] = {"path": "docker/init-user.sh", "sha256": sha(args.work_root / "source/docker/init-user.sh"), "postgres_base": manifest["base_images"]["postgres"]}
             receipt["completed"].append(name)
         require(sha(manifest["source_archive"]) == manifest["source_sha256"], "Source archive changed during build; reject these artifacts")
         for base in receipt["local_base_receipts"].values():
