@@ -535,9 +535,11 @@ def create_webhook_trigger(
     trigger_ref = trigger.get("ref", f"{pack_ref}.{trigger_name}")
     trigger = client.enable_webhook(trigger_ref=trigger_ref)
 
-    # Ensure webhook_url is present for test convenience
-    if "webhook_url" not in trigger and "webhook_key" in trigger:
-        trigger["webhook_url"] = f"/api/v1/webhooks/{trigger['webhook_key']}"
+    # Retain the dedicated management response; ordinary GET metadata has no key.
+    key = trigger.get("webhook_key")
+    if not trigger.get("webhook_enabled") or not isinstance(key, str) or not key:
+        raise RuntimeError("Enabled webhook did not return a management credential")
+    trigger["webhook_url"] = f"/api/v1/webhooks/{key}"
     return trigger
 
 

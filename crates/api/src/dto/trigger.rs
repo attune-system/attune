@@ -260,11 +260,6 @@ pub struct TriggerResponse {
     #[schema(example = false)]
     pub webhook_enabled: bool,
 
-    /// Webhook key (only present if webhooks are enabled)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(example = "wh_k7j2n9p4m8q1r5w3x6z0a2b5c8d1e4f7g9h2")]
-    pub webhook_key: Option<String>,
-
     /// Whether this is an ad-hoc trigger (not from pack installation)
     #[schema(example = false)]
     pub is_adhoc: bool,
@@ -776,7 +771,6 @@ impl From<attune_common::models::trigger::Trigger> for TriggerResponse {
             out_schema: trigger.out_schema,
             event_config_schema: trigger.event_config_schema,
             webhook_enabled: trigger.webhook_enabled,
-            webhook_key: trigger.webhook_key,
             is_adhoc: trigger.is_adhoc,
             reference_visibility: trigger.reference_visibility,
             reference_allowed_pack_refs: trigger.reference_allowed_pack_refs,

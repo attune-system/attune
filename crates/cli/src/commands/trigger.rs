@@ -94,8 +94,6 @@ struct Trigger {
     #[serde(default)]
     webhook_enabled: Option<bool>,
     #[serde(default)]
-    webhook_key: Option<String>,
-    #[serde(default)]
     reference_visibility: Option<String>,
     #[serde(default)]
     reference_allowed_pack_refs: Vec<String>,
@@ -132,8 +130,6 @@ struct TriggerDetail {
     event_config_schema: Option<serde_json::Value>,
     #[serde(default)]
     webhook_enabled: Option<bool>,
-    #[serde(default)]
-    webhook_key: Option<String>,
     #[serde(default)]
     reference_visibility: Option<String>,
     #[serde(default)]
@@ -302,11 +298,6 @@ async fn handle_show(
                 ("Created", output::format_timestamp(&trigger.created)),
                 ("Updated", output::format_timestamp(&trigger.updated)),
             ]);
-
-            if let Some(webhook_key) = &trigger.webhook_key {
-                output::print_section("Webhook");
-                output::print_info(&format!("Key: {}", webhook_key));
-            }
 
             if let Some(param_schema) = &trigger.param_schema {
                 if !param_schema.is_null() {

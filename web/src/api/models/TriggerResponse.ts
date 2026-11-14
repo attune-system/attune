@@ -80,8 +80,4 @@ export type TriggerResponse = {
    * Whether webhooks are enabled for this trigger
    */
   webhook_enabled: boolean;
-  /**
-   * Webhook key (only present if webhooks are enabled)
-   */
-  webhook_key?: string | null;
 };

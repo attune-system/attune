@@ -323,6 +323,20 @@ super::schema_consumer::schema_consumer_repository!(
 );
 
 impl TriggerRepository {
+    /// Retain the exact credential source while authorizing explicit disclosure.
+    pub async fn find_by_ref_for_share(
+        conn: &mut PgConnection,
+        trigger_ref: &str,
+    ) -> Result<Option<Trigger>> {
+        Ok(sqlx::query_as::<_, Trigger>(&format!(
+            "SELECT {} FROM trigger WHERE ref = $1 AND retired_at IS NULL FOR SHARE",
+            TRIGGER_COLUMNS
+        ))
+        .bind(trigger_ref)
+        .fetch_optional(conn)
+        .await?)
+    }
+
     async fn create_row<'e, E>(executor: E, input: CreateTriggerInput) -> Result<Trigger>
     where
         E: Executor<'e, Database = Postgres> + 'e,

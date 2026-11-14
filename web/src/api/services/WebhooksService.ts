@@ -2,7 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
-import type { TriggerResponse } from "../models/TriggerResponse";
+import type { ApiResponse_WebhookManagementResponse } from "../models/ApiResponse_WebhookManagementResponse";
 import type { WebhookReceiverRequest } from "../models/WebhookReceiverRequest";
 import type { WebhookReceiverResponse } from "../models/WebhookReceiverResponse";
 import type { CancelablePromise } from "../core/CancelablePromise";
@@ -11,7 +11,7 @@ import { request as __request } from "../core/request";
 export class WebhooksService {
   /**
    * Disable webhooks for a trigger
-   * @returns TriggerResponse Webhooks disabled
+   * @returns ApiResponse_WebhookManagementResponse Webhooks disabled
    * @throws ApiError
    */
   public static disableWebhook({
@@ -21,7 +21,7 @@ export class WebhooksService {
      * Trigger reference (pack.name)
      */
     ref: string;
-  }): CancelablePromise<TriggerResponse> {
+  }): CancelablePromise<ApiResponse_WebhookManagementResponse> {
     return __request(OpenAPI, {
       method: "POST",
       url: "/api/v1/triggers/{ref}/webhooks/disable",
@@ -36,7 +36,7 @@ export class WebhooksService {
   }
   /**
    * Enable webhooks for a trigger
-   * @returns TriggerResponse Webhooks enabled
+   * @returns ApiResponse_WebhookManagementResponse Webhooks enabled
    * @throws ApiError
    */
   public static enableWebhook({
@@ -46,7 +46,7 @@ export class WebhooksService {
      * Trigger reference (pack.name)
      */
     ref: string;
-  }): CancelablePromise<TriggerResponse> {
+  }): CancelablePromise<ApiResponse_WebhookManagementResponse> {
     return __request(OpenAPI, {
       method: "POST",
       url: "/api/v1/triggers/{ref}/webhooks/enable",
@@ -61,7 +61,7 @@ export class WebhooksService {
   }
   /**
    * Regenerate webhook key for a trigger
-   * @returns TriggerResponse Webhook key regenerated
+   * @returns ApiResponse_WebhookManagementResponse Webhook key regenerated
    * @throws ApiError
    */
   public static regenerateWebhookKey({
@@ -71,7 +71,7 @@ export class WebhooksService {
      * Trigger reference (pack.name)
      */
     ref: string;
-  }): CancelablePromise<TriggerResponse> {
+  }): CancelablePromise<ApiResponse_WebhookManagementResponse> {
     return __request(OpenAPI, {
       method: "POST",
       url: "/api/v1/triggers/{ref}/webhooks/regenerate",
@@ -82,6 +82,27 @@ export class WebhooksService {
         400: `Webhooks not enabled for this trigger`,
         404: `Trigger not found`,
         500: `Internal server error`,
+      },
+    });
+  }
+  /**
+   * Explicitly reveal the webhook bearer credential to an authorized manager.
+   * @returns ApiResponse_WebhookManagementResponse
+   * @throws ApiError
+   */
+  public static revealWebhookKey({
+    ref,
+  }: {
+    /**
+     * Trigger reference
+     */
+    ref: string;
+  }): CancelablePromise<ApiResponse_WebhookManagementResponse> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/triggers/{ref}/webhooks/reveal",
+      path: {
+        ref: ref,
       },
     });
   }

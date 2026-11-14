@@ -168,6 +168,11 @@ async fn test_webhook_hmac_sha256_valid() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri(format!("/api/v1/webhooks/{}", webhook_info.webhook_key))
                 .header("content-type", "application/json")
@@ -218,6 +223,11 @@ async fn test_webhook_hmac_sha512_valid() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri(format!("/api/v1/webhooks/{}", webhook_info.webhook_key))
                 .header("content-type", "application/json")
@@ -267,6 +277,11 @@ async fn test_webhook_hmac_invalid_signature() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri(format!("/api/v1/webhooks/{}", webhook_info.webhook_key))
                 .header("content-type", "application/json")
@@ -315,6 +330,11 @@ async fn test_webhook_hmac_missing_signature() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri(format!("/api/v1/webhooks/{}", webhook_info.webhook_key))
                 .header("content-type", "application/json")
@@ -366,6 +386,11 @@ async fn test_webhook_hmac_wrong_secret() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri(format!("/api/v1/webhooks/{}", webhook_info.webhook_key))
                 .header("content-type", "application/json")
@@ -419,6 +444,11 @@ async fn test_webhook_rate_limit_enforced() {
         let response = app
             .oneshot(
                 Request::builder()
+                    .extension(axum::extract::ConnectInfo(
+                        "192.168.1.100:12345"
+                            .parse::<std::net::SocketAddr>()
+                            .unwrap(),
+                    ))
                     .method("POST")
                     .uri(format!("/api/v1/webhooks/{}", webhook_info.webhook_key))
                     .header("content-type", "application/json")
@@ -441,6 +471,11 @@ async fn test_webhook_rate_limit_enforced() {
     let response = app
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri(format!("/api/v1/webhooks/{}", webhook_info.webhook_key))
                 .header("content-type", "application/json")
@@ -481,6 +516,11 @@ async fn test_webhook_rate_limit_disabled() {
         let response = app
             .oneshot(
                 Request::builder()
+                    .extension(axum::extract::ConnectInfo(
+                        "192.168.1.100:12345"
+                            .parse::<std::net::SocketAddr>()
+                            .unwrap(),
+                    ))
                     .method("POST")
                     .uri(format!("/api/v1/webhooks/{}", webhook_info.webhook_key))
                     .header("content-type", "application/json")
@@ -534,10 +574,19 @@ async fn test_webhook_ip_whitelist_allowed() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri(format!("/api/v1/webhooks/{}", webhook_info.webhook_key))
                 .header("content-type", "application/json")
-                .header("x-forwarded-for", "192.168.1.100")
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .body(Body::from(serde_json::to_string(&webhook_payload).unwrap()))
                 .unwrap(),
         )
@@ -551,10 +600,17 @@ async fn test_webhook_ip_whitelist_allowed() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri(format!("/api/v1/webhooks/{}", webhook_info.webhook_key))
                 .header("content-type", "application/json")
-                .header("x-forwarded-for", "10.0.0.1")
+                .extension(axum::extract::ConnectInfo(
+                    "10.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap(),
+                ))
                 .body(Body::from(serde_json::to_string(&webhook_payload).unwrap()))
                 .unwrap(),
         )
@@ -599,10 +655,17 @@ async fn test_webhook_ip_whitelist_blocked() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri(format!("/api/v1/webhooks/{}", webhook_info.webhook_key))
                 .header("content-type", "application/json")
-                .header("x-forwarded-for", "8.8.8.8")
+                .extension(axum::extract::ConnectInfo(
+                    "8.8.8.8:12345".parse::<std::net::SocketAddr>().unwrap(),
+                ))
                 .body(Body::from(serde_json::to_string(&webhook_payload).unwrap()))
                 .unwrap(),
         )
@@ -655,6 +718,11 @@ async fn test_webhook_payload_size_limit_enforced() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri(format!("/api/v1/webhooks/{}", webhook_info.webhook_key))
                 .header("content-type", "application/json")
@@ -700,6 +768,11 @@ async fn test_webhook_payload_size_within_limit() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri(format!("/api/v1/webhooks/{}", webhook_info.webhook_key))
                 .header("content-type", "application/json")
@@ -742,10 +815,17 @@ async fn test_webhook_event_logging_success() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri(format!("/api/v1/webhooks/{}", webhook_info.webhook_key))
                 .header("content-type", "application/json")
-                .header("x-forwarded-for", "192.168.1.1")
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.1:12345".parse::<std::net::SocketAddr>().unwrap(),
+                ))
                 .header("user-agent", "TestAgent/1.0")
                 .body(Body::from(serde_json::to_string(&webhook_payload).unwrap()))
                 .unwrap(),
@@ -816,6 +896,11 @@ async fn test_webhook_event_logging_failure() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri(format!("/api/v1/webhooks/{}", webhook_info.webhook_key))
                 .header("content-type", "application/json")
@@ -891,11 +976,20 @@ async fn test_webhook_all_security_features_pass() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri(format!("/api/v1/webhooks/{}", webhook_info.webhook_key))
                 .header("content-type", "application/json")
                 .header("x-webhook-signature", signature)
-                .header("x-forwarded-for", "192.168.1.50")
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.50:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .header("user-agent", "TestClient/1.0")
                 .body(Body::from(payload_bytes))
                 .unwrap(),
@@ -959,10 +1053,17 @@ async fn test_webhook_multiple_security_failures() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri(format!("/api/v1/webhooks/{}", webhook_info.webhook_key))
                 .header("content-type", "application/json")
-                .header("x-forwarded-for", "8.8.8.8") // Wrong IP
+                .extension(axum::extract::ConnectInfo(
+                    "8.8.8.8:12345".parse::<std::net::SocketAddr>().unwrap(),
+                )) // Wrong IP
                 // Missing signature header
                 .body(Body::from(serde_json::to_string(&webhook_payload).unwrap()))
                 .unwrap(),
@@ -1001,6 +1102,11 @@ async fn test_webhook_malformed_json() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri(format!("/api/v1/webhooks/{}", webhook_info.webhook_key))
                 .header("content-type", "application/json")
@@ -1036,6 +1142,11 @@ async fn test_webhook_empty_payload() {
         .clone()
         .oneshot(
             Request::builder()
+                .extension(axum::extract::ConnectInfo(
+                    "192.168.1.100:12345"
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap(),
+                ))
                 .method("POST")
                 .uri(format!("/api/v1/webhooks/{}", webhook_info.webhook_key))
                 .header("content-type", "application/json")
@@ -1046,4 +1157,262 @@ async fn test_webhook_empty_payload() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn malformed_security_and_spoofed_sources_create_no_events() {
+    let ctx = setup_test_context().await;
+    let pack = create_test_pack(&ctx.pool, "failclosed").await;
+    let id = create_test_trigger(&ctx.pool, pack, "failclosed", "failclosed.trigger").await;
+    let info = TriggerRepository::enable_webhook(&ctx.pool, id)
+        .await
+        .unwrap();
+    for config in [
+        json!({"hmac": {"enabled": true}}),
+        json!({"hmac": {"enabled": true, "secret": "", "algorithm": "sha256"}}),
+        json!({"hmac": {"enabled": "true"}}),
+        json!({"ip_whitelist": {"enabled": true}}),
+        json!({"ip_whitelist": {"enabled": true, "ips": ["broken"]}}),
+        json!({"ip_whitelist": {"enabled": true, "ips": ["192.168.0.0/16"]}}),
+        json!({"rate_limit": {"enabled": true, "requests": 0, "window_seconds": 60}}),
+    ] {
+        TriggerRepository::update_webhook_config(&ctx.pool, id, config)
+            .await
+            .unwrap();
+        for forwarded in ["192.168.1.100", "192.168.1.100, 10.1.1.1", "broken"] {
+            let response = ctx
+                .app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/webhooks/{}", info.webhook_key))
+                        .extension(axum::extract::ConnectInfo(
+                            "203.0.113.1:1234".parse::<std::net::SocketAddr>().unwrap(),
+                        ))
+                        .header("x-forwarded-for", forwarded)
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"payload": {"message": "probe"}}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+    }
+    TriggerRepository::update_webhook_config(&ctx.pool, id, json!({}))
+        .await
+        .unwrap();
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/webhooks/{}", info.webhook_key))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"payload": {}}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let events =
+        attune_common::repositories::event::EventRepository::find_by_trigger(&ctx.pool, id).await;
+    assert!(events.unwrap().is_empty());
+    ctx.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn trusted_proxy_boundary_and_canonical_rate_limit() {
+    let ctx = setup_test_context()
+        .await
+        .with_webhook_trusted_proxies(vec!["10.0.0.0/8".into()])
+        .await
+        .unwrap();
+    let pack = create_test_pack(&ctx.pool, "proxy").await;
+    let id = create_test_trigger(&ctx.pool, pack, "proxy", "proxy.trigger").await;
+    let info = TriggerRepository::enable_webhook(&ctx.pool, id)
+        .await
+        .unwrap();
+    TriggerRepository::update_webhook_config(
+        &ctx.pool,
+        id,
+        json!({
+            "ip_whitelist": {"enabled": true, "ips": ["203.0.113.8"]},
+            "rate_limit": {"enabled": true, "requests": 1, "window_seconds": 60},
+            "hmac": {"enabled": true, "secret": "test-owned-secret", "algorithm": "sha256"}
+        }),
+    )
+    .await
+    .unwrap();
+    let body = r#"{"payload": {"message": "ok"}}"#;
+    let signature = generate_hmac_signature(body.as_bytes(), "test-owned-secret", "sha256");
+    for (forwarded, expected) in [
+        ("bad, 203.0.113.8", StatusCode::FORBIDDEN),
+        ("203.0.113.8, 198.51.100.2", StatusCode::FORBIDDEN),
+        ("198.51.100.1, 203.0.113.8, 10.0.0.2", StatusCode::OK),
+        ("198.51.100.9, 203.0.113.8", StatusCode::TOO_MANY_REQUESTS),
+    ] {
+        let response = ctx
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/webhooks/{}", info.webhook_key))
+                    .extension(axum::extract::ConnectInfo(
+                        "10.0.0.1:1234".parse::<std::net::SocketAddr>().unwrap(),
+                    ))
+                    .header("x-forwarded-for", forwarded)
+                    .header("x-webhook-signature", &signature)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{forwarded}");
+    }
+    let events =
+        attune_common::repositories::event::EventRepository::find_by_trigger(&ctx.pool, id)
+            .await
+            .unwrap();
+    let logged: Vec<String> =
+        sqlx::query_scalar("SELECT webhook_key FROM webhook_event_log WHERE trigger_id = $1")
+            .bind(id)
+            .fetch_all(&ctx.pool)
+            .await
+            .unwrap();
+    assert!(!logged.is_empty());
+    assert!(logged
+        .iter()
+        .all(|key| key.len() == 64 && key != &info.webhook_key));
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].config.as_ref().unwrap()["source_ip"],
+        "203.0.113.8"
+    );
+    ctx.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn dual_stack_whitelists_allow_both_families_in_any_order_and_reject_invalid_networks() {
+    use std::net::{IpAddr, SocketAddr};
+
+    let ctx = setup_test_context().await;
+    let pack = create_test_pack(&ctx.pool, "dual_stack").await;
+    let id = create_test_trigger(&ctx.pool, pack, "dual_stack", "dual_stack.trigger").await;
+    let info = TriggerRepository::enable_webhook(&ctx.pool, id)
+        .await
+        .unwrap();
+    let body = r#"{"payload": {"message": "dual-stack"}}"#;
+    let secret = "test-owned-dual-stack-secret";
+    let signature = generate_hmac_signature(body.as_bytes(), secret, "sha256");
+    let mut accepted = 0;
+
+    for networks in [
+        json!(["192.0.2.0/24", "2001:db8::/32"]),
+        json!(["2001:db8::/32", "192.0.2.0/24"]),
+    ] {
+        TriggerRepository::update_webhook_config(
+            &ctx.pool,
+            id,
+            json!({
+                "ip_whitelist": {"enabled": true, "ips": networks},
+                "hmac": {"enabled": true, "secret": secret, "algorithm": "sha256"}
+            }),
+        )
+        .await
+        .unwrap();
+        for (peer, expected) in [
+            ("192.0.2.7", StatusCode::OK),
+            ("2001:db8::7", StatusCode::OK),
+            ("198.51.100.7", StatusCode::FORBIDDEN),
+            ("2001:db9::7", StatusCode::FORBIDDEN),
+        ] {
+            let peer: IpAddr = peer.parse().unwrap();
+            let response = ctx
+                .app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/webhooks/{}", info.webhook_key))
+                        .extension(axum::extract::ConnectInfo(SocketAddr::new(peer, 1234)))
+                        // An untrusted sender cannot replace its real peer with either
+                        // whitelisted address, even while HMAC is independently valid.
+                        .header("x-forwarded-for", "192.0.2.7, 2001:db8::7")
+                        .header("x-webhook-signature", &signature)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "peer {peer}");
+            if expected == StatusCode::OK {
+                accepted += 1;
+            }
+            let events =
+                attune_common::repositories::event::EventRepository::find_by_trigger(&ctx.pool, id)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                events.len(),
+                accepted,
+                "denied peers must not create events"
+            );
+            if expected == StatusCode::OK {
+                assert!(events
+                    .iter()
+                    .any(|event| event.config.as_ref().unwrap()["source_ip"] == peer.to_string()));
+            }
+        }
+    }
+
+    // Invalid networks still reject the whole configuration, even after an
+    // otherwise matching entry and with a valid signature.
+    for (networks, peer) in [
+        (json!(["192.0.2.0/24", "2001:db8::/129"]), "192.0.2.7"),
+        (json!(["2001:db8::/32", "192.0.2.0/33"]), "2001:db8::7"),
+        (json!(["192.0.2.0/24", "not-a-network"]), "192.0.2.7"),
+    ] {
+        TriggerRepository::update_webhook_config(
+            &ctx.pool,
+            id,
+            json!({
+                "ip_whitelist": {"enabled": true, "ips": networks},
+                "hmac": {"enabled": true, "secret": secret, "algorithm": "sha256"}
+            }),
+        )
+        .await
+        .unwrap();
+        let response = ctx
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/webhooks/{}", info.webhook_key))
+                    .extension(axum::extract::ConnectInfo(SocketAddr::new(
+                        peer.parse().unwrap(),
+                        1234,
+                    )))
+                    .header("x-webhook-signature", &signature)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let events =
+            attune_common::repositories::event::EventRepository::find_by_trigger(&ctx.pool, id)
+                .await
+                .unwrap();
+        assert_eq!(events.len(), accepted);
+    }
+    assert_eq!(accepted, 4);
+    ctx.cleanup().await.unwrap();
 }

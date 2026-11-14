@@ -152,6 +152,24 @@ impl TestContext {
     }
 
     #[allow(dead_code)]
+    pub async fn with_webhook_trusted_proxies(mut self, proxies: Vec<String>) -> Result<Self> {
+        self.state
+            .reclamation_cancellation
+            .shutdown(tokio::time::Instant::now() + std::time::Duration::from_secs(10))
+            .await?;
+        let mut config = self.state.config.as_ref().clone();
+        config.server.webhook_trusted_proxies = proxies;
+        let state = Arc::new(attune_api::state::AppState::new_with_audit(
+            self.pool.clone(),
+            config,
+            self.audit_writer.as_ref().unwrap().emitter.clone(),
+        ));
+        self.app = attune_api::server::Server::new(state.clone()).router();
+        self.state = state;
+        Ok(self)
+    }
+
+    #[allow(dead_code)]
     pub async fn new_without_registry_encryption_key() -> Result<Self> {
         Self::new_with_options(
             CacheAdmissionConfig::default(),

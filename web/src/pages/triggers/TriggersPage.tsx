@@ -1,3 +1,4 @@
+import { WebhooksService } from "../../api/services/WebhooksService";
 import {
   Link,
   useParams,
@@ -350,14 +351,20 @@ function TriggerDetail({ triggerRef }: { triggerRef: string }) {
   };
 
   const copyWebhookUrl = async () => {
-    if (!trigger?.data?.webhook_key) return;
+    if (!trigger?.data?.webhook_enabled) return;
 
     const apiBaseUrl =
       import.meta.env.VITE_API_BASE_URL || window.location.origin;
-    const webhookUrl = `${apiBaseUrl}/webhooks/${trigger.data.webhook_key}`;
 
     try {
-      await navigator.clipboard.writeText(webhookUrl);
+      const response = await WebhooksService.revealWebhookKey({
+        ref: triggerRef,
+      });
+      const key = response.data?.webhook_key;
+      if (!key) return;
+      await navigator.clipboard.writeText(
+        `${apiBaseUrl}/api/v1/webhooks/${key}`,
+      );
       setCopiedWebhookUrl(true);
       setTimeout(() => setCopiedWebhookUrl(false), 2000);
     } catch (err) {
@@ -662,17 +669,10 @@ function TriggerDetail({ triggerRef }: { triggerRef: string }) {
         {/* Sidebar */}
         <div className="space-y-6">
           {/* Webhook URL (if enabled) */}
-          {trigger.data?.webhook_enabled && trigger.data?.webhook_key && (
+          {trigger.data?.webhook_enabled && (
             <div className="bg-white shadow rounded-lg p-6">
               <h2 className="text-lg font-semibold mb-4">Webhook URL</h2>
               <div className="space-y-3">
-                <div className="p-3 bg-gray-50 rounded border border-gray-200">
-                  <code className="text-xs break-all text-gray-700">
-                    {import.meta.env.VITE_API_BASE_URL ||
-                      window.location.origin}
-                    /webhooks/{trigger.data.webhook_key}
-                  </code>
-                </div>
                 <button
                   onClick={copyWebhookUrl}
                   className="w-full flex items-center justify-center gap-2 px-4 py-2 text-sm bg-blue-600 text-white rounded hover:bg-blue-700"
@@ -685,7 +685,7 @@ function TriggerDetail({ triggerRef }: { triggerRef: string }) {
                   ) : (
                     <>
                       <Copy className="h-4 w-4" />
-                      Copy URL
+                      Reveal and copy URL
                     </>
                   )}
                 </button>

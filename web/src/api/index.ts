@@ -65,6 +65,7 @@ export type { ApiResponse_Vec_PackReleaseResponse } from "./models/ApiResponse_V
 export type { ApiResponse_Vec_RetiredPackComponentResponse } from "./models/ApiResponse_Vec_RetiredPackComponentResponse";
 export type { ApiResponse_Vec_WorkflowCacheIterationResponse } from "./models/ApiResponse_Vec_WorkflowCacheIterationResponse";
 export type { ApiResponse_Vec_WorkflowTaskWaitResponse } from "./models/ApiResponse_Vec_WorkflowTaskWaitResponse";
+export type { ApiResponse_WebhookManagementResponse } from "./models/ApiResponse_WebhookManagementResponse";
 export type { ApiResponse_WebhookReceiverResponse } from "./models/ApiResponse_WebhookReceiverResponse";
 export type { ApiResponse_WorkflowResponse } from "./models/ApiResponse_WorkflowResponse";
 export type { ApiResponse_WorkQueueItemResponse } from "./models/ApiResponse_WorkQueueItemResponse";
@@ -439,6 +440,7 @@ export type { UploadCacheChunkRequest } from "./models/UploadCacheChunkRequest";
 export type { UserInfo } from "./models/UserInfo";
 export type { ValidationResults } from "./models/ValidationResults";
 export type { Value } from "./models/Value";
+export type { WebhookManagementResponse } from "./models/WebhookManagementResponse";
 export type { WebhookReceiverRequest } from "./models/WebhookReceiverRequest";
 export type { WebhookReceiverResponse } from "./models/WebhookReceiverResponse";
 export type { WorkerAffinity } from "./models/WorkerAffinity";
