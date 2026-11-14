@@ -77,7 +77,10 @@ Declarations must be arrays of unique portable names (`[A-Za-z_][A-Za-z0-9_]*`),
 without wildcards, nulls or case-insensitive duplicates. Interpreter, linker,
 shell startup, search path, home/configuration discovery, locale, temporary-directory
 and Attune controls are forbidden even when listed. Examples include `BASH_ENV`,
-`PYTHONPATH`, `NODE_OPTIONS`, `LD_PRELOAD`, `PATH`, `HOME`, and `ATTUNE_API_TOKEN`.
+`PYTHONPATH`, `LUA_INIT`, `LUA_PATH`, `LUA_CPATH`, `NODE_OPTIONS`, `LD_PRELOAD`,
+`PATH`, `HOME`, and `ATTUNE_API_TOKEN`. The `LUA_` family includes versioned
+startup/module-path controls such as `LUA_INIT_5_4`; Lua can execute startup
+code before the fixed script ([Lua standalone contract](https://www.lua.org/manual/5.4/manual.html#7)).
 Operator `env_vars` and passthrough settings remain separate trusted configuration.
 Declare only names whose values the fixed action treats as data.
 

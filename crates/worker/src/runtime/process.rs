@@ -1591,6 +1591,103 @@ mod tests {
         assert_eq!(result.stdout, "debug|eu-west-1|42");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn caller_lua_startup_and_module_paths_cannot_replace_fixed_action() {
+        let root = TempDir::new().unwrap();
+        let startup_marker = root.path().join("caller-startup");
+        let fixed_marker = root.path().join("fixed-action");
+        let script = root.path().join("fixed.lua");
+        std::fs::write(
+            &script,
+            format!(
+                "local f = assert(io.open({:?}, 'w')); f:close(); io.write(os.getenv('APP_REGION') or 'missing')",
+                fixed_marker.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let startup = format!(
+            "local f = assert(io.open({:?}, 'w')); f:close(); os.exit(0)",
+            startup_marker.to_str().unwrap()
+        );
+        let binary = "/usr/bin/lua5.4";
+        let baseline = attune_common::child_process_environment::ChildProcessEnvironment::default();
+        if Path::new(binary).exists() {
+            // Positive exploit control: each real startup name can replace the
+            // fixed action if it reaches an interpreter without policy checks.
+            for name in ["LUA_INIT", "LUA_INIT_5_4"] {
+                let mut command = Command::new(binary);
+                command.arg(&script);
+                parameter_passing::apply_runtime_environment(
+                    &mut command,
+                    &HashMap::from([(name.into(), startup.clone())]),
+                    &baseline,
+                );
+                let output = command.output().await.unwrap();
+                assert!(output.status.success(), "{name}: {:?}", output.stderr);
+                assert!(startup_marker.exists(), "{name}");
+                assert!(!fixed_marker.exists(), "{name}");
+                std::fs::remove_file(&startup_marker).unwrap();
+            }
+        } else {
+            eprintln!("Lua startup control/positive subprocess unavailable: {binary} is not installed; pre-spawn rejection assertions still run");
+        }
+
+        let mut config = make_shell_config();
+        config.interpreter.binary = if Path::new(binary).exists() {
+            binary.into()
+        } else {
+            "/bin/sh".into()
+        };
+        config.interpreter.file_extension = Some(".lua".into());
+        config.inline_execution.extension = Some(".lua".into());
+        config.inline_execution.inject_shell_helpers = false;
+        let runtime = ProcessRuntime::new(
+            "lua".into(),
+            config,
+            root.path().into(),
+            root.path().join("envs"),
+        );
+        for name in [
+            "LUA_INIT",
+            "LUA_INIT_5_4",
+            "LUA_PATH",
+            "LUA_PATH_5_4",
+            "LUA_CPATH",
+            "LUA_CPATH_5_4",
+        ] {
+            let mut context = ExecutionContext::test_context("test.lua".into(), None);
+            context.code_path = Some(script.clone());
+            context.working_dir = Some(root.path().into());
+            context.execution_env.insert(name.into(), startup.clone());
+            let error = runtime.execute(context).await.unwrap_err();
+            assert!(matches!(error, RuntimeError::InvalidAction(_)), "{name}");
+            assert!(error.to_string().contains(name));
+            assert!(!error.to_string().contains(&startup));
+            assert!(!startup_marker.exists(), "{name}");
+            assert!(!fixed_marker.exists(), "{name}");
+        }
+
+        if Path::new(binary).exists() {
+            let mut context = ExecutionContext::test_context("test.lua".into(), None);
+            context.code_path = Some(script);
+            context.working_dir = Some(root.path().into());
+            context
+                .execution_env
+                .insert("APP_REGION".into(), "west".into());
+            attune_common::execution_env::validate_caller_environment(
+                &serde_json::json!({"permitted_caller_env":["APP_REGION"]}),
+                &serde_json::to_value(&context.execution_env).unwrap(),
+            )
+            .unwrap();
+            let result = runtime.execute(context).await.unwrap();
+            assert_eq!(result.exit_code, 0);
+            assert_eq!(result.stdout, "west");
+            assert!(fixed_marker.exists());
+            assert!(!startup_marker.exists());
+        }
+    }
+
     fn make_python_config() -> RuntimeExecutionConfig {
         RuntimeExecutionConfig {
             interpreter: InterpreterConfig {

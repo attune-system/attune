@@ -40,7 +40,7 @@ pub fn validate_caller_env_name(name: &str) -> crate::Result<()> {
     let forbidden = [
         "ATTUNE_", "LD_", "DYLD_", "PYTHON", "NODE_", "BASH", "PERL", "RUBY", "GEM_", "BUNDLE_",
         "JAVA_", "JDK_", "JRE_", "DOTNET_", "COMPLUS_", "GCONV_", "LC_", "LDR_", "_RLD_",
-        "MALLOC_", "R_", "CGO_",
+        "MALLOC_", "R_", "CGO_", "LUA_",
     ]
     .iter()
     .any(|prefix| upper.starts_with(prefix))
@@ -364,15 +364,19 @@ mod tests {
             "APP_REGION",
             "[APP_REGION, APP_REGION]",
             "[BASH_ENV]",
+            "[LUA_INIT]",
+            "[LUA_INIT_5_4]",
         ] {
             std::fs::write(&runtime, format!("ref: demo.app\nname: App\nexecution_config:\n  permitted_caller_env: {declaration}\n")).unwrap();
             assert!(crate::pack_check::validate_pack_environment(root.path()).is_err());
         }
-        std::fs::write(&runtime, "ref: demo.app\nname: App\nexecution_config:\n  permitted_caller_env: [APP_REGION]\nversions:\n  - version: '1.0.0'\n    execution_config:\n      permitted_caller_env: [NODE_OPTIONS]\n").unwrap();
-        let error = crate::pack_check::validate_pack_environment(root.path())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("versions[0].execution_config"));
+        for name in ["NODE_OPTIONS", "LUA_INIT_5_4", "LUA_PATH", "LUA_CPATH"] {
+            std::fs::write(&runtime, format!("ref: demo.app\nname: App\nexecution_config:\n  permitted_caller_env: [APP_REGION]\nversions:\n  - version: '1.0.0'\n    execution_config:\n      permitted_caller_env: [{name}]\n")).unwrap();
+            let error = crate::pack_check::validate_pack_environment(root.path())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("versions[0].execution_config"));
+        }
         std::fs::write(&runtime, "ref: demo.app\nname: App\nexecution_config:\n  permitted_caller_env: [APP_REGION]\n  env_vars:\n    PYTHONPATH: operator/lib\nversions:\n  - version: '1.0.0'\n    execution_config:\n      permitted_caller_env: [APP_REGION]\n").unwrap();
         assert!(crate::pack_check::validate_pack_environment(root.path()).is_ok());
     }
@@ -396,6 +400,14 @@ mod tests {
             "ENV",
             "PYTHONPATH",
             "PYTHONSTARTUP",
+            "LUA_INIT",
+            "LUA_INIT_5_1",
+            "LUA_INIT_5_4",
+            "LUA_PATH",
+            "LUA_PATH_5_4",
+            "LUA_CPATH",
+            "LUA_CPATH_5_4",
+            "lua_init",
             "GOFLAGS",
             "GOCACHEPROG",
             "R_PROFILE_USER",
@@ -458,6 +470,14 @@ mod tests {
         .to_string();
         assert!(error.contains("GOCACHEPROG"));
         assert!(!error.contains("owned-helper-value-not-for-diagnostics"));
+        let error = validate_caller_environment(
+            &serde_json::json!({"permitted_caller_env":["LUA_INIT_5_4"]}),
+            &serde_json::json!({"LUA_INIT_5_4":"owned-lua-startup-not-for-diagnostics"}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("LUA_INIT_5_4"));
+        assert!(!error.contains("owned-lua-startup-not-for-diagnostics"));
         let vars = serde_json::json!({"APP_REGION":"west", "EMPTY":""});
         assert!(validate_caller_environment(&serde_json::json!({}), &vars).is_err());
         assert!(validate_caller_environment(
@@ -466,7 +486,7 @@ mod tests {
         )
         .is_ok());
         assert!(validate_runtime_environment(
-            &serde_json::json!({"env_vars":{"PYTHONPATH":"operator/lib", "PATH":"operator/bin"}})
+            &serde_json::json!({"env_vars":{"PYTHONPATH":"operator/lib", "PATH":"operator/bin", "LUA_INIT":"operator startup"}})
         )
         .is_ok());
         assert!(!component_environment_errors("runtimes", &serde_json::json!({"versions":[{"execution_config":{"permitted_caller_env":["PATH"]}}]})).is_empty());

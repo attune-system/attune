@@ -839,6 +839,10 @@ async fn execution_tokens_are_limited_to_embedded_permission_sets() -> TResult<(
     for name in [
         "BASH_ENV",
         "PYTHONPATH",
+        "LUA_INIT",
+        "LUA_INIT_5_4",
+        "LUA_PATH",
+        "LUA_CPATH",
         "NODE_OPTIONS",
         "LD_PRELOAD",
         "PATH",
