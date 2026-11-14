@@ -17,17 +17,15 @@ beforeEach(() => {
   window.history.replaceState(null, "", "/login/callback#code=one-use");
 });
 it("redeems once in StrictMode, removes code and completes login with server redirect", async () => {
-  const fetch = vi
-    .fn()
-    .mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        data: {
-          tokens: { access_token: "access", refresh_token: "refresh" },
-          redirect_to: "/executions",
-        },
-      }),
-    });
+  const fetch = vi.fn().mockResolvedValue({
+    ok: true,
+    json: async () => ({
+      data: {
+        tokens: { access_token: "access", refresh_token: "refresh" },
+        redirect_to: "/executions",
+      },
+    }),
+  });
   vi.stubGlobal("fetch", fetch);
   render(
     <StrictMode>
