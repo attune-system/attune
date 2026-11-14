@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import ssl
+import socket
 import subprocess
 import tempfile
 import threading
@@ -32,7 +33,7 @@ class NativeHttpTests(unittest.TestCase):
             server.server_close()
             self.assertFalse(thread.is_alive())
 
-    def server(self, *, tls=False, redirect=None, delay=0):
+    def server(self, *, tls=False, dual_tls=False, redirect=None, delay=0, body_delay=0, payload=None):
         received = self.requests
 
         class Handler(BaseHTTPRequestHandler):
@@ -46,19 +47,23 @@ class NativeHttpTests(unittest.TestCase):
                 received.append(record)
                 if delay:
                     time.sleep(delay)
-                if redirect:
-                    status, target = redirect
+                destination = redirect(record) if callable(redirect) else redirect
+                if destination:
+                    status, target = destination
                     self.send_response(status)
                     self.send_header("Location", target)
                     self.end_headers()
                     return
-                data = json.dumps(record, ensure_ascii=False).encode()
+                data = payload if payload is not None else json.dumps(record, ensure_ascii=False).encode()
                 self.send_response(418 if self.path == "/failure" else 200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("X-Quote", 'a "quote"')
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 try:
+                    if body_delay:
+                        self.wfile.flush()
+                        time.sleep(body_delay)
                     if self.command != "HEAD":
                         self.wfile.write(data)
                 except (BrokenPipeError, ConnectionResetError):
@@ -66,7 +71,18 @@ class NativeHttpTests(unittest.TestCase):
 
             do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = do_GET
 
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        context = None
+
+        class Server(ThreadingHTTPServer):
+            def get_request(self):
+                stream, address = super().get_request()
+                if dual_tls:
+                    stream.settimeout(5)
+                    if stream.recv(1, socket.MSG_PEEK) == b"\x16":
+                        stream = context.wrap_socket(stream, server_side=True)
+                return stream, address
+
+        server = Server(("127.0.0.1", 0), Handler)
         server.daemon_threads = False
         if tls:
             root = Path(self.owned.name)
@@ -77,7 +93,8 @@ class NativeHttpTests(unittest.TestCase):
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=15)
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.load_cert_chain(root / "cert.pem", root / "key.pem")
-            server.socket = context.wrap_socket(server.socket, server_side=True)
+            if not dual_tls:
+                server.socket = context.wrap_socket(server.socket, server_side=True)
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
         thread.start()
         self.servers.append((server, thread))
@@ -167,6 +184,61 @@ class NativeHttpTests(unittest.TestCase):
         downgrade = self.server(tls=True, redirect=(307, plain))
         output = self.invoke({"url": downgrade, "verify_ssl": False, "auth_type": "bearer", "auth_token": "private"})
         self.assertNotIn("authorization", output["json"]["headers"])
+
+    def test_redirect_origin_credentials_and_later_hop_validation(self):
+        credentials = {"Authorization": "Bearer private", "Cookie": "session=private",
+                       "Proxy-Authorization": "Basic private"}
+        # Relative redirects retain all three headers on the same origin.
+        same = self.server(redirect=lambda r: (307, "/final") if r["path"] == "/start" else None)
+        output = self.invoke({"url": same + "/start", "headers": credentials})
+        for name, value in credentials.items():
+            self.assertEqual(output["json"]["headers"][name.lower()], value)
+        # Same port/scheme, hostname only changes (both addresses are loopback).
+        host = self.server(redirect=lambda r: (307, "http://localhost:" + host.rsplit(":", 1)[1] + "/final") if r["path"] == "/start" else None)
+        output = self.invoke({"url": host + "/start", "headers": credentials})
+        for name in credentials:
+            self.assertNotIn(name.lower(), output["json"]["headers"])
+        # Same host AND port, scheme alone changes. The owned server accepts TLS
+        # and plaintext on its one ephemeral listener, so no port change masks it.
+        scheme = self.server(tls=True, dual_tls=True, redirect=lambda r: (307, scheme.replace("https:", "http:") + "/final") if r["path"] == "/start" else None)
+        output = self.invoke({"url": scheme + "/start", "verify_ssl": False, "headers": credentials})
+        for name in credentials:
+            self.assertNotIn(name.lower(), output["json"]["headers"])
+        for unsafe in ("file:///etc/passwd", "http://user:private@127.0.0.1/"):
+            later = self.server(redirect=(307, unsafe))
+            first = self.server(redirect=(307, later))
+            output = self.invoke({"url": first}, success=False)
+            self.assertEqual(output["status_code"], 0)
+            self.assertNotIn("private", output["error"])
+
+    def test_response_size_types_and_complete_request_deadline(self):
+        for data, expected in ((b'[1,"two"]', [1, "two"]), (b'42', None), (b'plain', None)):
+            output = self.invoke({"url": self.server(payload=data)})
+            self.assertEqual(output["json"], expected)
+            self.assertEqual(output["body"], data.decode())
+        limit = 16 * 1024 * 1024
+        self.assertEqual(len(self.invoke({"url": self.server(payload=b"x" * limit)})["body"]), limit)
+        output = self.invoke({"url": self.server(payload=b"x" * (limit + 1))}, success=False)
+        self.assertIn("16 MiB", output["error"])
+        slow = self.server(body_delay=2)
+        started = time.monotonic()
+        self.invoke({"url": slow, "timeout": 1}, success=False)
+        self.assertLess(time.monotonic() - started, 2)
+        later = self.server(delay=0.7)
+        first = self.server(delay=0.7, redirect=(307, later))
+        started = time.monotonic()
+        self.invoke({"url": first, "timeout": 1}, success=False)
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_malformed_and_physical_line_stdin_rejected(self):
+        base = self.server()
+        for raw in (b'url="' + base.encode() + b'"\nmethod=POST\n', b'{"url":', b'[]', b'{"url":"' + base.encode() + b'"}\n{"method":"POST"}'):
+            result = subprocess.run([str(self.binary)], input=raw,
+                                    env={"PATH": "/no-tools-or-interpreters"}, capture_output=True, timeout=8)
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stderr, b"")
+            self.assertFalse(json.loads(result.stdout)["success"])
+        self.assertEqual(self.requests, [])
 
     def test_timeout_is_bounded(self):
         base = self.server(delay=2)

@@ -22,6 +22,7 @@ REQUIRED += ("crates/common/examples/interoperability_inspector.rs", "crates/com
 REQUIRED += ("crates/common/examples/legacy_native_writer.rs", "docker/acceptance/attune-native-legacy@.service", *["scripts/legacy_storage_controller/" + name for name in NATIVE_MODULES])
 REQUIRED += ("scripts/acceptance/native-controller-source-pins.json", "crates/common/examples/native_settlement_adapter.rs", "crates/common/examples/native_producer_acceptance_archive.rs", "crates/common/src/repositories/file_native_setup.rs", "crates/common/src/repositories/native_generation_origin.rs", "migrations/20261016006015_controlled_native_file_operations.sql", "scripts/legacy_storage_controller/producer-context.example.json", "scripts/legacy_storage_controller/config.example.json", *["scripts/legacy_storage_controller/producer_pack/" + name for name in ("pack.yaml", "actions/producer.yaml", "actions/producer.py")])
 REQUIRED += ("scripts/acceptance/native_controller_lifecycle.py", "scripts/acceptance/native_producer_fixture.py")
+REQUIRED += ("crates/core-actions/Cargo.toml", "crates/core-actions/Cargo.lock")
 
 
 class InputError(RuntimeError):

@@ -43,6 +43,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Expected actual core source".into());
     }
     let version = metadata["version"].as_str().ok_or("Missing core version")?;
+    // Validate the actual exported action variants before freezing their bytes;
+    // a source-only pack is not a complete acceptance artifact.
+    let report = attune_common::pack_check::check_pack(&source);
+    if !report.valid {
+        return Err(format!("Core acceptance payload failed pack-check: {report:?}").into());
+    }
     // This is the SAME publisher/normalizer as API admission, not the Python
     // upload tarball or an OCI manifest digest.
     let published = PackStorage::new(output).publish_release(&source, "core", version)?;

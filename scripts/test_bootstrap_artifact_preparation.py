@@ -123,7 +123,7 @@ class Preparation(unittest.TestCase):
         recipe = (ROOT / artifacts.DOCKERFILE).read_text()
         self.assertIn("CARGO_BUILD_JOBS=2", recipe)
         self.assertEqual(recipe.count("cargo build --locked --release -j 2"), 2)
-        self.assertEqual(recipe.count("cargo zigbuild --locked --release -j 2"), 2)
+        self.assertEqual(recipe.count("cargo zigbuild --locked --release -j 2"), 3)
         self.assertIn("amd64:x86_64-unknown-linux-musl arm64:aarch64-unknown-linux-musl", recipe)
         self.assertIn("bootstrap_acceptance_archive /out/core /out/canonical-store", recipe)
         self.assertNotIn("fn main(){}", recipe)
@@ -132,6 +132,18 @@ class Preparation(unittest.TestCase):
         self.assertIn("exec python3 /scripts/bootstrap_core_pack.py publish", init)
         self.assertNotIn("cp ", init)
         self.assertNotIn("BOOTSTRAP_ADMISSION_ENABLED", recipe)
+
+    def test_acceptance_producer_assembles_native_actions_before_canonical_publication(self):
+        recipe = (ROOT / artifacts.DOCKERFILE).read_text()
+        build = recipe.index("--manifest-path crates/core-actions/Cargo.toml")
+        copy = recipe.index('"/out/core/actions/bin/$action/linux-$arch"')
+        publish = recipe.index("bootstrap_acceptance_archive /out/core /out/canonical-store")
+        self.assertLess(build, copy)
+        self.assertLess(copy, publish)
+        self.assertIn("for action in echo sleep noop http_request; do", recipe)
+        self.assertIn("crates/core-actions/Cargo.lock", artifacts.REQUIRED)
+        helper = (ROOT / "crates/common/examples/bootstrap_acceptance_archive.rs").read_text()
+        self.assertLess(helper.index("check_pack(&source)"), helper.index(".publish_release("))
 
 
 if __name__ == "__main__":
