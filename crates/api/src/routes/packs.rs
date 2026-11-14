@@ -4944,9 +4944,32 @@ fn concrete_source_metadata(
 )]
 pub async fn sync_pack_workflows(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(pack_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    let pack = PackRepository::find_by_ref(&state.db, &pack_ref)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", pack_ref)))?;
+    let mut tx = state.db.begin().await?;
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx).await?;
+    PackRepository::acquire_mutation_lock(&mut tx, &pack_ref).await?;
+    let current = PackRepository::find_by_ref_locked(&mut tx, &pack_ref)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Pack is unavailable".into()))?;
+    if current.id != pack.id {
+        return Err(ApiError::Conflict(
+            "Pack changed during sync authorization".into(),
+        ));
+    }
+    super::lifecycle_authorization::existing(
+        &state,
+        &mut tx,
+        &user,
+        attune_common::repositories::runtime_target::RuntimeTarget::Pack(pack.id),
+        Action::Install,
+    )
+    .await?;
+
     // Get packs base directory from config
     let packs_base_dir = PathBuf::from(&state.config.packs_base_dir);
 
@@ -4961,7 +4984,10 @@ pub async fn sync_pack_workflows(
     let service = PackWorkflowService::new(state.db.clone(), service_config);
 
     // Sync workflows
-    let result = service.sync_pack_workflows(&pack_ref).await?;
+    let result = service
+        .sync_pack_workflows_in_transaction(&mut tx, &pack_ref)
+        .await?;
+    tx.commit().await?;
 
     // Convert to response DTO
     let response = PackWorkflowSyncResponse {
@@ -5007,9 +5033,22 @@ pub async fn sync_pack_workflows(
 )]
 pub async fn validate_pack_workflows(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(pack_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    let pack = PackRepository::find_by_ref(&state.db, &pack_ref)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", pack_ref)))?;
+    let mut tx = state.db.begin().await?;
+    super::lifecycle_authorization::existing(
+        &state,
+        &mut tx,
+        &user,
+        attune_common::repositories::runtime_target::RuntimeTarget::Pack(pack.id),
+        Action::Read,
+    )
+    .await?;
+
     // Get packs base directory from config
     let packs_base_dir = PathBuf::from(&state.config.packs_base_dir);
 
@@ -5025,6 +5064,7 @@ pub async fn validate_pack_workflows(
 
     // Validate workflows
     let result = service.validate_pack_workflows(&pack_ref).await?;
+    tx.commit().await?;
 
     // Convert to response DTO
     let response = PackWorkflowValidationResponse {
@@ -5492,9 +5532,10 @@ pub async fn download_packs(
 )]
 pub async fn get_pack_dependencies(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Json(request): Json<GetPackDependenciesRequest>,
 ) -> ApiResult<Json<ApiResponse<GetPackDependenciesResponse>>> {
+    authorize_global_pack_registry_action(&state, &user, Action::Read).await?;
     use attune_common::repositories::List;
 
     let mut dependencies = Vec::new();
@@ -5640,10 +5681,11 @@ pub async fn get_pack_dependencies(
     security(("bearer_auth" = []))
 )]
 pub async fn build_pack_envs(
-    State(_state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
     super::pack_request::PackJson(request): super::pack_request::PackJson<BuildPackEnvsRequest>,
 ) -> ApiResult<Json<ApiResponse<BuildPackEnvsResponse>>> {
+    authorize_global_pack_registry_action(&state, &user, Action::Install).await?;
     use std::path::Path;
     use std::process::Command;
 

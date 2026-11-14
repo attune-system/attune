@@ -82,10 +82,24 @@ impl PackWorkflowService {
     /// This loads all workflow YAML files from the pack's workflows directory
     /// and registers them in the database.
     pub async fn sync_pack_workflows(&self, pack_ref: &str) -> Result<PackSyncResult> {
+        let mut tx = self.pool.begin().await?;
+        let result = self
+            .sync_pack_workflows_in_transaction(&mut tx, pack_ref)
+            .await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    /// Retains the caller's pack and authority locks through filesystem loading and publication.
+    pub async fn sync_pack_workflows_in_transaction(
+        &self,
+        connection: &mut sqlx::PgConnection,
+        pack_ref: &str,
+    ) -> Result<PackSyncResult> {
         info!("Syncing workflows for pack: {}", pack_ref);
 
         // Verify pack exists in database
-        let _pack = PackRepository::find_by_ref(&self.pool, pack_ref)
+        let _pack = PackRepository::find_by_ref(&mut *connection, pack_ref)
             .await?
             .ok_or_else(|| Error::not_found("pack", "ref", pack_ref))?;
 
@@ -133,7 +147,9 @@ impl PackWorkflowService {
         };
 
         let registrar = WorkflowRegistrar::new(self.pool.clone(), registrar_options);
-        let results = registrar.register_workflows(&workflows).await?;
+        let results = registrar
+            .register_workflows_in_transaction(connection, &workflows)
+            .await?;
 
         let registered_count = results.len();
         let errors: Vec<String> = results.iter().flat_map(|r| r.warnings.clone()).collect();

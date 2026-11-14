@@ -927,7 +927,7 @@ pub async fn update_rule(
     attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
         .await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
-    let existing_rule = RuleRepository::find_by_ref(&mut *tx, &rule_ref)
+    let existing_rule = RuleRepository::find_by_id_for_share(&mut tx, authorized_rule_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Rule '{}' not found", rule_ref)))?;
     let current_managing_pack =
@@ -938,6 +938,7 @@ pub async fn update_rule(
         )
         .await?;
     if existing_rule.id != authorized_rule_id
+        || existing_rule.r#ref != rule_ref
         || existing_rule.pack != authorized_rule_pack
         || existing_rule.updated != authorized_rule_updated
         || current_managing_pack != authorized_managing_pack
@@ -946,6 +947,25 @@ pub async fn update_rule(
             "Rule '{}' changed while the update was being authorized",
             rule_ref
         )));
+    }
+    // An actual enabled-state transition has the same fresh Access contract as
+    // the dedicated lifecycle endpoints. Unchanged full-form fields and metadata
+    // edits retain the existing Access/Execution contract and its token ceiling.
+    if request
+        .enabled
+        .is_some_and(|enabled| enabled != existing_rule.enabled)
+    {
+        super::lifecycle_authorization::existing(
+            &state,
+            &mut tx,
+            &user,
+            attune_common::repositories::runtime_target::RuntimeTarget::Component(
+                attune_common::repositories::runtime_target::ComponentTarget::Rule,
+                existing_rule.id,
+            ),
+            Action::Update,
+        )
+        .await?;
     }
     let action_ref = request
         .action_ref
@@ -1307,6 +1327,9 @@ pub async fn delete_rule(
         .await?;
 
     let mut tx = state.db.begin().await?;
+    // The delete trigger requires exclusive graph admission before sensor admission.
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     let deleted = RuleRepository::delete(&mut *tx, rule.id).await?;
 
@@ -1374,15 +1397,29 @@ pub async fn delete_rule(
 )]
 pub async fn enable_rule(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(rule_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let mut tx = state.db.begin().await?;
+    // Graph admission must precede the sensor fence and lifecycle owner locks.
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx).await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     // Check if rule exists
     let existing_rule = RuleRepository::find_by_ref(&mut *tx, &rule_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Rule '{}' not found", rule_ref)))?;
+
+    super::lifecycle_authorization::existing(
+        &state,
+        &mut tx,
+        &user,
+        attune_common::repositories::runtime_target::RuntimeTarget::Component(
+            attune_common::repositories::runtime_target::ComponentTarget::Rule,
+            existing_rule.id,
+        ),
+        Action::Update,
+    )
+    .await?;
 
     // Update rule to enabled
     let update_input = UpdateRuleInput {
@@ -1456,15 +1493,29 @@ pub async fn enable_rule(
 )]
 pub async fn disable_rule(
     State(state): State<Arc<AppState>>,
-    RequireAuth(_user): RequireAuth,
+    RequireAuth(user): RequireAuth,
     Path(rule_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let mut tx = state.db.begin().await?;
+    // Graph admission must precede the sensor fence and lifecycle owner locks.
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx).await?;
     SensorAdmissionRepository::lock_mutations(&mut tx).await?;
     // Check if rule exists
     let existing_rule = RuleRepository::find_by_ref(&mut *tx, &rule_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Rule '{}' not found", rule_ref)))?;
+
+    super::lifecycle_authorization::existing(
+        &state,
+        &mut tx,
+        &user,
+        attune_common::repositories::runtime_target::RuntimeTarget::Component(
+            attune_common::repositories::runtime_target::ComponentTarget::Rule,
+            existing_rule.id,
+        ),
+        Action::Update,
+    )
+    .await?;
 
     // Update rule to disabled
     let update_input = UpdateRuleInput {
