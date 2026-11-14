@@ -190,3 +190,52 @@ async fn oidc_browser_exchange_is_bound_single_use_and_has_no_bearer_fragment() 
     );
     ctx.cleanup().await.unwrap();
 }
+
+#[tokio::test]
+async fn frozen_deleted_and_pre_session_credentials_fail_closed() {
+    use attune_common::repositories::Delete;
+    let ctx = TestContext::new().await.unwrap();
+    let tokens = login(&ctx).await;
+    let identity = IdentityRepository::find_by_login(&ctx.pool, "session-user")
+        .await
+        .unwrap()
+        .unwrap();
+    let unrecorded = attune_common::auth::jwt::generate_refresh_token(
+        identity.id,
+        &identity.login,
+        &ctx.state.jwt_config,
+    )
+    .unwrap();
+    assert_eq!(
+        refresh(&ctx, &unrecorded).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    IdentityRepository::update(
+        &ctx.pool,
+        identity.id,
+        UpdateIdentityInput {
+            display_name: None,
+            password_hash: None,
+            attributes: None,
+            frozen: Some(true),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        refresh(&ctx, tokens["refresh_token"].as_str().unwrap())
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    IdentityRepository::delete(&ctx.pool, identity.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        refresh(&ctx, tokens["refresh_token"].as_str().unwrap())
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    ctx.cleanup().await.unwrap();
+}

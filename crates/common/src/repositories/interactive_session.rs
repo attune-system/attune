@@ -21,7 +21,7 @@ impl InteractiveSessionRepository {
             .bind(identity.id).bind(&identity.password_hash).fetch_one(&mut *tx).await?;
         if eligible {
             let hash = token_hash(token);
-            let id: i64 = sqlx::query_scalar("INSERT INTO interactive_session(identity_id,current_hash,expires) VALUES($1,$2,clock_timestamp()+$3*interval '1 second') RETURNING id")
+            let id: i64 = sqlx::query_scalar("INSERT INTO interactive_session(identity_id,current_hash,expires) VALUES($1,$2,clock_timestamp()+$3::bigint*interval '1 second') RETURNING id")
                 .bind(identity.id).bind(&hash).bind(ttl).fetch_one(&mut *tx).await?;
             sqlx::query("INSERT INTO interactive_refresh_use(token_hash,session_id) VALUES($1,$2)")
                 .bind(hash)
