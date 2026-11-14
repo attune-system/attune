@@ -29,3 +29,11 @@ Missing scope context previously generally denied scoped grants; it was not a
 proven scoped fail-open. Global update's credential authority was the separation
 risk. Attribute/freeze changes invalidate authorization metadata. Password session
 revocation is owned by the interactive-session contract.
+
+Catalog revision 4 (compatibility epoch 1) reconciles the explicit administration
+grant into installed platform-owned `core.admin` rows at API startup. Catalog IDs,
+direct assignments, and role links remain intact. Current-revision reconciliation
+remains a no-op for stored component content; its bootstrap source snapshot stays
+consistent. Custom profile/editor grants gain no administration permission.
+Both shipped admin YAML definitions intentionally include the new action; all
+other platform definition bytes remain unchanged.

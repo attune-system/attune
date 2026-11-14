@@ -382,3 +382,268 @@ async fn identity_administration_scopes_are_authorable_via_api() {
     );
     ctx.cleanup().await.unwrap();
 }
+#[tokio::test]
+async fn installed_revision_three_admin_receives_explicit_administration() {
+    use attune_common::{
+        models::ManagementOrigin,
+        platform_catalog::{
+            definitions, ManagedComponentKind, CATALOG_REVISION, COMPATIBILITY_EPOCH,
+        },
+        repositories::{
+            identity::{
+                CreateIdentityRoleAssignmentInput, CreatePermissionSetRoleAssignmentInput,
+                IdentityRoleAssignmentRepository, PermissionSetRoleAssignmentRepository,
+            },
+            platform_catalog::PlatformCatalogRepository as Catalog,
+            FindByRef,
+        },
+    };
+
+    let ctx = TestContext::new().await.unwrap().with_auth().await.unwrap();
+    let actor = ctx.user.as_ref().unwrap().id;
+    ctx.create_test_user("catalog_recovery_admin")
+        .await
+        .unwrap();
+    let target = IdentityRepository::find_by_login(&ctx.pool, "catalog_recovery_admin")
+        .await
+        .unwrap()
+        .unwrap();
+    let profile_token = ctx
+        .create_test_user("catalog_profile_editor")
+        .await
+        .unwrap();
+    let profile = IdentityRepository::find_by_login(&ctx.pool, "catalog_profile_editor")
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Frozen catalog bytes from be05d042, not current YAML with an old counter.
+    // Fixture SQL only: seed an installed platform row without violating the
+    // production prohibition on downgrading existing platform-owned rows.
+    let old: Value =
+        serde_yaml::from_str(include_str!("fixtures/catalog-revision-3-admin.yaml")).unwrap();
+    let old_identity = old["grants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["resource"] == "identities")
+        .unwrap();
+    assert!(!old_identity["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a == "manage"));
+    let mut tx = ctx.pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('attune.catalog_write', 'on', true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO permission_set (ref, label, description, grants, catalog_revision) VALUES ($1->>'ref', $1->>'label', $1->>'description', $1->'grants', 3)")
+        .bind(&old).execute(&mut *tx).await.unwrap();
+    sqlx::query("UPDATE platform_catalog_state SET revision = 3, bootstrap_definitions = $1 WHERE singleton")
+        .bind(json!({"permission_set":{"core.admin":old}})).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let admin = PermissionSetRepository::find_by_ref(&ctx.pool, "core.admin")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(admin.grants, old["grants"]);
+    assert_eq!(
+        Catalog::origin(&ctx.pool, ManagedComponentKind::PermissionSet, "core.admin")
+            .await
+            .unwrap(),
+        Some(ManagementOrigin::Platform {
+            catalog_revision: 3
+        })
+    );
+    // Recovery actor gets admin only through its role; target admin has a
+    // direct assignment. Reconciliation must preserve both forms of linkage.
+    let direct = PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: target.id,
+            permset: admin.id,
+        },
+    )
+    .await
+    .unwrap();
+    let membership = IdentityRoleAssignmentRepository::create(
+        &ctx.pool,
+        CreateIdentityRoleAssignmentInput {
+            identity: actor,
+            role: "security_admin".into(),
+            source: "manual".into(),
+            managed: false,
+        },
+    )
+    .await
+    .unwrap();
+    let role = PermissionSetRoleAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionSetRoleAssignmentInput {
+            permset: admin.id,
+            role: "security_admin".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let links_before = json!([&direct, &membership, &role]);
+    grant(
+        &ctx,
+        profile.id,
+        json!([{"resource":"identities","actions":["update"]}]),
+    )
+    .await;
+    AuthorizationService::invalidate_identity_authz_cache(actor).await;
+
+    let path = format!("/api/v1/identities/{}", target.id);
+    assert_eq!(
+        ctx.put(
+            &path,
+            json!({"password":"CatalogRecovery123!"}),
+            ctx.token()
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        ctx.put(
+            &path,
+            json!({"password":"CatalogRecovery123!"}),
+            Some(&profile_token)
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    Catalog::reconcile(&ctx.pool).await.unwrap();
+    // Startup reconciliation precedes request authorization. Discard snapshots
+    // from the pre-upgrade probes to model the restarted API's empty caches.
+    AuthorizationService::invalidate_identity_authz_cache(actor).await;
+    AuthorizationService::invalidate_permission_set_caches().await;
+    let upgraded = PermissionSetRepository::find_by_ref(&ctx.pool, "core.admin")
+        .await
+        .unwrap()
+        .unwrap();
+    let expected = definitions()
+        .unwrap()
+        .into_iter()
+        .find(|(_, d)| d["ref"] == "core.admin")
+        .unwrap()
+        .1;
+    assert_eq!(upgraded.id, admin.id);
+    assert_eq!(
+        Catalog::origin(&ctx.pool, ManagedComponentKind::PermissionSet, "core.admin")
+            .await
+            .unwrap(),
+        Some(ManagementOrigin::Platform {
+            catalog_revision: CATALOG_REVISION
+        })
+    );
+    assert_eq!(upgraded.grants, expected["grants"]);
+    assert_ne!(upgraded.grants, admin.grants);
+    assert_eq!(
+        json!([
+            PermissionAssignmentRepository::find_by_id(&ctx.pool, direct.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            IdentityRoleAssignmentRepository::find_by_id(&ctx.pool, membership.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            PermissionSetRoleAssignmentRepository::find_by_id(&ctx.pool, role.id)
+                .await
+                .unwrap()
+                .unwrap()
+        ]),
+        links_before
+    );
+    let state: (i32, i32, Value) = sqlx::query_as("SELECT compatibility_epoch, revision, bootstrap_definitions FROM platform_catalog_state WHERE singleton")
+        .fetch_one(&ctx.pool).await.unwrap();
+    assert_eq!((state.0, state.1), (COMPATIBILITY_EPOCH, CATALOG_REVISION));
+    assert_eq!(
+        state.2["permission_set"]["core.admin"]["grants"],
+        upgraded.grants
+    );
+
+    // Current-revision reconciliation preserves content, timestamps and snapshot.
+    Catalog::reconcile(&ctx.pool).await.unwrap();
+    let unchanged = PermissionSetRepository::find_by_ref(&ctx.pool, "core.admin")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&unchanged).unwrap(),
+        serde_json::to_value(&upgraded).unwrap()
+    );
+    let snapshot: Value = sqlx::query_scalar(
+        "SELECT bootstrap_definitions FROM platform_catalog_state WHERE singleton",
+    )
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(snapshot, state.2);
+
+    assert_eq!(
+        ctx.put(
+            &path,
+            json!({"password":"CatalogRecovery123!"}),
+            ctx.token()
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::OK
+    );
+    let recovered = ctx
+        .post(
+            "/auth/login",
+            json!({"login":target.login,"password":"CatalogRecovery123!"}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered.status(), StatusCode::OK);
+    assert_eq!(
+        ctx.post(
+            &format!("{path}/integration-tokens"),
+            json!({"label":"reconciled-recovery"}),
+            ctx.token()
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::CREATED
+    );
+    for body in [
+        json!({"password":"DeniedCatalog123!"}),
+        json!({"attributes":{"department":"admin"}}),
+        json!({"frozen":true}),
+    ] {
+        assert_eq!(
+            ctx.put(&path, body, Some(&profile_token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    assert_eq!(
+        ctx.put(
+            &path,
+            json!({"display_name":"Profile after upgrade"}),
+            Some(&profile_token)
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::OK
+    );
+    ctx.cleanup().await.unwrap();
+}

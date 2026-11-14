@@ -91,14 +91,17 @@ export const OWNER_REF_RESOURCES = new Set(["caches", "keys", "artifacts"]);
 // Cache namespaces are the "component" being scoped, so this resource gets
 // cache-specific copy instead of the generic "Component scoped" wording.
 export function componentScopeOptionLabel(resource: string): string {
+  if (resource === "identities") return "Identity scoped";
   return resource === "caches" ? "Namespace scoped" : "Component scoped";
 }
 
 export function componentScopeFieldLabel(resource: string): string {
+  if (resource === "identities") return "Identity logins";
   return resource === "caches" ? "Namespace refs" : "Component refs";
 }
 
 export function componentScopePlaceholder(resource: string): string {
+  if (resource === "identities") return "alice, deploy-bot";
   return resource === "caches"
     ? "users, locations"
     : "core.echo, slack.post_message";
