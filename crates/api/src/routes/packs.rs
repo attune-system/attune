@@ -590,6 +590,21 @@ pub async fn get_pack_icon(
         HeaderValue::from_static("public, max-age=300"),
     );
 
+    // Pack-controlled images can be opened as documents, including through the web
+    // proxy. Keep them in an opaque-origin sandbox with no scripts, forms, popups
+    // or external resources. Inline styles preserve self-contained static SVGs.
+    // Apply this even to raster filenames: the extension is not content validation.
+    response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "sandbox; default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'",
+        ),
+    );
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+
     Ok(response)
 }
 
