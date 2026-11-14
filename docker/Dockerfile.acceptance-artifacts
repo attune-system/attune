@@ -81,7 +81,10 @@ FROM ${PYTHON_BASE} AS init-packs
 COPY --from=compiled /core/ /source/packs/core/
 COPY scripts/bootstrap_core_pack.py /scripts/bootstrap_core_pack.py
 COPY docker/acceptance/init-packs.sh /init-packs.sh
-RUN python3 -c 'import sys,yaml; assert sys.version_info >= (3,11)' && chmod +x /init-packs.sh
+COPY docker/normalize-pack-image-permissions.sh /scripts/normalize-pack-image-permissions.sh
+RUN python3 -c 'import sys,yaml; assert sys.version_info >= (3,11)' && chmod +x /init-packs.sh && \
+    chmod 0755 /source /source/packs && \
+    sh /scripts/normalize-pack-image-permissions.sh /source/packs/core
 CMD ["/bin/sh", "/init-packs.sh"]
 
 FROM ${POSTGRES_IMAGE} AS migrations

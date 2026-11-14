@@ -207,3 +207,18 @@ hash and `docker/test-init-user.sh` before consuming it in chart bootstrap.
 This is an artifact capability check, not proof of live Helm seeding. The
 lifecycle acceptance runner still rejects SQL init-user as its operator credential
 fixture; no bootstrap/session/authority policy is bypassed.
+
+
+Init-packs publication must also work as UID1000. Both the acceptance image and
+`Dockerfile.init-packs-package` run the same image-only permission normalizer:
+directories0755, non-executable files0644, executable-intent files0755, no symlinks.
+Private host staging stays private; payload bytes and canonical executable intent
+are unchanged. Normalization must happen inside the image, not by elevating the
+chart publisher or replacing mounted payloads.
+
+Under the owned Docker lane, `scripts/check_core_image_permissions.py` runs actual
+UID1000 preflight, full payload reads, the real upload tar assembler, and the
+captured canonical archive helper in a disposable test container. It compares
+all file hashes/executable flags and the canonical digest, and supports a real
+0700-image rejection probe. The helper is copied into that test container only;
+it is not shipped in init-packs and adds no product runtime prerequisite.

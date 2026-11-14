@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import tarfile
 import tempfile
+import subprocess
 import unittest
 from unittest import mock
 
@@ -198,6 +199,28 @@ class Preparation(unittest.TestCase):
         self.assertIn("exec python3 /scripts/bootstrap_core_pack.py publish", init)
         self.assertNotIn("cp ", init)
         self.assertNotIn("BOOTSTRAP_ADMISSION_ENABLED", recipe)
+
+    def test_image_permissions_normalize_only_modes_and_both_paths_use_same_helper(self):
+        script = ROOT / "docker/normalize-pack-image-permissions.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            pack = Path(directory) / "core"
+            binary = pack / "actions/bin/http_request/linux-amd64"
+            binary.parent.mkdir(parents=True, mode=0o700)
+            binary.write_bytes(b"executable intent fixture")
+            binary.chmod(0o700)
+            metadata = pack / "pack.yaml"
+            metadata.write_bytes(b"readable metadata fixture")
+            metadata.chmod(0o600)
+            subprocess.run(["sh", str(script), str(pack)], check=True)
+            self.assertEqual(binary.read_bytes(), b"executable intent fixture")
+            self.assertEqual(metadata.read_bytes(), b"readable metadata fixture")
+            self.assertEqual(binary.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(metadata.stat().st_mode & 0o777, 0o644)
+            self.assertTrue(all(path.stat().st_mode & 0o777 == 0o755 for path in pack.rglob("*") if path.is_dir()))
+        for path in [ROOT / artifacts.DOCKERFILE, ROOT / "docker/Dockerfile.init-packs-package"]:
+            recipe = path.read_text()
+            self.assertIn("COPY docker/normalize-pack-image-permissions.sh /scripts/normalize-pack-image-permissions.sh", recipe)
+            self.assertIn("sh /scripts/normalize-pack-image-permissions.sh /source/packs/core", recipe)
 
     def test_init_user_companion_keeps_service_inventory_and_existing_bootstrap_source(self):
         self.assertEqual(artifacts.IMAGES[:4], ("api", "executor", "notifier", "supervisor"))
