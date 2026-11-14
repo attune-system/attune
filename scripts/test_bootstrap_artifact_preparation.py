@@ -113,6 +113,36 @@ class Preparation(unittest.TestCase):
             self.assertEqual(receipt["archive_sha256"], artifacts.sha(path))
             self.assertNotIn("repository", receipt)
 
+    def test_local_base_uses_measured_oci_bytes_and_rejects_wrong_digest(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            root = Path(directory)
+            archive, digest = self.oci(root)
+            receipt = artifacts.unpack_oci_base(archive, root / "layout", digest)
+            self.assertEqual(receipt["oci_manifest_digest"], digest)
+            self.assertTrue((root / "layout/oci-layout").is_file())
+            with self.assertRaisesRegex(artifacts.InputError, "digest changed"):
+                artifacts.unpack_oci_base(archive, root / "wrong", "sha256:" + "0" * 64)
+            self.assertFalse((root / "wrong").exists())
+            args = artifacts.arguments(["--work-root", str(root / "build")])
+            manifest = {"base_images": {"service": "unit-service@" + digest},
+                        "base_oci_archives": {"service": str(archive)}}
+            command = artifacts.commands(args, manifest)[0]["command"]
+            self.assertIn("SERVICE_BASE=attune_base_service", command)
+            self.assertIn("attune_base_service=oci-layout://" + str(args.work_root / "base-contexts/service") + "@" + digest, command)
+            self.assertFalse(any("--push" in part for part in command))
+
+    def test_local_oci_extra_path_cannot_escape_owned_layout(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            root = Path(directory)
+            archive, digest = self.oci(root)
+            with tarfile.open(archive, "a") as source:
+                entry = tarfile.TarInfo("../escape")
+                entry.size = 1
+                source.addfile(entry, io.BytesIO(b"x"))
+            with self.assertRaisesRegex(artifacts.InputError, "OCI file path"):
+                artifacts.unpack_oci_base(archive, root / "layout", digest)
+            self.assertFalse((root / "escape").exists())
+
     def test_corrupt_oci_content_cannot_produce_a_receipt(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             path, _ = self.oci(Path(directory), corrupt=True)

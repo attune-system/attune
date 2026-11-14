@@ -64,7 +64,13 @@ def commands(args, manifest):
     docker = ["docker", "--context", manifest.get("docker_context", "<local-context>"), "buildx", "build", "--builder", manifest.get("buildx_builder", "<central-owned-builder>"), "--platform", manifest.get("platform", "linux/amd64"), "--provenance=false", "--sbom=false", "--file", str(root / "source" / DOCKERFILE)]
     for name in BASES:
         argument = {"toolchain": "TOOLCHAIN_IMAGE", "node": "NODE_IMAGE", "service": "SERVICE_BASE", "python": "PYTHON_BASE", "busybox": "BUSYBOX_IMAGE", "postgres": "POSTGRES_IMAGE", "nginx": "NGINX_IMAGE"}[name]
-        docker += ["--build-arg", argument + "=" + manifest.get("base_images", {}).get(name, "<required-immutable-base>")]
+        image = manifest.get("base_images", {}).get(name, "<required-immutable-base>")
+        if name in manifest.get("base_oci_archives", {}):
+            # Supply measured local bytes without BuildKit's registry resolver.
+            alias = "attune_base_" + name
+            docker += ["--build-context", alias + "=oci-layout://" + str(root / "base-contexts" / name) + "@" + image.rsplit("@", 1)[1]]
+            image = alias
+        docker += ["--build-arg", argument + "=" + image]
     docker += ["--build-arg", "ATTUNE_BUILD_GIT_SHA=" + manifest.get("source_revision", "<source-revision>"), "--build-arg", "SOURCE_DATE_EPOCH=" + str(manifest.get("source_date_epoch", "<fixed-source-time>"))]
     output = []
     for name, target in (("native", "native-export"), ("frontend", "frontend-export"), *[(image, "service" if image in IMAGES[:4] else image) for image in IMAGES]):
@@ -98,6 +104,12 @@ def validate(args, manifest):
     require(set(manifest.get("base_images", {})) == set(BASES), "Supply all seven actual immutable build/runtime bases")
     for name, image in manifest["base_images"].items():
         require(bool(re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image)), "Missing immutable base digest for " + name)
+    local = manifest.get("base_oci_archives", {})
+    require(isinstance(local, dict) and set(local) <= set(BASES), "Unknown local OCI base")
+    for name, path in local.items():
+        archive = Path(path)
+        require(archive.is_absolute() and archive.is_file() and not archive.is_symlink(), "Supply an actual regular local OCI archive")
+        require(oci_receipt(archive)["oci_manifest_digest"] == manifest["base_images"][name].rsplit("@", 1)[1], "Local OCI base does not match its immutable manifest digest")
     archive = Path(manifest.get("source_archive", ""))
     require(archive.is_file() and not archive.is_symlink() and sha(archive) == manifest.get("source_sha256"), "Missing/mismatched actual source archive; never build a moving primary checkout")
 
@@ -164,6 +176,25 @@ def oci_receipt(path):
             member = members.get("blobs/sha256/" + item["digest"].split(":")[1])
             require(member is not None and member.isfile() and member.size == item["size"], "OCI manifest references missing/incomplete content")
         return {"oci_archive": str(path), "archive_sha256": sha(path), "oci_manifest_digest": descriptor["digest"]}
+
+
+def unpack_oci_base(archive, destination, expected_digest):
+    receipt = oci_receipt(archive)
+    require(receipt["oci_manifest_digest"] == expected_digest, "Local OCI base digest changed")
+    destination.mkdir(parents=True, mode=0o700)
+    with tarfile.open(archive, "r:*") as source:
+        for member in source:
+            name = str(PurePosixPath(member.name))
+            if member.isdir():
+                require(name in {".", "blobs", "blobs/sha256"}, "Unexpected OCI directory")
+                continue
+            require(bool(re.fullmatch(r"oci-layout|index\.json|blobs/sha256/[0-9a-f]{64}", name)), "Unexpected OCI file path")
+            target = destination / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with source.extractfile(member) as incoming, target.open("xb") as outgoing:
+                while block := incoming.read(1024 * 1024):
+                    outgoing.write(block)
+    return receipt
 
 
 def native_receipt(root):
@@ -234,6 +265,10 @@ def execute(args, manifest):
     receipt = {"status": "INCOMPLETE", "source_revision": manifest["source_revision"], "source_sha256": manifest["source_sha256"], "build_jobs": 2, "completed": [], "images": {}, "acceptance": "NOT_RUN", "admission_gates": "UNCHANGED"}
     try:
         unpack_source(manifest["source_archive"], args.work_root / "source")
+        receipt["base_images"] = manifest["base_images"]
+        receipt["local_base_receipts"] = {}
+        for name, archive in manifest.get("base_oci_archives", {}).items():
+            receipt["local_base_receipts"][name] = unpack_oci_base(Path(archive), args.work_root / "base-contexts" / name, manifest["base_images"][name].rsplit("@", 1)[1])
         for entry in commands(args, manifest):
             driver.command(entry["command"], timeout=args.timeout_seconds)
             name = entry["artifact"]
@@ -243,6 +278,8 @@ def execute(args, manifest):
                 receipt["images"][name] = oci_receipt(args.work_root / (name + ".oci.tar"))
             receipt["completed"].append(name)
         require(sha(manifest["source_archive"]) == manifest["source_sha256"], "Source archive changed during build; reject these artifacts")
+        for base in receipt["local_base_receipts"].values():
+            require(sha(Path(base["oci_archive"])) == base["archive_sha256"], "Local base archive changed during build")
         receipt["status"] = "BUILT_NOT_DEPLOYED"
     finally:
         require(not driver.ACTIVE_GROUPS, "Build client has not joined. Central scheduler must drain its builder; retained output is not complete")

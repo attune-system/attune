@@ -72,7 +72,15 @@ PyYAML 6.0.3. Each derived image records package/tool versions under
 `/usr/local/share/attune-base-receipt/`. Record the actual exported OCI manifest
 and blob digests after building; a Docker configuration ID is not a manifest
 digest. Verify the measured local immutable reference resolves in the existing
-builder before passing it to the full producer. No public push is needed.
+builder before passing it to the full producer. No public push is needed. A loaded Docker image may inspect successfully by digest
+while BuildKit's FROM resolver still tries its registry. In that case, retain
+`base_images` as measured immutable references and provide optional v1
+`base_oci_archives: {"service": "/owned/service.oci.tar", ...}` entries. The
+producer verifies manifest/blob hashes against those references, extracts only
+OCI metadata/blob paths into its new owned work root, and supplies digest-pinned
+`oci-layout://` named build contexts. It rechecks archive hashes after the build.
+A configuration ID, mutable tag or unresolved placeholder cannot replace a
+measured manifest. This preserves local/offline consumption without a registry.
 
 Build these prerequisites and the producer serially in the same owned resource
 lane. Check both host and Docker storage budgets, retain failed logs and never
