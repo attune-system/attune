@@ -37,7 +37,7 @@ Use `scripts/acceptance/artifact-build.example.json` as the input shape. Supply:
   running docker/docker-container node attached to that validated local context.
   A local Docker context cannot authorize a remote/Kubernetes or inactive builder.
   Run on the selected native Linux amd64 or arm64 host. No QEMU fallback is inferred.
-- Seven real digest-pinned base images. The toolchain contains a compatible Rust,
+- Seven real digest-pinned base images. The toolchain contains Rust 1.100.0,
   cargo-zigbuild, Zig, native linker/SSL development dependencies and installed
   x86_64/aarch64 musl targets. The Node 24 image supplies npm. The compatible service
   runtime base supplies glibc/libssl, CA roots, curl/git and the attune UID 1000
@@ -60,6 +60,27 @@ manufacture a build revision or export a stale HEAD while claiming staged fixes.
 Source tar members are bounded and must be ordinary files/directories: links,
 traversal, operational env/private files and caches are rejected. Keep any source
 archive credentials out entirely, not merely hidden by a Docker ignore pattern.
+
+## Provisioning the derived bases
+
+Missing base images are build inputs to prepare locally, not documents an operator
+must already own. `docker/Dockerfile.acceptance-bases` supplies separate toolchain,
+service and Python targets from immutable upstream `RUST_BASE`, `SERVICE_BASE` and
+`PYTHON_BASE` references. The toolchain pins Rust 1.100.0, Zig 0.16.0 and
+cargo-zigbuild 0.23.4 and installs both musl targets; the Python target pins
+PyYAML 6.0.3. Each derived image records package/tool versions under
+`/usr/local/share/attune-base-receipt/`. Record the actual exported OCI manifest
+and blob digests after building; a Docker configuration ID is not a manifest
+digest. Verify the measured local immutable reference resolves in the existing
+builder before passing it to the full producer. No public push is needed.
+
+Build these prerequisites and the producer serially in the same owned resource
+lane. Check both host and Docker storage budgets, retain failed logs and never
+prune unrelated caches to make room. The measured source snapshot, upstream
+references, recipe bytes, resulting OCI archives, capability probes and full v1
+manifest together supply provenance. Installed distribution package versions are
+recorded in the base receipt; a rebuild must be remeasured rather than presumed
+bit-identical.
 
 ## What actually runs later
 
