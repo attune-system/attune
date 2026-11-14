@@ -440,7 +440,7 @@ async fn behavioral_edits_require_actual_editor_authority_even_for_same_subject_
         )?,
         helpers::delegated_source::token(&ctx, owner, std::slice::from_ref(&narrow.r#ref)).await?,
     ];
-    for token in &tokens {
+    for (index, token) in tokens.iter().enumerate() {
         for change in [
             json!({"action_ref":privileged.r#ref}),
             json!({"action_params":{"credential":"{{ keystore['system.api_token'] }}"}}),
@@ -461,7 +461,7 @@ async fn behavioral_edits_require_actual_editor_authority_even_for_same_subject_
         .assert_status(StatusCode::OK);
         ctx.put(
             &format!("/api/v1/rules/{rule_ref}"),
-            json!({"action_params":{"message":"covered"},"conditions":{}}),
+            json!({"action_params":{"message":format!("covered-{index}")},"conditions":{}}),
             Some(token),
         )
         .await?
@@ -480,7 +480,7 @@ async fn behavioral_edits_require_actual_editor_authority_even_for_same_subject_
     .await?;
     for token in &tokens {
         for change in [
-            json!({"conditions":{}}),
+            json!({"conditions":{"==":[1,1]}}),
             json!({"trace_tag_template":"changed"}),
             json!({"action_params":{}}),
         ] {
@@ -496,6 +496,53 @@ async fn behavioral_edits_require_actual_editor_authority_even_for_same_subject_
         .await?
         .assert_status(StatusCode::OK);
     }
+    // Inherited action defaults are also effective permission selections.
+    use attune_common::repositories::action::{ActionRepository, UpdateActionInput};
+    ActionRepository::update(
+        &ctx.pool,
+        rule.action.unwrap(),
+        UpdateActionInput {
+            default_execution_permission_set_refs: Some(vec![admin.r#ref.clone()]),
+            ..Default::default()
+        },
+    )
+    .await?;
+    RuleRepository::update(
+        &ctx.pool,
+        rule.id,
+        UpdateRuleInput {
+            permission_set_refs: Some(Patch::Clear),
+            ..Default::default()
+        },
+    )
+    .await?;
+    for token in &tokens {
+        ctx.put(
+            &format!("/api/v1/rules/{rule_ref}"),
+            json!({"trace_tag_template":"inherited-default-edit"}),
+            Some(token),
+        )
+        .await?
+        .assert_status(StatusCode::FORBIDDEN);
+    }
+    ActionRepository::update(
+        &ctx.pool,
+        rule.action.unwrap(),
+        UpdateActionInput {
+            default_execution_permission_set_refs: Some(vec![]),
+            ..Default::default()
+        },
+    )
+    .await?;
+    RuleRepository::update(
+        &ctx.pool,
+        rule.id,
+        UpdateRuleInput {
+            permission_set_refs: Some(Patch::Set(vec![admin.r#ref.clone()])),
+            ..Default::default()
+        },
+    )
+    .await?;
     // A mixed public/protected retained binding lets public selectors pass with
     // Read alone; secret selectors require Decrypt without restoring the value.
     let mut pack =
@@ -624,6 +671,15 @@ async fn behavioral_edits_require_actual_editor_authority_even_for_same_subject_
         DelegatedExecutionRepository::enforcement_selection(&mut tx, &retained).await?,
         (owner, vec![])
     );
+    assert_eq!(
+        serde_json::to_value(
+            SchemaContractRepository::find(&mut tx, BindingOwner::Enforcement, pending.id)
+                .await?
+                .unwrap()
+        )?,
+        serde_json::to_value(&binding)?,
+        "pending enforcement retains its original schema binding"
+    );
     tx.commit().await?;
     // Managed input coverage comes from the retained deployment capture, even
     // after the live permission-set definition no longer contains these grants.
@@ -690,6 +746,387 @@ async fn behavioral_edits_require_actual_editor_authority_even_for_same_subject_
         serde_json::to_value(captured)?
     );
     tx.commit().await?;
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+fn full_form_update(rule: &attune_common::models::Rule, label: &str) -> serde_json::Value {
+    json!({"label":label,"description":rule.description,"action_ref":rule.action_ref,
+        "trigger_ref":rule.trigger_ref,"conditions":rule.conditions,"action_params":rule.action_params,
+        "trigger_params":rule.trigger_params,"permission_set_refs":rule.permission_set_refs,
+        "trace_tag_template":rule.trace_tag_template,"enabled":rule.enabled,
+        "sensor_worker_selector":rule.sensor_worker_selector,
+        "sensor_worker_tolerations":rule.sensor_worker_tolerations,
+        "sensor_worker_affinity":rule.sensor_worker_affinity})
+}
+
+#[tokio::test]
+async fn full_form_metadata_retains_update_semantics_but_placement_spends_editor_authority(
+) -> Result<()> {
+    use attune_common::{
+        auth::jwt::{generate_token, TokenType},
+        repositories::{rule::UpdateRuleInput, Patch, Update},
+    };
+    let ctx = TestContext::new().await?;
+    let (rule_ref, sponsor) = seed_rule_and_identity(&ctx, "full_form").await?;
+    let editor = IdentityRepository::create(
+        &ctx.pool,
+        CreateIdentityInput {
+            login: "full_form_editor".into(),
+            display_name: None,
+            attributes: json!({}),
+            password_hash: None,
+        },
+    )
+    .await?;
+    let metadata = PermissionSetRepository::create(&ctx.pool,CreatePermissionSetInput {
+        r#ref:"test.full_form_metadata".into(),pack:None,pack_ref:None,label:None,description:None,
+        grants:json!([{"resource":"rules","actions":["update"],"constraints":{"refs":[rule_ref]}},
+            {"resource":"actions","actions":["read"]},{"resource":"triggers","actions":["read"]}]),
+    }).await?;
+    let admin = PermissionSetRepository::create(&ctx.pool,CreatePermissionSetInput {
+        r#ref:"test.full_form_sponsor".into(),pack:None,pack_ref:None,label:None,description:None,
+        grants:json!([{"resource":"rules","actions":["update"]},{"resource":"actions","actions":["execute"]}]),
+    }).await?;
+    for (identity, permset) in [
+        (sponsor, metadata.id),
+        (editor.id, metadata.id),
+        (sponsor, admin.id),
+    ] {
+        PermissionAssignmentRepository::create(
+            &ctx.pool,
+            CreatePermissionAssignmentInput { identity, permset },
+        )
+        .await?;
+    }
+    let rule = RuleRepository::find_by_ref(&ctx.pool, &rule_ref)
+        .await?
+        .unwrap();
+    RuleRepository::update(
+        &ctx.pool,
+        rule.id,
+        UpdateRuleInput {
+            owner_identity: Some(Patch::Set(sponsor)),
+            permission_set_refs: Some(Patch::Set(vec![])),
+            ..Default::default()
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
+    let tokens = [
+        generate_token(
+            editor.id,
+            "full_form_editor",
+            &jwt_config(),
+            TokenType::Access,
+        )?,
+        helpers::delegated_source::token(&ctx, sponsor, std::slice::from_ref(&metadata.r#ref))
+            .await?,
+    ];
+    let placement_edits = [
+        json!({"sensor_worker_selector":{"zone":"other"}}),
+        json!({"sensor_worker_tolerations":[{"key":"dedicated","operator":"exists"}]}),
+        json!({"sensor_worker_affinity":{"required":[{"match_labels":{"zone":"other"}}]}}),
+    ];
+    for token in &tokens {
+        let before = RuleRepository::find_by_ref(&ctx.pool, &rule_ref)
+            .await?
+            .unwrap();
+        let payload = full_form_update(&before, "Full form label");
+        ctx.put(
+            &format!("/api/v1/rules/{rule_ref}"),
+            payload.clone(),
+            Some(token),
+        )
+        .await?
+        .assert_status(StatusCode::OK);
+        let mut behavioral = payload;
+        behavioral["label"] = json!("Must roll back with behavior");
+        behavioral["trace_tag_template"] = json!("real behavior change");
+        ctx.put(
+            &format!("/api/v1/rules/{rule_ref}"),
+            behavioral,
+            Some(token),
+        )
+        .await?
+        .assert_status(StatusCode::FORBIDDEN);
+        let before = RuleRepository::find_by_ref(&ctx.pool, &rule_ref)
+            .await?
+            .unwrap();
+        for change in &placement_edits {
+            let denied = ctx
+                .put(
+                    &format!("/api/v1/rules/{rule_ref}"),
+                    change.clone(),
+                    Some(token),
+                )
+                .await?;
+            let status = denied.status();
+            let body: serde_json::Value = denied.json().await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{}", body["message"]);
+            assert_eq!(body["message"], "Insufficient permissions: actions:execute");
+            assert_eq!(
+                serde_json::to_value(
+                    RuleRepository::find_by_ref(&ctx.pool, &rule_ref)
+                        .await?
+                        .unwrap()
+                )?,
+                serde_json::to_value(&before)?
+            );
+        }
+        assert_eq!(before.label, "Full form label");
+        assert_eq!(before.owner_identity, Some(sponsor));
+    }
+    let covered = generate_token(
+        sponsor,
+        "rule_authz_full_form",
+        &jwt_config(),
+        TokenType::Access,
+    )?;
+    for change in placement_edits {
+        let response = ctx
+            .put(&format!("/api/v1/rules/{rule_ref}"), change, Some(&covered))
+            .await?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "covered placement: {}",
+            body["message"]
+        );
+    }
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn config_sources_match_actual_pack_ownership_and_access_role_membership() -> Result<()> {
+    use attune_common::{
+        auth::jwt::{generate_token, TokenType},
+        repositories::{
+            identity::{CreateIdentityRoleAssignmentInput, IdentityRoleAssignmentRepository},
+            pack::PackRepository,
+            rule::UpdateRuleInput,
+            Delete, Patch, Update,
+        },
+    };
+    let ctx = TestContext::new().await?;
+    let sponsor = IdentityRepository::create(
+        &ctx.pool,
+        CreateIdentityInput {
+            login: "config_source_sponsor".into(),
+            display_name: None,
+            attributes: json!({}),
+            password_hash: None,
+        },
+    )
+    .await?;
+    for (suffix, scope, ownership, role_member, allowed) in [
+        ("unowned", json!({"owner":"none"}), "none", false, true),
+        (
+            "owned_none",
+            json!({"owner":"none"}),
+            "sponsor",
+            false,
+            false,
+        ),
+        ("owned_self", json!({"owner":"self"}), "editor", false, true),
+        (
+            "foreign_self",
+            json!({"owner":"self"}),
+            "sponsor",
+            false,
+            false,
+        ),
+        ("role_self", json!({"owner":"self"}), "sponsor", true, true),
+        (
+            "role_pack",
+            json!({"pack_owner":"self"}),
+            "sponsor",
+            true,
+            true,
+        ),
+    ] {
+        let (rule_ref, editor) = seed_rule_and_identity(&ctx, suffix).await?;
+        let rule = RuleRepository::find_by_ref(&ctx.pool, &rule_ref)
+            .await?
+            .unwrap();
+        if ownership != "none" {
+            PackRepository::set_installed_by(
+                &ctx.pool,
+                rule.pack,
+                if ownership == "editor" {
+                    editor
+                } else {
+                    sponsor.id
+                },
+            )
+            .await?;
+        }
+        RuleRepository::update(
+            &ctx.pool,
+            rule.id,
+            UpdateRuleInput {
+                owner_identity: Some(Patch::Set(sponsor.id)),
+                permission_set_refs: Some(Patch::Set(vec![])),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let mut pack = PackRepository::find_by_ref(&ctx.pool, &rule.pack_ref)
+            .await?
+            .unwrap();
+        pack.conf_schema = json!({"private_name":{"type":"string","secret":true}});
+        let mut tx = ctx.pool.begin().await?;
+        attune_common::repositories::component_configuration::ComponentConfigurationRepository::bind_pack(
+            &mut tx,&pack,Some(&json!({"private_name":"fixture-only-config"})),ctx.state.config.security.encryption_key.as_deref(),
+        ).await?;
+        PackRepository::set_owner_roles(&mut tx, pack.id, vec!["rule-config-maintainers".into()])
+            .await?;
+        tx.commit().await?;
+        let member = if role_member {
+            Some(
+                IdentityRoleAssignmentRepository::create(
+                    &ctx.pool,
+                    CreateIdentityRoleAssignmentInput {
+                        identity: editor,
+                        role: "rule-config-maintainers".into(),
+                        source: "test".into(),
+                        managed: false,
+                    },
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let grants = json!([{"resource":"rules","actions":["update"],"constraints":{"refs":[rule_ref]}},
+            {"resource":"actions","actions":["execute"],"constraints":{"refs":[rule.action_ref]}},
+            {"resource":"packs","actions":["read","decrypt"],"constraints":scope}]);
+        let permission = PermissionSetRepository::create(
+            &ctx.pool,
+            CreatePermissionSetInput {
+                r#ref: format!("test.config_{suffix}"),
+                pack: None,
+                pack_ref: None,
+                label: None,
+                description: None,
+                grants: grants.clone(),
+            },
+        )
+        .await?;
+        PermissionAssignmentRepository::create(
+            &ctx.pool,
+            CreatePermissionAssignmentInput {
+                identity: editor,
+                permset: permission.id,
+            },
+        )
+        .await?;
+        attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
+        let token = generate_token(
+            editor,
+            &format!("rule_authz_{suffix}"),
+            &jwt_config(),
+            TokenType::Access,
+        )?;
+        let response = ctx
+            .put(
+                &format!("/api/v1/rules/{rule_ref}"),
+                json!({"action_params":{"message":"{{ pack.config.private_name }}","attempt":1}}),
+                Some(&token),
+            )
+            .await?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await?;
+        assert_eq!(
+            status,
+            if allowed {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            },
+            "config case {suffix}: {}",
+            body["message"]
+        );
+        if !allowed {
+            assert_eq!(body["message"], "Insufficient permissions: packs:read");
+        }
+        if suffix == "unowned" || suffix == "owned_none" {
+            let execution = helpers::delegated_source::token(
+                &ctx,
+                editor,
+                std::slice::from_ref(&permission.r#ref),
+            )
+            .await?;
+            ctx.put(
+                &format!("/api/v1/rules/{rule_ref}"),
+                json!({"action_params":{"message":"{{ pack.config.private_name }}","attempt":2}}),
+                Some(&execution),
+            )
+            .await?
+            .assert_status(if allowed {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            });
+        }
+        if let Some(member) = member {
+            let mut token_grants = grants;
+            token_grants[2]["constraints"] = json!({"owner":"none"});
+            let narrow = PermissionSetRepository::create(
+                &ctx.pool,
+                CreatePermissionSetInput {
+                    r#ref: format!("test.config_narrow_{suffix}"),
+                    pack: None,
+                    pack_ref: None,
+                    label: None,
+                    description: None,
+                    grants: token_grants,
+                },
+            )
+            .await?;
+            PermissionAssignmentRepository::create(
+                &ctx.pool,
+                CreatePermissionAssignmentInput {
+                    identity: editor,
+                    permset: narrow.id,
+                },
+            )
+            .await?;
+            attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
+            let execution =
+                helpers::delegated_source::token(&ctx, editor, std::slice::from_ref(&narrow.r#ref))
+                    .await?;
+            ctx.put(
+                &format!("/api/v1/rules/{rule_ref}"),
+                json!({"action_params":{"message":"{{ pack.config.private_name }}","attempt":2}}),
+                Some(&execution),
+            )
+            .await?
+            .assert_status(StatusCode::FORBIDDEN);
+            IdentityRoleAssignmentRepository::delete(&ctx.pool, member.id).await?;
+            attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
+            ctx.put(
+                &format!("/api/v1/rules/{rule_ref}"),
+                json!({"action_params":{"message":"{{ pack.config.private_name }}","attempt":3}}),
+                Some(&token),
+            )
+            .await?
+            .assert_status(StatusCode::FORBIDDEN);
+            let before = RuleRepository::find_by_ref(&ctx.pool, &rule_ref)
+                .await?
+                .unwrap();
+            ctx.put(
+                &format!("/api/v1/rules/{rule_ref}"),
+                full_form_update(&before, "Metadata after role revocation"),
+                Some(&token),
+            )
+            .await?
+            .assert_status(StatusCode::OK);
+        }
+    }
     ctx.cleanup().await?;
     Ok(())
 }

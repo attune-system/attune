@@ -861,7 +861,15 @@ pub async fn update_rule(
         &existing_rule.r#ref,
     )?;
 
-    if existing_rule.is_adhoc && (request.action_params.is_some() || request.action_ref.is_some()) {
+    if existing_rule.is_adhoc
+        && (request
+            .action_params
+            .as_ref()
+            .is_some_and(|value| value != &existing_rule.action_params)
+            || request.action_ref.is_some()
+                && (action.r#ref != existing_rule.action_ref
+                    || existing_rule.action != Some(action.id)))
+    {
         validate_action_params_with_registry(
             &state.db,
             &action,
@@ -873,7 +881,14 @@ pub async fn update_rule(
         .await?;
     }
 
-    if request.trigger_params.is_some() || request.trigger_ref.is_some() {
+    if request
+        .trigger_params
+        .as_ref()
+        .is_some_and(|value| value != &existing_rule.trigger_params)
+        || request.trigger_ref.is_some()
+            && (trigger.r#ref != existing_rule.trigger_ref
+                || existing_rule.trigger != Some(trigger.id))
+    {
         validate_trigger_params_with_registry(
             &state.db,
             &trigger,
@@ -885,15 +900,6 @@ pub async fn update_rule(
         .await?;
     }
 
-    // Behavioral edits can spend the retained owner's authority even when neither
-    // the action nor the selected refs changes. Attribution is never authority.
-    let behavioral_edit = request.action_ref.is_some()
-        || request.trigger_ref.is_some()
-        || request.conditions.is_some()
-        || request.action_params.is_some()
-        || request.trigger_params.is_some()
-        || request.trace_tag_template.is_some()
-        || request.permission_set_refs.is_some();
     let authorized_rule_id = existing_rule.id;
     let authorized_rule_pack = existing_rule.pack;
     let authorized_rule_updated = existing_rule.updated;
@@ -947,6 +953,53 @@ pub async fn update_rule(
         "rule",
         &existing_rule.r#ref,
     )?;
+    // Compare against the transactionally reread row. Full-form metadata saves
+    // carry unchanged behavior fields; their presence alone spends no authority.
+    // Rebinding a recreated ref to a new row ID is still a behavioral change.
+    let action_changed = request.action_ref.is_some()
+        && (action.r#ref != existing_rule.action_ref || existing_rule.action != Some(action.id));
+    let trigger_ref_changed = request.trigger_ref.is_some()
+        && (trigger.r#ref != existing_rule.trigger_ref
+            || existing_rule.trigger != Some(trigger.id));
+    let action_params_changed = request
+        .action_params
+        .as_ref()
+        .is_some_and(|value| value != &existing_rule.action_params);
+    let trigger_params_changed = request
+        .trigger_params
+        .as_ref()
+        .is_some_and(|value| value != &existing_rule.trigger_params);
+    let conditions_changed = request
+        .conditions
+        .as_ref()
+        .is_some_and(|value| value != &existing_rule.conditions);
+    let trace_changed = request
+        .trace_tag_template
+        .as_ref()
+        .is_some_and(|value| value != &existing_rule.trace_tag_template);
+    let permission_selection_changed = request
+        .permission_set_refs
+        .as_ref()
+        .is_some_and(|value| value != &existing_rule.permission_set_refs);
+    let placement_changed = request
+        .sensor_worker_selector
+        .as_ref()
+        .is_some_and(|value| value != &existing_rule.sensor_worker_selector)
+        || request
+            .sensor_worker_tolerations
+            .as_ref()
+            .is_some_and(|value| value != &existing_rule.sensor_worker_tolerations)
+        || request
+            .sensor_worker_affinity
+            .as_ref()
+            .is_some_and(|value| value != &existing_rule.sensor_worker_affinity);
+    let input_fields_changed = action_changed
+        || trigger_ref_changed
+        || action_params_changed
+        || trigger_params_changed
+        || conditions_changed
+        || trace_changed;
+    let behavioral_edit = input_fields_changed || permission_selection_changed || placement_changed;
     let snapshot = if user.claims.token_type == TokenType::Execution {
         Some(
             crate::authz::AuthorizationService::retain_legacy_execution_snapshot_on(&mut tx, &user)
@@ -1094,17 +1147,34 @@ pub async fn update_rule(
             })?
             .secret_paths
             .is_empty();
-            let mut context = AuthorizationContext::new(identity_id);
-            context.target_id = Some(pack_id);
-            context.target_ref = Some(existing_rule.pack_ref.clone());
-            context.pack_ref = Some(existing_rule.pack_ref.clone());
-            context.managing_pack_id = Some(pack_id);
-            if !caller.allows(Resource::Packs, Action::Read, context.clone())
-                || protected && !caller.allows(Resource::Packs, Action::Decrypt, context)
-            {
-                return Err(ApiError::Forbidden(
-                    "Rule configuration inputs exceed editor authority".into(),
-                ));
+            let target =
+                attune_common::repositories::runtime_target::RuntimeTargetRepository::resolve(
+                    &mut tx,
+                    attune_common::repositories::runtime_target::RuntimeTarget::Pack(pack_id),
+                    identity_id,
+                )
+                .await?
+                .ok_or_else(|| {
+                    ApiError::Forbidden("Rule configuration owner is unavailable".into())
+                })?;
+            let source_actions = if protected {
+                vec![Action::Read, Action::Decrypt]
+            } else {
+                vec![Action::Read]
+            };
+            for source_action in source_actions {
+                let check = AuthorizationCheck {
+                    resource: Resource::Packs,
+                    action: source_action,
+                    context: target.context().clone(),
+                };
+                if let Some(snapshot) = &snapshot {
+                    authz.authorize_with_snapshot(&user, Some(snapshot), check)?;
+                } else {
+                    // Fresh Access matching resolves actual ownership and current
+                    // owner-role membership; Execution snapshots never borrow it.
+                    authz.authorize_access_fresh(&mut tx, &user, check).await?;
+                }
             }
         }
         let expressions = attune_common::template_resolver::referenced_keystore_expressions(
@@ -1141,7 +1211,7 @@ pub async fn update_rule(
             ));
         }
     }
-    if existing_rule.is_adhoc && (request.action_params.is_some() || request.action_ref.is_some()) {
+    if existing_rule.is_adhoc && (action_params_changed || action_changed) {
         validate_rule_params_with_registry(
             &mut tx,
             &action.r#ref,
@@ -1154,7 +1224,7 @@ pub async fn update_rule(
         )
         .await?;
     }
-    if request.trigger_params.is_some() || request.trigger_ref.is_some() {
+    if trigger_params_changed || trigger_ref_changed {
         validate_rule_params_with_registry(
             &mut tx,
             &trigger.r#ref,
@@ -1168,22 +1238,11 @@ pub async fn update_rule(
         .await?;
     }
 
-    let trigger_ref_changed = request
-        .trigger_ref
-        .as_ref()
-        .is_some_and(|value| value != &existing_rule.trigger_ref);
-    let trigger_params_changed = request
-        .trigger_params
-        .as_ref()
-        .is_some_and(|value| value != &existing_rule.trigger_params);
     let enabled_after_update = request.enabled.unwrap_or(existing_rule.enabled);
     let was_enabled = existing_rule.enabled;
     let became_enabled = !was_enabled && enabled_after_update;
     let became_disabled = was_enabled && !enabled_after_update;
-    let sensor_placement = if request.sensor_worker_selector.is_some()
-        || request.sensor_worker_tolerations.is_some()
-        || request.sensor_worker_affinity.is_some()
-    {
+    let sensor_placement = if placement_changed {
         let placement = RuleSensorPlacementInput {
             selector: request
                 .sensor_worker_selector
@@ -1210,17 +1269,8 @@ pub async fn update_rule(
     let trigger_config_changed =
         trigger_ref_changed || trigger_params_changed || sensor_placement.is_some();
     let admission_changed = trigger_ref_changed || sensor_placement.is_some() || became_enabled;
-    let authority_change = !existing_rule.is_adhoc
-        && (request.action_ref.is_some() || request.permission_set_refs.is_some());
-    let input_change = !existing_rule.is_adhoc
-        && (request.action_ref.is_some()
-            || request.conditions.is_some()
-            || request.action_params.is_some()
-            || request.trigger_ref.is_some()
-            || request.trigger_params.is_some()
-            || request.trace_tag_template.is_some());
-    let policy_change =
-        !existing_rule.is_adhoc && (authority_change || input_change || sensor_placement.is_some());
+    let input_change = !existing_rule.is_adhoc && input_fields_changed;
+    let policy_change = !existing_rule.is_adhoc && behavioral_edit;
     if input_change {
         // An authorized managed behavior edit retains this purpose-specific
         // ceiling. It neither borrows the editor's Key grants nor recaptures

@@ -333,6 +333,25 @@ async fn direct_managed_edits_readmit_but_labels_need_no_key_or_runtime_grants()
             .await?
             .assert_status(StatusCode::OK);
     }
+    // The existing RuleForm echoes all fields, including unchanged enabled and
+    // placement values, when saving a label. This must not spend input/runtime
+    // authority or cause policy readmission.
+    ctx.put(
+        "/api/v1/rules/managed_api.route",
+        json!({
+            "label":"Full form metadata", "description":rule.description,
+            "action_ref":rule.action_ref, "trigger_ref":rule.trigger_ref,
+            "conditions":rule.conditions, "action_params":rule.action_params,
+            "trigger_params":rule.trigger_params, "permission_set_refs":rule.permission_set_refs,
+            "trace_tag_template":rule.trace_tag_template, "enabled":rule.enabled,
+            "sensor_worker_selector":rule.sensor_worker_selector,
+            "sensor_worker_tolerations":rule.sensor_worker_tolerations,
+            "sensor_worker_affinity":rule.sensor_worker_affinity,
+        }),
+        Some(token),
+    )
+    .await?
+    .assert_status(StatusCode::OK);
     ctx.put(
         "/api/v1/queues/managed_api.associated",
         json!({"label":"Must not authorize association"}),
@@ -496,50 +515,53 @@ async fn direct_managed_edits_readmit_but_labels_need_no_key_or_runtime_grants()
             attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(editor).await;
             attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
         }
-        let denied = ctx
-            .put(
-                "/api/v1/rules/managed_api.route",
-                json!({"trace_tag_template":"new-trace"}),
-                Some(token),
-            )
-            .await?;
-        let status = denied.status();
-        let body: serde_json::Value = denied.json().await?;
-        assert_eq!(
-            status,
-            StatusCode::FORBIDDEN,
-            "trace behavior denial: {}",
-            body["message"]
-        );
-        assert_eq!(body["code"], "FORBIDDEN");
-        assert_eq!(body["message"], expected_message);
-        eprintln!("managed rule trace edit rejected: {expected_message}");
-        let mut tx = ctx.pool.begin().await?;
-        assert_eq!(
-            serde_json::to_value(
-                RuleRepository::find_by_ref(&mut *tx, &rule.r#ref)
+        for change in [
+            json!({"trace_tag_template":"new-trace"}),
+            json!({"sensor_worker_selector":{"zone":"other"}}),
+            json!({"sensor_worker_tolerations":[{"key":"dedicated","operator":"exists"}]}),
+            json!({"sensor_worker_affinity":{"required":[{"match_labels":{"zone":"other"}}]}}),
+        ] {
+            let denied = ctx
+                .put("/api/v1/rules/managed_api.route", change, Some(token))
+                .await?;
+            let status = denied.status();
+            let body: serde_json::Value = denied.json().await?;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "trace behavior denial: {}",
+                body["message"]
+            );
+            assert_eq!(body["code"], "FORBIDDEN");
+            assert_eq!(body["message"], expected_message);
+            eprintln!("managed rule trace edit rejected: {expected_message}");
+            let mut tx = ctx.pool.begin().await?;
+            assert_eq!(
+                serde_json::to_value(
+                    RuleRepository::find_by_ref(&mut *tx, &rule.r#ref)
+                        .await?
+                        .unwrap()
+                )?,
+                serde_json::to_value(&before_trace)?,
+                "rejected edit must leave the whole rule unchanged"
+            );
+            assert_eq!(
+                RuntimeAuthorityRepository::current_policy(&mut tx, pack.id)
                     .await?
                     .unwrap()
-            )?,
-            serde_json::to_value(&before_trace)?,
-            "rejected edit must leave the whole rule unchanged"
-        );
-        assert_eq!(
-            RuntimeAuthorityRepository::current_policy(&mut tx, pack.id)
-                .await?
-                .unwrap()
-                .id,
-            target_policy.id,
-            "rejected edit must not readmit runtime authority"
-        );
-        let unchanged_input_revision: i64 = sqlx::query_scalar(
-            "SELECT revision FROM rule_runtime_authority_current WHERE rule = $1",
-        )
-        .bind(rule.id)
-        .fetch_one(&mut *tx)
-        .await?;
-        assert_eq!(unchanged_input_revision, input_revision);
-        tx.rollback().await?;
+                    .id,
+                target_policy.id,
+                "rejected edit must not readmit runtime authority"
+            );
+            let unchanged_input_revision: i64 = sqlx::query_scalar(
+                "SELECT revision FROM rule_runtime_authority_current WHERE rule = $1",
+            )
+            .bind(rule.id)
+            .fetch_one(&mut *tx)
+            .await?;
+            assert_eq!(unchanged_input_revision, input_revision);
+            tx.rollback().await?;
+        }
     }
     // Grant precisely the retained deployment input ceiling, rather than
     // borrowing the pack owner's IAM or recapturing a live authoring definition.
