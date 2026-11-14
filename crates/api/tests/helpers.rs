@@ -372,7 +372,7 @@ impl TestContext {
                 label: Some("Admin".to_string()),
                 description: Some("Test admin permission set".to_string()),
                 grants: json!([
-                    {"resource": "identities", "actions": ["read", "create", "update", "delete"]},
+                    {"resource": "identities", "actions": ["read", "create", "update", "delete", "manage"]},
                     {"resource": "permissions", "actions": ["read", "create", "update", "delete", "manage"]},
                     {"resource": "packs", "actions": ["read", "create", "install", "update", "configure", "delete"]}
                 ]),

@@ -282,9 +282,13 @@ pub struct CreateIdentityRequest {
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct UpdateIdentityRequest {
+    /// Profile field; requires identities:update on the target.
     pub display_name: Option<String>,
+    /// Password reset; requires identities:manage on the target.
     pub password: Option<String>,
+    /// Authorization/provider attributes; requires identities:manage on the target.
     pub attributes: Option<JsonValue>,
+    /// Administrative freeze state; requires identities:manage on the target.
     pub frozen: Option<bool>,
 }
 

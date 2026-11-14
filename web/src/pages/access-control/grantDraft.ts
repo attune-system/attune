@@ -44,7 +44,7 @@ export const RESOURCE_ACTIONS: Record<string, string[]> = {
   workers: ["read", "manage"],
   dashboards: ["read", "create", "update", "delete"],
   retention: ["read", "update"],
-  identities: ["read", "create", "update", "delete"],
+  identities: ["read", "create", "update", "delete", "manage"],
   permissions: ["read", "manage"],
   audit_log: ["read"],
 } satisfies Record<RbacResource, string[]>;
@@ -76,8 +76,14 @@ export const COMPONENT_SCOPED_RESOURCES = new Set([
   "queue_items",
   "events",
   "inquiries",
+  "identities",
 ]);
-export const OWNER_SCOPED_RESOURCES = new Set(["packs", "keys", "artifacts"]);
+export const OWNER_SCOPED_RESOURCES = new Set([
+  "packs",
+  "keys",
+  "artifacts",
+  "identities",
+]);
 export const OWNER_TYPE_RESOURCES = new Set(["keys", "artifacts", "caches"]);
 // Owner-reference selectors narrow structural ownership; they never establish it.
 export const OWNER_REF_RESOURCES = new Set(["caches", "keys", "artifacts"]);

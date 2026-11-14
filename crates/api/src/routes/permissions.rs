@@ -170,7 +170,7 @@ pub async fn get_identity(
     RequireAuth(user): RequireAuth,
     Path(identity_id): Path<i64>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_permissions(&state, &user, Resource::Identities, Action::Read).await?;
+    authorize_identity_target(&state, &user, identity_id, Action::Read).await?;
 
     let identity = IdentityRepository::find_by_id(&state.db, identity_id)
         .await?
@@ -275,7 +275,24 @@ pub async fn update_identity(
     Path(identity_id): Path<i64>,
     Json(request): Json<UpdateIdentityRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_permissions(&state, &user, Resource::Identities, Action::Update).await?;
+    // Sensitive fields require explicit identity administration, including on self.
+    // Check every requested capability before hashing or writing any field.
+    if request.display_name.is_some()
+        || (request.password.is_none() && request.attributes.is_none() && request.frozen.is_none())
+    {
+        authorize_identity_target(&state, &user, identity_id, Action::Update).await?;
+    }
+    if request.password.is_some() || request.attributes.is_some() || request.frozen.is_some() {
+        authorize_identity_target(&state, &user, identity_id, Action::Manage).await?;
+    }
+    let caller_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".into()))?;
+    if caller_id == identity_id && request.frozen == Some(true) {
+        return Err(ApiError::BadRequest(
+            "Refusing to freeze the currently authenticated identity".into(),
+        ));
+    }
 
     let existing = IdentityRepository::find_by_id(&state.db, identity_id)
         .await?
@@ -297,6 +314,11 @@ pub async fn update_identity(
         },
     )
     .await?;
+
+    if existing.attributes != identity.attributes || existing.frozen != identity.frozen {
+        publish_identity_authorization_metadata_change(&state, identity_id, "identity_updated")
+            .await;
+    }
 
     emit_admin_audit(
         &state,
@@ -341,7 +363,7 @@ pub async fn delete_identity(
     RequireAuth(user): RequireAuth,
     Path(identity_id): Path<i64>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_permissions(&state, &user, Resource::Identities, Action::Delete).await?;
+    authorize_identity_target(&state, &user, identity_id, Action::Delete).await?;
 
     let caller_identity_id = user
         .identity_id()
@@ -1181,7 +1203,7 @@ pub async fn list_integration_tokens(
     RequireAuth(user): RequireAuth,
     Path(identity_id): Path<i64>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_permissions(&state, &user, Resource::Identities, Action::Read).await?;
+    authorize_identity_target(&state, &user, identity_id, Action::Read).await?;
     ensure_identity_exists(&state, identity_id).await?;
 
     let tokens = IntegrationTokenRepository::list_by_identity(&state.db, identity_id).await?;
@@ -1213,7 +1235,7 @@ pub async fn create_integration_token(
     Path(identity_id): Path<i64>,
     Json(request): Json<CreateIntegrationTokenRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_permissions(&state, &user, Resource::Identities, Action::Update).await?;
+    authorize_identity_target(&state, &user, identity_id, Action::Manage).await?;
     request.validate()?;
     ensure_identity_exists(&state, identity_id).await?;
 
@@ -1292,7 +1314,7 @@ pub async fn revoke_integration_token(
     Path((identity_id, token_id)): Path<(i64, i64)>,
     Json(request): Json<RevokeIntegrationTokenRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_permissions(&state, &user, Resource::Identities, Action::Update).await?;
+    authorize_identity_target(&state, &user, identity_id, Action::Manage).await?;
     request.validate()?;
     ensure_token_belongs_to_identity(&state, identity_id, token_id).await?;
 
@@ -1346,7 +1368,7 @@ pub async fn delete_integration_token(
     RequireAuth(user): RequireAuth,
     Path((identity_id, token_id)): Path<(i64, i64)>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_permissions(&state, &user, Resource::Identities, Action::Update).await?;
+    authorize_identity_target(&state, &user, identity_id, Action::Manage).await?;
     let token = ensure_token_belongs_to_identity(&state, identity_id, token_id).await?;
 
     let deleted = IntegrationTokenRepository::delete(&state.db, token_id).await?;
@@ -1466,6 +1488,38 @@ async fn authorize_permissions(
                 resource,
                 action,
                 context: AuthorizationContext::new(identity_id),
+            },
+        )
+        .await
+}
+
+/// Resolve scope from the persisted target, never from the requesting identity.
+async fn authorize_identity_target(
+    state: &Arc<AppState>,
+    user: &crate::auth::middleware::AuthenticatedUser,
+    target_id: i64,
+    action: Action,
+) -> ApiResult<()> {
+    let target = IdentityRepository::find_by_id(&state.db, target_id)
+        .await?
+        .ok_or_else(|| ApiError::Forbidden("Identity access denied".into()))?;
+    let caller = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".into()))?;
+    let mut context = AuthorizationContext::new(caller);
+    context.target_id = Some(target.id);
+    context.target_ref = Some(target.login);
+    context.owner_identity_id = Some(target.id);
+    context.owner_type = Some(attune_common::models::OwnerType::Identity);
+    context.owner_ref = Some(target.id.to_string());
+    state
+        .authorization_service()
+        .authorize(
+            user,
+            AuthorizationCheck {
+                resource: Resource::Identities,
+                action,
+                context,
             },
         )
         .await
@@ -1809,7 +1863,7 @@ async fn set_identity_frozen(
     identity_id: i64,
     frozen: bool,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_permissions(state, user, Resource::Identities, Action::Update).await?;
+    authorize_identity_target(state, user, identity_id, Action::Manage).await?;
 
     let caller_identity_id = user
         .identity_id()
@@ -1835,6 +1889,8 @@ async fn set_identity_frozen(
         },
     )
     .await?;
+
+    publish_identity_authorization_metadata_change(state, identity_id, "identity_frozen").await;
 
     emit_admin_audit(
         state,

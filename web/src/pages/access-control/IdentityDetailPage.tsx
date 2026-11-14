@@ -1218,8 +1218,8 @@ export default function IdentityDetailPage() {
                   No integration tokens
                 </p>
                 <p className="text-xs text-gray-400 mt-1">
-                  Create a token to enable passwordless API login for an
-                  integration.
+                  Creating tokens requires identities:manage for this identity
+                  and enables passwordless API login with its authority.
                 </p>
               </div>
             )}

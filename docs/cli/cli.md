@@ -475,7 +475,7 @@ mutation request. They do not prove that a later mutation will be authorized.
 Permission inspection requires `permissions:read`. Permission-set updates,
 assignments, and role membership changes require `permissions:manage`.
 Identity inspection and identity-target resolution require `identities:read`.
-Freeze and unfreeze require `identities:update`.
+Freeze and unfreeze require `identities:manage`.
 The API enforces authorization for every request.
 
 ### Pack Management
