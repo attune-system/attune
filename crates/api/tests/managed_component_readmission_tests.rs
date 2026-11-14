@@ -333,6 +333,25 @@ async fn direct_managed_edits_readmit_but_labels_need_no_key_or_runtime_grants()
             .await?
             .assert_status(StatusCode::OK);
     }
+    // The existing RuleForm echoes all fields, including unchanged enabled and
+    // placement values, when saving a label. This must not spend input/runtime
+    // authority or cause policy readmission.
+    ctx.put(
+        "/api/v1/rules/managed_api.route",
+        json!({
+            "label":"Full form metadata", "description":rule.description,
+            "action_ref":rule.action_ref, "trigger_ref":rule.trigger_ref,
+            "conditions":rule.conditions, "action_params":rule.action_params,
+            "trigger_params":rule.trigger_params, "permission_set_refs":rule.permission_set_refs,
+            "trace_tag_template":rule.trace_tag_template, "enabled":rule.enabled,
+            "sensor_worker_selector":rule.sensor_worker_selector,
+            "sensor_worker_tolerations":rule.sensor_worker_tolerations,
+            "sensor_worker_affinity":rule.sensor_worker_affinity,
+        }),
+        Some(token),
+    )
+    .await?
+    .assert_status(StatusCode::OK);
     ctx.put(
         "/api/v1/queues/managed_api.associated",
         json!({"label":"Must not authorize association"}),
@@ -449,13 +468,155 @@ async fn direct_managed_edits_readmit_but_labels_need_no_key_or_runtime_grants()
         "managed_api.other"
     );
     tx.rollback().await?;
-    ctx.put(
-        "/api/v1/rules/managed_api.route",
-        json!({"trace_tag_template":"new-trace"}),
-        Some(token),
+    // Labels above need only Update. This trace edit changes behavior and must
+    // be authorized by the editor, independently of the managed runtime owner.
+    let before_trace = RuleRepository::find_by_ref(&ctx.pool, &rule.r#ref)
+        .await?
+        .unwrap();
+    let mut tx = ctx.pool.begin().await?;
+    let captured_inputs =
+        attune_common::repositories::rule_authority::RuleAuthorityRepository::current(
+            &mut tx,
+            &before_trace,
+        )
+        .await?
+        .ok_or("managed rule input capture missing")?;
+    tx.rollback().await?;
+    assert!(!captured_inputs.input_grants.is_empty());
+    for (grant_execute, expected_message) in [
+        (false, "Insufficient permissions: actions:execute"),
+        (
+            true,
+            "Changing deployed rule inputs requires authority over its captured input grants",
+        ),
+    ] {
+        if grant_execute {
+            let execute = PermissionSetRepository::create(
+                &ctx.pool,
+                CreatePermissionSetInput {
+                    r#ref: "managed_api.rule_editor_execute".into(),
+                    pack: Some(pack.id),
+                    pack_ref: Some(pack.r#ref.clone()),
+                    label: None,
+                    description: None,
+                    grants: json!([{"resource":"actions","actions":["execute"],
+                    "constraints":{"refs":[leaf.r#ref]}}]),
+                },
+            )
+            .await?;
+            PermissionAssignmentRepository::create(
+                &ctx.pool,
+                CreatePermissionAssignmentInput {
+                    identity: editor,
+                    permset: execute.id,
+                },
+            )
+            .await?;
+            attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(editor).await;
+            attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
+        }
+        for change in [
+            json!({"trace_tag_template":"new-trace"}),
+            json!({"sensor_worker_selector":{"zone":"other"}}),
+            json!({"sensor_worker_tolerations":[{"key":"dedicated","operator":"exists"}]}),
+            json!({"sensor_worker_affinity":{"required":[{"match_labels":{"zone":"other"}}]}}),
+        ] {
+            let denied = ctx
+                .put("/api/v1/rules/managed_api.route", change, Some(token))
+                .await?;
+            let status = denied.status();
+            let body: serde_json::Value = denied.json().await?;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "trace behavior denial: {}",
+                body["error"]
+            );
+            assert_eq!(body["code"], "FORBIDDEN");
+            assert_eq!(body["error"], expected_message);
+            eprintln!("managed rule trace edit rejected: {expected_message}");
+            let mut tx = ctx.pool.begin().await?;
+            assert_eq!(
+                serde_json::to_value(
+                    RuleRepository::find_by_ref(&mut *tx, &rule.r#ref)
+                        .await?
+                        .unwrap()
+                )?,
+                serde_json::to_value(&before_trace)?,
+                "rejected edit must leave the whole rule unchanged"
+            );
+            assert_eq!(
+                RuntimeAuthorityRepository::current_policy(&mut tx, pack.id)
+                    .await?
+                    .unwrap()
+                    .id,
+                target_policy.id,
+                "rejected edit must not readmit runtime authority"
+            );
+            let unchanged_input_revision: i64 = sqlx::query_scalar(
+                "SELECT revision FROM rule_runtime_authority_current WHERE rule = $1",
+            )
+            .bind(rule.id)
+            .fetch_one(&mut *tx)
+            .await?;
+            assert_eq!(unchanged_input_revision, input_revision);
+            tx.rollback().await?;
+        }
+    }
+    // Assign the existing deployed set only after proving its effective grants
+    // equal the retained input ceiling. Structural IDs in captured grants are
+    // server-owned and must not be copied into a new authored policy definition.
+    let inputs = PermissionSetRepository::find_by_ref(&ctx.pool, "managed_api.inputs")
+        .await?
+        .ok_or("deployed input permission set missing")?;
+    assert_eq!(
+        inputs.grants,
+        serde_json::to_value(&captured_inputs.input_grants)?,
+        "fixture assignment must cover exactly the retained input grants"
+    );
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: editor,
+            permset: inputs.id,
+        },
     )
-    .await?
-    .assert_status(StatusCode::OK);
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(editor).await;
+    attune_api::authz::AuthorizationService::invalidate_permission_set_caches().await;
+    let covered = ctx
+        .put(
+            "/api/v1/rules/managed_api.route",
+            json!({"trace_tag_template":"new-trace"}),
+            Some(token),
+        )
+        .await?;
+    let status = covered.status();
+    let body: serde_json::Value = covered.json().await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "covered trace behavior update: {}",
+        body["error"]
+    );
+    let updated_rule = RuleRepository::find_by_ref(&ctx.pool, &rule.r#ref)
+        .await?
+        .unwrap();
+    assert_eq!(
+        updated_rule.trace_tag_template.as_deref(),
+        Some("new-trace")
+    );
+    assert_eq!(updated_rule.owner_identity, before_trace.owner_identity);
+    let mut tx = ctx.pool.begin().await?;
+    assert_ne!(
+        RuntimeAuthorityRepository::current_policy(&mut tx, pack.id)
+            .await?
+            .unwrap()
+            .id,
+        target_policy.id,
+        "covered rule trace edit must independently readmit runtime authority"
+    );
+    tx.rollback().await?;
     let repaired = ctx
         .put(
             "/api/v1/workflows/managed_api.flow",
