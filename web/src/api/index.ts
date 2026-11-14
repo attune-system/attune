@@ -248,6 +248,7 @@ export { LabelExpressionOperator } from "./models/LabelExpressionOperator";
 export type { LdapLoginRequest } from "./models/LdapLoginRequest";
 export type { LogAvailability } from "./models/LogAvailability";
 export { LogAvailabilityState } from "./models/LogAvailabilityState";
+export type { LoginExchangeRequest } from "./models/LoginExchangeRequest";
 export type { LoginRequest } from "./models/LoginRequest";
 export type { LogRetentionLimitPatch } from "./models/LogRetentionLimitPatch";
 export type { LogRetentionPolicyPatch } from "./models/LogRetentionPolicyPatch";

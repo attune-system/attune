@@ -8,6 +8,7 @@ import type { DeviceWaitReason } from "../models/DeviceWaitReason";
 import type { EffectivePermissionResponse } from "../models/EffectivePermissionResponse";
 import type { InternalCreateSensorTokenRequest } from "../models/InternalCreateSensorTokenRequest";
 import type { LdapLoginRequest } from "../models/LdapLoginRequest";
+import type { LoginExchangeRequest } from "../models/LoginExchangeRequest";
 import type { LoginRequest } from "../models/LoginRequest";
 import type { ProviderProfileResponse } from "../models/ProviderProfileResponse";
 import type { RefreshTokenRequest } from "../models/RefreshTokenRequest";
@@ -74,6 +75,25 @@ export class AuthService {
         400: `Validation error`,
         401: `Invalid current password or unauthorized`,
         404: `Identity not found`,
+      },
+    });
+  }
+  /**
+   * @returns any Browser login exchanged
+   * @throws ApiError
+   */
+  public static loginExchange({
+    requestBody,
+  }: {
+    requestBody: LoginExchangeRequest;
+  }): CancelablePromise<any> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/auth/exchange",
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        401: `Invalid exchange`,
       },
     });
   }
@@ -557,6 +577,23 @@ export class AuthService {
         400: `Validation error`,
         409: `User already exists`,
       },
+    });
+  }
+  /**
+   * Revoke a local/CLI session using its refresh credential, including a previously rotated token.
+   * @returns any Session revoked
+   * @throws ApiError
+   */
+  public static logoutSession({
+    requestBody,
+  }: {
+    requestBody: RefreshTokenRequest;
+  }): CancelablePromise<any> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/auth/session/logout",
+      body: requestBody,
+      mediaType: "application/json",
     });
   }
   /**

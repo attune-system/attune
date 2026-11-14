@@ -1,3 +1,4 @@
+import { refreshSession } from "./session-refresh";
 import axios, {
   type AxiosError,
   type AxiosInstance,
@@ -5,18 +6,6 @@ import axios, {
 } from "axios";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "";
-
-// A bare axios instance with NO interceptors, used exclusively for token refresh
-// requests. This prevents infinite loops when the refresh endpoint returns 401.
-const refreshClient = axios.create({
-  baseURL: API_BASE_URL || undefined,
-  timeout: 10000,
-  headers: { "Content-Type": "application/json" },
-});
-
-function getRefreshUrl(): string {
-  return API_BASE_URL ? `${API_BASE_URL}/auth/refresh` : "/auth/refresh";
-}
 
 // Clear auth state and redirect to the login page.
 function clearSessionAndRedirect(): void {
@@ -69,30 +58,7 @@ apiClient.interceptors.response.use(
       originalRequest._retry = true;
 
       try {
-        const refreshToken = localStorage.getItem("refresh_token");
-        if (!refreshToken) {
-          console.warn("No refresh token available, redirecting to login");
-          throw new Error("No refresh token available");
-        }
-
-        // Use the bare refreshClient (no interceptors) to avoid infinite loops
-        const response = await refreshClient.post(getRefreshUrl(), {
-          refresh_token: refreshToken,
-        });
-
-        const { access_token, refresh_token: newRefreshToken } =
-          response.data.data;
-
-        // Save new tokens
-        localStorage.setItem("access_token", access_token);
-        if (newRefreshToken) {
-          localStorage.setItem("refresh_token", newRefreshToken);
-        }
-        try {
-          window.dispatchEvent(new CustomEvent("auth:token-changed"));
-        } catch {
-          // Older browsers — best-effort.
-        }
+        const access_token = await refreshSession();
 
         // Retry original request with new token
         if (originalRequest.headers) {

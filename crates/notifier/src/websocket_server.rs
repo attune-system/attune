@@ -39,7 +39,9 @@ use attune_common::{
         },
         execution::ExecutionRepository,
         identity::{IdentityRepository, IdentityRoleAssignmentRepository, PermissionSetRepository},
+        inquiry::InquiryRepository,
         rule::RuleRepository,
+        work_queue::{WorkQueueItemRepository, WorkQueueRepository},
         FindById, FindByRef,
     },
 };
@@ -48,6 +50,8 @@ use crate::recorded_authority::RecordedConnection;
 use crate::service::Notification;
 use crate::subscriber_manager::{ClientId, SubscriberManager, SubscriptionFilter};
 mod human_delivery;
+#[cfg(test)]
+mod target_authorization_tests;
 
 /// Role name that grants the holder unrestricted filter ACL (e.g. ability to
 /// subscribe to `User(other_id)` filters for arbitrary identities).
@@ -461,7 +465,7 @@ async fn filter_allowed_for_identity(
                 .all(|resource| has_stream_read_access(grants, token_type, resource, identity_id))
         }
         SubscriptionFilter::EntityType(entity_type) => entity_type_resource(entity_type)
-            .is_none_or(|resource| {
+            .is_some_and(|resource| {
                 has_stream_read_access(grants, token_type, resource, identity_id)
             }),
         SubscriptionFilter::Entity {
@@ -469,20 +473,39 @@ async fn filter_allowed_for_identity(
             entity_id,
         } => {
             let Some(resource) = entity_type_resource(entity_type) else {
-                return true;
+                return false;
             };
             if allows_baseline_collection_read(token_type, resource) {
                 return true;
             }
-            let Some(ctx) =
-                operational_entity_context(db_pool, identity_id, entity_type, *entity_id).await
+            let Some(ctx) = operational_entity_context(
+                db_pool,
+                identity_id,
+                token_type,
+                entity_type,
+                *entity_id,
+            )
+            .await
             else {
                 return false;
             };
-            has_operational_read(grants, resource, ctx)
+            if entity_type == "inquiry"
+                && *token_type == TokenType::Access
+                && inquiry_participant(db_pool, identity_id, *entity_id).await
+            {
+                return true;
+            }
+            if matches!(entity_type.as_str(), "work_queue" | "work_queue_item")
+                && !queue_notification_visible(db_pool, grants, &ctx, entity_type).await
+            {
+                return false;
+            }
+            has_operational_read(grants, resource, ctx.clone())
+                || (resource == Resource::QueueItems
+                    && has_operational_read(grants, Resource::Queues, ctx))
         }
         SubscriptionFilter::NotificationType(notification_type) => {
-            notification_type_resource(notification_type).is_none_or(|resource| {
+            notification_type_resource(notification_type).is_some_and(|resource| {
                 has_stream_read_access(grants, token_type, resource, identity_id)
             })
         }
@@ -504,7 +527,15 @@ fn has_stream_read_access(
     resource: Resource,
     identity_id: i64,
 ) -> bool {
-    allows_baseline_collection_read(token_type, resource)
+    // Admission to an inquiry stream is not a read grant: Access identities
+    // may be participants; each delivered inquiry checks persisted membership.
+    (*token_type == TokenType::Access && resource == Resource::Inquiries)
+        || (resource == Resource::QueueItems && resource_action_grant_exists(grants, Resource::Queues, Action::Read))
+        || allows_baseline_collection_read(token_type, resource)
+        // A stream may select many targets; scoped grants are checked again for
+        // each concrete notification, never against an empty target context.
+        || (matches!(resource, Resource::Queues | Resource::QueueItems | Resource::Inquiries)
+            && resource_action_grant_exists(grants, resource, Action::Read))
         || has_operational_read(grants, resource, AuthorizationContext::new(identity_id))
 }
 
@@ -525,29 +556,39 @@ fn entity_type_resource(entity_type: &str) -> Option<Resource> {
         "execution" => Some(Resource::Executions),
         "artifact" => Some(Resource::Artifacts),
         "rule_lifecycle" => Some(Resource::Rules),
+        "work_queue" => Some(Resource::Queues),
+        "work_queue_item" => Some(Resource::QueueItems),
+        "inquiry" => Some(Resource::Inquiries),
+        _ => None,
+    }
+}
+
+// Exact publisher catalog: new streams must acquire an explicit authorization
+// mapping before they can be subscribed to or delivered.
+fn notification_entity_type(notification_type: &str) -> Option<&'static str> {
+    match notification_type {
+        "event_created" => Some("event"),
+        "enforcement_created" | "enforcement_status_changed" => Some("enforcement"),
+        "execution_created" | "execution_status_changed" | "workflow_execution_status_changed" => {
+            Some("execution")
+        }
+        "artifact_created" | "artifact_updated" => Some("artifact"),
+        "rule_lifecycle_changed" => Some("rule_lifecycle"),
+        "work_queue_created" | "work_queue_updated" => Some("work_queue"),
+        "work_queue_item_created" | "work_queue_item_updated" => Some("work_queue_item"),
+        "inquiry_created" | "inquiry_responded" | "inquiry_timeout" => Some("inquiry"),
         _ => None,
     }
 }
 
 fn notification_type_resource(notification_type: &str) -> Option<Resource> {
-    if notification_type == "rule_lifecycle_changed" {
-        Some(Resource::Rules)
-    } else if notification_type.contains("event") {
-        Some(Resource::Events)
-    } else if notification_type.contains("enforcement") {
-        Some(Resource::Enforcements)
-    } else if notification_type.contains("execution") {
-        Some(Resource::Executions)
-    } else if notification_type.contains("artifact") {
-        Some(Resource::Artifacts)
-    } else {
-        None
-    }
+    entity_type_resource(notification_entity_type(notification_type)?)
 }
 
 async fn operational_entity_context(
     db_pool: &PgPool,
     identity_id: i64,
+    token_type: &TokenType,
     entity_type: &str,
     entity_id: i64,
 ) -> Option<AuthorizationContext> {
@@ -611,6 +652,64 @@ async fn operational_entity_context(
                     .map(|(pack, _)| pack.to_string()),
                 _ => None,
             };
+        }
+        "work_queue" | "work_queue_item" => {
+            // Item grants use the parent queue's ID/ref, as the queue-item API
+            // does. A copied queue_ref in the item/notification is not authority.
+            let queue_id = if entity_type == "work_queue_item" {
+                WorkQueueItemRepository::find_by_id(db_pool, entity_id)
+                    .await
+                    .ok()
+                    .flatten()?
+                    .queue
+            } else {
+                entity_id
+            };
+            let queue = WorkQueueRepository::find_by_id(db_pool, queue_id)
+                .await
+                .ok()
+                .flatten()?;
+            ctx.target_id = Some(queue.id);
+            ctx.target_ref = Some(queue.r#ref);
+            ctx.pack_ref = queue.pack_ref;
+            use attune_common::repositories::{
+                iam_ownership::IamOwnershipRepository, runtime_target::ComponentTarget,
+            };
+            ctx.managing_pack_id =
+                IamOwnershipRepository::component_pack(db_pool, ComponentTarget::Queue, queue.id)
+                    .await
+                    .ok()?;
+            IamOwnershipRepository::populate_pack_owner(db_pool, Resource::Queues, &mut ctx)
+                .await
+                .ok()?;
+            IamOwnershipRepository::populate_pack_role_membership(
+                db_pool,
+                Resource::Queues,
+                &mut ctx,
+                *token_type == TokenType::Access,
+            )
+            .await
+            .ok()?;
+        }
+        "inquiry" => {
+            let inquiry = InquiryRepository::find_by_id(db_pool, entity_id)
+                .await
+                .ok()
+                .flatten()?;
+            ctx.target_ref = Some(format!("inquiry:{entity_id}"));
+            if let Some(execution) =
+                ExecutionRepository::find_by_id(db_pool, inquiry.created_by_execution)
+                    .await
+                    .ok()
+                    .flatten()
+            {
+                ctx.pack_ref = execution
+                    .action_ref
+                    .split_once('.')
+                    .map(|(pack, _)| pack.to_string());
+                ctx.owner_identity_id = execution.executor;
+                ctx.execution_owner_identity_id = execution.executor;
+            }
         }
         "rule_lifecycle" => {
             let rule = RuleRepository::find_by_id(db_pool, entity_id)
@@ -767,6 +866,11 @@ async fn notification_allowed_for_identity(
     if is_token_expired(auth.token_exp, chrono::Utc::now().timestamp()) {
         return false;
     }
+    if notification_entity_type(&notification.notification_type)
+        != Some(notification.entity_type.as_str())
+    {
+        return false;
+    }
     if let Some(recorded) = &auth.recorded {
         return recorded.permits(db_pool, notification).await;
     }
@@ -793,8 +897,95 @@ async fn notification_allowed_for_identity(
         "rule_lifecycle" => {
             rule_lifecycle_notification_readable(auth, db_pool, notification.entity_id).await
         }
-        _ => true,
+        "work_queue" | "work_queue_item" | "inquiry" => {
+            let Some(mut ctx) = operational_entity_context(
+                db_pool,
+                auth.identity_id,
+                &auth.token_type,
+                &notification.entity_type,
+                notification.entity_id,
+            )
+            .await
+            else {
+                return false;
+            };
+            ctx.identity_attributes = auth.identity_attributes.clone();
+            if notification.entity_type == "inquiry"
+                && auth.token_type == TokenType::Access
+                && inquiry_participant(db_pool, auth.identity_id, notification.entity_id).await
+            {
+                return true;
+            }
+            if matches!(
+                notification.entity_type.as_str(),
+                "work_queue" | "work_queue_item"
+            ) && !queue_notification_visible(
+                db_pool,
+                &auth.grants,
+                &ctx,
+                &notification.entity_type,
+            )
+            .await
+            {
+                return false;
+            }
+            let Some(resource) = entity_type_resource(&notification.entity_type) else {
+                return false;
+            };
+            has_operational_read(&auth.grants, resource, ctx.clone())
+                || (resource == Resource::QueueItems
+                    && has_operational_read(&auth.grants, Resource::Queues, ctx))
+        }
+        _ => false,
     }
+}
+
+// Subscription admission and delivery must use the same private-queue predicate:
+// otherwise success/error at entity subscription is an existence oracle.
+async fn queue_notification_visible(
+    pool: &PgPool,
+    grants: &[Grant],
+    ctx: &AuthorizationContext,
+    entity_type: &str,
+) -> bool {
+    let Some(queue_id) = ctx.target_id else {
+        return false;
+    };
+    let Ok(Some(queue)) = WorkQueueRepository::find_by_id(pool, queue_id).await else {
+        return false;
+    };
+    attune_common::action_visibility::queue_reference_allowed(&queue, None)
+        || [Action::Update, Action::Delete].into_iter().any(|action| {
+            grants
+                .iter()
+                .any(|grant| grant.allows(Resource::Queues, action, ctx))
+        })
+        || (entity_type == "work_queue_item"
+            && grants.iter().any(|grant| {
+                grant.constraints.as_ref().is_some_and(|c| {
+                    c.ids.as_ref().is_some_and(|ids| ids.contains(&queue.id))
+                        || c.refs
+                            .as_ref()
+                            .is_some_and(|refs| refs.contains(&queue.r#ref))
+                        || c.pack_refs.as_ref().is_some_and(|refs| {
+                            queue.pack_ref.as_ref().is_some_and(|p| refs.contains(p))
+                        })
+                }) && grant.allows(Resource::QueueItems, Action::Read, ctx)
+            }))
+}
+
+async fn inquiry_participant(pool: &PgPool, identity_id: i64, inquiry_id: i64) -> bool {
+    let Ok(Some(inquiry)) = InquiryRepository::find_by_id(pool, inquiry_id).await else {
+        return false;
+    };
+    if inquiry.assigned_to == Some(identity_id) {
+        return true;
+    }
+    ExecutionRepository::find_by_id(pool, inquiry.created_by_execution)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|execution| execution.executor == Some(identity_id))
 }
 
 fn resource_action_grant_exists(grants: &[Grant], resource: Resource, action: Action) -> bool {
@@ -1659,6 +1850,14 @@ fn parse_subscription_filter(filter_str: &str) -> Result<SubscriptionFilter> {
         anyhow::bail!("Invalid filter format: {}", filter_str);
     }
 
+    // This parser precedes both identity IAM and recorded-credential filter
+    // admission. Neither credential family can subscribe to a future stream
+    // before it has an explicit catalog mapping.
+    if (matches!(parts[0], "entity_type" | "entity") && entity_type_resource(parts[1]).is_none())
+        || (parts[0] == "notification_type" && notification_type_resource(parts[1]).is_none())
+    {
+        anyhow::bail!("Unknown subscription entity or notification type");
+    }
     match parts[0] {
         "entity_type" => Ok(SubscriptionFilter::EntityType(parts[1].to_string())),
         "notification_type" => Ok(SubscriptionFilter::NotificationType(parts[1].to_string())),

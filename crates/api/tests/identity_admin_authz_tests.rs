@@ -48,6 +48,18 @@ async fn profile_editor_cannot_take_over_admin_or_change_authorization() {
         .await
         .unwrap();
     let target = ctx.user.as_ref().unwrap().id;
+    // Exercise a real persisted session across denied profile-editor attempts
+    // and an authorized administrative reset, not just the access-token fixture.
+    let prior_login = ctx
+        .post(
+            "/auth/login",
+            json!({"login":ctx.user.as_ref().unwrap().login,"password":"TestPassword123!"}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(prior_login.status(), StatusCode::OK);
+    let prior_login: Value = prior_login.json().await.unwrap();
     let editor_token = ctx.create_test_user("profile_editor").await.unwrap();
     let editor = IdentityRepository::find_by_login(&ctx.pool, "profile_editor")
         .await
@@ -123,6 +135,19 @@ async fn profile_editor_cannot_take_over_admin_or_change_authorization() {
     assert_eq!(after.frozen, before.frozen);
     assert_eq!(after.display_name.as_deref(), Some("Profile"));
 
+    // Rejected credential writes and a permitted display-name change must
+    // leave the existing session usable.
+    let rotated = ctx
+        .post(
+            "/auth/refresh",
+            json!({"refresh_token":prior_login["data"]["refresh_token"]}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rotated.status(), StatusCode::OK);
+    let rotated: Value = rotated.json().await.unwrap();
+
     // Explicit admin authority still supports recovery and token lifecycle.
     assert_eq!(
         ctx.put(
@@ -140,6 +165,18 @@ async fn profile_editor_cannot_take_over_admin_or_change_authorization() {
         .unwrap()
         .unwrap();
     assert_ne!(after.password_hash, before.password_hash);
+    // The same admin endpoint's hash write must atomically revoke the family.
+    assert_eq!(
+        ctx.post(
+            "/auth/refresh",
+            json!({"refresh_token":rotated["data"]["refresh_token"]}),
+            None,
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
     let recovered = ctx
         .post(
             "/auth/login",
@@ -150,6 +187,17 @@ async fn profile_editor_cannot_take_over_admin_or_change_authorization() {
         .unwrap();
     assert_eq!(recovered.status(), StatusCode::OK);
     let recovered: Value = recovered.json().await.unwrap();
+    assert_eq!(
+        ctx.post(
+            "/auth/refresh",
+            json!({"refresh_token":recovered["data"]["refresh_token"]}),
+            None,
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::OK
+    );
     let recovered_token = recovered["data"]["access_token"].as_str().unwrap();
     let response = ctx
         .post(

@@ -43,6 +43,14 @@ fn setup(home: &std::path::Path, url: &str) -> std::path::PathBuf {
     path
 }
 async fn login_mock(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(request_path("/auth/session/logout"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"data":{"message":"Session revoked"}})),
+        )
+        .mount(server)
+        .await;
+
     Mock::given(method("GET"))
         .and(request_path("/auth/settings"))
         .respond_with(
@@ -457,4 +465,39 @@ async fn login_rejects_concurrent_profile_deletion_for_all_login_methods() {
     ] {
         assert_login_rejects_concurrent_profile_change(flow, true).await;
     }
+}
+
+#[tokio::test]
+async fn encrypted_profile_logout_revokes_before_removing_credentials() {
+    let server = MockServer::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let file = setup(home.path(), &server.uri());
+    login_mock(&server).await;
+    run(
+        home.path(),
+        &[
+            "auth",
+            "login",
+            "--username",
+            "alice",
+            "--password",
+            "test-password",
+        ],
+    );
+    assert!(std::fs::read_to_string(&file)
+        .unwrap()
+        .contains("ciphertext:"));
+    run(home.path(), &["auth", "logout"]);
+    let requests = server.received_requests().await.unwrap();
+    let logout = requests
+        .iter()
+        .find(|r| r.url.path() == "/auth/session/logout")
+        .expect("encrypted logout must revoke");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&logout.body).unwrap()["refresh_token"],
+        "private-refresh"
+    );
+    assert!(!std::fs::read_to_string(file)
+        .unwrap()
+        .contains("ciphertext:"));
 }
