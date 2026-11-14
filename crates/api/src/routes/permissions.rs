@@ -1500,9 +1500,15 @@ async fn authorize_identity_target(
     target_id: i64,
     action: Action,
 ) -> ApiResult<()> {
-    let target = IdentityRepository::find_by_id(&state.db, target_id)
-        .await?
-        .ok_or_else(|| ApiError::Forbidden("Identity access denied".into()))?;
+    let Some(target) = IdentityRepository::find_by_id(&state.db, target_id).await? else {
+        // Only callers authorized without target metadata may learn it is absent.
+        // Scoped and unauthorized callers get the same denial as an existing target.
+        authorize_permissions(state, user, Resource::Identities, action).await?;
+        return Err(ApiError::NotFound(format!(
+            "Identity '{}' not found",
+            target_id
+        )));
+    };
     let caller = user
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".into()))?;

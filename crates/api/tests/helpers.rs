@@ -438,7 +438,7 @@ impl TestContext {
     }
 
     /// Create a test user and return access token
-    async fn create_test_user(&self, login: &str) -> Result<String> {
+    pub async fn create_test_user(&self, login: &str) -> Result<String> {
         // Register via API to get real token
         let response = self
             .post(

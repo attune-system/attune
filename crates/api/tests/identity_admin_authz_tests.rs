@@ -140,22 +140,22 @@ async fn profile_editor_cannot_take_over_admin_or_change_authorization() {
         .unwrap()
         .unwrap();
     assert_ne!(after.password_hash, before.password_hash);
-    assert_eq!(
-        ctx.post(
+    let recovered = ctx
+        .post(
             "/api/v1/auth/login",
             json!({"login":after.login,"password":"RecoveredPass123!"}),
-            None
+            None,
         )
         .await
-        .unwrap()
-        .status(),
-        StatusCode::OK
-    );
+        .unwrap();
+    assert_eq!(recovered.status(), StatusCode::OK);
+    let recovered: Value = recovered.json().await.unwrap();
+    let recovered_token = recovered["data"]["access_token"].as_str().unwrap();
     let response = ctx
         .post(
             &format!("{path}/integration-tokens"),
             json!({"label":"recovery"}),
-            ctx.token(),
+            Some(recovered_token),
         )
         .await
         .unwrap();
@@ -193,14 +193,21 @@ async fn profile_editor_cannot_take_over_admin_or_change_authorization() {
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        ctx.post(&format!("{token_path}/revoke"), json!({}), ctx.token())
-            .await
-            .unwrap()
-            .status(),
+        ctx.post(
+            &format!("{token_path}/revoke"),
+            json!({}),
+            Some(recovered_token)
+        )
+        .await
+        .unwrap()
+        .status(),
         StatusCode::OK
     );
     assert_eq!(
-        ctx.delete(&token_path, ctx.token()).await.unwrap().status(),
+        ctx.delete(&token_path, Some(recovered_token))
+            .await
+            .unwrap()
+            .status(),
         StatusCode::OK
     );
     ctx.cleanup().await.unwrap();
@@ -225,17 +232,6 @@ async fn identity_scopes_use_actual_target_for_profile_and_administration() {
             .await
             .unwrap()
             .status(),
-        StatusCode::OK
-    );
-    assert_eq!(
-        ctx.put(
-            &own_path,
-            json!({"password":"SelfPassword123!"}),
-            ctx.token()
-        )
-        .await
-        .unwrap()
-        .status(),
         StatusCode::OK
     );
     assert_eq!(
@@ -310,6 +306,39 @@ async fn identity_scopes_use_actual_target_for_profile_and_administration() {
         .status(),
         StatusCode::FORBIDDEN
     );
+    assert_eq!(
+        ctx.get(&other_path, ctx.token()).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        ctx.get("/api/v1/identities/-1", ctx.token())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        ctx.put(
+            "/api/v1/identities/-1",
+            json!({"display_name":"Absent"}),
+            ctx.token()
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        ctx.put(
+            &own_path,
+            json!({"password":"SelfPassword123!"}),
+            ctx.token()
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::OK
+    );
     ctx.cleanup().await.unwrap();
 }
 
@@ -333,5 +362,23 @@ async fn identity_administration_scopes_are_authorable_via_api() {
                 "grants":[{"resource":"identities","actions":["read","update","manage"],"constraints":constraints}]}),
             ctx.token()).await.unwrap().status(), StatusCode::CREATED);
     }
+    assert_eq!(
+        ctx.get("/api/v1/identities/-1", ctx.token())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        ctx.put(
+            "/api/v1/identities/-1",
+            json!({"password":"AbsentPassword123!"}),
+            ctx.token()
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::NOT_FOUND
+    );
     ctx.cleanup().await.unwrap();
 }
