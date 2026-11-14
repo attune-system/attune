@@ -1166,7 +1166,7 @@ fn registry_revisions_must_not_be_authoring_previews() {
 #[test]
 fn repository_core_schema_definitions_use_the_supported_contract() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs/core");
-    let mut checked = 0;
+    let mut checked = std::collections::BTreeSet::new();
     for entry in walkdir::WalkDir::new(&root) {
         let entry = entry.unwrap();
         if !entry.file_type().is_file()
@@ -1193,11 +1193,45 @@ fn repository_core_schema_definitions_use_the_supported_contract() {
                     &schema,
                 )
                 .unwrap_or_else(|error| panic!("{}#{field}: {error}", entry.path().display()));
-                checked += 1;
+                checked.insert((
+                    entry.path().strip_prefix(&root).unwrap().to_path_buf(),
+                    field.to_owned(),
+                ));
             }
         }
     }
-    assert!(checked > 20);
+    // Keep compiling every discovered schema, including future additions. These
+    // retained catalog anchors make a truncated/empty walk fail meaningfully.
+    for (file, field) in [
+        ("pack.yaml", "conf_schema"),
+        ("actions/echo.yaml", "parameters"),
+        ("actions/sleep.yaml", "parameters"),
+        ("actions/noop.yaml", "parameters"),
+        ("actions/http_request.yaml", "parameters"),
+        ("actions/http_request.yaml", "output_schema"),
+        ("sensors/timer_sensor.yaml", "parameters"),
+    ] {
+        assert!(
+            checked.contains(&(std::path::PathBuf::from(file), field.to_owned())),
+            "retained core schema was not checked: {file}#{field}"
+        );
+    }
+    for file in [
+        "triggers/alert.yaml",
+        "triggers/crontimer.yaml",
+        "triggers/datetimetimer.yaml",
+        "triggers/intervaltimer.yaml",
+        "triggers/queue_empty.yaml",
+        "triggers/queue_started.yaml",
+        "triggers/rruletimer.yaml",
+    ] {
+        for field in ["parameters", "output"] {
+            assert!(
+                checked.contains(&(std::path::PathBuf::from(file), field.to_owned())),
+                "retained core schema was not checked: {file}#{field}"
+            );
+        }
+    }
 }
 
 #[test]

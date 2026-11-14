@@ -19,7 +19,7 @@ COPY . .
 # This supplied toolchain must already contain cargo-zigbuild, Zig and both musl
 # targets. Never silently download a different toolchain or regenerate lockfiles.
 RUN test "$BUILDPLATFORM" = "$TARGETPLATFORM" && \
-    test -f Cargo.lock && test -f crates/core-timer-sensor/Cargo.lock && \
+    test -f Cargo.lock && test -f crates/core-timer-sensor/Cargo.lock && test -f crates/core-actions/Cargo.lock && \
     cargo build --locked --release -j 2 --bin attune-api --bin attune-executor --bin attune-notifier --bin attune-supervisor --bin export-openapi && \
     cargo build --locked --release -j 2 -p attune-common --example bootstrap_acceptance_archive --example storage_probe_inspector --example interoperability_acceptance_archive --example interoperability_inspector --example legacy_native_writer --example native_settlement_adapter --example native_producer_acceptance_archive && \
     mkdir -p /out/services /out/agents /out/tools /out/core/sensors/bin /out/native-controller && \
@@ -39,7 +39,12 @@ RUN test "$BUILDPLATFORM" = "$TARGETPLATFORM" && \
         arch="${pair%%:*}"; target="${pair#*:}"; \
         CARGO_TARGET_DIR=/source/crates/core-timer-sensor/target cargo zigbuild --locked --release -j 2 --manifest-path crates/core-timer-sensor/Cargo.toml --target "$target" --bin attune-core-timer-sensor && \
         mkdir -p "/out/core/sensors/bin/linux-$arch" && \
-        cp "crates/core-timer-sensor/target/$target/release/attune-core-timer-sensor" "/out/core/sensors/bin/linux-$arch/attune-core-timer-sensor" || exit 1; \
+        cp "crates/core-timer-sensor/target/$target/release/attune-core-timer-sensor" "/out/core/sensors/bin/linux-$arch/attune-core-timer-sensor" && \
+        CARGO_TARGET_DIR=/source/crates/core-actions/target cargo zigbuild --locked --release -j 2 --manifest-path crates/core-actions/Cargo.toml --target "$target" --bins || exit 1; \
+        for action in echo sleep noop http_request; do \
+            mkdir -p "/out/core/actions/bin/$action" && \
+            cp "crates/core-actions/target/$target/release/attune-core-$action" "/out/core/actions/bin/$action/linux-$arch" || exit 1; \
+        done; \
     done && \
     /out/tools/bootstrap_acceptance_archive /out/core /out/canonical-store > /out/core-release.json
 

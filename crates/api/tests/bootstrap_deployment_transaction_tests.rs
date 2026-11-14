@@ -2,6 +2,7 @@
 //! Exercises the same admission service called by normal upload/core bootstrap.
 mod helpers;
 
+use anyhow::Context;
 use tower::ServiceExt;
 
 use attune_common::{
@@ -22,15 +23,15 @@ use serde_json::json;
 
 const ACCEPTANCE_QUEUE: &str = "\
 ref: core.acceptance_queue
-label: Actual core installer acceptance queue
-description: Supplementary queue dispatching the shipped canonical installer
+label: Actual core native acceptance queue
+description: Supplementary queue dispatching the shipped native noop
 enabled: true
 accepting_new_items: true
-dispatch_action: core.install_packs
+dispatch_action: core.noop
 permission_set_refs: [core.executor]
 item_schema: {}
 action_params:
-  packs: ['https://example.invalid/acceptance.tar.gz']
+  exit_code: 0
 config: {}
 ";
 
@@ -43,17 +44,14 @@ fn supplementary_actual_core_queue_satisfies_canonical_metadata_and_schema_contr
     let definition = parse_work_queue_definition_yaml(ACCEPTANCE_QUEUE)?;
     validate_work_queue_definition(&definition)?;
     assert_eq!(definition.r#ref, "core.acceptance_queue");
-    assert_eq!(definition.dispatch_action, "core.install_packs");
+    assert_eq!(definition.dispatch_action, "core.noop");
     assert_eq!(
         definition.permission_set_refs,
         Some(vec!["core.executor".into()])
     );
-    assert_eq!(
-        definition.action_params["packs"].as_array().unwrap().len(),
-        1
-    );
+    assert_eq!(definition.action_params["exit_code"], 0);
     let missing_label =
-        ACCEPTANCE_QUEUE.replace("label: Actual core installer acceptance queue\n", "");
+        ACCEPTANCE_QUEUE.replace("label: Actual core native acceptance queue\n", "");
     assert!(parse_work_queue_definition_yaml(&missing_label).is_err());
     Ok(())
 }
@@ -324,6 +322,28 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
         "the registrar must not be able to issue deployment approvals"
     );
     let source = actual_core_tree(&ctx.test_packs_dir.join("actual-core-source"))?;
+    assert_eq!(
+        std::fs::read_dir(source.join("actions"))?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "yaml"))
+            .count(),
+        4
+    );
+    // Preserve the retained, inert shipped definition byte-for-byte. Its
+    // withdrawn SSH owner is not a valid owner for a new synthetic consumer.
+    let retained_key_creator = std::fs::read(source.join("permission_sets/key_creator.yaml"))?;
+    let retained_key_definition: attune_common::runtime_authority::PermissionSetDefinition =
+        serde_yaml_ng::from_slice(&retained_key_creator)?;
+    // IAM storage binds authored local grants to the installing pack. Compare
+    // the complete canonical form, including its managing_pack_id envelope.
+    let retained_key_grants = attune_common::runtime_authority::normalize_iam_grants(
+        retained_key_definition.authored_grants()?,
+        Some(pack.id),
+    )?;
+    // The admission-only consumer and its local key policy both belong to this
+    // owned fixture. No shipped policy or callable is changed or reintroduced.
+    std::fs::write(source.join("permission_sets/acceptance_key_access.yaml"), "ref: core.acceptance_key_access\nlabel: Owned fixture key-create policy\ngrants:\n  - resource: keys\n    actions: [create]\n    constraints:\n      owner_types: [action]\n      owner_refs: [core.acceptance_key_creator]\n      encrypted: true\n")?;
+    std::fs::write(source.join("actions/acceptance_key_creator.yaml"), "ref: core.acceptance_key_creator\nlabel: Explicit fixture key grant consumer\nrunner_type: native\nentry_point: bin/noop\ndefault_execution_permission_set_refs: [core.acceptance_key_access]\nparameters:\n  local_ref:\n    type: string\n")?;
     let ceiling = actual_core_global_ceiling(&source, "executor")?;
     assert_eq!(
         PermissionSetRepository::find_by_ref(&ctx.pool, "core.executor")
@@ -333,7 +353,8 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
         serde_json::to_value(&ceiling)?
     );
     // Pre-provision fixed, explicit consent for the shipped global ceiling. The
-    // unmodified core actions select only local key_creator; the supplementary
+    // shipped actions select no API authority; the explicit test consumer
+    // selects its explicit fixture-owned key policy and the supplementary
     // queue below deliberately selects this real platform definition at upgrade.
     let initial_approval = explicitly_approve_core_ceiling(&ctx, &ceiling).await?;
     assert_eq!(initial_approval.subject_pack_id, pack.id);
@@ -343,18 +364,54 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
         .await?
         .unwrap();
     let original_policy_body = serde_json::to_value(&policy.policy)?;
+    assert!(
+        ActionRepository::find_by_ref(&mut *fresh, "core.generate_ssh_key_pair")
+            .await?
+            .is_none()
+    );
+    assert_eq!(
+        PermissionSetRepository::find_by_ref(&mut *fresh, "core.key_creator")
+            .await?
+            .unwrap()
+            .grants,
+        retained_key_grants
+    );
+    let fixture_invocation = policy
+        .policy
+        .invocations
+        .iter()
+        .find(|entry| {
+            entry.binding
+                == InvocationBinding::Action {
+                    action_ref: "core.acceptance_key_creator".into(),
+                }
+        })
+        .unwrap();
+    let fixture_grants = &fixture_invocation.permission_sets["core.acceptance_key_access"].grants;
+    assert_eq!(fixture_grants.len(), 1);
+    assert!(fixture_grants[0].approval_id().is_none());
+    let fixture_grant = fixture_grants[0].grant();
+    assert_eq!(fixture_grant.resource, attune_common::rbac::Resource::Keys);
+    assert_eq!(
+        fixture_grant.actions,
+        vec![attune_common::rbac::Action::Create]
+    );
+    let fixture_constraints = fixture_grant.constraints.as_ref().unwrap();
+    assert_eq!(
+        serde_json::to_value(&fixture_constraints.owner_refs)?,
+        json!(["core.acceptance_key_creator"])
+    );
+    assert_eq!(
+        serde_json::to_value(&fixture_constraints.owner_types)?,
+        json!(["action"])
+    );
+    assert_eq!(fixture_constraints.encrypted, Some(true));
     for reference in [
         "core.echo",
         "core.noop",
         "core.sleep",
         "core.http_request",
-        "core.generate_ssh_key_pair",
-        "core.run_agent_command",
-        "core.download_packs",
-        "core.register_packs",
-        "core.get_pack_dependencies",
-        "core.build_pack_envs",
-        "core.install_packs",
+        "core.acceptance_key_creator",
     ] {
         assert_eq!(
             ActionRepository::find_by_ref(&mut *fresh, reference)
@@ -368,42 +425,23 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
                 action_ref: reference.into()
             }));
     }
-    for (index, action_ref) in [
-        "core.noop",
-        "core.download_packs",
-        "core.noop",
-        "core.get_pack_dependencies",
-        "core.noop",
-        "core.build_pack_envs",
-        "core.register_packs",
-        "core.noop",
-        "core.download_packs",
-        "core.get_pack_dependencies",
-        "core.build_pack_envs",
-        "core.register_packs",
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        assert!(policy.policy.invocations.iter().any(|entry| entry.binding
-            == InvocationBinding::WorkflowTask {
-                workflow_ref: "core.install_packs".into(),
-                task_path: format!("/tasks/{index}"),
-                action_ref: action_ref.into(),
-            }));
-    }
-    let installer_binding = InvocationBinding::Action {
-        action_ref: "core.install_packs".into(),
+    assert!(!policy
+        .policy
+        .invocations
+        .iter()
+        .any(|entry| matches!(entry.binding, InvocationBinding::WorkflowTask { .. })));
+    let native_binding = InvocationBinding::Action {
+        action_ref: "core.noop".into(),
     };
-    let workflow_executable = ManagedExecutableRepository::resolve_invocation(
+    let native_executable = ManagedExecutableRepository::resolve_invocation(
         &mut fresh,
         &policy.policy,
-        &installer_binding,
+        &native_binding,
     )
     .await?;
-    assert_eq!(workflow_executable.release.id, release_id);
-    assert!(workflow_executable.executable.runtime.is_none());
-    assert!(workflow_executable.executable.workflow_definition.is_some());
+    assert_eq!(native_executable.release.id, release_id);
+    assert!(native_executable.executable.runtime.is_some());
+    assert!(native_executable.executable.workflow_definition.is_none());
     for reference in [
         "core.intervaltimer",
         "core.crontimer",
@@ -427,7 +465,7 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
         .await?
         .unwrap();
     let binding = InvocationBinding::Action {
-        action_ref: "core.generate_ssh_key_pair".into(),
+        action_ref: "core.acceptance_key_creator".into(),
     };
     let executable =
         ManagedExecutableRepository::resolve_invocation(&mut fresh, &policy.policy, &binding)
@@ -442,7 +480,7 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
     let selected = policy.policy.select(
         policy.id,
         &binding,
-        &["core.key_creator".into()],
+        &["core.acceptance_key_access".into()],
         RequestAttribution::Human {
             actor: HumanAttribution {
                 identity_id: installer.id,
@@ -454,9 +492,9 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
         &mut *fresh,
         CreateExecutionInput {
             action: Some(executable.executable.action.id),
-            action_ref: "core.generate_ssh_key_pair".into(),
+            action_ref: "core.acceptance_key_creator".into(),
             executor: Some(installer.id),
-            permission_set_refs: vec!["core.key_creator".into()],
+            permission_set_refs: vec!["core.acceptance_key_access".into()],
             status: attune_common::models::ExecutionStatus::Running,
             config: Some(json!({"local_ref":"acceptance-only"})),
             ..Default::default()
@@ -469,12 +507,13 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
         RuntimeOwner::Execution(execution.id),
         &selected,
     )
-    .await?;
+    .await
+    .context("record explicitly owned fixture key-create admission")?;
     let credential = RuntimeCredentialBinding {
         execution_id: execution.id,
         admission_id: admission.id,
         sponsor_identity_id: admission.authority.owner.sponsor_identity_id,
-        action_ref: "core.generate_ssh_key_pair".into(),
+        action_ref: "core.acceptance_key_creator".into(),
         attempt: admission.authority.attempt,
     };
     fresh.commit().await?;
@@ -505,8 +544,8 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
     .await?;
     overrides.commit().await?;
 
-    // Core intentionally ships no queue. Only the queue is supplementary; it
-    // dispatches the actual shipped canonical installer workflow.
+    // Core intentionally ships no queue. The supplementary queue dispatches
+    // the actual shipped native noop with an explicitly selected ceiling.
     std::fs::create_dir_all(source.join("queues"))?;
     std::fs::write(source.join("queues/00_acceptance.yaml"), ACCEPTANCE_QUEUE)?;
     let mut metadata: serde_json::Value =
@@ -521,7 +560,7 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
         serde_yaml_ng::to_string(&metadata)?,
     )?;
     // Revoke only the test's explicit pre-provisioned approval. The original
-    // shipped policy is local and remains pinned; queue dispatch now requests
+    // fixture key policy is local and remains pinned; queue dispatch now requests
     // the actual core.executor global ceiling, never a synthetic action/policy.
     let revoked = ctx
         .post(
@@ -650,7 +689,7 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
             entry.binding
                 == InvocationBinding::Queue {
                     queue_ref: "core.acceptance_queue".into(),
-                    action_ref: "core.install_packs".into(),
+                    action_ref: "core.noop".into(),
                 }
         })
         .unwrap();
@@ -695,7 +734,7 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
         .any(|entry| entry.binding
             == InvocationBinding::Queue {
                 queue_ref: "core.acceptance_queue".into(),
-                action_ref: "core.install_packs".into(),
+                action_ref: "core.noop".into(),
             }));
     upgrade.commit().await?;
     let current = PackRepository::find_by_id(&ctx.pool, pack.id)
@@ -779,11 +818,11 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
             ManagedExecutableRepository::resolve_invocation(
                 &mut retained,
                 &original.policy,
-                &installer_binding,
+                &native_binding,
             )
             .await?
         )?,
-        serde_json::to_value(workflow_executable)?
+        serde_json::to_value(native_executable)?
     );
     assert_eq!(
         serde_json::to_value(
@@ -831,6 +870,17 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
     assert_eq!(ready.release_id, release_id);
     assert_eq!(ready.policy_revision, rollback_policy.id);
     assert_eq!(ready.digest, original_release.digest);
+    assert_eq!(
+        std::fs::read(source.join("permission_sets/key_creator.yaml"))?,
+        retained_key_creator
+    );
+    assert_eq!(
+        PermissionSetRepository::find_by_ref(&ctx.pool, "core.key_creator")
+            .await?
+            .unwrap()
+            .grants,
+        retained_key_grants
+    );
     ctx.cleanup().await?;
     Ok(())
 }
@@ -930,10 +980,18 @@ fn release_source(
         ),
     )?;
     std::fs::write(source.join("actions/leaf.yaml"), "ref: core.leaf\nrunner_type: shell\nentry_point: leaf.sh\ndefault_execution_permission_set_refs: [core.effects]\n")?;
-    std::fs::copy(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs/core/actions/echo.sh"),
-        source.join("actions/leaf.sh"),
+    // This synthetic admission fixture owns its executable independently of
+    // the shipped core inventory; policy/pin tests do not execute the leaf.
+    let leaf = source.join("actions/leaf.sh");
+    std::fs::write(
+        &leaf,
+        b"#!/bin/sh\nprintf '%s\\n' 'owned admission fixture'\n",
     )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o755))?;
+    }
     std::fs::write(
         source.join("actions/flow.yaml"),
         "ref: core.flow\nworkflow_file: workflows/flow.workflow.yaml\n",
@@ -1294,6 +1352,139 @@ async fn bootstrap_fixed_approval_expiry_denies_readiness_and_replacement_withou
         release_id
     );
     retained.rollback().await?;
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+/// Normal upload/admission metadata, without skip_tests and without any
+/// interpreter-capable worker. Compiled byte execution is exercised separately
+/// by the owned core_native_archive lane, not by an executable stand-in here.
+#[tokio::test]
+async fn core_native_only_worker_upload_admits_without_interpreter_test_dispatch() -> Result<()> {
+    use attune_common::{
+        models::{WorkerStatus, WorkerType},
+        repositories::{
+            action::ActionRepository,
+            identity::{
+                CreatePermissionAssignmentInput, PermissionAssignmentRepository,
+                PermissionSetRepository,
+            },
+            pack_install::PackInstallRepository,
+            runtime::{CreateWorkerInput, WorkerRepository},
+        },
+    };
+    let ctx = TestContext::new().await?.with_auth().await?;
+    PlatformCatalogRepository::reconcile(&ctx.pool).await?;
+    let administrator = PermissionSetRepository::find_by_ref(&ctx.pool, "core.admin")
+        .await?
+        .unwrap();
+    let identity = ctx.user.as_ref().unwrap();
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: identity.id,
+            permset: administrator.id,
+        },
+    )
+    .await?;
+    attune_api::authz::AuthorizationService::invalidate_identity_authz_cache(identity.id).await;
+    let worker = WorkerRepository::create(
+        &ctx.pool,
+        CreateWorkerInput {
+            name: "owned-core-native-only".into(),
+            worker_type: WorkerType::Local,
+            runtime: None,
+            host: None,
+            port: None,
+            status: Some(WorkerStatus::Active),
+            capabilities: Some(json!({"runtimes":["native"]})),
+            meta: None,
+        },
+    )
+    .await?;
+    assert_eq!(
+        worker.capabilities.as_ref().unwrap()["runtimes"],
+        json!(["native"])
+    );
+    let source = actual_core_tree(&ctx.test_packs_dir.join("native-only-upload"))?;
+    let metadata: serde_json::Value =
+        serde_yaml_ng::from_str(&std::fs::read_to_string(source.join("pack.yaml"))?)?;
+    assert_eq!(metadata["runtime_deps"], json!(["native"]));
+    assert_eq!(metadata["testing"]["enabled"], false);
+    assert_eq!(metadata["testing"]["runners"], json!({}));
+    let testing: attune_common::test_executor::TestConfig =
+        serde_json::from_value(metadata["testing"].clone())?;
+    assert!(!testing.enabled);
+    assert!(testing.runners.is_empty());
+    attune_common::pack_registry::diagnostics::validate_metadata(&source)?;
+    let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut archive = tar::Builder::new(gzip);
+    archive.append_dir_all("core", &source)?;
+    let archive = archive.into_inner()?.finish()?;
+    let boundary = "core-native-only-upload";
+    let mut body = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"absent_metadata_policy\"\r\n\r\nremove\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"pack\"; filename=\"core.tar.gz\"\r\nContent-Type: application/gzip\r\n\r\n").into_bytes();
+    body.extend_from_slice(&archive);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/v1/packs/upload")
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .header("authorization", format!("Bearer {}", ctx.token().unwrap()))
+        .body(axum::body::Body::from(body))?;
+    let response = helpers::TestResponse::new(ctx.app.clone().oneshot(request).await?);
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::CREATED,
+        "{}",
+        response.text().await?
+    );
+    let installed = PackRepository::find_by_ref(&ctx.pool, "core")
+        .await?
+        .unwrap();
+    assert_eq!(installed.runtime_deps, vec!["native"]);
+    assert_eq!(installed.version, "1.0.7");
+    let install = PackInstallRepository::new(ctx.pool.clone())
+        .find_latest_by_pack_ref("core")
+        .await?;
+    assert!(install.as_ref().is_none_or(
+        |install| install.assigned_worker_id.is_none() && install.test_execution_id.is_none()
+    ));
+    for reference in ["core.echo", "core.sleep", "core.noop", "core.http_request"] {
+        let action = ActionRepository::find_by_ref(&ctx.pool, reference)
+            .await?
+            .unwrap();
+        assert_eq!(action.required_worker_runtimes, json!({}));
+        assert!(action.default_execution_permission_set_refs.is_empty());
+    }
+    for reference in [
+        "core.run_agent_command",
+        "core.install_packs",
+        "core.generate_ssh_key_pair",
+        "core.download_packs",
+        "core.get_pack_dependencies",
+        "core.build_pack_envs",
+        "core.register_packs",
+    ] {
+        assert!(ActionRepository::find_by_ref(&ctx.pool, reference)
+            .await?
+            .is_none());
+        let denied = ctx
+            .post(
+                "/api/v1/executions/execute",
+                json!({"action_ref":reference, "parameters":{}}),
+                ctx.token(),
+            )
+            .await?;
+        assert_eq!(
+            denied.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "{}",
+            denied.text().await?
+        );
+    }
     ctx.cleanup().await?;
     Ok(())
 }

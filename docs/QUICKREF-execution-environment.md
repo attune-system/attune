@@ -33,7 +33,7 @@ All actions receive the following environment variables:
 
 | Variable | Type | Description | Always Present |
 |----------|------|-------------|----------------|
-| `ATTUNE_ACTION` | string | Action ref (e.g., `core.http_request`) | ✅ Yes |
+| `ATTUNE_ACTION` | string | Action ref (e.g., `example.http_request`) | ✅ Yes |
 | `ATTUNE_EXEC_ID` | integer | Execution database ID | ✅ Yes |
 | `ATTUNE_API_URL` | string | Base URL for demand-driven API access | ✅ Yes |
 | `ATTUNE_API_TOKEN` | string | Execution-scoped API token | ❌ Only with non-empty `permission_set_refs` |
@@ -50,7 +50,7 @@ All actions receive the following environment variables:
 
 **Examples:**
 ```bash
-ATTUNE_ACTION="core.http_request"
+ATTUNE_ACTION="example.http_request"
 ATTUNE_ACTION="core.echo"
 ATTUNE_ACTION="slack.post_message"
 ATTUNE_ACTION="aws.ec2.describe_instances"
@@ -244,7 +244,7 @@ curl -X POST http://localhost:8080/api/v1/executions/execute \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "action_ref": "core.http_request",
+    "action_ref": "example.http_request",
     "parameters": {
       "url": "https://api.example.com",
       "method": "GET"
@@ -578,7 +578,7 @@ When testing actions locally, you can simulate these environment variables:
 #!/bin/bash
 # test-action.sh - Local testing script
 
-export ATTUNE_ACTION="core.http_request"
+export ATTUNE_ACTION="example.http_request"
 export ATTUNE_EXEC_ID="99999"
 export ATTUNE_API_TOKEN="test-token-local"
 export ATTUNE_RULE="test.rule"

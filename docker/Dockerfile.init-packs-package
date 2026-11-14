@@ -1,8 +1,10 @@
 FROM python:3.11-slim
+ENV ATTUNE_BOOTSTRAP_MODE=api
 
 COPY packs/ /source/packs/
 # Every image carries the same pack bytes so core versions have one digest.
 COPY dist/core-timer-sensor/ /source/packs/core/sensors/bin/
+COPY dist/core-actions/ /source/packs/core/actions/bin/
 COPY scripts/load_core_pack.py /scripts/load_core_pack.py
 COPY scripts/bootstrap_core_pack.py /scripts/bootstrap_core_pack.py
 COPY docker/prune-removed-pack-rules.sh /scripts/prune-removed-pack-rules.sh
@@ -12,6 +14,10 @@ RUN pip install --no-cache-dir psycopg2-binary pyyaml \
     && chmod +x /init-packs.sh /scripts/bootstrap_core_pack.py /scripts/prune-removed-pack-rules.sh \
         /source/packs/core/sensors/timer-sensor-launcher \
         /source/packs/core/sensors/bin/linux-amd64/attune-core-timer-sensor \
-        /source/packs/core/sensors/bin/linux-arm64/attune-core-timer-sensor
+        /source/packs/core/sensors/bin/linux-arm64/attune-core-timer-sensor \
+    && for action in echo sleep noop http_request; do \
+        test -x /source/packs/core/actions/bin/$action/linux-amd64 || exit 1; \
+        test -x /source/packs/core/actions/bin/$action/linux-arm64 || exit 1; \
+    done
 
 CMD ["/bin/sh", "/init-packs.sh"]

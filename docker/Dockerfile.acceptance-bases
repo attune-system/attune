@@ -1,0 +1,37 @@
+# Local acceptance inputs only. Supply measured immutable upstream references;
+# export and hash each derived OCI image before using it in a build manifest.
+ARG RUST_BASE=docker.io/library/rust@sha256:198cd28b4ba92b20fe849d5d8b119ace1bd28423d9e82e9c4de5ee1300d453a0
+ARG SERVICE_BASE=debian@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
+ARG PYTHON_BASE=python@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
+FROM ${RUST_BASE} AS toolchain
+ENV DEBIAN_FRONTEND=noninteractive CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 CMAKE_BUILD_PARALLEL_LEVEL=2 MAKEFLAGS=-j2
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake musl-tools pkg-config libssl-dev ca-certificates \
+    curl git file binutils python3 python3-pip && rm -rf /var/lib/apt/lists/*
+COPY docker/acceptance/cargo-with-budget.sh /opt/attune-budget/bin/cargo
+RUN chmod +x /opt/attune-budget/bin/cargo
+ENV PATH="/opt/attune-budget/bin:${PATH}"
+RUN python3 -m pip install --break-system-packages --no-cache-dir 'ziglang==0.16.0' && \
+    cargo install --locked --version 0.23.4 cargo-zigbuild && \
+    rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl && \
+    ln -s "$(python3 -c 'import os,ziglang; print(os.path.join(os.path.dirname(ziglang.__file__), "zig"))')" /usr/local/bin/zig
+RUN mkdir -p /usr/local/share/attune-base-receipt && \
+    rustc --version | grep '^rustc 1.100.0 ' && \
+    test "$(zig version)" = 0.16.0 && \
+    test "$(cargo-zigbuild --version)" = 'cargo-zigbuild 0.23.4' && \
+    rustup target list --installed | grep -x x86_64-unknown-linux-musl && \
+    rustup target list --installed | grep -x aarch64-unknown-linux-musl && \
+    { rustc -Vv; cargo -V; zig version; cargo-zigbuild --version; rustup target list --installed; } > /usr/local/share/attune-base-receipt/versions.txt && \
+    dpkg-query -W > /usr/local/share/attune-base-receipt/packages.txt
+FROM ${SERVICE_BASE} AS service
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3 ca-certificates curl git && rm -rf /var/lib/apt/lists/* && \
+    groupadd --gid 1000 attune && useradd --uid 1000 --gid 1000 --create-home attune && \
+    mkdir -p /usr/local/share/attune-base-receipt && \
+    dpkg-query -W > /usr/local/share/attune-base-receipt/packages.txt && \
+    { ldd --version; openssl version; curl --version; git --version; id attune; } > /usr/local/share/attune-base-receipt/versions.txt
+FROM ${PYTHON_BASE} AS python
+RUN python3 -m pip install --no-cache-dir 'PyYAML==6.0.3' && \
+    mkdir -p /usr/local/share/attune-base-receipt && \
+    python3 -c 'import sys,yaml; assert sys.version_info >= (3,11); assert yaml.__version__ == "6.0.3"; print(sys.version); print(yaml.__version__)' > /usr/local/share/attune-base-receipt/versions.txt && \
+    python3 -m pip freeze > /usr/local/share/attune-base-receipt/packages.txt

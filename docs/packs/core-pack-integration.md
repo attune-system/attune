@@ -1,3 +1,7 @@
+> Core 1.0.7 ships only native echo, sleep, and noop actions. References below to
+> HTTP, SSH, agent-command, or pack-installation core actions describe withdrawn
+> examples. Use application-owned packs or the normal pack CLI/API instead.
+
 # Core Pack Integration Guide
 
 **Last Updated**: 2026-01-20  

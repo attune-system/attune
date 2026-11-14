@@ -11,7 +11,7 @@
 #   docker compose -f docker-compose.yaml -f docker-compose.e2e.yaml \
 #     run --rm rust-int-tests [filter]
 
-ARG RUST_VERSION=1.98.1
+ARG RUST_VERSION=1.100.0
 ARG DEBIAN_VERSION=bookworm
 
 FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder

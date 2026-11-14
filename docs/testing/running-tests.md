@@ -87,7 +87,7 @@ agent can distinguish saved progress from merge readiness.
 cargo fmt --all -- --check
 cargo check --all-targets --workspace
 (cd web && npm test)
-python3 -m unittest packs.core.tests.test_actions.TestHttpRequestAction
+cargo test --manifest-path crates/core-actions/Cargo.toml --locked -- --test-threads=4
 bash scripts/test-test-isolation-guards.sh
 ```
 

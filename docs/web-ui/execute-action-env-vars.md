@@ -17,7 +17,7 @@ The Execute Action modal now includes an "Environment Variables" section that al
 │ Execute Action                                        X  │
 ├──────────────────────────────────────────────────────────┤
 │                                                          │
-│ Action: core.http_request                                │
+│ Action: example.http_request                                │
 │ Make an HTTP request to a specified URL                  │
 │                                                          │
 ├──────────────────────────────────────────────────────────┤
@@ -160,7 +160,7 @@ When you click Execute with environment variables, the UI sends:
 ```json
 POST /api/v1/executions/execute
 {
-  "action_ref": "core.http_request",
+  "action_ref": "example.http_request",
   "parameters": {
     "url": "https://api.example.com",
     "method": "GET"

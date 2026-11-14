@@ -792,7 +792,22 @@ impl PackChecker {
                     "native" | "builtin" | "standalone"
                 )
             });
-        if !native {
+        if native {
+            if let Some(path) = self.safe_join(
+                &self.root.join("actions"),
+                &entrypoint,
+                rel,
+                "action.entrypoint",
+            ) {
+                if path.is_dir() {
+                    if let Err(error) = crate::native_entrypoint::validate_directory(
+                        &self.root.join("actions").join(&entrypoint),
+                    ) {
+                        self.error(Some(rel), "action.native_directory", error);
+                    }
+                }
+            }
+        } else {
             self.check_referenced_file(
                 &self.root.join("actions"),
                 &entrypoint,
@@ -1802,6 +1817,50 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn native_directory_checks_unknown_variants_links_and_escape() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        write(
+            root.path(),
+            "pack.yaml",
+            "ref: demo\nversion: '1.0.0'\nlabel: Demo\n",
+        );
+        write(
+            root.path(),
+            "actions/run.yaml",
+            "ref: demo.run\nlabel: Run\nrunner_type: native\nentry_point: bin/run\n",
+        );
+        write(root.path(), "actions/bin/run/linux-amd64", "owned fixture");
+        let binary = root.path().join("actions/bin/run/linux-amd64");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(check_pack(root.path()).valid);
+        write(root.path(), "actions/bin/run/unknown", "invalid");
+        assert!(!check_pack(root.path()).valid);
+        std::fs::remove_file(root.path().join("actions/bin/run/unknown")).unwrap();
+        symlink(&binary, root.path().join("actions/bin/run/linux-arm64")).unwrap();
+        assert!(!check_pack(root.path()).valid);
+        std::fs::remove_file(root.path().join("actions/bin/run/linux-arm64")).unwrap();
+        symlink(
+            root.path().join("actions/bin/run"),
+            root.path().join("actions/alias"),
+        )
+        .unwrap();
+        write(
+            root.path(),
+            "actions/run.yaml",
+            "ref: demo.run\nlabel: Run\nrunner_type: native\nentry_point: alias\n",
+        );
+        assert!(!check_pack(root.path()).valid);
+        write(
+            root.path(),
+            "actions/run.yaml",
+            "ref: demo.run\nlabel: Run\nrunner_type: native\nentry_point: ../../elsewhere\n",
+        );
+        assert!(!check_pack(root.path()).valid);
+    }
 
     #[test]
     fn e2e_fixture_pack_uses_valid_flat_schemas_and_action_linked_workflows() {

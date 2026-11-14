@@ -7,14 +7,14 @@ description: "Does nothing - useful for testing and placeholder workflows"
 enabled: true
 
 # Runner type determines how the action is executed
-runner_type: shell
+runner_type: native
 
-# Entry point is the shell command or script to execute
-entry_point: noop.sh
+# Native directory: worker selects its own Linux architecture
+entry_point: bin/noop
 
-# Parameter delivery: stdin for secure parameter passing (no env vars)
+# Flat stdin JSON preserves parameter boundaries
 parameter_delivery: stdin
-parameter_format: dotenv
+parameter_format: json
 
 # Output format: text (no structured data parsing)
 output_format: text

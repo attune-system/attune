@@ -22,6 +22,7 @@ REQUIRED += ("crates/common/examples/interoperability_inspector.rs", "crates/com
 REQUIRED += ("crates/common/examples/legacy_native_writer.rs", "docker/acceptance/attune-native-legacy@.service", *["scripts/legacy_storage_controller/" + name for name in NATIVE_MODULES])
 REQUIRED += ("scripts/acceptance/native-controller-source-pins.json", "crates/common/examples/native_settlement_adapter.rs", "crates/common/examples/native_producer_acceptance_archive.rs", "crates/common/src/repositories/file_native_setup.rs", "crates/common/src/repositories/native_generation_origin.rs", "migrations/20261016006015_controlled_native_file_operations.sql", "scripts/legacy_storage_controller/producer-context.example.json", "scripts/legacy_storage_controller/config.example.json", *["scripts/legacy_storage_controller/producer_pack/" + name for name in ("pack.yaml", "actions/producer.yaml", "actions/producer.py")])
 REQUIRED += ("scripts/acceptance/native_controller_lifecycle.py", "scripts/acceptance/native_producer_fixture.py")
+REQUIRED += ("crates/core-actions/Cargo.toml", "crates/core-actions/Cargo.lock")
 
 
 class InputError(RuntimeError):
@@ -63,7 +64,13 @@ def commands(args, manifest):
     docker = ["docker", "--context", manifest.get("docker_context", "<local-context>"), "buildx", "build", "--builder", manifest.get("buildx_builder", "<central-owned-builder>"), "--platform", manifest.get("platform", "linux/amd64"), "--provenance=false", "--sbom=false", "--file", str(root / "source" / DOCKERFILE)]
     for name in BASES:
         argument = {"toolchain": "TOOLCHAIN_IMAGE", "node": "NODE_IMAGE", "service": "SERVICE_BASE", "python": "PYTHON_BASE", "busybox": "BUSYBOX_IMAGE", "postgres": "POSTGRES_IMAGE", "nginx": "NGINX_IMAGE"}[name]
-        docker += ["--build-arg", argument + "=" + manifest.get("base_images", {}).get(name, "<required-immutable-base>")]
+        image = manifest.get("base_images", {}).get(name, "<required-immutable-base>")
+        if name in manifest.get("base_oci_archives", {}):
+            # Supply measured local bytes without BuildKit's registry resolver.
+            alias = "attune_base_" + name
+            docker += ["--build-context", alias + "=oci-layout://" + str(root / "base-contexts" / name) + "@" + image.rsplit("@", 1)[1]]
+            image = alias
+        docker += ["--build-arg", argument + "=" + image]
     docker += ["--build-arg", "ATTUNE_BUILD_GIT_SHA=" + manifest.get("source_revision", "<source-revision>"), "--build-arg", "SOURCE_DATE_EPOCH=" + str(manifest.get("source_date_epoch", "<fixed-source-time>"))]
     output = []
     for name, target in (("native", "native-export"), ("frontend", "frontend-export"), *[(image, "service" if image in IMAGES[:4] else image) for image in IMAGES]):
@@ -74,6 +81,8 @@ def commands(args, manifest):
             command += ["--label", "org.opencontainers.image.revision=" + manifest.get("source_revision", "<source-revision>"), "--label", "io.attune.acceptance.source-sha256=" + manifest.get("source_sha256", "<source-archive-sha256>"), "--build-context", "frontend=" + str(root / "frontend"), "--output", "type=oci,dest=" + str(root / (name + ".oci.tar")) + ",rewrite-timestamp=true"]
             if target == "service":
                 command += ["--build-arg", "SERVICE=" + name]
+        elif name == "native":
+            command += ["--output", "type=tar,dest=" + str(root / "native-export.tar")]
         else:
             command += ["--output", "type=local,dest=" + str(root / name)]
         command += [str(root / "source")]
@@ -97,6 +106,12 @@ def validate(args, manifest):
     require(set(manifest.get("base_images", {})) == set(BASES), "Supply all seven actual immutable build/runtime bases")
     for name, image in manifest["base_images"].items():
         require(bool(re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image)), "Missing immutable base digest for " + name)
+    local = manifest.get("base_oci_archives", {})
+    require(isinstance(local, dict) and set(local) <= set(BASES), "Unknown local OCI base")
+    for name, path in local.items():
+        archive = Path(path)
+        require(archive.is_absolute() and archive.is_file() and not archive.is_symlink(), "Supply an actual regular local OCI archive")
+        require(oci_receipt(archive)["oci_manifest_digest"] == manifest["base_images"][name].rsplit("@", 1)[1], "Local OCI base does not match its immutable manifest digest")
     archive = Path(manifest.get("source_archive", ""))
     require(archive.is_file() and not archive.is_symlink() and sha(archive) == manifest.get("source_sha256"), "Missing/mismatched actual source archive; never build a moving primary checkout")
 
@@ -165,6 +180,53 @@ def oci_receipt(path):
         return {"oci_archive": str(path), "archive_sha256": sha(path), "oci_manifest_digest": descriptor["digest"]}
 
 
+def unpack_native_export(archive, destination):
+    # Canonical publisher trees are read-only. A non-root local exporter cannot
+    # create their children after applying those directory modes. Transport via
+    # tar, retaining archive/file bytes and executable status in private staging.
+    destination.mkdir(mode=0o700)
+    names = set()
+    total = 0
+    with tarfile.open(archive, "r:*") as source:
+        for member in source:
+            path = PurePosixPath(member.name)
+            if str(path) == "." and member.isdir():
+                continue
+            require(not path.is_absolute() and ".." not in path.parts and str(path) not in names, "Unsafe or duplicate native export path")
+            require(member.isfile() or member.isdir(), "Native export must contain ordinary files/directories")
+            total += member.size
+            require(total <= 8 * 1024**3 and len(names) < 100000, "Native export exceeds its explicit bound")
+            names.add(str(path))
+            target = destination.joinpath(*path.parts)
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True, mode=0o700)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                with source.extractfile(member) as incoming, target.open("xb") as outgoing:
+                    while block := incoming.read(1024 * 1024):
+                        outgoing.write(block)
+                target.chmod(0o755 if member.mode & 0o111 else 0o644)
+
+
+def unpack_oci_base(archive, destination, expected_digest):
+    receipt = oci_receipt(archive)
+    require(receipt["oci_manifest_digest"] == expected_digest, "Local OCI base digest changed")
+    destination.mkdir(parents=True, mode=0o700)
+    with tarfile.open(archive, "r:*") as source:
+        for member in source:
+            name = str(PurePosixPath(member.name))
+            if member.isdir():
+                require(name in {".", "blobs", "blobs/sha256"}, "Unexpected OCI directory")
+                continue
+            require(bool(re.fullmatch(r"oci-layout|index\.json|blobs/sha256/[0-9a-f]{64}", name)), "Unexpected OCI file path")
+            target = destination / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with source.extractfile(member) as incoming, target.open("xb") as outgoing:
+                while block := incoming.read(1024 * 1024):
+                    outgoing.write(block)
+    return receipt
+
+
 def native_receipt(root):
     result = json.loads((root / "core-release.json").read_text())
     require(re.fullmatch(r"[0-9a-f]{64}", result["digest"]), "Canonical helper did not report a measured SHA256")
@@ -175,6 +237,12 @@ def native_receipt(root):
         with binary.open("rb") as source:
             header = source.read(20)
         require(len(header) == 20 and header[:6] == b"\x7fELF\x02\x01" and int.from_bytes(header[18:20], "little") == machine and binary.stat().st_mode & 0o111, "Missing actual architecture-specific executable timer")
+    for arch, machine in (("amd64", 62), ("arm64", 183)):
+        for action in ("echo", "sleep", "noop", "http_request"):
+            binary = root / "core/actions/bin" / action / ("linux-" + arch)
+            with binary.open("rb") as source:
+                header = source.read(20)
+            require(len(header) == 20 and header[:6] == b"\x7fELF\x02\x01" and int.from_bytes(header[18:20], "little") == machine and binary.stat().st_mode & 0o111, "Missing actual architecture-specific core action")
     machine = {"x86_64": 62, "aarch64": 183}[platform.machine()]
     binaries = {}
     for family, names in (("services", ["attune-" + name for name in IMAGES[:4]]), ("agents", ["attune", "attune-mcp", "attune-agent", "attune-sensor-agent"]), ("tools", ["bootstrap_acceptance_archive", "storage_probe_inspector", "interoperability_acceptance_archive", "interoperability_inspector", "legacy_native_writer", "native_settlement_adapter", "native_producer_acceptance_archive"])):
@@ -206,6 +274,16 @@ def native_receipt(root):
     return {"core": {"version": result["version"], "digest": result["digest"], "archive_path": str(archive), "archive_size": archive.stat().st_size}, "binaries": binaries, "native_controller_files": modules, "native_producer_release": producer}
 
 
+def select_builder_inventory(raw, name):
+    matches = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    matches = [entry for entry in matches if entry.get("Name") == name]
+    require(bool(matches), "Selected builder is absent from local inventory")
+    # Buildx can list the same context-backed builder twice. Only identical
+    # records are acceptable; conflicting endpoint/state records fail closed.
+    require(len({json.dumps(entry, sort_keys=True) for entry in matches}) == 1, "Selected builder inventory is ambiguous")
+    return matches[0]
+
+
 def require_local_builder(info, manifest, endpoint):
     require(info.get("Name") == manifest["buildx_builder"] and info.get("Driver") in ("docker", "docker-container"), "Use an explicitly selected existing local Docker builder, not a remote/Kubernetes builder")
     nodes = info.get("Nodes", [])
@@ -221,21 +299,29 @@ def execute(args, manifest):
     docker = ["docker", "--context", manifest["docker_context"]]
     inspected = json.loads(driver.command([*docker, "context", "inspect", manifest["docker_context"]]))[0]
     require(inspected["Endpoints"]["docker"]["Host"].startswith("unix://"), "Only an explicit local Docker socket is supported")
-    builder = json.loads(driver.command([*docker, "buildx", "inspect", manifest["buildx_builder"], "--format", "{{json .}}"]))
+    builder = select_builder_inventory(driver.command([*docker, "buildx", "ls", "--format", "{{json .}}"]), manifest["buildx_builder"])
     require_local_builder(builder, manifest, inspected["Endpoints"]["docker"]["Host"])
     args.work_root.mkdir(mode=0o700)
-    receipt = {"status": "INCOMPLETE", "source_revision": manifest["source_revision"], "source_sha256": manifest["source_sha256"], "build_jobs": 2, "completed": [], "images": {}, "acceptance": "NOT_RUN", "admission_gates": "UNCHANGED"}
+    receipt = {"status": "INCOMPLETE", "source_revision": manifest["source_revision"], "source_sha256": manifest["source_sha256"], "build_jobs": 2, "completed": [], "images": {}, "acceptance": "NOT_RUN", "admission_gates": "UNCHANGED", "producer_script_sha256": sha(Path(__file__))}
     try:
         unpack_source(manifest["source_archive"], args.work_root / "source")
+        receipt["base_images"] = manifest["base_images"]
+        receipt["local_base_receipts"] = {}
+        for name, archive in manifest.get("base_oci_archives", {}).items():
+            receipt["local_base_receipts"][name] = unpack_oci_base(Path(archive), args.work_root / "base-contexts" / name, manifest["base_images"][name].rsplit("@", 1)[1])
         for entry in commands(args, manifest):
             driver.command(entry["command"], timeout=args.timeout_seconds)
             name = entry["artifact"]
             if name == "native":
+                unpack_native_export(args.work_root / "native-export.tar", args.work_root / "native")
+                receipt["native_export_sha256"] = sha(args.work_root / "native-export.tar")
                 receipt.update(native_receipt(args.work_root / "native"))
             elif name in IMAGES:
                 receipt["images"][name] = oci_receipt(args.work_root / (name + ".oci.tar"))
             receipt["completed"].append(name)
         require(sha(manifest["source_archive"]) == manifest["source_sha256"], "Source archive changed during build; reject these artifacts")
+        for base in receipt["local_base_receipts"].values():
+            require(sha(Path(base["oci_archive"])) == base["archive_sha256"], "Local base archive changed during build")
         receipt["status"] = "BUILT_NOT_DEPLOYED"
     finally:
         require(not driver.ACTIVE_GROUPS, "Build client has not joined. Central scheduler must drain its builder; retained output is not complete")

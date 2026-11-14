@@ -17,7 +17,16 @@ class InitPacksAdmissionTests(unittest.TestCase):
             target = root / "target" / "core"
             (target / "sensors").mkdir(parents=True)
             (target / "pack.yaml").write_text("ref: core\nversion: 1.0.0\n")
-            (target / "sensors" / "attune-core-timer-sensor").write_text("owned-binary")
+            staged = target.parent / ".pack-binaries/core"
+            (staged / "sensors").mkdir(parents=True)
+            (staged / "sensors/attune-core-timer-sensor").write_text("owned-binary")
+            import platform
+            native_target = {"x86_64": "linux-amd64", "aarch64": "linux-arm64"}[platform.machine()]
+            for action in ("echo", "sleep", "noop", "http_request"):
+                native = staged / "actions/bin" / action / native_target
+                native.parent.mkdir(parents=True)
+                native.write_text("owned-action")
+                native.chmod(0o755)
             binaries = root / "bin"
             binaries.mkdir()
             for name in ("pip", "chown"):
@@ -39,6 +48,7 @@ class InitPacksAdmissionTests(unittest.TestCase):
                                ATTUNE_BOOTSTRAP_MODE=mode,
                                SOURCE_PACKS_DIR=str(source.parent),
                                TARGET_PACKS_DIR=str(target.parent),
+                               PACK_BINARIES_DIR=str(staged.parent),
                                RUNTIME_ENVS_DIR=str(root / "runtime"),
                                ARTIFACTS_DIR=str(root / "artifacts"),
                                EVIDENCE=str(root / "evidence"),
@@ -51,6 +61,7 @@ class InitPacksAdmissionTests(unittest.TestCase):
             self.assertIn("version: 2.0.0", evidence)
             self.assertEqual("owned-binary" in evidence, mode == "volume")
             self.assertIn("version: 1.0.0", (target / "pack.yaml").read_text())
+            self.assertFalse((target / "actions").exists(), "binary staging must not mutate the active projection")
             self.assertFalse(Path((root / "candidate-path").read_text()).exists())
 
     def test_volume_mode_stages_private_candidate_and_keeps_active_projection(self):

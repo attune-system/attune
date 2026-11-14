@@ -1,126 +1,111 @@
-# HTTP Request Action
-# Make HTTP requests to external APIs
-
 ref: core.http_request
-label: "HTTP Request"
-description: "Make HTTP requests to external APIs with support for various methods, headers, and authentication"
+label: HTTP Request
+description: Make HTTP requests to external APIs with support for various methods,
+  headers, and authentication
 enabled: true
-
-# Runner type determines how the action is executed
-runner_type: shell
-
-# Entry point is the bash script to execute
-entry_point: http_request.sh
-
-# Parameter delivery configuration (for security)
-# Use stdin + DOTENV for secure parameter passing (credentials won't appear in process list)
+runner_type: native
+entry_point: bin/http_request
 parameter_delivery: stdin
-parameter_format: dotenv
-
-# Output format: json (structured data parsing enabled)
+parameter_format: json
 output_format: json
-
-# Action parameters schema (StackStorm-style with inline required/secret)
 parameters:
   url:
     type: string
-    description: "URL to send the request to"
+    description: URL to send the request to
     required: true
   method:
     type: string
-    description: "HTTP method to use"
-    default: "GET"
+    description: HTTP method to use
+    default: GET
     enum:
-      - GET
-      - POST
-      - PUT
-      - PATCH
-      - DELETE
-      - HEAD
-      - OPTIONS
+    - GET
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    - HEAD
+    - OPTIONS
   headers:
     type: object
-    description: "HTTP headers to include in the request"
+    description: HTTP headers to include in the request
     default: {}
   body:
     type: string
-    description: "Request body (for POST, PUT, PATCH methods)"
+    description: Request body (for POST, PUT, PATCH methods)
   json_body:
     type: object
-    description: "JSON request body (alternative to body parameter)"
+    description: JSON request body (alternative to body parameter)
   query_params:
     type: object
-    description: "URL query parameters as key-value pairs"
+    description: URL query parameters as key-value pairs
     default: {}
   timeout:
     type: integer
-    description: "Request timeout in seconds"
+    description: Request timeout in seconds
     default: 30
     minimum: 1
     maximum: 300
   verify_ssl:
     type: boolean
-    description: "Verify SSL certificates"
+    description: Verify SSL certificates
     default: true
   auth_type:
     type: string
-    description: "Authentication type"
+    description: Authentication type
     enum:
-      - none
-      - basic
-      - bearer
+    - none
+    - basic
+    - bearer
   auth_username:
     type: string
-    description: "Username for basic authentication"
+    description: Username for basic authentication
   auth_password:
     type: string
-    description: "Password for basic authentication"
+    description: Password for basic authentication
     secret: true
   auth_token:
     type: string
-    description: "Bearer token for bearer authentication"
+    description: Bearer token for bearer authentication
     secret: true
   follow_redirects:
     type: boolean
-    description: "Follow HTTP redirects"
+    description: Follow HTTP redirects
     default: true
   max_redirects:
     type: integer
-    description: "Maximum number of redirects to follow"
+    description: Maximum number of redirects to follow
     default: 10
-
-# Output schema: describes the JSON structure written to stdout
-# Note: stdout/stderr/exit_code are captured automatically by the execution system
 output_schema:
   status_code:
     type: integer
-    description: "HTTP status code"
+    description: HTTP status code
   headers:
     type: object
-    description: "Response headers"
+    description: Response headers
   body:
     type: string
-    description: "Response body as text"
+    description: Response body as text
   json:
-    type: object
-    description: "Parsed JSON response (if applicable, null otherwise)"
+    type:
+    - object
+    - array
+    - 'null'
+    description: Parsed object/array JSON response, or null.
   elapsed_ms:
     type: integer
-    description: "Request duration in milliseconds"
+    description: Request duration in milliseconds
   url:
     type: string
-    description: "Final URL after redirects"
+    description: Final URL after redirects
   success:
     type: boolean
-    description: "Whether the request was successful (2xx status code)"
+    description: Whether the request was successful (2xx status code)
   error:
     type: string
-    description: "Error message if request failed (only present on failure)"
-
-# Tags for categorization
+    description: Error message if request failed (only present on failure)
 tags:
-  - http
-  - api
-  - web
-  - utility
-  - integration
+- http
+- api
+- web
+- utility
+- integration
