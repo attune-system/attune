@@ -40,3 +40,7 @@ Expired/revoked session and exchange rows are retained until identity deletion;
 operators should account for this metadata growth. Tokens are hashed in session
 records. Exchange payload ciphertext is short-lived but currently retained after
 expiry until identity deletion; successful redemption deletes it.
+
+The browser UI requires Web Locks (a supported browser in a secure context) for
+automatic refresh. Without it refresh fails before sending a credential; sign in
+again in a supported environment. It never falls back to unsafe per-tab rotation.

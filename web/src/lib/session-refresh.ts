@@ -31,10 +31,28 @@ export function refreshSession(): Promise<string> {
         "attune-interactive-refresh",
         rotate,
       );
-    return await rotate();
+    throw new Error(
+      "Session refresh requires Web Locks. Use a supported browser over HTTPS and sign in again.",
+    );
   };
   inFlight = run().finally(() => {
     inFlight = undefined;
   });
   return inFlight;
+}
+
+/** Fail without clearing local state when server revocation cannot be confirmed. */
+export async function revokeBrowserSession(): Promise<void> {
+  const refresh = localStorage.getItem("refresh_token");
+  if (!refresh) return;
+  const base = import.meta.env.VITE_API_BASE_URL || "";
+  try {
+    await refreshClient.post(`${base}/auth/session/logout`, {
+      refresh_token: refresh,
+    });
+  } catch {
+    throw new Error(
+      "Session revocation failed. Check your connection and retry signing out.",
+    );
+  }
 }

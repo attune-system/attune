@@ -308,3 +308,129 @@ async fn integration_refresh_retains_provenance_and_credential_revocation() {
     );
     ctx.cleanup().await.unwrap();
 }
+
+#[tokio::test]
+async fn password_change_fences_stale_issuance_and_pending_browser_exchange() {
+    use attune_common::repositories::interactive_session::InteractiveSessionRepository as Sessions;
+    let ctx = TestContext::new().await.unwrap();
+    login(&ctx).await;
+    let identity = IdentityRepository::find_by_login(&ctx.pool, "session-user")
+        .await
+        .unwrap()
+        .unwrap();
+    let tokens = attune_api::auth::session::issue(&ctx.state, &identity)
+        .await
+        .unwrap();
+    Sessions::create_exchange(
+        &ctx.pool,
+        identity.id,
+        "code",
+        "browser",
+        "encrypted",
+        "/",
+        &tokens.refresh_token,
+    )
+    .await
+    .unwrap();
+    let response = ctx
+        .post(
+            "/auth/change-password",
+            json!({"current_password":"TestPassword123!","new_password":"ChangedPassword123!"}),
+            Some(&tokens.access_token),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(attune_api::auth::session::issue(&ctx.state, &identity)
+        .await
+        .is_err());
+    assert!(Sessions::consume_exchange(&ctx.pool, "code", "browser")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        refresh(&ctx, &tokens.refresh_token).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    ctx.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn browser_exchange_expiry_freeze_and_concurrent_consume_are_fenced() {
+    use attune_common::repositories::interactive_session::InteractiveSessionRepository as Sessions;
+    let ctx = TestContext::new().await.unwrap();
+    let tokens = login(&ctx).await;
+    let identity = IdentityRepository::find_by_login(&ctx.pool, "session-user")
+        .await
+        .unwrap()
+        .unwrap();
+    let refresh = tokens["refresh_token"].as_str().unwrap();
+    Sessions::create_exchange(
+        &ctx.pool,
+        identity.id,
+        "code",
+        "browser",
+        "encrypted",
+        "/",
+        refresh,
+    )
+    .await
+    .unwrap();
+    IdentityRepository::update(
+        &ctx.pool,
+        identity.id,
+        UpdateIdentityInput {
+            display_name: None,
+            password_hash: None,
+            attributes: None,
+            frozen: Some(true),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(Sessions::consume_exchange(&ctx.pool, "code", "browser")
+        .await
+        .unwrap()
+        .is_none());
+    IdentityRepository::update(
+        &ctx.pool,
+        identity.id,
+        UpdateIdentityInput {
+            display_name: None,
+            password_hash: None,
+            attributes: None,
+            frozen: Some(false),
+        },
+    )
+    .await
+    .unwrap();
+    let (a, b) = tokio::join!(
+        Sessions::consume_exchange(&ctx.pool, "code", "browser"),
+        Sessions::consume_exchange(&ctx.pool, "code", "browser")
+    );
+    assert_eq!(
+        [a.unwrap(), b.unwrap()]
+            .iter()
+            .filter(|v| v.is_some())
+            .count(),
+        1
+    );
+    Sessions::create_exchange(
+        &ctx.pool,
+        identity.id,
+        "expired",
+        "browser",
+        "encrypted",
+        "/",
+        refresh,
+    )
+    .await
+    .unwrap();
+    // Owned fixture mutation, no clock sleeps or process-global clock state.
+    sqlx::query("UPDATE interactive_login_exchange SET expires=clock_timestamp()-interval '1 second' WHERE code_hash=$1").bind(attune_common::repositories::interactive_session::token_hash("expired")).execute(&ctx.pool).await.unwrap();
+    assert!(Sessions::consume_exchange(&ctx.pool, "expired", "browser")
+        .await
+        .unwrap()
+        .is_none());
+    ctx.cleanup().await.unwrap();
+}
