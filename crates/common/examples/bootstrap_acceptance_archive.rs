@@ -6,7 +6,9 @@ fn require_official_action_variants(source: &Path) -> Result<(), String> {
     for action in ["echo", "sleep", "noop", "http_request"] {
         let directory = source.join("actions/bin").join(action);
         if !directory.is_dir() {
-            return Err(format!("Official core native action {action} requires a directory"));
+            return Err(format!(
+                "Official core native action {action} requires a directory"
+            ));
         }
         for architecture in ["x86_64", "aarch64"] {
             attune_common::native_entrypoint::resolve(&directory, "linux", architecture)
