@@ -5,7 +5,14 @@ use sqlx::PgPool;
 pub struct InteractiveSessionRepository;
 
 pub fn token_hash(token: &str) -> String {
-    format!("{:x}", Sha256::digest(token.as_bytes()))
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(token.as_bytes());
+    let mut encoded = String::with_capacity(64);
+    for &byte in digest.iter() {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 impl InteractiveSessionRepository {
@@ -129,5 +136,31 @@ impl InteractiveSessionRepository {
     ) -> crate::Result<Option<(String, String)>> {
         Ok(sqlx::query_as("DELETE FROM interactive_login_exchange e USING identity i WHERE e.code_hash=$1 AND e.browser_hash=$2 AND e.expires>clock_timestamp() AND i.id=e.identity_id AND NOT i.frozen RETURNING e.payload,e.redirect_to")
             .bind(token_hash(code)).bind(token_hash(browser)).fetch_optional(pool).await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::token_hash;
+
+    #[test]
+    fn sha256_vectors_have_fixed_lowercase_hex_encoding() {
+        for (input, expected) in [
+            (
+                "",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                "abc",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+        ] {
+            let actual = token_hash(input);
+            assert_eq!(actual, expected);
+            assert_eq!(actual.len(), 64);
+            assert!(actual
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        }
     }
 }
