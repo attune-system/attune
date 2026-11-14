@@ -5219,17 +5219,19 @@ async fn local_source_ingestion_requires_operator_roots_and_global_authority() -
     let ctx = ctx
         .with_local_source_roots(vec![archive_root.path().into()])
         .await?;
-    let downloaded: serde_json::Value = ctx
+    let installed = ctx
         .post(
-            "/api/v1/packs/download",
-            json!({"packs":[archive_path]}),
+            "/api/v1/packs/install",
+            json!({"source": archive_path, "force":true, "skip_tests":true, "skip_deps":true}),
             ctx.token(),
         )
-        .await?
-        .json()
         .await?;
-    assert_eq!(downloaded["data"]["success_count"], 1);
-    // Download creates only staging, not another release.
+    assert!(
+        installed.status().is_success(),
+        "{}",
+        installed.text().await?
+    );
+    // Reinstalling identical archive bytes reuses the immutable release.
     let pack = PackRepository::find_by_ref(&ctx.pool, "local_confinement")
         .await?
         .unwrap();
