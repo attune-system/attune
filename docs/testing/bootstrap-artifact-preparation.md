@@ -115,6 +115,14 @@ The fixed sequence is one foreground BuildKit invocation at a time:
    fixed-time inputs are recorded. Init-packs uses an API-only offline-dependency
    entrypoint: no runtime pip, old flat-binary adoption or mutable projection copy.
 
+Native output is transported as `native-export.tar`, then extracted into a new
+owned staging directory with writable owner directories and preserved file bytes
+and executable status. This avoids a non-root BuildKit local exporter trying to
+write children beneath canonical read-only release directories. The canonical
+`pack.tar.gz` bytes/digest remain unchanged. The receipt separately hashes the
+transport tar and the producer script; staging permissions are not live release
+immutability or an admission policy.
+
 The script verifies exported OCI blob hashes, root descriptor and referenced
 content sizes. It measures each OCI tar checksum separately from the actual image
 manifest digest. Its receipt also records actual host-native binary checksums and

@@ -153,6 +153,32 @@ class Preparation(unittest.TestCase):
                 artifacts.unpack_oci_base(archive, root / "layout", digest)
             self.assertFalse((root / "escape").exists())
 
+    def test_native_export_stages_readonly_release_without_changing_bytes_or_execute_status(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            root = Path(directory)
+            archive = root / "export.tar"
+            with tarfile.open(archive, "w") as target:
+                entry = tarfile.TarInfo("release")
+                entry.type = tarfile.DIRTYPE
+                entry.mode = 0o555
+                target.addfile(entry)
+                for name, mode in [("manifest.json", 0o444), ("action", 0o555)]:
+                    entry = tarfile.TarInfo("release/" + name)
+                    entry.mode = mode
+                    entry.size = 7
+                    target.addfile(entry, io.BytesIO(b"fixture"))
+            artifacts.unpack_native_export(archive, root / "native")
+            self.assertEqual((root / "native/release/manifest.json").read_bytes(), b"fixture")
+            self.assertFalse((root / "native/release/manifest.json").stat().st_mode & 0o111)
+            self.assertTrue((root / "native/release/action").stat().st_mode & 0o111)
+            with (root / "native/release/probe").open("x") as output:
+                output.write("owned staging remains writable")
+            bad = root / "bad.tar"
+            tar(bad, {"../escape": b"x"})
+            with self.assertRaisesRegex(artifacts.InputError, "native export path"):
+                artifacts.unpack_native_export(bad, root / "bad")
+            self.assertFalse((root / "escape").exists())
+
     def test_corrupt_oci_content_cannot_produce_a_receipt(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             path, _ = self.oci(Path(directory), corrupt=True)

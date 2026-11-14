@@ -81,6 +81,8 @@ def commands(args, manifest):
             command += ["--label", "org.opencontainers.image.revision=" + manifest.get("source_revision", "<source-revision>"), "--label", "io.attune.acceptance.source-sha256=" + manifest.get("source_sha256", "<source-archive-sha256>"), "--build-context", "frontend=" + str(root / "frontend"), "--output", "type=oci,dest=" + str(root / (name + ".oci.tar")) + ",rewrite-timestamp=true"]
             if target == "service":
                 command += ["--build-arg", "SERVICE=" + name]
+        elif name == "native":
+            command += ["--output", "type=tar,dest=" + str(root / "native-export.tar")]
         else:
             command += ["--output", "type=local,dest=" + str(root / name)]
         command += [str(root / "source")]
@@ -178,6 +180,34 @@ def oci_receipt(path):
         return {"oci_archive": str(path), "archive_sha256": sha(path), "oci_manifest_digest": descriptor["digest"]}
 
 
+def unpack_native_export(archive, destination):
+    # Canonical publisher trees are read-only. A non-root local exporter cannot
+    # create their children after applying those directory modes. Transport via
+    # tar, retaining archive/file bytes and executable status in private staging.
+    destination.mkdir(mode=0o700)
+    names = set()
+    total = 0
+    with tarfile.open(archive, "r:*") as source:
+        for member in source:
+            path = PurePosixPath(member.name)
+            if str(path) == "." and member.isdir():
+                continue
+            require(not path.is_absolute() and ".." not in path.parts and str(path) not in names, "Unsafe or duplicate native export path")
+            require(member.isfile() or member.isdir(), "Native export must contain ordinary files/directories")
+            total += member.size
+            require(total <= 8 * 1024**3 and len(names) < 100000, "Native export exceeds its explicit bound")
+            names.add(str(path))
+            target = destination.joinpath(*path.parts)
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True, mode=0o700)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                with source.extractfile(member) as incoming, target.open("xb") as outgoing:
+                    while block := incoming.read(1024 * 1024):
+                        outgoing.write(block)
+                target.chmod(0o755 if member.mode & 0o111 else 0o644)
+
+
 def unpack_oci_base(archive, destination, expected_digest):
     receipt = oci_receipt(archive)
     require(receipt["oci_manifest_digest"] == expected_digest, "Local OCI base digest changed")
@@ -272,7 +302,7 @@ def execute(args, manifest):
     builder = select_builder_inventory(driver.command([*docker, "buildx", "ls", "--format", "{{json .}}"]), manifest["buildx_builder"])
     require_local_builder(builder, manifest, inspected["Endpoints"]["docker"]["Host"])
     args.work_root.mkdir(mode=0o700)
-    receipt = {"status": "INCOMPLETE", "source_revision": manifest["source_revision"], "source_sha256": manifest["source_sha256"], "build_jobs": 2, "completed": [], "images": {}, "acceptance": "NOT_RUN", "admission_gates": "UNCHANGED"}
+    receipt = {"status": "INCOMPLETE", "source_revision": manifest["source_revision"], "source_sha256": manifest["source_sha256"], "build_jobs": 2, "completed": [], "images": {}, "acceptance": "NOT_RUN", "admission_gates": "UNCHANGED", "producer_script_sha256": sha(Path(__file__))}
     try:
         unpack_source(manifest["source_archive"], args.work_root / "source")
         receipt["base_images"] = manifest["base_images"]
@@ -283,6 +313,8 @@ def execute(args, manifest):
             driver.command(entry["command"], timeout=args.timeout_seconds)
             name = entry["artifact"]
             if name == "native":
+                unpack_native_export(args.work_root / "native-export.tar", args.work_root / "native")
+                receipt["native_export_sha256"] = sha(args.work_root / "native-export.tar")
                 receipt.update(native_receipt(args.work_root / "native"))
             elif name in IMAGES:
                 receipt["images"][name] = oci_receipt(args.work_root / (name + ".oci.tar"))
