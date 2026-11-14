@@ -863,8 +863,8 @@ async fn full_form_metadata_retains_update_semantics_but_placement_spends_editor
                 .await?;
             let status = denied.status();
             let body: serde_json::Value = denied.json().await?;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{}", body["message"]);
-            assert_eq!(body["message"], "Insufficient permissions: actions:execute");
+            assert_eq!(status, StatusCode::FORBIDDEN, "{}", body["error"]);
+            assert_eq!(body["error"], "Insufficient permissions: actions:execute");
             assert_eq!(
                 serde_json::to_value(
                     RuleRepository::find_by_ref(&ctx.pool, &rule_ref)
@@ -893,7 +893,7 @@ async fn full_form_metadata_retains_update_semantics_but_placement_spends_editor
             status,
             StatusCode::OK,
             "covered placement: {}",
-            body["message"]
+            body["error"]
         );
     }
     ctx.cleanup().await?;
@@ -1048,10 +1048,10 @@ async fn config_sources_match_actual_pack_ownership_and_access_role_membership()
                 StatusCode::FORBIDDEN
             },
             "config case {suffix}: {}",
-            body["message"]
+            body["error"]
         );
         if !allowed {
-            assert_eq!(body["message"], "Insufficient permissions: packs:read");
+            assert_eq!(body["error"], "Insufficient permissions: packs:read");
         }
         if suffix == "unowned" || suffix == "owned_none" {
             let execution = helpers::delegated_source::token(

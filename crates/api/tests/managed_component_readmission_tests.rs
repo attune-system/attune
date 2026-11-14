@@ -530,10 +530,10 @@ async fn direct_managed_edits_readmit_but_labels_need_no_key_or_runtime_grants()
                 status,
                 StatusCode::FORBIDDEN,
                 "trace behavior denial: {}",
-                body["message"]
+                body["error"]
             );
             assert_eq!(body["code"], "FORBIDDEN");
-            assert_eq!(body["message"], expected_message);
+            assert_eq!(body["error"], expected_message);
             eprintln!("managed rule trace edit rejected: {expected_message}");
             let mut tx = ctx.pool.begin().await?;
             assert_eq!(
@@ -600,7 +600,7 @@ async fn direct_managed_edits_readmit_but_labels_need_no_key_or_runtime_grants()
         status,
         StatusCode::OK,
         "covered trace behavior update: {}",
-        body["message"]
+        body["error"]
     );
     let updated_rule = RuleRepository::find_by_ref(&ctx.pool, &rule.r#ref)
         .await?
