@@ -210,6 +210,8 @@ class Preparation(unittest.TestCase):
         published = (ROOT / "docker/Dockerfile.init-user-package").read_text()
         self.assertIn("COPY docker/init-user.sh /init-user.sh", published)
         self.assertIn("docker/init-user.sh", artifacts.REQUIRED)
+        command = next(entry["command"] for entry in artifacts.commands(artifacts.arguments([]), {}) if entry["artifact"] == "init-user")
+        self.assertFalse(any(part.startswith(("compiled=", "frontend=")) for part in command))
         lifecycle = (ROOT / "scripts/run-bootstrap-lifecycle-acceptance.py").read_text()
         self.assertIn('require("init-user" not in selected', lifecycle)
 

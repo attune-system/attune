@@ -75,10 +75,12 @@ def commands(args, manifest):
     output = []
     for name, target in (("native", "native-export"), ("frontend", "frontend-export"), *[(image, "service" if image in IMAGES[:4] else image) for image in IMAGES]):
         command = [*docker, "--target", target, "--metadata-file", str(root / (name + ".build-metadata.json"))]
-        if name != "native":
+        if name in ("frontend", *IMAGES[:4], "agent", "init-packs"):
             command += ["--build-context", "compiled=" + str(root / "native")]
         if name in IMAGES:
-            command += ["--label", "org.opencontainers.image.revision=" + manifest.get("source_revision", "<source-revision>"), "--label", "io.attune.acceptance.source-sha256=" + manifest.get("source_sha256", "<source-archive-sha256>"), "--build-context", "frontend=" + str(root / "frontend"), "--output", "type=oci,dest=" + str(root / (name + ".oci.tar")) + ",rewrite-timestamp=true"]
+            command += ["--label", "org.opencontainers.image.revision=" + manifest.get("source_revision", "<source-revision>"), "--label", "io.attune.acceptance.source-sha256=" + manifest.get("source_sha256", "<source-archive-sha256>"), "--output", "type=oci,dest=" + str(root / (name + ".oci.tar")) + ",rewrite-timestamp=true"]
+            if name == "web":
+                command += ["--build-context", "frontend=" + str(root / "frontend")]
             if target == "service":
                 command += ["--build-arg", "SERVICE=" + name]
         elif name == "native":
