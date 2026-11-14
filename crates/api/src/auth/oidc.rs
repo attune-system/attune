@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::sync::LazyLock;
-use url::{form_urlencoded::byte_serialize, Url};
+use url::Url;
 
 use crate::{
     auth::jwt::validate_token,
@@ -378,7 +378,7 @@ pub(super) async fn complete_provider_login(
     }
 
     let identity = upsert_identity(state, &oidc_claims).await?;
-    let token_response = crate::auth::session::issue(&state, &identity)
+    let token_response = crate::auth::session::issue(state, &identity)
         .await?
         .with_user(
             identity.id,

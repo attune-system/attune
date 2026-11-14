@@ -66,7 +66,7 @@ pub async fn authenticate(
             "Identity is frozen and cannot authenticate".to_string(),
         ));
     }
-    let token_response = crate::auth::session::issue(&state, &identity)
+    let token_response = crate::auth::session::issue(state, &identity)
         .await?
         .with_user(
             identity.id,
