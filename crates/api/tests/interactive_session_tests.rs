@@ -478,3 +478,109 @@ async fn browser_exchange_expiry_freeze_and_concurrent_consume_are_fenced() {
         .is_none());
     ctx.cleanup().await.unwrap();
 }
+
+#[tokio::test]
+async fn interactive_body_refresh_keeps_only_matching_browser_cookie_in_sync() {
+    use attune_api::auth::oidc::REFRESH_COOKIE_NAME;
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+        response::Response,
+    };
+    use tower::ServiceExt;
+
+    async fn request(ctx: &TestContext, body: Option<&str>, cookie: Option<&str>) -> Response {
+        let mut request = Request::builder().method("POST").uri("/auth/refresh");
+        if let Some(cookie) = cookie {
+            request = request.header(header::COOKIE, format!("{REFRESH_COOKIE_NAME}={cookie}"));
+        }
+        let payload = if let Some(token) = body {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+            Body::from(json!({"refresh_token": token}).to_string())
+        } else {
+            Body::empty()
+        };
+        ctx.app
+            .clone()
+            .oneshot(request.body(payload).unwrap())
+            .await
+            .unwrap()
+    }
+    fn cookie(response: &Response) -> Option<String> {
+        let prefix = format!("{REFRESH_COOKIE_NAME}=");
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .find_map(|value| {
+                value
+                    .to_str()
+                    .ok()?
+                    .split(';')
+                    .next()?
+                    .strip_prefix(prefix.as_str())
+                    .map(str::to_owned)
+            })
+    }
+    async fn body(response: Response) -> Value {
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap()).unwrap()
+    }
+
+    let ctx = TestContext::new().await.unwrap();
+    let initial = login(&ctx).await;
+    let response = request(&ctx, initial["refresh_token"].as_str(), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        !response.headers().contains_key(header::SET_COOKIE),
+        "JSON-only refresh must not create cookies"
+    );
+    let current = body(response).await["data"]["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let other = ctx
+        .post(
+            "/auth/register",
+            json!({"login":"other-session-user","password":"TestPassword123!"}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(other.status(), StatusCode::OK);
+    let other: Value = other.json().await.unwrap();
+    let other_refresh = other["data"]["refresh_token"].as_str().unwrap();
+    let response = request(&ctx, Some(&current), Some(other_refresh)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        !response.headers().contains_key(header::SET_COOKIE),
+        "Body refresh must not overwrite an unrelated cookie session"
+    );
+    let current = body(response).await["data"]["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        request(&ctx, None, Some(other_refresh)).await.status(),
+        StatusCode::OK
+    );
+
+    let response = request(&ctx, Some(&current), Some(&current)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let rotated_cookie =
+        cookie(&response).expect("Matching browser cookie must rotate with JSON refresh");
+    let response_body = body(response).await;
+    assert!(
+        response_body["data"]["refresh_token"].as_str() == Some(rotated_cookie.as_str()),
+        "Cookie and JSON credentials must match"
+    );
+    assert!(
+        rotated_cookie != current,
+        "Refresh must rotate the credential"
+    );
+    assert_eq!(
+        request(&ctx, None, Some(&rotated_cookie)).await.status(),
+        StatusCode::OK
+    );
+    ctx.cleanup().await.unwrap();
+}

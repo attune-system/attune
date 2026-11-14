@@ -44,3 +44,9 @@ expiry until identity deletion; successful redemption deletes it.
 The browser UI requires Web Locks (a supported browser in a secure context) for
 automatic refresh. Without it refresh fails before sending a credential; sign in
 again in a supported environment. It never falls back to unsafe per-tab rotation.
+
+Interactive JSON refresh updates HttpOnly auth cookies only when the incoming
+refresh cookie exactly matches the submitted credential. Cookie-only refresh
+also rotates cookies. JSON clients without cookies receive no cookies, and an
+unrelated cookie session is never overwritten by an explicit body credential.
+Integration refresh retains its separate existing cookie policy.

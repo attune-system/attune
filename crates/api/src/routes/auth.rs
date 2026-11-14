@@ -787,6 +787,12 @@ pub async fn refresh_token(
         return refresh_integration_token(state, claims, browser_cookie_refresh).await;
     }
 
+    // Keep an opted-in browser's cookie and JSON credential in sync, without
+    // replacing a different cookie session or adding cookies to CLI refreshes.
+    let rotate_browser_cookies = browser_cookie_refresh
+        || get_cookie_value(&headers, REFRESH_COOKIE_NAME).as_deref()
+            == Some(refresh_token.as_str());
+
     // Parse identity ID
     let identity_id: i64 = claims
         .sub
@@ -820,7 +826,7 @@ pub async fn refresh_token(
     );
     let response_body = Json(ApiResponse::new(response.clone()));
 
-    if browser_cookie_refresh {
+    if rotate_browser_cookies {
         let mut http_response = response_body.into_response();
         apply_cookies_to_headers(
             http_response.headers_mut(),

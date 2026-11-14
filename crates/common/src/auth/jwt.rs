@@ -1,7 +1,7 @@
 //! JWT token generation and validation
 //!
 //! Shared across all Attune services. Token types:
-//! - **Access**: Standard user login tokens (1h default)
+//! - **Access**: Interactive user tokens (5m ceiling); integration access uses the configured TTL
 //! - **Refresh**: Long-lived refresh tokens (7d default)
 //! - **Sensor**: Sensor service tokens with trigger type metadata (24h default)
 //! - **Execution**: Short-lived tokens scoped to a single execution (matching execution timeout)
