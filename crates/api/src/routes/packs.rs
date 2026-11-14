@@ -2071,13 +2071,14 @@ pub async fn register_pack(
     request.validate()?;
 
     authorize_pack_install_preflight(&state, &user).await?;
+    let local_path = authorize_local_pack_source(&state, &user, FsPath::new(&request.path)).await?;
     // Call internal registration logic
     let registered_pack = register_pack_internal(
         state.clone(),
         &user,
         PackRegistrationInput {
             acknowledge_incompatible_rollout: request.acknowledge_incompatible_rollout,
-            path: request.path.clone(),
+            path: local_path.to_string_lossy().into_owned(),
             expected_release_digest: None,
             force: request.force,
             skip_tests: request.skip_tests,
@@ -4158,16 +4159,7 @@ pub async fn install_pack(
         request.ref_spec.as_deref(),
         !request.no_registry,
     )?;
-    if let attune_common::pack_registry::PackSource::LocalDirectory { path }
-    | attune_common::pack_registry::PackSource::LocalArchive { path } = &source
-    {
-        if !path.exists() {
-            return Err(ApiError::NotFound(format!(
-                "Local pack source '{}' not found",
-                path.display()
-            )));
-        }
-    }
+    let source = authorize_local_source_variant(&state, &user, source).await?;
     if request.registry_id.is_some()
         && !matches!(
             source,
@@ -4649,6 +4641,91 @@ fn direct_pack_registry_config(
         config.allow_http = false;
     }
     config
+}
+
+// Server-local reads are independent of candidate deployment authority. Only
+// operator-approved roots and unconstrained human install grants authorize them.
+async fn authorize_local_pack_source(
+    state: &AppState,
+    user: &crate::auth::middleware::AuthenticatedUser,
+    path: &FsPath,
+) -> ApiResult<PathBuf> {
+    authorize_global_pack_registry_action(state, user, Action::Install).await?;
+    confine_local_pack_source(state, path)
+}
+
+fn confine_local_pack_source(state: &AppState, path: &FsPath) -> ApiResult<PathBuf> {
+    let denied =
+        || ApiError::Forbidden("Local pack source is outside operator-approved roots".into());
+    if state.config.packs.local_source_roots.is_empty() {
+        return Err(denied());
+    }
+    let resolved = path.canonicalize().map_err(|_| denied())?;
+    for root in &state.config.packs.local_source_roots {
+        let root = root.canonicalize().map_err(|_| denied())?;
+        if resolved.starts_with(root) {
+            return Ok(resolved);
+        }
+    }
+    Err(denied())
+}
+
+/// Admit the complete request before reading manifests or probing runtimes.
+/// These endpoints inspect host metadata, not candidate deployment authority.
+fn confine_host_pack_paths(state: &AppState, paths: &[String]) -> ApiResult<Vec<String>> {
+    let mut approved = Vec::with_capacity(paths.len());
+    for path in paths {
+        let root = confine_local_pack_source(state, FsPath::new(path))?;
+        // Unlike ingestion, inspection does not copy through the symlink-rejecting
+        // staging layer. Reject links at every file/directory inspected below.
+        for name in [
+            "pack.yaml",
+            "requirements.txt",
+            "package.json",
+            "venv",
+            "node_modules",
+        ] {
+            match std::fs::symlink_metadata(root.join(name)) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(ApiError::Forbidden(
+                        "Host pack inspection rejects symlinked metadata or environment paths"
+                            .into(),
+                    ))
+                }
+                Ok(metadata) if name == "pack.yaml" && !metadata.is_file() => {
+                    return Err(ApiError::Forbidden(
+                        "Host pack inspection requires an ordinary manifest file".into(),
+                    ))
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    return Err(ApiError::Forbidden(
+                        "Host pack inspection path is unavailable".into(),
+                    ))
+                }
+            }
+        }
+        approved.push(root.to_string_lossy().into_owned());
+    }
+    Ok(approved)
+}
+
+async fn authorize_local_source_variant(
+    state: &AppState,
+    user: &crate::auth::middleware::AuthenticatedUser,
+    source: attune_common::pack_registry::PackSource,
+) -> ApiResult<attune_common::pack_registry::PackSource> {
+    use attune_common::pack_registry::PackSource;
+    Ok(match source {
+        PackSource::LocalDirectory { path } => PackSource::LocalDirectory {
+            path: authorize_local_pack_source(state, user, &path).await?,
+        },
+        PackSource::LocalArchive { path } => PackSource::LocalArchive {
+            path: authorize_local_pack_source(state, user, &path).await?,
+        },
+        remote => remote,
+    })
 }
 
 fn detect_pack_source(
@@ -5460,6 +5537,17 @@ pub async fn download_packs(
             });
             continue;
         }
+        let pack_source = match authorize_local_source_variant(&state, &user, pack_source).await {
+            Ok(source) => source,
+            Err(error) => {
+                failed.push(crate::dto::pack::FailedPack {
+                    source: source.clone(),
+                    error: error.to_string(),
+                    details: error.response_body().details,
+                });
+                continue;
+            }
+        };
         let source_type_str = get_source_type(&pack_source).to_string();
 
         match installer.install(pack_source).await {
@@ -5536,6 +5624,7 @@ pub async fn get_pack_dependencies(
     Json(request): Json<GetPackDependenciesRequest>,
 ) -> ApiResult<Json<ApiResponse<GetPackDependenciesResponse>>> {
     authorize_global_pack_registry_action(&state, &user, Action::Read).await?;
+    let approved_paths = confine_host_pack_paths(&state, &request.pack_paths)?;
     use attune_common::repositories::List;
 
     let mut dependencies = Vec::new();
@@ -5548,7 +5637,7 @@ pub async fn get_pack_dependencies(
     let installed_refs: std::collections::HashSet<String> =
         installed_packs_list.into_iter().map(|p| p.r#ref).collect();
 
-    for pack_path in &request.pack_paths {
+    for pack_path in &approved_paths {
         let pack_yaml_path = std::path::Path::new(pack_path).join("pack.yaml");
 
         if !pack_yaml_path.exists() {
@@ -5686,6 +5775,7 @@ pub async fn build_pack_envs(
     super::pack_request::PackJson(request): super::pack_request::PackJson<BuildPackEnvsRequest>,
 ) -> ApiResult<Json<ApiResponse<BuildPackEnvsResponse>>> {
     authorize_global_pack_registry_action(&state, &user, Action::Install).await?;
+    let approved_paths = confine_host_pack_paths(&state, &request.pack_paths)?;
     use std::path::Path;
     use std::process::Command;
 
@@ -5695,7 +5785,7 @@ pub async fn build_pack_envs(
     let python_envs_built = 0;
     let nodejs_envs_built = 0;
 
-    for pack_path in &request.pack_paths {
+    for pack_path in &approved_paths {
         let pack_path_obj = Path::new(pack_path);
         let pack_start = std::time::Instant::now();
 
@@ -5888,11 +5978,21 @@ pub async fn register_packs_batch(
 ) -> ApiResult<Json<ApiResponse<RegisterPacksResponse>>> {
     authorize_pack_install_preflight(&state, &user).await?;
 
+    // Admit every requested local source before any batch publication.
+    let mut approved_paths = Vec::new();
+    for path in &request.pack_paths {
+        approved_paths.push(
+            authorize_local_pack_source(&state, &user, FsPath::new(path))
+                .await?
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
     let start = std::time::Instant::now();
     let mut registered = Vec::new();
     let mut failed = Vec::new();
     let mut total_components = 0;
-    for pack_path in &request.pack_paths {
+    for pack_path in &approved_paths {
         // Call the existing register_pack_internal function
         let register_req = crate::dto::pack::RegisterPackRequest {
             acknowledge_incompatible_rollout: request.acknowledge_incompatible_rollout,

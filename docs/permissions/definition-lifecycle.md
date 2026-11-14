@@ -57,3 +57,47 @@ commit outcome conservatively retains the publication and a private
 operator reconciliation. PostgreSQL and the filesystem do not form one atomic
 transaction; a process/host loss or an uncertain commit requires reconciliation,
 not an assumption that SQL rollback removed files.
+
+## Operator-approved local pack sources
+
+HTTP registration (single and batch), installation and staged download may read
+API-host paths only for Access credentials with unconstrained `packs:install`
+and only under canonical roots explicitly configured in
+`packs.local_source_roots`. The default empty list disables local ingestion.
+Candidate namespace authorization still applies. Scoped upload/remote deployers
+must use upload or remote sources; deployment authority alone does not disclose
+API-host files. Upload and remote staging do not require local-source approval.
+
+For operator local registration, configure a dedicated, operator-owned source
+mount, for example `packs: {local_source_roots: [/srv/attune-pack-sources]}`,
+and register a pack directory beneath that mount using an operator credential.
+Keep the mount and its ancestors immutable to untrusted writers while ingestion
+runs; canonical path checks are not a sandbox against concurrent host filesystem
+mutation. Do not approve `/`, home directories, or shared temporary roots.
+Directory copying and release publication reject symlinks within pack trees.
+Test runner entrypoints must be relative existing files resolving inside the
+owned pack root; traversal, absolute paths and symlink escapes are rejected by
+the executor as well as metadata validation.
+
+The host-path dependency and environment-inspection endpoints also preflight
+**every** requested path under these approved roots before reading any manifest,
+examining environment paths or running version probes. Dependency inspection
+requires global Access `packs:read`; environment detection requires global Access
+`packs:install`. Neither grant replaces the approved-root policy. Inspection
+rejects symlinked manifests, requirements/package files and environment paths.
+`build-envs` detects API-host runtimes and environment presence; it does not
+execute pack scripts or install dependencies.
+
+Direct upload and remote/managed installation use their existing private candidate
+staging and publication paths and do not need approved host source roots. If an
+operator separately inspects an installed upload/remote pack through these
+host-path endpoints, explicitly approve its operator-owned projection root. The
+staged `download` → `dependencies` → `build-envs` → `register-batch` flow (including
+`core.pack_api` callers using an operator Access token) requires an explicitly
+approved service-owned staging root, currently `/tmp/attune-pack-downloads`, for
+its returned `pack_path` values. Precreate that dedicated directory with service
+ownership and permissions, protect its ancestors, and approve that directory
+only, never all of `/tmp`. Caller `destination_dir`/`packs_base_dir` values do not
+establish trust. No automatic trust is inferred from an ambient temporary path
+or a client-supplied pack name. The UI/CLI direct install/upload flows do not call
+these inspection endpoints or require that additional staging-root approval.

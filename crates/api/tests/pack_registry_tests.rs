@@ -169,9 +169,7 @@ async fn owner_roles_use_current_membership_previous_deployment_policy_and_prese
     write_candidate("1.0.0", Some(&["platform-team", "platform-team"]))?;
     let request =
         || json!({"path": source.path().to_string_lossy(), "force": true, "skip_tests": true});
-    let response = ctx
-        .post("/api/v1/packs/register", request(), ctx.token())
-        .await?;
+    let response = upload_registration_fixture(&ctx, request(), ctx.token()).await?;
     assert_eq!(
         response.status(),
         StatusCode::CREATED,
@@ -342,7 +340,7 @@ async fn owner_roles_use_current_membership_previous_deployment_policy_and_prese
     .await?;
     write_candidate("2.0.0", Some(&["attacker-team"]))?;
     assert_eq!(
-        ctx.post("/api/v1/packs/register", request(), Some(&outsider))
+        upload_registration_fixture(&ctx, request(), Some(&outsider))
             .await?
             .status(),
         StatusCode::FORBIDDEN,
@@ -387,9 +385,7 @@ async fn owner_roles_use_current_membership_previous_deployment_policy_and_prese
         response.text().await?
     );
     write_candidate("3.0.0", None)?;
-    let response = ctx
-        .post("/api/v1/packs/register", request(), Some(&member))
-        .await?;
+    let response = upload_registration_fixture(&ctx, request(), Some(&member)).await?;
     assert_eq!(
         response.status(),
         StatusCode::CREATED,
@@ -402,9 +398,7 @@ async fn owner_roles_use_current_membership_previous_deployment_policy_and_prese
     assert_eq!(pack.owner_roles, vec!["platform-team"]);
     assert_eq!(pack.installed_by, Some(original_owner));
     write_candidate("4.0.0", Some(&[]))?;
-    let response = ctx
-        .post("/api/v1/packs/register", request(), Some(&member))
-        .await?;
+    let response = upload_registration_fixture(&ctx, request(), Some(&member)).await?;
     assert_eq!(
         response.status(),
         StatusCode::CREATED,
@@ -419,9 +413,7 @@ async fn owner_roles_use_current_membership_previous_deployment_policy_and_prese
     );
     let scoped = register_pack_index_user(&ctx, json!([{"resource":"packs","actions":["install"],"constraints":{"refs":["owner_roles_team"]}}])).await?;
     write_candidate("5.0.0", Some(&["automation-maintainers"]))?;
-    let response = ctx
-        .post("/api/v1/packs/register", request(), Some(&scoped))
-        .await?;
+    let response = upload_registration_fixture(&ctx, request(), Some(&scoped)).await?;
     assert_eq!(
         response.status(),
         StatusCode::CREATED,
@@ -876,13 +868,7 @@ async fn editor_claims_fresh_namespace_but_existing_deployments_require_matching
         "ref: editor_claim.admin\nscope: external\ngrants:\n  - resource: permissions\n    actions: [manage]\n")?;
     let request =
         json!({"path": source.path().to_string_lossy(), "force": true, "skip_tests": true});
-    let response = ctx
-        .post(
-            "/api/v1/packs/register",
-            request.clone(),
-            Some(&owner_token),
-        )
-        .await?;
+    let response = upload_registration_fixture(&ctx, request.clone(), Some(&owner_token)).await?;
     assert_eq!(
         response.status(),
         StatusCode::CREATED,
@@ -893,9 +879,7 @@ async fn editor_claims_fresh_namespace_but_existing_deployments_require_matching
         (&owner_token, StatusCode::CREATED),
         (&other_token, StatusCode::FORBIDDEN),
     ] {
-        let response = ctx
-            .post("/api/v1/packs/register", request.clone(), Some(token))
-            .await?;
+        let response = upload_registration_fixture(&ctx, request.clone(), Some(token)).await?;
         assert_eq!(
             response.status(),
             expected,
@@ -934,9 +918,7 @@ async fn editor_claims_fresh_namespace_but_existing_deployments_require_matching
     )
     .await?;
     for token in [scoped.as_str(), ctx.token().unwrap()] {
-        let response = ctx
-            .post("/api/v1/packs/register", request.clone(), Some(token))
-            .await?;
+        let response = upload_registration_fixture(&ctx, request.clone(), Some(token)).await?;
         assert_eq!(
             response.status(),
             StatusCode::CREATED,
@@ -976,15 +958,14 @@ async fn editor_claims_fresh_namespace_but_existing_deployments_require_matching
     .await?;
     for reference in ["ownerless_claim", "core"] {
         let source = create_test_pack_dir(reference, "1.0.0")?;
-        let response = ctx
-            .post(
-                "/api/v1/packs/register",
-                json!({
-                    "path": source.path().to_string_lossy(), "force": true, "skip_tests": true,
-                }),
-                Some(&other_token),
-            )
-            .await?;
+        let response = upload_registration_fixture(
+            &ctx,
+            json!({
+                "path": source.path().to_string_lossy(), "force": true, "skip_tests": true,
+            }),
+            Some(&other_token),
+        )
+        .await?;
         assert_eq!(
             response.status(),
             StatusCode::FORBIDDEN,
@@ -1052,15 +1033,7 @@ async fn pack_create_cannot_bypass_namespace_claim_authority() -> Result<()> {
     assert_eq!(pack.installed_by, Some(identity));
     let (other, _) = register_pack_role_user(&ctx, "core.editor").await?;
     let source = create_test_pack_dir("created_claim", "1.0.0")?;
-    let response = ctx
-        .post(
-            "/api/v1/packs/register",
-            json!({
-                "path": source.path().to_string_lossy(), "force": true, "skip_tests": true,
-            }),
-            Some(&other),
-        )
-        .await?;
+    let response = upload_test_pack_with_token(&ctx, source.path(), true, &other).await?;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     ctx.cleanup().await?;
     Ok(())
@@ -1088,13 +1061,13 @@ async fn concurrent_editor_first_uploads_have_one_primary_owner_and_no_late_over
         drop(gate);
     };
     let (first_response, second_response, ()) = tokio::join!(
-        ctx.post(
-            "/api/v1/packs/register",
+        upload_registration_fixture(
+            &ctx,
             json!({"path": first.path().to_string_lossy(), "force": true, "skip_tests": true}),
             Some(&first_token)
         ),
-        ctx.post(
-            "/api/v1/packs/register",
+        upload_registration_fixture(
+            &ctx,
             json!({"path": second.path().to_string_lossy(), "force": true, "skip_tests": true}),
             Some(&second_token)
         ),
@@ -1157,13 +1130,12 @@ async fn scoped_install_authority_admits_only_the_named_fresh_pack() -> Result<(
     fs::create_dir(allowed.path().join("permission_sets"))?;
     fs::write(allowed.path().join("permission_sets/admin.yaml"),
         "ref: scoped_fresh.admin\nscope: external\ngrants:\n  - resource: permissions\n    actions: [manage]\n")?;
-    let response = ctx
-        .post(
-            "/api/v1/packs/register",
-            json!({"path": allowed.path().to_string_lossy(), "skip_tests": true}),
-            ctx.token(),
-        )
-        .await?;
+    let response = upload_registration_fixture(
+        &ctx,
+        json!({"path": allowed.path().to_string_lossy(), "skip_tests": true}),
+        ctx.token(),
+    )
+    .await?;
     let status = response.status();
     assert_eq!(
         status,
@@ -1191,13 +1163,12 @@ async fn scoped_install_authority_admits_only_the_named_fresh_pack() -> Result<(
     fs::create_dir(denied.path().join("permission_sets"))?;
     fs::write(denied.path().join("permission_sets/admin.yaml"),
         "ref: outside_scope.admin\nscope: external\ngrants:\n  - resource: permissions\n    actions: [manage]\n")?;
-    let response = ctx
-        .post(
-            "/api/v1/packs/register",
-            json!({"path": denied.path().to_string_lossy(), "skip_tests": true}),
-            ctx.token(),
-        )
-        .await?;
+    let response = upload_registration_fixture(
+        &ctx,
+        json!({"path": denied.path().to_string_lossy(), "skip_tests": true}),
+        ctx.token(),
+    )
+    .await?;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert!(PackRepository::find_by_ref(&ctx.pool, "outside_scope")
         .await?
@@ -3095,6 +3066,24 @@ async fn test_register_pack_rolls_back_when_component_loading_fails() -> Result<
     let fixture =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pack_load_failure");
 
+    // Confirm that the default temporary-source fixture policy rejects this
+    // repository source before malformed component metadata is read.
+    let denied = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({"path": fixture, "skip_tests": true}),
+            ctx.token(),
+        )
+        .await?;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let denied: serde_json::Value = denied.json().await?;
+    assert_eq!(
+        denied["error"],
+        "Local pack source is outside operator-approved roots"
+    );
+    // Trust only this immutable repository fixture, never the repository root.
+    let ctx = ctx.with_local_source_roots(vec![fixture.clone()]).await?;
+
     let response = ctx
         .post(
             "/api/v1/packs/register",
@@ -3201,6 +3190,7 @@ async fn test_register_pack_rolls_back_when_component_loading_fails() -> Result<
         "cache definition preflight must prevent partial existing-pack component updates"
     );
 
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -4634,6 +4624,22 @@ async fn pack_releases_reject_conflicting_versions_and_preserve_previous_bytes()
     Ok(())
 }
 
+// Scoped deployment tests supply their own archive bytes. Local host reads have
+// separate operator authority and are covered by local_source_ingestion_*.
+async fn upload_registration_fixture(
+    ctx: &TestContext,
+    request: serde_json::Value,
+    token: Option<&str>,
+) -> Result<helpers::TestResponse> {
+    upload_test_pack_with_token(
+        ctx,
+        std::path::Path::new(request["path"].as_str().unwrap()),
+        request["force"].as_bool().unwrap_or(false),
+        token.unwrap(),
+    )
+    .await
+}
+
 async fn upload_test_pack(
     ctx: &TestContext,
     source: &std::path::Path,
@@ -5097,5 +5103,338 @@ async fn missing_legacy_pack_bytes_fail_closed_without_a_fake_release() -> Resul
 
     let response = ctx.get("/health/ready", None).await?;
     assert_eq!(response.status(), axum::http::StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_source_ingestion_requires_operator_roots_and_global_authority() -> Result<()> {
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let source = create_test_pack_dir("local_confinement", "1.0.0")?;
+    assert!(attune_common::config::PacksConfig::default()
+        .local_source_roots
+        .is_empty());
+    let ctx = ctx.with_local_source_roots(Vec::new()).await?;
+    assert_eq!(
+        ctx.post(
+            "/api/v1/packs/register",
+            json!({"path": source.path(), "skip_tests": true}),
+            ctx.token()
+        )
+        .await?
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    let archive_root = TempDir::new()?;
+    let archive_path = archive_root.path().join("local.tar.gz");
+    let gzip = flate2::write::GzEncoder::new(
+        fs::File::create(&archive_path)?,
+        flate2::Compression::default(),
+    );
+    let mut archive = tar::Builder::new(gzip);
+    archive.append_dir_all(".", source.path())?;
+    archive.into_inner()?.finish()?;
+    assert_eq!(
+        ctx.post(
+            "/api/v1/packs/install",
+            json!({"source":archive_path, "skip_tests":true}),
+            ctx.token()
+        )
+        .await?
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    let approved = TempDir::new()?;
+    let ctx = ctx
+        .with_local_source_roots(vec![approved.path().into()])
+        .await?;
+    let token = ctx.token.as_deref();
+    for (route, body) in [
+        (
+            "/api/v1/packs/register",
+            json!({"path": source.path(), "skip_tests": true}),
+        ),
+        (
+            "/api/v1/packs/register-batch",
+            json!({"pack_paths": [source.path()], "skip_tests": true}),
+        ),
+        (
+            "/api/v1/packs/install",
+            json!({"source": source.path(), "skip_tests": true}),
+        ),
+    ] {
+        assert_eq!(
+            ctx.post(route, body, token).await?.status(),
+            StatusCode::FORBIDDEN,
+            "{route}"
+        );
+    }
+    let downloaded: serde_json::Value = ctx
+        .post(
+            "/api/v1/packs/download",
+            json!({"packs":[source.path()]}),
+            token,
+        )
+        .await?
+        .json()
+        .await?;
+    assert_eq!(
+        downloaded["data"]["downloaded_packs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert!(
+        PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "local_confinement")
+            .await?
+            .is_none()
+    );
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(source.path(), approved.path().join("escape"))?;
+        assert_eq!(
+            ctx.post(
+                "/api/v1/packs/register",
+                json!({"path": approved.path().join("escape"), "skip_tests":true}),
+                token
+            )
+            .await?
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    let ctx = ctx
+        .with_local_source_roots(vec![source.path().into()])
+        .await?;
+    let editor = register_pack_index_user(&ctx, json!([{"resource":"packs", "actions":["install"], "constraints":{"refs":["local_confinement"]}}])).await?;
+    assert_eq!(
+        ctx.post(
+            "/api/v1/packs/register",
+            json!({"path":source.path(), "skip_tests":true}),
+            Some(&editor)
+        )
+        .await?
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(
+        PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "local_confinement")
+            .await?
+            .is_none()
+    );
+    let response = ctx
+        .post(
+            "/api/v1/packs/register",
+            json!({"path":source.path(), "skip_tests":true}),
+            ctx.token.as_deref(),
+        )
+        .await?;
+    assert!(response.status().is_success(), "{}", response.text().await?);
+    assert!(
+        PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "local_confinement")
+            .await?
+            .is_some()
+    );
+    let ctx = ctx
+        .with_local_source_roots(vec![archive_root.path().into()])
+        .await?;
+    let installed = ctx
+        .post(
+            "/api/v1/packs/install",
+            json!({"source": archive_path, "force":true, "skip_tests":true, "skip_deps":true}),
+            ctx.token(),
+        )
+        .await?;
+    assert!(
+        installed.status().is_success(),
+        "{}",
+        installed.text().await?
+    );
+    // Reinstalling identical archive bytes reuses the immutable release.
+    let pack = PackRepository::find_by_ref(&ctx.pool, "local_confinement")
+        .await?
+        .unwrap();
+    assert_eq!(
+        PackReleaseRepository::list_by_pack(&ctx.pool, pack.id)
+            .await?
+            .len(),
+        1
+    );
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn host_pack_inspection_confines_all_paths_and_preserves_read_authority() -> Result<()> {
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let approved = TempDir::new()?;
+    let outside = create_test_pack_dir("outside_inspection", "1.0.0")?;
+    let allowed = approved.path().join("allowed");
+    fs::create_dir(&allowed)?;
+    fs::write(allowed.join("pack.yaml"), "ref: allowed_inspection\nversion: 1.0.0\npython: '3.11'\ndependencies: [missing_inspection@1.0.0]\n")?;
+    fs::write(allowed.join("requirements.txt"), "")?;
+    let reader =
+        register_pack_index_user(&ctx, json!([{"resource":"packs","actions":["read"]}])).await?;
+    let installer =
+        register_pack_index_user(&ctx, json!([{"resource":"packs","actions":["install"]}])).await?;
+    let ctx = ctx.with_local_source_roots(Vec::new()).await?;
+    for (route, token) in [("dependencies", &reader), ("build-envs", &installer)] {
+        assert_eq!(
+            ctx.post(
+                &format!("/api/v1/packs/{route}"),
+                json!({"pack_paths":[allowed]}),
+                Some(token)
+            )
+            .await?
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    let ctx = ctx
+        .with_local_source_roots(vec![approved.path().into()])
+        .await?;
+    std::os::unix::fs::symlink(outside.path(), approved.path().join("escape"))?;
+    let manifest_escape = approved.path().join("manifest-escape");
+    fs::create_dir(&manifest_escape)?;
+    std::os::unix::fs::symlink(
+        outside.path().join("pack.yaml"),
+        manifest_escape.join("pack.yaml"),
+    )?;
+    let traversal = approved
+        .path()
+        .join("..")
+        .join(outside.path().file_name().unwrap());
+    for (route, token) in [("dependencies", &reader), ("build-envs", &installer)] {
+        for paths in [
+            json!([outside.path()]), // Absolute outside path.
+            json!([traversal]),
+            json!([approved.path().join("escape")]),
+            json!([manifest_escape]),
+            json!([allowed, outside.path()]), // No partial success/probes.
+            json!([outside.path(), allowed]),
+        ] {
+            let response = ctx
+                .post(
+                    &format!("/api/v1/packs/{route}"),
+                    json!({"pack_paths":paths}),
+                    Some(token),
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{route}");
+            let body: serde_json::Value = response.json().await?;
+            assert!(
+                body.get("data").is_none(),
+                "no partial metadata or detection result"
+            );
+        }
+        for name in ["requirements.txt", "package.json", "venv", "node_modules"] {
+            let probe = approved.path().join(format!("{route}-link-{name}"));
+            fs::create_dir(&probe)?;
+            fs::write(
+                probe.join("pack.yaml"),
+                fs::read(allowed.join("pack.yaml"))?,
+            )?;
+            std::os::unix::fs::symlink(outside.path(), probe.join(name))?;
+            assert_eq!(
+                ctx.post(
+                    &format!("/api/v1/packs/{route}"),
+                    json!({"pack_paths":[probe]}),
+                    Some(token)
+                )
+                .await?
+                .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+    }
+    let response = ctx
+        .post(
+            "/api/v1/packs/dependencies",
+            json!({"pack_paths":[allowed]}),
+            Some(&reader),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await?;
+    assert_eq!(
+        body["data"]["analyzed_packs"][0]["pack_ref"],
+        "allowed_inspection"
+    );
+    assert_eq!(
+        body["data"]["missing_dependencies"][0]["pack_ref"],
+        "missing_inspection"
+    );
+    assert_eq!(
+        ctx.post(
+            "/api/v1/packs/build-envs",
+            json!({"pack_paths":[allowed]}),
+            Some(&reader)
+        )
+        .await?
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        ctx.post(
+            "/api/v1/packs/dependencies",
+            json!({"pack_paths":[allowed]}),
+            Some(&installer)
+        )
+        .await?
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    let response = ctx
+        .post(
+            "/api/v1/packs/build-envs",
+            json!({"pack_paths":[allowed], "skip_nodejs":true}),
+            Some(&installer),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await?;
+    assert_eq!(
+        body["data"]["built_environments"][0]["pack_ref"],
+        "allowed_inspection"
+    );
+    // Detection only: no environment installation or release publication.
+    assert!(!allowed.join("venv").exists());
+    assert!(!allowed.join("node_modules").exists());
+    assert!(
+        PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "allowed_inspection")
+            .await?
+            .is_none()
+    );
+    assert!(
+        PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "outside_inspection")
+            .await?
+            .is_none()
+    );
+
+    // Upload remains independent of source approval. An operator may then
+    // explicitly approve its installed projection for metadata inspection.
+    let uploaded = create_test_pack_dir("uploaded_inspection", "1.0.0")?;
+    let response = upload_test_pack(&ctx, uploaded.path(), false).await?;
+    assert!(response.status().is_success(), "{}", response.text().await?);
+    let projection = ctx.test_packs_dir.join("uploaded_inspection");
+    let projection_root = ctx.test_packs_dir.clone();
+    let ctx = ctx.with_local_source_roots(vec![projection_root]).await?;
+    for (route, token) in [("dependencies", &reader), ("build-envs", &installer)] {
+        let response = ctx
+            .post(
+                &format!("/api/v1/packs/{route}"),
+                json!({"pack_paths":[projection], "skip_python":true, "skip_nodejs":true}),
+                Some(token),
+            )
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{route}: {}",
+            response.text().await?
+        );
+    }
+    ctx.cleanup().await?;
     Ok(())
 }
