@@ -34,6 +34,7 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    attune_common::parent_process_protection::protect_service_parent()?;
     attune_common::auth::install_crypto_provider();
 
     let args = Args::parse();

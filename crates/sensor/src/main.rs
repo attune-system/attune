@@ -21,8 +21,13 @@ struct Args {
     log_level: Option<String>,
 }
 
+fn main() -> Result<()> {
+    attune_common::parent_process_protection::protect_service_parent()?;
+    run()
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn run() -> Result<()> {
     attune_common::auth::install_crypto_provider();
 
     let args = Args::parse();

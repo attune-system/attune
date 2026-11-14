@@ -137,11 +137,45 @@ required keys. Worker pools do not import the entire runtime Secret.
 
 ## Isolation boundary
 
-This policy controls environment inheritance. It does not isolate files,
-networks, shared mounts, or same-user process access. Pack code still runs with
+This policy controls environment inheritance. Linux production entrypoints for
+`attune-worker`, `attune-agent`, `attune-sensor`, `attune-sensor-agent`, and
+`attune-api` additionally disable and verify parent dumpability with
+`PR_SET_DUMPABLE(0)` before runtime initialization, configuration/credential
+loading, runtime detection, setup, or verification. Failure to apply or verify
+this protection stops Linux startup. The API is included because pack handling
+can launch setup/test/runtime verification commands. Shared library constructors
+and in-process tests do not change process dumpability.
+
+Protection takes effect only after the entrypoint call succeeds. It does not
+prevent inspection before that point or revoke inspection access already acquired
+by an existing same-UID attacker.
+
+This blocks unprivileged same-UID ptrace and ptrace-gated procfs reads of the
+protected parent (including initial environment and memory), and disables its
+core dumps. It does not hide all procfs metadata. Privileged tracers with the
+relevant `CAP_SYS_PTRACE` authority can bypass the restriction; run pack hosts
+without that capability. Services must not change OS credentials or re-enable
+dumpability after startup. Ordinary child exec remains supported and can reset
+the child's dumpability: sibling child token/memory inspection remains a risk.
+Non-Linux builds continue without this Linux-specific protection; no equivalent
+parent-inspection guarantee is made there.
+
+This mitigation is not full execution isolation. Same-UID signals, writable
+mounts, shared runtime poisoning, sibling processes, worker-held control-plane
+credentials, and network access remain unresolved isolation boundaries (roadmap
+issue137 and findings s-2/s-23 remain open). It does not isolate files,
+networks, or shared mounts. Pack code still runs with
 the operating-system privileges of its configured runtime container or host.
 
 The shared implementation is `crates/common/src/child_process_environment.rs`.
 Worker process/native builders and sensor command builders apply it before
 adding explicit context. Regression tests use owned subprocesses with dummy
 service credentials, without mutating the test runner's environment.
+
+
+The startup guard is `crates/common/src/parent_process_protection.rs`.
+`cargo test -p attune-common --test parent_process_protection_tests -- --nocapture`
+uses only owned same-UID processes with a dummy initial environment. It observes
+real dumpability, reports host-restricted baseline access honestly, asserts
+protected procfs denial, and exercises cleared child environments and stdin JSON.
+The driver never changes its own dumpability; all children are joined.

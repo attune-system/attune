@@ -22,8 +22,13 @@ struct Args {
     name: Option<String>,
 }
 
+fn main() -> Result<()> {
+    attune_common::parent_process_protection::protect_service_parent()?;
+    run()
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn run() -> Result<()> {
     // Install HMAC-only JWT crypto provider (must be before any token operations)
     attune_common::auth::install_crypto_provider();
 

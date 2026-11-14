@@ -275,8 +275,13 @@ async fn authz_metadata_invalidation_loop(mq_url: String) {
     }
 }
 
+fn main() -> Result<()> {
+    attune_common::parent_process_protection::protect_service_parent()?;
+    run()
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn run() -> Result<()> {
     // Install a JWT crypto provider that supports both Attune's HS tokens
     // and external RS256 OIDC identity tokens.
     let _ = jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.install_default();
