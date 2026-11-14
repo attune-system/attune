@@ -458,7 +458,6 @@ async fn core_action_reduction_retires_only_omitted_actions_and_keeps_release_by
     let previous = owned.path().join("previous");
     copy(&current, &previous);
     let removed = [
-        "http_request",
         "run_agent_command",
         "generate_ssh_key_pair",
         "download_packs",
@@ -504,7 +503,7 @@ async fn core_action_reduction_retires_only_omitted_actions_and_keeps_release_by
         .await
         .unwrap();
     drop(connection);
-    let retained_actions: Vec<_> = ["core.echo", "core.sleep", "core.noop"]
+    let retained_actions: Vec<_> = ["core.echo", "core.sleep", "core.noop", "core.http_request"]
         .into_iter()
         .map(str::to_owned)
         .collect();

@@ -22,7 +22,7 @@ class InitPacksAdmissionTests(unittest.TestCase):
             (staged / "sensors/attune-core-timer-sensor").write_text("owned-binary")
             import platform
             native_target = {"x86_64": "linux-amd64", "aarch64": "linux-arm64"}[platform.machine()]
-            for action in ("echo", "sleep", "noop"):
+            for action in ("echo", "sleep", "noop", "http_request"):
                 native = staged / "actions/bin" / action / native_target
                 native.parent.mkdir(parents=True)
                 native.write_text("owned-action")

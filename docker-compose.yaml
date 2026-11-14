@@ -128,7 +128,7 @@ services:
       [
         "/bin/sh",
         "-c",
-        "case $$(uname -m) in x86_64) target=linux-amd64;; aarch64) target=linux-arm64;; *) exit 1;; esac; mkdir -p /opt/attune/pack-binaries/core/sensors; cp /pack-binaries/attune-core-timer-sensor /opt/attune/pack-binaries/core/sensors/attune-core-timer-sensor; chmod +x /opt/attune/pack-binaries/core/sensors/attune-core-timer-sensor; for action in echo sleep noop; do mkdir -p /opt/attune/pack-binaries/core/actions/bin/$$action; cp /pack-binaries/attune-core-$$action /opt/attune/pack-binaries/core/actions/bin/$$action/$$target; chmod +x /opt/attune/pack-binaries/core/actions/bin/$$action/$$target; done",
+        "case $$(uname -m) in x86_64) target=linux-amd64;; aarch64) target=linux-arm64;; *) exit 1;; esac; mkdir -p /opt/attune/pack-binaries/core/sensors; cp /pack-binaries/attune-core-timer-sensor /opt/attune/pack-binaries/core/sensors/attune-core-timer-sensor; chmod +x /opt/attune/pack-binaries/core/sensors/attune-core-timer-sensor; for action in echo sleep noop http_request; do mkdir -p /opt/attune/pack-binaries/core/actions/bin/$$action; cp /pack-binaries/attune-core-$$action /opt/attune/pack-binaries/core/actions/bin/$$action/$$target; chmod +x /opt/attune/pack-binaries/core/actions/bin/$$action/$$target; done",
       ]
     restart: "no"
     networks:

@@ -109,7 +109,7 @@ case "$RUST_TARGET" in
     aarch64-unknown-linux-musl) action_target=linux-arm64 ;;
     *) echo "Unsupported core action target" >&2; exit 1 ;;
 esac
-for action in echo sleep noop; do
+for action in echo sleep noop http_request; do
     mkdir -p "packs/core/actions/bin/$action"
     docker cp "${CONTAINER_NAME}:/pack-binaries/attune-core-$action" "packs/core/actions/bin/$action/$action_target"
     chmod +x "packs/core/actions/bin/$action/$action_target"

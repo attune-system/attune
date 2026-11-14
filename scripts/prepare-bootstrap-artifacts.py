@@ -176,7 +176,7 @@ def native_receipt(root):
             header = source.read(20)
         require(len(header) == 20 and header[:6] == b"\x7fELF\x02\x01" and int.from_bytes(header[18:20], "little") == machine and binary.stat().st_mode & 0o111, "Missing actual architecture-specific executable timer")
     for arch, machine in (("amd64", 62), ("arm64", 183)):
-        for action in ("echo", "sleep", "noop"):
+        for action in ("echo", "sleep", "noop", "http_request"):
             binary = root / "core/actions/bin" / action / ("linux-" + arch)
             with binary.open("rb") as source:
                 header = source.read(20)

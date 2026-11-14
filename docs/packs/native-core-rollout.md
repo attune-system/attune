@@ -1,6 +1,6 @@
 # Native core 1.0.7 rollout gate
 
-Core 1.0.7 contains only native echo, sleep, and noop actions. Their directory
+Core 1.0.7 contains only native echo, sleep, noop, and HTTP request actions. Their directory
 entrypoints require updated worker/agent code. Stock platform 0.10.4 workers
 advertise `native` but cannot dispatch those directories. An app-version string
 or advertised native capability alone is not compatibility evidence.

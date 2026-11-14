@@ -31,7 +31,7 @@ class CoreCompositionTests(unittest.TestCase):
             self.assertEqual(actual, expected)
             for relative in expected:
                 self.assertEqual((CORE / relative).stat().st_mode & 0o111, (owned / relative).stat().st_mode & 0o111, relative)
-            for folder, count in (("actions", 3), ("triggers", 7), ("sensors", 1), ("runtimes", 9), ("permission_sets", 5)):
+            for folder, count in (("actions", 4), ("triggers", 7), ("sensors", 1), ("runtimes", 9), ("permission_sets", 5)):
                 self.assertEqual(len(list((owned / folder).glob("*.yaml"))), count, folder)
 
     def test_core_actions_need_only_native_and_have_no_script_fallback(self):
@@ -41,7 +41,7 @@ class CoreCompositionTests(unittest.TestCase):
         self.assertFalse(manifest["testing"].get("runners"))
         self.assertFalse(list((CORE / "actions").glob("*.py")))
         self.assertFalse(list((CORE / "actions").glob("*.sh")))
-        for name in ("echo", "sleep", "noop"):
+        for name in ("echo", "sleep", "noop", "http_request"):
             action = yaml.safe_load((CORE / "actions" / (name + ".yaml")).read_text())
             self.assertEqual(action["runner_type"], "native")
             self.assertEqual(action["entry_point"], "bin/" + name)
@@ -67,7 +67,7 @@ class CoreCompositionTests(unittest.TestCase):
     def test_shipped_refs_and_canonical_installer_are_explicit(self):
         self.assertEqual(publisher.bundled_pack_version(CORE), "1.0.7")
         actions = {yaml.safe_load(path.read_text())["ref"] for path in (CORE / "actions").glob("*.yaml")}
-        self.assertEqual(actions, {"core.echo", "core.noop", "core.sleep"})
+        self.assertEqual(actions, {"core.echo", "core.noop", "core.sleep", "core.http_request"})
         sensor = yaml.safe_load((CORE / "sensors/timer_sensor.yaml").read_text())
         triggers = {yaml.safe_load(path.read_text())["ref"] for path in (CORE / "triggers").glob("*.yaml")}
         self.assertTrue(set(sensor["trigger_types"]).issubset(triggers))

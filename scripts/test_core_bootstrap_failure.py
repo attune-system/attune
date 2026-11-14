@@ -147,7 +147,7 @@ sys.exit(98)
             shutil.copytree(ROOT / "packs/core", root / "source/core")
             (root / "active").mkdir()
             (root / "active/sentinel").write_text("unchanged")
-            for action in ("echo", "sleep", "noop"):
+            for action in ("echo", "sleep", "noop", "http_request"):
                 binary = root / "staging/core/actions/bin" / action / host[0]
                 binary.parent.mkdir(parents=True)
                 header = bytearray(64)
@@ -189,7 +189,7 @@ sys.exit(98)
             start = body.index(b"\x1f\x8b")
             with tarfile.open(fileobj=io.BytesIO(body[start:]), mode="r:gz") as archive:
                 names = archive.getnames()
-                for action in ("echo", "sleep", "noop"):
+                for action in ("echo", "sleep", "noop", "http_request"):
                     self.assertIn(f"core/actions/bin/{action}/{host[0]}", names)
                 self.assertNotIn("core/actions/run_agent_command.yaml", names)
                 self.assertEqual(archive.extractfile("core/sensors/timer_sensor.yaml").read(),

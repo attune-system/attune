@@ -3,7 +3,8 @@ name = "core-actions"
 version = "1.0.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Standalone stdin JSON echo, sleep and noop actions for Attune"
+description = "Standalone stdin JSON native actions for Attune"
 
 [dependencies]
 serde_json = "1.0"
+reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls"] }

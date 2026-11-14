@@ -70,7 +70,7 @@ class BootstrapCorePackTests(unittest.TestCase):
     def test_native_payload_requires_complete_official_static_variants(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {"ATTUNE_BOOTSTRAP_MODE": "api"}):
             root = Path(directory)
-            for action in ("echo", "sleep", "noop"):
+            for action in ("echo", "sleep", "noop", "http_request"):
                 target = root / "actions/bin" / action
                 target.mkdir(parents=True)
                 for name, machine in (("linux-amd64", 62), ("linux-arm64", 183)):
@@ -103,7 +103,7 @@ class BootstrapCorePackTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "ELF architecture"):
                 bootstrap.validate_native_payload(root)
             # Host-only mode is explicit and cannot satisfy the official mode.
-            for action in ("echo", "sleep", "noop"):
+            for action in ("echo", "sleep", "noop", "http_request"):
                 (root / "actions/bin" / action / "linux-arm64").unlink()
             with mock.patch.dict(os.environ, {"ATTUNE_BOOTSTRAP_MODE": "volume"}), mock.patch.object(bootstrap.platform, "machine", return_value="x86_64"), mock.patch.object(bootstrap.platform, "system", return_value="Linux"):
                 bootstrap.validate_native_payload(root)

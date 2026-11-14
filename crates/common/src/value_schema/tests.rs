@@ -1207,6 +1207,8 @@ fn repository_core_schema_definitions_use_the_supported_contract() {
         ("actions/echo.yaml", "parameters"),
         ("actions/sleep.yaml", "parameters"),
         ("actions/noop.yaml", "parameters"),
+        ("actions/http_request.yaml", "parameters"),
+        ("actions/http_request.yaml", "output_schema"),
         ("sensors/timer_sensor.yaml", "parameters"),
     ] {
         assert!(

@@ -63,7 +63,7 @@ async fn main() {
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs/core"),
         &source,
     );
-    for action in ["echo", "sleep", "noop"] {
+    for action in ["echo", "sleep", "noop", "http_request"] {
         let directory = source.join("actions/bin").join(action);
         std::fs::create_dir_all(&directory).unwrap();
         for (target, variant) in [

@@ -1,8 +1,10 @@
 # Native core actions
 
-Only `echo.yaml`, `sleep.yaml`, and `noop.yaml` declare core actions. Their native
-binaries receive one flat JSON object on stdin and produce text output. See the
-[core README](../README.md) for parameter behavior and architecture packaging.
+`echo.yaml`, `sleep.yaml`, `noop.yaml` and `http_request.yaml` declare the four
+native actions. Each binary entrypoint implements its own behavior and receives
+flat stdin JSON; the shared Rust library only parses/validates parameters.
+Echo/sleep/noop keep text output; HTTP returns structured JSON with native Rust TLS.
+See the [core README](../README.md) for HTTP semantics and architecture packaging.
 
-No shell/Python wrappers, HTTP clients, arbitrary command launchers, SSH key
-helpers, pack-administration actions, or installation workflows are shipped here.
+No shell/Python/curl wrappers, arbitrary command launchers, SSH key helpers,
+pack-administration actions, or installation workflow are shipped here.

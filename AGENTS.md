@@ -212,7 +212,7 @@ Workflow details live in:
 
 ## Runtime / Execution Rules
 
-- Core ships only native `echo`, `sleep`, and `noop` actions. Native directory entrypoints contain regular executable `linux-amd64`/`linux-arm64` variants selected directly by the worker; see `packs/core/README.md` and `docs/packs/native-core-rollout.md`.
+- Core ships only native `echo`, `sleep`, `noop`, and `http_request` actions. Native directory entrypoints contain regular executable `linux-amd64`/`linux-arm64` variants selected directly by the worker; see `packs/core/README.md` and `docs/packs/native-core-rollout.md`.
 - Worker runtimes come from DB-backed runtime definitions; native runtimes are represented by empty interpreter config.
 - Candidate pack tests always download version-pinned archives from the API's configured object backend, including shared-volume workers. See `docs/deployment/pack-candidate-distribution.md`.
 - Pack publication keeps releases immutable. For the off/on/suffix republishing policy and preserved release pins, read `docs/packs/pack-release-artifacts-spec.md#republishing-policy`.

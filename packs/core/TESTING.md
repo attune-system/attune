@@ -23,3 +23,14 @@ materializes archive bytes, deletes authoring/source releases, and invokes the
 real NativeRuntime with an unusable PATH and no API token. The explicit lane
 fails if its prebuilt fixtures are missing; it never silently skips or passes.
 Component lifecycle DB regressions verify omission retirement independently.
+
+HTTP's owning loopback-only process suite exercises the real executable with an
+unusable PATH and no inherited API credentials:
+
+```sh
+ATTUNE_CORE_HTTP_BINARY=/absolute/path/to/attune-core-http_request python3 scripts/test_native_http_action.py
+```
+
+The test harness needs Python and OpenSSL solely to create an ephemeral self-signed
+TLS mock; neither is a worker/action prerequisite. It runs against debug and real
+static AMD64 binaries in CI; ARM64 must also build and pass strict ELF packaging.

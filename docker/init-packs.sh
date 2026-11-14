@@ -50,7 +50,7 @@ if [ "${ATTUNE_BOOTSTRAP_MODE:-volume}" = volume ]; then
         aarch64|arm64) target=linux-arm64 ;;
         *) echo 'Unsupported local core action architecture' >&2; exit 1 ;;
     esac
-    for action in echo sleep noop; do
+    for action in echo sleep noop http_request; do
         binary="$binary_root/actions/bin/$action/$target"
         test -x "$binary" || { echo 'Missing local native core action' >&2; exit 1; }
         rm -rf "$candidate/core/actions/bin/$action"

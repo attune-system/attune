@@ -11,7 +11,7 @@ images contain AMD64 and ARM64 action variants plus the existing timer binaries.
 There is no source/interpreter fallback. See [packaging details](README.md).
 
 Upgrades use the existing pack-wide omission removal policy. The release keeps all
-nonaction definitions and removes the eight obsolete action definitions plus
+nonaction definitions and removes the seven obsolete action definitions plus
 the installer action's owned workflow graph/definition. Existing
 rows and historical release pins are retained under the ordinary lifecycle rules;
 no database reset or manual cleanup is part of this change.

@@ -327,7 +327,7 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
             .filter_map(|entry| entry.ok())
             .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "yaml"))
             .count(),
-        3
+        4
     );
     // Preserve the retained, inert shipped definition byte-for-byte. Its
     // withdrawn SSH owner is not a valid owner for a new synthetic consumer.
@@ -410,6 +410,7 @@ async fn actual_core_archive_admission_preserves_platform_roles_defaults_and_exa
         "core.echo",
         "core.noop",
         "core.sleep",
+        "core.http_request",
         "core.acceptance_key_creator",
     ] {
         assert_eq!(
@@ -1451,7 +1452,7 @@ async fn core_native_only_worker_upload_admits_without_interpreter_test_dispatch
     assert!(install.as_ref().is_none_or(
         |install| install.assigned_worker_id.is_none() && install.test_execution_id.is_none()
     ));
-    for reference in ["core.echo", "core.sleep", "core.noop"] {
+    for reference in ["core.echo", "core.sleep", "core.noop", "core.http_request"] {
         let action = ActionRepository::find_by_ref(&ctx.pool, reference)
             .await?
             .unwrap();
@@ -1459,7 +1460,6 @@ async fn core_native_only_worker_upload_admits_without_interpreter_test_dispatch
         assert!(action.default_execution_permission_set_refs.is_empty());
     }
     for reference in [
-        "core.http_request",
         "core.run_agent_command",
         "core.install_packs",
         "core.generate_ssh_key_pair",

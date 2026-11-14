@@ -159,7 +159,7 @@ jobs:
           mkdir -p dist/core-timer-sensor/linux-amd64 dist/core-timer-sensor/linux-arm64
           install -m 0755 /bin/true dist/core-timer-sensor/linux-amd64/attune-core-timer-sensor
           install -m 0755 /bin/true dist/core-timer-sensor/linux-arm64/attune-core-timer-sensor
-          for action in echo sleep noop; do
+          for action in echo sleep noop http_request; do
             mkdir -p "dist/core-actions/$action"
             install -m 0755 /bin/true "dist/core-actions/$action/linux-amd64"
             install -m 0755 /bin/true "dist/core-actions/$action/linux-arm64"
@@ -358,6 +358,11 @@ jobs:
       - name: Standalone core action tests
         run: cargo test --manifest-path crates/core-actions/Cargo.toml --locked -- --test-threads=4
 
+      - name: Native HTTP action loopback HTTP and TLS tests
+        env:
+          ATTUNE_CORE_HTTP_BINARY: ${{ github.workspace }}/crates/core-actions/target/debug/attune-core-http_request
+        run: python3 scripts/test_native_http_action.py
+
       - name: Build static core action fixtures
         run: |
           rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
@@ -367,6 +372,11 @@ jobs:
           export PATH="$zig_directory:$PATH"
           cargo zigbuild --locked --release --manifest-path crates/core-actions/Cargo.toml --target x86_64-unknown-linux-musl --bins
           cargo zigbuild --locked --release --manifest-path crates/core-actions/Cargo.toml --target aarch64-unknown-linux-musl --bins
+
+      - name: Static native HTTP action loopback HTTP and TLS tests
+        env:
+          ATTUNE_CORE_HTTP_BINARY: ${{ github.workspace }}/crates/core-actions/target/x86_64-unknown-linux-musl/release/attune-core-http_request
+        run: python3 scripts/test_native_http_action.py
 
       - name: Native core archive smoke test
         env:

@@ -15,7 +15,7 @@ RUN pip install --no-cache-dir psycopg2-binary pyyaml \
         /source/packs/core/sensors/timer-sensor-launcher \
         /source/packs/core/sensors/bin/linux-amd64/attune-core-timer-sensor \
         /source/packs/core/sensors/bin/linux-arm64/attune-core-timer-sensor \
-    && for action in echo sleep noop; do \
+    && for action in echo sleep noop http_request; do \
         test -x /source/packs/core/actions/bin/$action/linux-amd64 || exit 1; \
         test -x /source/packs/core/actions/bin/$action/linux-arm64 || exit 1; \
     done

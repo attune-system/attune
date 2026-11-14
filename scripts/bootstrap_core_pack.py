@@ -113,7 +113,7 @@ def validate_native_payload(pack_dir):
         if platform.system() != "Linux" or host is None:
             raise RuntimeError("unsupported local core platform")
         required = {host}
-    for action in ("echo", "sleep", "noop"):
+    for action in ("echo", "sleep", "noop", "http_request"):
         directory = pack_dir / "actions/bin" / action
         for path in (pack_dir, pack_dir / "actions", pack_dir / "actions/bin", directory):
             if path.is_symlink() or not path.is_dir():

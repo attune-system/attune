@@ -466,7 +466,7 @@ jobs:
 
           verify_arch "$pack_binary"
           verify_static "$pack_binary"
-          for action in echo sleep noop; do
+          for action in echo sleep noop http_request; do
             action_binary="crates/core-actions/target/${{ matrix.musl_target }}/release/attune-core-$action"
             verify_arch "$action_binary"
             verify_static "$action_binary"
@@ -500,7 +500,7 @@ jobs:
           cp "target/${MUSL_TARGET}/release/attune-mcp" "$bundle_root/agent/"
           cp "target/${MUSL_TARGET}/release/attune" "$bundle_root/agent/"
           cp "${pack_binary_output_dir}/attune-core-timer-sensor" "$bundle_root/pack-binaries/"
-          for action in echo sleep noop; do
+          for action in echo sleep noop http_request; do
             cp "crates/core-actions/target/${MUSL_TARGET}/release/attune-core-$action" "$bundle_root/pack-binaries/"
           done
 
@@ -1670,7 +1670,7 @@ jobs:
                 install -m 0755 \
                   "dist/core-artifacts/${arch}/extracted/pack-binaries/attune-core-timer-sensor" \
                   "dist/core-timer-sensor/linux-${arch}/attune-core-timer-sensor"
-                for action in echo sleep noop; do
+                for action in echo sleep noop http_request; do
                   mkdir -p "dist/core-actions/$action"
                   install -m 0755 "dist/core-artifacts/${arch}/extracted/pack-binaries/attune-core-$action" "dist/core-actions/$action/linux-${arch}"
                 done

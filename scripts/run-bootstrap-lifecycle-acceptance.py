@@ -722,7 +722,7 @@ def execute(args, manifest):
                 require(digest(path) == digest(source / relative), "Packaged core source differs from integrated source")
         actual = {str(path.relative_to(source)) for path in source.rglob("*") if path.is_file()}
         native = {"sensors/bin/" + arch + "/attune-core-timer-sensor" for arch in ("linux-amd64", "linux-arm64")}
-        native.update("actions/bin/" + action + "/" + arch for action in ("echo", "sleep", "noop") for arch in ("linux-amd64", "linux-arm64"))
+        native.update("actions/bin/" + action + "/" + arch for action in ("echo", "sleep", "noop", "http_request") for arch in ("linux-amd64", "linux-arm64"))
         require(actual - expected <= native and native <= actual, "Packaged core has unreviewed extras or missing real native inputs")
         published = archive(tool.resolve(), source, args.work_root / "canonical-archive")
         spec = importlib.util.spec_from_file_location("acceptance_publisher", args.source_root / "scripts/bootstrap_core_pack.py")
