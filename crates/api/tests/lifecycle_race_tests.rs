@@ -718,12 +718,6 @@ async fn lifecycle_admission_order(kind: &str, operation: &str) -> Result<()> {
     } else {
         ("POST", format!("/api/v1/{kind}/{target_ref}/{operation}"))
     };
-    let expected = if kind == "sensors" && operation == "enable" {
-        // No live sensor worker is provisioned; placement admission still runs.
-        StatusCode::UNPROCESSABLE_ENTITY
-    } else {
-        StatusCode::OK
-    };
     let mut blocker = ctx.pool.begin().await?;
     SchemaTypeRepository::lock_reclamation(&mut blocker).await?;
     let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
@@ -781,6 +775,16 @@ async fn lifecycle_admission_order(kind: &str, operation: &str) -> Result<()> {
         requests.abort_all();
         while requests.join_next().await.is_some() {}
     }
+    let sensor_after = if kind == "sensors" {
+        Some(
+            attune_common::repositories::trigger::SensorRepository::find_by_ref(
+                &ctx.pool, target_ref,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
     ctx.cleanup().await?;
     rollback?;
     let available = observation?;
@@ -790,9 +794,15 @@ async fn lifecycle_admission_order(kind: &str, operation: &str) -> Result<()> {
         "{kind}/{operation} held sensor admission while blocked on graph admission"
     );
     assert_eq!(responses.len(), 2);
+    // This native sensor is idle: no active rule or transport demand requires
+    // a live worker. Enabling it succeeds after the normal placement check.
     for response in responses {
-        let (deletion, status) = response?;
-        assert_eq!(status, if deletion { StatusCode::OK } else { expected });
+        let (_, status) = response?;
+        assert_eq!(status, StatusCode::OK);
+    }
+    if let Some(sensor_after) = sensor_after {
+        let sensor = sensor_after?.ok_or("Lifecycle sensor disappeared")?;
+        assert_eq!(sensor.enabled, operation == "enable");
     }
     Ok(())
 }
