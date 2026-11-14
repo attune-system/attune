@@ -82,10 +82,10 @@ Use it when you want an MCP-capable agent or harness to interact with Attune thr
 ./target/debug/attune-mcp --profile prod
 
 # Run as an HTTP service for containers or remote MCP clients
-./target/debug/attune-mcp --transport http --listen-addr 0.0.0.0:8090
+./target/debug/attune-mcp --transport http --api-url http://localhost:8080 --http-host localhost:8090 --listen-addr 127.0.0.1:8090
 
 # Enable local pack checking over HTTP for explicitly mounted roots
-./target/debug/attune-mcp --transport http --packs-check-root /workspace/packs
+./target/debug/attune-mcp --transport http --api-url http://api:8080 --http-host localhost:8090 --packs-check-root /workspace/packs
 
 # Run with an execution-scoped token inside an Attune action/worker
 ATTUNE_API_URL=http://attune-api:8080 ATTUNE_API_TOKEN="$ATTUNE_API_TOKEN" ./target/debug/attune-mcp
@@ -104,7 +104,7 @@ Current MCP tool families:
 
 Notes:
 - `attune-mcp` defaults to **stdio transport** for MCP client launchers, but also supports **HTTP transport** at `POST /mcp` with `GET /health` for containerized deployment.
-- It reuses the same CLI config/profile/auth state as `attune`, and also supports non-interactive startup auth via `ATTUNE_AUTH_TOKEN` / `ATTUNE_REFRESH_TOKEN` or `ATTUNE_LOGIN` / `ATTUNE_PASSWORD`.
+- **Stdio** reuses the same CLI config/profile/auth state as `attune`, and also supports non-interactive startup auth via `ATTUNE_AUTH_TOKEN` / `ATTUNE_REFRESH_TOKEN` or `ATTUNE_LOGIN` / `ATTUNE_PASSWORD`.
 - For Attune-managed executions, `ATTUNE_API_TOKEN` is supported as an **execution-scoped auth source** and takes precedence over saved profile tokens.
 - The main `attune` CLI uses the same token env precedence, so helper commands running inside worker containers can reuse execution-scoped tokens without creating a profile on disk.
 - When a container image does not provide a system CA bundle, the CLI falls back to bundled Mozilla root certificates so internal execution-token API calls do not panic during client initialization.
@@ -116,6 +116,45 @@ Notes:
 Container deployment surfaces:
 - Docker Compose includes an optional `mcp` profile-backed service on port `8090`.
 - The Helm chart includes an optional `mcp.enabled` deployment/service, disabled by default.
+
+#### HTTP caller authentication
+
+HTTP is opt-in; stdio remains the default. Every `POST /mcp` request, including
+initialization, tool listing and local pack checks, requires an Attune access
+bearer token in `Authorization: Bearer <token>`. The server validates it through
+`GET /auth/me` and uses the same token for API operations. API permissions and the
+MCP tool policy must both allow the operation. Invalid, expired, frozen or
+unavailable callers fail closed before dispatch. `/health` is an unauthenticated
+liveness endpoint with no identity or tool data.
+
+HTTP requires an explicit `--api-url` / `ATTUNE_API_URL` HTTP(S) origin. It does
+not load profiles or the credential store. Startup token, refresh, login/password
+and profile options are rejected in HTTP mode. Incoming tokens stay in the
+request client only: no persistence, refresh, password login, shared administrator
+session or redirect following. Client authorization headers are never logged.
+There is no shared-service identity mode. Use TLS for remote clients and API
+connections; terminate inbound TLS at a trusted proxy when needed.
+
+Set repeatable `--http-host` / comma-separated `ATTUNE_MCP_HTTP_HOSTS` to exact
+accepted Host authorities, including ports. No wildcard or forwarded-header
+trust is supported; configure the proxy to preserve an accepted Host. Browser
+Origins are denied unless exactly listed by `--http-origin` /
+`ATTUNE_MCP_HTTP_ORIGINS`. Missing Origin is allowed for non-browser clients;
+Origin and Host checks never substitute for bearer authentication. No permissive
+CORS is installed. Compose binds MCP to loopback, supplies local Host entries,
+and supplies no bootstrap credentials.
+
+HTTP is request-scoped and retains no cache-refresh metadata across calls. Clients
+using an explicitly enabled refresh policy must supply seal metadata explicitly.
+The default read-only policy excludes mutations and execution file export.
+Existing filesystem root confinement still applies with any explicit policy.
+
+The separate `attune-charts` counterpart must keep `mcp.enabled: false`, remove
+bootstrap login/password injection, require per-request bearer authentication,
+configure exact Host/Origin allowlists, use TLS ingress and retain the read-only
+policy. Those chart changes are tracked with security finding s-4 / issue #132;
+they are not delivered by this repository PR. Do not enable an older MCP image
+with anonymous access or a shared bootstrap session.
 
 #### File-only execution disclosure through MCP
 
@@ -203,8 +242,9 @@ filter applied to their lists.
 For containers, mount your own file read-only and select it in that process.
 An explicit flag overrides its corresponding environment variable. Restart MCP
 after editing the file or changing the selected policy. Tool arguments cannot
-switch policies. A shared HTTP process uses one policy and one identity for all
-its clients; use separate processes when either must differ.
+switch policies. An HTTP process uses one policy ceiling for all clients; each request uses its
+own caller identity and API permissions. Use separate processes for different
+policy ceilings.
 
 Policies are ceilings, not Attune IAM grants. Missing user permissions do not
 prevent a policy from loading; the API authorizes each target, and an individual

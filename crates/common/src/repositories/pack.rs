@@ -1010,6 +1010,18 @@ impl PackRepository {
     /// the validated pack ref. PostgreSQL releases the lock automatically when
     /// `transaction` commits or rolls back. Hash collisions are theoretically
     /// possible, but impractical; a collision would only cause extra serialization.
+    /// Lock the exact associated pack without treating association as management.
+    pub async fn find_by_ref_locked(
+        connection: &mut sqlx::PgConnection,
+        reference: &str,
+    ) -> Result<Option<Pack>> {
+        sqlx::query("SELECT id FROM pack WHERE ref = $1 FOR SHARE")
+            .bind(reference)
+            .fetch_optional(&mut *connection)
+            .await?;
+        Self::find_by_ref(connection, reference).await
+    }
+
     pub async fn acquire_mutation_lock(
         transaction: &mut sqlx::Transaction<'_, Postgres>,
         pack_ref: &str,

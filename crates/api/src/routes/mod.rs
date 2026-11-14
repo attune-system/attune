@@ -21,6 +21,7 @@ pub mod inquiries;
 pub mod inquiry_callbacks;
 pub mod internal_files;
 pub mod keys;
+mod lifecycle_authorization;
 mod pack_request;
 pub mod packs;
 pub mod permissions;
@@ -38,6 +39,7 @@ pub mod visibility;
 pub mod webhooks;
 pub mod work_queues;
 pub mod workers;
+mod workflow_file_publication;
 pub mod workflows;
 
 pub use actions::routes as action_routes;

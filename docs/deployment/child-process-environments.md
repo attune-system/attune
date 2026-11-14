@@ -60,8 +60,41 @@ container or host.
 
 For actions, explicit worker context overrides the baseline. Runtime `env_vars`
 then apply their set, prepend, or append operation. Parameter-delivery metadata
-and execution-request `env_vars` follow. Runtime and execution-request values
+and admitted execution-request `env_vars` follow. Runtime and execution-request values
 cannot replace the reserved Attune context.
+
+Caller overrides default to denied. Trusted runtime metadata may declare exact
+ordinary application names in the canonical v1 execution configuration:
+
+```yaml
+execution_config:
+  permitted_caller_env: [APP_REGION, LOG_LEVEL]
+  env_vars:
+    LOG_LEVEL: info
+```
+
+Declarations must be arrays of unique portable names (`[A-Za-z_][A-Za-z0-9_]*`),
+without wildcards, nulls or case-insensitive duplicates. Interpreter, linker,
+shell startup, search path, home/configuration discovery, locale, temporary-directory
+and Attune controls are forbidden even when listed. Examples include `BASH_ENV`,
+`PYTHONPATH`, `LUA_INIT`, `LUA_PATH`, `LUA_CPATH`, `NODE_OPTIONS`, `LD_PRELOAD`,
+`PATH`, `HOME`, and `ATTUNE_API_TOKEN`. The `LUA_` family includes versioned
+startup/module-path controls such as `LUA_INIT_5_4`; Lua can execute startup
+code before the fixed script ([Lua standalone contract](https://www.lua.org/manual/5.4/manual.html#7)).
+Operator `env_vars` and passthrough settings remain separate trusted configuration.
+Declare only names whose values the fixed action treats as data.
+
+Admission reads the immutable executable snapshot, requiring the captured parent
+runtime and every eligible available captured version to permit each name.
+Version eligibility uses the action's captured constraint. Differing declarations
+may therefore reject a request before worker placement; policy errors name the
+variable, never its value. The worker also checks the exact captured version it
+selects after placement. Authoring edits do not change existing selections.
+Workflow/callback inheritance and retries are validated at repository creation
+against their own target snapshot; a wider parent declaration grants no child
+permission. Queue and enforcement producers supply no overrides by default.
+Invalid stored overrides fail execution rather than being silently stripped.
+No new snapshot format or compatibility reader is introduced.
 
 Prepend and append operations read selected or explicitly supplied values.
 They do not retrieve excluded values from the ambient service environment.

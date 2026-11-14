@@ -18,7 +18,7 @@ export type CreateExecutionRequest = {
   artifact_retention_limit?: number | null;
   artifact_retention_policy?: null | RetentionPolicyType;
   /**
-   * Environment overrides for this execution. ATTUNE_ names are reserved for internal use.
+   * Caller environment values; names must be declared in the captured runtime execution_config.permitted_caller_env. Startup, search-path and ATTUNE_ controls are forbidden.
    */
   env_vars?: Record<string, string> | null;
   /**
