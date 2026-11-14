@@ -371,6 +371,33 @@ impl ApiClient {
         }
     }
 
+    /// Request-owned authority for HTTP MCP. Never reads profiles, environment
+    /// credentials or refresh state, and never follows API redirects.
+    pub fn for_caller(base_url: &str, token: Option<String>) -> Result<Self> {
+        let url = url::Url::parse(base_url).context("Invalid MCP API origin")?;
+        anyhow::ensure!(
+            matches!(url.scheme(), "http" | "https")
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+                && url.path() == "/",
+            "MCP API URL must be an HTTP(S) origin without credentials, path, query or fragment"
+        );
+        Ok(Self {
+            client: HttpClient::builder()
+                .timeout(Duration::from_secs(300))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .context("Could not initialize caller API client")?,
+            base_url: url.as_str().trim_end_matches('/').to_owned(),
+            auth_token: token,
+            refresh_token: None,
+            credential_origin: None,
+        })
+    }
+
     /// Set the authentication token
     pub fn set_auth_token(&mut self, token: String) {
         self.credential_origin = None;
