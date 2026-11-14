@@ -7,7 +7,7 @@
   "enforcements": ["decrypt", "read"],
   "events": ["create", "decrypt", "read"],
   "executions": ["cancel", "decrypt", "read", "update"],
-  "identities": ["create", "delete", "read", "update"],
+  "identities": ["create", "delete", "manage", "read", "update"],
   "inquiries": ["create", "decrypt", "delete", "read", "respond", "update"],
   "keys": ["create", "decrypt", "delete", "read", "update", "use"],
   "packs": ["configure", "create", "decrypt", "delete", "install", "read"],

@@ -17,10 +17,9 @@ INVOKER = [
     {"resource": "actions", "actions": ["read", "execute"], "constraints": {"refs": ["core.echo", "core.sleep", "core.noop"]}},
     {"resource": "executions", "actions": ["read", "cancel"], "constraints": {"owner": "self"}},
 ]
-# Identity admin routes currently authorize without a target context. A narrower
-# ids constraint cannot mint tokens through those routes. This temporary issuer
-# receives only identities:update, never a role or permissions:manage.
-ISSUER = [{"resource": "identities", "actions": ["update"]}]
+# Temporary credential issuer receives explicit identity administration, never
+# a role or permissions:manage. It is frozen immediately after issuance.
+ISSUER = [{"resource": "identities", "actions": ["manage"]}]
 
 
 def principals(ctx):

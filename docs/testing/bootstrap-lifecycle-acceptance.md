@@ -178,10 +178,10 @@ Neither grants first-admin status. The API publisher expects an already existing
 credential. This fixture therefore cannot manufacture the first administrator.
 An operator must complete supported installation/IdP provisioning for the owned
 deployment and supply its credential. Missing or denied onboarding fails without
-SQL, seeded JWTs or a changed authorization guard. Also, identity admin routes use
-targetless `authorize_permissions`, so the temporary issuer needs the single
-global identities:update action to mint credentials. It is frozen immediately
-after issuance. Adding ineffective target constraints would fake least privilege.
+SQL, seeded JWTs or a changed authorization guard. The temporary issuer receives explicit
+`identities:manage` credential administration to mint credentials, and is frozen
+immediately after issuance. Single-identity routes resolve the actual target;
+scoped issuer grants can use identity login refs.
 
 ### Concrete F storage binding and third principal
 
