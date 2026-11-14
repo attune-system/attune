@@ -13,6 +13,28 @@ use axum::http::StatusCode;
 use helpers::{Result, TestContext};
 use serde_json::{json, Value};
 
+async fn grant_creation_fixture(ctx: &TestContext, pack_ref: &str) -> Result<()> {
+    let identity = attune_common::auth::jwt::validate_token(
+        ctx.token.as_deref().unwrap(),
+        &ctx.state.jwt_config,
+    )?
+    .sub
+    .parse::<i64>()?;
+    let set = PermissionSetRepository::create(&ctx.pool, CreatePermissionSetInput {
+        r#ref: "test.configuration_create".into(), pack: None, pack_ref: None, label: None, description: None,
+        grants: json!([{ "resource":"triggers", "actions":["create"], "constraints":{"pack_refs":[pack_ref]} }]),
+    }).await?;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity,
+            permset: set.id,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn managed_sensor_put_readmits_code_schema_and_local_purposes_without_personal_key_grants(
 ) -> Result<()> {
@@ -24,6 +46,7 @@ async fn managed_sensor_put_readmits_code_schema_and_local_purposes_without_pers
         trigger::SensorRepository,
     };
     let ctx = TestContext::new().await?.with_admin_auth().await?;
+    grant_creation_fixture(&ctx, "sensor_readmission").await?;
     let token = ctx.token.as_deref().unwrap();
     let identity = attune_common::auth::jwt::validate_token(token, &ctx.state.jwt_config)?
         .sub
@@ -187,6 +210,7 @@ async fn managed_sensor_put_readmits_code_schema_and_local_purposes_without_pers
 #[tokio::test]
 async fn trigger_rollout_preflight_is_protected_and_reports_only_emitter_ids() -> Result<()> {
     let ctx = TestContext::new().await?.with_admin_auth().await?;
+    grant_creation_fixture(&ctx, "rollout_api").await?;
     let token = ctx.token.as_deref().unwrap();
     let identity = attune_common::auth::jwt::validate_token(token, &ctx.state.jwt_config)?
         .sub
@@ -263,6 +287,7 @@ async fn sensor_configuration_overrides_encrypt_and_equivalent_schema_reuses_bin
         trigger::SensorRepository,
     };
     let ctx = TestContext::new().await?.with_admin_auth().await?;
+    grant_creation_fixture(&ctx, "configuration_sensor").await?;
     let token = ctx.token.as_deref().unwrap();
     ctx.post(
         "/api/v1/packs",

@@ -237,6 +237,15 @@ pub async fn create_action(
     RequireAuth(user): RequireAuth,
     Json(request): Json<CreateActionRequest>,
 ) -> ApiResult<impl IntoResponse> {
+    if !matches!(
+        user.claims.token_type,
+        crate::auth::jwt::TokenType::Access | crate::auth::jwt::TokenType::Execution
+    ) {
+        return Err(ApiError::Forbidden(
+            "This token type cannot administer actions".into(),
+        ));
+    }
+
     // Validate request
     request.validate()?;
 
@@ -256,25 +265,23 @@ pub async fn create_action(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pack '{}' not found", request.pack_ref)))?;
 
-    if user.claims.token_type == crate::auth::jwt::TokenType::Access {
-        let identity_id = user
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = state.authorization_service();
-        let mut ctx = AuthorizationContext::new(identity_id);
-        ctx.pack_ref = Some(pack.r#ref.clone());
-        ctx.target_ref = Some(request.r#ref.clone());
-        authz
-            .authorize(
-                &user,
-                AuthorizationCheck {
-                    resource: Resource::Actions,
-                    action: Action::Create,
-                    context: ctx,
-                },
-            )
-            .await?;
-    }
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    let authz = state.authorization_service();
+    let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.pack_ref = Some(pack.r#ref.clone());
+    ctx.target_ref = Some(request.r#ref.clone());
+    authz
+        .authorize(
+            &user,
+            AuthorizationCheck {
+                resource: Resource::Actions,
+                action: Action::Create,
+                context: ctx,
+            },
+        )
+        .await?;
 
     let runtime =
         resolve_runtime_id(&state, request.runtime, request.runtime_ref.as_deref()).await?;
@@ -358,6 +365,15 @@ pub async fn update_action(
     Path(action_ref): Path<String>,
     Json(request): Json<UpdateActionRequest>,
 ) -> ApiResult<impl IntoResponse> {
+    if !matches!(
+        user.claims.token_type,
+        crate::auth::jwt::TokenType::Access | crate::auth::jwt::TokenType::Execution
+    ) {
+        return Err(ApiError::Forbidden(
+            "This token type cannot administer actions".into(),
+        ));
+    }
+
     // Validate request
     request.validate()?;
 
@@ -366,33 +382,31 @@ pub async fn update_action(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Action '{}' not found", action_ref)))?;
 
-    if user.claims.token_type == crate::auth::jwt::TokenType::Access {
-        let identity_id = user
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = state.authorization_service();
-        let mut ctx = AuthorizationContext::new(identity_id);
-        ctx.target_id = Some(existing_action.id);
-        ctx.managing_pack_id =
-            attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
-                &state.db,
-                attune_common::repositories::runtime_target::ComponentTarget::Action,
-                existing_action.id,
-            )
-            .await?;
-        ctx.target_ref = Some(existing_action.r#ref.clone());
-        ctx.pack_ref = Some(existing_action.pack_ref.clone());
-        authz
-            .authorize(
-                &user,
-                AuthorizationCheck {
-                    resource: Resource::Actions,
-                    action: Action::Update,
-                    context: ctx,
-                },
-            )
-            .await?;
-    }
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    let authz = state.authorization_service();
+    let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.target_id = Some(existing_action.id);
+    ctx.managing_pack_id =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+            &state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Action,
+            existing_action.id,
+        )
+        .await?;
+    ctx.target_ref = Some(existing_action.r#ref.clone());
+    ctx.pack_ref = Some(existing_action.pack_ref.clone());
+    authz
+        .authorize(
+            &user,
+            AuthorizationCheck {
+                resource: Resource::Actions,
+                action: Action::Update,
+                context: ctx,
+            },
+        )
+        .await?;
 
     let runtime =
         resolve_runtime_id(&state, request.runtime, request.runtime_ref.as_deref()).await?;
@@ -568,38 +582,45 @@ pub async fn delete_action(
     RequireAuth(user): RequireAuth,
     Path(action_ref): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    if !matches!(
+        user.claims.token_type,
+        crate::auth::jwt::TokenType::Access | crate::auth::jwt::TokenType::Execution
+    ) {
+        return Err(ApiError::Forbidden(
+            "This token type cannot administer actions".into(),
+        ));
+    }
+
     // Check if action exists
     let action = ActionRepository::find_by_ref(&state.db, &action_ref)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Action '{}' not found", action_ref)))?;
 
-    if user.claims.token_type == crate::auth::jwt::TokenType::Access {
-        let identity_id = user
-            .identity_id()
-            .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
-        let authz = state.authorization_service();
-        let mut ctx = AuthorizationContext::new(identity_id);
-        ctx.target_id = Some(action.id);
-        ctx.managing_pack_id =
-            attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
-                &state.db,
-                attune_common::repositories::runtime_target::ComponentTarget::Action,
-                action.id,
-            )
-            .await?;
-        ctx.target_ref = Some(action.r#ref.clone());
-        ctx.pack_ref = Some(action.pack_ref.clone());
-        authz
-            .authorize(
-                &user,
-                AuthorizationCheck {
-                    resource: Resource::Actions,
-                    action: Action::Delete,
-                    context: ctx,
-                },
-            )
-            .await?;
-    }
+    let identity_id = user
+        .identity_id()
+        .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
+    let authz = state.authorization_service();
+    let mut ctx = AuthorizationContext::new(identity_id);
+    ctx.target_id = Some(action.id);
+    ctx.managing_pack_id =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+            &state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Action,
+            action.id,
+        )
+        .await?;
+    ctx.target_ref = Some(action.r#ref.clone());
+    ctx.pack_ref = Some(action.pack_ref.clone());
+    authz
+        .authorize(
+            &user,
+            AuthorizationCheck {
+                resource: Resource::Actions,
+                action: Action::Delete,
+                context: ctx,
+            },
+        )
+        .await?;
 
     let mut tx = state.db.begin().await?;
     let tombstoned_caches =

@@ -172,6 +172,21 @@ Migration `20261021000001_pack_owner_roles.sql` adds the column and list-integri
 constraint. It must be applied with the compatible services during a coordinated
 rollout. Catalog revision remains 2; the editor's component grants are unchanged.
 
+## Credential consumers
+
+Generic identity authorization accepts Access and delegated Execution credentials
+only. Both must have an authorization snapshot; absence never bypasses RBAC.
+Execution grants retain their selected permission ceiling and scoped `standard`
+behavior. Recorded execution credentials require a converted, target-aware
+consumer and cannot be flattened into mutable IAM grants.
+
+Sensor, Worker, and Refresh credentials cannot use generic IAM authorization,
+read identity grants, or delegate permission sets, including empty or
+`standard`-only selections. In particular, Sensor and Worker credentials cannot
+administer identities, roles, permission sets, assignments, or integration tokens.
+Dedicated sensor and worker APIs continue to enforce their own signed scopes,
+workload generations, worker assignments, and recorded consumer restrictions.
+
 ## Execution authority
 
 Execution authority is persisted in `execution_authority_selection`, independently

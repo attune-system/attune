@@ -402,6 +402,18 @@ impl RuntimeTargetRepository {
         }))
     }
 
+    /// Display/scoping association is independent of managed runtime ownership.
+    pub async fn component_associated_pack_ref(
+        connection: &mut PgConnection,
+        kind: ComponentTarget,
+        id: Id,
+    ) -> Result<Option<String>> {
+        super::schema_type::SchemaTypeRepository::lock_selection(&mut *connection).await?;
+        let table = kind.metadata().0;
+        Ok(sqlx::query_scalar(&format!("SELECT p.ref FROM {table} c JOIN pack p ON p.id = c.pack WHERE c.id = $1 FOR SHARE OF c, p"))
+            .bind(id).fetch_optional(connection).await?)
+    }
+
     pub async fn resolve(
         connection: &mut PgConnection,
         target: RuntimeTarget,

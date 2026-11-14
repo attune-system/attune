@@ -2588,8 +2588,13 @@ async fn authorize_queue_create(
     queue_ref: &str,
     pack_ref: Option<&str>,
 ) -> Result<(), ApiError> {
-    if user.claims.token_type != TokenType::Access {
-        return Ok(());
+    if !matches!(
+        user.claims.token_type,
+        TokenType::Access | TokenType::Execution
+    ) {
+        return Err(ApiError::Forbidden(
+            "This token type cannot create queues".into(),
+        ));
     }
 
     let identity_id = user

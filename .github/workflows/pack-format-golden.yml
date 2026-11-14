@@ -1,5 +1,9 @@
 name: Pack format-1 golden vectors
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   pull_request:
     paths:
