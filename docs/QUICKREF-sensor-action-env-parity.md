@@ -12,7 +12,7 @@ Both sensors and actions receive standard environment variables that provide exe
 | Purpose | Sensor Variable | Action Variable | Notes |
 |---------|----------------|-----------------|-------|
 | **Database ID** | `ATTUNE_SENSOR_ID` | `ATTUNE_EXEC_ID` | Unique identifier in database |
-| **Reference Name** | `ATTUNE_SENSOR_REF` | `ATTUNE_ACTION` | Human-readable ref (e.g., `core.timer`, `core.http_request`) |
+| **Reference Name** | `ATTUNE_SENSOR_REF` | `ATTUNE_ACTION` | Human-readable ref (e.g., `core.timer`, `example.http_request`) |
 | **API Access Token** | `ATTUNE_API_TOKEN` | `ATTUNE_API_TOKEN` | ✅ Same variable name |
 | **API Base URL** | `ATTUNE_API_URL` | `ATTUNE_API_URL` | ✅ Same variable name |
 | **Triggering Rule** | N/A | `ATTUNE_RULE` | Only for actions triggered by rules |
@@ -72,7 +72,7 @@ Actions receive additional context about their triggering source:
 ### Example Action Environment (Rule-Triggered)
 ```bash
 ATTUNE_EXEC_ID=12345
-ATTUNE_ACTION=core.http_request
+ATTUNE_ACTION=example.http_request
 ATTUNE_API_URL=http://localhost:8080
 ATTUNE_API_TOKEN=eyJ0eXAiOiJKV1QiLCJhbGc...
 ATTUNE_RULE=monitoring.disk_space_alert

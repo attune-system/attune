@@ -429,3 +429,154 @@ async fn loader_retires_omitted_versions_and_rejects_a_retired_runtime_dependenc
             .unwrap();
     assert!(runtime_still_active);
 }
+
+/// Actual core inventory: omission is pack-wide, but every nonaction definition
+/// remains present. Historical content is not rewritten by projection retirement.
+#[tokio::test]
+async fn core_action_reduction_retires_only_omitted_actions_and_keeps_release_bytes() {
+    use attune_common::pack_registry::PackStorage;
+    let pool = create_test_pool().await.unwrap();
+    PlatformCatalogRepository::reconcile(&pool).await.unwrap();
+    let pack = PackFixture::new("core").create(&pool).await.unwrap();
+    let owned = tempfile::tempdir().unwrap();
+    let current = owned.path().join("current");
+    fn copy(source: &std::path::Path, target: &std::path::Path) {
+        std::fs::create_dir_all(target).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                copy(&entry.path(), &target.join(entry.file_name()));
+            } else {
+                std::fs::copy(entry.path(), target.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+    copy(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs/core"),
+        &current,
+    );
+    let previous = owned.path().join("previous");
+    copy(&current, &previous);
+    let removed = [
+        "run_agent_command",
+        "generate_ssh_key_pair",
+        "download_packs",
+        "get_pack_dependencies",
+        "build_pack_envs",
+        "register_packs",
+        "install_packs",
+    ];
+    for name in removed {
+        // Minimal former action records suffice: lifecycle is about recorded
+        // ownership/ref presence, never a removed helper's executable behavior.
+        std::fs::write(previous.join("actions").join(format!("{name}.yaml")), format!("ref: core.{name}\nlabel: Former core action\nrunner_type: native\nentry_point: former-binary\n")).unwrap();
+    }
+    std::fs::create_dir_all(previous.join("actions/workflows")).unwrap();
+    std::fs::write(previous.join("actions/install_packs.yaml"), "ref: core.install_packs\nlabel: Former installer workflow\nworkflow_file: workflows/install_packs.workflow.yaml\n").unwrap();
+    std::fs::write(
+        previous.join("actions/workflows/install_packs.workflow.yaml"),
+        "version: '1.0.0'\ntasks:\n  - name: former_task\n    action: core.noop\n    next: []\n",
+    )
+    .unwrap();
+    let manifest = previous.join("pack.yaml");
+    std::fs::write(
+        &manifest,
+        std::fs::read_to_string(&manifest)
+            .unwrap()
+            .replace("1.0.7", "1.0.6"),
+    )
+    .unwrap();
+    let storage = PackStorage::new(owned.path().join("releases"));
+    let old = storage.publish_release(&previous, "core", "1.0.6").unwrap();
+    let pinned_bytes = std::fs::read(&old.archive_path).unwrap();
+    let loader = PackComponentLoader::new(
+        &pool,
+        pack.id,
+        "core",
+        &CacheAdmissionConfig::default(),
+        helpers::pack_registration_authority(&pool).await,
+    )
+    .with_absent_metadata_policy(AbsentMetadataPolicy::Remove);
+    loader.load_all(&previous).await.unwrap();
+    let mut connection = pool.acquire().await.unwrap();
+    let before = ComponentLifecycleRepository::active_projection_ids(&mut connection, pack.id)
+        .await
+        .unwrap();
+    drop(connection);
+    let retained_actions: Vec<_> = ["core.echo", "core.sleep", "core.noop", "core.http_request"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let mut retained_ids = Vec::new();
+    for reference in &retained_actions {
+        retained_ids.push(
+            ActionRepository::find_by_ref(&pool, reference)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+        );
+    }
+    loader.load_all(&current).await.unwrap();
+    let mut connection = pool.acquire().await.unwrap();
+    let after = ComponentLifecycleRepository::active_projection_ids(&mut connection, pack.id)
+        .await
+        .unwrap();
+    macro_rules! unchanged {
+        ($($field:ident),* $(,)?) => { $(assert_eq!(before.$field, after.$field, stringify!($field));)* };
+    }
+    unchanged!(
+        schema_types,
+        runtimes,
+        runtime_versions,
+        permission_sets,
+        triggers,
+        sensors,
+        rules,
+        policies,
+        work_queues,
+        dashboards,
+        caches
+    );
+    for reference in removed.map(|name| format!("core.{name}")) {
+        assert!(
+            ActionRepository::find_by_ref(&pool, &reference)
+                .await
+                .unwrap()
+                .is_none(),
+            "removed ref remains callable: {reference}"
+        );
+        let historical = ActionRepository::find_by_ref_including_retired(&pool, &reference)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(historical.retired_at.is_some());
+    }
+    assert_eq!(before.workflows.len(), 1);
+    assert!(
+        after.workflows.is_empty(),
+        "the removed installer owns its workflow definition"
+    );
+    let mut active = after.actions;
+    active.sort_unstable();
+    retained_ids.sort_unstable();
+    assert_eq!(active, retained_ids);
+    let retired = ComponentLifecycleRepository::list_retired_by_pack(&pool, pack.id)
+        .await
+        .unwrap();
+    assert_eq!(retired.len(), removed.len() + 1);
+    assert_eq!(
+        retired
+            .iter()
+            .filter(|entry| entry.kind == "workflow")
+            .count(),
+        1
+    );
+    assert!(retired
+        .iter()
+        .all(|entry| matches!(entry.kind.as_str(), "action" | "workflow")));
+    assert_eq!(std::fs::read(&old.archive_path).unwrap(), pinned_bytes);
+    assert!(old.pack_path.join("actions/http_request.yaml").is_file());
+    drop(connection);
+    pool.cleanup().await.unwrap();
+}

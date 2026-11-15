@@ -129,94 +129,14 @@ class OperatorTests(unittest.TestCase):
         write_private(human, {"kind": "password", "login": "operator", "password": "unit-test-only", "owned_project": "eaccept-test-sharedfile"})
         return {"api_url": "http://127.0.0.1:1234", "project": "eaccept-test-sharedfile", "run_id": "test", "compose_file": str(root / "compose.private.json"), "operator_credential_file": str(human), "credential_output": str(root / "installer.private"), "invoker_credential_output": str(root / "invoker.private"), "maintenance_credential_output": str(root / "maintenance.private"), "storage_fixture": {"allow_shell_invocation": True, "allow_maintenance_management": True, "legacy_artifact_ref": "core.real_legacy_test", "legacy_owner_ref": "core.run_agent_command"}}
 
-    def test_storage_invoker_and_maintenance_are_explicit_distinct_publicly_provisioned(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+    def test_retired_storage_fixture_fails_before_api_or_credential_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
             ctx = self.storage_context(Path(directory))
             api = RouteModel()
-            result = fixture.provision(ctx, api)
-            self.assertEqual({row["id"] for role, row in result["identities"].items() if role != "issuer"}, {3, 4, 5})
-            self.assertEqual(api.audit_token, "5")
-            self.assertIsNone(api.access_scope[5])
-            self.assertEqual([api.access_scope[identity] for identity in (3, 4)], ["integration_token", "integration_token"])
-            self.assertEqual(api.grants[4][0]["constraints"], {"refs": ["core.run_agent_command"]})
-            self.assertNotIn("core.run_agent_command", fixture.INVOKER[0]["constraints"]["refs"])
-            artifacts = api.grants[5][0]
-            self.assertEqual(artifacts["actions"], ["read", "decrypt", "delete"])
-            self.assertEqual(artifacts["constraints"]["refs"], ["core.f_probe_test", "core.real_legacy_test"])
-            self.assertEqual(api.grants[5][1:], [{"resource": "retention", "actions": ["read", "update"]}, {"resource": "permissions", "actions": ["manage"]}])
-            secrets = [read_secret(ctx[field]) for field in ("credential_output", "invoker_credential_output", "maintenance_credential_output")]
-            self.assertEqual(len(set(secrets)), 3)
-            credential = json.loads(secrets[2])
-            self.assertEqual(set(credential), {"kind", "role", "run_id", "owned_project", "identity_id", "login", "password"})
-            self.assertEqual(credential["kind"], "password")
-            self.assertEqual((credential["role"], credential["run_id"], credential["owned_project"], credential["identity_id"]), ("maintenance", ctx["run_id"], ctx["project"], 5))
-            self.assertEqual(credential["login"], api.users[5]["login"])
-            self.assertEqual(credential["password"], api.users[5]["password"])
-            self.assertEqual(len(credential["password"]), 43)
-            self.assertNotEqual(credential["password"], api.users[1]["password"])
-            self.assertNotEqual(credential["password"], api.users[2]["password"])
-            self.assertNotIn(5, api.tokens.values())
-            self.assertEqual(len(api.tokens), 2)
-            self.assertEqual(result["identities"]["maintenance"]["auth_method"], "password")
-            self.assertNotIn(credential["password"], json.dumps(result))
-            self.assertEqual(Path(ctx["maintenance_credential_output"]).stat().st_mode & 0o077, 0)
-            self.assertFalse(api.users[1]["frozen"])
-            self.assertNotIn("unit-test-only-token", json.dumps(result))
-
-    def test_audit_denial_does_not_fall_back_to_human_or_integration_token(self):
-        class AuditDenied(RouteModel):
-            def call(self, path, token=None, *args, **kwargs):
-                if path.endswith("/file-audits/capabilities"):
-                    self.denied_token = token
-                    raise FixtureError("403")
-                return super().call(path, token, *args, **kwargs)
-        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
-            ctx = self.storage_context(Path(directory))
-            api = AuditDenied()
-            with self.assertRaisesRegex(FixtureError, "password capability.*No operator/integration-token fallback"):
+            with self.assertRaisesRegex(Exception, "Deferred coverage.*142"):
                 fixture.provision(ctx, api)
-            self.assertEqual(api.denied_token, "5")
-            self.assertTrue(api.users[2]["frozen"])
-            self.assertTrue(all(not Path(ctx[field]).exists() for field in ("credential_output", "invoker_credential_output", "maintenance_credential_output")))
-            state = (Path(directory) / "operator-provision-state.private.json").read_text()
-            self.assertEqual(json.loads(state)["identities"]["maintenance"]["id"], 5)
-            self.assertNotIn("unit-test-only-token", state)
-            self.assertNotIn(api.users[5]["password"], state)
-
-    def test_nonlocal_maintenance_account_metadata_is_rejected(self):
-        class WrongProvider(RouteModel):
-            def call(self, path, token=None, *args, **kwargs):
-                result = super().call(path, token, *args, **kwargs)
-                if path == "/auth/me" and token == "5":
-                    result["data"].update(auth_provider="oidc", is_local=False, can_change_password=False)
-                return result
-        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
-            ctx = self.storage_context(Path(directory))
-            api = WrongProvider()
-            with self.assertRaisesRegex(FixtureError, "local password"):
-                fixture.provision(ctx, api)
-            self.assertFalse(Path(ctx["maintenance_credential_output"]).exists())
-            self.assertNotIn(5, api.tokens.values())
-            self.assertFalse(api.users[1]["frozen"])
-
-    def test_maintenance_password_reauth_after_issuer_freeze_is_required(self):
-        class DeniedReauth(RouteModel):
-            def call(self, path, token=None, body=None, *args, **kwargs):
-                if path == "/auth/login" and body["login"].endswith(".maintenance") and self.users[2]["frozen"]:
-                    raise FixtureError("Maintenance password reauthentication denied")
-                return super().call(path, token, body, *args, **kwargs)
-        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
-            ctx = self.storage_context(Path(directory))
-            api = DeniedReauth()
-            with self.assertRaisesRegex(FixtureError, "reauthentication denied"):
-                fixture.provision(ctx, api)
-            self.assertTrue(api.users[2]["frozen"])
-            self.assertFalse(Path(ctx["maintenance_credential_output"]).exists())
-            self.assertNotIn(5, api.tokens.values())
-
-    def test_storage_powerful_grants_require_explicit_consent(self):
-        with self.assertRaisesRegex(FixtureError, "explicit"):
-            fixture.principals({"storage_fixture": {}})
+            for field in ("credential_output", "invoker_credential_output", "maintenance_credential_output"):
+                self.assertFalse(Path(ctx[field]).exists())
 
 
 if __name__ == "__main__":

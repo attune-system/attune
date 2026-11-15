@@ -1,3 +1,7 @@
+> Core 1.0.7 ships only native echo, sleep, and noop actions. References below to
+> HTTP, SSH, agent-command, or pack-installation core actions describe withdrawn
+> examples. Use application-owned packs or the normal pack CLI/API instead.
+
 # Pack Installation Workflow API
 
 This document describes the API endpoints for the Pack Installation Workflow system, which enables downloading, analyzing, building environments, and registering packs through a multi-stage process.

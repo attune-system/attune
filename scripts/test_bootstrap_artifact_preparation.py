@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import tarfile
 import tempfile
+import subprocess
 import unittest
 from unittest import mock
 
@@ -30,6 +31,16 @@ class Preparation(unittest.TestCase):
         for info in ({"Name": "central", "Driver": "remote", "Nodes": []}, {"Name": "central", "Driver": "docker-container", "Nodes": [{"Endpoint": "ssh://foreign", "Status": "running"}]}, {"Name": "central", "Driver": "docker-container", "Nodes": [{"Endpoint": "default", "Status": "inactive"}]}):
             with self.assertRaises(artifacts.InputError):
                 artifacts.require_local_builder(info, manifest, "unix:///unit/docker.sock")
+
+    def test_builder_inventory_selects_exact_name_and_rejects_conflicting_records(self):
+        builder = {"Name": "central", "Driver": "docker", "Nodes": [{"Endpoint": "default", "Status": "running"}]}
+        raw = json.dumps(builder)
+        self.assertEqual(artifacts.select_builder_inventory(raw + "\n" + raw, "central"), builder)
+        with self.assertRaisesRegex(artifacts.InputError, "absent"):
+            artifacts.select_builder_inventory(raw, "other")
+        conflicting = dict(builder, Nodes=[{"Endpoint": "ssh://foreign", "Status": "running"}])
+        with self.assertRaisesRegex(artifacts.InputError, "ambiguous"):
+            artifacts.select_builder_inventory(raw + "\n" + json.dumps(conflicting), "central")
 
     def test_existing_running_single_local_node_is_required_not_created(self):
         manifest = {"buildx_builder": "central", "docker_context": "default"}
@@ -113,6 +124,62 @@ class Preparation(unittest.TestCase):
             self.assertEqual(receipt["archive_sha256"], artifacts.sha(path))
             self.assertNotIn("repository", receipt)
 
+    def test_local_base_uses_measured_oci_bytes_and_rejects_wrong_digest(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            root = Path(directory)
+            archive, digest = self.oci(root)
+            receipt = artifacts.unpack_oci_base(archive, root / "layout", digest)
+            self.assertEqual(receipt["oci_manifest_digest"], digest)
+            self.assertTrue((root / "layout/oci-layout").is_file())
+            with self.assertRaisesRegex(artifacts.InputError, "digest changed"):
+                artifacts.unpack_oci_base(archive, root / "wrong", "sha256:" + "0" * 64)
+            self.assertFalse((root / "wrong").exists())
+            args = artifacts.arguments(["--work-root", str(root / "build")])
+            manifest = {"base_images": {"service": "unit-service@" + digest},
+                        "base_oci_archives": {"service": str(archive)}}
+            command = artifacts.commands(args, manifest)[0]["command"]
+            self.assertIn("SERVICE_BASE=attune_base_service", command)
+            self.assertIn("attune_base_service=oci-layout://" + str(args.work_root / "base-contexts/service") + "@" + digest, command)
+            self.assertFalse(any("--push" in part for part in command))
+
+    def test_local_oci_extra_path_cannot_escape_owned_layout(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            root = Path(directory)
+            archive, digest = self.oci(root)
+            with tarfile.open(archive, "a") as source:
+                entry = tarfile.TarInfo("../escape")
+                entry.size = 1
+                source.addfile(entry, io.BytesIO(b"x"))
+            with self.assertRaisesRegex(artifacts.InputError, "OCI file path"):
+                artifacts.unpack_oci_base(archive, root / "layout", digest)
+            self.assertFalse((root / "escape").exists())
+
+    def test_native_export_stages_readonly_release_without_changing_bytes_or_execute_status(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+            root = Path(directory)
+            archive = root / "export.tar"
+            with tarfile.open(archive, "w") as target:
+                entry = tarfile.TarInfo("release")
+                entry.type = tarfile.DIRTYPE
+                entry.mode = 0o555
+                target.addfile(entry)
+                for name, mode in [("manifest.json", 0o444), ("action", 0o555)]:
+                    entry = tarfile.TarInfo("release/" + name)
+                    entry.mode = mode
+                    entry.size = 7
+                    target.addfile(entry, io.BytesIO(b"fixture"))
+            artifacts.unpack_native_export(archive, root / "native")
+            self.assertEqual((root / "native/release/manifest.json").read_bytes(), b"fixture")
+            self.assertFalse((root / "native/release/manifest.json").stat().st_mode & 0o111)
+            self.assertTrue((root / "native/release/action").stat().st_mode & 0o111)
+            with (root / "native/release/probe").open("x") as output:
+                output.write("owned staging remains writable")
+            bad = root / "bad.tar"
+            tar(bad, {"../escape": b"x"})
+            with self.assertRaisesRegex(artifacts.InputError, "native export path"):
+                artifacts.unpack_native_export(bad, root / "bad")
+            self.assertFalse((root / "escape").exists())
+
     def test_corrupt_oci_content_cannot_produce_a_receipt(self):
         with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
             path, _ = self.oci(Path(directory), corrupt=True)
@@ -123,7 +190,7 @@ class Preparation(unittest.TestCase):
         recipe = (ROOT / artifacts.DOCKERFILE).read_text()
         self.assertIn("CARGO_BUILD_JOBS=2", recipe)
         self.assertEqual(recipe.count("cargo build --locked --release -j 2"), 2)
-        self.assertEqual(recipe.count("cargo zigbuild --locked --release -j 2"), 2)
+        self.assertEqual(recipe.count("cargo zigbuild --locked --release -j 2"), 3)
         self.assertIn("amd64:x86_64-unknown-linux-musl arm64:aarch64-unknown-linux-musl", recipe)
         self.assertIn("bootstrap_acceptance_archive /out/core /out/canonical-store", recipe)
         self.assertNotIn("fn main(){}", recipe)
@@ -132,6 +199,56 @@ class Preparation(unittest.TestCase):
         self.assertIn("exec python3 /scripts/bootstrap_core_pack.py publish", init)
         self.assertNotIn("cp ", init)
         self.assertNotIn("BOOTSTRAP_ADMISSION_ENABLED", recipe)
+
+    def test_image_permissions_normalize_only_modes_and_both_paths_use_same_helper(self):
+        script = ROOT / "docker/normalize-pack-image-permissions.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            pack = Path(directory) / "core"
+            binary = pack / "actions/bin/http_request/linux-amd64"
+            binary.parent.mkdir(parents=True, mode=0o700)
+            binary.write_bytes(b"executable intent fixture")
+            binary.chmod(0o700)
+            metadata = pack / "pack.yaml"
+            metadata.write_bytes(b"readable metadata fixture")
+            metadata.chmod(0o600)
+            subprocess.run(["sh", str(script), str(pack)], check=True)
+            self.assertEqual(binary.read_bytes(), b"executable intent fixture")
+            self.assertEqual(metadata.read_bytes(), b"readable metadata fixture")
+            self.assertEqual(binary.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(metadata.stat().st_mode & 0o777, 0o644)
+            self.assertTrue(all(path.stat().st_mode & 0o777 == 0o755 for path in pack.rglob("*") if path.is_dir()))
+        for path in [ROOT / artifacts.DOCKERFILE, ROOT / "docker/Dockerfile.init-packs-package"]:
+            recipe = path.read_text()
+            self.assertIn("COPY docker/normalize-pack-image-permissions.sh /scripts/normalize-pack-image-permissions.sh", recipe)
+            self.assertIn("sh /scripts/normalize-pack-image-permissions.sh /source/packs/core", recipe)
+
+    def test_init_user_companion_keeps_service_inventory_and_existing_bootstrap_source(self):
+        self.assertEqual(artifacts.IMAGES[:4], ("api", "executor", "notifier", "supervisor"))
+        self.assertEqual(len(artifacts.IMAGES), 9)
+        self.assertIn("init-user", artifacts.IMAGES)
+        recipe = (ROOT / artifacts.DOCKERFILE).read_text()
+        self.assertIn("FROM ${POSTGRES_IMAGE} AS init-user", recipe)
+        self.assertIn("apk add --no-cache argon2", recipe)
+        self.assertIn("COPY docker/init-user.sh /init-user.sh", recipe)
+        published = (ROOT / "docker/Dockerfile.init-user-package").read_text()
+        self.assertIn("COPY docker/init-user.sh /init-user.sh", published)
+        self.assertIn("docker/init-user.sh", artifacts.REQUIRED)
+        command = next(entry["command"] for entry in artifacts.commands(artifacts.arguments([]), {}) if entry["artifact"] == "init-user")
+        self.assertFalse(any(part.startswith(("compiled=", "frontend=")) for part in command))
+        lifecycle = (ROOT / "scripts/run-bootstrap-lifecycle-acceptance.py").read_text()
+        self.assertIn('require("init-user" not in selected', lifecycle)
+
+    def test_acceptance_producer_assembles_native_actions_before_canonical_publication(self):
+        recipe = (ROOT / artifacts.DOCKERFILE).read_text()
+        build = recipe.index("--manifest-path crates/core-actions/Cargo.toml")
+        copy = recipe.index('"/out/core/actions/bin/$action/linux-$arch"')
+        publish = recipe.index("bootstrap_acceptance_archive /out/core /out/canonical-store")
+        self.assertLess(build, copy)
+        self.assertLess(copy, publish)
+        self.assertIn("for action in echo sleep noop http_request; do", recipe)
+        self.assertIn("crates/core-actions/Cargo.lock", artifacts.REQUIRED)
+        helper = (ROOT / "crates/common/examples/bootstrap_acceptance_archive.rs").read_text()
+        self.assertLess(helper.index("check_pack(&source)"), helper.index(".publish_release("))
 
 
 if __name__ == "__main__":

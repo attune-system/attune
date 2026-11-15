@@ -5,15 +5,15 @@ all-features = true
 version = 2
 yanked = "deny"
 ignore = [
-    # jsonwebtoken's RSA support is required for verifying external RS256 OIDC ID tokens.
-    # No patched rsa release is available yet for RUSTSEC-2023-0071, so tolerate it until
-    # the upstream ecosystem provides a safe replacement or fix.
+    # Patched rsa >=0.10.0 is available, but jsonwebtoken 10.4 and openidconnect
+    # 4.1 still require rsa 0.9. jsonwebtoken 12 supports rsa 0.10; removing this
+    # exception also requires upstream OIDC support and updated RSA test fixtures.
     "RUSTSEC-2023-0071",
     # Temporary risk acceptance for crypto-bigint 0.5.5 via JWT/OIDC's elliptic-curve
-    # dependency. The fix requires >=0.7.6, which those upstream libraries do not
-    # yet support. Remove when their dependency graph is patched. Review by
+    # dependency. jsonwebtoken 12 and openidconnect 4.1 support patched >=0.7.6;
+    # upgrading requires migrating Attune's custom JWT crypto provider. Review by
     # 2026-11-22; cargo-deny 0.20.2 does not support enforced ignore expiry.
-    { id = "RUSTSEC-2026-0387", reason = "Await upstream JWT/OIDC support for patched crypto-bigint; tracked in PR #14; review by 2026-11-22" },
+    { id = "RUSTSEC-2026-0387", reason = "Upgrade to jsonwebtoken 12 and openidconnect 4.1, including custom JWT provider migration; tracked in PR #14; review by 2026-11-22" },
 ]
 
 [licenses]

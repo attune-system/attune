@@ -30,9 +30,51 @@ async fn fixture() -> TestResult<TestDatabase> {
         env!("CARGO_MANIFEST_DIR"),
         "/../../config.test.yaml"
     ))?;
-    Ok(TestDatabase::create(&config.database)
+    let db = TestDatabase::create(&config.database)
         .await?
-        .with_cleanup_on_drop())
+        .with_cleanup_on_drop();
+    isolate_empty_migration_leaves(db.pool()).await?;
+    Ok(db)
+}
+
+async fn isolate_empty_migration_leaves(pool: &PgPool) -> TestResult {
+    // A run-owned migrated template may have been built before UTC midnight.
+    // Its empty day+0..7 leaves are inherited by every clone; once old enough,
+    // retention correctly counts them in addition to the leaf a test seeds.
+    // Remove only this owned fixture's verified-empty baseline before seeding.
+    // Use its actual inventory horizon, not a wall-clock-dependent cutoff.
+    let config = NativeMaintenanceConfig::default();
+    let inventory = PartitionRepository::inventory(pool, 100, &config).await?;
+    assert!(inventory.len() < 100, "fixture inventory must be complete");
+    for table in [ManagedTable::Event, ManagedTable::ExecutionHistory] {
+        assert_eq!(
+            scalar(
+                pool,
+                &format!("SELECT count(*) FROM {}", table.table_name())
+            )
+            .await?,
+            0,
+            "fixture isolation must never discard seeded rows"
+        );
+        let leaves: Vec<_> = inventory
+            .iter()
+            .filter(|leaf| leaf.parent == table)
+            .collect();
+        if let Some(cutoff) = leaves.iter().map(|leaf| leaf.upper_bound).max() {
+            let result =
+                PartitionRepository::expire_before(pool, table, cutoff, &config, false, || false)
+                    .await?;
+            assert_eq!(result.candidates, leaves.len() as i64);
+            assert_eq!(result.partitions_dropped, leaves.len() as i64);
+            assert!(!result.cancelled && !result.budget_exhausted);
+        }
+    }
+    let remaining = PartitionRepository::inventory(pool, 100, &config).await?;
+    assert!(remaining.iter().all(|leaf| !matches!(
+        leaf.parent,
+        ManagedTable::Event | ManagedTable::ExecutionHistory
+    )));
+    Ok(())
 }
 
 async fn seed(pool: &PgPool, kind: SummaryKind, at: DateTime<Utc>, count: i64) -> TestResult {
@@ -188,6 +230,68 @@ async fn failed_housekeeping_preserves_raw_progress_then_zero_candidate_restart_
     }
     restarted.close().await;
     db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn aged_empty_template_leaf_changes_only_partition_progress_until_fixture_isolated(
+) -> TestResult {
+    for isolate in [false, true] {
+        let db = fixture().await?;
+        let native = NativeMaintenanceConfig {
+            default_repair_row_limit: 1,
+            ..Default::default()
+        };
+        // Deterministically represent an inherited migration-day leaf after
+        // midnight+retention, without changing the clock or registry bounds.
+        let aged_day = utc_day(Utc::now()) - Duration::days(2);
+        assert_eq!(
+            PartitionRepository::ensure_day(db.pool(), ManagedTable::Event, aged_day, &native)
+                .await?,
+            PartitionRepairOutcome::Applied { rows_moved: 0 }
+        );
+        if isolate {
+            isolate_empty_migration_leaves(db.pool()).await?;
+        }
+        let bucket = utc_day(Utc::now()) - Duration::days(100);
+        seed(db.pool(), SummaryKind::EventVolume, bucket, 5).await?;
+        refresh(db.pool(), SummaryKind::EventVolume, bucket).await?;
+        let settings = RetentionConfig {
+            batch_size: 2,
+            max_batches_per_target: 1,
+            native_maintenance: native,
+            ..Default::default()
+        };
+        let result = RetentionRepository::run_target_bounded(
+            db.pool(),
+            RetentionTarget::Events,
+            3600,
+            &settings,
+            || false,
+        )
+        .await?;
+        assert_eq!(
+            (result.deleted, result.partitions_dropped, result.candidates),
+            (2, if isolate { 0 } else { 1 }, 3),
+            "empty inherited leaf affects partition progress, never raw progress"
+        );
+        assert!(!result.candidates_exact);
+        assert_eq!(scalar(db.pool(), "SELECT count(*) FROM event").await?, 3);
+        absent(db.pool(), SummaryKind::EventVolume, bucket).await?;
+        let mut conn = db.pool().acquire().await?;
+        let read = AnalyticsRepository::event_volume_hourly(
+            &mut *conn,
+            &AnalyticsTimeRange {
+                since: bucket,
+                until: bucket + Duration::hours(1) - Duration::nanoseconds(1),
+            },
+        )
+        .await?;
+        assert_eq!(read.metadata.mode, ReadMode::RawOnly);
+        assert_eq!(read.data.iter().map(|row| row.event_count).sum::<i64>(), 3);
+        drop(conn);
+        db.cleanup().await?;
+    }
     Ok(())
 }
 

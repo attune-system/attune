@@ -57,7 +57,7 @@ pack_ref: alerts
 label: "Critical System Alert"
 description: "Send critical Attune system alerts to an incident webhook"
 trigger_ref: core.alert
-action_ref: core.http_request
+action_ref: example.http_request
 trigger_params: {}
 conditions:
   expression: 'event.payload.severity == "critical" and event.payload.category != "test"'
@@ -271,7 +271,7 @@ Before finalizing, verify:
 
 ## Invocation Prompts
 
-- "Act as Attune Rule Author. Create a rule in pack `alerts` that listens to `core.alert` and calls `core.http_request`; here is the alert payload and action schema..."
+- "Act as Attune Rule Author. Create a rule in pack `alerts` that listens to `core.alert` and calls `example.http_request`; here is the alert payload and action schema..."
 - "Review this rule YAML for Attune correctness, especially conditions and flat `action_params`."
 - "Given this trigger output schema and action parameter schema, draft a pack-bundled rule and a synthetic-event test plan."
 - "Debug why rule `monitoring.cpu_critical` did not fire. Tell me which events, enforcements, and executions to inspect."

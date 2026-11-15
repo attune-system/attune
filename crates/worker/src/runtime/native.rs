@@ -65,6 +65,13 @@ impl NativeRuntime {
         stderr_log_writer: Option<BoundedLogFileWriter>,
         cancel_token: Option<CancellationToken>,
     ) -> RuntimeResult<ExecutionResult> {
+        let binary_path = attune_common::native_entrypoint::resolve(
+            &binary_path,
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        )
+        .map_err(RuntimeError::InvalidAction)?;
+
         // Check if binary exists and is executable
         if !binary_path.exists() {
             return Err(RuntimeError::ExecutionFailed(format!(
@@ -700,3 +707,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "native_core_tests.rs"]
+mod native_core_tests;

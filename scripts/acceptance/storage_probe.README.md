@@ -1,3 +1,10 @@
+> The optional legacy storage producer invocation is retired in core 1.0.7.
+> It fails explicitly before dispatch/provisioning and is deferred coverage tracked
+> in local issue #142. It is not a passing or skipped required validation lane.
+> Shared API/private helpers remain for the supported independent native controller
+> fixture; run that fixture separately. Historical legacy instructions below do
+> not describe an available core action.
+
 # Owned storage lifecycle probe
 
 `storage_probe.py` implements E's `storage_probe_command` stdin/stdout protocol.

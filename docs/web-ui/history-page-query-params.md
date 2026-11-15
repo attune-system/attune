@@ -111,7 +111,7 @@ You can share URLs with query parameters to help others view specific filtered d
 
 ```
 # Share a view of all failed executions for a specific action
-http://localhost:3000/executions?action_ref=core.http_request&status=failed
+http://localhost:3000/executions?action_ref=example.http_request&status=failed
 
 # Share enforcements for a specific rule
 http://localhost:3000/enforcements?rule_ref=my_pack.important_rule

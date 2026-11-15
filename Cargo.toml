@@ -17,6 +17,7 @@ members = [
 # them.
 exclude = [
     "crates/core-timer-sensor",
+    "crates/core-actions",
     "vendor/utoipa-swagger-ui",
     "vendor/sqlx-core-0.8.6",
     "vendor/sqlx-postgres-0.8.6",
