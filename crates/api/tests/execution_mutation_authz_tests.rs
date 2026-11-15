@@ -587,7 +587,7 @@ async fn access_created_rule_retains_sponsor_and_inputs_through_event_consumers(
         ctx.pool.clone(),
         publisher.clone(),
         consumers[0].clone(),
-        None,
+        ctx.state.config.security.encryption_key.clone(),
     );
     let enforcement_processor = EnforcementProcessor::new(
         ctx.pool.clone(),
@@ -595,7 +595,7 @@ async fn access_created_rule_retains_sponsor_and_inputs_through_event_consumers(
         consumers[1].clone(),
         Arc::new(PolicyEnforcer::new(ctx.pool.clone())),
         Arc::new(ExecutionQueueManager::new(QueueConfig::default())),
-        None,
+        ctx.state.config.security.encryption_key.clone(),
     );
     let event_task = tokio::spawn(async move { event_processor.start().await });
     let enforcement_task = tokio::spawn(async move { enforcement_processor.start().await });
