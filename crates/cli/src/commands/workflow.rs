@@ -39,12 +39,12 @@ pub enum WorkflowCommands {
     },
     /// Show details of a specific workflow
     Show {
-        /// Workflow reference (e.g. core.install_packs)
+        /// Workflow reference (e.g. example.install_packs)
         workflow_ref: String,
     },
     /// Delete a workflow
     Delete {
-        /// Workflow reference (e.g. core.install_packs)
+        /// Workflow reference (e.g. example.install_packs)
         workflow_ref: String,
 
         /// Skip confirmation prompt

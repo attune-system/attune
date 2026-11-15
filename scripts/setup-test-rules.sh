@@ -146,32 +146,21 @@ fi
 echo "✓ Rule 2 created (ID: $RULE2_ID)"
 echo ""
 
-# Create Rule 3: HTTP POST to httpbin.org every 10 seconds
-echo "Creating Rule 3: HTTP POST to httpbin.org every 10 seconds..."
+# Create Rule 3: native noop every 10 seconds (no external HTTP dependency).
+echo "Creating Rule 3: native noop every 10 seconds..."
 RULE3=$(curl -s -X POST "$API_URL/api/v1/rules" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "ref": "test.httpbin_post",
-    "label": "HTTPBin POST Every 10 Seconds",
-    "description": "Makes a POST request to httpbin.org every 10 seconds",
+    "ref": "test.noop_interval",
+    "label": "Native Noop Every 10 Seconds",
+    "description": "Exercises native core action dispatch",
     "pack_ref": "core",
-    "action_ref": "core.http_request",
+    "action_ref": "core.noop",
     "trigger_ref": "core.intervaltimer",
     "enabled": true,
-    "trigger_params": {
-      "unit": "seconds",
-      "interval": 10
-    },
-    "action_params": {
-      "url": "https://httpbin.org/post",
-      "method": "POST",
-      "body": "{\"message\": \"Test from Attune\", \"timestamp\": \"{{event.payload.executed_at}}\", \"rule\": \"test.httpbin_post\"}",
-      "headers": {
-        "Content-Type": "application/json",
-        "User-Agent": "Attune-Test/1.0"
-      }
-    }
+    "trigger_params": {"unit": "seconds", "interval": 10},
+    "action_params": {"exit_code": 0, "message": "Test from Attune"}
   }')
 
 RULE3_ID=$(echo "$RULE3" | jq -r '.data.id // .id // empty')

@@ -7,7 +7,6 @@ from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import secrets
-import re
 
 from fixture_support import API, FixtureError, read_secret, require, run, write_private
 
@@ -27,22 +26,11 @@ def principals(ctx):
     storage = ctx.get("storage_fixture")
     if storage is None:
         return roles
-    require(storage.get("allow_shell_invocation") is True and storage.get("allow_maintenance_management") is True, "Concrete storage fixture requires explicit isolated shell and maintenance-management consent")
-    run_ref = "core.f_probe_" + ctx["run_id"].replace("-", "_")
-    legacy_ref = storage.get("legacy_artifact_ref", "")
-    legacy_owner = storage.get("legacy_owner_ref", "")
-    require(bool(re.fullmatch(r"core\.[a-zA-Z0-9_]+", legacy_ref)) and bool(re.fullmatch(r"core\.[a-zA-Z0-9_]+", legacy_owner)), "Supply exact real run-owned legacy artifact and action owner refs")
-    invoker = [
-        {"resource": "actions", "actions": ["read", "execute"], "constraints": {"refs": ["core.run_agent_command"]}},
-        {"resource": "executions", "actions": ["read", "cancel"], "constraints": {"owner": "self"}},
-    ]
-    maintenance = [
-        # Protected plaintext file GET explicitly checks Read AND Decrypt.
-        {"resource": "artifacts", "actions": ["read", "decrypt", "delete"], "constraints": {"refs": sorted({run_ref, legacy_ref}), "owner_types": ["action"], "owner_refs": sorted({"core.run_agent_command", legacy_owner})}},
-        {"resource": "retention", "actions": ["read", "update"]},
-        {"resource": "permissions", "actions": ["manage"]},
-    ]
-    return [("installer", INSTALLER), ("invoker", invoker), ("maintenance", maintenance)]
+    raise FixtureError(
+        "Deferred coverage (#142): the legacy storage producer used removed "
+        "core.run_agent_command. No principals/grants were provisioned. "
+        "The independent native controller fixture remains supported."
+    )
 
 
 def normalize(grants):

@@ -112,7 +112,7 @@ services:
 
   # Build and extract statically-linked pack binaries (sensors, etc.)
   # These binaries are built with musl for cross-architecture compatibility
-  # and placed directly into the packs volume for sensor containers to use.
+  # and staged separately for private core-candidate assembly.
   init-pack-binaries:
     build:
       context: .
@@ -123,12 +123,12 @@ services:
         RUST_TARGET: ${PACK_BINARIES_RUST_TARGET:-}
     container_name: attune-init-pack-binaries
     volumes:
-      - packs_data:/opt/attune/packs
+      - pack_binaries:/opt/attune/pack-binaries
     entrypoint:
       [
         "/bin/sh",
         "-c",
-        "mkdir -p /opt/attune/packs/core/sensors && cp /pack-binaries/attune-core-timer-sensor /opt/attune/packs/core/sensors/attune-core-timer-sensor && chmod +x /opt/attune/packs/core/sensors/attune-core-timer-sensor && echo 'Pack binaries copied successfully'",
+        "case $$(uname -m) in x86_64) target=linux-amd64;; aarch64) target=linux-arm64;; *) exit 1;; esac; mkdir -p /opt/attune/pack-binaries/core/sensors; cp /pack-binaries/attune-core-timer-sensor /opt/attune/pack-binaries/core/sensors/attune-core-timer-sensor; chmod +x /opt/attune/pack-binaries/core/sensors/attune-core-timer-sensor; for action in echo sleep noop http_request; do mkdir -p /opt/attune/pack-binaries/core/actions/bin/$$action; cp /pack-binaries/attune-core-$$action /opt/attune/pack-binaries/core/actions/bin/$$action/$$target; chmod +x /opt/attune/pack-binaries/core/actions/bin/$$action/$$target; done",
       ]
     restart: "no"
     networks:
@@ -144,6 +144,7 @@ services:
       - ./scripts/bootstrap_core_pack.py:/scripts/bootstrap_core_pack.py:ro
       - ./docker/init-packs.sh:/init-packs.sh:ro
       - packs_data:/opt/attune/packs
+      - pack_binaries:/opt/attune/pack-binaries:ro
       - runtime_envs:/opt/attune/runtime_envs
       - artifacts_data:/opt/attune/artifacts
     environment:
@@ -978,6 +979,8 @@ volumes:
   sensor_secondary_logs:
     driver: local
   notifier_logs:
+    driver: local
+  pack_binaries:
     driver: local
   packs_data:
     driver: local

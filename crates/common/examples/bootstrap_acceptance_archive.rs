@@ -1,6 +1,22 @@
 //! Local acceptance artifact assembly. Run only in the central permissioned lane.
 use attune_common::pack_registry::PackStorage;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+fn require_official_action_variants(source: &Path) -> Result<(), String> {
+    for action in ["echo", "sleep", "noop", "http_request"] {
+        let directory = source.join("actions/bin").join(action);
+        if !directory.is_dir() {
+            return Err(format!(
+                "Official core native action {action} requires a directory"
+            ));
+        }
+        for architecture in ["x86_64", "aarch64"] {
+            attune_common::native_entrypoint::resolve(&directory, "linux", architecture)
+                .map_err(|error| format!("Official core native action {action}: {error}"))?;
+        }
+    }
+    Ok(())
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
@@ -43,6 +59,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Expected actual core source".into());
     }
     let version = metadata["version"].as_str().ok_or("Missing core version")?;
+    // General pack-check also supports explicit host-only local Compose packs.
+    // This official acceptance producer must carry both release architectures.
+    require_official_action_variants(&source)?;
+    // Validate the actual exported action variants before freezing their bytes;
+    // a source-only pack is not a complete acceptance artifact.
+    let report = attune_common::pack_check::check_pack(&source);
+    if !report.valid {
+        return Err(format!("Core acceptance payload failed pack-check: {report:?}").into());
+    }
     // This is the SAME publisher/normalizer as API admission, not the Python
     // upload tarball or an OCI manifest digest.
     let published = PackStorage::new(output).publish_release(&source, "core", version)?;
@@ -57,4 +82,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     );
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn official_inventory_requires_both_architectures_for_every_action() {
+        let root = tempfile::tempdir().unwrap();
+        for action in ["echo", "sleep", "noop", "http_request"] {
+            let directory = root.path().join("actions/bin").join(action);
+            std::fs::create_dir_all(&directory).unwrap();
+            for variant in ["linux-amd64", "linux-arm64"] {
+                // Directory-inventory fixture only, not an ELF/admission fixture.
+                let path = directory.join(variant);
+                std::fs::write(&path, b"inventory fixture").unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        require_official_action_variants(root.path()).unwrap();
+        for action in ["echo", "sleep", "noop", "http_request"] {
+            for variant in ["linux-amd64", "linux-arm64"] {
+                let path = root.path().join("actions/bin").join(action).join(variant);
+                let saved = std::fs::read(&path).unwrap();
+                std::fs::remove_file(&path).unwrap();
+                assert!(require_official_action_variants(root.path()).is_err());
+                std::fs::write(&path, saved).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+    }
 }

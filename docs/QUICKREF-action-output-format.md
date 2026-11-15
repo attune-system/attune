@@ -77,7 +77,7 @@ For actions that output JSON, define the schema:
 
 ```yaml
 name: http_request
-ref: core.http_request
+ref: example.http_request
 runner_type: python
 entry_point: http_request.py
 

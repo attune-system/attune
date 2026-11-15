@@ -21,7 +21,7 @@ async fn mock_workflow_list(server: &MockServer) {
             "items": [
                 {
                     "id": 1,
-                    "ref": "core.install_packs",
+                    "ref": "example.install_packs",
                     "pack_ref": "core",
                     "label": "Install Packs",
                     "description": "Install one or more packs",
@@ -318,7 +318,7 @@ async fn test_workflow_list_authenticated() {
 
     cmd.assert()
         .success()
-        .stdout(predicate::str::contains("core.install_packs"))
+        .stdout(predicate::str::contains("example.install_packs"))
         .stdout(predicate::str::contains("mypack.deploy"))
         .stdout(predicate::str::contains("2 workflow(s) found"));
 }
@@ -364,7 +364,7 @@ async fn test_workflow_list_json_output() {
 
     cmd.assert()
         .success()
-        .stdout(predicate::str::contains("\"core.install_packs\""))
+        .stdout(predicate::str::contains("\"example.install_packs\""))
         .stdout(predicate::str::contains("\"mypack.deploy\""));
 }
 
@@ -386,7 +386,7 @@ async fn test_workflow_list_yaml_output() {
 
     cmd.assert()
         .success()
-        .stdout(predicate::str::contains("core.install_packs"))
+        .stdout(predicate::str::contains("example.install_packs"))
         .stdout(predicate::str::contains("mypack.deploy"));
 }
 

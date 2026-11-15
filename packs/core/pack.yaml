@@ -3,8 +3,8 @@
 
 ref: core
 label: "Core Pack"
-description: "Built-in core functionality including timer triggers, HTTP utilities, and basic shell actions"
-version: "1.0.6"
+description: "Built-in core functionality including timer triggers and standalone native utility actions"
+version: "1.0.7"
 author: "Attune Team"
 email: "core@attune.io"
 
@@ -36,13 +36,7 @@ meta:
     - "core"
     - "utilities"
     - "timers"
-    - "http"
-    - "shell"
-
-  # Python dependencies for Python-based actions
-  python_dependencies:
-    - "requests>=2.28.0"
-    - "croniter>=1.4.0"
+    - "native"
 
   # Documentation
   documentation_url: "https://docs.attune.io/packs/core"
@@ -57,42 +51,15 @@ tags:
 
 # Runtime dependencies
 runtime_deps:
-  - shell
-  - python
   - native
 
 # Enabled by default
 enabled: true
 
-# Pack Testing Configuration
+# Native actions are tested by their standalone Cargo suite and publication tests.
+# Candidate test runners currently require an interpreter; core actions do not.
 testing:
-  # Enable testing during installation
-  enabled: true
-
-  # Test discovery method
+  enabled: false
   discovery:
-    method: "directory"
-    path: "tests"
-
-  # Test runners by runtime type
-  runners:
-    shell:
-      type: "script"
-      entry_point: "tests/run_tests.sh"
-      timeout: 60
-      result_format: "simple"
-
-    python:
-      type: "unittest"
-      entry_point: "tests/test_actions.py"
-      timeout: 120
-      result_format: "simple"
-
-  # Test result expectations
-  result_path: "tests/results/"
-
-  # Minimum passing criteria (100% tests must pass)
-  min_pass_rate: 1.0
-
-  # Block installation if tests fail
-  on_failure: "block"
+    method: directory
+  runners: {}

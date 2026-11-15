@@ -121,10 +121,10 @@ def main():
     old_pack_digest = tree_digest(args.base_ref, "packs/core")
     new_pack_digest = tree_digest(args.head_ref, "packs/core")
     old_pack_digest = hashlib.sha256(
-        f"{old_pack_digest}:{old_timer_version}".encode()
+        f"{old_pack_digest}:{old_timer_version}:{tree_digest(args.base_ref, 'crates/core-actions')}".encode()
     ).hexdigest()
     new_pack_digest = hashlib.sha256(
-        f"{new_pack_digest}:{new_timer_version}".encode()
+        f"{new_pack_digest}:{new_timer_version}:{tree_digest(args.head_ref, 'crates/core-actions')}".encode()
     ).hexdigest()
     validate_component(
         "core pack",

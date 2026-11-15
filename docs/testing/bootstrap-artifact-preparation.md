@@ -33,11 +33,11 @@ Use `scripts/acceptance/artifact-build.example.json` as the input shape. Supply:
 - An explicit local Docker context and existing central permissioned BuildKit
   builder slot. The script neither creates nor prunes that builder. Its scheduler
   must enforce at most two build jobs and serialize this job with other heavy work.
-  Preflight uses Buildx's JSON inspect format and requires exactly one already
+  Preflight selects the exact named builder from Buildx's JSON inventory and requires exactly one already
   running docker/docker-container node attached to that validated local context.
   A local Docker context cannot authorize a remote/Kubernetes or inactive builder.
   Run on the selected native Linux amd64 or arm64 host. No QEMU fallback is inferred.
-- Seven real digest-pinned base images. The toolchain contains a compatible Rust,
+- Seven real digest-pinned base images. The toolchain contains Rust 1.100.0,
   cargo-zigbuild, Zig, native linker/SSL development dependencies and installed
   x86_64/aarch64 musl targets. The Node 24 image supplies npm. The compatible service
   runtime base supplies glibc/libssl, CA roots, curl/git and the attune UID 1000
@@ -49,10 +49,16 @@ Use `scripts/acceptance/artifact-build.example.json` as the input shape. Supply:
 One way for the integration owner to capture committed source after the freeze:
 
 ```sh
-git -C /owned/integrated archive --format=tar --output=/owned/source/integrated-source.tar ACTUAL_REVISION
+git -C /owned/integrated archive --format=tar --output=/owned/source/integrated-source.tar ACTUAL_REVISION -- . ":!web/.env.development"
 sha256sum /owned/source/integrated-source.tar
 git -C /owned/integrated show -s --format=%ct ACTUAL_REVISION
 ```
+
+The excluded tracked `web/.env.development` is local development configuration,
+not a production build input. Record this exclusion in the source receipt; the
+archive hash binds the exact exported bytes. The source validator continues to
+reject operational `.env` files rather than weakening its secret-input boundary.
+The production frontend uses its production build mode and retained templates.
 
 For staged/uncommitted combined source, use the integration owner's reviewed
 snapshot procedure and hash its actual output instead. Do not commit primary to
@@ -60,6 +66,35 @@ manufacture a build revision or export a stale HEAD while claiming staged fixes.
 Source tar members are bounded and must be ordinary files/directories: links,
 traversal, operational env/private files and caches are rejected. Keep any source
 archive credentials out entirely, not merely hidden by a Docker ignore pattern.
+
+## Provisioning the derived bases
+
+Missing base images are build inputs to prepare locally, not documents an operator
+must already own. `docker/Dockerfile.acceptance-bases` supplies separate toolchain,
+service and Python targets from immutable upstream `RUST_BASE`, `SERVICE_BASE` and
+`PYTHON_BASE` references. The toolchain pins Rust 1.100.0, Zig 0.16.0 and
+cargo-zigbuild 0.23.4 and installs both musl targets; the Python target pins
+PyYAML 6.0.3. Each derived image records package/tool versions under
+`/usr/local/share/attune-base-receipt/`. Record the actual exported OCI manifest
+and blob digests after building; a Docker configuration ID is not a manifest
+digest. Verify the measured local immutable reference resolves in the existing
+builder before passing it to the full producer. No public push is needed. A loaded Docker image may inspect successfully by digest
+while BuildKit's FROM resolver still tries its registry. In that case, retain
+`base_images` as measured immutable references and provide optional v1
+`base_oci_archives: {"service": "/owned/service.oci.tar", ...}` entries. The
+producer verifies manifest/blob hashes against those references, extracts only
+OCI metadata/blob paths into its new owned work root, and supplies digest-pinned
+`oci-layout://` named build contexts. It rechecks archive hashes after the build.
+A configuration ID, mutable tag or unresolved placeholder cannot replace a
+measured manifest. This preserves local/offline consumption without a registry.
+
+Build these prerequisites and the producer serially in the same owned resource
+lane. Check both host and Docker storage budgets, retain failed logs and never
+prune unrelated caches to make room. The measured source snapshot, upstream
+references, recipe bytes, resulting OCI archives, capability probes and full v1
+manifest together supply provenance. Installed distribution package versions are
+recorded in the base receipt; a rebuild must be remeasured rather than presumed
+bit-identical.
 
 ## What actually runs later
 
@@ -76,9 +111,17 @@ The fixed sequence is one foreground BuildKit invocation at a time:
    client only inside the isolated build image using that exact API document and
    npm's lockfile. No primary SDK/web/generated files are modified.
 4. Package API, executor, notifier, supervisor, injected agent, native-inclusive
-   init-packs, migrations and web into eight local OCI tar archives. Source and
+   init-packs, migrations, web and the init-user bootstrap companion into nine local OCI tar archives. Source and
    fixed-time inputs are recorded. Init-packs uses an API-only offline-dependency
    entrypoint: no runtime pip, old flat-binary adoption or mutable projection copy.
+
+Native output is transported as `native-export.tar`, then extracted into a new
+owned staging directory with writable owner directories and preserved file bytes
+and executable status. This avoids a non-root BuildKit local exporter trying to
+write children beneath canonical read-only release directories. The canonical
+`pack.tar.gz` bytes/digest remain unchanged. The receipt separately hashes the
+transport tar and the producer script; staging permissions are not live release
+immutability or an admission policy.
 
 The script verifies exported OCI blob hashes, root descriptor and referenced
 content sizes. It measures each OCI tar checksum separately from the actual image
@@ -154,3 +197,28 @@ No DB/provider volume is at risk while collecting these filesystem artifacts.
 Compilation, image imports and service lifecycle are intentionally separate
 permissions. The source release gates are compiled unchanged; no build receipt
 claims that admission is enabled or the full user SOW has passed.
+
+
+The init-user companion uses the measured PostgreSQL18 Alpine base plus argon2
+and the unchanged `docker/init-user.sh` used by the existing release image. Its
+receipt binds the script SHA256 and PostgreSQL base; the image carries psql/APK
+version and source receipts. Verify real psql/argon2, a nondefault dummy password
+hash and `docker/test-init-user.sh` before consuming it in chart bootstrap.
+This is an artifact capability check, not proof of live Helm seeding. The
+lifecycle acceptance runner still rejects SQL init-user as its operator credential
+fixture; no bootstrap/session/authority policy is bypassed.
+
+
+Init-packs publication must also work as UID1000. Both the acceptance image and
+`Dockerfile.init-packs-package` run the same image-only permission normalizer:
+directories0755, non-executable files0644, executable-intent files0755, no symlinks.
+Private host staging stays private; payload bytes and canonical executable intent
+are unchanged. Normalization must happen inside the image, not by elevating the
+chart publisher or replacing mounted payloads.
+
+Under the owned Docker lane, `scripts/check_core_image_permissions.py` runs actual
+UID1000 preflight, full payload reads, the real upload tar assembler, and the
+captured canonical archive helper in a disposable test container. It compares
+all file hashes/executable flags and the canonical digest, and supports a real
+0700-image rejection probe. The helper is copied into that test container only;
+it is not shipped in init-packs and adds no product runtime prerequisite.

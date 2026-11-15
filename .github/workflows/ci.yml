@@ -117,6 +117,9 @@ jobs:
       - name: Rustfmt
         run: cargo fmt --all -- --check
 
+      - name: Core actions rustfmt
+        run: cargo fmt --manifest-path crates/core-actions/Cargo.toml -- --check
+
       - name: Timer sensor rustfmt
         run: cargo fmt --manifest-path crates/core-timer-sensor/Cargo.toml -- --check
 
@@ -145,6 +148,7 @@ jobs:
           sh docker/test-prune-removed-pack-rules.sh
           python3 scripts/test_load_core_pack.py
           python3 scripts/test_bootstrap_core_pack.py
+          python3 scripts/test_core_bootstrap_failure.py
           python3 scripts/test_check_core_component_versions.py
           python3 scripts/test_publish_image_provenance.py
           python3 scripts/test_ci_rust_resources.py
@@ -155,6 +159,11 @@ jobs:
           mkdir -p dist/core-timer-sensor/linux-amd64 dist/core-timer-sensor/linux-arm64
           install -m 0755 /bin/true dist/core-timer-sensor/linux-amd64/attune-core-timer-sensor
           install -m 0755 /bin/true dist/core-timer-sensor/linux-arm64/attune-core-timer-sensor
+          for action in echo sleep noop http_request; do
+            mkdir -p "dist/core-actions/$action"
+            install -m 0755 /bin/true "dist/core-actions/$action/linux-amd64"
+            install -m 0755 /bin/true "dist/core-actions/$action/linux-arm64"
+          done
           docker build \
             --file docker/Dockerfile.init-packs-package \
             --tag attune-init-packs-package-test \
@@ -346,6 +355,35 @@ jobs:
           AWS_REGION: us-east-1
         run: scripts/run-ci-rust-tests.sh
 
+      - name: Standalone core action tests
+        run: cargo test --manifest-path crates/core-actions/Cargo.toml --locked -- --test-threads=4
+
+      - name: Native HTTP action loopback HTTP and TLS tests
+        env:
+          ATTUNE_CORE_HTTP_BINARY: ${{ github.workspace }}/crates/core-actions/target/debug/attune-core-http_request
+        run: python3 scripts/test_native_http_action.py
+
+      - name: Build static core action fixtures
+        run: |
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          python3 -m pip install --user --break-system-packages 'ziglang==0.16.0'
+          cargo install --locked --version 0.23.4 cargo-zigbuild
+          zig_directory=$(python3 -c 'import os,ziglang; print(os.path.dirname(ziglang.__file__))')
+          export PATH="$zig_directory:$PATH"
+          cargo zigbuild --locked --release --manifest-path crates/core-actions/Cargo.toml --target x86_64-unknown-linux-musl --bins
+          cargo zigbuild --locked --release --manifest-path crates/core-actions/Cargo.toml --target aarch64-unknown-linux-musl --bins
+
+      - name: Static native HTTP action loopback HTTP and TLS tests
+        env:
+          ATTUNE_CORE_HTTP_BINARY: ${{ github.workspace }}/crates/core-actions/target/x86_64-unknown-linux-musl/release/attune-core-http_request
+        run: python3 scripts/test_native_http_action.py
+
+      - name: Native core archive smoke test
+        env:
+          ATTUNE_CORE_ACTION_BIN_ROOT: ${{ github.workspace }}/crates/core-actions/target
+        run: >-
+          cargo run -p attune-worker --example core_native_archive
+
       - name: Standalone timer sensor tests
         run: >-
           cargo test --manifest-path crates/core-timer-sensor/Cargo.toml --locked
@@ -452,6 +490,13 @@ jobs:
         continue-on-error: ${{ github.ref != 'refs/heads/main' && github.head_ref != 'main' && github.event.merge_group.base_ref != 'refs/heads/main' }}
         run: cargo deny --locked check
 
+      - name: Cargo Deny (core actions)
+        id: deny-core-actions
+        if: ${{ !cancelled() }}
+        continue-on-error: ${{ github.ref != 'refs/heads/main' && github.head_ref != 'main' && github.event.merge_group.base_ref != 'refs/heads/main' }}
+        # Both cached 0.19 and 0.20 read deny.toml from this repository-root cwd.
+        run: cargo deny --manifest-path crates/core-actions/Cargo.toml --locked check
+
       - name: Cargo Deny (timer)
         id: deny-timer
         if: ${{ !cancelled() }}
@@ -459,7 +504,7 @@ jobs:
         run: cargo deny --manifest-path crates/core-timer-sensor/Cargo.toml --config deny.toml --locked check
 
       - name: Report non-blocking Cargo Deny failures
-        if: ${{ !cancelled() && github.ref != 'refs/heads/main' && github.head_ref != 'main' && github.event.merge_group.base_ref != 'refs/heads/main' && (steps.deny-workspace.outcome == 'failure' || steps.deny-timer.outcome == 'failure') }}
+        if: ${{ !cancelled() && github.ref != 'refs/heads/main' && github.head_ref != 'main' && github.event.merge_group.base_ref != 'refs/heads/main' && (steps.deny-workspace.outcome == 'failure' || steps.deny-timer.outcome == 'failure' || steps.deny-core-actions.outcome == 'failure') }}
         run: |
           echo "::warning::Cargo Deny failed. Findings are non-blocking on this branch, but must be resolved before main passes. See the Cargo Deny step logs."
           echo "### Cargo Deny warning" >> "$GITHUB_STEP_SUMMARY"

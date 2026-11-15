@@ -165,7 +165,7 @@ echo '{"file": "b.txt", "size": 2048}'  # Valid JSON
 
 ```sql
 -- Check action output format
-SELECT ref, output_format FROM action WHERE ref = 'core.http_request';
+SELECT ref, output_format FROM action WHERE ref = 'example.http_request';
 
 -- Update action output format
 UPDATE action SET output_format = 'jsonl' WHERE ref = 'mypack.myaction';
