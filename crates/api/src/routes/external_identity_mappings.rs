@@ -55,8 +55,8 @@ pub async fn create_external_identity_mapping(
     Path(integration_identity): Path<i64>,
     Json(request): Json<CreateExternalIdentityMappingRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_mapping_admin(&state, &user, integration_identity, Action::Update).await?;
-    authorize_mapping_admin(&state, &user, request.mapped_identity, Action::Update).await?;
+    authorize_mapping_admin(&state, &user, integration_identity, Action::Manage).await?;
+    authorize_mapping_admin(&state, &user, request.mapped_identity, Action::Manage).await?;
     request.validate()?;
     ensure_identity_exists(&state, integration_identity).await?;
 
@@ -202,7 +202,7 @@ pub async fn update_external_identity_mapping(
     Path((integration_identity, mapping_id)): Path<(i64, i64)>,
     Json(request): Json<UpdateExternalIdentityMappingRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_mapping_admin(&state, &user, integration_identity, Action::Update).await?;
+    authorize_mapping_admin(&state, &user, integration_identity, Action::Manage).await?;
     request.validate()?;
     ensure_identity_exists(&state, integration_identity).await?;
     let mut transaction = state.db.begin().await?;
@@ -213,9 +213,9 @@ pub async fn update_external_identity_mapping(
     )
     .await?
     .ok_or_else(|| mapping_not_found(mapping_id))?;
-    authorize_mapping_admin(&state, &user, existing.mapped_identity, Action::Update).await?;
+    authorize_mapping_admin(&state, &user, existing.mapped_identity, Action::Manage).await?;
     if request.mapped_identity != existing.mapped_identity {
-        authorize_mapping_admin(&state, &user, request.mapped_identity, Action::Update).await?;
+        authorize_mapping_admin(&state, &user, request.mapped_identity, Action::Manage).await?;
     }
 
     let mapping = ExternalIdentityMappingRepository::update(
@@ -281,7 +281,7 @@ pub async fn delete_external_identity_mapping(
     RequireAuth(user): RequireAuth,
     Path((integration_identity, mapping_id)): Path<(i64, i64)>,
 ) -> ApiResult<impl IntoResponse> {
-    authorize_mapping_admin(&state, &user, integration_identity, Action::Update).await?;
+    authorize_mapping_admin(&state, &user, integration_identity, Action::Manage).await?;
     ensure_identity_exists(&state, integration_identity).await?;
     let mut transaction = state.db.begin().await?;
     let mapping = ExternalIdentityMappingRepository::find_by_id_for_update(
@@ -291,7 +291,7 @@ pub async fn delete_external_identity_mapping(
     )
     .await?
     .ok_or_else(|| mapping_not_found(mapping_id))?;
-    authorize_mapping_admin(&state, &user, mapping.mapped_identity, Action::Update).await?;
+    authorize_mapping_admin(&state, &user, mapping.mapped_identity, Action::Manage).await?;
 
     if !ExternalIdentityMappingRepository::delete(
         &mut *transaction,
@@ -350,12 +350,27 @@ async fn authorize_mapping_admin(
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".to_string()))?;
     let mut context = AuthorizationContext::new(caller_identity);
     context.target_id = Some(integration_identity);
+    // Read/list retain their existing policy. Mapping writes bind callback authority,
+    // so require permissions administration over every persisted affected identity.
+    let resource = if action == Action::Manage {
+        if let Some(target) =
+            IdentityRepository::find_by_id(&state.db, integration_identity).await?
+        {
+            context.target_ref = Some(target.login);
+            context.owner_identity_id = Some(target.id);
+            context.owner_type = Some(attune_common::models::OwnerType::Identity);
+            context.owner_ref = Some(target.id.to_string());
+        }
+        Resource::Permissions
+    } else {
+        Resource::Identities
+    };
     state
         .authorization_service()
         .authorize(
             user,
             AuthorizationCheck {
-                resource: Resource::Identities,
+                resource,
                 action,
                 context,
             },

@@ -3,11 +3,14 @@ use serde_json::json;
 
 use attune_api::authz::AuthorizationService;
 use attune_common::repositories::{
+    external_identity_mapping::{
+        CreateExternalIdentityMappingInput, ExternalIdentityMappingRepository,
+    },
     identity::{
         CreateIdentityInput, CreatePermissionAssignmentInput, CreatePermissionSetInput,
         IdentityRepository, PermissionAssignmentRepository, PermissionSetRepository,
     },
-    Create,
+    Create, FindById,
 };
 
 use helpers::*;
@@ -91,6 +94,49 @@ async fn admin_can_manage_external_identity_mappings() {
     assert_eq!(wrong_parent.status(), StatusCode::NOT_FOUND);
 
     let item_path = format!("{path}/{mapping_id}");
+    // An administrator sponsor cannot lend authority omitted by its credential.
+    let narrow =
+        helpers::delegated_source::token(&ctx, ctx.user.as_ref().unwrap().id, &["standard".into()])
+            .await
+            .unwrap();
+    let denied = json!({"mapped_identity":replacement_identity,"provider":"slack",
+        "tenant":"T1","subject_kind":"user","external_subject":"attacker"});
+    assert_eq!(
+        ctx.post(&path, denied.clone(), Some(&narrow))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        ctx.put(&item_path, denied, Some(&narrow))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        ctx.delete(&item_path, Some(&narrow))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let unchanged =
+        ExternalIdentityMappingRepository::find_by_id(&ctx.pool, integration_identity, mapping_id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(unchanged.mapped_identity, mapped_identity);
+    assert_eq!(unchanged.external_subject, "User-42");
+    assert_eq!(
+        ExternalIdentityMappingRepository::list_page(&ctx.pool, integration_identity, 10, 0)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
     let updated = ctx
         .put(
             &item_path,
@@ -154,8 +200,8 @@ async fn scoped_admin_cannot_map_an_identity_outside_their_scope() {
             label: Some("Scoped mapping administration".to_string()),
             description: None,
             grants: json!([{
-                "resource": "identities",
-                "actions": ["update"],
+                "resource": "permissions",
+                "actions": ["manage"],
                 "constraints": {"ids": [integration_identity]}
             }]),
         },
@@ -233,4 +279,215 @@ async fn mapping_api_rejects_non_admins_and_credential_fields() {
         .await
         .expect("reject credential field");
     assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+async fn grant(ctx: &TestContext, identity: i64, grants: serde_json::Value) {
+    let set = PermissionSetRepository::create(
+        &ctx.pool,
+        CreatePermissionSetInput {
+            r#ref: format!("test.mapping_{}", uuid::Uuid::new_v4().simple()),
+            pack: None,
+            pack_ref: None,
+            label: None,
+            description: None,
+            grants,
+        },
+    )
+    .await
+    .unwrap();
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity,
+            permset: set.id,
+        },
+    )
+    .await
+    .unwrap();
+    AuthorizationService::invalidate_identity_authz_cache(identity).await;
+}
+
+#[tokio::test]
+async fn profile_update_cannot_mutate_mappings_and_reads_still_work() {
+    let ctx = TestContext::new().await.unwrap().with_auth().await.unwrap();
+    let editor = ctx.user.as_ref().unwrap().id;
+    grant(
+        &ctx,
+        editor,
+        json!([{"resource":"identities","actions":["update", "read"]}]),
+    )
+    .await;
+    let integration = create_identity(&ctx, "editor_integration").await;
+    let victim = create_identity(&ctx, "editor_victim").await;
+    let mapping = ExternalIdentityMappingRepository::create(
+        &ctx.pool,
+        integration,
+        CreateExternalIdentityMappingInput {
+            mapped_identity: victim,
+            provider: "slack".into(),
+            tenant: "T1".into(),
+            subject_kind: "user".into(),
+            external_subject: "legitimate".into(),
+            created_by: None,
+        },
+    )
+    .await
+    .unwrap();
+    let path = format!("/api/v1/identities/{integration}/external-identity-mappings");
+    let item = format!("{path}/{}", mapping.id);
+    let forged = json!({"mapped_identity":victim,"provider":"slack","tenant":"T1",
+        "subject_kind":"user","external_subject":"attacker"});
+    assert_eq!(
+        ctx.post(&path, forged.clone(), ctx.token())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        ctx.put(&item, forged, ctx.token()).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        ctx.delete(&item, ctx.token()).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    let rows = ExternalIdentityMappingRepository::list_page(&ctx.pool, integration, 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, mapping.id);
+    assert_eq!(rows[0].external_subject, "legitimate");
+    assert_eq!(rows[0].mapped_identity, victim);
+    assert_eq!(
+        ctx.get(&path, ctx.token()).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        ctx.get(&item, ctx.token()).await.unwrap().status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn scoped_mapping_management_requires_integration_old_and_new_targets() {
+    let ctx = TestContext::new().await.unwrap().with_auth().await.unwrap();
+    let integration = create_identity(&ctx, "scoped_integration").await;
+    let current = create_identity(&ctx, "scoped_current").await;
+    let replacement = create_identity(&ctx, "scoped_new").await;
+    let mapping = ExternalIdentityMappingRepository::create(
+        &ctx.pool,
+        integration,
+        CreateExternalIdentityMappingInput {
+            mapped_identity: current,
+            provider: "slack".into(),
+            tenant: "T1".into(),
+            subject_kind: "user".into(),
+            external_subject: "legitimate".into(),
+            created_by: None,
+        },
+    )
+    .await
+    .unwrap();
+    let path = format!("/api/v1/identities/{integration}/external-identity-mappings");
+    let item = format!("{path}/{}", mapping.id);
+    let request = json!({"mapped_identity":replacement,"provider":"slack","tenant":"T1",
+        "subject_kind":"user","external_subject":"replacement"});
+    for omitted in [integration, current, replacement] {
+        let login = format!("scope_editor_{omitted}");
+        let token = ctx.create_test_user(&login).await.unwrap();
+        let caller = IdentityRepository::find_by_login(&ctx.pool, &login)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut refs = Vec::new();
+        for id in [integration, current, replacement] {
+            if id != omitted {
+                refs.push(
+                    IdentityRepository::find_by_id(&ctx.pool, id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .login,
+                );
+            }
+        }
+        grant(
+            &ctx,
+            caller.id,
+            json!([{"resource":"permissions","actions":["manage"],
+            "constraints":{"refs":refs}}]),
+        )
+        .await;
+        assert_eq!(
+            ctx.put(&item, request.clone(), Some(&token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        if omitted != replacement {
+            assert_eq!(
+                ctx.delete(&item, Some(&token)).await.unwrap().status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        if omitted != current {
+            assert_eq!(
+                ctx.post(&path, request.clone(), Some(&token))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        let row = ExternalIdentityMappingRepository::find_by_id(&ctx.pool, integration, mapping.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.mapped_identity, current);
+        assert_eq!(row.external_subject, "legitimate");
+        assert_eq!(
+            ExternalIdentityMappingRepository::list_page(&ctx.pool, integration, 10, 0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    let mut refs = Vec::new();
+    for id in [integration, current, replacement] {
+        refs.push(
+            IdentityRepository::find_by_id(&ctx.pool, id)
+                .await
+                .unwrap()
+                .unwrap()
+                .login,
+        );
+    }
+    grant(
+        &ctx,
+        ctx.user.as_ref().unwrap().id,
+        json!([{"resource":"permissions","actions":["manage"],
+        "constraints":{"refs":refs}}]),
+    )
+    .await;
+    assert_eq!(
+        ctx.put(&item, request.clone(), ctx.token())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        ctx.delete(&item, ctx.token()).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        ctx.post(&path, request, ctx.token())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CREATED
+    );
 }
