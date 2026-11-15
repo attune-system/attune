@@ -10,6 +10,7 @@ prefix does not establish managed pack ownership.
 | Workflow delete | Actions / Delete on companion action, or workflow ref if absent | Access |
 | Trigger and sensor create/delete | Triggers / Create or Delete | Access |
 | Trigger, sensor and rule enable/disable | Triggers or Rules / Update | Access |
+| Rule create (durable ad hoc sponsorship) | Rules / Create on proposed ref and actual pack | Access |
 | Rule enabled-state transition through PUT | Rules / Update on locked current target | Access |
 | Pack workflow sync | Packs / Install on actual pack | Access |
 | Pack workflow validation | Packs / Read on actual pack | Access |

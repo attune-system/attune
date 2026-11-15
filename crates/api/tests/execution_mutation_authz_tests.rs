@@ -196,9 +196,21 @@ async fn delegated_mutations_require_target_grants_even_with_admin_sponsor() -> 
         .await?
         .is_some());
 
+    // Rules establish durable human sponsorship, which v1 cannot cap to an
+    // execution credential. Even target Create permission must not admit one.
+    ctx.post("/api/v1/rules", &rule_body, Some(&target))
+        .await?
+        .assert_status(StatusCode::FORBIDDEN);
+    let access = attune_common::auth::jwt::generate_access_token(
+        identity.id,
+        "mutation_admin",
+        &ctx.state.jwt_config,
+    )?;
+    ctx.post("/api/v1/rules", &rule_body, Some(&access))
+        .await?
+        .assert_status(StatusCode::CREATED);
     for (path, body) in [
         ("/api/v1/actions", &action_body),
-        ("/api/v1/rules", &rule_body),
         ("/api/v1/queues", &queue_body),
     ] {
         let response = ctx.post(path, body, Some(&target)).await?;
@@ -293,6 +305,114 @@ async fn delegated_mutations_require_target_grants_even_with_admin_sponsor() -> 
         .assert_status(StatusCode::OK);
     assert!(
         ActionRepository::find_by_ref(&ctx.pool, "mutation_authz.new")
+            .await?
+            .is_none()
+    );
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rule_creation_cannot_turn_execution_credentials_into_durable_sponsors() -> Result<()> {
+    use attune_common::repositories::action::UpdateActionInput;
+
+    let ctx = TestContext::new().await?;
+    let pack = create_test_pack(&ctx.pool, "create_ceiling").await?;
+    let action =
+        create_test_action(&ctx.pool, pack.id, &pack.r#ref, "create_ceiling.target").await?;
+    let trigger = create_test_trigger(&ctx.pool, pack.id, "create_ceiling.trigger").await?;
+    let owner = IdentityRepository::create(
+        &ctx.pool,
+        CreateIdentityInput {
+            login: "create_ceiling_owner".into(),
+            display_name: None,
+            attributes: json!({}),
+            password_hash: None,
+        },
+    )
+    .await?;
+    // The active sponsor can execute and read every input; the live source's
+    // immutable selection deliberately cannot. Create alone used to succeed.
+    assign(
+        &ctx,
+        owner.id,
+        "test.create_sponsor",
+        json!([
+            {"resource":"rules","actions":["create"]},
+            {"resource":"actions","actions":["execute"]},
+            {"resource":"packs","actions":["read","decrypt"]},
+            {"resource":"keys","actions":["read","decrypt"]}
+        ]),
+    )
+    .await?;
+    assign(
+        &ctx,
+        owner.id,
+        "test.create_only",
+        json!([
+            {"resource":"rules","actions":["create"],"constraints":{"pack_refs":[pack.r#ref]}}
+        ]),
+    )
+    .await?;
+    ActionRepository::update(
+        &ctx.pool,
+        action.id,
+        UpdateActionInput {
+            default_execution_permission_set_refs: Some(vec!["test.create_only".into()]),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let narrow =
+        helpers::delegated_source::token(&ctx, owner.id, &["test.create_only".into()]).await?;
+    let covered = helpers::delegated_source::token(
+        &ctx,
+        owner.id,
+        &["test.create_sponsor".into(), "standard".into()],
+    )
+    .await?;
+    let before: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM rule), (SELECT count(*) FROM enforcement), (SELECT count(*) FROM execution)",
+    ).fetch_one(&ctx.pool).await?;
+    for token in [&narrow, &covered] {
+        for selection in [
+            None,
+            Some(json!([])),
+            Some(json!(["test.create_only"])),
+            Some(json!(["standard"])),
+        ] {
+            for params in [
+                json!({}),
+                json!({"value":"{{ pack.config.region }}"}),
+                json!({"value":"{{ keystore['system.api_token'] }}"}),
+            ] {
+                let mut body = json!({
+                    "ref":"create_ceiling.rule", "pack_ref":pack.r#ref,
+                    "label":"Cannot acquire sponsor authority", "action_ref":action.r#ref,
+                    "trigger_ref":trigger.r#ref, "action_params":params, "trigger_params":{}
+                });
+                if let Some(selection) = &selection {
+                    body["permission_set_refs"] = selection.clone();
+                }
+                let response = ctx.post("/api/v1/rules", body, Some(token)).await?;
+                response.assert_status(StatusCode::FORBIDDEN);
+                assert!(response
+                    .json::<Value>()
+                    .await?
+                    .to_string()
+                    .contains("requires an access token"));
+            }
+        }
+    }
+    let after: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM rule), (SELECT count(*) FROM enforcement), (SELECT count(*) FROM execution)",
+    ).fetch_one(&ctx.pool).await?;
+    assert_eq!(
+        before, after,
+        "rejected creation must have no runtime effects"
+    );
+    assert!(
+        RuleRepository::find_by_ref(&ctx.pool, "create_ceiling.rule")
             .await?
             .is_none()
     );

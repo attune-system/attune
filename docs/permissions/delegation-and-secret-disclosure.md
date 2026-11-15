@@ -231,6 +231,18 @@ the original active owner, selected refs, grant digest, executable and schema;
 later rule edits cannot reselect that pending enforcement's authority. Queue
 contributors likewise retain their accepted owner and selection.
 
+Ad hoc rule creation requires an Access credential with Rules/Create and coverage
+of the effective execution permission selection (omission uses action defaults;
+`[]` selects none). It establishes durable sponsorship by that active identity.
+The v1 rule stores no originating credential ceiling: event admission checks the
+sponsor's current Execute, configuration and Key authority and pins accepted
+work. Consequently Execution credentials cannot create rules, even with Create,
+Execute, all input grants, or empty/`standard` selections. Checking these grants
+once would allow future sponsor or role grants to expand a delegated creator's
+authority. Use an authorized Access caller or trusted pack deployment instead;
+creation does not transfer ownership or synthesize a recorded admission.
+Existing behavioral-update and enabled-transition checks remain independent.
+
 Queued native workflows publish terminal completions through the same consumer
 as workers, including cancellation and immediate completion. Redelivery can replay
 a pending completion after broker failure and stops once its dispatch is terminal.

@@ -543,12 +543,13 @@ pub async fn create_rule(
     RequireAuth(user): RequireAuth,
     Json(request): Json<CreateRuleRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    if !matches!(
-        user.claims.token_type,
-        crate::auth::jwt::TokenType::Access | crate::auth::jwt::TokenType::Execution
-    ) {
+    // v1 persists an ad hoc sponsor, not the originating credential ceiling.
+    // A one-time Execute/input check cannot constrain later sponsor IAM growth.
+    // Only an Access actor can establish this durable sponsorship.
+    if user.claims.token_type != crate::auth::jwt::TokenType::Access {
         return Err(ApiError::Forbidden(
-            "This token type cannot administer rules".into(),
+            "Rule creation requires an access token; delegated creator authority cannot be retained"
+                .into(),
         ));
     }
 
