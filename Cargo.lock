@@ -429,6 +429,7 @@ dependencies = [
  "argon2",
  "async-trait",
  "attune-common",
+ "attune-executor",
  "attune-notifier",
  "attune-supervisor",
  "attune-worker",
