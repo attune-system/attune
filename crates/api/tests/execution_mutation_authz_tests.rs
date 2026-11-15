@@ -395,7 +395,7 @@ async fn rule_creation_cannot_turn_execution_credentials_into_durable_sponsors()
                     body["permission_set_refs"] = selection.clone();
                 }
                 let response = ctx.post("/api/v1/rules", body, Some(token)).await?;
-                response.assert_status(StatusCode::FORBIDDEN);
+                let response = response.assert_status(StatusCode::FORBIDDEN);
                 assert!(response
                     .json::<Value>()
                     .await?
@@ -418,4 +418,275 @@ async fn rule_creation_cannot_turn_execution_credentials_into_durable_sponsors()
     );
     ctx.cleanup().await?;
     Ok(())
+}
+
+/// Real broker consumers; run only against the lane-owned RabbitMQ and PG.
+#[tokio::test]
+#[ignore = "requires owned RabbitMQ via ATTUNE_RULE_TEST_AMQP_URL and PostgreSQL"]
+async fn access_created_rule_retains_sponsor_and_inputs_through_event_consumers() -> Result<()> {
+    use attune_common::{
+        event_schema::EventSchemaBinding,
+        mq::{
+            Connection, Consumer, ConsumerConfig, EventCreatedPayload, MessageEnvelope,
+            MessageQueueConfig, MessageType, Publisher, PublisherConfig,
+        },
+        repositories::{
+            component_lifecycle::PackProjectionIds,
+            delegated_execution::DelegatedExecutionRepository,
+            event::{CreateEventInput, EnforcementRepository, EventRepository},
+            event_origin::EventOriginRepository,
+            execution::ExecutionRepository,
+        },
+    };
+    use attune_executor::{
+        enforcement_processor::EnforcementProcessor, event_processor::EventProcessor,
+        ExecutionQueueManager, PolicyEnforcer, QueueConfig,
+    };
+    use futures::FutureExt;
+    use std::{panic::AssertUnwindSafe, sync::Arc, time::Duration};
+
+    let ctx = TestContext::new().await?;
+    let pack = create_test_pack(&ctx.pool, "access_event_sponsor").await?;
+    let action = create_test_action(
+        &ctx.pool,
+        pack.id,
+        &pack.r#ref,
+        "access_event_sponsor.target",
+    )
+    .await?;
+    let trigger = create_test_trigger(&ctx.pool, pack.id, "access_event_sponsor.tick").await?;
+    helpers::activate_test_pack_release_with_projections(
+        &ctx.pool,
+        &pack,
+        &PackProjectionIds {
+            actions: vec![action.id],
+            triggers: vec![trigger.id],
+            ..Default::default()
+        },
+    )
+    .await?;
+    let owner = IdentityRepository::create(
+        &ctx.pool,
+        CreateIdentityInput {
+            login: "access_event_owner".into(),
+            display_name: None,
+            attributes: json!({}),
+            password_hash: None,
+        },
+    )
+    .await?;
+    assign(
+        &ctx,
+        owner.id,
+        "test.access_event_owner",
+        json!([
+            {"resource":"rules","actions":["create"]},
+            {"resource":"actions","actions":["execute"],"constraints":{"refs":[action.r#ref]}}
+        ]),
+    )
+    .await?;
+    let access = attune_common::auth::jwt::generate_access_token(
+        owner.id,
+        "access_event_owner",
+        &ctx.state.jwt_config,
+    )?;
+    let response = ctx
+        .post(
+            "/api/v1/rules",
+            json!({
+                "ref":"access_event_sponsor.rule", "pack_ref":pack.r#ref,
+                "label":"Access sponsor", "action_ref":action.r#ref, "trigger_ref":trigger.r#ref,
+                "enabled":true, "permission_set_refs":["standard"],
+                "action_params":{"message":"{{ event.payload.message }}"}, "trigger_params":{}
+            }),
+            Some(&access),
+        )
+        .await?
+        .assert_status(StatusCode::CREATED);
+    let body: Value = response.json().await?;
+    assert_eq!(body["data"]["owner_identity"], owner.id);
+    let rule = RuleRepository::find_by_ref(&ctx.pool, "access_event_sponsor.rule")
+        .await?
+        .unwrap();
+    assert!(rule.is_adhoc);
+    assert_eq!(rule.owner_identity, Some(owner.id));
+
+    let payload = json!({"message":"authorized-event-value"});
+    let mut tx = ctx.pool.begin().await?;
+    let event = EventRepository::create(
+        &mut *tx,
+        CreateEventInput {
+            trigger: Some(trigger.id),
+            trigger_ref: trigger.r#ref.clone(),
+            config: None,
+            payload: Some(payload.clone()),
+            trace_tag: None,
+            source: None,
+            source_ref: None,
+            rule: None,
+            rule_ref: None,
+        },
+    )
+    .await?;
+    EventOriginRepository::capture(
+        &mut tx,
+        &event,
+        &EventSchemaBinding {
+            trigger_id: Some(trigger.id),
+            trigger_ref: trigger.r#ref.clone(),
+            payload: None,
+            config: None,
+            webhook: false,
+        },
+        &[],
+        &[],
+    )
+    .await?;
+    tx.commit().await?;
+
+    // The broker is exclusively owned by this test lane. No other service
+    // consumes these queues; messages may safely arrive before start() awaits.
+    let connection = Connection::connect(&std::env::var("ATTUNE_RULE_TEST_AMQP_URL")?).await?;
+    let mq = MessageQueueConfig::default();
+    connection.setup_common_infrastructure(&mq).await?;
+    connection.setup_executor_infrastructure(&mq).await?;
+    let publisher = Arc::new(
+        Publisher::new(
+            &connection,
+            PublisherConfig {
+                confirm_publish: true,
+                timeout_secs: 10,
+                exchange: "attune.events".into(),
+            },
+        )
+        .await?,
+    );
+    let mut consumers = Vec::new();
+    for (queue, tag) in [
+        (&mq.rabbitmq.queues.executor_events.name, "rule-event-test"),
+        (
+            &mq.rabbitmq.queues.enforcements.name,
+            "rule-enforcement-test",
+        ),
+    ] {
+        consumers.push(Arc::new(
+            Consumer::new(
+                &connection,
+                ConsumerConfig {
+                    queue: queue.clone(),
+                    tag: tag.into(),
+                    prefetch_count: 1,
+                    auto_ack: false,
+                    exclusive: false,
+                },
+            )
+            .await?,
+        ));
+    }
+    let event_processor = EventProcessor::new(
+        ctx.pool.clone(),
+        publisher.clone(),
+        consumers[0].clone(),
+        None,
+    );
+    let enforcement_processor = EnforcementProcessor::new(
+        ctx.pool.clone(),
+        publisher.clone(),
+        consumers[1].clone(),
+        Arc::new(PolicyEnforcer::new(ctx.pool.clone())),
+        Arc::new(ExecutionQueueManager::new(QueueConfig::default())),
+        None,
+    );
+    let event_task = tokio::spawn(async move { event_processor.start().await });
+    let enforcement_task = tokio::spawn(async move { enforcement_processor.start().await });
+    let check = async {
+        publisher
+            .publish_envelope(&MessageEnvelope::new(
+                MessageType::EventCreated,
+                EventCreatedPayload {
+                    event_created: Some(event.created),
+                    event_id: event.id,
+                    trigger_id: Some(trigger.id),
+                    trigger_ref: trigger.r#ref.clone(),
+                    sensor_id: None,
+                    sensor_ref: None,
+                    payload: payload.clone(),
+                    config: None,
+                },
+            ))
+            .await?;
+        let (enforcement, execution) = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let enforcements = EnforcementRepository::find_by_rule(&ctx.pool, rule.id).await?;
+                if let Some(enforcement) = enforcements.into_iter().next() {
+                    let executions =
+                        ExecutionRepository::find_by_enforcement(&ctx.pool, enforcement.id).await?;
+                    if let Some(execution) = executions.into_iter().next() {
+                        return Ok::<_, attune_common::Error>((enforcement, execution));
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            "Access-created rule did not traverse event/enforcement consumers within 30 seconds"
+        })??;
+        assert_eq!(enforcement.event, Some(event.id));
+        assert_eq!(execution.enforcement, Some(enforcement.id));
+        assert_eq!(execution.executor, Some(owner.id));
+        assert_eq!(execution.action_ref, action.r#ref);
+        assert_eq!(
+            execution.config,
+            Some(json!({"message":"authorized-event-value"}))
+        );
+        assert_eq!(execution.permission_set_refs, vec!["standard".to_string()]);
+        let mut tx = ctx.pool.begin().await?;
+        assert_eq!(
+            DelegatedExecutionRepository::enforcement_selection(&mut tx, &enforcement).await?,
+            (owner.id, vec!["standard".into()])
+        );
+        let selection = DelegatedExecutionRepository::find(&mut tx, execution.id).await?;
+        assert_eq!(selection.mode, "delegated");
+        assert!(selection.explicit);
+        assert_eq!(selection.owner, Some(owner.id));
+        assert_eq!(selection.selected_refs, execution.permission_set_refs);
+        assert!(selection.admission.is_none());
+        assert!(selection.executable_snapshot.is_some());
+        assert!(selection.schema_digest.is_some());
+        assert!(selection.grant_digest.is_some());
+        tx.commit().await?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    };
+    let result = AssertUnwindSafe(check).catch_unwind().await;
+    // Always await stop and both writers before closing/removing the database,
+    // including assertion/timeout failures returned from the consumer check.
+    let stop_event = consumers[0].stop().await;
+    let stop_enforcement = consumers[1].stop().await;
+    async fn join_writer(mut task: tokio::task::JoinHandle<anyhow::Result<()>>) -> Result<()> {
+        match tokio::time::timeout(Duration::from_secs(10), &mut task).await {
+            Ok(done) => {
+                done??;
+                Ok(())
+            }
+            Err(_) => {
+                task.abort();
+                let _cancelled = task.await;
+                Err("consumer failed to stop; aborted and joined".into())
+            }
+        }
+    }
+    let event_done = join_writer(event_task).await;
+    let enforcement_done = join_writer(enforcement_task).await;
+    let connection_closed = connection.close().await;
+    stop_event?;
+    stop_enforcement?;
+    event_done?;
+    enforcement_done?;
+    connection_closed?;
+    ctx.cleanup().await?;
+    match result {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
