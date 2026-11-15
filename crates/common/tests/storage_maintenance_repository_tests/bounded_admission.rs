@@ -731,7 +731,7 @@ async fn shared_pending(
 async fn shared_cleanup_claim_defers_then_commits_the_fresh_path_and_atomic_completion() {
     let db = create_test_pool().await.unwrap();
     let candidate = shared_pending(db.pool(), "bounded_shared").await;
-    let budget = MaintenanceBudget::default();
+    let budget = shared_cleanup_progress_budget();
     let cancel = CancellationToken::new();
     let mut capture = db.pool().begin().await.unwrap();
     Evidence::lock_capture(&mut capture).await.unwrap();
@@ -790,6 +790,90 @@ async fn shared_cleanup_claim_defers_then_commits_the_fresh_path_and_atomic_comp
     let remaining: (bool,bool) = sqlx::query_as("SELECT EXISTS(SELECT 1 FROM artifact_version WHERE id=$1),EXISTS(SELECT 1 FROM artifact WHERE id=$2)")
         .bind(candidate.id).bind(candidate.artifact).fetch_one(db.pool()).await.unwrap();
     assert_eq!(remaining, (false, false));
+    db.cleanup().await.unwrap();
+}
+
+fn shared_cleanup_progress_budget() -> MaintenanceBudget {
+    // This path checks admission, the fresh claim and atomic deletion, not a
+    // 250 ms database latency SLO. Keep ordinary (nonqueued) admission while
+    // allowing scheduling headroom. The default deadline is exercised below
+    // with a server-side delay that deterministically exceeds it.
+    MaintenanceBudget {
+        statement_timeout: Duration::from_secs(2),
+        page_timeout: Duration::from_secs(4),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn shared_cleanup_statement_deadline_rolls_back_before_a_later_claim() {
+    let db = create_test_pool().await.unwrap();
+    let candidate = shared_pending(db.pool(), "shared_statement_deadline").await;
+    // Delay protected metadata work, not COMMIT: a statement timeout must
+    // acknowledge rollback and cannot return a path for physical deletion.
+    sqlx::raw_sql("CREATE FUNCTION owned_delay_shared_claim() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.35); RETURN NEW; END $$; CREATE TRIGGER owned_delay_shared_claim BEFORE UPDATE ON artifact_version FOR EACH ROW WHEN (NEW.body_state='cleanup_claimed' AND OLD.body_state IS DISTINCT FROM NEW.body_state) EXECUTE FUNCTION owned_delay_shared_claim();")
+        .execute(db.pool()).await.unwrap();
+    let report = StorageMaintenanceRepository::claim_abandoned_shared_log_pending_bounded(
+        db.pool(),
+        candidate.clone(),
+        Utc::now(),
+        &MaintenanceBudget::default(),
+        deadline(),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(
+        report.outcome,
+        MaintenanceOutcome::DeadlineDeferred,
+        "{report:?}"
+    );
+    assert!(report.rollback_acknowledged, "{report:?}");
+    assert!(report.value.is_none());
+    assert_eq!(report.changed, 0);
+    assert!(matches!(
+        report.error.as_ref(),
+        Some(attune_common::Error::Database(sqlx::Error::Database(error)))
+            if error.code().as_deref() == Some("57014")
+    ));
+    assert!(report.into_result().is_err());
+    let state: (String, Option<i64>, Option<String>) = sqlx::query_as(
+        "SELECT av.body_state::text,o.cleanup_group,av.file_path FROM artifact_version av JOIN file_evidence_owner o ON o.version=av.id WHERE av.id=$1",
+    )
+    .bind(candidate.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        state,
+        ("pending".into(), None, Some(candidate.file_path.clone()))
+    );
+    let mut reader = db.pool().begin().await.unwrap();
+    timeout(Duration::from_secs(1), Evidence::lock_capture(&mut reader))
+        .await
+        .unwrap()
+        .unwrap();
+    reader.rollback().await.unwrap();
+
+    // Keep the delay installed: progress requires an explicitly different
+    // budget, not a hidden retry of the same expired attempt.
+    let report = StorageMaintenanceRepository::claim_abandoned_shared_log_pending_bounded(
+        db.pool(),
+        candidate.clone(),
+        Utc::now(),
+        &shared_cleanup_progress_budget(),
+        deadline(),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(report.outcome, MaintenanceOutcome::Progress, "{report:?}");
+    assert_eq!(report.changed, 1);
+    assert_eq!(
+        report.value.unwrap().unwrap().file_path,
+        candidate.file_path
+    );
+    let state: (String, bool) = sqlx::query_as("SELECT av.body_state::text,o.cleanup_group IS NOT NULL FROM artifact_version av JOIN file_evidence_owner o ON o.version=av.id WHERE av.id=$1")
+        .bind(candidate.id).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(state, ("cleanup_claimed".into(), true));
     db.cleanup().await.unwrap();
 }
 
