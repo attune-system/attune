@@ -1371,6 +1371,108 @@ async fn callback_delivery_history_does_not_block_sensor_deletion() -> TResult<(
 }
 
 #[tokio::test]
+async fn profile_editor_cannot_forge_callback_assignee_mapping() -> TResult<()> {
+    let ctx = TestContext::new().await?;
+    let fixture = setup_callback_response_fixture(&ctx, "mapping_editor").await?;
+    let token = ctx.create_test_user("mapping_profile_editor").await?;
+    let editor = IdentityRepository::find_by_login(&ctx.pool, "mapping_profile_editor")
+        .await?
+        .unwrap();
+    let set = PermissionSetRepository::create(
+        &ctx.pool,
+        CreatePermissionSetInput {
+            r#ref: "test.mapping_profile_editor".into(),
+            pack: None,
+            pack_ref: None,
+            label: None,
+            description: None,
+            grants: json!([{"resource":"identities","actions":["update"]}]),
+        },
+    )
+    .await?;
+    PermissionAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionAssignmentInput {
+            identity: editor.id,
+            permset: set.id,
+        },
+    )
+    .await?;
+    let path = format!(
+        "/api/v1/identities/{}/external-identity-mappings",
+        fixture.integration_identity_id
+    );
+    let response = ctx
+        .post(
+            &path,
+            json!({
+                "mapped_identity":fixture.mapped_identity_id,"provider":"slack","tenant":"T123",
+                "subject_kind":"user","external_subject":"ATTACKER"
+            }),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    // Exercise the real callback resolver and assignee check with attacker evidence.
+    let workload =
+        SensorWorkloadRepository::find_by_id(&ctx.pool, fixture.workload_fence.workload_id)
+            .await?
+            .unwrap();
+    let encrypted_payload = encrypt_json(
+        &json!({
+            "provider":"slack","subject_kind":"user","response_handle":fixture.response_handle,
+            "tenant":"T123","external_subject":"ATTACKER"
+        }),
+        ctx.state.config.security.encryption_key.as_deref().unwrap(),
+    )?;
+    let mut tx = ctx.pool.begin().await?;
+    let forged = InquiryCallbackDeliveryRepository::insert_or_load(
+        &mut tx,
+        CreateInquiryCallbackDelivery {
+            sensor: fixture.sensor_id,
+            integration_identity: fixture.integration_identity_id,
+            workload: workload.id,
+            assignment_generation: fixture.workload_fence.generation,
+            pack_release: workload.pack_release.unwrap(),
+            pack_release_digest: workload.pack_release_digest.as_deref().unwrap(),
+            adapter_ref: CALLBACK_ADAPTER_REF,
+            provider_delivery_id: "mapping-attacker",
+            request_digest: &format!("sha256:{}", "a".repeat(64)),
+            encrypted_payload: &encrypted_payload,
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    let forged = match forged {
+        InsertInquiryCallbackDelivery::Inserted(row) => row,
+        _ => unreachable!(),
+    };
+    assert!(matches!(
+        attune_api::inquiry_response::submit_inquiry_response(
+            &ctx.state,
+            attune_api::inquiry_response::InquiryResponseSubmission::CallbackAdapter {
+                delivery_id: forged.id
+            }
+        )
+        .await,
+        Err(attune_api::middleware::ApiError::Forbidden(_))
+    ));
+    let pending = InquiryRepository::find_by_id(&ctx.pool, fixture.inquiry_id)
+        .await?
+        .unwrap();
+    assert_eq!(pending.status, InquiryStatus::Pending);
+    assert_eq!(pending.responded_by, None);
+    let valid = attune_api::inquiry_response::submit_inquiry_response(
+        &ctx.state,
+        callback_submission(&fixture),
+    )
+    .await?;
+    assert_eq!(valid.responded_by, Some(fixture.mapped_identity_id));
+    assert_eq!(valid.response, Some(json!({"approved":true})));
+    Ok(())
+}
+
+#[tokio::test]
 async fn callback_response_resolves_actor_and_uses_bound_option() -> TResult<()> {
     let ctx = TestContext::new().await?;
     let fixture = setup_callback_response_fixture(&ctx, "success").await?;

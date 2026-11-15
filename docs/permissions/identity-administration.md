@@ -12,6 +12,13 @@ or minting a token can impersonate the target with its effective permissions.
 The platform `core.admin` catalog includes it. Custom administrators must add it
 explicitly; profile editors must not receive it. Role and permission assignments
 and external identity mappings retain their separate `permissions:manage` gate.
+Mapping creation and deletion require that gate on the integration and mapped
+identity; rebinding requires it on both the old and new mapped identities too.
+Mapping mutation scope resolves persisted identity logins (`refs`) and ownership
+(`owner: self`), and the supplied credential must cover every affected target.
+Read/list continue to require `identities:read` on the integration. A profile
+editor cannot bind an external subject to an inquiry assignee; a legitimately
+admitted callback integration still resolves administrator-configured mappings.
 
 PUT requests require authority for every supplied non-null field. Mixed profile
 and sensitive updates require both capabilities, checked before any write. Send
