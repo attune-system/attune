@@ -1437,7 +1437,7 @@ async fn profile_editor_cannot_forge_callback_assignee_mapping() -> TResult<()> 
             pack_release_digest: workload.pack_release_digest.as_deref().unwrap(),
             adapter_ref: CALLBACK_ADAPTER_REF,
             provider_delivery_id: "mapping-attacker",
-            request_digest: "sha256:mapping-attacker",
+            request_digest: &format!("sha256:{}", "a".repeat(64)),
             encrypted_payload: &encrypted_payload,
         },
     )
