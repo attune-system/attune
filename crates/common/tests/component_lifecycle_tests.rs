@@ -483,7 +483,7 @@ async fn core_action_reduction_retires_only_omitted_actions_and_keeps_release_by
         &manifest,
         std::fs::read_to_string(&manifest)
             .unwrap()
-            .replace("1.0.7", "1.0.6"),
+            .replace("1.0.8", "1.0.6"),
     )
     .unwrap();
     let storage = PackStorage::new(owned.path().join("releases"));

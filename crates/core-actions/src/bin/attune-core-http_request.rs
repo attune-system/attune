@@ -1,3 +1,6 @@
+#[path = "http_request/destination.rs"]
+mod destination;
+
 use reqwest::{blocking::Client, header, redirect, Method, Url};
 use serde_json::{json, Map, Value};
 use std::io::{self, Read, Write};
@@ -30,6 +33,19 @@ fn safe_url(url: &Url) -> bool {
 }
 
 fn request(p: &Map<String, Value>) -> Result<Value, &'static str> {
+    request_with_resolver(
+        p,
+        std::sync::Arc::new(destination::PublicResolver),
+        #[cfg(test)]
+        false,
+    )
+}
+
+fn request_with_resolver<R: reqwest::dns::Resolve + 'static>(
+    p: &Map<String, Value>,
+    resolver: std::sync::Arc<R>,
+    #[cfg(test)] test_transport: bool,
+) -> Result<Value, &'static str> {
     let raw = string(p, "url", "")?;
     if raw.chars().any(|c| c.is_control() || c == ' ') {
         return Err("URL contains unencoded whitespace or control characters");
@@ -76,6 +92,8 @@ fn request(p: &Map<String, Value>) -> Result<Value, &'static str> {
         }
     }
     let client = Client::builder()
+        .no_proxy()
+        .dns_resolver(resolver)
         .timeout(Duration::from_secs(timeout))
         .connect_timeout(Duration::from_secs(timeout.min(10)))
         .danger_accept_invalid_certs(!boolean(p, "verify_ssl", true)?)
@@ -124,6 +142,25 @@ fn request(p: &Map<String, Value>) -> Result<Value, &'static str> {
     let mut request = request.build().map_err(|_| "invalid HTTP request")?;
     let mut redirects = 0;
     let response = loop {
+        // IP literals bypass reqwest's DNS resolver, so admit them here on every
+        // hop. Only unit-test loopback transport can substitute this check.
+        #[cfg(test)]
+        let check_destination = !test_transport;
+        #[cfg(not(test))]
+        let check_destination = true;
+        #[cfg(test)]
+        let fixture_literal = test_transport
+            && request.url().host_str().is_some_and(|host| {
+                host.trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+            });
+        #[cfg(not(test))]
+        let fixture_literal = false;
+        if !fixture_literal {
+            destination::check_literal(request.url())?;
+        }
         let remaining = Duration::from_secs(timeout)
             .checked_sub(start.elapsed())
             .ok_or("HTTP request timed out")?;
@@ -137,6 +174,13 @@ fn request(p: &Map<String, Value>) -> Result<Value, &'static str> {
                     "HTTP request failed"
                 }
             })?;
+        if check_destination
+            && !response
+                .remote_addr()
+                .is_some_and(|addr| destination::public_address(addr.ip()))
+        {
+            return Err("HTTP destination is not public");
+        }
         let status = response.status().as_u16();
         if !follow || !matches!(status, 301 | 302 | 303 | 307 | 308) {
             break response;
@@ -217,6 +261,10 @@ fn request(p: &Map<String, Value>) -> Result<Value, &'static str> {
 
 fn main() {
     let result = core_actions::read_parameters().and_then(|parameters| request(&parameters));
+    emit_result(result);
+}
+
+fn emit_result(result: Result<Value, &'static str>) {
     let value = match result {
         Ok(value) => value,
         Err(error) => json!({"status_code":0,"headers":{},"body":"","json":null,
@@ -232,5 +280,247 @@ fn main() {
     }
     if !success {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+
+    struct MockResolver {
+        answers: Mutex<Vec<Vec<SocketAddr>>>,
+        check: bool,
+    }
+    impl Resolve for MockResolver {
+        fn resolve(&self, _: Name) -> Resolving {
+            let addresses = self.answers.lock().unwrap().remove(0);
+            let check = self.check;
+            Box::pin(async move {
+                if check {
+                    Ok(destination::checked_addresses(addresses)?)
+                } else {
+                    Ok(Box::new(addresses.into_iter()) as Addrs)
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn address_policy_and_normalized_literals() {
+        for ip in [
+            "0.0.0.0",
+            "10.0.0.1",
+            "100.64.0.1",
+            "100.127.255.255",
+            "127.0.0.1",
+            "169.254.169.254",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "192.0.0.8",
+            "192.0.2.1",
+            "192.88.99.1",
+            "198.18.0.1",
+            "198.19.0.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "168.63.129.16",
+            "::",
+            "::1",
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+            "::127.0.0.1",
+            "fe80::1",
+            "fc00::1",
+            "fd00:ec2::254",
+            "ff02::1",
+            "64:ff9b::7f00:1",
+            "2002:7f00:1::",
+            "2001::1",
+            "2001:db8::1",
+            "3fff::1",
+        ] {
+            assert!(!destination::public_address(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "100.128.0.1",
+            "172.32.0.1",
+            "192.169.0.1",
+            "2606:4700:4700::1111",
+            "2001:4860:4860::8888",
+            "::ffff:8.8.8.8",
+        ] {
+            assert!(destination::public_address(ip.parse().unwrap()), "{ip}");
+        }
+        for host in [
+            "127.1",
+            "2130706433",
+            "0x7f000001",
+            "0177.0.0.1",
+            "[::ffff:7f00:1]",
+        ] {
+            assert!(
+                destination::check_literal(&Url::parse(&format!("http://{host}/")).unwrap())
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn checked_dns_answers_are_the_exact_connector_addresses() {
+        let public = vec![
+            "8.8.8.8:0".parse().unwrap(),
+            "[2606:4700::1111]:0".parse().unwrap(),
+        ];
+        assert_eq!(
+            destination::checked_addresses(public.clone())
+                .unwrap()
+                .collect::<Vec<_>>(),
+            public
+        );
+        for bad in [
+            "127.0.0.1:0",
+            "10.1.2.3:0",
+            "169.254.169.254:0",
+            "[::ffff:127.0.0.1]:0",
+            "[fd00::1]:0",
+        ] {
+            assert!(destination::checked_addresses(vec![public[0], bad.parse().unwrap()]).is_err());
+        }
+        assert!(destination::checked_addresses(vec![]).is_err());
+    }
+
+    #[test]
+    fn dns_denial_has_no_connection_or_credential_effect() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let resolver = Arc::new(MockResolver {
+            answers: Mutex::new(vec![vec![addr]]),
+            check: true,
+        });
+        let p = json!({"url":format!("http://public-name.invalid:{}/", addr.port()),
+            "auth_type":"bearer","auth_token":"never-send-this", "timeout":1});
+        let error = request_with_resolver(p.as_object().unwrap(), resolver, false).unwrap_err();
+        assert!(!error.contains("never-send-this"));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn redirect_dns_rebinding_cannot_reconnect_to_private_answer() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(e) => panic!("owned listener failed: {e}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buffer = [0; 4096];
+            assert!(stream.read(&mut buffer).unwrap() > 0);
+            stream.write_all(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            // Return the listener to assert no second connection after denial.
+            listener
+        });
+        struct RebindingResolver {
+            resolutions: std::sync::atomic::AtomicUsize,
+            fixture: SocketAddr,
+        }
+        impl Resolve for RebindingResolver {
+            fn resolve(&self, _: Name) -> Resolving {
+                let first = self
+                    .resolutions
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    == 0;
+                let fixture = self.fixture;
+                Box::pin(async move {
+                    if first {
+                        // Simulate the first admitted public hop using owned local
+                        // transport. Subsequent answers use the production guard.
+                        Ok(Box::new(vec![fixture].into_iter()) as Addrs)
+                    } else {
+                        Ok(destination::checked_addresses(vec![fixture])?)
+                    }
+                })
+            }
+        }
+        let resolver = Arc::new(RebindingResolver {
+            resolutions: std::sync::atomic::AtomicUsize::new(0),
+            fixture: addr,
+        });
+        let p = json!({"url":format!("http://rebind.invalid:{}/start",addr.port()),"timeout":2});
+        let result = request_with_resolver(p.as_object().unwrap(), resolver.clone(), true);
+        let listener = server.join().unwrap();
+        assert!(result.is_err());
+        assert_eq!(
+            resolver
+                .resolutions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    // Invoked only as a subprocess by the Python mock suite. This branch and
+    // its loopback resolver do not exist in any production/release binary.
+    #[test]
+    fn mock_transport_entrypoint() {
+        if std::env::var("ATTUNE_CORE_HTTP_TEST_HARNESS").as_deref() != Ok("1") {
+            return;
+        }
+        struct LoopbackResolver;
+        impl Resolve for LoopbackResolver {
+            fn resolve(&self, _: Name) -> Resolving {
+                Box::pin(async {
+                    Ok(
+                        Box::new(vec!["127.0.0.1:0".parse::<SocketAddr>().unwrap()].into_iter())
+                            as Addrs,
+                    )
+                })
+            }
+        }
+        emit_result(
+            core_actions::read_parameters()
+                .and_then(|p| request_with_resolver(&p, Arc::new(LoopbackResolver), true)),
+        );
+    }
+
+    #[test]
+    fn existing_http_semantics_with_test_only_local_transport() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/test_native_http_action.py");
+        assert!(std::process::Command::new("python3")
+            .arg(script)
+            .env("ATTUNE_CORE_HTTP_BINARY", std::env::current_exe().unwrap())
+            .env("ATTUNE_CORE_HTTP_TEST_HARNESS", "1")
+            .status()
+            .unwrap()
+            .success());
     }
 }

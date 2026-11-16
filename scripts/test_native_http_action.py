@@ -15,6 +15,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 class NativeHttpTests(unittest.TestCase):
+    harness = os.environ.get("ATTUNE_CORE_HTTP_TEST_HARNESS") == "1"
+
+    @classmethod
+    def command(cls):
+        if cls.harness:
+            return [str(cls.binary), "--exact", "tests::mock_transport_entrypoint", "--nocapture"]
+        return [str(cls.binary)]
+
+    def decode(self, data):
+        if self.harness:
+            return json.loads(next(line[line.index(b'{'):] for line in data.splitlines() if b'{' in line))
+        return json.loads(data)
+
     @classmethod
     def setUpClass(cls):
         cls.binary = Path(os.environ["ATTUNE_CORE_HTTP_BINARY"]).resolve(strict=True)
@@ -101,14 +114,31 @@ class NativeHttpTests(unittest.TestCase):
         return f"{'https' if tls else 'http'}://127.0.0.1:{server.server_port}"
 
     def invoke(self, parameters, *, success=True):
-        result = subprocess.run([str(self.binary)], input=json.dumps(parameters).encode(),
-                                env={"PATH": "/no-tools-or-interpreters"}, capture_output=True, timeout=8)
+        result = subprocess.run(self.command(), input=json.dumps(parameters).encode(),
+                                env={"PATH": "/no-tools-or-interpreters", "ATTUNE_CORE_HTTP_TEST_HARNESS": "1" if self.harness else "0"}, capture_output=True, timeout=8)
         self.assertEqual(result.returncode, 0 if success else 1, result.stdout.decode())
         self.assertEqual(result.stderr, b"")
-        output = json.loads(result.stdout)
+        output = self.decode(result.stdout)
         self.assertEqual(output["success"], success)
         return output
 
+    @unittest.skipIf(harness, "production destination rejection suite")
+    def test_nonpublic_destinations_cannot_reach_owned_listener(self):
+        base = self.server()
+        port = base.rsplit(":", 1)[1]
+        for host in ("127.0.0.1", "127.1", "2130706433", "0x7f000001", "0177.0.0.1",
+                     "localhost", "[::1]", "[::ffff:127.0.0.1]", "0.0.0.0",
+                     "10.0.0.1", "172.16.0.1", "192.168.0.1", "169.254.169.254",
+                     "100.100.100.200", "168.63.129.16", "[fd00:ec2::254]"):
+            output = self.invoke({"url": f"http://{host}:{port}/secret", "timeout": 1,
+                                  "auth_type": "bearer", "auth_token": "private-token",
+                                  "destination_policy": "allow-all"}, success=False)
+            self.assertEqual(output["status_code"], 0)
+            self.assertNotIn("private-token", output["error"])
+            self.assertEqual(output["body"], "")
+        self.assertEqual(self.requests, [])
+
+    @unittest.skipUnless(harness, "positive transport is exercised through the Rust test-only loopback harness")
     def test_binary_body_quotes_unicode_newlines_and_query_round_trip(self):
         base = self.server()
         body = "雪 '\" \\ \nurl=--help\n\0\n\n"
@@ -141,11 +171,13 @@ class NativeHttpTests(unittest.TestCase):
             self.assertNotIn("secret", output["error"])
         self.assertEqual(self.requests, [])
 
+    @unittest.skipUnless(harness, "positive transport is exercised through the Rust test-only loopback harness")
     def test_http_error_preserves_response_and_is_not_success(self):
         output = self.invoke({"url": self.server() + "/failure"}, success=False)
         self.assertEqual(output["status_code"], 418)
         self.assertEqual(output["json"]["path"], "/failure")
 
+    @unittest.skipUnless(harness, "positive transport is exercised through the Rust test-only loopback harness")
     def test_authentication_and_cross_origin_redirects(self):
         target = self.server()
         first = self.server(redirect=(307, target + "/final"))
@@ -159,6 +191,7 @@ class NativeHttpTests(unittest.TestCase):
         basic = self.invoke({"url": target, "auth_type": "basic", "auth_username": "name", "auth_password": "p:a'ss"})
         self.assertEqual(basic["json"]["headers"]["authorization"], "Basic " + base64.b64encode(b"name:p:a'ss").decode())
 
+    @unittest.skipUnless(harness, "positive transport is exercised through the Rust test-only loopback harness")
     def test_redirect_method_limits_and_protocols(self):
         target = self.server()
         first = self.server(redirect=(303, target))
@@ -172,6 +205,7 @@ class NativeHttpTests(unittest.TestCase):
         self.invoke({"url": evil}, success=False)
         self.assertFalse(any(r["path"].startswith("file:") for r in self.requests))
 
+    @unittest.skipUnless(harness, "positive transport is exercised through the Rust test-only loopback harness")
     def test_tls_verification_defaults_secure_and_redirect_cannot_switch_protocol(self):
         target = self.server(tls=True)
         self.invoke({"url": target}, success=False)
@@ -185,6 +219,7 @@ class NativeHttpTests(unittest.TestCase):
         output = self.invoke({"url": downgrade, "verify_ssl": False, "auth_type": "bearer", "auth_token": "private"})
         self.assertNotIn("authorization", output["json"]["headers"])
 
+    @unittest.skipUnless(harness, "positive transport is exercised through the Rust test-only loopback harness")
     def test_redirect_origin_credentials_and_later_hop_validation(self):
         credentials = {"Authorization": "Bearer private", "Cookie": "session=private",
                        "Proxy-Authorization": "Basic private"}
@@ -204,13 +239,16 @@ class NativeHttpTests(unittest.TestCase):
         output = self.invoke({"url": scheme + "/start", "verify_ssl": False, "headers": credentials})
         for name in credentials:
             self.assertNotIn(name.lower(), output["json"]["headers"])
-        for unsafe in ("file:///etc/passwd", "http://user:private@127.0.0.1/"):
+        for unsafe in ("file:///etc/passwd", "http://user:private@127.0.0.1/",
+                       "http://10.0.0.1/", "http://169.254.169.254/", "http://[fd00:ec2::254]/",
+                       "http://[::ffff:169.254.169.254]/", "http://168.63.129.16/"):
             later = self.server(redirect=(307, unsafe))
             first = self.server(redirect=(307, later))
             output = self.invoke({"url": first}, success=False)
             self.assertEqual(output["status_code"], 0)
             self.assertNotIn("private", output["error"])
 
+    @unittest.skipUnless(harness, "positive transport is exercised through the Rust test-only loopback harness")
     def test_response_size_types_and_complete_request_deadline(self):
         for data, expected in ((b'[1,"two"]', [1, "two"]), (b'42', None), (b'plain', None)):
             output = self.invoke({"url": self.server(payload=data)})
@@ -233,13 +271,14 @@ class NativeHttpTests(unittest.TestCase):
     def test_malformed_and_physical_line_stdin_rejected(self):
         base = self.server()
         for raw in (b'url="' + base.encode() + b'"\nmethod=POST\n', b'{"url":', b'[]', b'{"url":"' + base.encode() + b'"}\n{"method":"POST"}'):
-            result = subprocess.run([str(self.binary)], input=raw,
-                                    env={"PATH": "/no-tools-or-interpreters"}, capture_output=True, timeout=8)
+            result = subprocess.run(self.command(), input=raw,
+                                    env={"PATH": "/no-tools-or-interpreters", "ATTUNE_CORE_HTTP_TEST_HARNESS": "1" if self.harness else "0"}, capture_output=True, timeout=8)
             self.assertEqual(result.returncode, 1)
             self.assertEqual(result.stderr, b"")
-            self.assertFalse(json.loads(result.stdout)["success"])
+            self.assertFalse(self.decode(result.stdout)["success"])
         self.assertEqual(self.requests, [])
 
+    @unittest.skipUnless(harness, "positive transport is exercised through the Rust test-only loopback harness")
     def test_timeout_is_bounded(self):
         base = self.server(delay=2)
         output = self.invoke({"url": base, "timeout": 1}, success=False)

@@ -1,6 +1,6 @@
 # Attune core pack
 
-Core 1.0.7 ships four actions: `core.echo`, `core.sleep`, `core.noop`, and `core.http_request`.
+The core 1.0.8 source candidate ships four actions: `core.echo`, `core.sleep`, `core.noop`, and `core.http_request`.
 They are standalone static native binaries. No Python, shell, curl, or other
 interpreter/tool is required to execute them. Parameters remain a flat JSON
 object on stdin; the text actions keep text output and HTTP emits structured JSON.
@@ -21,8 +21,20 @@ object on stdin; the text actions keep text output and HTTP emits structured JSO
   Standard Authorization/Cookie/Proxy-Authorization headers are removed across
   origins (scheme/host/port). Other headers and replayed bodies remain application
   data; disable redirects when those data must not reach a redirected destination.
-  This is an intentionally general HTTP client, not a destination allowlist or
-  worker network sandbox. Only HTTP(S) is permitted initially and on every hop.
+  Destinations must be public HTTP(S), initially and on every redirect. Literal
+  addresses and all DNS answers are checked; mixed public/private answers fail
+  closed. The connector uses those checked answers, avoiding a second DNS lookup.
+  Loopback, private, link-local, shared-address, multicast, reserved/documentation
+  ranges and platform metadata addresses (including Azure's 168.63.129.16) are
+  denied. IPv4-mapped IPv6 follows the IPv4 policy; IPv6 must be global unicast
+  outside special-purpose, documentation and 6to4 ranges. Proxies are disabled
+  regardless of environment settings so they cannot resolve/connect around policy.
+  There is no action parameter, environment flag or runtime configuration bypass.
+  Internal automation formerly supported by this general client must use a
+  separately reviewed operator-controlled action/network policy; this action
+  currently provides no internal-destination exception. This changes destination
+  behavior; the flat v1 stdin/response format is unchanged. It is not a network
+  sandbox for other pack code or a defense against a public server proxying requests.
   Non-2xx responses retain status/body and exit1; configuration/transport failures
   return status0 and generic errors without embedding input credential values.
 
@@ -55,7 +67,8 @@ Binaries are built using `docker/Dockerfile.pack-binaries` / cargo-zigbuild, as 
 the timer sensor. Source checkout alone is not an executable pack: build artifacts
 must be assembled before publication; there is no interpreter/source fallback.
 
-Core 1.0.7 has a new immutable version/digest binding. Normal bootstrap explicitly
+Core 1.0.7 is already published with an immutable version/digest binding.
+The changed HTTP destination contract targets a new core 1.0.8 binding. Normal bootstrap explicitly
 requests the existing **pack-wide** `absent_metadata_policy=remove`. Complete retained
 nonaction definitions remain in the candidate; omitted actions and the installer's
 owned workflow definition retire. Omitted actions cannot
@@ -65,7 +78,9 @@ release trees, or republish changed bytes under an existing stable version.
 
 See [testing](TESTING.md) and [deployment setup](SETUP.md).
 
-The restored native HTTP implementation changes this candidate's bytes. Version
-1.0.7 remains provisional until release coordination verifies that it has not
-already been published immutably; discovery of an existing digest requires a
-coordinated pack/chart version bump, never replacement of that artifact.
+Core 1.0.8 deliberately restricts the formerly general HTTP client to public
+HTTP(S) destinations. Existing RFC1918, loopback and link-local automation calls
+are unsupported by the new action. Retained 1.0.7 releases and execution pins
+keep their original bytes and behavior. Version 1.0.8 is a source release target;
+no tag, archive, image, chart update or publication is implied by this change.
+Deploy only after coordinated release validation and publication.
