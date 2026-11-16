@@ -2,7 +2,10 @@
 use super::*;
 use attune_common::{
     models::{Inquiry, InquiryResponseOption, InquiryResponseOptionStyle},
-    repositories::inquiry::{CreateInquiryInput, InquiryRepository},
+    repositories::{
+        inquiry::{CreateInquiryInput, InquiryRepository},
+        FindById,
+    },
 };
 
 async fn inquiry(fixture: &Fixture, parent: Option<Id>) -> Result<Inquiry> {
