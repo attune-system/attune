@@ -1359,7 +1359,7 @@ async fn standard_execution_access_covers_action_and_pack_scoped_resources() -> 
         protected_body["data"]["value"],
         json!({"token": "owned-standard-secret"})
     );
-    assert_eq!(protected_body["data"]["decrypted"], true);
+    assert_eq!(protected_body["data"]["encrypted"], true);
     // Invoking authority is not a direct human Key grant, even to the owner
     // whose active identity sponsors this action's standard credential.
     let access = attune_common::auth::jwt::generate_token(
@@ -1606,6 +1606,41 @@ async fn workflow_task_standard_access_includes_workflow_action_scope() -> TResu
         Some(workflow_execution.id),
     )
     .await?;
+    // A task marker cannot attach another workflow's standard scope to an
+    // otherwise correctly selected parent and executable snapshot.
+    let mut forged_task = child.workflow_task.clone().unwrap();
+    forged_task.workflow_execution = -1;
+    let forged = ExecutionRepository::create_pinned(
+        &mut *tx,
+        CreateExecutionInput {
+            action: Some(sql_action.id),
+            action_ref: sql_action.r#ref.clone(),
+            executor: Some(identity.id),
+            parent: Some(workflow_execution.id),
+            permission_set_refs: vec![STANDARD_EXECUTION_ACCESS_REF.into()],
+            workflow_task: Some(forged_task),
+            ..Default::default()
+        },
+        &snapshot,
+    )
+    .await?;
+    SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, forged.id, &binding).await?;
+    assert!(
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::select(
+            &mut tx,
+            forged.id,
+            Some(workflow_execution.id)
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::find(
+            &mut tx, forged.id
+        )
+        .await
+        .is_err()
+    );
     start_delegated_fixture(&mut tx, child.id).await?;
     tx.commit().await?;
     let token = standard_execution_token(
