@@ -298,7 +298,37 @@ Queue batches need one attributed requester to obtain execution API access or re
 Execution-token enqueue preserves its requesting identity.
 Missing ownership never implies identity `1` or another privileged actor.
 
+### Reserved standard invocation authority
+
 The reserved `standard` ref retains its scoped key and artifact contract.
+It is an invocation capability: an authorized caller can invoke a trusted action
+that reads its own action/pack Keys without personally possessing those Key
+grants. It does not grant that caller direct plaintext access. Action publication
+and configuration are therefore trust boundaries: code receiving a secret can
+send it elsewhere, and `standard` does not promise to sandbox that code's output.
+Named-ref delegation comparisons intentionally omit this reserved capability;
+they are not proof of target authorization. Invocation still requires Execute
+and the execution producer's target, input and credential-ceiling checks.
+
+For delegated credentials, the API resolves standard scope from the persisted
+execution action and, for workflow tasks, the immediate containing workflow.
+Both signed action and pack scope arrays must match that scope. A mismatched
+workflow parent or an expanded signed selector fails closed before consumer
+effects. A valid signature alone cannot expand this context. Children cannot
+select `standard` when their source did not select it. Recorded credentials use
+their separately admitted target-aware consumers and never inherit this generic
+metadata path. Missing retained containing-workflow or parent records invalidate
+the delegated credential rather than falling back to its signed selectors.
+Retries retain their original containing parent and task metadata; nested
+workflows add only the immediate containing workflow, as the worker token
+producer does. Freezing the attributable delegated owner or closing/replacing
+the attempt invalidates the credential independently of standard scope.
+
+Within that scope, Keys allow Read/Decrypt, artifacts allow Read/Create/Update/
+Delete subject to their additional content policies, and caches allow Read only.
+System, identity, unrelated pack/action and other owner types remain outside the
+capability. A workflow child receives its own action/pack and the containing
+workflow action/pack; it does not receive every ancestor or sibling action.
 It does not grant shared system-key access.
 Sensor standard cache access remains read-only within the sensor and its pack.
 Named sensor cache grants are admitted under trusted pack deployment and

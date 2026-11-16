@@ -1233,6 +1233,69 @@ async fn standard_execution_access_covers_action_and_pack_scoped_resources() -> 
     create_artifact_for_action(&ctx.pool, &action, &action_artifact_ref).await?;
     create_artifact_for_pack(&ctx.pool, &unrelated_pack, &unrelated_artifact_ref).await?;
 
+    let protected = KeyRepository::create_encrypted_in_pool(
+        &ctx.pool,
+        CreateKeyInput {
+            local_ref: "protected".into(),
+            owner_type: OwnerType::Pack,
+            owner_pack: Some(salesforce_pack.id),
+            owner_pack_ref: Some(salesforce_pack.r#ref.clone()),
+            owner_identity: None,
+            owner_action: None,
+            owner_action_ref: None,
+            owner_sensor: None,
+            owner_sensor_ref: None,
+            name: "Protected fixture".into(),
+            encrypted: true,
+            encryption_key_hash: None,
+            value: json!({"token": "owned-standard-secret"}),
+        },
+        ctx.state.config.security.encryption_key.as_deref().unwrap(),
+    )
+    .await?;
+    let mut hidden_keys = Vec::new();
+    for (owner_type, owner_identity) in [
+        (OwnerType::System, None),
+        (OwnerType::Identity, Some(identity.id)),
+    ] {
+        hidden_keys.push(
+            KeyRepository::create(
+                &ctx.pool,
+                CreateKeyInput {
+                    local_ref: format!("hidden_{suffix}"),
+                    owner_type,
+                    owner_identity,
+                    owner_pack: None,
+                    owner_pack_ref: None,
+                    owner_action: None,
+                    owner_action_ref: None,
+                    owner_sensor: None,
+                    owner_sensor_ref: None,
+                    name: "Hidden fixture".into(),
+                    encrypted: false,
+                    encryption_key_hash: None,
+                    value: json!("hidden-standard-secret"),
+                },
+            )
+            .await?,
+        );
+    }
+    use attune_common::repositories::cache::{
+        CacheNamespacePolicy, CacheNamespaceRepository, CacheOwnerScope, CreateCacheNamespaceInput,
+    };
+    for pack in [&salesforce_pack, &unrelated_pack] {
+        CacheNamespaceRepository::create(
+            &ctx.pool,
+            CreateCacheNamespaceInput {
+                owner: CacheOwnerScope::pack(pack.id, Some(pack.r#ref.clone())),
+                namespace: "standard_data".into(),
+                policy: CacheNamespacePolicy::default(),
+                mode: Default::default(),
+            },
+        )
+        .await?;
+    }
+
     let execution = create_parent_execution(&ctx.pool, &action, &identity).await?;
     let token = standard_execution_token(
         &ctx.pool,
@@ -1290,6 +1353,122 @@ async fn standard_execution_access_covers_action_and_pack_scoped_resources() -> 
         StatusCode::NOT_FOUND
     );
 
+    let protected_path = format!("/api/v1/keys/{}", protected.r#ref);
+    let protected_body: Value = ctx.get(&protected_path, Some(&token)).await?.json().await?;
+    assert_eq!(
+        protected_body["data"]["value"],
+        json!({"token": "owned-standard-secret"})
+    );
+    assert_eq!(protected_body["data"]["encrypted"], true);
+    // Invoking authority is not a direct human Key grant, even to the owner
+    // whose active identity sponsors this action's standard credential.
+    let access = attune_common::auth::jwt::generate_token(
+        identity.id,
+        &identity.login,
+        &jwt_config(),
+        attune_common::auth::jwt::TokenType::Access,
+    )?;
+    assert_eq!(
+        ctx.get(&protected_path, Some(&access)).await?.status(),
+        StatusCode::NOT_FOUND
+    );
+    for hidden in hidden_keys {
+        let response = ctx
+            .get(&format!("/api/v1/keys/{}", hidden.r#ref), Some(&token))
+            .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: Value = response.json().await?;
+        assert!(!body.to_string().contains("hidden-standard-secret"));
+    }
+    for (pack, expected) in [
+        (&salesforce_pack, StatusCode::OK),
+        // Cache metadata uses explicit 403 denial (show_namespace contract),
+        // independently of Key/artifact existence-concealing 404 responses.
+        (&unrelated_pack, StatusCode::FORBIDDEN),
+    ] {
+        let path = format!(
+            "/api/v1/cache/namespaces/standard_data?owner_type=pack&owner_ref={}",
+            pack.r#ref
+        );
+        let response = ctx.get(&path, Some(&token)).await?;
+        assert_eq!(response.status(), expected);
+        let body: Value = response.json().await?;
+        if expected == StatusCode::OK {
+            assert_eq!(body["data"]["namespace"], "standard_data");
+        } else {
+            assert!(body.get("data").is_none());
+            assert!(!body.to_string().contains("standard_data"));
+        }
+    }
+    let write = ctx.post("/api/v1/cache/namespaces", json!({
+        "owner_type": "pack", "owner_ref": salesforce_pack.r#ref, "namespace": "forbidden_write"
+    }), Some(&token)).await?;
+    assert_eq!(write.status(), StatusCode::FORBIDDEN);
+    assert!(CacheNamespaceRepository::resolve(
+        &ctx.pool,
+        &CacheOwnerScope::pack(salesforce_pack.id, Some(salesforce_pack.r#ref.clone())),
+        "forbidden_write"
+    )
+    .await?
+    .is_none());
+
+    // Signed metadata is still bounded by the persisted execution. This models
+    // an overbroad credential producer, not an unauthenticated JWT forgery.
+    let expanded = standard_execution_token(
+        &ctx.pool,
+        &identity,
+        &execution,
+        &action.r#ref,
+        &[action.r#ref.clone(), unrelated_action.r#ref.clone()],
+    )
+    .await?;
+    for path in [
+        format!("/api/v1/keys/{unrelated_key_ref}"),
+        format!("/api/v1/artifacts/ref/{unrelated_artifact_ref}"),
+    ] {
+        assert_eq!(
+            ctx.get(&path, Some(&expanded)).await?.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let forged_ref = format!("{}.forged_scope", unrelated_action.r#ref);
+    assert_eq!(
+        ctx.post(
+            "/api/v1/artifacts",
+            json!({
+                "ref": forged_ref, "scope": "action", "owner": unrelated_action.r#ref,
+                "type": "progress", "visibility": "private", "data": []
+            }),
+            Some(&expanded)
+        )
+        .await?
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(ArtifactRepository::find_by_ref(&ctx.pool, &forged_ref)
+        .await?
+        .is_none());
+
+    // The signature, attempt, action and selected refs remain valid; only the
+    // independent pack selector is expanded. It must not authorize anything.
+    let mut claims = attune_common::auth::jwt::validate_token(&token, &jwt_config())?;
+    claims.metadata.as_mut().unwrap()["standard_access_pack_refs"] =
+        json!([salesforce_pack.r#ref, unrelated_pack.r#ref]);
+    let expanded_pack = jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+    )?;
+    assert_eq!(
+        ctx.get(
+            &format!("/api/v1/keys/{unrelated_key_ref}"),
+            Some(&expanded_pack)
+        )
+        .await?
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
     let create_allowed = ctx
         .post(
             "/api/v1/artifacts",
@@ -1323,6 +1502,20 @@ async fn standard_execution_access_covers_action_and_pack_scoped_resources() -> 
         )
         .await?;
     assert_eq!(create_denied.status(), StatusCode::FORBIDDEN);
+    IdentityRepository::update(
+        &ctx.pool,
+        identity.id,
+        attune_common::repositories::identity::UpdateIdentityInput {
+            frozen: Some(true),
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert_eq!(
+        ctx.get(&protected_path, Some(&token)).await?.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -1430,6 +1623,59 @@ async fn workflow_task_standard_access_includes_workflow_action_scope() -> TResu
         Some(workflow_execution.id),
     )
     .await?;
+    // A task marker cannot attach another workflow's standard scope to an
+    // otherwise correctly selected parent and executable snapshot.
+    let mut forged_task = child.workflow_task.clone().unwrap();
+    let other_workflow = WorkflowExecutionRepository::create(
+        &mut *tx,
+        CreateWorkflowExecutionInput {
+            execution: child.id,
+            workflow_def: workflow_action.workflow_def.unwrap(),
+            task_graph: json!({}),
+            variables: json!({}),
+            status: ExecutionStatus::Running,
+        },
+    )
+    .await?;
+    forged_task.workflow_execution = other_workflow.id;
+    let forged = ExecutionRepository::create_pinned(
+        &mut *tx,
+        CreateExecutionInput {
+            action: Some(sql_action.id),
+            action_ref: sql_action.r#ref.clone(),
+            executor: Some(identity.id),
+            parent: Some(workflow_execution.id),
+            permission_set_refs: vec![STANDARD_EXECUTION_ACCESS_REF.into()],
+            workflow_task: Some(forged_task),
+            ..Default::default()
+        },
+        &snapshot,
+    )
+    .await?;
+    SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, forged.id, &binding).await?;
+    assert!(
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::select(
+            &mut tx,
+            forged.id,
+            Some(workflow_execution.id)
+        )
+        .await
+        .is_err()
+    );
+    let unselected =
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::find(
+            &mut tx, forged.id,
+        )
+        .await?;
+    assert!(!unselected.explicit);
+    assert_eq!(unselected.mode, "recorded");
+    assert!(
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::validate(
+            &mut tx, forged.id
+        )
+        .await
+        .is_err()
+    );
     start_delegated_fixture(&mut tx, child.id).await?;
     tx.commit().await?;
     let token = standard_execution_token(
@@ -1440,6 +1686,24 @@ async fn workflow_task_standard_access_includes_workflow_action_scope() -> TResu
         &[sql_action.r#ref.clone(), workflow_action.r#ref.clone()],
     )
     .await?;
+
+    let missing_workflow_scope = standard_execution_token(
+        &ctx.pool,
+        &identity,
+        &child,
+        &sql_action.r#ref,
+        std::slice::from_ref(&sql_action.r#ref),
+    )
+    .await?;
+    assert_eq!(
+        ctx.get(
+            &format!("/api/v1/keys/{sql_action_key_ref}"),
+            Some(&missing_workflow_scope)
+        )
+        .await?
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
 
     for key_ref in [
         &workflow_pack_key_ref,
@@ -1519,5 +1783,85 @@ async fn workflow_task_standard_access_includes_workflow_action_scope() -> TResu
         )
         .await?;
     assert_eq!(unrelated_create.status(), StatusCode::FORBIDDEN);
+    // The retry producer preserves the containing parent and task metadata,
+    // while selecting a new worker attempt under the original child ceiling.
+    let mut retry_tx = ctx.pool.begin().await?;
+    ExecutionRepository::update(
+        &mut *retry_tx,
+        child.id,
+        attune_common::repositories::execution::UpdateExecutionInput {
+            status: Some(ExecutionStatus::Failed),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let retry = ExecutionRepository::create_retry(
+        &mut *retry_tx,
+        CreateExecutionInput {
+            action: child.action,
+            action_ref: child.action_ref.clone(),
+            executor: child.executor,
+            parent: child.parent,
+            permission_set_refs: child.permission_set_refs.clone(),
+            workflow_task: child.workflow_task.clone(),
+            ..Default::default()
+        },
+        &snapshot,
+        1,
+        Some(1),
+        None,
+        child.id,
+    )
+    .await?;
+    SchemaContractRepository::attach(&mut retry_tx, BindingOwner::Execution, retry.id, &binding)
+        .await?;
+    attune_common::repositories::delegated_execution::DelegatedExecutionRepository::select(
+        &mut retry_tx,
+        retry.id,
+        Some(child.id),
+    )
+    .await?;
+    start_delegated_fixture(&mut retry_tx, retry.id).await?;
+    retry_tx.commit().await?;
+    let retry_token = standard_execution_token(
+        &ctx.pool,
+        &identity,
+        &retry,
+        &sql_action.r#ref,
+        &[sql_action.r#ref.clone(), workflow_action.r#ref.clone()],
+    )
+    .await?;
+    for key_ref in [&workflow_pack_key_ref, &sql_action_key_ref] {
+        assert_eq!(
+            ctx.get(&format!("/api/v1/keys/{key_ref}"), Some(&retry_token))
+                .await?
+                .status(),
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        ctx.get(
+            &format!("/api/v1/keys/{unrelated_key_ref}"),
+            Some(&retry_token)
+        )
+        .await?
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // Independent retention can leave a dangling task marker. Losing proof of
+    // its containing scope invalidates the credential, including own-scope
+    // reads: signed selectors are never a fallback for missing lineage.
+    assert!(WorkflowExecutionRepository::delete(&ctx.pool, wf.id).await?);
+    assert_eq!(
+        ctx.get(
+            &format!("/api/v1/keys/{sql_action_key_ref}"),
+            Some(&retry_token)
+        )
+        .await?
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    ctx.cleanup().await?;
     Ok(())
 }

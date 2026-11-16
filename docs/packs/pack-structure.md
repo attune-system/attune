@@ -181,8 +181,9 @@ Action metadata files define the parameters, output schema, and execution detail
 - `enabled` (boolean): Whether action is enabled (default: true)
 - `parameters` (object): Parameter definitions (JSON Schema style)
 - `output_schema` (object): Output schema definition
-- `parameter_delivery` (string): How parameters are delivered - `env` (environment variables), `stdin` (standard input), or `file` (temporary file). Default: `env`. **Security Note**: Use `stdin` or `file` for actions with sensitive parameters.
-- `parameter_format` (string): Parameter serialization format - `dotenv` (KEY='VALUE'), `json` (JSON object), or `yaml` (YAML format). Default: `dotenv`
+- `parameter_delivery` (string): How parameters are delivered - `stdin` (standard input) or `file` (temporary file). Default: `stdin`.
+- `parameter_format` (string): Parameter serialization format - `dotenv` (KEY='VALUE'), `json` (JSON object), or `yaml` (YAML format). Default: `json`
+  Dotenv is an opt-in line-record transport: names (including nested object keys) must be nonempty and contain only ASCII letters, digits, `_`, `.`, or `-`. Nested objects flatten to dotted names; collisions are rejected. String leaves cannot contain control characters (including CR/LF) or Unicode line/paragraph separators. Arrays use compact JSON and must also serialize without physical controls or line separators. Invalid input fails before the action process starts, with diagnostics that omit names and values. Use the default stdin JSON for multiline text and typed data. Dotenv consumers must parse records as data, never evaluate them as shell code.
 - `tags` (array): Tags for categorization
 - `timeout` (integer): Default timeout in seconds
 - `log_retention_policy` (string): Optional per-action stdout/stderr artifact retention override (`versions`, `days`, `hours`, or `minutes`)

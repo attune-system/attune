@@ -66,51 +66,81 @@ pub fn format_parameters(
 fn flatten_parameters(
     params: &HashMap<String, JsonValue>,
     prefix: &str,
-) -> HashMap<String, String> {
+) -> Result<HashMap<String, String>, RuntimeError> {
     let mut flattened = HashMap::new();
 
     for (key, value) in params {
+        // Names are record syntax, not quoted values. Validate every segment,
+        // including names whose empty object would otherwise emit no record.
+        if key.is_empty()
+            || !key
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))
+        {
+            return Err(RuntimeError::InvalidAction(
+                "Dotenv parameter names must use only ASCII letters, digits, _, . or -".to_string(),
+            ));
+        }
         let full_key = if prefix.is_empty() {
             key.clone()
         } else {
             format!("{}.{}", prefix, key)
         };
 
-        match value {
+        let rendered = match value {
             JsonValue::Object(map) => {
-                // Recursively flatten nested objects
-                let nested_params: HashMap<String, JsonValue> =
-                    map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                let nested_flattened = flatten_parameters(&nested_params, &full_key);
-                flattened.extend(nested_flattened);
+                let nested_params = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                for (name, value) in flatten_parameters(&nested_params, &full_key)? {
+                    insert_dotenv_record(&mut flattened, name, value)?;
+                }
+                continue;
             }
-            JsonValue::Array(_) => {
-                // Arrays are serialized as JSON strings
-                flattened.insert(full_key, serde_json::to_string(value).unwrap_or_default());
-            }
-            JsonValue::String(s) => {
-                flattened.insert(full_key, s.clone());
-            }
-            JsonValue::Number(n) => {
-                flattened.insert(full_key, n.to_string());
-            }
-            JsonValue::Bool(b) => {
-                flattened.insert(full_key, b.to_string());
-            }
-            JsonValue::Null => {
-                flattened.insert(full_key, String::new());
-            }
-        }
+            // Compact JSON escapes control characters inside arrays. Validate
+            // the final record bytes below, rather than rejecting typed data
+            // that has a safe representation.
+            JsonValue::Array(_) => serde_json::to_string(value).map_err(|_| {
+                RuntimeError::InvalidAction("Cannot serialize dotenv parameter array".to_string())
+            })?,
+            JsonValue::String(s) => s.clone(),
+            JsonValue::Number(n) => n.to_string(),
+            JsonValue::Bool(b) => b.to_string(),
+            JsonValue::Null => String::new(),
+        };
+        insert_dotenv_record(&mut flattened, full_key, rendered)?;
     }
 
-    flattened
+    Ok(flattened)
+}
+
+fn insert_dotenv_record(
+    records: &mut HashMap<String, String>,
+    name: String,
+    value: String,
+) -> Result<(), RuntimeError> {
+    // Custom consumers do not share an escape decoder. Never emit physical
+    // record separators or controls, and never include names/values in errors.
+    if value
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+    {
+        return Err(RuntimeError::InvalidAction(
+            "Dotenv parameter values cannot contain control characters or line separators; use JSON"
+                .to_string(),
+        ));
+    }
+    if records.insert(name, value).is_some() {
+        return Err(RuntimeError::InvalidAction(
+            "Dotenv parameter names collide after dotted flattening; use JSON".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Format parameters as dotenv (key='value')
 /// Note: Parameter names are preserved as-is (case-sensitive)
 /// Nested objects are flattened with dot notation (e.g., headers.Content-Type)
 fn format_dotenv(parameters: &HashMap<String, JsonValue>) -> Result<String, RuntimeError> {
-    let flattened = flatten_parameters(parameters, "");
+    let flattened = flatten_parameters(parameters, "")?;
     let mut lines = Vec::new();
 
     for (key, value) in flattened {
@@ -488,6 +518,212 @@ mod tests {
         let result = format_dotenv(&params).unwrap();
 
         assert!(result.contains("message='It'\\''s a test'"));
+    }
+
+    fn unsafe_dotenv_parameters() -> Vec<HashMap<String, JsonValue>> {
+        let mut cases = Vec::new();
+        for control in [
+            '\n', '\r', '\0', '\t', '\u{7f}', '\u{85}', '\u{2028}', '\u{2029}',
+        ] {
+            let value = format!("private-sentinel{control}injected='private-sentinel'");
+            cases.push(HashMap::from([("message".to_string(), json!(value))]));
+            cases.push(HashMap::from([(
+                "outer".to_string(),
+                json!({"leaf": value}),
+            )]));
+        }
+        for name in [
+            "",
+            "private-sentinel\nextra",
+            "private-sentinel\rextra",
+            "x=y",
+            "x y",
+            "#x",
+            "x'",
+            "x\0",
+            "x\t",
+            "x;exit",
+            "x\\",
+        ] {
+            cases.push(HashMap::from([(
+                name.to_string(),
+                json!("private-sentinel"),
+            )]));
+            cases.push(HashMap::from([(
+                "outer".to_string(),
+                json!({name: "private-sentinel"}),
+            )]));
+            // An empty object must not hide an invalid segment.
+            cases.push(HashMap::from([(name.to_string(), json!({}))]));
+            // Nor may a non-string value hide an invalid record name.
+            for value in [
+                json!(7),
+                json!(true),
+                json!(null),
+                json!(["private-sentinel"]),
+            ] {
+                cases.push(HashMap::from([(name.to_string(), value)]));
+            }
+        }
+        cases.push(HashMap::from([
+            ("outer.leaf".to_string(), json!("private-sentinel")),
+            ("outer".to_string(), json!({"leaf": "private-sentinel"})),
+        ]));
+        // JSON escapes ASCII controls in arrays, but retains these separators.
+        cases.push(HashMap::from([(
+            "items".to_string(),
+            json!([{"leaf": "private-sentinel\u{2028}extra"}]),
+        )]));
+        cases
+    }
+
+    #[test]
+    fn dotenv_denials_are_value_free_and_do_not_mutate_delivery_environment() {
+        for parameters in unsafe_dotenv_parameters() {
+            for delivery in [ParameterDelivery::Stdin, ParameterDelivery::File] {
+                let original = HashMap::from([("EXPLICIT".to_string(), "unchanged".to_string())]);
+                let mut env = original.clone();
+                let error = prepare_parameters(
+                    &parameters,
+                    &mut env,
+                    ParameterDeliveryConfig {
+                        delivery,
+                        format: ParameterFormat::Dotenv,
+                    },
+                )
+                .unwrap_err();
+                assert!(matches!(error, RuntimeError::InvalidAction(_)));
+                assert!(!format!("{error:?} {error}").contains("private-sentinel"));
+                assert_eq!(env, original);
+            }
+        }
+    }
+
+    // Exercise the actual configurable interpreter, preparation and spawn path.
+    // The first instruction leaves an owned marker: a denial must prevent even
+    // that instruction, not merely prevent parsing the injected record.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dotenv_custom_runtime_rejects_injection_before_action_spawn() {
+        use crate::runtime::process::ProcessRuntime;
+        use crate::runtime::{ExecutionContext, OutputFormat, Runtime};
+        use attune_common::models::runtime::{InterpreterConfig, RuntimeExecutionConfig};
+
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("spawned");
+        let script = root.path().join("consumer.py");
+        std::fs::write(
+            &script,
+            r#"
+import json, os, pathlib, sys
+pathlib.Path(os.environ['SPAWN_MARKER']).write_text('spawned')
+if os.environ['ATTUNE_PARAMETER_DELIVERY'] == 'file':
+    payload = pathlib.Path(os.environ['ATTUNE_PARAMETER_FILE']).read_text()
+else:
+    payload = sys.stdin.read()
+if os.environ['ATTUNE_PARAMETER_FORMAT'] == 'json':
+    print(json.dumps(json.loads(payload)))
+else:
+    # A line-oriented data consumer; deliberately no shell evaluation.
+    print(json.dumps(payload.splitlines()))
+"#,
+        )
+        .unwrap();
+        let config = RuntimeExecutionConfig {
+            interpreter: InterpreterConfig {
+                binary: "python3".to_string(),
+                args: vec![],
+                file_extension: Some(".py".to_string()),
+            },
+            inline_execution: Default::default(),
+            environment: None,
+            dependencies: None,
+            env_vars: HashMap::new(),
+        };
+        let runtime = ProcessRuntime::new(
+            "custom".to_string(),
+            config,
+            root.path().to_path_buf(),
+            root.path().join("envs"),
+        );
+        for delivery in [ParameterDelivery::Stdin, ParameterDelivery::File] {
+            let make_context = || {
+                let mut context =
+                    ExecutionContext::test_context("fixture.consume".to_string(), None);
+                context.code_path = Some(script.clone());
+                context.working_dir = Some(root.path().to_path_buf());
+                context.parameter_delivery = delivery;
+                context.parameter_format = ParameterFormat::Dotenv;
+                context.output_format = OutputFormat::Json;
+                context.output_policy = attune_common::output_policy::OutputPolicy::default()
+                    .resolve(None, OutputFormat::Json)
+                    .unwrap();
+                context.env.insert(
+                    "SPAWN_MARKER".to_string(),
+                    marker.to_str().unwrap().to_string(),
+                );
+                context
+            };
+            for parameters in unsafe_dotenv_parameters() {
+                // Secret merging must not create a bypass of the same check.
+                for as_secret in [false, true] {
+                    let mut context = make_context();
+                    if as_secret {
+                        context.secrets = parameters.clone();
+                    } else {
+                        context.parameters = parameters.clone();
+                    }
+                    let error = runtime.execute(context).await.unwrap_err();
+                    assert!(matches!(error, RuntimeError::InvalidAction(_)));
+                    assert!(!format!("{error:?} {error}").contains("private-sentinel"));
+                    assert!(!marker.exists(), "rejected input spawned the action");
+                }
+            }
+            let mut context = make_context();
+            context.parameters = HashMap::from([
+                ("message".to_string(), json!("It's $(data)=only")),
+                (
+                    "headers".to_string(),
+                    json!({"Content-Type": "application/json"}),
+                ),
+                (
+                    "items".to_string(),
+                    json!(["line\nnext\r", {"x=y\n": true}, null, 3]),
+                ),
+                ("count".to_string(), json!(42)),
+                ("enabled".to_string(), json!(true)),
+                ("empty".to_string(), json!(null)),
+            ]);
+            let valid_parameters = context.parameters.clone();
+            let output = runtime.execute(context).await.unwrap();
+            assert_eq!(output.exit_code, 0, "{}", output.stderr);
+            assert!(marker.exists());
+            let records = output.result.unwrap();
+            let records = records.as_array().unwrap();
+            assert_eq!(records.len(), 6, "one record per flattened field");
+            assert!(records.contains(&json!("message='It'\\''s $(data)=only'")));
+            assert!(records.contains(&json!("headers.Content-Type='application/json'")));
+            assert!(records.contains(&json!(
+                "items='[\"line\\nnext\\r\",{\"x=y\\n\":true},null,3]'"
+            )));
+            std::fs::remove_file(&marker).unwrap();
+
+            // Default typed JSON retains multiline/control-bearing text, keys,
+            // arrays, objects and scalar types; dotenv restrictions stay local.
+            assert_eq!(ParameterFormat::default(), ParameterFormat::Json);
+            let mut context = make_context();
+            context.parameters = valid_parameters;
+            context.parameter_format = ParameterFormat::default();
+            context
+                .parameters
+                .insert("x=y\n".to_string(), json!({"leaf": "a\n\r\0b"}));
+            let expected = serde_json::to_value(&context.parameters).unwrap();
+            let output = runtime.execute(context).await.unwrap();
+            assert_eq!(output.exit_code, 0, "{}", output.stderr);
+            assert_eq!(output.result.unwrap(), expected);
+            std::fs::remove_file(&marker).unwrap();
+        }
+        root.close().unwrap();
     }
 
     #[test]
