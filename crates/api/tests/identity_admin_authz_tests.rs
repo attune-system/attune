@@ -775,7 +775,7 @@ async fn identity_manager_cannot_issue_admin_credentials_or_satisfy_rbac_attribu
         .await
         .unwrap();
     assert_eq!(
-        ctx.get("/api/v1/permissions/roles", Some(&manager_token))
+        ctx.get("/api/v1/permissions/sets", Some(&manager_token))
             .await
             .unwrap()
             .status(),
@@ -867,6 +867,36 @@ async fn identity_manager_cannot_issue_admin_credentials_or_satisfy_rbac_attribu
         .status(),
         StatusCode::OK
     );
+    // Attribute omission, null and an empty object do not supply an RBAC
+    // predicate or provider binding when creating an ordinary local identity.
+    for (login, attrs) in [
+        ("plain_omitted", None),
+        ("plain_null", Some(Value::Null)),
+        ("plain_empty", Some(json!({}))),
+    ] {
+        let mut body = json!({"login":login,"password":"LocalPass123!"});
+        if let Some(attrs) = attrs {
+            body["attributes"] = attrs;
+        }
+        assert_eq!(
+            ctx.post("/api/v1/identities", body, Some(&manager_token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            ctx.post(
+                "/auth/login",
+                json!({"login":login,"password":"LocalPass123!"}),
+                None
+            )
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::OK
+        );
+    }
     // An authorized attribute change really does satisfy the role predicate.
     assert_eq!(
         ctx.put(
@@ -880,7 +910,7 @@ async fn identity_manager_cannot_issue_admin_credentials_or_satisfy_rbac_attribu
         StatusCode::OK
     );
     assert_eq!(
-        ctx.get("/api/v1/permissions/roles", Some(&manager_token))
+        ctx.get("/api/v1/permissions/sets", Some(&manager_token))
             .await
             .unwrap()
             .status(),
