@@ -1382,18 +1382,35 @@ async fn standard_execution_access_covers_action_and_pack_scoped_resources() -> 
     }
     for (pack, expected) in [
         (&salesforce_pack, StatusCode::OK),
-        (&unrelated_pack, StatusCode::NOT_FOUND),
+        // Cache metadata uses explicit 403 denial (show_namespace contract),
+        // independently of Key/artifact existence-concealing 404 responses.
+        (&unrelated_pack, StatusCode::FORBIDDEN),
     ] {
         let path = format!(
             "/api/v1/cache/namespaces/standard_data?owner_type=pack&owner_ref={}",
             pack.r#ref
         );
-        assert_eq!(ctx.get(&path, Some(&token)).await?.status(), expected);
+        let response = ctx.get(&path, Some(&token)).await?;
+        assert_eq!(response.status(), expected);
+        let body: Value = response.json().await?;
+        if expected == StatusCode::OK {
+            assert_eq!(body["data"]["namespace"], "standard_data");
+        } else {
+            assert!(body.get("data").is_none());
+            assert!(!body.to_string().contains("standard_data"));
+        }
     }
     let write = ctx.post("/api/v1/cache/namespaces", json!({
         "owner_type": "pack", "owner_ref": salesforce_pack.r#ref, "namespace": "forbidden_write"
     }), Some(&token)).await?;
     assert_eq!(write.status(), StatusCode::FORBIDDEN);
+    assert!(CacheNamespaceRepository::resolve(
+        &ctx.pool,
+        &CacheOwnerScope::pack(salesforce_pack.id, Some(salesforce_pack.r#ref.clone())),
+        "forbidden_write"
+    )
+    .await?
+    .is_none());
 
     // Signed metadata is still bounded by the persisted execution. This models
     // an overbroad credential producer, not an unauthenticated JWT forgery.
