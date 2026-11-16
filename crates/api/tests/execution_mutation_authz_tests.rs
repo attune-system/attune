@@ -338,7 +338,7 @@ async fn rule_creation_cannot_turn_execution_credentials_into_durable_sponsors()
         owner.id,
         "test.create_sponsor",
         json!([
-            {"resource":"rules","actions":["create"]},
+            {"resource":"rules","actions":["create","update"]},
             {"resource":"actions","actions":["execute"]},
             {"resource":"packs","actions":["read","decrypt"]},
             {"resource":"keys","actions":["read","decrypt"]}
@@ -423,7 +423,8 @@ async fn rule_creation_cannot_turn_execution_credentials_into_durable_sponsors()
 /// Real broker consumers; run only against the lane-owned RabbitMQ and PG.
 #[tokio::test]
 #[ignore = "requires owned RabbitMQ via ATTUNE_RULE_TEST_AMQP_URL and PostgreSQL"]
-async fn access_created_rule_retains_sponsor_and_inputs_through_event_consumers() -> Result<()> {
+async fn edited_rule_retains_sponsor_without_borrowing_editor_authority_through_consumers(
+) -> Result<()> {
     use attune_common::{
         event_schema::EventSchemaBinding,
         mq::{
@@ -510,6 +511,130 @@ async fn access_created_rule_retains_sponsor_and_inputs_through_event_consumers(
         .unwrap();
     assert!(rule.is_adhoc);
     assert_eq!(rule.owner_identity, Some(owner.id));
+
+    // B can edit metadata but cannot redirect A's durable sponsorship to code
+    // B cannot Execute. A bounded token of A cannot durably rewrite it either.
+    let editor = IdentityRepository::create(
+        &ctx.pool,
+        CreateIdentityInput {
+            login: "rule_event_editor".into(),
+            display_name: None,
+            attributes: json!({}),
+            password_hash: None,
+        },
+    )
+    .await?;
+    assign(
+        &ctx,
+        editor.id,
+        "test.rule_event_editor",
+        json!([{"resource":"rules","actions":["update"]}]),
+    )
+    .await?;
+    assign(
+        &ctx,
+        owner.id,
+        "test.rule_event_narrow",
+        json!([
+            {"resource":"rules","actions":["update"]},
+            {"resource":"actions","actions":["execute"],"constraints":{"refs":[action.r#ref]}}
+        ]),
+    )
+    .await?;
+    let editor_access = attune_common::auth::jwt::generate_access_token(
+        editor.id,
+        "rule_event_editor",
+        &ctx.state.jwt_config,
+    )?;
+    let bounded =
+        helpers::delegated_source::token(&ctx, owner.id, &["test.rule_event_narrow".into()])
+            .await?;
+    for (bearer, change) in [
+        (
+            &editor_access,
+            json!({"action_params":{"message":"attacker-selected"}}),
+        ),
+        (
+            &bounded,
+            json!({"action_params":{"message":"future-durable-authority"}}),
+        ),
+    ] {
+        let response = ctx
+            .put(
+                &format!("/api/v1/rules/{}", rule.r#ref),
+                change,
+                Some(bearer),
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body: Value = response.json().await?;
+        assert!(!body.to_string().contains("attacker-selected"));
+        let retained = RuleRepository::find_by_ref(&ctx.pool, &rule.r#ref)
+            .await?
+            .unwrap();
+        assert_eq!(retained.action_params, rule.action_params);
+        assert_eq!(retained.owner_identity, Some(owner.id));
+        assert_eq!(retained.updated, rule.updated);
+        assert!(EnforcementRepository::find_by_rule(&ctx.pool, rule.id)
+            .await?
+            .is_empty());
+    }
+    for bearer in [&editor_access, &bounded] {
+        ctx.put(
+            &format!("/api/v1/rules/{}", rule.r#ref),
+            json!({"label":"Metadata remains editable"}),
+            Some(bearer),
+        )
+        .await?
+        .assert_status(StatusCode::OK);
+    }
+    ctx.put(
+        &format!("/api/v1/rules/{}", rule.r#ref),
+        json!({"trace_tag_template":"legitimate-access-edit"}),
+        Some(&access),
+    )
+    .await?
+    .assert_status(StatusCode::OK);
+
+    use attune_common::{
+        models::OwnerType,
+        repositories::key::{CreateKeyInput, KeyRepository},
+    };
+    let mut keys = Vec::new();
+    for (local_ref, owner_type) in [
+        ("pack_secret", OwnerType::Pack),
+        ("system_secret", OwnerType::System),
+    ] {
+        keys.push(
+            KeyRepository::create_encrypted_in_pool(
+                &ctx.pool,
+                CreateKeyInput {
+                    local_ref: local_ref.into(),
+                    owner_type,
+                    owner_identity: None,
+                    owner_pack: (owner_type == OwnerType::Pack).then_some(pack.id),
+                    owner_pack_ref: (owner_type == OwnerType::Pack).then_some(pack.r#ref.clone()),
+                    owner_action: None,
+                    owner_action_ref: None,
+                    owner_sensor: None,
+                    owner_sensor_ref: None,
+                    name: "Rule consumer fixture".into(),
+                    encrypted: true,
+                    encryption_key_hash: None,
+                    value: json!("owned-rule-runtime-secret"),
+                },
+                ctx.state.config.security.encryption_key.as_deref().unwrap(),
+            )
+            .await?,
+        );
+    }
+    // Neither human has ambient Key authority. Execute grants invocation of the
+    // trusted target; standard subsequently allows only its actual owned Keys.
+    for bearer in [&access, &editor_access] {
+        ctx.get(&format!("/api/v1/keys/{}", keys[0].r#ref), Some(bearer))
+            .await?
+            .assert_status(StatusCode::NOT_FOUND);
+    }
 
     let payload = json!({"message":"authorized-event-value"});
     let mut tx = ctx.pool.begin().await?;
@@ -655,7 +780,22 @@ async fn access_created_rule_retains_sponsor_and_inputs_through_event_consumers(
         assert!(selection.executable_snapshot.is_some());
         assert!(selection.schema_digest.is_some());
         assert!(selection.grant_digest.is_some());
+        helpers::delegated::start(&mut tx, execution.id).await?;
         tx.commit().await?;
+        let runtime = helpers::delegated_source::execution_token(&ctx, execution.id).await?;
+        let allowed: Value = ctx
+            .get(&format!("/api/v1/keys/{}", keys[0].r#ref), Some(&runtime))
+            .await?
+            .assert_status(StatusCode::OK)
+            .json()
+            .await?;
+        assert_eq!(allowed["data"]["value"], "owned-rule-runtime-secret");
+        let denied = ctx
+            .get(&format!("/api/v1/keys/{}", keys[1].r#ref), Some(&runtime))
+            .await?
+            .assert_status(StatusCode::NOT_FOUND);
+        let denied: Value = denied.json().await?;
+        assert!(!denied.to_string().contains("owned-rule-runtime-secret"));
         Ok::<(), Box<dyn std::error::Error>>(())
     };
     let result = AssertUnwindSafe(check).catch_unwind().await;

@@ -1050,6 +1050,15 @@ pub async fn update_rule(
         authz.authorize_access_fresh(&mut tx, &user, check).await?;
     }
     if behavioral_edit {
+        // Ad hoc rules retain the sponsor's live authority at future matches.
+        // Like creation, changing that durable program requires Access: v1 has
+        // no persisted editor credential ceiling to fence future IAM/default
+        // changes. Metadata and unchanged full-form saves spend no such grant.
+        if existing_rule.is_adhoc && user.claims.token_type != TokenType::Access {
+            return Err(ApiError::Forbidden(
+                "Changing ad hoc rule behavior requires an access token".into(),
+            ));
+        }
         let caller = if let Some(snapshot) = &snapshot {
             attune_common::delegation::DelegationAuthority::new(
                 identity_id,
