@@ -1445,7 +1445,7 @@ async fn core_native_only_worker_upload_admits_without_interpreter_test_dispatch
         .await?
         .unwrap();
     assert_eq!(installed.runtime_deps, vec!["native"]);
-    assert_eq!(installed.version, "1.0.7");
+    assert_eq!(installed.version, "1.0.8");
     let install = PackInstallRepository::new(ctx.pool.clone())
         .find_latest_by_pack_ref("core")
         .await?;

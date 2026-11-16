@@ -1,7 +1,11 @@
 # Core setup
 
 Core is published by the normal authenticated init-packs API bootstrap. Configure
-a registrar token and the core 1.0.7 image/version in the deployment configuration.
+a registrar token and a compatible published core image/version in deployment
+configuration. This source targets core 1.0.8; its publication is a separate
+release step. Do not assume the source version means an image already exists.
+Core 1.0.8's HTTP action supports only public destinations; internal automation
+calls formerly supported by 1.0.7 require a separately reviewed operator policy.
 The token does not grant action execution authority. Runtime actions need only the
 native capability, which the worker advertises even in interpreter-limited pools.
 

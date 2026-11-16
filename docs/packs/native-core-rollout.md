@@ -1,4 +1,4 @@
-# Native core 1.0.7 rollout gate
+# Native core rollout gates
 
 Core 1.0.7 contains only native echo, sleep, noop, and HTTP request actions. Their directory
 entrypoints require updated worker/agent code. Stock platform 0.10.4 workers
@@ -13,6 +13,23 @@ and an approved worker/agent image built from compatible integrated code. This
 source reference does not assert that an image has been released or approved.
 In particular, preserve the execution-environment Result propagation when
 integrating the independent environment remediation.
+
+## Core 1.0.8 HTTP destination restriction
+
+Core 1.0.7 is already public and immutable. The 1.0.8 source candidate changes
+`core.http_request` to reject non-public destinations, initially and on every
+redirect/connection. This is a deliberate breaking restriction of formerly
+general internal HTTP access, not a claim that 1.0.7 denied SSRF destinations.
+There is no caller-supplied bypass. Inventory RFC1918, loopback, link-local and
+metadata-dependent automation before adopting 1.0.8; the new action does not
+support those calls. See [the action contract](../../packs/core/README.md).
+
+Preserve existing 1.0.7 release bytes and admitted pins. The source version and
+distributable defaults reserve the next release target; this change does not
+publish a tag, image or archive, update a chart, or authorize deployment. Static
+AMD64/ARM64 binaries, strict ELF packaging and coordinated release validation
+remain required. The original native-worker compatibility gate below still
+applies when migrating from workers predating the directory dispatcher.
 
 ## Stage workers before activating core
 

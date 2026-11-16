@@ -1,6 +1,6 @@
 # Attune core pack
 
-Core 1.0.7 ships four actions: `core.echo`, `core.sleep`, `core.noop`, and `core.http_request`.
+The core 1.0.8 source candidate ships four actions: `core.echo`, `core.sleep`, `core.noop`, and `core.http_request`.
 They are standalone static native binaries. No Python, shell, curl, or other
 interpreter/tool is required to execute them. Parameters remain a flat JSON
 object on stdin; the text actions keep text output and HTTP emits structured JSON.
@@ -67,7 +67,8 @@ Binaries are built using `docker/Dockerfile.pack-binaries` / cargo-zigbuild, as 
 the timer sensor. Source checkout alone is not an executable pack: build artifacts
 must be assembled before publication; there is no interpreter/source fallback.
 
-Core 1.0.7 has a new immutable version/digest binding. Normal bootstrap explicitly
+Core 1.0.7 is already published with an immutable version/digest binding.
+The changed HTTP destination contract targets a new core 1.0.8 binding. Normal bootstrap explicitly
 requests the existing **pack-wide** `absent_metadata_policy=remove`. Complete retained
 nonaction definitions remain in the candidate; omitted actions and the installer's
 owned workflow definition retire. Omitted actions cannot
@@ -77,7 +78,9 @@ release trees, or republish changed bytes under an existing stable version.
 
 See [testing](TESTING.md) and [deployment setup](SETUP.md).
 
-The restored native HTTP implementation changes this candidate's bytes. Version
-1.0.7 remains provisional until release coordination verifies that it has not
-already been published immutably; discovery of an existing digest requires a
-coordinated pack/chart version bump, never replacement of that artifact.
+Core 1.0.8 deliberately restricts the formerly general HTTP client to public
+HTTP(S) destinations. Existing RFC1918, loopback and link-local automation calls
+are unsupported by the new action. Retained 1.0.7 releases and execution pins
+keep their original bytes and behavior. Version 1.0.8 is a source release target;
+no tag, archive, image, chart update or publication is implied by this change.
+Deploy only after coordinated release validation and publication.

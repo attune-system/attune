@@ -116,9 +116,9 @@ sys.exit(98)
                         "revision": "authenticated-pack-publication-1", "authorization": "registrar",
                         "components": ["immutable_release", "atomic_deployment"]}})
                 elif self.path == "/api/v1/packs/core/releases":
-                    self.respond(200, {"data": [{"id": 1, "version": "1.0.7", "digest": "owned", "is_active": True}] if active else []})
+                    self.respond(200, {"data": [{"id": 1, "version": "1.0.8", "digest": "owned", "is_active": True}] if active else []})
                 elif self.path == "/health/bootstrap":
-                    self.respond(200, {"core": {"release_id": 1, "version": "1.0.7", "digest": "owned"}})
+                    self.respond(200, {"core": {"release_id": 1, "version": "1.0.8", "digest": "owned"}})
                 else:
                     self.respond(404, {})
 
