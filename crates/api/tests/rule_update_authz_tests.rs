@@ -890,7 +890,13 @@ async fn full_form_metadata_retains_update_semantics_but_placement_spends_editor
         json!({"sensor_worker_tolerations":[{"key":"dedicated","operator":"exists"}]}),
         json!({"sensor_worker_affinity":{"required":[{"match_labels":{"zone":"other"}}]}}),
     ];
-    for token in &tokens {
+    for (token, placement_denial) in [
+        (&tokens[0], "Insufficient permissions: actions:execute"),
+        (
+            &tokens[1],
+            "Changing ad hoc rule behavior requires an access token",
+        ),
+    ] {
         let before = RuleRepository::find_by_ref(&ctx.pool, &rule_ref)
             .await?
             .unwrap();
@@ -926,7 +932,7 @@ async fn full_form_metadata_retains_update_semantics_but_placement_spends_editor
             let status = denied.status();
             let body: serde_json::Value = denied.json().await?;
             assert_eq!(status, StatusCode::FORBIDDEN, "{}", body["error"]);
-            assert_eq!(body["error"], "Insufficient permissions: actions:execute");
+            assert_eq!(body["error"], placement_denial);
             assert_eq!(
                 serde_json::to_value(
                     RuleRepository::find_by_ref(&ctx.pool, &rule_ref)
