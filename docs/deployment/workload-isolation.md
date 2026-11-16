@@ -21,7 +21,9 @@ scratch/artifact tree is mounted. The operator must keep credentials out of
 system binary/certificate trees and selected pack/runtime trees.
 
 The existing selected environment, scoped API credential and stdin JSON are
-preserved. `HOME` and `TMPDIR` become `/tmp`; `ATTUNE_ARTIFACTS_DIR` becomes the
+preserved. Bubblewrap itself starts with only a fixed trusted PATH; workload
+variables and command arguments are installed through an unlinked private file
+descriptor after namespace setup. Loader controls never apply to the host launcher. `HOME` and `TMPDIR` become `/tmp`; `ATTUNE_ARTIFACTS_DIR` becomes the
 private `/tmp/artifacts` directory. File producers must upload through the API
 before exit. File writes under the pack, runtime, or any arbitrary host working
 directory fail. Dependencies needing writable state must use private scratch.

@@ -105,23 +105,77 @@ impl WorkloadSandbox {
         sandbox
             .arg("--chdir")
             .arg(command.get_current_dir().unwrap_or(Path::new("/tmp")));
-        sandbox
-            .arg("--")
-            .arg(command.get_program())
-            .args(command.get_args());
-        sandbox.env_clear();
-        for (key, value) in command.get_envs() {
-            if let Some(value) = value {
-                sandbox.env(key, value);
-            }
-        }
-        // No inherited home/config or host scratch/artifact tree is mounted.
-        sandbox
-            .env("HOME", "/tmp")
-            .env("TMPDIR", "/tmp")
-            .env("ATTUNE_ARTIFACTS_DIR", "/tmp/artifacts");
+        install_workload_arguments(&mut sandbox, &command)?;
         Ok(sandbox)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn install_workload_arguments(sandbox: &mut Command, command: &Command) -> io::Result<()> {
+    use std::io::{Seek, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::{ffi::OsStrExt, process::CommandExt};
+
+    // Workload loader/runtime controls must never affect the host-side launcher.
+    // Pass all variable values and executable arguments through an unlinked file,
+    // rather than publishing tokens/inline source in Bubblewrap's command line.
+    let mut arguments = tempfile::tempfile()?;
+    let mut append = |value: &std::ffi::OsStr| -> io::Result<()> {
+        if value.as_bytes().contains(&0) {
+            return Err(io::Error::other("NUL in workload argument"));
+        }
+        arguments.write_all(value.as_bytes())?;
+        arguments.write_all(&[0])
+    };
+    append("--clearenv".as_ref())?;
+    for (key, value) in command.get_envs() {
+        if let Some(value) = value {
+            append("--setenv".as_ref())?;
+            append(key)?;
+            append(value)?;
+        }
+    }
+    for (key, value) in [
+        ("HOME", "/tmp"),
+        ("TMPDIR", "/tmp"),
+        ("ATTUNE_ARTIFACTS_DIR", "/tmp/artifacts"),
+    ] {
+        append("--setenv".as_ref())?;
+        append(key.as_ref())?;
+        append(value.as_ref())?;
+    }
+    append("--".as_ref())?;
+    append(command.get_program())?;
+    for argument in command.get_args() {
+        append(argument)?;
+    }
+    arguments.rewind()?;
+    let fd = arguments.as_raw_fd();
+    sandbox.env_clear().env("PATH", "/usr/bin:/bin");
+    sandbox.arg("--args").arg(fd.to_string());
+    // SAFETY: the descriptor is owned by this closure throughout spawn. Only
+    // async-signal-safe fcntl executes after fork; parent CLOEXEC is unchanged.
+    unsafe {
+        sandbox.pre_exec(move || {
+            let flags = libc::fcntl(arguments.as_raw_fd(), libc::F_GETFD);
+            if flags < 0
+                || libc::fcntl(
+                    arguments.as_raw_fd(),
+                    libc::F_SETFD,
+                    flags & !libc::FD_CLOEXEC,
+                ) < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_workload_arguments(_: &mut Command, _: &Command) -> io::Result<()> {
+    Err(io::Error::other("bubblewrap workloads require Linux"))
 }
 
 #[cfg(test)]
@@ -150,6 +204,68 @@ mod tests {
         let command = WorkloadSandbox::Disabled.wrap(command, &[]).unwrap();
         assert_eq!(command.get_program(), "/bin/sh");
         assert_eq!(command.get_envs().count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux bubblewrap, cc and unprivileged namespaces"]
+    fn bubblewrap_loader_environment_is_installed_after_isolation() {
+        let root = tempfile::TempDir::new().unwrap();
+        let pack = root.path().join("pack");
+        std::fs::create_dir(&pack).unwrap();
+        let marker = root.path().join("host-only-marker");
+        let source = pack.join("preload.c");
+        let library = pack.join("preload.so");
+        std::fs::write(
+            &source,
+            format!(
+                r#"#include <fcntl.h>
+#include <unistd.h>
+__attribute__((constructor)) static void probe(void) {{
+ int fd = open("{}", O_WRONLY|O_CREAT, 0600);
+ if (fd >= 0) {{ write(fd, "escaped", 7); close(fd); }}
+}}
+"#,
+                marker.display()
+            ),
+        )
+        .unwrap();
+        assert!(Command::new("cc")
+            .args(["-shared", "-fPIC"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&library)
+            .status()
+            .unwrap()
+            .success());
+        let mut plain = Command::new("/bin/true");
+        plain.env_clear().env("LD_PRELOAD", &library);
+        assert!(plain.status().unwrap().success());
+        assert!(marker.exists(), "loader probe must run without sandbox");
+        std::fs::remove_file(&marker).unwrap();
+        let mut workload = Command::new("/bin/sh");
+        workload
+            .args([
+                "-c",
+                "test -n \"$LD_PRELOAD\" && test \"$ATTUNE_API_TOKEN\" = dummy-scoped-token",
+            ])
+            .env_clear()
+            .env("LD_PRELOAD", &library)
+            .env("ATTUNE_API_TOKEN", "dummy-scoped-token");
+        let mut sandbox = WorkloadSandbox::Bubblewrap
+            .wrap(workload, &[&pack])
+            .unwrap();
+        assert!(sandbox.get_envs().all(|(key, _)| key == "PATH"));
+        assert!(
+            !format!("{:?}", sandbox.get_args().collect::<Vec<_>>()).contains("dummy-scoped-token")
+        );
+        let output = sandbox.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!marker.exists(), "loader must not run in host namespaces");
     }
 
     // This is a required boundary test when explicitly selected. Missing bwrap

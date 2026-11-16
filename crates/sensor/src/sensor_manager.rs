@@ -132,6 +132,21 @@ fn build_sensor_command(
     (program, command)
 }
 
+fn sandbox_sensor_command(
+    command: Command,
+    environment: &ChildProcessEnvironment,
+    pack_dir: &std::path::Path,
+    env_dir: Option<&std::path::Path>,
+) -> io::Result<Command> {
+    let mut paths = vec![pack_dir];
+    if let Some(path) = env_dir {
+        paths.push(path);
+    }
+    environment
+        .sandbox_workload(command.into_std(), &paths)
+        .map(Command::from)
+}
+
 fn build_sensor_setup_command(
     program: &str,
     args: &[String],
@@ -1576,15 +1591,8 @@ impl SensorManager {
         apply_runtime_env_vars(&mut cmd, &exec_config, &pack_dir, env_dir_opt);
         cmd.env_remove("ATTUNE_SENSOR_TRIGGERS")
             .env_remove("ATTUNE_SENSOR_CONFIG_JSON");
-        let mut sandbox_paths = vec![pack_dir.as_path()];
-        if let Some(path) = env_dir_opt {
-            sandbox_paths.push(path);
-        }
-        let mut cmd = Command::from(
-            self.inner
-                .child_environment
-                .sandbox_workload(cmd.into_std(), &sandbox_paths)?,
-        );
+        let mut cmd =
+            sandbox_sensor_command(cmd, &self.inner.child_environment, &pack_dir, env_dir_opt)?;
         configure_sensor_process(&mut cmd)
             .map_err(|e| anyhow!("Failed to configure sensor process: {}", e))?;
         cmd.kill_on_drop(true);
@@ -3952,6 +3960,60 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::fs;
     use tokio::io::{AsyncBufReadExt, BufReader};
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Linux bubblewrap and unprivileged namespaces"]
+    async fn sandbox_sensor_preserves_bootstrap_and_scoped_token() {
+        let root = tempfile::TempDir::new().unwrap();
+        let pack = root.path().join("pack");
+        std::fs::create_dir(&pack).unwrap();
+        let script = pack.join("sensor.sh");
+        let hidden = root.path().join("manager-secret");
+        std::fs::write(&hidden, "owned-dummy-secret").unwrap();
+        std::fs::write(&script, format!("set -eu\n[ ! -e '{}' ]\n[ \"$ATTUNE_API_TOKEN\" = scoped-sensor-token ]\nread bootstrap\n[ \"$bootstrap\" = '{{\"config\":{{}}}}' ]\necho sensor-ok\n", hidden.display())).unwrap();
+        let environment = ChildProcessEnvironment::from_parent([], &[])
+            .unwrap()
+            .with_workload_sandbox(attune_common::workload_sandbox::WorkloadSandbox::Bubblewrap);
+        let mut config = RuntimeExecutionConfig::default();
+        config.interpreter.binary = "/bin/sh".into();
+        let (_, mut command) = build_sensor_command(
+            script.to_str().unwrap(),
+            false,
+            &config,
+            &pack,
+            None,
+            &environment,
+        );
+        command.env("ATTUNE_API_TOKEN", "scoped-sensor-token");
+        let mut command = sandbox_sensor_command(command, &environment, &pack, None).unwrap();
+        configure_sensor_process(&mut command).unwrap();
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        deliver_sensor_bootstrap(&mut child, br#"{"config":{}}"#, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let output = child.wait_with_output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"sensor-ok\n");
+        assert_eq!(
+            std::fs::read_to_string(hidden).unwrap(),
+            "owned-dummy-secret"
+        );
+        let missing = root.path().join("absent-pack");
+        assert!(
+            sandbox_sensor_command(Command::new("/bin/sh"), &environment, &missing, None).is_err()
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]
