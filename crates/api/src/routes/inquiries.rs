@@ -460,38 +460,43 @@ pub async fn respond_to_inquiry(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Inquiry with ID {} not found", id)))?;
 
-    // `InquiryVisibilityEvaluator` also validates that the caller's token
-    // type is one this endpoint accepts (Access or Execution), and computes
-    // `execution_visible` for redacting the linked execution id in the
-    // response payload. Unlike `get_inquiry`/list endpoints, however, the
-    // respond endpoint's *authorization* is governed by `assigned_to`
-    // (below) and the privilege-loop guard, not by the general RBAC
-    // "content visible" predicate. Gating on `content_visible` here was
-    // incorrectly turning "not the assignee, no RBAC read grant" into a 404
-    // (masking the intended 403), and turning unassigned inquiries (any
-    // authenticated caller allowed) into a 404 for callers without a
-    // matching grant.
-    let mut visibility = InquiryVisibilityEvaluator::new(&state, &user.0).await?;
-    let visibility_decision = visibility.evaluate(&inquiry).await?;
+    // Response redaction can traverse creator ancestry before the submission
+    // transaction. Reject malformed cycles with the cycle-aware reader first;
+    // otherwise the generic visibility owner walk never reaches that guard.
+    // Dangling parents retain their historical visibility semantics here; the
+    // stricter execution-approval completeness check remains in submission.
+    if ExecutionRepository::find_authorization_lineages(&state.db, &[inquiry.created_by_execution])
+        .await?
+        .iter()
+        .any(|lineage| lineage.cyclic)
+    {
+        return Err(ApiError::Forbidden(
+            "Inquiry response requires acyclic creator lineage".into(),
+        ));
+    }
 
-    let responded_by = user.0.identity_id().map_err(|_| {
-        ApiError::Forbidden("Cannot record response: caller has no resolvable identity".to_string())
-    })?;
+    // Recorded response authority is checked by the typed submission consumer;
+    // it never borrows sponsor IAM for linked-execution disclosure.
+    let execution_visible = if crate::recorded_consumers::is_recorded(&user.0)? {
+        false
+    } else {
+        let mut visibility = InquiryVisibilityEvaluator::new(&state, &user.0).await?;
+        visibility.evaluate(&inquiry).await?.execution_visible
+    };
+
     let submission = match request {
         InquiryRespondRequest::Response(request) => {
             crate::inquiry_response::InquiryResponseSubmission::Human {
                 inquiry_id: id,
                 response: request.response,
-                identity_id: responded_by,
-                execution_id: user.0.execution_id(),
+                user: Box::new(user.0.clone()),
             }
         }
         InquiryRespondRequest::Option(request) => {
             crate::inquiry_response::InquiryResponseSubmission::HumanOption {
                 inquiry_id: id,
                 option_ref: request.option_ref,
-                identity_id: responded_by,
-                execution_id: user.0.execution_id(),
+                user: Box::new(user.0.clone()),
             }
         }
     };
@@ -499,10 +504,7 @@ pub async fn respond_to_inquiry(
         crate::inquiry_response::submit_inquiry_response(&state, submission).await?;
 
     let response = ApiResponse::with_message(
-        redact_inquiry_response(
-            InquiryResponse::from(updated_inquiry),
-            visibility_decision.execution_visible,
-        ),
+        redact_inquiry_response(InquiryResponse::from(updated_inquiry), execution_visible),
         "Response submitted successfully",
     );
 
@@ -1156,6 +1158,11 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/executions/{execution_id}/inquiries",
             get(list_inquiries_by_execution),
         )
-        .route("/inquiries/{id}/respond", post(respond_to_inquiry))
+        .route(
+            "/inquiries/{id}/respond",
+            post(respond_to_inquiry).layer(axum::Extension(
+                crate::auth::middleware::RecordedRuntimeConsumer::InquiryResponse,
+            )),
+        )
         .route("/inquiries/{id}/cancel", post(cancel_inquiry))
 }

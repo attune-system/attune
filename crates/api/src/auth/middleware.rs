@@ -215,6 +215,7 @@ pub(crate) enum RecordedRuntimeConsumer {
     ExecutionControl,
     QueueOperations,
     EventIngress,
+    InquiryResponse,
     KeyRead,
     KeyList,
     KeyUpdate,

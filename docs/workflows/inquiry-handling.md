@@ -134,7 +134,9 @@ Submit a human response with `POST /api/v1/inquiries/{id}/respond`:
 }
 ```
 
-The API validates the response against the inquiry's flat `response_schema`. Only the assigned identity can answer an assigned inquiry. The API rejects self-approval by the creator execution and its descendants.
+The API validates the response against the inquiry's flat `response_schema`. Every direct response (including a fixed option) requires `inquiries:respond` on the actual inquiry and its creator's pack/owner context. Assignment is an additional restriction: only the assigned identity can answer an assigned inquiry. Unassigned inquiries still require the Respond grant. Execution credentials must carry explicit response authority; `standard` does not grant it. Recorded credentials retain their admitted target scope and approval deadlines, and legacy credentials retain their selected caps and live delegation checks.
+
+The API rejects execution self-approval across the entire surviving execution tree, resolving parent links from the repository rather than trusting token lineage. The creator, root, siblings, and descendants cannot answer their own tree's inquiry. An unrelated execution with explicit response authority may answer (and must match any assignment); automated inquiries remain supported. Missing or cyclic execution lineage fails closed, including an otherwise surviving execution whose parent has been removed by independent retention. This stricter approval check does not change historical visibility for dangling execution IDs.
 
 Fields marked `secret: true` are redacted from inquiry API responses after submission. Workflow context uses the stored value. Fixed response option payloads are visible to inquiry readers, so options must not contain secrets.
 
@@ -147,6 +149,8 @@ Managed sensors submit provider envelopes through one metadata-selected endpoint
 ```http
 POST /api/v1/internal/inquiry-callbacks/{adapter_ref}
 ```
+
+Provider transport and authentication belong to the pack-owned sensor: it verifies the provider connection or envelope and supplies the actual actor evidence. Core adapters use free provider/subject-kind identifiers and metadata extraction rules; installing a Slack or Teams pack does not require a provider-specific core driver or registration. Core enforces administrator-controlled exact identity mappings, response permission, assignment, state and audit. Direct provider HTTP ingress and service exposure are separate generic deployment capabilities; this callback contract does not establish that a Teams installation or a proposed HTTP ingress strategy is available.
 
 The sensor calls this endpoint with its fenced sensor token and the provider's native envelope. Its release-pinned `config.inquiry_callback_adapters` entry defines the provider, subject kind, JSON Pointer extraction rules, and bounded request constraints. Attune stores the normalized selection as encrypted JSON before acknowledging it. The handle supplies opaque correlation and option integrity, not authorization. Ingress requires the caller's current workload fence and an enabled adapter with the same ref in both live and pinned sensor metadata. The background processor rechecks current sensor availability, the `inquiries:respond` grant for the sensor identity, the exact provider identity mapping, and that the mapped identity matches `assigned_to`.
 

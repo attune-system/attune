@@ -30,6 +30,8 @@ mod helpers;
 #[cfg(unix)]
 #[path = "recorded_execution_events_tests/http_handoff.rs"]
 mod http_handoff;
+#[path = "recorded_execution_events_tests/inquiry_response.rs"]
+mod inquiry_response;
 #[path = "recorded_execution_events_tests/live_decoder_gate.rs"]
 mod live_decoder_gate;
 #[path = "recorded_execution_events_tests/live_streams.rs"]

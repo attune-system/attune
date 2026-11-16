@@ -10,8 +10,7 @@
 //!   inquiry it created.
 //! - Execution-scoped tokens for a *different* execution may respond when
 //!   they belong to the assignee.
-//! - When `assigned_to` is unset, any authenticated caller may respond
-//!   (existing behavior).
+//! - Unassigned inquiries require explicit response authority.
 
 use attune_common::{
     auth::jwt::{generate_access_token, generate_sensor_token_with_workload_fence, JwtConfig},
@@ -79,6 +78,30 @@ async fn create_identity(pool: &PgPool, login: &str) -> TResult<Identity> {
         },
     )
     .await?)
+}
+
+async fn grant_respond(pool: &PgPool, identity: i64) -> TResult<PermissionSet> {
+    let set = PermissionSetRepository::create(
+        pool,
+        CreatePermissionSetInput {
+            r#ref: format!("test.respond_{identity}"),
+            pack: None,
+            pack_ref: None,
+            label: None,
+            description: None,
+            grants: json!([{"resource":"inquiries","actions":["respond"]}]),
+        },
+    )
+    .await?;
+    PermissionAssignmentRepository::create(
+        pool,
+        CreatePermissionAssignmentInput {
+            identity,
+            permset: set.id,
+        },
+    )
+    .await?;
+    Ok(set)
 }
 
 async fn setup_pack_action(pool: &PgPool, suffix: &str) -> TResult<(Pack, Action)> {
@@ -405,6 +428,7 @@ async fn secret_options_are_selectable_without_plaintext_access_and_require_expl
     let ctx = TestContext::new().await?;
     let creator = create_identity(&ctx.pool, "secret_inquiry_creator").await?;
     let assignee = create_identity(&ctx.pool, "secret_inquiry_assignee").await?;
+    grant_respond(&ctx.pool, assignee.id).await?;
     let (_pack, action) = setup_pack_action(&ctx.pool, "secret_options").await?;
     let child = create_workflow_child_execution(&ctx.pool, &action, creator.id, "unused").await?;
     let token = generate_access_token(assignee.id, &assignee.login, &jwt_config())?;
@@ -1540,6 +1564,7 @@ async fn assignee_with_access_token_can_respond() -> TResult<()> {
     let cfg = jwt_config();
 
     let assignee = create_identity(&ctx.pool, "assignee_ok").await?;
+    grant_respond(&ctx.pool, assignee.id).await?;
     let (_pack, action) = setup_pack_action(&ctx.pool, "ok").await?;
     let exec = create_execution(&ctx.pool, &action).await?;
     let inquiry = create_inquiry(&ctx.pool, exec.id, Some(assignee.id)).await?;
@@ -1565,6 +1590,7 @@ async fn non_assignee_access_token_is_forbidden() -> TResult<()> {
 
     let assignee = create_identity(&ctx.pool, "assignee_real").await?;
     let other = create_identity(&ctx.pool, "other_user").await?;
+    grant_respond(&ctx.pool, other.id).await?;
     let (_pack, action) = setup_pack_action(&ctx.pool, "non_assignee").await?;
     let exec = create_execution(&ctx.pool, &action).await?;
     let inquiry = create_inquiry(&ctx.pool, exec.id, Some(assignee.id)).await?;
@@ -1591,13 +1617,14 @@ async fn execution_token_self_response_is_blocked() -> TResult<()> {
     let ctx = TestContext::new().await?;
 
     let assignee = create_identity(&ctx.pool, "assignee_self").await?;
+    let response_set = grant_respond(&ctx.pool, assignee.id).await?;
     let (_pack, action) = setup_pack_action(&ctx.pool, "self").await?;
     let exec = owned_execution(
         &ctx.pool,
         &action,
         assignee.id,
         None,
-        vec!["standard".into()],
+        vec![response_set.r#ref.clone()],
     )
     .await?;
     let inquiry = create_inquiry(&ctx.pool, exec.id, Some(assignee.id)).await?;
@@ -1633,6 +1660,7 @@ async fn execution_token_for_different_execution_can_respond_when_assignee() -> 
     let ctx = TestContext::new().await?;
 
     let assignee = create_identity(&ctx.pool, "assignee_other_exec").await?;
+    let response_set = grant_respond(&ctx.pool, assignee.id).await?;
     let (_pack, action) = setup_pack_action(&ctx.pool, "other_exec").await?;
     let creating_exec = create_execution(&ctx.pool, &action).await?;
     let other_exec = owned_execution(
@@ -1640,7 +1668,7 @@ async fn execution_token_for_different_execution_can_respond_when_assignee() -> 
         &action,
         assignee.id,
         None,
-        vec!["standard".into()],
+        vec![response_set.r#ref.clone()],
     )
     .await?;
     let inquiry = create_inquiry(&ctx.pool, creating_exec.id, Some(assignee.id)).await?;
@@ -1665,10 +1693,17 @@ async fn execution_token_for_different_execution_blocked_when_not_assignee() -> 
 
     let assignee = create_identity(&ctx.pool, "assignee_diff_id").await?;
     let other = create_identity(&ctx.pool, "non_assignee_id").await?;
+    let response_set = grant_respond(&ctx.pool, other.id).await?;
     let (_pack, action) = setup_pack_action(&ctx.pool, "exec_non_assignee").await?;
     let creating_exec = create_execution(&ctx.pool, &action).await?;
-    let other_exec =
-        owned_execution(&ctx.pool, &action, other.id, None, vec!["standard".into()]).await?;
+    let other_exec = owned_execution(
+        &ctx.pool,
+        &action,
+        other.id,
+        None,
+        vec![response_set.r#ref.clone()],
+    )
+    .await?;
     let inquiry = create_inquiry(&ctx.pool, creating_exec.id, Some(assignee.id)).await?;
 
     let token = helpers::delegated_source::execution_token(&ctx, other_exec.id).await?;
@@ -1686,7 +1721,7 @@ async fn execution_token_for_different_execution_blocked_when_not_assignee() -> 
 }
 
 #[tokio::test]
-async fn unassigned_inquiry_accepts_any_authenticated_caller() -> TResult<()> {
+async fn unassigned_inquiry_requires_explicit_response_authority() -> TResult<()> {
     let ctx = TestContext::new().await?;
 
     let caller = create_identity(&ctx.pool, "any_caller").await?;
@@ -1704,7 +1739,20 @@ async fn unassigned_inquiry_accepts_any_authenticated_caller() -> TResult<()> {
         )
         .await?;
 
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let pending = InquiryRepository::find_by_id(&ctx.pool, inquiry.id)
+        .await?
+        .unwrap();
+    assert!(pending.response.is_none() && pending.responded_by.is_none());
+    grant_respond(&ctx.pool, caller.id).await?;
+    let allowed = ctx
+        .post(
+            &format!("/api/v1/inquiries/{}/respond", inquiry.id),
+            respond_body(),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(allowed.status(), StatusCode::OK);
     Ok(())
 }
 
@@ -1717,13 +1765,14 @@ async fn nested_execution_token_self_response_is_blocked() -> TResult<()> {
     let ctx = TestContext::new().await?;
 
     let assignee = create_identity(&ctx.pool, "assignee_nested").await?;
+    let response_set = grant_respond(&ctx.pool, assignee.id).await?;
     let (_pack, action) = setup_pack_action(&ctx.pool, "nested").await?;
     let exec_a = owned_execution(
         &ctx.pool,
         &action,
         assignee.id,
         None,
-        vec!["standard".into()],
+        vec![response_set.r#ref.clone()],
     )
     .await?;
     let exec_b = owned_execution(
@@ -1731,7 +1780,7 @@ async fn nested_execution_token_self_response_is_blocked() -> TResult<()> {
         &action,
         assignee.id,
         Some(exec_a.id),
-        vec!["standard".into()],
+        vec![response_set.r#ref.clone()],
     )
     .await?;
     let inquiry = create_inquiry(&ctx.pool, exec_a.id, Some(assignee.id)).await?;
@@ -1765,13 +1814,14 @@ async fn deeply_nested_execution_token_self_response_is_blocked() -> TResult<()>
     let ctx = TestContext::new().await?;
 
     let assignee = create_identity(&ctx.pool, "assignee_deep").await?;
+    let response_set = grant_respond(&ctx.pool, assignee.id).await?;
     let (_pack, action) = setup_pack_action(&ctx.pool, "deep").await?;
     let exec_a = owned_execution(
         &ctx.pool,
         &action,
         assignee.id,
         None,
-        vec!["standard".into()],
+        vec![response_set.r#ref.clone()],
     )
     .await?;
     let exec_b = owned_execution(
@@ -1779,7 +1829,7 @@ async fn deeply_nested_execution_token_self_response_is_blocked() -> TResult<()>
         &action,
         assignee.id,
         Some(exec_a.id),
-        vec!["standard".into()],
+        vec![response_set.r#ref.clone()],
     )
     .await?;
     let exec_c = owned_execution(
@@ -1787,7 +1837,7 @@ async fn deeply_nested_execution_token_self_response_is_blocked() -> TResult<()>
         &action,
         assignee.id,
         Some(exec_b.id),
-        vec!["standard".into()],
+        vec![response_set.r#ref.clone()],
     )
     .await?;
     let inquiry = create_inquiry(&ctx.pool, exec_a.id, Some(assignee.id)).await?;
@@ -1816,6 +1866,7 @@ async fn responded_by_recorded_for_access_token() -> TResult<()> {
     let cfg = jwt_config();
 
     let assignee = create_identity(&ctx.pool, "assignee_audit").await?;
+    grant_respond(&ctx.pool, assignee.id).await?;
     let (_pack, action) = setup_pack_action(&ctx.pool, "audit").await?;
     let exec = create_execution(&ctx.pool, &action).await?;
     let inquiry = create_inquiry(&ctx.pool, exec.id, Some(assignee.id)).await?;
@@ -1841,5 +1892,452 @@ async fn responded_by_recorded_for_access_token() -> TResult<()> {
     );
     assert_eq!(stored.responded_by, Some(assignee.id));
     assert_eq!(stored.response, Some(json!({ "approved": true })));
+    Ok(())
+}
+
+#[tokio::test]
+async fn response_authority_is_required_for_both_human_forms_even_when_assigned() -> TResult<()> {
+    use attune_common::repositories::{identity::UpdateIdentityInput, Update};
+    let ctx = TestContext::new().await?;
+    let caller = create_identity(&ctx.pool, "response_grant").await?;
+    let (_, action) = setup_pack_action(&ctx.pool, "response_grant").await?;
+    let creator = create_execution(&ctx.pool, &action).await?;
+    let token = generate_access_token(caller.id, &caller.login, &jwt_config())?;
+    for assigned in [None, Some(caller.id)] {
+        let inquiry = create_inquiry(&ctx.pool, creator.id, assigned).await?;
+        for body in [respond_body(), json!({"option_ref":"approve"})] {
+            let response = ctx
+                .post(
+                    &format!("/api/v1/inquiries/{}/respond", inquiry.id),
+                    body,
+                    Some(&token),
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let row = InquiryRepository::find_by_id(&ctx.pool, inquiry.id)
+                .await?
+                .unwrap();
+            assert!(
+                row.response.is_none() && row.responded_at.is_none() && row.responded_by.is_none()
+            );
+        }
+    }
+    let set = grant_respond(&ctx.pool, caller.id).await?;
+    let inquiry = create_inquiry(&ctx.pool, creator.id, Some(caller.id)).await?;
+    // A fresh transaction must observe frozen identities, even after a prior request.
+    IdentityRepository::update(
+        &ctx.pool,
+        caller.id,
+        UpdateIdentityInput {
+            frozen: Some(true),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let response = ctx
+        .post(
+            &format!("/api/v1/inquiries/{}/respond", inquiry.id),
+            respond_body(),
+            Some(&token),
+        )
+        .await?;
+    assert!(matches!(
+        response.status(),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+    ));
+    IdentityRepository::update(
+        &ctx.pool,
+        caller.id,
+        UpdateIdentityInput {
+            frozen: Some(false),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let assignments =
+        PermissionAssignmentRepository::find_by_identity(&ctx.pool, caller.id).await?;
+    for assignment in assignments {
+        if assignment.permset == set.id {
+            PermissionAssignmentRepository::delete(&ctx.pool, assignment.id).await?;
+        }
+    }
+    let response = ctx
+        .post(
+            &format!("/api/v1/inquiries/{}/respond", inquiry.id),
+            respond_body(),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let row = InquiryRepository::find_by_id(&ctx.pool, inquiry.id)
+        .await?
+        .unwrap();
+    assert!(row.response.is_none() && row.responded_at.is_none() && row.responded_by.is_none());
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn response_with_explicit_execution_caps_rejects_root_leaf_sibling_and_descendant(
+) -> TResult<()> {
+    let ctx = TestContext::new().await?;
+    let owner = create_identity(&ctx.pool, "tree_responder").await?;
+    let set = grant_respond(&ctx.pool, owner.id).await?;
+    let (_, action) = setup_pack_action(&ctx.pool, "tree_responder").await?;
+    let refs = vec![set.r#ref.clone()];
+    let root = owned_execution(&ctx.pool, &action, owner.id, None, refs.clone()).await?;
+    let leaf = owned_execution(&ctx.pool, &action, owner.id, Some(root.id), refs.clone()).await?;
+    let sibling =
+        owned_execution(&ctx.pool, &action, owner.id, Some(root.id), refs.clone()).await?;
+    let descendant =
+        owned_execution(&ctx.pool, &action, owner.id, Some(leaf.id), refs.clone()).await?;
+    let unrelated = owned_execution(&ctx.pool, &action, owner.id, None, refs).await?;
+    for responder in [root.id, leaf.id, sibling.id, descendant.id] {
+        let token = helpers::delegated_source::execution_token(&ctx, responder).await?;
+        for body in [respond_body(), json!({"option_ref":"approve"})] {
+            let inquiry = create_inquiry(&ctx.pool, leaf.id, Some(owner.id)).await?;
+            let response = ctx
+                .post(
+                    &format!("/api/v1/inquiries/{}/respond", inquiry.id),
+                    body,
+                    Some(&token),
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let row = InquiryRepository::find_by_id(&ctx.pool, inquiry.id)
+                .await?
+                .unwrap();
+            assert!(
+                row.response.is_none() && row.responded_at.is_none() && row.responded_by.is_none()
+            );
+        }
+    }
+    let token = helpers::delegated_source::execution_token(&ctx, unrelated.id).await?;
+    let inquiry = create_inquiry(&ctx.pool, leaf.id, Some(owner.id)).await?;
+    let path = format!("/api/v1/inquiries/{}/respond", inquiry.id);
+    assert_eq!(
+        ctx.post(&path, respond_body(), Some(&token))
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        ctx.post(&path, respond_body(), Some(&token))
+            .await?
+            .status(),
+        StatusCode::CONFLICT
+    );
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn response_scope_uses_actual_creator_and_role_revocation_is_fresh() -> TResult<()> {
+    use attune_common::repositories::identity::{
+        CreateIdentityRoleAssignmentInput, CreatePermissionSetRoleAssignmentInput,
+        IdentityRoleAssignmentRepository, PermissionSetRoleAssignmentRepository,
+    };
+    let ctx = TestContext::new().await?;
+    let caller = create_identity(&ctx.pool, "scoped_responder").await?;
+    let (pack, action) = setup_pack_action(&ctx.pool, "scoped_response").await?;
+    let (_, foreign) = setup_pack_action(&ctx.pool, "foreign_response").await?;
+    let local_creator = create_execution(&ctx.pool, &action).await?;
+    let foreign_creator = create_execution(&ctx.pool, &foreign).await?;
+    let set = PermissionSetRepository::create(&ctx.pool, CreatePermissionSetInput {
+        r#ref: "test.scoped_responder".into(), pack: None, pack_ref: None,
+        label: None, description: None,
+        grants: json!([{"resource":"inquiries","actions":["respond"],"constraints":{"pack_refs":[pack.r#ref]}}]),
+    }).await?;
+    PermissionSetRoleAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionSetRoleAssignmentInput {
+            permset: set.id,
+            role: "response-reviewer".into(),
+        },
+    )
+    .await?;
+    let role = IdentityRoleAssignmentRepository::create(
+        &ctx.pool,
+        CreateIdentityRoleAssignmentInput {
+            identity: caller.id,
+            role: "response-reviewer".into(),
+            source: "manual".into(),
+            managed: false,
+        },
+    )
+    .await?;
+    let token = generate_access_token(caller.id, &caller.login, &jwt_config())?;
+    let allowed = create_inquiry(&ctx.pool, local_creator.id, Some(caller.id)).await?;
+    assert_eq!(
+        ctx.post(
+            &format!("/api/v1/inquiries/{}/respond", allowed.id),
+            json!({"option_ref":"approve"}),
+            Some(&token)
+        )
+        .await?
+        .status(),
+        StatusCode::OK
+    );
+    let denied = create_inquiry(&ctx.pool, foreign_creator.id, Some(caller.id)).await?;
+    assert_eq!(
+        ctx.post(
+            &format!("/api/v1/inquiries/{}/respond", denied.id),
+            json!({"option_ref":"approve"}),
+            Some(&token)
+        )
+        .await?
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    IdentityRoleAssignmentRepository::delete(&ctx.pool, role.id).await?;
+    let revoked = create_inquiry(&ctx.pool, local_creator.id, Some(caller.id)).await?;
+    assert_eq!(
+        ctx.post(
+            &format!("/api/v1/inquiries/{}/respond", revoked.id),
+            respond_body(),
+            Some(&token)
+        )
+        .await?
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    for id in [denied.id, revoked.id] {
+        let row = InquiryRepository::find_by_id(&ctx.pool, id).await?.unwrap();
+        assert!(row.response.is_none() && row.responded_by.is_none() && row.responded_at.is_none());
+    }
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_authorized_responses_commit_exactly_one_choice() -> TResult<()> {
+    let ctx = TestContext::new().await?;
+    let caller = create_identity(&ctx.pool, "atomic_responder").await?;
+    grant_respond(&ctx.pool, caller.id).await?;
+    let (_, action) = setup_pack_action(&ctx.pool, "atomic_response").await?;
+    let creator = create_execution(&ctx.pool, &action).await?;
+    let target = create_inquiry(&ctx.pool, creator.id, Some(caller.id)).await?;
+    let token = generate_access_token(caller.id, &caller.login, &jwt_config())?;
+    let path = format!("/api/v1/inquiries/{}/respond", target.id);
+    let (first, second) = tokio::join!(
+        ctx.post(&path, respond_body(), Some(&token)),
+        ctx.post(&path, json!({"option_ref":"approve"}), Some(&token)),
+    );
+    let mut statuses = [first?.status().as_u16(), second?.status().as_u16()];
+    statuses.sort();
+    assert_eq!(statuses, [200, 409]);
+    let row = InquiryRepository::find_by_id(&ctx.pool, target.id)
+        .await?
+        .unwrap();
+    assert_eq!(row.responded_by, Some(caller.id));
+    assert_eq!(row.response, Some(json!({"approved":true})));
+    assert!(row.responded_at.is_some());
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+async fn assert_no_response_effects(ctx: &TestContext, id: i64) -> TResult<()> {
+    use attune_common::{
+        audit::{AuditEventFilters, AuditOutcome, AuditRepository},
+        repositories::execution_secret_value::ExecutionSecretValueRepository,
+    };
+    let row = InquiryRepository::find_by_id(&ctx.pool, id).await?.unwrap();
+    assert!(row.response.is_none() && row.responded_by.is_none() && row.responded_at.is_none());
+    assert!(ExecutionSecretValueRepository::find_stored_by_entity(
+        &ctx.pool,
+        attune_common::secret_values::ENTITY_INQUIRY_RESPONSE,
+        id
+    )
+    .await?
+    .is_empty());
+    ctx.flush_audit().await?;
+    let success = AuditRepository::search(
+        &ctx.pool,
+        &AuditEventFilters {
+            resource_type: Some("inquiry".into()),
+            resource_id: Some(id),
+            outcome: Some(AuditOutcome::Success),
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert!(
+        success.is_empty(),
+        "Denied response emitted a success audit"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sponsor_respond_authority_does_not_expand_legacy_selected_caps() -> TResult<()> {
+    let ctx = TestContext::new().await?;
+    let owner = create_identity(&ctx.pool, "cap_denial").await?;
+    grant_respond(&ctx.pool, owner.id).await?;
+    let (_, action) = setup_pack_action(&ctx.pool, "cap_denial").await?;
+    let responder =
+        owned_execution(&ctx.pool, &action, owner.id, None, vec!["standard".into()]).await?;
+    let creator = create_execution(&ctx.pool, &action).await?;
+    let token = helpers::delegated_source::execution_token(&ctx, responder.id).await?;
+    for body in [respond_body(), json!({"option_ref":"approve"})] {
+        let target = create_inquiry(&ctx.pool, creator.id, Some(owner.id)).await?;
+        assert_eq!(
+            ctx.post(
+                &format!("/api/v1/inquiries/{}/respond", target.id),
+                body,
+                Some(&token)
+            )
+            .await?
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_no_response_effects(&ctx, target.id).await?;
+    }
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_creator_ancestry_cannot_be_treated_as_an_unrelated_tree() -> TResult<()> {
+    let ctx = TestContext::new().await?;
+    let owner = create_identity(&ctx.pool, "missing_parent").await?;
+    let set = grant_respond(&ctx.pool, owner.id).await?;
+    let (_, action) = setup_pack_action(&ctx.pool, "missing_parent").await?;
+    let root = create_execution(&ctx.pool, &action).await?;
+    let creator = ExecutionRepository::create(
+        &ctx.pool,
+        CreateExecutionInput {
+            action: Some(action.id),
+            action_ref: action.r#ref.clone(),
+            parent: Some(root.id),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let responder = owned_execution(&ctx.pool, &action, owner.id, None, vec![set.r#ref]).await?;
+    let target = create_inquiry(&ctx.pool, creator.id, Some(owner.id)).await?;
+    assert!(ExecutionRepository::delete(&ctx.pool, root.id).await?);
+    // Historical visibility still intentionally resolves the last surviving row.
+    let historical =
+        ExecutionRepository::find_authorization_lineages(&ctx.pool, &[creator.id]).await?;
+    assert_eq!(historical[0].anchor_id, creator.id);
+    let token = helpers::delegated_source::execution_token(&ctx, responder.id).await?;
+    assert_eq!(
+        ctx.post(
+            &format!("/api/v1/inquiries/{}/respond", target.id),
+            respond_body(),
+            Some(&token)
+        )
+        .await?
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_no_response_effects(&ctx, target.id).await?;
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_with_execution_update_precedes_response_ancestry_locks() -> TResult<()> {
+    let ctx = TestContext::new().await?;
+    let owner = create_identity(&ctx.pool, "cancel_response").await?;
+    let set = grant_respond(&ctx.pool, owner.id).await?;
+    let (_, action) = setup_pack_action(&ctx.pool, "cancel_response").await?;
+    let creator = create_workflow_child_execution(&ctx.pool, &action, owner.id, "unused").await?;
+    let workflow_id = creator.workflow_task.as_ref().unwrap().workflow_execution;
+    let mut setup = ctx.pool.begin().await?;
+    let target =
+        attune_common::repositories::inquiry_schema::InquirySchemaRepository::create_workflow(
+            &mut setup,
+            CreateWorkflowInquiryInput {
+                created_by_execution: creator.id,
+                purpose: "cancellation".into(),
+                prompt: "Approve?".into(),
+                response_schema: None,
+                response_options: vec![InquiryResponseOption {
+                    r#ref: "approve".into(),
+                    label: "Approve".into(),
+                    style: InquiryResponseOptionStyle::Positive,
+                    response: json!({"approved":true}),
+                }],
+                assigned_to: Some(owner.id),
+                timeout_seconds: None,
+            },
+            ctx.state.config.security.encryption_key.as_deref().unwrap(),
+        )
+        .await?;
+    setup.commit().await?;
+    let responder = owned_execution(&ctx.pool, &action, owner.id, None, vec![set.r#ref]).await?;
+    let token = helpers::delegated_source::execution_token(&ctx, responder.id).await?;
+    let path = format!("/api/v1/inquiries/{}/respond", target.id);
+    let mut cancellation = ctx.pool.begin().await?;
+    WorkflowExecutionRepository::acquire_advisory_lock(&mut cancellation, workflow_id).await?;
+    let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *cancellation)
+        .await?;
+    let cancel = async {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut interval = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                let waiting: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)) AND wait_event = 'advisory')")
+                    .bind(blocker).fetch_one(&ctx.pool).await?;
+                if waiting { break; }
+                interval.tick().await;
+            }
+            // This updates the workflow root execution while holding its graph lock.
+            WorkflowExecutionRepository::cancel_with_prerequisites_with_conn(&mut cancellation, workflow_id, "Owned cancellation race", Some((ExecutionStatus::Cancelled, None))).await?;
+            cancellation.commit().await?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        }).await??;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    };
+    let (response, cancelled) = tokio::join!(ctx.post(&path, respond_body(), Some(&token)), cancel);
+    cancelled?;
+    assert_eq!(response?.status(), StatusCode::CONFLICT);
+    assert_no_response_effects(&ctx, target.id).await?;
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cyclic_response_ancestry_is_bounded_and_has_no_effect() -> TResult<()> {
+    let ctx = TestContext::new().await?;
+    let owner = create_identity(&ctx.pool, "cyclic_response").await?;
+    let set = grant_respond(&ctx.pool, owner.id).await?;
+    let (_, action) = setup_pack_action(&ctx.pool, "cyclic_response").await?;
+    let root = create_execution(&ctx.pool, &action).await?;
+    let creator = ExecutionRepository::create(
+        &ctx.pool,
+        CreateExecutionInput {
+            action: Some(action.id),
+            action_ref: action.r#ref.clone(),
+            parent: Some(root.id),
+            ..Default::default()
+        },
+    )
+    .await?;
+    // Corrupt only this owned fixture: normal repository insertion cannot form
+    // a cycle, but defensive authorization must terminate on malformed lineage.
+    sqlx::query("UPDATE execution SET parent = $2 WHERE id = $1")
+        .bind(root.id)
+        .bind(creator.id)
+        .execute(&ctx.pool)
+        .await?;
+    let responder = owned_execution(&ctx.pool, &action, owner.id, None, vec![set.r#ref]).await?;
+    let target = create_inquiry(&ctx.pool, creator.id, Some(owner.id)).await?;
+    let token = helpers::delegated_source::execution_token(&ctx, responder.id).await?;
+    let path = format!("/api/v1/inquiries/{}/respond", target.id);
+    let human = generate_access_token(owner.id, &owner.login, &jwt_config())?;
+    for credential in [&token, &human] {
+        for body in [respond_body(), json!({"option_ref":"approve"})] {
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                ctx.post(&path, body, Some(credential)),
+            )
+            .await??;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_no_response_effects(&ctx, target.id).await?;
+        }
+    }
+    ctx.cleanup().await?;
     Ok(())
 }

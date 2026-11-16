@@ -398,6 +398,54 @@ impl ExecutionRepository {
             .map_err(Into::into)
     }
 
+    /// Approval requires complete ancestry, unlike historical visibility, which
+    /// deliberately stops at dangling parents after independent retention.
+    pub async fn find_response_lineages(
+        connection: &mut sqlx::PgConnection,
+        ids: &[Id],
+    ) -> Result<Vec<ExecutionLineageRow>> {
+        let rows = Self::find_authorization_lineages(&mut *connection, ids).await?;
+        let anchors = Self::find_authorization_rows(
+            &mut *connection,
+            &rows.iter().map(|row| row.anchor_id).collect::<Vec<_>>(),
+        )
+        .await?;
+        if ids
+            .iter()
+            .any(|id| !rows.iter().any(|row| row.execution_id == *id))
+            || rows.iter().any(|row| {
+                row.cyclic
+                    || !anchors
+                        .iter()
+                        .any(|anchor| anchor.id == row.anchor_id && anchor.parent.is_none())
+            })
+        {
+            return Err(Error::PermissionDenied(
+                "Inquiry response requires complete, acyclic execution lineage".into(),
+            ));
+        }
+        Ok(rows)
+    }
+
+    /// Retain surviving ancestry through an inquiry response transaction. Parent
+    /// links are insertion-time lineage; row locks fence concurrent retention.
+    pub async fn lock_response_lineages(
+        connection: &mut sqlx::PgConnection,
+        ids: &[Id],
+    ) -> Result<Vec<ExecutionLineageRow>> {
+        let _: Vec<Id> = sqlx::query_scalar(
+            "WITH RECURSIVE ancestors AS ( \
+             SELECT id, parent FROM execution WHERE id = ANY($1) \
+             UNION SELECT p.id, p.parent FROM execution p JOIN ancestors a ON a.parent = p.id) \
+             SELECT e.id FROM execution e WHERE e.id IN (SELECT id FROM ancestors) \
+             ORDER BY e.id FOR SHARE",
+        )
+        .bind(ids)
+        .fetch_all(&mut *connection)
+        .await?;
+        Self::find_response_lineages(connection, ids).await
+    }
+
     /// Diagnostic over the same SELECT and binds as the authorization reader.
     pub async fn explain_authorization_lineages<'e, E>(
         executor: E,
@@ -411,6 +459,20 @@ impl ExecutionRepository {
         ))
         .bind(ids)
         .fetch_one(executor)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Retain creator attribution while committing an inquiry response.
+    pub async fn find_response_creator_for_share(
+        connection: &mut sqlx::PgConnection,
+        id: Id,
+    ) -> Result<Option<ExecutionAuthorizationRow>> {
+        sqlx::query_as(
+            "SELECT id, action_ref, parent, executor FROM execution WHERE id = $1 FOR SHARE",
+        )
+        .bind(id)
+        .fetch_optional(connection)
         .await
         .map_err(Into::into)
     }
