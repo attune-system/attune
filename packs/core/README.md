@@ -21,8 +21,20 @@ object on stdin; the text actions keep text output and HTTP emits structured JSO
   Standard Authorization/Cookie/Proxy-Authorization headers are removed across
   origins (scheme/host/port). Other headers and replayed bodies remain application
   data; disable redirects when those data must not reach a redirected destination.
-  This is an intentionally general HTTP client, not a destination allowlist or
-  worker network sandbox. Only HTTP(S) is permitted initially and on every hop.
+  Destinations must be public HTTP(S), initially and on every redirect. Literal
+  addresses and all DNS answers are checked; mixed public/private answers fail
+  closed. The connector uses those checked answers, avoiding a second DNS lookup.
+  Loopback, private, link-local, shared-address, multicast, reserved/documentation
+  ranges and platform metadata addresses (including Azure's 168.63.129.16) are
+  denied. IPv4-mapped IPv6 follows the IPv4 policy; IPv6 must be global unicast
+  outside special-purpose, documentation and 6to4 ranges. Proxies are disabled
+  regardless of environment settings so they cannot resolve/connect around policy.
+  There is no action parameter, environment flag or runtime configuration bypass.
+  Internal automation formerly supported by this general client must use a
+  separately reviewed operator-controlled action/network policy; this action
+  currently provides no internal-destination exception. This changes destination
+  behavior; the flat v1 stdin/response format is unchanged. It is not a network
+  sandbox for other pack code or a defense against a public server proxying requests.
   Non-2xx responses retain status/body and exit1; configuration/transport failures
   return status0 and generic errors without embedding input credential values.
 
