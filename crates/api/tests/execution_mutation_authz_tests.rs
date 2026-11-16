@@ -546,9 +546,20 @@ async fn edited_rule_retains_sponsor_without_borrowing_editor_authority_through_
         "rule_event_editor",
         &ctx.state.jwt_config,
     )?;
-    let bounded =
-        helpers::delegated_source::token(&ctx, owner.id, &["test.rule_event_narrow".into()])
-            .await?;
+    // The source has the SAME action/pack standard scope and covers Execute:
+    // every immediate pre-fix check passes, isolating the durable edit boundary.
+    let source = helpers::delegated_source::create(
+        &ctx.pool,
+        attune_common::repositories::execution::CreateExecutionInput {
+            action: Some(action.id),
+            action_ref: action.r#ref.clone(),
+            executor: Some(owner.id),
+            permission_set_refs: vec!["test.rule_event_narrow".into(), "standard".into()],
+            ..Default::default()
+        },
+    )
+    .await?;
+    let bounded = helpers::delegated_source::execution_token(&ctx, source.id).await?;
     for (bearer, change) in [
         (
             &editor_access,
