@@ -761,6 +761,16 @@ async fn identity_manager_cannot_issue_admin_credentials_or_satisfy_rbac_attribu
         .await
         .unwrap()
         .unwrap();
+    let session = ctx
+        .post(
+            "/auth/login",
+            json!({"login":admin.login,"password":"TestPassword123!"}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(session.status(), StatusCode::OK);
+    let session: Value = session.json().await.unwrap();
     let tokens_before = IntegrationTokenRepository::list_by_identity(&ctx.pool, admin.id)
         .await
         .unwrap();
@@ -846,6 +856,17 @@ async fn identity_manager_cannot_issue_admin_credentials_or_satisfy_rbac_attribu
         .status(),
         StatusCode::OK
     );
+    assert_eq!(
+        ctx.post(
+            "/auth/refresh",
+            json!({"refresh_token":session["data"]["refresh_token"]}),
+            None
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::OK
+    );
     // An authorized attribute change really does satisfy the role predicate.
     assert_eq!(
         ctx.put(
@@ -897,6 +918,48 @@ async fn identity_manager_cannot_issue_admin_credentials_or_satisfy_rbac_attribu
         .unwrap()
         .status(),
         StatusCode::FORBIDDEN
+    );
+    let before_narrow = IdentityRepository::find_by_id(&ctx.pool, manager.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ctx.put(
+            &self_path,
+            json!({"display_name":"Partial execution write","attributes":{"department":"changed"}}),
+            Some(&narrow)
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        serde_json::to_value(&before_narrow).unwrap(),
+        serde_json::to_value(
+            IdentityRepository::find_by_id(&ctx.pool, manager.id)
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        ctx.post(
+            "/api/v1/identities",
+            json!({"login":"execution_injected","attributes":{"department":"security"}}),
+            Some(&narrow)
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(
+        IdentityRepository::find_by_login(&ctx.pool, "execution_injected")
+            .await
+            .unwrap()
+            .is_none()
     );
     // Human credential with both explicit capabilities can recover the account.
     assert_eq!(
@@ -960,6 +1023,38 @@ async fn external_identity_password_reset_is_rejected_without_partial_writes() {
         .unwrap();
     let path = format!("/api/v1/identities/{}", target.id);
     for provider in ["oidc", "ldap"] {
+        // Neither creation nor adding a provider marker to a local identity may
+        // create a local password at the same time, even for an administrator.
+        assert_eq!(ctx.post("/api/v1/identities", json!({"login":format!("new_{provider}"),"password":"DeniedPass123!","attributes":{provider:{"sub":"external"}}}), ctx.token()).await.unwrap().status(), StatusCode::BAD_REQUEST);
+        assert!(
+            IdentityRepository::find_by_login(&ctx.pool, &format!("new_{provider}"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            ctx.put(&path, json!({"attributes":{}}), ctx.token())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let local = IdentityRepository::find_by_id(&ctx.pool, target.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ctx.put(&path, json!({"password":"DeniedPass123!","display_name":"partial","attributes":{provider:{"sub":"external"}}}), ctx.token()).await.unwrap().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::to_value(&local).unwrap(),
+            serde_json::to_value(
+                IdentityRepository::find_by_id(&ctx.pool, target.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap()
+        );
+
         assert_eq!(
             ctx.put(
                 &path,
