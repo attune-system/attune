@@ -243,17 +243,15 @@ pub async fn submit_inquiry_response(
             }
             attune_common::auth::jwt::TokenType::Execution => {
                 if crate::recorded_consumers::is_recorded(user)? {
-                    authority = Some(
-                        crate::recorded_consumers::authorize_target(
-                            &mut transaction,
-                            user,
-                            attune_common::repositories::runtime_target::RuntimeTarget::Inquiry(
-                                inquiry_id,
-                            ),
-                            RbacAction::Respond,
-                        )
-                        .await?,
-                    );
+                    // Retain source authority before workflow/inquiry locks. Resolve
+                    // the target only after the inquiry's exclusive lock, avoiding
+                    // concurrent responders upgrading shared target locks.
+                    authority = user.recorded_runtime_authority(&mut transaction).await?;
+                    if authority.is_none() {
+                        return Err(ApiError::Forbidden(
+                            "Recorded response authority is unavailable".into(),
+                        ));
+                    }
                 } else {
                     let (snapshot, _) = AuthorizationService::retain_legacy_execution_snapshot_on(
                         &mut transaction,
@@ -355,6 +353,26 @@ pub async fn submit_inquiry_response(
             ));
         }
         _ => {}
+    }
+
+    {
+        let (connection, authority) = transaction.authorized_parts();
+        if let Some(authority) = authority {
+            let target =
+                attune_common::repositories::runtime_target::RuntimeTargetRepository::resolve(
+                    connection,
+                    attune_common::repositories::runtime_target::RuntimeTarget::Inquiry(inquiry_id),
+                    authority.credential_binding().sponsor_identity_id,
+                )
+                .await?
+                .ok_or_else(|| ApiError::Forbidden("Inquiry target is unavailable".into()))?;
+            if !authority.allows_new_effect(&target, RbacAction::Respond) {
+                return Err(ApiError::Forbidden(
+                    "Recorded authority does not permit this response".into(),
+                ));
+            }
+            authority.ensure_fresh_on(connection).await?;
+        }
     }
 
     let selected_index =

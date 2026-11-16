@@ -1590,6 +1590,7 @@ async fn non_assignee_access_token_is_forbidden() -> TResult<()> {
 
     let assignee = create_identity(&ctx.pool, "assignee_real").await?;
     let other = create_identity(&ctx.pool, "other_user").await?;
+    grant_respond(&ctx.pool, other.id).await?;
     let (_pack, action) = setup_pack_action(&ctx.pool, "non_assignee").await?;
     let exec = create_execution(&ctx.pool, &action).await?;
     let inquiry = create_inquiry(&ctx.pool, exec.id, Some(assignee.id)).await?;
@@ -1692,10 +1693,17 @@ async fn execution_token_for_different_execution_blocked_when_not_assignee() -> 
 
     let assignee = create_identity(&ctx.pool, "assignee_diff_id").await?;
     let other = create_identity(&ctx.pool, "non_assignee_id").await?;
+    let response_set = grant_respond(&ctx.pool, other.id).await?;
     let (_pack, action) = setup_pack_action(&ctx.pool, "exec_non_assignee").await?;
     let creating_exec = create_execution(&ctx.pool, &action).await?;
-    let other_exec =
-        owned_execution(&ctx.pool, &action, other.id, None, vec!["standard".into()]).await?;
+    let other_exec = owned_execution(
+        &ctx.pool,
+        &action,
+        other.id,
+        None,
+        vec![response_set.r#ref.clone()],
+    )
+    .await?;
     let inquiry = create_inquiry(&ctx.pool, creating_exec.id, Some(assignee.id)).await?;
 
     let token = helpers::delegated_source::execution_token(&ctx, other_exec.id).await?;
@@ -1757,13 +1765,14 @@ async fn nested_execution_token_self_response_is_blocked() -> TResult<()> {
     let ctx = TestContext::new().await?;
 
     let assignee = create_identity(&ctx.pool, "assignee_nested").await?;
+    let response_set = grant_respond(&ctx.pool, assignee.id).await?;
     let (_pack, action) = setup_pack_action(&ctx.pool, "nested").await?;
     let exec_a = owned_execution(
         &ctx.pool,
         &action,
         assignee.id,
         None,
-        vec!["standard".into()],
+        vec![response_set.r#ref.clone()],
     )
     .await?;
     let exec_b = owned_execution(
@@ -1771,7 +1780,7 @@ async fn nested_execution_token_self_response_is_blocked() -> TResult<()> {
         &action,
         assignee.id,
         Some(exec_a.id),
-        vec!["standard".into()],
+        vec![response_set.r#ref.clone()],
     )
     .await?;
     let inquiry = create_inquiry(&ctx.pool, exec_a.id, Some(assignee.id)).await?;
@@ -1805,13 +1814,14 @@ async fn deeply_nested_execution_token_self_response_is_blocked() -> TResult<()>
     let ctx = TestContext::new().await?;
 
     let assignee = create_identity(&ctx.pool, "assignee_deep").await?;
+    let response_set = grant_respond(&ctx.pool, assignee.id).await?;
     let (_pack, action) = setup_pack_action(&ctx.pool, "deep").await?;
     let exec_a = owned_execution(
         &ctx.pool,
         &action,
         assignee.id,
         None,
-        vec!["standard".into()],
+        vec![response_set.r#ref.clone()],
     )
     .await?;
     let exec_b = owned_execution(
@@ -1819,7 +1829,7 @@ async fn deeply_nested_execution_token_self_response_is_blocked() -> TResult<()>
         &action,
         assignee.id,
         Some(exec_a.id),
-        vec!["standard".into()],
+        vec![response_set.r#ref.clone()],
     )
     .await?;
     let exec_c = owned_execution(
@@ -1827,7 +1837,7 @@ async fn deeply_nested_execution_token_self_response_is_blocked() -> TResult<()>
         &action,
         assignee.id,
         Some(exec_b.id),
-        vec!["standard".into()],
+        vec![response_set.r#ref.clone()],
     )
     .await?;
     let inquiry = create_inquiry(&ctx.pool, exec_a.id, Some(assignee.id)).await?;
@@ -2017,6 +2027,111 @@ async fn response_with_explicit_execution_caps_rejects_root_leaf_sibling_and_des
             .status(),
         StatusCode::CONFLICT
     );
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn response_scope_uses_actual_creator_and_role_revocation_is_fresh() -> TResult<()> {
+    use attune_common::repositories::identity::{
+        CreateIdentityRoleAssignmentInput, CreatePermissionSetRoleAssignmentInput,
+        IdentityRoleAssignmentRepository, PermissionSetRoleAssignmentRepository,
+    };
+    let ctx = TestContext::new().await?;
+    let caller = create_identity(&ctx.pool, "scoped_responder").await?;
+    let (pack, action) = setup_pack_action(&ctx.pool, "scoped_response").await?;
+    let (_, foreign) = setup_pack_action(&ctx.pool, "foreign_response").await?;
+    let local_creator = create_execution(&ctx.pool, &action).await?;
+    let foreign_creator = create_execution(&ctx.pool, &foreign).await?;
+    let set = PermissionSetRepository::create(&ctx.pool, CreatePermissionSetInput {
+        r#ref: "test.scoped_responder".into(), pack: None, pack_ref: None,
+        label: None, description: None,
+        grants: json!([{"resource":"inquiries","actions":["respond"],"constraints":{"pack_refs":[pack.r#ref]}}]),
+    }).await?;
+    PermissionSetRoleAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionSetRoleAssignmentInput {
+            permset: set.id,
+            role: "response-reviewer".into(),
+        },
+    )
+    .await?;
+    let role = IdentityRoleAssignmentRepository::create(
+        &ctx.pool,
+        CreateIdentityRoleAssignmentInput {
+            identity: caller.id,
+            role: "response-reviewer".into(),
+            source: "manual".into(),
+            managed: false,
+        },
+    )
+    .await?;
+    let token = generate_access_token(caller.id, &caller.login, &jwt_config())?;
+    let allowed = create_inquiry(&ctx.pool, local_creator.id, Some(caller.id)).await?;
+    assert_eq!(
+        ctx.post(
+            &format!("/api/v1/inquiries/{}/respond", allowed.id),
+            json!({"option_ref":"approve"}),
+            Some(&token)
+        )
+        .await?
+        .status(),
+        StatusCode::OK
+    );
+    let denied = create_inquiry(&ctx.pool, foreign_creator.id, Some(caller.id)).await?;
+    assert_eq!(
+        ctx.post(
+            &format!("/api/v1/inquiries/{}/respond", denied.id),
+            json!({"option_ref":"approve"}),
+            Some(&token)
+        )
+        .await?
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    IdentityRoleAssignmentRepository::delete(&ctx.pool, role.id).await?;
+    let revoked = create_inquiry(&ctx.pool, local_creator.id, Some(caller.id)).await?;
+    assert_eq!(
+        ctx.post(
+            &format!("/api/v1/inquiries/{}/respond", revoked.id),
+            respond_body(),
+            Some(&token)
+        )
+        .await?
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    for id in [denied.id, revoked.id] {
+        let row = InquiryRepository::find_by_id(&ctx.pool, id).await?.unwrap();
+        assert!(row.response.is_none() && row.responded_by.is_none() && row.responded_at.is_none());
+    }
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_authorized_responses_commit_exactly_one_choice() -> TResult<()> {
+    let ctx = TestContext::new().await?;
+    let caller = create_identity(&ctx.pool, "atomic_responder").await?;
+    grant_respond(&ctx.pool, caller.id).await?;
+    let (_, action) = setup_pack_action(&ctx.pool, "atomic_response").await?;
+    let creator = create_execution(&ctx.pool, &action).await?;
+    let target = create_inquiry(&ctx.pool, creator.id, Some(caller.id)).await?;
+    let token = generate_access_token(caller.id, &caller.login, &jwt_config())?;
+    let path = format!("/api/v1/inquiries/{}/respond", target.id);
+    let (first, second) = tokio::join!(
+        ctx.post(&path, respond_body(), Some(&token)),
+        ctx.post(&path, json!({"option_ref":"approve"}), Some(&token)),
+    );
+    let mut statuses = [first?.status().as_u16(), second?.status().as_u16()];
+    statuses.sort();
+    assert_eq!(statuses, [200, 409]);
+    let row = InquiryRepository::find_by_id(&ctx.pool, target.id)
+        .await?
+        .unwrap();
+    assert_eq!(row.responded_by, Some(caller.id));
+    assert_eq!(row.response, Some(json!({"approved":true})));
+    assert!(row.responded_at.is_some());
     ctx.cleanup().await?;
     Ok(())
 }

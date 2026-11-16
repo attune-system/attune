@@ -460,10 +460,14 @@ pub async fn respond_to_inquiry(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Inquiry with ID {} not found", id)))?;
 
-    // Visibility controls response redaction; the shared submission transaction
-    // separately requires Respond and enforces assignment and execution lineage.
-    let mut visibility = InquiryVisibilityEvaluator::new(&state, &user.0).await?;
-    let visibility_decision = visibility.evaluate(&inquiry).await?;
+    // Recorded response authority is checked by the typed submission consumer;
+    // it never borrows sponsor IAM for linked-execution disclosure.
+    let execution_visible = if crate::recorded_consumers::is_recorded(&user.0)? {
+        false
+    } else {
+        let mut visibility = InquiryVisibilityEvaluator::new(&state, &user.0).await?;
+        visibility.evaluate(&inquiry).await?.execution_visible
+    };
 
     let submission = match request {
         InquiryRespondRequest::Response(request) => {
@@ -485,10 +489,7 @@ pub async fn respond_to_inquiry(
         crate::inquiry_response::submit_inquiry_response(&state, submission).await?;
 
     let response = ApiResponse::with_message(
-        redact_inquiry_response(
-            InquiryResponse::from(updated_inquiry),
-            visibility_decision.execution_visible,
-        ),
+        redact_inquiry_response(InquiryResponse::from(updated_inquiry), execution_visible),
         "Response submitted successfully",
     );
 
