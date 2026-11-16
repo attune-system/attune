@@ -1609,7 +1609,18 @@ async fn workflow_task_standard_access_includes_workflow_action_scope() -> TResu
     // A task marker cannot attach another workflow's standard scope to an
     // otherwise correctly selected parent and executable snapshot.
     let mut forged_task = child.workflow_task.clone().unwrap();
-    forged_task.workflow_execution = -1;
+    let other_workflow = WorkflowExecutionRepository::create(
+        &mut *tx,
+        CreateWorkflowExecutionInput {
+            execution: child.id,
+            workflow_def: workflow_action.workflow_def.unwrap(),
+            task_graph: json!({}),
+            variables: json!({}),
+            status: ExecutionStatus::Running,
+        },
+    )
+    .await?;
+    forged_task.workflow_execution = other_workflow.id;
     let forged = ExecutionRepository::create_pinned(
         &mut *tx,
         CreateExecutionInput {
@@ -1634,8 +1645,15 @@ async fn workflow_task_standard_access_includes_workflow_action_scope() -> TResu
         .await
         .is_err()
     );
-    assert!(
+    let unselected =
         attune_common::repositories::delegated_execution::DelegatedExecutionRepository::find(
+            &mut tx, forged.id,
+        )
+        .await?;
+    assert!(!unselected.explicit);
+    assert_eq!(unselected.mode, "recorded");
+    assert!(
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::validate(
             &mut tx, forged.id
         )
         .await
