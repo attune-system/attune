@@ -153,25 +153,7 @@ impl DelegatedExecutionRepository {
         }
         output_grants.retain(|grant| !grant.actions.is_empty());
         if row.permission_set_refs.iter().any(|r| r == "standard") {
-            let mut actions = vec![row.action_ref.clone()];
-            if row.workflow_task.is_some() {
-                if let Some(parent) = row.parent {
-                    actions.push(
-                        ExecutionRepository::find_by_id(&mut *conn, parent)
-                            .await?
-                            .ok_or_else(denied)?
-                            .action_ref,
-                    );
-                }
-            }
-            actions.sort();
-            actions.dedup();
-            let mut packs = actions
-                .iter()
-                .filter_map(|a| a.split_once('.').map(|(p, _)| p.to_owned()))
-                .collect::<Vec<_>>();
-            packs.sort();
-            packs.dedup();
+            let (actions, packs) = Self::standard_scope(conn, &row).await?;
             let mut owners = actions.clone();
             owners.extend(packs.iter().cloned());
             owners.sort();
@@ -404,6 +386,45 @@ impl DelegatedExecutionRepository {
             .bind(execution).bind(attempt).bind(worker).fetch_optional(conn).await?.ok_or_else(denied)?;
         Ok(value)
     }
+    /// Resolve reserved access from persisted lineage, never bearer-supplied refs.
+    /// A workflow child's additional scope belongs to its immediate containing
+    /// workflow, not an arbitrary parent or a caller-selected ancestor.
+    async fn standard_scope(
+        conn: &mut PgConnection,
+        row: &crate::models::Execution,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        let mut actions = vec![row.action_ref.clone()];
+        if let Some(task) = &row.workflow_task {
+            let workflow = super::workflow::WorkflowExecutionRepository::find_by_id(
+                &mut *conn,
+                task.workflow_execution,
+            )
+            .await?
+            .ok_or_else(denied)?;
+            if row.parent != Some(workflow.execution) {
+                return Err(denied());
+            }
+            let parent = ExecutionRepository::find_by_id(&mut *conn, workflow.execution)
+                .await?
+                .ok_or_else(denied)?;
+            actions.push(parent.action_ref);
+        }
+        actions.sort();
+        actions.dedup();
+        let mut packs = actions
+            .iter()
+            .map(|action| {
+                action
+                    .split_once('.')
+                    .map(|(pack, _)| pack.to_owned())
+                    .ok_or_else(denied)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        packs.sort();
+        packs.dedup();
+        Ok((actions, packs))
+    }
+
     pub async fn validate_claims(
         conn: &mut PgConnection,
         claims: &Claims,
@@ -441,6 +462,25 @@ impl DelegatedExecutionRepository {
             || claims.exp <= chrono::Utc::now().timestamp()
         {
             return Err(denied());
+        }
+        if refs
+            .iter()
+            .any(|reference| reference == crate::auth::jwt::STANDARD_EXECUTION_ACCESS_REF)
+        {
+            let (actions, packs) = Self::standard_scope(conn, &row).await?;
+            for (field, expected) in [
+                ("standard_access_action_refs", actions),
+                ("standard_access_pack_refs", packs),
+            ] {
+                let mut claimed: Vec<String> =
+                    serde_json::from_value(meta.get(field).cloned().ok_or_else(denied)?)
+                        .map_err(|_| denied())?;
+                claimed.sort();
+                claimed.dedup();
+                if claimed != expected {
+                    return Err(denied());
+                }
+            }
         }
         if !selection.explicit {
             return Err(denied());
