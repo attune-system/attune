@@ -105,20 +105,21 @@ impl WorkloadSandbox {
         sandbox
             .arg("--chdir")
             .arg(command.get_current_dir().unwrap_or(Path::new("/tmp")));
-        install_workload_arguments(&mut sandbox, &command)?;
+        install_workload_environment(&mut sandbox, &command)?;
         Ok(sandbox)
     }
 }
 
 #[cfg(target_os = "linux")]
-fn install_workload_arguments(sandbox: &mut Command, command: &Command) -> io::Result<()> {
+fn install_workload_environment(sandbox: &mut Command, command: &Command) -> io::Result<()> {
     use std::io::{Seek, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::{ffi::OsStrExt, process::CommandExt};
 
     // Workload loader/runtime controls must never affect the host-side launcher.
-    // Pass all variable values and executable arguments through an unlinked file,
-    // rather than publishing tokens/inline source in Bubblewrap's command line.
+    // Pass variable values through an unlinked file instead of publishing API
+    // tokens in Bubblewrap's command line. Bubblewrap's --args accepts options;
+    // the executable and its ordinary arguments must follow on the main argv.
     let mut arguments = tempfile::tempfile()?;
     let mut append = |value: &std::ffi::OsStr| -> io::Result<()> {
         if value.as_bytes().contains(&0) {
@@ -144,15 +145,15 @@ fn install_workload_arguments(sandbox: &mut Command, command: &Command) -> io::R
         append(key.as_ref())?;
         append(value.as_ref())?;
     }
-    append("--".as_ref())?;
-    append(command.get_program())?;
-    for argument in command.get_args() {
-        append(argument)?;
-    }
     arguments.rewind()?;
     let fd = arguments.as_raw_fd();
     sandbox.env_clear().env("PATH", "/usr/bin:/bin");
-    sandbox.arg("--args").arg(fd.to_string());
+    sandbox
+        .arg("--args")
+        .arg(fd.to_string())
+        .arg("--")
+        .arg(command.get_program())
+        .args(command.get_args());
     // SAFETY: the descriptor is owned by this closure throughout spawn. Only
     // async-signal-safe fcntl executes after fork; parent CLOEXEC is unchanged.
     unsafe {
@@ -174,7 +175,7 @@ fn install_workload_arguments(sandbox: &mut Command, command: &Command) -> io::R
 }
 
 #[cfg(not(target_os = "linux"))]
-fn install_workload_arguments(_: &mut Command, _: &Command) -> io::Result<()> {
+fn install_workload_environment(_: &mut Command, _: &Command) -> io::Result<()> {
     Err(io::Error::other("bubblewrap workloads require Linux"))
 }
 
