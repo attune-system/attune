@@ -13,7 +13,7 @@ use attune_common::repositories::{
 
 mod helpers;
 
-async fn grant(ctx: &TestContext, identity: i64, grants: Value) {
+async fn grant(ctx: &TestContext, identity: i64, grants: Value) -> String {
     let set = PermissionSetRepository::create(
         &ctx.pool,
         CreatePermissionSetInput {
@@ -37,6 +37,7 @@ async fn grant(ctx: &TestContext, identity: i64, grants: Value) {
     .await
     .unwrap();
     AuthorizationService::invalidate_identity_authz_cache(identity).await;
+    set.r#ref
 }
 
 #[tokio::test]
@@ -309,6 +310,13 @@ async fn identity_scopes_use_actual_target_for_profile_and_administration() {
         .status(),
         StatusCode::FORBIDDEN
     );
+    // Permission administration is necessary but never widens identity scopes.
+    grant(
+        &ctx,
+        caller.id,
+        json!([{"resource":"permissions","actions":["manage"]}]),
+    )
+    .await;
     // Explicit login scopes grant other-target recovery, not global access.
     grant(
         &ctx,
@@ -689,5 +697,314 @@ async fn installed_revision_three_admin_receives_explicit_administration() {
         .status(),
         StatusCode::OK
     );
+    ctx.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn identity_manager_cannot_issue_admin_credentials_or_satisfy_rbac_attributes() {
+    use attune_common::repositories::{
+        identity::{
+            CreateIdentityRoleAssignmentInput, CreatePermissionSetRoleAssignmentInput,
+            IdentityRoleAssignmentRepository, PermissionSetRoleAssignmentRepository,
+        },
+        IntegrationTokenRepository,
+    };
+    let ctx = TestContext::new()
+        .await
+        .unwrap()
+        .with_admin_auth()
+        .await
+        .unwrap();
+    let admin = ctx.user.as_ref().unwrap();
+    let manager_token = ctx.create_test_user("delegated_manager").await.unwrap();
+    let manager = IdentityRepository::find_by_login(&ctx.pool, "delegated_manager")
+        .await
+        .unwrap()
+        .unwrap();
+    let refs = grant(
+        &ctx,
+        manager.id,
+        json!([
+            {"resource":"identities","actions":["create","update","manage"]}
+        ]),
+    )
+    .await;
+    // A real role grants read authority only after its attribute predicate matches.
+    let conditional = PermissionSetRepository::create(&ctx.pool, CreatePermissionSetInput {
+        r#ref: "test.attribute_gate".into(), pack:None, pack_ref:None, label:None, description:None,
+        grants:json!([{"resource":"permissions","actions":["read"],"constraints":{"attributes":{"department":"security"}}}]),
+    }).await.unwrap();
+    IdentityRoleAssignmentRepository::create(
+        &ctx.pool,
+        CreateIdentityRoleAssignmentInput {
+            identity: manager.id,
+            role: "conditional_reader".into(),
+            source: "local".into(),
+            managed: false,
+        },
+    )
+    .await
+    .unwrap();
+    PermissionSetRoleAssignmentRepository::create(
+        &ctx.pool,
+        CreatePermissionSetRoleAssignmentInput {
+            role: "conditional_reader".into(),
+            permset: conditional.id,
+        },
+    )
+    .await
+    .unwrap();
+    AuthorizationService::invalidate_identity_authz_cache(manager.id).await;
+    let admin_path = format!("/api/v1/identities/{}", admin.id);
+    let self_path = format!("/api/v1/identities/{}", manager.id);
+    let before = IdentityRepository::find_by_id(&ctx.pool, admin.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let tokens_before = IntegrationTokenRepository::list_by_identity(&ctx.pool, admin.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.get("/api/v1/permissions/roles", Some(&manager_token))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    for (path, body) in [
+        (&admin_path, json!({"password":"AttackerPass123!"})),
+        (
+            &admin_path,
+            json!({"display_name":"Partial","password":"AttackerPass123!"}),
+        ),
+        (&self_path, json!({"attributes":{"department":"security"}})),
+        (&self_path, json!({"password":"AttackerPass123!"})),
+    ] {
+        let response = ctx.put(path, body, Some(&manager_token)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!response.text().await.unwrap().contains("AttackerPass"));
+    }
+    let denied = ctx
+        .post(
+            &format!("{admin_path}/integration-tokens"),
+            json!({"label":"takeover"}),
+            Some(&manager_token),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let body: Value = denied.json().await.unwrap();
+    assert!(body.get("data").is_none_or(Value::is_null));
+    let after = IdentityRepository::find_by_id(&ctx.pool, admin.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&before).unwrap(),
+        serde_json::to_value(&after).unwrap()
+    );
+    assert_eq!(
+        tokens_before.len(),
+        IntegrationTokenRepository::list_by_identity(&ctx.pool, admin.id)
+            .await
+            .unwrap()
+            .len()
+    );
+    assert_eq!(
+        IdentityRepository::find_by_id(&ctx.pool, manager.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .attributes,
+        manager.attributes
+    );
+    assert_eq!(
+        ctx.post(
+            "/api/v1/identities",
+            json!({"login":"injected_identity","attributes":{"department":"security"}}),
+            Some(&manager_token)
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(
+        IdentityRepository::find_by_login(&ctx.pool, "injected_identity")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        ctx.put(
+            &admin_path,
+            json!({"display_name":"Safe profile"}),
+            Some(&manager_token)
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::OK
+    );
+    // An authorized attribute change really does satisfy the role predicate.
+    assert_eq!(
+        ctx.put(
+            &self_path,
+            json!({"attributes":{"department":"security"}}),
+            ctx.token()
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        ctx.get("/api/v1/permissions/roles", Some(&manager_token))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    // Adding permission administration to the owner does not widen its existing
+    // execution credential: only the selected identity-management set is admitted.
+    grant(
+        &ctx,
+        manager.id,
+        json!([{"resource":"permissions","actions":["manage"]}]),
+    )
+    .await;
+    let narrow = helpers::delegated_source::token(&ctx, manager.id, &[refs])
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.put(
+            &admin_path,
+            json!({"password":"AttackerPass123!"}),
+            Some(&narrow)
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        ctx.post(
+            &format!("{admin_path}/integration-tokens"),
+            json!({"label":"narrow"}),
+            Some(&narrow)
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    // Human credential with both explicit capabilities can recover the account.
+    assert_eq!(
+        ctx.put(
+            &admin_path,
+            json!({"password":"RecoveredPass123!"}),
+            Some(&manager_token)
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        ctx.post(
+            "/auth/login",
+            json!({"login":admin.login,"password":"RecoveredPass123!"}),
+            None
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::OK
+    );
+    let issued = ctx
+        .post(
+            &format!("{admin_path}/integration-tokens"),
+            json!({"label":"authorized-recovery"}),
+            Some(&manager_token),
+        )
+        .await
+        .unwrap();
+    assert_eq!(issued.status(), StatusCode::CREATED);
+    let issued: Value = issued.json().await.unwrap();
+    assert_eq!(
+        ctx.post(
+            "/auth/token-login",
+            json!({"token":issued["data"]["token"]}),
+            None
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::OK
+    );
+    ctx.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn external_identity_password_reset_is_rejected_without_partial_writes() {
+    let ctx = TestContext::new()
+        .await
+        .unwrap()
+        .with_admin_auth()
+        .await
+        .unwrap();
+    ctx.create_test_user("external_identity").await.unwrap();
+    let target = IdentityRepository::find_by_login(&ctx.pool, "external_identity")
+        .await
+        .unwrap()
+        .unwrap();
+    let path = format!("/api/v1/identities/{}", target.id);
+    for provider in ["oidc", "ldap"] {
+        assert_eq!(
+            ctx.put(
+                &path,
+                json!({"attributes":{provider:{"sub":"external"}}}),
+                ctx.token()
+            )
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::OK
+        );
+        let before = IdentityRepository::find_by_id(&ctx.pool, target.id)
+            .await
+            .unwrap()
+            .unwrap();
+        for body in [
+            json!({"password":"DeniedPass123!","display_name":"partial"}),
+            json!({"password":"DeniedPass123!","attributes":{}}),
+        ] {
+            assert_eq!(
+                ctx.put(&path, body, ctx.token()).await.unwrap().status(),
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(
+                serde_json::to_value(&before).unwrap(),
+                serde_json::to_value(
+                    IdentityRepository::find_by_id(&ctx.pool, target.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap()
+            );
+        }
+        assert_eq!(
+            ctx.put(
+                &path,
+                json!({"display_name":"External profile"}),
+                ctx.token()
+            )
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::OK
+        );
+    }
     ctx.cleanup().await.unwrap();
 }

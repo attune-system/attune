@@ -5,13 +5,21 @@ administration. Existing global `identities:update` grants now authorize only
 `display_name` edits. They do not authorize password resets, integration-token
 creation/revocation/deletion, freeze/unfreeze, or authorization/provider attributes.
 
-Explicit `identities:manage` authorizes those sensitive operations. This includes
-administration of the caller's own identity; self access is never implicit.
-Grant this permission only to trusted identity administrators: resetting a password
-or minting a token can impersonate the target with its effective permissions.
-The platform `core.admin` catalog includes it. Custom administrators must add it
-explicitly; profile editors must not receive it. Role and permission assignments
-and external identity mappings retain their separate `permissions:manage` gate.
+Explicit `identities:manage` authorizes freeze/unfreeze and integration-token
+revocation/deletion, including on self. Password resets, integration-token
+creation, and arbitrary attribute writes additionally require `permissions:manage`.
+This extra gate applies even to self, unchanged attributes, and apparently
+unprivileged targets: credentials inherit the target's present and future grants,
+and attributes affect RBAC predicates and external account bindings. Identity
+creation with nonempty attributes requires `permissions:manage` too. No privilege
+ceiling is inferred from current role membership. Both checks use the supplied
+credential, so a narrow execution token cannot borrow its owner's IAM authority.
+The platform `core.admin` already holds both permissions; no catalog update is
+needed. Safe display-name edits retain `identities:update`; scoped identity
+management remains required even for permission administrators. Local password
+writes are rejected for OIDC/LDAP identities before any field is changed.
+Role/permission assignments and external identity mappings also require
+`permissions:manage`.
 Mapping creation and deletion require that gate on the integration and mapped
 identity; rebinding requires it on both the old and new mapped identities too.
 Mapping mutation scope resolves persisted identity logins (`refs`) and ownership
