@@ -1233,6 +1233,69 @@ async fn standard_execution_access_covers_action_and_pack_scoped_resources() -> 
     create_artifact_for_action(&ctx.pool, &action, &action_artifact_ref).await?;
     create_artifact_for_pack(&ctx.pool, &unrelated_pack, &unrelated_artifact_ref).await?;
 
+    let protected = KeyRepository::create_encrypted_in_pool(
+        &ctx.pool,
+        CreateKeyInput {
+            local_ref: "protected".into(),
+            owner_type: OwnerType::Pack,
+            owner_pack: Some(salesforce_pack.id),
+            owner_pack_ref: Some(salesforce_pack.r#ref.clone()),
+            owner_identity: None,
+            owner_action: None,
+            owner_action_ref: None,
+            owner_sensor: None,
+            owner_sensor_ref: None,
+            name: "Protected fixture".into(),
+            encrypted: true,
+            encryption_key_hash: None,
+            value: json!({"token": "owned-standard-secret"}),
+        },
+        ctx.state.config.security.encryption_key.as_deref().unwrap(),
+    )
+    .await?;
+    let mut hidden_keys = Vec::new();
+    for (owner_type, owner_identity) in [
+        (OwnerType::System, None),
+        (OwnerType::Identity, Some(identity.id)),
+    ] {
+        hidden_keys.push(
+            KeyRepository::create(
+                &ctx.pool,
+                CreateKeyInput {
+                    local_ref: format!("hidden_{suffix}"),
+                    owner_type,
+                    owner_identity,
+                    owner_pack: None,
+                    owner_pack_ref: None,
+                    owner_action: None,
+                    owner_action_ref: None,
+                    owner_sensor: None,
+                    owner_sensor_ref: None,
+                    name: "Hidden fixture".into(),
+                    encrypted: false,
+                    encryption_key_hash: None,
+                    value: json!("hidden-standard-secret"),
+                },
+            )
+            .await?,
+        );
+    }
+    use attune_common::repositories::cache::{
+        CacheNamespacePolicy, CacheNamespaceRepository, CacheOwnerScope, CreateCacheNamespaceInput,
+    };
+    for pack in [&salesforce_pack, &unrelated_pack] {
+        CacheNamespaceRepository::create(
+            &ctx.pool,
+            CreateCacheNamespaceInput {
+                owner: CacheOwnerScope::pack(pack.id, Some(pack.r#ref.clone())),
+                namespace: "standard_data".into(),
+                policy: CacheNamespacePolicy::default(),
+                mode: Default::default(),
+            },
+        )
+        .await?;
+    }
+
     let execution = create_parent_execution(&ctx.pool, &action, &identity).await?;
     let token = standard_execution_token(
         &ctx.pool,
@@ -1289,6 +1352,48 @@ async fn standard_execution_access_covers_action_and_pack_scoped_resources() -> 
         .status(),
         StatusCode::NOT_FOUND
     );
+
+    let protected_path = format!("/api/v1/keys/{}", protected.r#ref);
+    let protected_body: Value = ctx.get(&protected_path, Some(&token)).await?.json().await?;
+    assert_eq!(
+        protected_body["data"]["value"],
+        json!({"token": "owned-standard-secret"})
+    );
+    assert_eq!(protected_body["data"]["decrypted"], true);
+    // Invoking authority is not a direct human Key grant, even to the owner
+    // whose active identity sponsors this action's standard credential.
+    let access = attune_common::auth::jwt::generate_token(
+        identity.id,
+        &identity.login,
+        &jwt_config(),
+        attune_common::auth::jwt::TokenType::Access,
+    )?;
+    assert_eq!(
+        ctx.get(&protected_path, Some(&access)).await?.status(),
+        StatusCode::NOT_FOUND
+    );
+    for hidden in hidden_keys {
+        let response = ctx
+            .get(&format!("/api/v1/keys/{}", hidden.r#ref), Some(&token))
+            .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: Value = response.json().await?;
+        assert!(!body.to_string().contains("hidden-standard-secret"));
+    }
+    for (pack, expected) in [
+        (&salesforce_pack, StatusCode::OK),
+        (&unrelated_pack, StatusCode::NOT_FOUND),
+    ] {
+        let path = format!(
+            "/api/v1/cache/namespaces/standard_data?owner_type=pack&owner_ref={}",
+            pack.r#ref
+        );
+        assert_eq!(ctx.get(&path, Some(&token)).await?.status(), expected);
+    }
+    let write = ctx.post("/api/v1/cache/namespaces", json!({
+        "owner_type": "pack", "owner_ref": salesforce_pack.r#ref, "namespace": "forbidden_write"
+    }), Some(&token)).await?;
+    assert_eq!(write.status(), StatusCode::FORBIDDEN);
 
     // Signed metadata is still bounded by the persisted execution. This models
     // an overbroad credential producer, not an unauthenticated JWT forgery.
@@ -1380,6 +1485,19 @@ async fn standard_execution_access_covers_action_and_pack_scoped_resources() -> 
         )
         .await?;
     assert_eq!(create_denied.status(), StatusCode::FORBIDDEN);
+    IdentityRepository::update(
+        &ctx.pool,
+        identity.id,
+        attune_common::repositories::identity::UpdateIdentityInput {
+            frozen: Some(true),
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert_eq!(
+        ctx.get(&protected_path, Some(&token)).await?.status(),
+        StatusCode::UNAUTHORIZED
+    );
     ctx.cleanup().await?;
     Ok(())
 }
@@ -1499,6 +1617,24 @@ async fn workflow_task_standard_access_includes_workflow_action_scope() -> TResu
     )
     .await?;
 
+    let missing_workflow_scope = standard_execution_token(
+        &ctx.pool,
+        &identity,
+        &child,
+        &sql_action.r#ref,
+        std::slice::from_ref(&sql_action.r#ref),
+    )
+    .await?;
+    assert_eq!(
+        ctx.get(
+            &format!("/api/v1/keys/{sql_action_key_ref}"),
+            Some(&missing_workflow_scope)
+        )
+        .await?
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
     for key_ref in [
         &workflow_pack_key_ref,
         &workflow_action_key_ref,
@@ -1577,5 +1713,6 @@ async fn workflow_task_standard_access_includes_workflow_action_scope() -> TResu
         )
         .await?;
     assert_eq!(unrelated_create.status(), StatusCode::FORBIDDEN);
+    ctx.cleanup().await?;
     Ok(())
 }
