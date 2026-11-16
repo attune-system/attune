@@ -25,7 +25,7 @@ class NativeHttpTests(unittest.TestCase):
 
     def decode(self, data):
         if self.harness:
-            return json.loads(next(line for line in data.splitlines() if line.startswith(b'{')))
+            return json.loads(next(line[line.index(b'{'):] for line in data.splitlines() if b'{' in line))
         return json.loads(data)
 
     @classmethod
