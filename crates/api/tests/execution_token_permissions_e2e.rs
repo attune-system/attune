@@ -1766,6 +1766,85 @@ async fn workflow_task_standard_access_includes_workflow_action_scope() -> TResu
         )
         .await?;
     assert_eq!(unrelated_create.status(), StatusCode::FORBIDDEN);
+    // The retry producer preserves the containing parent and task metadata,
+    // while selecting a new worker attempt under the original child ceiling.
+    let mut retry_tx = ctx.pool.begin().await?;
+    ExecutionRepository::update(
+        &mut *retry_tx,
+        child.id,
+        attune_common::repositories::execution::UpdateExecutionInput {
+            status: Some(ExecutionStatus::Failed),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let retry = ExecutionRepository::create_retry(
+        &mut *retry_tx,
+        CreateExecutionInput {
+            action: child.action,
+            action_ref: child.action_ref.clone(),
+            executor: child.executor,
+            parent: child.parent,
+            permission_set_refs: child.permission_set_refs.clone(),
+            workflow_task: child.workflow_task.clone(),
+            ..Default::default()
+        },
+        &snapshot,
+        1,
+        Some(1),
+        None,
+        child.id,
+    )
+    .await?;
+    SchemaContractRepository::attach(&mut retry_tx, BindingOwner::Execution, retry.id, &binding)
+        .await?;
+    attune_common::repositories::delegated_execution::DelegatedExecutionRepository::select(
+        &mut retry_tx,
+        retry.id,
+        Some(child.id),
+    )
+    .await?;
+    start_delegated_fixture(&mut retry_tx, retry.id).await?;
+    retry_tx.commit().await?;
+    let retry_token = standard_execution_token(
+        &ctx.pool,
+        &identity,
+        &retry,
+        &sql_action.r#ref,
+        &[sql_action.r#ref.clone(), workflow_action.r#ref.clone()],
+    )
+    .await?;
+    for key_ref in [&workflow_pack_key_ref, &sql_action_key_ref] {
+        assert_eq!(
+            ctx.get(&format!("/api/v1/keys/{key_ref}"), Some(&retry_token))
+                .await?
+                .status(),
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        ctx.get(
+            &format!("/api/v1/keys/{unrelated_key_ref}"),
+            Some(&retry_token)
+        )
+        .await?
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // Independent retention can leave a dangling task marker. Losing proof of
+    // its containing scope invalidates the credential, including own-scope
+    // reads: signed selectors are never a fallback for missing lineage.
+    assert!(WorkflowExecutionRepository::delete(&ctx.pool, wf.id).await?);
+    assert_eq!(
+        ctx.get(
+            &format!("/api/v1/keys/{sql_action_key_ref}"),
+            Some(&retry_token)
+        )
+        .await?
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
     ctx.cleanup().await?;
     Ok(())
 }

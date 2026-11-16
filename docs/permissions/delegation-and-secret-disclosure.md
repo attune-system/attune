@@ -303,7 +303,11 @@ workflow parent or an expanded signed selector fails closed before consumer
 effects. A valid signature alone cannot expand this context. Children cannot
 select `standard` when their source did not select it. Recorded credentials use
 their separately admitted target-aware consumers and never inherit this generic
-metadata path. Freezing the attributable delegated owner or closing/replacing
+metadata path. Missing retained containing-workflow or parent records invalidate
+the delegated credential rather than falling back to its signed selectors.
+Retries retain their original containing parent and task metadata; nested
+workflows add only the immediate containing workflow, as the worker token
+producer does. Freezing the attributable delegated owner or closing/replacing
 the attempt invalidates the credential independently of standard scope.
 
 Within that scope, Keys allow Read/Decrypt, artifacts allow Read/Create/Update/
