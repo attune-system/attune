@@ -256,7 +256,8 @@ impl WorkerService {
                 attune_common::workload_sandbox::WorkloadSandbox::from_environment(
                     config.artifacts.transport
                         == attune_common::artifact_transport::TransportMode::Api,
-                )?,
+                )
+                .map_err(|error| Error::validation(error.to_string()))?,
             );
         config.validate_deployed_pack_transport()?;
         config.validate_deployed_artifact_transport()?;
