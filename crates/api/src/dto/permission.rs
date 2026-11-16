@@ -284,9 +284,9 @@ pub struct CreateIdentityRequest {
 pub struct UpdateIdentityRequest {
     /// Profile field; requires identities:update on the target.
     pub display_name: Option<String>,
-    /// Password reset; requires identities:manage on the target.
+    /// Password reset; requires identities:manage on the target and permissions:manage.
     pub password: Option<String>,
-    /// Authorization/provider attributes; requires identities:manage on the target.
+    /// Authorization/provider attributes; requires identities:manage on the target and permissions:manage.
     pub attributes: Option<JsonValue>,
     /// Administrative freeze state; requires identities:manage on the target.
     pub frozen: Option<bool>,

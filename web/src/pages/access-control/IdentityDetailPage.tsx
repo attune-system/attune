@@ -1219,7 +1219,8 @@ export default function IdentityDetailPage() {
                 </p>
                 <p className="text-xs text-gray-400 mt-1">
                   Creating tokens requires identities:manage for this identity
-                  and enables passwordless API login with its authority.
+                  and permissions:manage. Tokens enable passwordless API login
+                  with its authority.
                 </p>
               </div>
             )}

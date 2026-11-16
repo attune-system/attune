@@ -217,6 +217,11 @@ pub async fn create_identity(
 ) -> ApiResult<impl IntoResponse> {
     authorize_permissions(&state, &user, Resource::Identities, Action::Create).await?;
     request.validate()?;
+    // New identity attributes participate in RBAC and provider account binding.
+    if !request.attributes.is_null() && request.attributes != serde_json::json!({}) {
+        authorize_permissions(&state, &user, Resource::Permissions, Action::Manage).await?;
+    }
+    reject_provider_password(request.password.is_some(), &request.attributes)?;
 
     let password_hash = match request.password {
         Some(password) => Some(hash_password(&password)?),
@@ -285,6 +290,12 @@ pub async fn update_identity(
     if request.password.is_some() || request.attributes.is_some() || request.frozen.is_some() {
         authorize_identity_target(&state, &user, identity_id, Action::Manage).await?;
     }
+    if request.password.is_some() || request.attributes.is_some() {
+        // Target credentials inherit all present and future target authority;
+        // arbitrary attributes also drive RBAC and external account bindings.
+        // No stable privilege ceiling can be proven for either operation.
+        authorize_permissions(&state, &user, Resource::Permissions, Action::Manage).await?;
+    }
     let caller_id = user
         .identity_id()
         .map_err(|_| ApiError::Unauthorized("Invalid user identity".into()))?;
@@ -297,6 +308,11 @@ pub async fn update_identity(
     let existing = IdentityRepository::find_by_id(&state.db, identity_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Identity '{}' not found", identity_id)))?;
+
+    reject_provider_password(request.password.is_some(), &existing.attributes)?;
+    if let Some(attributes) = &request.attributes {
+        reject_provider_password(request.password.is_some(), attributes)?;
+    }
 
     let password_hash = match request.password {
         Some(password) => Some(hash_password(&password)?),
@@ -1236,6 +1252,7 @@ pub async fn create_integration_token(
     Json(request): Json<CreateIntegrationTokenRequest>,
 ) -> ApiResult<impl IntoResponse> {
     authorize_identity_target(&state, &user, identity_id, Action::Manage).await?;
+    authorize_permissions(&state, &user, Resource::Permissions, Action::Manage).await?;
     request.validate()?;
     ensure_identity_exists(&state, identity_id).await?;
 
@@ -1460,6 +1477,16 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/permissions/assignments/{id}",
             delete(delete_permission_assignment),
         )
+}
+
+fn reject_provider_password(password_requested: bool, attributes: &JsonValue) -> ApiResult<()> {
+    if password_requested && (attributes.get("oidc").is_some() || attributes.get("ldap").is_some())
+    {
+        return Err(ApiError::BadRequest(
+            "Passwords cannot be set for externally authenticated identities".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_admin_pagination(query: &PaginationParams) -> ApiResult<()> {

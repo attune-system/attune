@@ -14,7 +14,7 @@ export type UpdateIdentityRequest = {
    */
   frozen?: boolean | null;
   /**
-   * Password reset; requires identities:manage on the target.
+   * Password reset; requires identities:manage on the target and permissions:manage.
    */
   password?: string | null;
 };
