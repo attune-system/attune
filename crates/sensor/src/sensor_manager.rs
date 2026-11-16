@@ -1576,6 +1576,15 @@ impl SensorManager {
         apply_runtime_env_vars(&mut cmd, &exec_config, &pack_dir, env_dir_opt);
         cmd.env_remove("ATTUNE_SENSOR_TRIGGERS")
             .env_remove("ATTUNE_SENSOR_CONFIG_JSON");
+        let mut sandbox_paths = vec![pack_dir.as_path()];
+        if let Some(path) = env_dir_opt {
+            sandbox_paths.push(path);
+        }
+        let mut cmd = Command::from(
+            self.inner
+                .child_environment
+                .sandbox_workload(cmd.into_std(), &sandbox_paths)?,
+        );
         configure_sensor_process(&mut cmd)
             .map_err(|e| anyhow!("Failed to configure sensor process: {}", e))?;
         cmd.kill_on_drop(true);

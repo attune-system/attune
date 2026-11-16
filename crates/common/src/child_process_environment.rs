@@ -40,6 +40,7 @@ const WINDOWS_BASE_VARIABLES: &[&str] = &[
 #[derive(Clone)]
 pub struct ChildProcessEnvironment {
     values: BTreeMap<OsString, OsString>,
+    workload_sandbox: crate::workload_sandbox::WorkloadSandbox,
 }
 
 impl fmt::Debug for ChildProcessEnvironment {
@@ -86,12 +87,31 @@ impl ChildProcessEnvironment {
                 })
             })
             .collect();
-        Ok(Self { values })
+        Ok(Self {
+            values,
+            workload_sandbox: Default::default(),
+        })
     }
 
     /// Clear inheritance before applying the selected baseline and explicit overlays.
     pub fn apply(&self, command: &mut Command) {
         command.env_clear().envs(&self.values);
+    }
+
+    pub fn with_workload_sandbox(
+        mut self,
+        sandbox: crate::workload_sandbox::WorkloadSandbox,
+    ) -> Self {
+        self.workload_sandbox = sandbox;
+        self
+    }
+
+    pub fn sandbox_workload(
+        &self,
+        command: Command,
+        read_paths: &[&std::path::Path],
+    ) -> std::io::Result<Command> {
+        self.workload_sandbox.wrap(command, read_paths)
     }
 
     pub fn get(&self, name: &str) -> Option<&OsStr> {

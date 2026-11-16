@@ -1244,6 +1244,18 @@ impl Runtime for ProcessRuntime {
             }
         };
 
+        let mut sandbox_paths = vec![pack_dir.as_path()];
+        if let Some(path) = env_dir_opt {
+            sandbox_paths.push(path);
+        }
+        if let Some(path) = temp_inline_file.as_deref() {
+            sandbox_paths.push(path);
+        }
+        let cmd = Command::from(
+            self.child_environment
+                .sandbox_workload(cmd.into_std(), &sandbox_paths)?,
+        );
+
         // Log the spawned process accurately instead of using Command's shell-like Debug output.
         info!(
             "Running command: {} (action: '{}', execution_id: {}, working_dir: {:?})",

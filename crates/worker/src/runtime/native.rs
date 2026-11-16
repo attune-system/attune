@@ -105,6 +105,11 @@ impl NativeRuntime {
 
         parameter_passing::apply_runtime_environment(&mut cmd, env, &self.child_environment);
 
+        let cmd = Command::from(
+            self.child_environment
+                .sandbox_workload(cmd.into_std(), &[binary_path.as_path()])?,
+        );
+
         super::process_executor::execute_streaming_cancellable(
             cmd,
             &std::collections::HashMap::new(),
