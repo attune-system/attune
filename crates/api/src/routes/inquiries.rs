@@ -460,38 +460,24 @@ pub async fn respond_to_inquiry(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Inquiry with ID {} not found", id)))?;
 
-    // `InquiryVisibilityEvaluator` also validates that the caller's token
-    // type is one this endpoint accepts (Access or Execution), and computes
-    // `execution_visible` for redacting the linked execution id in the
-    // response payload. Unlike `get_inquiry`/list endpoints, however, the
-    // respond endpoint's *authorization* is governed by `assigned_to`
-    // (below) and the privilege-loop guard, not by the general RBAC
-    // "content visible" predicate. Gating on `content_visible` here was
-    // incorrectly turning "not the assignee, no RBAC read grant" into a 404
-    // (masking the intended 403), and turning unassigned inquiries (any
-    // authenticated caller allowed) into a 404 for callers without a
-    // matching grant.
+    // Visibility controls response redaction; the shared submission transaction
+    // separately requires Respond and enforces assignment and execution lineage.
     let mut visibility = InquiryVisibilityEvaluator::new(&state, &user.0).await?;
     let visibility_decision = visibility.evaluate(&inquiry).await?;
 
-    let responded_by = user.0.identity_id().map_err(|_| {
-        ApiError::Forbidden("Cannot record response: caller has no resolvable identity".to_string())
-    })?;
     let submission = match request {
         InquiryRespondRequest::Response(request) => {
             crate::inquiry_response::InquiryResponseSubmission::Human {
                 inquiry_id: id,
                 response: request.response,
-                identity_id: responded_by,
-                execution_id: user.0.execution_id(),
+                user: Box::new(user.0.clone()),
             }
         }
         InquiryRespondRequest::Option(request) => {
             crate::inquiry_response::InquiryResponseSubmission::HumanOption {
                 inquiry_id: id,
                 option_ref: request.option_ref,
-                identity_id: responded_by,
-                execution_id: user.0.execution_id(),
+                user: Box::new(user.0.clone()),
             }
         }
     };

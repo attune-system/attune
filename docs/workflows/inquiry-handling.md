@@ -134,7 +134,9 @@ Submit a human response with `POST /api/v1/inquiries/{id}/respond`:
 }
 ```
 
-The API validates the response against the inquiry's flat `response_schema`. Only the assigned identity can answer an assigned inquiry. The API rejects self-approval by the creator execution and its descendants.
+The API validates the response against the inquiry's flat `response_schema`. Every direct response (including a fixed option) requires `inquiries:respond` on the actual inquiry and its creator's pack/owner context. Assignment is an additional restriction: only the assigned identity can answer an assigned inquiry. Unassigned inquiries still require the Respond grant. Execution credentials must carry explicit response authority; `standard` does not grant it. Recorded credentials retain their admitted target scope and approval deadlines, and legacy credentials retain their selected caps and live delegation checks.
+
+The API rejects execution self-approval across the entire surviving execution tree, resolving parent links from the repository rather than trusting token lineage. The creator, root, siblings, and descendants cannot answer their own tree's inquiry. An unrelated execution with explicit response authority may answer (and must match any assignment); automated inquiries remain supported. Missing or cyclic execution lineage fails closed.
 
 Fields marked `secret: true` are redacted from inquiry API responses after submission. Workflow context uses the stored value. Fixed response option payloads are visible to inquiry readers, so options must not contain secrets.
 

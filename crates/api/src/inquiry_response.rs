@@ -29,7 +29,8 @@ use tokio::time::{Duration, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    authz::AuthorizationCheck,
+    auth::middleware::AuthenticatedUser,
+    authz::{AuthorizationCheck, AuthorizationService},
     middleware::{ApiError, ApiResult},
     state::AppState,
 };
@@ -38,14 +39,12 @@ pub enum InquiryResponseSubmission {
     Human {
         inquiry_id: Id,
         response: JsonDict,
-        identity_id: Id,
-        execution_id: Option<Id>,
+        user: Box<AuthenticatedUser>,
     },
     HumanOption {
         inquiry_id: Id,
         option_ref: String,
-        identity_id: Id,
-        execution_id: Option<Id>,
+        user: Box<AuthenticatedUser>,
     },
     CallbackAdapter {
         delivery_id: Id,
@@ -143,44 +142,26 @@ pub async fn submit_inquiry_response(
     };
 
     let actor = match &submission {
-        InquiryResponseSubmission::Human {
-            identity_id,
-            execution_id,
-            ..
+        InquiryResponseSubmission::Human { user, .. }
+        | InquiryResponseSubmission::HumanOption { user, .. } => {
+            let identity_id = user.identity_id().map_err(|_| {
+                ApiError::Forbidden("Cannot record response: caller has no identity".into())
+            })?;
+            ResolvedResponseActor {
+                identity_id,
+                execution_id: user.execution_id(),
+                external_actor: None,
+                audit_event: build_human_response_audit(
+                    inquiry_id,
+                    identity_id,
+                    user.execution_id().is_some(),
+                ),
+            }
         }
-        | InquiryResponseSubmission::HumanOption {
-            identity_id,
-            execution_id,
-            ..
-        } => ResolvedResponseActor {
-            identity_id: *identity_id,
-            execution_id: *execution_id,
-            external_actor: None,
-            audit_event: build_human_response_audit(
-                inquiry_id,
-                *identity_id,
-                execution_id.is_some(),
-            ),
-        },
         InquiryResponseSubmission::CallbackAdapter { delivery_id, .. } => {
             let (integration_identity_id, selection) = callback_selection
                 .as_ref()
                 .expect("callback delivery was resolved");
-            state
-                .authorization_service()
-                .authorize_identity_fresh(
-                    &mut transaction,
-                    *integration_identity_id,
-                    AuthorizationCheck {
-                        resource: Resource::Inquiries,
-                        action: RbacAction::Respond,
-                        context: AuthorizationContext {
-                            target_id: Some(inquiry_id),
-                            ..AuthorizationContext::new(*integration_identity_id)
-                        },
-                    },
-                )
-                .await?;
             let resolved = ExternalIdentityMappingRepository::resolve_exact_with_mapping_for_share(
                 &mut transaction,
                 *integration_identity_id,
@@ -220,23 +201,103 @@ pub async fn submit_inquiry_response(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Inquiry with ID {inquiry_id} not found")))?;
 
-    if let Some(execution_id) = actor.execution_id {
-        if initial.created_by_execution == execution_id {
-            return Err(ApiError::Forbidden(
-                "An execution cannot respond to an inquiry it created (privilege loop)".to_string(),
-            ));
-        }
-        if ExecutionRepository::is_in_execution_tree(
+    // Resolve scope from the persisted creator, never from token action/pack claims.
+    let creator = ExecutionRepository::find_authorization_rows(
+        &mut *transaction,
+        &[initial.created_by_execution],
+    )
+    .await?
+    .pop();
+    let packs =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::execution_packs(
             &mut *transaction,
-            initial.created_by_execution,
-            execution_id,
-            false,
+            &[initial.created_by_execution],
         )
-        .await?
+        .await?;
+    let mut context = AuthorizationContext::new(actor.identity_id);
+    context.target_id = Some(inquiry_id);
+    context.target_ref = Some(format!("inquiry:{inquiry_id}"));
+    context.managing_pack_id = packs.get(&initial.created_by_execution).copied();
+    if let Some(creator) = creator {
+        context.pack_ref = creator
+            .action_ref
+            .split_once('.')
+            .map(|(pack, _)| pack.to_owned());
+        context.owner_identity_id = creator.executor;
+        context.execution_owner_identity_id = creator.executor;
+    }
+    let check = AuthorizationCheck {
+        resource: Resource::Inquiries,
+        action: RbacAction::Respond,
+        context,
+    };
+    let mut authority = None;
+    match &submission {
+        InquiryResponseSubmission::Human { user, .. }
+        | InquiryResponseSubmission::HumanOption { user, .. } => match user.claims.token_type {
+            attune_common::auth::jwt::TokenType::Access => {
+                state
+                    .authorization_service()
+                    .authorize_access_fresh(&mut transaction, user, check)
+                    .await?;
+            }
+            attune_common::auth::jwt::TokenType::Execution => {
+                if crate::recorded_consumers::is_recorded(user)? {
+                    authority = Some(
+                        crate::recorded_consumers::authorize_target(
+                            &mut transaction,
+                            user,
+                            attune_common::repositories::runtime_target::RuntimeTarget::Inquiry(
+                                inquiry_id,
+                            ),
+                            RbacAction::Respond,
+                        )
+                        .await?,
+                    );
+                } else {
+                    let (snapshot, _) = AuthorizationService::retain_legacy_execution_snapshot_on(
+                        &mut transaction,
+                        user,
+                    )
+                    .await?;
+                    state.authorization_service().authorize_with_snapshot(
+                        user,
+                        Some(&snapshot),
+                        check,
+                    )?;
+                }
+            }
+            _ => {
+                return Err(ApiError::Forbidden(
+                    "Unsupported inquiry response credential".into(),
+                ))
+            }
+        },
+        InquiryResponseSubmission::CallbackAdapter { .. } => {
+            let (identity, _) = callback_selection.as_ref().expect("callback resolved");
+            state
+                .authorization_service()
+                .authorize_identity_fresh(&mut transaction, *identity, check)
+                .await?;
+        }
+    }
+    let mut transaction =
+        crate::recorded_effect::EffectTransaction::from_authority(transaction, authority);
+
+    if let Some(execution_id) = actor.execution_id {
+        let lineages = ExecutionRepository::lock_response_lineages(
+            &mut transaction,
+            &[initial.created_by_execution, execution_id],
+        )
+        .await?;
+        let creator = lineages
+            .iter()
+            .find(|row| row.execution_id == initial.created_by_execution);
+        let responder = lineages.iter().find(|row| row.execution_id == execution_id);
+        if !matches!((creator, responder), (Some(a), Some(b)) if !a.cyclic && !b.cyclic && a.anchor_id != b.anchor_id)
         {
             return Err(ApiError::Forbidden(
-                "A descendant execution cannot respond to an ancestor's inquiry (privilege loop)"
-                    .to_string(),
+                "An execution cannot respond within its own execution tree (privilege loop)".into(),
             ));
         }
     }
