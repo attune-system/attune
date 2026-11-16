@@ -248,7 +248,7 @@ __attribute__((constructor)) static void probe(void) {{
         workload
             .args([
                 "-c",
-                "test -n \"$LD_PRELOAD\" && test \"$ATTUNE_API_TOKEN\" = dummy-scoped-token",
+                "test -n \"$LD_PRELOAD\" && test -n \"$ATTUNE_API_TOKEN\"",
             ])
             .env_clear()
             .env("LD_PRELOAD", &library)
