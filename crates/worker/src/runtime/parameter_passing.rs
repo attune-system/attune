@@ -606,7 +606,7 @@ mod tests {
     #[tokio::test]
     async fn dotenv_custom_runtime_rejects_injection_before_action_spawn() {
         use crate::runtime::process::ProcessRuntime;
-        use crate::runtime::{ExecutionContext, Runtime};
+        use crate::runtime::{ExecutionContext, OutputFormat, Runtime};
         use attune_common::models::runtime::{InterpreterConfig, RuntimeExecutionConfig};
 
         let root = tempfile::tempdir().unwrap();
@@ -654,6 +654,10 @@ else:
                 context.working_dir = Some(root.path().to_path_buf());
                 context.parameter_delivery = delivery;
                 context.parameter_format = ParameterFormat::Dotenv;
+                context.output_format = OutputFormat::Json;
+                context.output_policy = attune_common::output_policy::OutputPolicy::default()
+                    .resolve(None, OutputFormat::Json)
+                    .unwrap();
                 context.env.insert(
                     "SPAWN_MARKER".to_string(),
                     marker.to_str().unwrap().to_string(),
