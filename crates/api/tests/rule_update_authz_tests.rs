@@ -234,8 +234,7 @@ async fn unauthorized_execution_and_worker_tokens_cannot_update_rule_trace_tag_t
 }
 
 #[tokio::test]
-async fn execution_token_with_rules_update_permission_can_update_trace_tag_template() -> Result<()>
-{
+async fn execution_token_cannot_rewrite_durable_ad_hoc_behavior() -> Result<()> {
     let ctx = TestContext::new().await?;
     let (rule_ref, identity_id) = seed_rule_and_identity(&ctx, "allowed").await?;
     let permission_set_ref = "test.rule_update";
@@ -271,15 +270,12 @@ async fn execution_token_with_rules_update_permission_can_update_trace_tag_templ
             Some(&token),
         )
         .await?;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
     let rule = RuleRepository::find_by_ref(&ctx.pool, &rule_ref)
         .await?
         .expect("seeded rule");
-    assert_eq!(
-        rule.trace_tag_template.as_deref(),
-        Some("authorized-change")
-    );
+    assert_eq!(rule.trace_tag_template, None);
 
     ctx.cleanup().await?;
     Ok(())
@@ -468,7 +464,11 @@ async fn behavioral_edits_require_actual_editor_authority_even_for_same_subject_
             Some(token),
         )
         .await?
-        .assert_status(StatusCode::OK);
+        .assert_status(if index == 0 {
+            StatusCode::OK
+        } else {
+            StatusCode::FORBIDDEN
+        });
     }
     // A retained named selection is checked for every behavioral edit, including
     // conditions and trace, even when the request does not mention the selection.
@@ -890,7 +890,13 @@ async fn full_form_metadata_retains_update_semantics_but_placement_spends_editor
         json!({"sensor_worker_tolerations":[{"key":"dedicated","operator":"exists"}]}),
         json!({"sensor_worker_affinity":{"required":[{"match_labels":{"zone":"other"}}]}}),
     ];
-    for token in &tokens {
+    for (token, placement_denial) in [
+        (&tokens[0], "Insufficient permissions: actions:execute"),
+        (
+            &tokens[1],
+            "Changing ad hoc rule behavior requires an access token",
+        ),
+    ] {
         let before = RuleRepository::find_by_ref(&ctx.pool, &rule_ref)
             .await?
             .unwrap();
@@ -926,7 +932,7 @@ async fn full_form_metadata_retains_update_semantics_but_placement_spends_editor
             let status = denied.status();
             let body: serde_json::Value = denied.json().await?;
             assert_eq!(status, StatusCode::FORBIDDEN, "{}", body["error"]);
-            assert_eq!(body["error"], "Insufficient permissions: actions:execute");
+            assert_eq!(body["error"], placement_denial);
             assert_eq!(
                 serde_json::to_value(
                     RuleRepository::find_by_ref(&ctx.pool, &rule_ref)
@@ -1141,11 +1147,7 @@ async fn config_sources_match_actual_pack_ownership_and_access_role_membership()
                 Some(&execution),
             )
             .await?
-            .assert_status(if allowed {
-                StatusCode::OK
-            } else {
-                StatusCode::FORBIDDEN
-            });
+            .assert_status(StatusCode::FORBIDDEN);
         }
         if let Some(member) = member {
             let mut token_grants = grants;
@@ -1933,15 +1935,15 @@ async fn mixed_enabled_and_behavior_updates_require_both_fresh_access_and_behavi
         ],
     )
     .await?;
-    // This exact delegated credential can change behavior when enabled is not
-    // transitioning. Human IAM held by its subject never permits it to toggle.
+    // Even full current input coverage cannot authorize a durable ad hoc edit
+    // from a bounded Execution credential; no editor ceiling survives in v1.
     ctx.put(
         &format!("/api/v1/rules/{reference}"),
         json!({"trace_tag_template":"delegated behavior"}),
         Some(&delegated),
     )
     .await?
-    .assert_status(StatusCode::OK);
+    .assert_status(StatusCode::FORBIDDEN);
     assert_combined_update_denied_without_rule_effects(
         &ctx,
         &reference,
@@ -1967,10 +1969,7 @@ async fn mixed_enabled_and_behavior_updates_require_both_fresh_access_and_behavi
         .unwrap();
     assert!(!metadata.enabled);
     assert_eq!(metadata.action_params, selector);
-    assert_eq!(
-        metadata.trace_tag_template.as_deref(),
-        Some("delegated behavior")
-    );
+    assert_eq!(metadata.trace_tag_template, disabled.trace_tag_template);
     assert_eq!(metadata.owner_identity, Some(sponsor.id));
 
     let enabled = ctx

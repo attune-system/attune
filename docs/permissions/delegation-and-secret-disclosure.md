@@ -241,7 +241,21 @@ Execute, all input grants, or empty/`standard` selections. Checking these grants
 once would allow future sponsor or role grants to expand a delegated creator's
 authority. Use an authorized Access caller or trusted pack deployment instead;
 creation does not transfer ownership or synthesize a recorded admission.
-Existing behavioral-update and enabled-transition checks remain independent.
+Actual behavioral edits to ad hoc rules also require Access, for the same durable
+sponsorship reason. This includes input, condition, trace, permission-selection,
+component and placement changes, even when a bounded Execution credential covers
+all current inputs. Metadata-only edits and unchanged full-form saves retain
+Rules/Update authorization without requiring Access. Managed rules retain their
+captured input admission checks. Enabled transitions keep their separate Access
+boundary. None of these edits transfers the original owner attribution.
+
+At release 0.11.0, immediate Execute, selected-ref, Key and configuration checks
+already fenced an editor from borrowing the sponsor's current grants. Retaining
+the sponsor and invoking a trusted target with its scoped `standard` capabilities
+are intentional. The residual ad hoc Execution-edit gap was temporal: a persisted
+behavior change could consume later sponsor grants or action defaults beyond its
+originating credential. Requiring Access closes that producer path without
+inventing a second authority format or changing pending enforcement pins.
 
 Queued native workflows publish terminal completions through the same consumer
 as workers, including cancellation and immediate completion. Redelivery can replay
