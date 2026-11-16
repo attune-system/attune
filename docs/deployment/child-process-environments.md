@@ -179,3 +179,6 @@ uses only owned same-UID processes with a dummy initial environment. It observes
 real dumpability, reports host-restricted baseline access honestly, asserts
 protected procfs denial, and exercises cleared child environments and stdin JSON.
 The driver never changes its own dumpability; all children are joined.
+
+For the experimental final-process namespace/filesystem boundary and its remaining
+setup and manager-credential gaps, see [Workload isolation](workload-isolation.md).

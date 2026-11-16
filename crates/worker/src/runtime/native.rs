@@ -105,6 +105,11 @@ impl NativeRuntime {
 
         parameter_passing::apply_runtime_environment(&mut cmd, env, &self.child_environment);
 
+        let cmd = Command::from(
+            self.child_environment
+                .sandbox_workload(cmd.into_std(), &[binary_path.as_path()])?,
+        );
+
         super::process_executor::execute_streaming_cancellable(
             cmd,
             &std::collections::HashMap::new(),
@@ -265,6 +270,44 @@ impl Runtime for NativeRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Linux bubblewrap and unprivileged namespaces"]
+    async fn sandbox_native_preserves_stdin_and_blocks_host_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::TempDir::new().unwrap();
+        let script = root.path().join("action");
+        let hidden = root.path().join("manager-secret");
+        std::fs::write(&hidden, "owned-dummy-secret").unwrap();
+        std::fs::write(&script, format!("#!/bin/sh\nset -eu\n[ ! -e '{}' ]\nread payload\n[ -n \"$payload\" ]\n[ \"$ATTUNE_API_TOKEN\" = scoped-token ]\necho native-ok\n", hidden.display())).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let environment =
+            attune_common::child_process_environment::ChildProcessEnvironment::from_parent([], &[])
+                .unwrap()
+                .with_workload_sandbox(
+                    attune_common::workload_sandbox::WorkloadSandbox::Bubblewrap,
+                );
+        let mut context = ExecutionContext::test_context("test.native".into(), None);
+        context.code_path = Some(script);
+        context
+            .env
+            .insert("ATTUNE_API_TOKEN".into(), "scoped-token".into());
+        context
+            .parameters
+            .insert("message".into(), serde_json::json!("allowed"));
+        let result = NativeRuntime::new()
+            .with_child_environment(environment)
+            .execute(context)
+            .await
+            .unwrap();
+        assert!(result.is_success(), "{}", result.stderr);
+        assert_eq!(result.stdout.trim(), "native-ok");
+        assert_eq!(
+            std::fs::read_to_string(hidden).unwrap(),
+            "owned-dummy-secret"
+        );
+    }
 
     #[cfg(unix)]
     use async_trait::async_trait;

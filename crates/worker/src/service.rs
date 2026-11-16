@@ -251,7 +251,14 @@ impl WorkerService {
                     .as_ref()
                     .map(|worker| worker.passthrough_env.as_slice())
                     .unwrap_or(&[]),
-            )?;
+            )?
+            .with_workload_sandbox(
+                attune_common::workload_sandbox::WorkloadSandbox::from_environment(
+                    config.artifacts.transport
+                        == attune_common::artifact_transport::TransportMode::Api,
+                )
+                .map_err(|error| Error::validation(error.to_string()))?,
+            );
         config.validate_deployed_pack_transport()?;
         config.validate_deployed_artifact_transport()?;
         let configured_api_url = std::env::var("ATTUNE_API_URL").ok();

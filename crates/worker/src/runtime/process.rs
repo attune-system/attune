@@ -1244,6 +1244,26 @@ impl Runtime for ProcessRuntime {
             }
         };
 
+        let mut sandbox_paths = vec![pack_dir.as_path()];
+        if let Some(path) = env_dir_opt {
+            sandbox_paths.push(path);
+        }
+        if let Some(path) = temp_inline_file.as_deref() {
+            sandbox_paths.push(path);
+        }
+        let cmd = match self
+            .child_environment
+            .sandbox_workload(cmd.into_std(), &sandbox_paths)
+        {
+            Ok(command) => Command::from(command),
+            Err(error) => {
+                if let Some(path) = temp_inline_file {
+                    tokio::fs::remove_file(path).await?;
+                }
+                return Err(error.into());
+            }
+        };
+
         // Log the spawned process accurately instead of using Command's shell-like Debug output.
         info!(
             "Running command: {} (action: '{}', execution_id: {}, working_dir: {:?})",
@@ -1396,6 +1416,61 @@ mod tests {
             dependencies: None,
             env_vars: HashMap::new(),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Linux bubblewrap and unprivileged namespaces"]
+    async fn sandbox_process_isolates_files_and_cleans_inline_source_on_rejection() {
+        let root = TempDir::new().unwrap();
+        let pack = root.path().join("test");
+        std::fs::create_dir(&pack).unwrap();
+        let scratch = root.path().join("inline");
+        let hidden = root.path().join("manager-secret");
+        std::fs::write(&hidden, "owned-dummy-secret").unwrap();
+        let environment =
+            attune_common::child_process_environment::ChildProcessEnvironment::from_parent([], &[])
+                .unwrap()
+                .with_workload_sandbox(
+                    attune_common::workload_sandbox::WorkloadSandbox::Bubblewrap,
+                );
+        let runtime = ProcessRuntime::new(
+            "shell".into(),
+            make_shell_config(),
+            root.path().into(),
+            root.path().join("runtime"),
+        )
+        .with_inline_actions_dir(scratch.clone())
+        .with_child_environment(environment);
+        let mut context = ExecutionContext::test_context(
+            "test.action".into(),
+            Some(format!(
+                "test ! -e '{}' && echo process-ok",
+                hidden.display()
+            )),
+        );
+        context.parameters.insert(
+            "secret".into(),
+            serde_json::json!("owned-dummy-input-secret"),
+        );
+        let result = runtime.execute(context).await.unwrap();
+        assert!(result.is_success(), "{}", result.stderr);
+        assert_eq!(result.stdout.trim(), "process-ok");
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+        // Materialization succeeds, but missing selected pack causes wrapping to fail.
+        std::fs::remove_dir(&pack).unwrap();
+        let mut rejected =
+            ExecutionContext::test_context("test.action".into(), Some("echo rejected".into()));
+        rejected.parameters.insert(
+            "secret".into(),
+            serde_json::json!("owned-dummy-input-secret"),
+        );
+        assert!(runtime.execute(rejected).await.is_err());
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read_to_string(hidden).unwrap(),
+            "owned-dummy-secret"
+        );
     }
 
     #[cfg(unix)]
