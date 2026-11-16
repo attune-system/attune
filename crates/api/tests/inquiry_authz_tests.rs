@@ -2253,7 +2253,12 @@ async fn cancellation_with_execution_update_precedes_response_ancestry_locks() -
                 purpose: "cancellation".into(),
                 prompt: "Approve?".into(),
                 response_schema: None,
-                response_options: vec![],
+                response_options: vec![InquiryResponseOption {
+                    r#ref: "approve".into(),
+                    label: "Approve".into(),
+                    style: InquiryResponseOptionStyle::Positive,
+                    response: json!({"approved":true}),
+                }],
                 assigned_to: Some(owner.id),
                 timeout_seconds: None,
             },
@@ -2321,13 +2326,18 @@ async fn cyclic_response_ancestry_is_bounded_and_has_no_effect() -> TResult<()> 
     let target = create_inquiry(&ctx.pool, creator.id, Some(owner.id)).await?;
     let token = helpers::delegated_source::execution_token(&ctx, responder.id).await?;
     let path = format!("/api/v1/inquiries/{}/respond", target.id);
-    let response = tokio::time::timeout(
-        Duration::from_secs(5),
-        ctx.post(&path, respond_body(), Some(&token)),
-    )
-    .await??;
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_no_response_effects(&ctx, target.id).await?;
+    let human = generate_access_token(owner.id, &owner.login, &jwt_config())?;
+    for credential in [&token, &human] {
+        for body in [respond_body(), json!({"option_ref":"approve"})] {
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                ctx.post(&path, body, Some(credential)),
+            )
+            .await??;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_no_response_effects(&ctx, target.id).await?;
+        }
+    }
     ctx.cleanup().await?;
     Ok(())
 }

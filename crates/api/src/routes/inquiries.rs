@@ -460,6 +460,21 @@ pub async fn respond_to_inquiry(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Inquiry with ID {} not found", id)))?;
 
+    // Response redaction can traverse creator ancestry before the submission
+    // transaction. Reject malformed cycles with the cycle-aware reader first;
+    // otherwise the generic visibility owner walk never reaches that guard.
+    // Dangling parents retain their historical visibility semantics here; the
+    // stricter execution-approval completeness check remains in submission.
+    if ExecutionRepository::find_authorization_lineages(&state.db, &[inquiry.created_by_execution])
+        .await?
+        .iter()
+        .any(|lineage| lineage.cyclic)
+    {
+        return Err(ApiError::Forbidden(
+            "Inquiry response requires acyclic creator lineage".into(),
+        ));
+    }
+
     // Recorded response authority is checked by the typed submission consumer;
     // it never borrows sponsor IAM for linked-execution disclosure.
     let execution_visible = if crate::recorded_consumers::is_recorded(&user.0)? {
