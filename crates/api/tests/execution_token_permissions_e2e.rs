@@ -1290,6 +1290,63 @@ async fn standard_execution_access_covers_action_and_pack_scoped_resources() -> 
         StatusCode::NOT_FOUND
     );
 
+    // Signed metadata is still bounded by the persisted execution. This models
+    // an overbroad credential producer, not an unauthenticated JWT forgery.
+    let expanded = standard_execution_token(
+        &ctx.pool,
+        &identity,
+        &execution,
+        &action.r#ref,
+        &[action.r#ref.clone(), unrelated_action.r#ref.clone()],
+    )
+    .await?;
+    for path in [
+        format!("/api/v1/keys/{unrelated_key_ref}"),
+        format!("/api/v1/artifacts/ref/{unrelated_artifact_ref}"),
+    ] {
+        assert_eq!(
+            ctx.get(&path, Some(&expanded)).await?.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let forged_ref = format!("{}.forged_scope", unrelated_action.r#ref);
+    assert_eq!(
+        ctx.post(
+            "/api/v1/artifacts",
+            json!({
+                "ref": forged_ref, "scope": "action", "owner": unrelated_action.r#ref,
+                "type": "progress", "visibility": "private", "data": []
+            }),
+            Some(&expanded)
+        )
+        .await?
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(ArtifactRepository::find_by_ref(&ctx.pool, &forged_ref)
+        .await?
+        .is_none());
+
+    // The signature, attempt, action and selected refs remain valid; only the
+    // independent pack selector is expanded. It must not authorize anything.
+    let mut claims = attune_common::auth::jwt::validate_token(&token, &jwt_config())?;
+    claims.metadata.as_mut().unwrap()["standard_access_pack_refs"] =
+        json!([salesforce_pack.r#ref, unrelated_pack.r#ref]);
+    let expanded_pack = jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+    )?;
+    assert_eq!(
+        ctx.get(
+            &format!("/api/v1/keys/{unrelated_key_ref}"),
+            Some(&expanded_pack)
+        )
+        .await?
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
     let create_allowed = ctx
         .post(
             "/api/v1/artifacts",
@@ -1323,6 +1380,7 @@ async fn standard_execution_access_covers_action_and_pack_scoped_resources() -> 
         )
         .await?;
     assert_eq!(create_denied.status(), StatusCode::FORBIDDEN);
+    ctx.cleanup().await?;
     Ok(())
 }
 
