@@ -958,8 +958,8 @@ mod tests {
     #[test]
     fn cache_grant_matches_owner_type_owner_ref_and_namespace_ref() {
         // Cache grants scope reads/writes by owner type + owner ref, and a
-        // specific namespace via the `refs` constraint (the namespace name is
-        // the authorization target ref). Owner-only grants (no `refs`) cover
+        // specific unmanaged namespace via the `refs` constraint. Managed
+        // namespaces instead use their declaration ref. Owner-only grants cover
         // all namespaces in that owner.
         let grant = Grant {
             resource: Resource::Caches,

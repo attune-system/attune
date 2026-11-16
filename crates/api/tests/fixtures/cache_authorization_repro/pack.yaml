@@ -1,0 +1,6 @@
+ref: cache_auth_repro
+name: Cache authorization reproduction
+version: 1.0.0
+description: Synthetic managed-cache identity mismatch fixture; no external integrations.
+author: Attune tests
+dependencies: []

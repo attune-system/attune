@@ -126,6 +126,7 @@ pub struct CacheNamespaceGrantFilter {
     pub owner: Option<OwnerConstraint>,
     pub owner_types: Option<Vec<OwnerType>>,
     pub owner_refs: Option<Vec<String>>,
+    /// Canonical permission refs: definition_ref when present, otherwise namespace.
     pub namespace_refs: Option<Vec<String>>,
 }
 
@@ -4296,10 +4297,7 @@ fn push_cache_namespace_grant_clause(
         if namespace_refs.is_empty() {
             query.push("FALSE");
         } else {
-            query.push(match grant.context {
-                CacheGrantContext::Delegation => "n.namespace IN (",
-                CacheGrantContext::Recorded => "COALESCE(n.definition_ref, n.namespace) IN (",
-            });
+            query.push("COALESCE(n.definition_ref, n.namespace) IN (");
             {
                 let mut separated = query.separated(", ");
                 for namespace_ref in namespace_refs {
