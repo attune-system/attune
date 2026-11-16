@@ -8,6 +8,21 @@ use attune_common::{
     },
 };
 
+/// Only fixed API error fields are retained in diagnostics; never print the
+/// successful response, source config, authority body or credential.
+async fn response_status(response: helpers::TestResponse) -> Result<(StatusCode, Value)> {
+    let status = response.status();
+    let body: Value = response.json().await?;
+    let error = match body.get("error") {
+        Some(Value::Object(fields)) => {
+            json!({"code": fields.get("code"), "message": fields.get("message")})
+        }
+        Some(Value::String(message)) => json!({"message":message}),
+        _ => Value::Null,
+    };
+    Ok((status, error))
+}
+
 async fn inquiry(fixture: &Fixture, parent: Option<Id>) -> Result<Inquiry> {
     let source =
         ExecutionRepository::find_by_id(&fixture.ctx.pool, fixture.credential.execution_id)
@@ -88,14 +103,19 @@ async fn recorded_response_requires_selected_authority_and_preserves_unrelated_a
                     Some(&fixture.token),
                 )
                 .await?;
+            let (status, error) = response_status(response).await?;
             assert_eq!(
-                response.status(),
+                status,
                 if permitted {
                     StatusCode::OK
                 } else {
                     StatusCode::FORBIDDEN
-                }
+                },
+                "API error fields: {error}"
             );
+            if !permitted {
+                no_effects(&fixture, target.id).await?;
+            }
             let stored = InquiryRepository::find_by_id(&fixture.ctx.pool, target.id)
                 .await?
                 .unwrap();
@@ -266,37 +286,77 @@ async fn recorded_response_approval_expiry_during_target_wait_cannot_commit() ->
         .fetch_one(&mut *blocker)
         .await?;
     let path = format!("/api/v1/inquiries/{}/respond", target.id);
-    let release = async {
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+    let outcome: Result<()> = async {
+        let request = fixture.ctx.post(&path, json!({"option_ref":"approve"}), Some(&fixture.token));
+        tokio::pin!(request);
+        let target_wait = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
             loop {
-                let waiting: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))").bind(blocker_pid).fetch_one(&fixture.ctx.pool).await?;
+                let waiting: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)) AND query LIKE '%FROM inquiry%FOR UPDATE%')").bind(blocker_pid).fetch_one(&fixture.ctx.pool).await?;
                 if waiting { return Ok::<_, Box<dyn std::error::Error>>(()); }
                 interval.tick().await;
             }
-        }).await??;
-        assert!(
-            expires > chrono::Utc::now(),
-            "source did not reach target before approval expired"
-        );
-        // Real elapsed time is the contract: wait until the recorded deadline,
-        // then make the previously blocked target available to the response.
-        let remaining = (expires - chrono::Utc::now()).to_std()?;
-        tokio::time::sleep(remaining + std::time::Duration::from_millis(25)).await;
-        blocker.commit().await?;
-        Ok::<_, Box<dyn std::error::Error>>(())
-    };
-    let (response, released) = tokio::join!(
-        fixture
-            .ctx
-            .post(&path, json!({"option_ref":"approve"}), Some(&fixture.token)),
-        release
-    );
-    released?;
-    assert!(matches!(
-        response?.status(),
-        StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED
-    ));
+        });
+        tokio::select! {
+            response = &mut request => {
+                let (status, error) = response_status(response?).await?;
+                blocker.rollback().await?;
+                Err(format!("Response completed before observed target lock wait: status={status}, API error fields={error}").into())
+            }
+            waited = target_wait => {
+                let wait_result = waited.map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) }).and_then(|value| value);
+                if let Err(error) = wait_result {
+                    blocker.rollback().await?;
+                    return Err(error);
+                }
+                if expires <= chrono::Utc::now() {
+                    blocker.rollback().await?;
+                    return Err("Source did not reach target lock before approval expired".into());
+                }
+                // Real elapsed time is the contract, after the observed source/
+                // target barrier; no increase to the recorded approval lifetime.
+                let remaining = (expires - chrono::Utc::now()).to_std()?;
+                tokio::time::sleep(remaining + std::time::Duration::from_millis(25)).await;
+                blocker.commit().await?;
+                let (status, error) = response_status(request.await?).await?;
+                assert!(matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED), "API error fields: {error}");
+                Ok(())
+            }
+        }
+    }.await;
+    no_effects(&fixture, target.id).await?;
+    fixture.ctx.cleanup().await?;
+    outcome?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn recorded_response_conversion_does_not_admit_unconverted_inquiry_routes() -> Result<()> {
+    let fixture = fixture_with_additional_grants(
+        false,
+        false,
+        &[],
+        &[],
+        &[json!({"resource":"inquiries","actions":["respond"]})],
+    )
+    .await?;
+    let target = inquiry(&fixture, None).await?;
+    for path in [
+        format!("/api/v1/inquiries/{}", target.id),
+        "/api/v1/inquiries".into(),
+    ] {
+        let (status, error) =
+            response_status(fixture.ctx.get(&path, Some(&fixture.token)).await?).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "API error fields: {error}");
+    }
+    for (path, body) in [
+        (format!("/api/v1/inquiries/{}/cancel", target.id), json!({})),
+        ("/api/v1/inquiries".into(), json!({})),
+    ] {
+        let (status, error) =
+            response_status(fixture.ctx.post(&path, body, Some(&fixture.token)).await?).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "API error fields: {error}");
+    }
     no_effects(&fixture, target.id).await?;
     fixture.ctx.cleanup().await?;
     Ok(())

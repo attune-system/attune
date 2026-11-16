@@ -1158,6 +1158,11 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/executions/{execution_id}/inquiries",
             get(list_inquiries_by_execution),
         )
-        .route("/inquiries/{id}/respond", post(respond_to_inquiry))
+        .route(
+            "/inquiries/{id}/respond",
+            post(respond_to_inquiry).layer(axum::Extension(
+                crate::auth::middleware::RecordedRuntimeConsumer::InquiryResponse,
+            )),
+        )
         .route("/inquiries/{id}/cancel", post(cancel_inquiry))
 }
