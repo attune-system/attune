@@ -41,9 +41,9 @@ fn request(p: &Map<String, Value>) -> Result<Value, &'static str> {
     )
 }
 
-fn request_with_resolver(
+fn request_with_resolver<R: reqwest::dns::Resolve + 'static>(
     p: &Map<String, Value>,
-    resolver: std::sync::Arc<dyn reqwest::dns::Resolve>,
+    resolver: std::sync::Arc<R>,
     #[cfg(test)] test_transport: bool,
 ) -> Result<Value, &'static str> {
     let raw = string(p, "url", "")?;
@@ -446,12 +446,15 @@ mod tests {
             listener
         });
         struct RebindingResolver {
-            first: Mutex<bool>,
+            resolutions: std::sync::atomic::AtomicUsize,
             fixture: SocketAddr,
         }
         impl Resolve for RebindingResolver {
             fn resolve(&self, _: Name) -> Resolving {
-                let first = std::mem::replace(&mut *self.first.lock().unwrap(), false);
+                let first = self
+                    .resolutions
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    == 0;
                 let fixture = self.fixture;
                 Box::pin(async move {
                     if first {
@@ -465,14 +468,19 @@ mod tests {
             }
         }
         let resolver = Arc::new(RebindingResolver {
-            first: Mutex::new(true),
+            resolutions: std::sync::atomic::AtomicUsize::new(0),
             fixture: addr,
         });
         let p = json!({"url":format!("http://rebind.invalid:{}/start",addr.port()),"timeout":2});
         let result = request_with_resolver(p.as_object().unwrap(), resolver.clone(), true);
         let listener = server.join().unwrap();
         assert!(result.is_err());
-        assert!(!*resolver.first.lock().unwrap());
+        assert_eq!(
+            resolver
+                .resolutions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
         assert_eq!(
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
