@@ -3971,7 +3971,7 @@ mod tests {
         let script = pack.join("sensor.sh");
         let hidden = root.path().join("manager-secret");
         std::fs::write(&hidden, "owned-dummy-secret").unwrap();
-        std::fs::write(&script, format!("set -eu\n[ ! -e '{}' ]\n[ \"$ATTUNE_API_TOKEN\" = scoped-sensor-token ]\nread bootstrap\n[ \"$bootstrap\" = '{{\"config\":{{}}}}' ]\necho sensor-ok\n", hidden.display())).unwrap();
+        std::fs::write(&script, format!("set -eu\n[ ! -e '{}' ]\n[ \"$ATTUNE_API_TOKEN\" = scoped-sensor-token ]\nbootstrap=$(cat)\n[ \"$bootstrap\" = '{{\"config\":{{}}}}' ]\necho sensor-ok\n", hidden.display())).unwrap();
         let environment = ChildProcessEnvironment::from_parent([], &[])
             .unwrap()
             .with_workload_sandbox(attune_common::workload_sandbox::WorkloadSandbox::Bubblewrap);
