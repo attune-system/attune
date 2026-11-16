@@ -20,7 +20,11 @@ ATTUNE_CORE_ACTION_BIN_ROOT="$PWD/crates/core-actions/target" ATTUNE_TEST_RUN_ID
 
 This lane publishes the actual core tree, checks deterministic archives, safely
 materializes archive bytes, deletes authoring/source releases, and invokes the
-real NativeRuntime with an unusable PATH and no API token. The explicit lane
+real NativeRuntime with an unusable PATH and no API token. For HTTP, the actual
+archived production binary must reject an owned loopback destination with status0,
+exit1 and no TCP connection; this is a denial test, not public-network success.
+Its nonblocking listener and any accepted socket close before assertions, with
+no background server to time out or leak on runtime failure. The explicit lane
 fails if its prebuilt fixtures are missing; it never silently skips or passes.
 Component lifecycle DB regressions verify omission retirement independently.
 

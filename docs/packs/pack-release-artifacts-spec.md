@@ -1361,7 +1361,15 @@ install-scoped test context:
 - Execute `core.noop`.
 - Execute `core.echo` with its declared dotenv input and verify exact text output.
 - Execute `core.sleep` with a short duration.
-- Exercise `core.http_request` against a controlled local endpoint.
+- For core 1.0.8+, execute the actual archived production `core.http_request`
+  against an owned loopback listener and require policy denial with no TCP
+  connection. Close owned listeners/sockets on success and failure before
+  reporting the action result; a mock-server accept timeout is not evidence of
+  action failure. Local successful HTTP/TLS, redirect and credential semantics
+  belong to the separately attributed test-only transport suite, while public
+  address/DNS admission has deterministic policy tests. Neither mock positives
+  nor archive loopback denial establish production public-network success. The
+  formerly general 1.0.7 HTTP action had a different destination contract.
 - Verify `core.generate_ssh_key_pair` with a fixture-scoped equivalent of
   `core.key_creator`, and verify the declared permission ref separately.
 - Run `core.run_agent_command` on a dedicated fixture host that exposes the

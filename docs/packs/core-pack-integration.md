@@ -1,6 +1,7 @@
-> Core 1.0.7 ships only native echo, sleep, and noop actions. References below to
-> HTTP, SSH, agent-command, or pack-installation core actions describe withdrawn
-> examples. Use application-owned packs or the normal pack CLI/API instead.
+> Core 1.0.8 ships native echo, sleep, noop and public-only HTTP actions. SSH,
+> agent-command and pack-installation actions remain withdrawn. Historical
+> HTTP interpreter/mock examples below do not describe production transport;
+> see [current validation contracts](../../packs/core/TESTING.md).
 
 # Core Pack Integration Guide
 
@@ -538,7 +539,9 @@ Keep SQL seed script for initial setup, add filesystem loader for development/up
 
 2. **Action Execution**
    - Execute `core.echo` with parameters
-   - Execute `core.http_request` with mock server
+   - Execute archived `core.http_request` against owned loopback and require
+     denial with no connection (core 1.0.8+). Successful local mock HTTP/TLS
+     cases run through the separately attributed test-only transport.
    - Verify environment variable passing
    - Capture stdout/stderr correctly
 
