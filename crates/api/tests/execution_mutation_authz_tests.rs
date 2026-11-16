@@ -338,7 +338,7 @@ async fn rule_creation_cannot_turn_execution_credentials_into_durable_sponsors()
         owner.id,
         "test.create_sponsor",
         json!([
-            {"resource":"rules","actions":["create","update"]},
+            {"resource":"rules","actions":["create"]},
             {"resource":"actions","actions":["execute"]},
             {"resource":"packs","actions":["read","decrypt"]},
             {"resource":"keys","actions":["read","decrypt"]}
@@ -481,7 +481,7 @@ async fn edited_rule_retains_sponsor_without_borrowing_editor_authority_through_
         owner.id,
         "test.access_event_owner",
         json!([
-            {"resource":"rules","actions":["create"]},
+            {"resource":"rules","actions":["create","update"]},
             {"resource":"actions","actions":["execute"],"constraints":{"refs":[action.r#ref]}}
         ]),
     )
@@ -560,14 +560,16 @@ async fn edited_rule_retains_sponsor_without_borrowing_editor_authority_through_
     )
     .await?;
     let bounded = helpers::delegated_source::execution_token(&ctx, source.id).await?;
-    for (bearer, change) in [
+    for (bearer, change, reason) in [
         (
             &editor_access,
             json!({"action_params":{"message":"attacker-selected"}}),
+            "Insufficient permissions: actions:execute",
         ),
         (
             &bounded,
             json!({"action_params":{"message":"future-durable-authority"}}),
+            "Changing ad hoc rule behavior requires an access token",
         ),
     ] {
         let response = ctx
@@ -579,6 +581,7 @@ async fn edited_rule_retains_sponsor_without_borrowing_editor_authority_through_
             .await?;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let body: Value = response.json().await?;
+        assert_eq!(body["error"], reason);
         assert!(!body.to_string().contains("attacker-selected"));
         let retained = RuleRepository::find_by_ref(&ctx.pool, &rule.r#ref)
             .await?
