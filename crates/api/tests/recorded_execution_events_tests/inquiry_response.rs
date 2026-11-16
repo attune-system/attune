@@ -10,20 +10,33 @@ async fn inquiry(fixture: &Fixture, parent: Option<Id>) -> Result<Inquiry> {
         ExecutionRepository::find_by_id(&fixture.ctx.pool, fixture.credential.execution_id)
             .await?
             .ok_or("source missing")?;
-    let mut tx = fixture.ctx.pool.begin().await?;
-    let creator = ExecutionRepository::create_pinned(
-        &mut *tx,
-        CreateExecutionInput {
-            action: source.action,
-            action_ref: source.action_ref.clone(),
-            parent,
-            executor: Some(fixture.credential.sponsor_identity_id),
-            ..Default::default()
-        },
+    inquiry_with_snapshot(
+        fixture,
+        parent,
         source
             .executable_snapshot
             .as_ref()
             .ok_or("source snapshot missing")?,
+    )
+    .await
+}
+
+async fn inquiry_with_snapshot(
+    fixture: &Fixture,
+    parent: Option<Id>,
+    snapshot: &attune_common::models::ExecutionExecutableSnapshot,
+) -> Result<Inquiry> {
+    let mut tx = fixture.ctx.pool.begin().await?;
+    let creator = ExecutionRepository::create_pinned(
+        &mut *tx,
+        CreateExecutionInput {
+            action: Some(snapshot.executable.action.id),
+            action_ref: snapshot.executable.action.r#ref.clone(),
+            parent,
+            executor: Some(fixture.credential.sponsor_identity_id),
+            ..Default::default()
+        },
+        snapshot,
     )
     .await?;
     let inquiry = InquiryRepository::create(
@@ -139,6 +152,149 @@ async fn recorded_response_rejects_revoked_admission_without_effect() -> Result<
     assert!(
         stored.response.is_none() && stored.responded_by.is_none() && stored.responded_at.is_none()
     );
+    fixture.ctx.cleanup().await?;
+    Ok(())
+}
+
+async fn no_effects(fixture: &Fixture, id: Id) -> Result<()> {
+    use attune_common::{
+        audit::{AuditEventFilters, AuditOutcome, AuditRepository},
+        repositories::execution_secret_value::ExecutionSecretValueRepository,
+    };
+    let row = InquiryRepository::find_by_id(&fixture.ctx.pool, id)
+        .await?
+        .unwrap();
+    assert!(row.response.is_none() && row.responded_by.is_none() && row.responded_at.is_none());
+    assert!(ExecutionSecretValueRepository::find_stored_by_entity(
+        &fixture.ctx.pool,
+        attune_common::secret_values::ENTITY_INQUIRY_RESPONSE,
+        id
+    )
+    .await?
+    .is_empty());
+    fixture.ctx.flush_audit().await?;
+    assert!(AuditRepository::search(
+        &fixture.ctx.pool,
+        &AuditEventFilters {
+            resource_type: Some("inquiry".into()),
+            resource_id: Some(id),
+            outcome: Some(AuditOutcome::Success),
+            ..Default::default()
+        }
+    )
+    .await?
+    .is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn recorded_respond_grant_does_not_cover_a_foreign_inquiry() -> Result<()> {
+    let fixture = fixture_with_additional_grants(
+        false,
+        false,
+        &[],
+        &[],
+        &[json!({"resource":"inquiries","actions":["respond"]})],
+    )
+    .await?;
+    let pack = create_test_pack(&fixture.ctx.pool, "foreign_inquiry").await?;
+    let action = create_test_action(
+        &fixture.ctx.pool,
+        pack.id,
+        &pack.r#ref,
+        "foreign_inquiry.ask",
+    )
+    .await?;
+    activate_test_pack_release_with_projections(
+        &fixture.ctx.pool,
+        &pack,
+        &PackProjectionIds {
+            actions: vec![action.id],
+            ..Default::default()
+        },
+    )
+    .await?;
+    let mut tx = fixture.ctx.pool.begin().await?;
+    let snapshot =
+        ExecutableSnapshotRepository::resolve_for_action_ref(&mut *tx, &action.r#ref).await?;
+    tx.commit().await?;
+    let target = inquiry_with_snapshot(&fixture, None, &snapshot).await?;
+    let response = fixture
+        .ctx
+        .post(
+            &format!("/api/v1/inquiries/{}/respond", target.id),
+            json!({"option_ref":"approve"}),
+            Some(&fixture.token),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    no_effects(&fixture, target.id).await?;
+    fixture.ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn recorded_response_approval_expiry_during_target_wait_cannot_commit() -> Result<()> {
+    // Warm the migration template before starting the actual expiry contract.
+    let warmup = TestContext::new().await?;
+    warmup.cleanup().await?;
+    let fixture = fixture_with_approval_lifetime(
+        false,
+        false,
+        &[],
+        &[],
+        &[json!({"resource":"inquiries","actions":["respond"]})],
+        Some(chrono::Duration::seconds(30)),
+    )
+    .await?;
+    let target = inquiry(&fixture, None).await?;
+    let mut read = fixture.ctx.pool.acquire().await?;
+    let approval =
+        RuntimeAuthorityRepository::find_approval(&mut read, fixture.signing_approval_id)
+            .await?
+            .ok_or("approval missing")?;
+    drop(read);
+    let expires = approval.expires_at.ok_or("expiry missing")?;
+    let mut blocker = fixture.ctx.pool.begin().await?;
+    InquiryRepository::find_by_id_for_update(&mut blocker, target.id)
+        .await?
+        .ok_or("target missing")?;
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await?;
+    let path = format!("/api/v1/inquiries/{}/respond", target.id);
+    let release = async {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
+            loop {
+                let waiting: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))").bind(blocker_pid).fetch_one(&fixture.ctx.pool).await?;
+                if waiting { return Ok::<_, Box<dyn std::error::Error>>(()); }
+                interval.tick().await;
+            }
+        }).await??;
+        assert!(
+            expires > chrono::Utc::now(),
+            "source did not reach target before approval expired"
+        );
+        // Real elapsed time is the contract: wait until the recorded deadline,
+        // then make the previously blocked target available to the response.
+        let remaining = (expires - chrono::Utc::now()).to_std()?;
+        tokio::time::sleep(remaining + std::time::Duration::from_millis(25)).await;
+        blocker.commit().await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    };
+    let (response, released) = tokio::join!(
+        fixture
+            .ctx
+            .post(&path, json!({"option_ref":"approve"}), Some(&fixture.token)),
+        release
+    );
+    released?;
+    assert!(matches!(
+        response?.status(),
+        StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED
+    ));
+    no_effects(&fixture, target.id).await?;
     fixture.ctx.cleanup().await?;
     Ok(())
 }

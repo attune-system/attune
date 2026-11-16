@@ -201,6 +201,27 @@ pub async fn submit_inquiry_response(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Inquiry with ID {inquiry_id} not found")))?;
 
+    // Deny our own tree before retaining source execution locks. Otherwise a
+    // cancelling workflow could own its graph lock while waiting for our source
+    // execution row. Repeat under ancestry locks after the workflow lock below.
+    if let Some(execution_id) = actor.execution_id {
+        let lineages = ExecutionRepository::find_response_lineages(
+            &mut transaction,
+            &[initial.created_by_execution, execution_id],
+        )
+        .await?;
+        let creator = lineages
+            .iter()
+            .find(|row| row.execution_id == initial.created_by_execution);
+        let responder = lineages.iter().find(|row| row.execution_id == execution_id);
+        if !matches!((creator, responder), (Some(a), Some(b)) if !a.cyclic && !b.cyclic && a.anchor_id != b.anchor_id)
+        {
+            return Err(ApiError::Forbidden(
+                "An execution cannot respond within its own execution tree (privilege loop)".into(),
+            ));
+        }
+    }
+
     // Resolve scope from the persisted creator, never from token action/pack claims.
     let creator = ExecutionRepository::find_authorization_rows(
         &mut *transaction,
@@ -218,6 +239,9 @@ pub async fn submit_inquiry_response(
     context.target_id = Some(inquiry_id);
     context.target_ref = Some(format!("inquiry:{inquiry_id}"));
     context.managing_pack_id = packs.get(&initial.created_by_execution).copied();
+    let expected_creator = creator
+        .as_ref()
+        .map(|row| (row.action_ref.clone(), row.executor));
     if let Some(creator) = creator {
         context.pack_ref = creator
             .action_ref
@@ -282,24 +306,6 @@ pub async fn submit_inquiry_response(
     let mut transaction =
         crate::recorded_effect::EffectTransaction::from_authority(transaction, authority);
 
-    if let Some(execution_id) = actor.execution_id {
-        let lineages = ExecutionRepository::lock_response_lineages(
-            &mut transaction,
-            &[initial.created_by_execution, execution_id],
-        )
-        .await?;
-        let creator = lineages
-            .iter()
-            .find(|row| row.execution_id == initial.created_by_execution);
-        let responder = lineages.iter().find(|row| row.execution_id == execution_id);
-        if !matches!((creator, responder), (Some(a), Some(b)) if !a.cyclic && !b.cyclic && a.anchor_id != b.anchor_id)
-        {
-            return Err(ApiError::Forbidden(
-                "An execution cannot respond within its own execution tree (privilege loop)".into(),
-            ));
-        }
-    }
-
     if let Some(workflow_execution_id) = initial.workflow_execution {
         WorkflowExecutionRepository::acquire_advisory_lock(&mut transaction, workflow_execution_id)
             .await?;
@@ -322,6 +328,42 @@ pub async fn submit_inquiry_response(
                 "Owning workflow is cancelling or terminal".to_string(),
             ));
         }
+    }
+
+    if let Some(execution_id) = actor.execution_id {
+        let lineages = ExecutionRepository::lock_response_lineages(
+            &mut transaction,
+            &[initial.created_by_execution, execution_id],
+        )
+        .await?;
+        let creator = lineages
+            .iter()
+            .find(|row| row.execution_id == initial.created_by_execution);
+        let responder = lineages.iter().find(|row| row.execution_id == execution_id);
+        if !matches!((creator, responder), (Some(a), Some(b)) if !a.cyclic && !b.cyclic && a.anchor_id != b.anchor_id)
+        {
+            return Err(ApiError::Forbidden(
+                "An execution cannot respond within its own execution tree (privilege loop)".into(),
+            ));
+        }
+    }
+
+    // Workflow cancellation takes its graph lock before execution-row locks.
+    // Retain the same creator attribution used by the source authorization;
+    // independent retention may remove a row, but cannot substitute its scope.
+    let locked_creator = ExecutionRepository::find_response_creator_for_share(
+        &mut transaction,
+        initial.created_by_execution,
+    )
+    .await?;
+    if locked_creator
+        .as_ref()
+        .map(|row| (row.action_ref.clone(), row.executor))
+        != expected_creator
+    {
+        return Err(ApiError::Conflict(
+            "Inquiry creator changed during response authorization".into(),
+        ));
     }
 
     let inquiry = InquiryRepository::find_by_id_for_update(&mut transaction, inquiry_id)

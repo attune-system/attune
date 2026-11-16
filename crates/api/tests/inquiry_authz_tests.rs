@@ -2135,3 +2135,199 @@ async fn concurrent_authorized_responses_commit_exactly_one_choice() -> TResult<
     ctx.cleanup().await?;
     Ok(())
 }
+
+async fn assert_no_response_effects(ctx: &TestContext, id: i64) -> TResult<()> {
+    use attune_common::{
+        audit::{AuditEventFilters, AuditOutcome, AuditRepository},
+        repositories::execution_secret_value::ExecutionSecretValueRepository,
+    };
+    let row = InquiryRepository::find_by_id(&ctx.pool, id).await?.unwrap();
+    assert!(row.response.is_none() && row.responded_by.is_none() && row.responded_at.is_none());
+    assert!(ExecutionSecretValueRepository::find_stored_by_entity(
+        &ctx.pool,
+        attune_common::secret_values::ENTITY_INQUIRY_RESPONSE,
+        id
+    )
+    .await?
+    .is_empty());
+    ctx.flush_audit().await?;
+    let success = AuditRepository::search(
+        &ctx.pool,
+        &AuditEventFilters {
+            resource_type: Some("inquiry".into()),
+            resource_id: Some(id),
+            outcome: Some(AuditOutcome::Success),
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert!(
+        success.is_empty(),
+        "Denied response emitted a success audit"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sponsor_respond_authority_does_not_expand_legacy_selected_caps() -> TResult<()> {
+    let ctx = TestContext::new().await?;
+    let owner = create_identity(&ctx.pool, "cap_denial").await?;
+    grant_respond(&ctx.pool, owner.id).await?;
+    let (_, action) = setup_pack_action(&ctx.pool, "cap_denial").await?;
+    let responder =
+        owned_execution(&ctx.pool, &action, owner.id, None, vec!["standard".into()]).await?;
+    let creator = create_execution(&ctx.pool, &action).await?;
+    let token = helpers::delegated_source::execution_token(&ctx, responder.id).await?;
+    for body in [respond_body(), json!({"option_ref":"approve"})] {
+        let target = create_inquiry(&ctx.pool, creator.id, Some(owner.id)).await?;
+        assert_eq!(
+            ctx.post(
+                &format!("/api/v1/inquiries/{}/respond", target.id),
+                body,
+                Some(&token)
+            )
+            .await?
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_no_response_effects(&ctx, target.id).await?;
+    }
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_creator_ancestry_cannot_be_treated_as_an_unrelated_tree() -> TResult<()> {
+    let ctx = TestContext::new().await?;
+    let owner = create_identity(&ctx.pool, "missing_parent").await?;
+    let set = grant_respond(&ctx.pool, owner.id).await?;
+    let (_, action) = setup_pack_action(&ctx.pool, "missing_parent").await?;
+    let root = create_execution(&ctx.pool, &action).await?;
+    let creator = ExecutionRepository::create(
+        &ctx.pool,
+        CreateExecutionInput {
+            action: Some(action.id),
+            action_ref: action.r#ref.clone(),
+            parent: Some(root.id),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let responder = owned_execution(&ctx.pool, &action, owner.id, None, vec![set.r#ref]).await?;
+    let target = create_inquiry(&ctx.pool, creator.id, Some(owner.id)).await?;
+    assert!(ExecutionRepository::delete(&ctx.pool, root.id).await?);
+    // Historical visibility still intentionally resolves the last surviving row.
+    let historical =
+        ExecutionRepository::find_authorization_lineages(&ctx.pool, &[creator.id]).await?;
+    assert_eq!(historical[0].anchor_id, creator.id);
+    let token = helpers::delegated_source::execution_token(&ctx, responder.id).await?;
+    assert_eq!(
+        ctx.post(
+            &format!("/api/v1/inquiries/{}/respond", target.id),
+            respond_body(),
+            Some(&token)
+        )
+        .await?
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_no_response_effects(&ctx, target.id).await?;
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_with_execution_update_precedes_response_ancestry_locks() -> TResult<()> {
+    let ctx = TestContext::new().await?;
+    let owner = create_identity(&ctx.pool, "cancel_response").await?;
+    let set = grant_respond(&ctx.pool, owner.id).await?;
+    let (_, action) = setup_pack_action(&ctx.pool, "cancel_response").await?;
+    let creator = create_workflow_child_execution(&ctx.pool, &action, owner.id, "unused").await?;
+    let workflow_id = creator.workflow_task.as_ref().unwrap().workflow_execution;
+    let mut setup = ctx.pool.begin().await?;
+    let target =
+        attune_common::repositories::inquiry_schema::InquirySchemaRepository::create_workflow(
+            &mut setup,
+            CreateWorkflowInquiryInput {
+                created_by_execution: creator.id,
+                purpose: "cancellation".into(),
+                prompt: "Approve?".into(),
+                response_schema: None,
+                response_options: vec![],
+                assigned_to: Some(owner.id),
+                timeout_seconds: None,
+            },
+            ctx.state.config.security.encryption_key.as_deref().unwrap(),
+        )
+        .await?;
+    setup.commit().await?;
+    let responder = owned_execution(&ctx.pool, &action, owner.id, None, vec![set.r#ref]).await?;
+    let token = helpers::delegated_source::execution_token(&ctx, responder.id).await?;
+    let path = format!("/api/v1/inquiries/{}/respond", target.id);
+    let mut cancellation = ctx.pool.begin().await?;
+    WorkflowExecutionRepository::acquire_advisory_lock(&mut cancellation, workflow_id).await?;
+    let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *cancellation)
+        .await?;
+    let cancel = async {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut interval = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                let waiting: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)) AND wait_event = 'advisory')")
+                    .bind(blocker).fetch_one(&ctx.pool).await?;
+                if waiting { break; }
+                interval.tick().await;
+            }
+            // This updates the workflow root execution while holding its graph lock.
+            WorkflowExecutionRepository::cancel_with_prerequisites_with_conn(&mut cancellation, workflow_id, "Owned cancellation race", Some((ExecutionStatus::Cancelled, None))).await?;
+            cancellation.commit().await?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        }).await??;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    };
+    let (response, cancelled) = tokio::join!(ctx.post(&path, respond_body(), Some(&token)), cancel);
+    cancelled?;
+    assert_eq!(response?.status(), StatusCode::CONFLICT);
+    assert_no_response_effects(&ctx, target.id).await?;
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cyclic_response_ancestry_is_bounded_and_has_no_effect() -> TResult<()> {
+    let ctx = TestContext::new().await?;
+    let owner = create_identity(&ctx.pool, "cyclic_response").await?;
+    let set = grant_respond(&ctx.pool, owner.id).await?;
+    let (_, action) = setup_pack_action(&ctx.pool, "cyclic_response").await?;
+    let root = create_execution(&ctx.pool, &action).await?;
+    let creator = ExecutionRepository::create(
+        &ctx.pool,
+        CreateExecutionInput {
+            action: Some(action.id),
+            action_ref: action.r#ref.clone(),
+            parent: Some(root.id),
+            ..Default::default()
+        },
+    )
+    .await?;
+    // Corrupt only this owned fixture: normal repository insertion cannot form
+    // a cycle, but defensive authorization must terminate on malformed lineage.
+    sqlx::query("UPDATE execution SET parent = $2 WHERE id = $1")
+        .bind(root.id)
+        .bind(creator.id)
+        .execute(&ctx.pool)
+        .await?;
+    let responder = owned_execution(&ctx.pool, &action, owner.id, None, vec![set.r#ref]).await?;
+    let target = create_inquiry(&ctx.pool, creator.id, Some(owner.id)).await?;
+    let token = helpers::delegated_source::execution_token(&ctx, responder.id).await?;
+    let path = format!("/api/v1/inquiries/{}/respond", target.id);
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        ctx.post(&path, respond_body(), Some(&token)),
+    )
+    .await??;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_no_response_effects(&ctx, target.id).await?;
+    ctx.cleanup().await?;
+    Ok(())
+}
