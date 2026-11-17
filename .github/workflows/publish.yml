@@ -1,9 +1,7 @@
 name: Publish Attune
 
 permissions:
-  actions: read
-  contents: write
-  packages: write
+  contents: read
 
 concurrency:
   group: publish-${{ github.ref }}
@@ -231,6 +229,9 @@ jobs:
 
   release-gate:
     name: Verify Release Commit
+    permissions:
+      contents: read
+      actions: read # Query CI runs for the release commit.
     runs-on: ubuntu-24.04
     needs:
       - metadata
@@ -1561,6 +1562,9 @@ jobs:
 
   publish-rust-images:
     name: Publish ${{ matrix.image.name }} (${{ matrix.arch }})
+    permissions:
+      contents: read
+      packages: write # Allow the GITHUB_TOKEN registry-auth fallback.
     runs-on: ${{ matrix.runner_label }}
     needs:
       - metadata
@@ -1748,6 +1752,9 @@ jobs:
 
   publish-web-images:
     name: Publish web (${{ matrix.arch }})
+    permissions:
+      contents: read
+      packages: write # Allow the GITHUB_TOKEN registry-auth fallback.
     runs-on: ${{ matrix.runner_label }}
     needs:
       - metadata
@@ -1861,6 +1868,8 @@ jobs:
 
   publish-rust-manifests:
     name: Publish Rust manifest ${{ matrix.repository }}
+    permissions:
+      packages: write # Publish manifests; this job does not check out source.
     runs-on: ubuntu-24.04
     needs:
       - metadata
@@ -1967,6 +1976,8 @@ jobs:
 
   publish-web-manifest:
     name: Publish Web Manifest
+    permissions:
+      packages: write # Publish manifests; this job does not check out source.
     runs-on: ubuntu-24.04
     needs:
       - metadata
@@ -2011,6 +2022,9 @@ jobs:
 
   publish-github-release:
     name: Publish GitHub Release
+    permissions:
+      contents: write # Create/finalize the release and upload its assets.
+      actions: read # Inventory this run's optional CLI artifacts.
     runs-on: ubuntu-24.04
     # Desktop and package jobs may fail, but required release inputs may not.
     if: >-
