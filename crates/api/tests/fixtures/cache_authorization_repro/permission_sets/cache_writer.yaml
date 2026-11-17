@@ -1,0 +1,9 @@
+ref: cache_auth_repro.cache_writer
+label: Synthetic cache writer
+grants:
+  - resource: caches
+    actions: [read, create, update]
+    constraints:
+      owner_types: [pack]
+      owner_refs: [cache_auth_repro]
+      refs: [cache_auth_repro.users, cache_auth_repro.control]

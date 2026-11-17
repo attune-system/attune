@@ -713,6 +713,15 @@ requirements.
 - Cache reads should be scoped to the cache owner and namespace.
 - Cache writes and generation promotion should require an explicit writer
   grant, constrained to the intended owner/namespace.
+- Existing-cache `constraints.refs` match `definition_ref` for a pack-managed
+  cache and the normalized `namespace` for an unmanaged cache. Admission,
+  individual reads/writes, and namespace listing use this same canonical
+  permission reference. HTTP paths and namespace filters still use `namespace`.
+  For example, a declaration `salesforce.users` with namespace `salesforce.crm.users`
+  requires `refs: [salesforce.users]` together with its owner constraints.
+  The namespace is not an alternate permission alias for that managed cache.
+  Prospective API namespace creation uses the requested namespace because no
+  declaration-bound target exists yet; owner and creation checks still apply.
 - The reserved `standard` execution access should grant read-only cache access
   for the executing action and pack, plus the containing workflow action/pack
   when those refs are included in the execution token's standard-access
@@ -1203,12 +1212,12 @@ token should silently expand that authority.
    actions: `Read` for entries and scans, `Create` for namespaces and staging
    generations, `Update` for ingestion and promotion, and `Delete` for
    explicit deletion. Do not reuse `Resource::Keys`.
-2. Represent a specific namespace through the existing `refs` constraint by
-   setting the authorization target ref to the normalized namespace name and
-   combining it with owner-type/owner-ref constraints. If generic refs cannot
-   express this cleanly, add a cache-specific namespace constraint. Owner-only
+2. Represent a specific existing cache through the existing `refs` constraint by
+   setting the authorization target ref to `COALESCE(definition_ref, namespace)`
+   and combining it with owner-type/owner-ref constraints. Prospective namespace
+   creation uses the normalized requested namespace. Owner-only
    grants intentionally cover all namespaces in that owner; writers should
-   normally include the namespace ref. Compile the supported constraint subset
+   normally include the canonical cache ref. Compile the supported constraint subset
    into SQL predicates in the cache repository, following the key-listing
    fail-closed pattern.
 3. Extend `execution_standard_access_grants` so `standard` grants

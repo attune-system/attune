@@ -727,9 +727,9 @@ async fn resolve_cache_effect_target(
         if !target.accepts_new_effects() {
             return Err(CacheApiError::namespace_deleted());
         }
-        let mut context = target.context().clone();
-        context.target_ref = Some(namespace.into());
-        prepared.authority.authorize_resolved(action, context)?;
+        prepared
+            .authority
+            .authorize_resolved(action, target.context().clone())?;
     } else {
         return Err(CacheApiError::forbidden("Cache authority is unavailable"));
     }

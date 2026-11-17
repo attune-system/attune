@@ -151,6 +151,20 @@
   - Operator-approved JWT signing can use `keys:use` or scoped `keys:read` without disclosing private-key material. Raw delivery requires read and decrypt authority.
   - Identity-owned keys should be visible only to the owning identity unless explicit scoped grants allow otherwise
 
+# Caches
+
+Cache read/list authority uses the same canonical resource reference as cache
+admission and individual operations: `definition_ref` for a managed cache, or
+`namespace` when no definition ref exists. `constraints.refs` match that reference
+exactly, together with owner and managing-pack constraints. A managed cache's
+namespace remains its API address and is not a second permission alias.
+Delegated and recorded authority use this reference consistently while retaining
+their independent grant, ownership, availability, and admission fences.
+
+Prospective API namespace creation checks the requested namespace and resolved
+owner. See [cache authorization](../KEY_CACHE.md#authorization-and-execution-access)
+for examples and execution/sensor access rules.
+
 # Work Queues (Suggested Implementation)
 - All authenticated users should be allowed to list/search for queues
 - Row-level results will be restricted in the following manner:

@@ -1,0 +1,13 @@
+ref: cache_auth_repro.probe
+label: Probe managed cache generation authorization
+runner_type: cache_auth_repro.python
+entry_point: probe.py
+parameter_delivery: stdin
+parameter_format: json
+output_format: json
+default_execution_permission_set_refs: [standard, cache_auth_repro.cache_writer]
+parameters:
+  namespace:
+    type: string
+    default: repro.users
+    enum: [repro.users, cache_auth_repro.control]

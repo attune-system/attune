@@ -1,0 +1,5 @@
+ref: cache_auth_repro.users
+namespace: repro.users
+mode: snapshot
+owner_type: pack
+owner_ref: cache_auth_repro

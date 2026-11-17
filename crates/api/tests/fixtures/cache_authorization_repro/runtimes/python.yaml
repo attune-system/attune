@@ -1,0 +1,15 @@
+ref: cache_auth_repro.python
+name: Cache authorization Python
+description: Minimal Python runtime for the self-contained synthetic probe.
+distributions:
+  verification:
+    commands:
+      - binary: python3
+        args: ["--version"]
+        exit_code: 0
+        pattern: "Python 3\\."
+execution_config:
+  interpreter:
+    binary: python3
+    args: ["-u"]
+    file_extension: ".py"
