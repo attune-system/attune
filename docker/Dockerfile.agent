@@ -243,6 +243,8 @@ ENTRYPOINT ["/usr/local/bin/attune-agent"]
 #         condition: service_completed_successfully
 FROM busybox:1.36 AS agent-init
 
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
 COPY --from=builder /build/attune /usr/local/bin/attune
 COPY --from=builder /build/attune-agent /usr/local/bin/attune-agent
 COPY --from=builder /build/attune-sensor-agent /usr/local/bin/attune-sensor-agent

@@ -25,7 +25,7 @@ RUN mkdir -p /usr/local/share/attune-base-receipt && \
     dpkg-query -W > /usr/local/share/attune-base-receipt/packages.txt
 FROM ${SERVICE_BASE} AS service
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl3 ca-certificates curl git && rm -rf /var/lib/apt/lists/* && \
+    bubblewrap libssl3 ca-certificates curl git && rm -rf /var/lib/apt/lists/* && \
     groupadd --gid 1000 attune && useradd --uid 1000 --gid 1000 --create-home attune && \
     mkdir -p /usr/local/share/attune-base-receipt && \
     dpkg-query -W > /usr/local/share/attune-base-receipt/packages.txt && \

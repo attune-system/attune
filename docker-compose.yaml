@@ -319,6 +319,7 @@ services:
       # Message Queue
       ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672
       # Worker config override
+      ATTUNE__ARTIFACTS__TRANSPORT: api
       ATTUNE__WORKER__WORKER_TYPE: container
     ports:
       - "8080:8080"
@@ -373,6 +374,7 @@ services:
       ATTUNE__DATABASE__URL: postgresql://attune:attune@postgres:5432/attune
       ATTUNE__DATABASE__SCHEMA: attune
       ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672
+      ATTUNE__ARTIFACTS__TRANSPORT: api
       ATTUNE__WORKER__WORKER_TYPE: container
       ATTUNE_API_URL: http://api:8080
     volumes:
@@ -425,6 +427,7 @@ services:
       ATTUNE__DATABASE__URL: postgresql://attune:attune@postgres:5432/attune
       ATTUNE__DATABASE__SCHEMA: attune
       ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672
+      ATTUNE__ARTIFACTS__TRANSPORT: api
       ATTUNE__WORKER__WORKER_TYPE: container
       ATTUNE_API_URL: http://api:8080
     volumes:
@@ -765,6 +768,7 @@ services:
       ATTUNE__DATABASE__URL: postgresql://attune:attune@postgres:5432/attune
       ATTUNE__DATABASE__SCHEMA: attune
       ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672
+      ATTUNE__ARTIFACTS__TRANSPORT: api
       ATTUNE__WORKER__WORKER_TYPE: container
       ATTUNE_API_URL: http://attune-api:8080
       ATTUNE_NOTIFIER_WS_URL: ws://notifier:8081/ws # nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- Explicit plaintext endpoint on the internal Docker network.
@@ -851,6 +855,7 @@ services:
       ATTUNE__DATABASE__URL: postgresql://attune:attune@postgres:5432/attune
       ATTUNE__DATABASE__SCHEMA: attune
       ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672
+      ATTUNE__ARTIFACTS__TRANSPORT: api
       ATTUNE__WORKER__WORKER_TYPE: container
     ports:
       - "8081:8081"

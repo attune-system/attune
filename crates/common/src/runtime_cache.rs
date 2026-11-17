@@ -291,6 +291,7 @@ impl RuntimeCacheKey {
     }
 
     pub fn publish(&self, temporary: &Path, destination: &Path) -> std::io::Result<()> {
+        crate::workload_sandbox::validate_staging(temporary)?;
         if !self.is_ready(temporary) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

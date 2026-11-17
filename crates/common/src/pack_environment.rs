@@ -808,6 +808,13 @@ impl PackEnvironmentManager {
     }
 
     async fn execute_installer_action(&self, action: &InstallerAction) -> Result<String> {
+        if !matches!(
+            crate::workload_sandbox::WorkloadSandbox::from_environment(true)
+                .map_err(|error| Error::validation(error.to_string()))?,
+            crate::workload_sandbox::WorkloadSandbox::Disabled
+        ) {
+            return Err(Error::validation("Legacy runtime installers are unsupported in isolated mode; use execution_config environment/dependencies with staged publication"));
+        }
         log_installer_execution(action);
 
         // nosemgrep: rust.actix.command-injection.rust-actix-command-injection.rust-actix-command-injection -- action.command is accepted only after strict validation of executable shape and allowed path roots.

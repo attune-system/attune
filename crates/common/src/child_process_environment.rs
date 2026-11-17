@@ -127,6 +127,16 @@ impl ChildProcessEnvironment {
         )
     }
 
+    pub fn sandbox_setup(
+        &self,
+        command: Command,
+        pack: &std::path::Path,
+        staging: &std::path::Path,
+    ) -> std::io::Result<Command> {
+        self.workload_sandbox
+            .wrap_stage(command, &[pack], &[staging])
+    }
+
     pub fn get(&self, name: &str) -> Option<&OsStr> {
         #[cfg(windows)]
         {

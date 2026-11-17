@@ -400,8 +400,12 @@ async fn run_verification_command(
 ) -> std::result::Result<bool, String> {
     let mut command = Command::new(&cmd.binary);
     child_environment.apply(command.as_std_mut());
+    command.args(&cmd.args);
+    let mut command = child_environment
+        .sandbox_workload(command.into_std(), &[])
+        .map(Command::from)
+        .map_err(|error| error.to_string())?;
     let output = command
-        .args(&cmd.args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
@@ -447,8 +451,12 @@ async fn run_verification_command(
 async fn run_basic_binary_check(binary: &str, child_environment: &ChildProcessEnvironment) -> bool {
     let mut command = Command::new(binary);
     child_environment.apply(command.as_std_mut());
+    command.arg("--version");
+    let Ok(command) = child_environment.sandbox_workload(command.into_std(), &[]) else {
+        return false;
+    };
+    let mut command = Command::from(command);
     match command
-        .arg("--version")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)

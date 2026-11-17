@@ -459,15 +459,28 @@ impl TestExecutor {
             .env("LANG", "C.UTF-8")
             .env("LC_ALL", "C.UTF-8")
             .args(args)
-            .current_dir(working_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null());
-        cmd.kill_on_drop(true);
+            .current_dir(working_dir);
+
         if let Some(candidate) = &self.candidate_effects {
             cmd.env("ATTUNE_CANDIDATE_EFFECTS_URL", &candidate.url)
                 .env("ATTUNE_CANDIDATE_EFFECTS_TOKEN", &candidate.token);
         }
+        let runtime = runtime_bin_dir.and_then(Path::parent);
+        let mut reads = vec![working_dir];
+        if let Some(runtime) = runtime {
+            reads.push(runtime);
+        }
+        let sandbox = crate::workload_sandbox::WorkloadSandbox::from_environment(true)
+            .map_err(|error| Error::validation(error.to_string()))?;
+        let mut cmd = Command::from(
+            sandbox
+                .wrap(cmd.into_std(), &reads)
+                .map_err(|error| Error::validation(error.to_string()))?,
+        );
+        cmd.stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
         #[cfg(unix)]
         cmd.process_group(0);
 

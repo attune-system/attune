@@ -271,15 +271,6 @@ impl ProcessRuntime {
         {
             return Ok(());
         }
-        let content_addressed = env_dir
-            .parent()
-            .and_then(Path::file_name)
-            .is_some_and(|name| name == "sha256");
-        if cache_key.is_none() && !content_addressed {
-            return self
-                .setup_pack_environment_in_place(pack_dir, env_dir)
-                .await;
-        }
         let ready = cache_key
             .map(|key| key.is_ready(env_dir))
             .unwrap_or_else(|| {
@@ -321,6 +312,7 @@ impl ProcessRuntime {
                     }
                 }
             }
+            attune_common::workload_sandbox::validate_staging(&temporary)?;
             if let Some(key) = cache_key {
                 key.write_ready_marker(&temporary)?;
             } else {
@@ -529,6 +521,11 @@ impl ProcessRuntime {
             &self.child_environment,
             &self.config,
         );
+        std::fs::create_dir_all(env_dir)?;
+        let command = self
+            .child_environment
+            .sandbox_setup(command.into_std(), pack_dir, env_dir)
+            .map(Command::from)?;
         let output = process_executor::run_command_output_owned(command)
             .await
             .map_err(|e| {
@@ -639,6 +636,11 @@ impl ProcessRuntime {
             &self.child_environment,
             &self.config,
         );
+        std::fs::create_dir_all(env_dir)?;
+        let command = self
+            .child_environment
+            .sandbox_setup(command.into_std(), pack_dir, env_dir)
+            .map(Command::from)?;
         let output = process_executor::run_command_output_owned(command)
             .await
             .map_err(|e| {
@@ -666,6 +668,7 @@ impl ProcessRuntime {
             output.stdout.len()
         );
 
+        attune_common::workload_sandbox::validate_staging(env_dir)?;
         // Write the checksum marker so subsequent calls skip the install.
         if let Some(checksum) = current_checksum {
             if let Err(e) = tokio::fs::write(&marker_path, checksum.as_bytes()).await {

@@ -154,7 +154,7 @@ fn build_sensor_setup_command(
     env_dir: &std::path::Path,
     exec_config: &RuntimeExecutionConfig,
     environment: &ChildProcessEnvironment,
-) -> Command {
+) -> io::Result<Command> {
     let mut command = Command::new(program);
     environment.apply(command.as_std_mut());
     apply_runtime_env_vars(&mut command, exec_config, pack_dir, Some(env_dir));
@@ -170,7 +170,10 @@ fn build_sensor_setup_command(
             "PIP_CONFIG_FILE",
             if cfg!(windows) { "NUL" } else { "/dev/null" },
         );
-    command
+    std::fs::create_dir_all(env_dir)?;
+    environment
+        .sandbox_setup(command.into_std(), pack_dir, env_dir)
+        .map(Command::from)
 }
 
 fn apply_runtime_env_vars(
@@ -971,6 +974,7 @@ impl SensorManager {
                     ));
                 }
             }
+            attune_common::workload_sandbox::validate_staging(&temporary)?;
             cache_key.write_ready_marker(&temporary)?;
             cache_key.publish(&temporary, env_dir)?;
             Ok(())
@@ -1033,7 +1037,7 @@ impl SensorManager {
                 env_dir,
                 exec_config,
                 child_environment,
-            ))
+            )?)
             .await
             .map_err(|e| anyhow!("Failed to run runtime environment create command: {e}"))?;
 
@@ -1082,7 +1086,7 @@ impl SensorManager {
             env_dir,
             exec_config,
             child_environment,
-        ))
+        )?)
         .await
         .map_err(|e| anyhow!("Failed to run runtime dependency install command: {e}"))?;
 
@@ -1094,6 +1098,7 @@ impl SensorManager {
             ));
         }
 
+        attune_common::workload_sandbox::validate_staging(env_dir)?;
         tokio::fs::write(&install_marker, b"ok")
             .await
             .map_err(|e| {
