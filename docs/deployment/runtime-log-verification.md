@@ -48,8 +48,12 @@ worker:
     max_finalizers: 64
 ```
 
-Persist the spool volume and keep the worker name and encryption key stable
-across process/container restarts. Each database worker has its own locked
+Persist the spool volume, including each worker subdirectory's `custody.key`,
+and keep the worker name stable across process/container restarts. The worker
+generates this independent random key locally; it is not derived from the
+platform master encryption key. Keep the spool root and its ancestors outside
+pack-controlled writable trees. The key must remain a regular file owned by the
+worker UID with mode `0600` and exactly one link. Each database worker has its own locked
 subdirectory. Entries are authenticated and encrypted at rest, contain the exact
 on-wire bytes and final proof, and contain no bearer credentials or encryption
 keys. Entry and total-byte budgets and the concurrent finalizer limit bound
@@ -57,6 +61,26 @@ resource use. If custody cannot be accepted, capture is marked incomplete and
 the classified action outcome can still settle. This local spool is not the log
 artifact backend: `artifacts.transport: api` and the configured object store
 continue to own delivery and published logs.
+
+Before upgrading from a build whose spool keys were master-derived, cordon the
+worker to stop new assignments, allow existing executions and background log
+finalizers to finish, and confirm their log versions are Ready or explicitly
+Incomplete. Inspect only that worker's owned spool directory: it must contain no
+`<version>.spool` entries before upgrading. Preserve any remaining entries and
+investigate delivery failures with the old build; do not delete them to satisfy
+the upgrade check. Stop the old worker before starting the new build. The new
+build creates `custody.key` only for an empty spool. There is no automatic key
+conversion, database reset, or reader for the previous master-derived key.
+
+Back up and restore `custody.key` together with its spool, preserving ownership
+and permissions. A missing or malformed key with retained deliveries rejects
+startup rather than rotating the key or deleting ciphertext. Restore the exact
+key from the same owned volume backup; a different key cannot recover those
+bytes. If the key is permanently lost, undelivered logs cannot be recovered.
+Existing delivery deadlines bound `finalizing` and expose the affected logs as
+incomplete; do not mark their contents Ready by hand. Replacing an empty/lost
+volume permits startup, and recovery marks missing custody incomplete. Neither
+case changes the action result or revives revoked delivery authority.
 
 A restarted worker claims only matching custody under its original attempt and
 active source authority. The new process instance fences old delivery tokens.
