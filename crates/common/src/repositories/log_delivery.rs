@@ -394,3 +394,102 @@ impl LogDeliveryRepository {
         Ok(())
     }
 }
+
+/// Canonical control-plane outcome. Only the API signs a delivery credential.
+pub enum ControlDecision {
+    Waiting,
+    Settled,
+    Deliver(LogDeliveryFence),
+}
+
+impl LogDeliveryRepository {
+    pub async fn reconcile_control(
+        pool: &sqlx::PgPool,
+        worker: i64,
+        instance: Uuid,
+        request: &crate::log_delivery::ControlRequest,
+        credential_deadline: i64,
+    ) -> Result<ControlDecision> {
+        use super::{artifact::ArtifactVersionRepository, FindById};
+        let fresh = || {
+            if credential_deadline <= Utc::now().timestamp() {
+                Err(denied())
+            } else {
+                Ok(())
+            }
+        };
+        fresh()?;
+        if worker <= 0
+            || [request.execution, request.version, request.stream]
+                .iter()
+                .any(|id| *id <= 0)
+            || request.attempt.is_nil()
+            || request.source_instance.is_nil()
+            || request.custody.is_nil()
+        {
+            return Err(denied());
+        }
+        let mut tx = pool.begin().await?;
+        let Some(intent) = Self::find(&mut *tx, request.version).await? else {
+            let absent = Self::custody_absent(&mut tx, request.version).await?;
+            Self::require_instance(&mut tx, worker, instance).await?;
+            fresh()?;
+            tx.commit().await?;
+            fresh()?;
+            return Ok(if absent {
+                ControlDecision::Settled
+            } else {
+                ControlDecision::Waiting
+            });
+        };
+        super::file_evidence_retention::FileEvidenceRetentionRepository::lock_capture(&mut tx)
+            .await?;
+        Self::require_instance(&mut tx, worker, instance).await?;
+        if intent.worker != worker
+            || intent.execution != request.execution
+            || intent.stream != request.stream
+            || intent.attempt != request.attempt
+            || intent.source_instance != request.source_instance
+            || intent.custody != request.custody
+        {
+            return Err(denied());
+        }
+        let ready = ArtifactVersionRepository::find_by_id(&mut *tx, request.version)
+            .await?
+            .is_some_and(|version| {
+                version.body_state == Some(crate::models::ArtifactBodyState::Ready)
+            });
+        let decision =
+            if ready || matches!(intent.state.as_str(), "incomplete" | "revoked" | "ready") {
+                if ready && matches!(intent.state.as_str(), "prepared" | "active") {
+                    Self::mark_ready(&mut tx, request.version).await?;
+                }
+                ControlDecision::Settled
+            } else if intent.finalize_by <= Utc::now() {
+                Self::mark_incomplete(
+                    &mut tx,
+                    request.version,
+                    worker,
+                    request.custody,
+                    "deadline",
+                )
+                .await?;
+                ControlDecision::Settled
+            } else if intent.state == "prepared" {
+                ControlDecision::Waiting
+            } else {
+                Self::claim(&mut tx, request.version, worker, instance, request.custody).await?;
+                let fence = Self::require(&mut tx, request.version, worker, instance).await?;
+                fence.ensure_fresh_on(&mut tx).await?;
+                fresh()?;
+                tx.commit().await?;
+                fresh()?;
+                fence.ensure_fresh()?;
+                return Ok(ControlDecision::Deliver(fence));
+            };
+        fresh()?;
+        tx.commit().await?;
+        fresh()?;
+        Ok(decision)
+    }
+}

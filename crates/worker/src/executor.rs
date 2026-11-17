@@ -91,6 +91,7 @@ pub struct ActionExecutor {
     runtime_envs_dir: PathBuf,
     api_url: String,
     jwt_config: JwtConfig,
+    worker_tokens: Option<Arc<attune_common::auth::WorkerTokenProvider>>,
     recorded_readiness: crate::recorded_credentials::RecordedConsumerReadiness,
     /// Transport abstraction for artifact file content.
     transport: Arc<dyn ArtifactFileTransport>,
@@ -378,6 +379,7 @@ impl ActionExecutor {
             runtime_envs_dir,
             api_url,
             jwt_config,
+            worker_tokens: None,
             recorded_readiness: Default::default(),
             transport,
             action_cache_by_id: Arc::new(MetadataCache::new(
@@ -403,6 +405,14 @@ impl ActionExecutor {
         }
     }
 
+    pub fn with_worker_token_provider(
+        mut self,
+        provider: Arc<attune_common::auth::WorkerTokenProvider>,
+    ) -> Self {
+        self.worker_tokens = Some(provider);
+        self
+    }
+
     pub async fn start_log_delivery(
         &self,
         config: attune_common::config::LogDeliveryConfig,
@@ -426,7 +436,9 @@ impl ActionExecutor {
                 root,
                 worker,
                 self.worker_instance,
-                self.jwt_config.clone(),
+                self.worker_tokens.clone().ok_or_else(|| {
+                    Error::invalid_state("Log delivery worker credential provider unavailable")
+                })?,
                 self.api_url.clone(),
                 config,
                 max_payload,

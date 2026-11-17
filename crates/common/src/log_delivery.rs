@@ -60,3 +60,23 @@ pub fn mint(intent: &LogDeliveryIntent, config: &JwtConfig) -> Result<String> {
     )
     .map_err(|_| Error::PermissionDenied("Unable to sign log delivery credential".into()))
 }
+
+/// Exact persisted custody binding; no payload or caller-selected authority.
+#[derive(Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ControlRequest {
+    pub execution: i64,
+    pub version: i64,
+    pub stream: i64,
+    pub attempt: uuid::Uuid,
+    pub source_instance: uuid::Uuid,
+    pub custody: uuid::Uuid,
+}
+
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ControlResponse {
+    Waiting,
+    Settled,
+    Deliver { token: String },
+}

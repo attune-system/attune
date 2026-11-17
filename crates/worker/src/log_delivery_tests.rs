@@ -19,6 +19,8 @@ struct Fixture {
     manager: Arc<LogDeliveryManager>,
     database: TestDatabase,
     directory: tempfile::TempDir,
+    control_stop: CancellationToken,
+    control_server: tokio::task::JoinHandle<()>,
 }
 impl Fixture {
     async fn new() -> Self {
@@ -35,17 +37,100 @@ impl Fixture {
             .unwrap()
             .with_cleanup_on_drop();
         let directory = tempfile::tempdir().unwrap();
-        let manager = LogDeliveryManager::open(
-            database.pool().clone(),
-            directory.path().join("spool"),
-            4,
-            Uuid::new_v4(),
-            JwtConfig {
+        let tokens = Arc::new(WorkerTokenProvider::new(
+            1,
+            "4",
+            attune_common::auth::jwt::JwtConfig {
                 secret: "log-delivery-test-signing-key".into(),
                 access_token_expiration: 60,
                 refresh_token_expiration: 60,
             },
-            "http://127.0.0.1:0".into(),
+        ));
+        use attune_common::repositories::runtime::{CreateWorkerInput, WorkerRepository};
+        let worker = WorkerRepository::register_incarnation(
+            database.pool(),
+            CreateWorkerInput {
+                name: format!("custody-{}", Uuid::new_v4()),
+                worker_type: attune_common::models::WorkerType::Local,
+                runtime: None,
+                host: None,
+                port: None,
+                status: None,
+                capabilities: Some(
+                    serde_json::json!({"log_delivery_instance": tokens.instance_id()}),
+                ),
+                meta: None,
+            },
+            attune_common::models::WorkerRole::Action,
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        tokens.set_worker_id(worker.id.to_string());
+        let pool = database.pool().clone();
+        let instance = tokens.instance_id();
+        let expected = tokens.token().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        // Transport fixture uses the canonical repository control decision;
+        // authorization/rejection coverage belongs to the real API tests.
+        let app = axum::Router::new().route(
+            "/api/v1/internal/log-delivery/control",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap,
+                      axum::Json(request): axum::Json<
+                    attune_common::log_delivery::ControlRequest,
+                >| {
+                    let pool = pool.clone();
+                    let expected = expected.clone();
+                    async move {
+                        use axum::response::IntoResponse;
+                        if headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            != Some(format!("Bearer {expected}").as_str())
+                        {
+                            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+                        }
+                        use attune_common::repositories::log_delivery::ControlDecision;
+                        match LogDeliveryRepository::reconcile_control(
+                            &pool,
+                            worker.id,
+                            instance,
+                            &request,
+                            chrono::Utc::now().timestamp() + 60,
+                        )
+                        .await
+                        {
+                            Ok(ControlDecision::Settled) => {
+                                axum::Json(attune_common::log_delivery::ControlResponse::Settled)
+                                    .into_response()
+                            }
+                            Ok(ControlDecision::Waiting) => {
+                                axum::Json(attune_common::log_delivery::ControlResponse::Waiting)
+                                    .into_response()
+                            }
+                            _ => axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                        }
+                    }
+                },
+            ),
+        );
+        let control_stop = CancellationToken::new();
+        let stopped = control_stop.clone();
+        let control_server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(stopped.cancelled_owned())
+                .await
+                .unwrap();
+        });
+        let manager = LogDeliveryManager::open(
+            database.pool().clone(),
+            directory.path().join("spool"),
+            worker.id,
+            tokens.instance_id(),
+            tokens,
+            api,
             LogDeliveryConfig {
                 max_finalizers: 1,
                 max_spool_bytes: 100_000,
@@ -60,6 +145,8 @@ impl Fixture {
             manager,
             database,
             directory,
+            control_stop,
+            control_server,
         }
     }
     fn writer(&self) -> SpoolingLogWriter {
@@ -121,6 +208,8 @@ impl Fixture {
         assert!(self.manager.spool.versions().await.unwrap().is_empty());
         assert_eq!(self.manager.slots.available_permits(), 1);
         drop(self.manager);
+        self.control_stop.cancel();
+        self.control_server.await.unwrap();
         self.database.cleanup().await.unwrap();
     }
     async fn entry(&self) -> SpoolDelivery {
@@ -170,7 +259,7 @@ impl Fixture {
             execution: 1,
             version: version.id,
             stream: stream.id,
-            worker: 4,
+            worker: self.manager.worker,
             attempt: Uuid::new_v4(),
             source_instance: self.manager.instance,
             custody: Uuid::new_v4(),

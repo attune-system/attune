@@ -78,6 +78,7 @@ impl Server {
             .merge(routes::agent_routes())
             .merge(routes::audit_routes())
             .merge(routes::internal_file_routes())
+            .merge(routes::log_delivery_control::routes())
             .merge(routes::sensor_log_routes())
             .merge(routes::trace_routes())
             .merge(routes::info::routes())

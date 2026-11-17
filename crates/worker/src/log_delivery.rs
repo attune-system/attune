@@ -2,7 +2,7 @@
 use crate::log_delivery_spool::{LogDeliverySpool, SpoolDelivery, SpoolSegment};
 use attune_common::{
     artifact_transport::ArtifactFileTransport,
-    auth::jwt::JwtConfig,
+    auth::WorkerTokenProvider,
     repositories::{
         delegated_execution::DelegatedExecutionRepository,
         file_evidence_retention::FileEvidenceRetentionRepository,
@@ -29,7 +29,7 @@ pub struct LogDeliveryManager {
     spool: LogDeliverySpool,
     worker: i64,
     instance: Uuid,
-    jwt: JwtConfig,
+    tokens: Arc<WorkerTokenProvider>,
     api: String,
     client: reqwest::Client,
     tasks: TaskTracker,
@@ -81,7 +81,7 @@ impl LogDeliveryManager {
         root: std::path::PathBuf,
         worker: i64,
         instance: Uuid,
-        jwt: JwtConfig,
+        tokens: Arc<WorkerTokenProvider>,
         api: String,
         config: attune_common::config::LogDeliveryConfig,
         max_payload: u64,
@@ -104,7 +104,7 @@ impl LogDeliveryManager {
             spool,
             worker,
             instance,
-            jwt,
+            tokens,
             api: api.trim_end_matches('/').to_owned(),
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
@@ -287,77 +287,43 @@ impl LogDeliveryManager {
             if self.stop.is_cancelled() {
                 return Ok(());
             }
-            let mut tx = self.pool.begin().await?;
-            let intent = LogDeliveryRepository::find(&mut *tx, entry.version).await?;
-            let Some(intent) = intent else {
-                let absent = LogDeliveryRepository::custody_absent(&mut tx, entry.version).await?;
-                tx.commit().await?;
-                if !absent {
+            let response = self
+                .client
+                .post(format!("{}/api/v1/internal/log-delivery/control", self.api))
+                .bearer_auth(
+                    self.tokens
+                        .token()
+                        .map_err(|_| Error::execution("Worker credential unavailable"))?,
+                )
+                .json(&attune_common::log_delivery::ControlRequest {
+                    execution: entry.execution,
+                    version: entry.version,
+                    stream: entry.stream,
+                    attempt: entry.attempt,
+                    source_instance: entry.source_instance,
+                    custody: entry.custody,
+                })
+                .send()
+                .await
+                .map_err(|_| Error::execution("Log custody control unavailable"))?;
+            if !response.status().is_success() {
+                return Err(Error::execution("Log custody control rejected"));
+            }
+            let response: attune_common::log_delivery::ControlResponse = response
+                .json()
+                .await
+                .map_err(|_| Error::execution("Invalid log custody control response"))?;
+            let token = match response {
+                attune_common::log_delivery::ControlResponse::Settled => {
+                    self.spool.remove(entry.version, entry.custody).await?;
+                    return Ok(());
+                }
+                attune_common::log_delivery::ControlResponse::Waiting => {
+                    tokio::select! {_=self.stop.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_millis(25))=>{}}
                     continue;
                 }
-                self.spool.remove(entry.version, entry.custody).await?;
-                return Ok(());
+                attune_common::log_delivery::ControlResponse::Deliver { token } => token,
             };
-            if intent.custody != entry.custody
-                || intent.worker != entry.worker
-                || intent.attempt != entry.attempt
-                || intent.source_instance != entry.source_instance
-            {
-                return Err(Error::PermissionDenied(
-                    "Log custody binding changed".into(),
-                ));
-            }
-            let ready =
-                attune_common::repositories::artifact::ArtifactVersionRepository::find_by_id(
-                    &mut *tx,
-                    entry.version,
-                )
-                .await?
-                .is_some_and(|v| {
-                    v.body_state == Some(attune_common::models::ArtifactBodyState::Ready)
-                });
-            if ready || matches!(intent.state.as_str(), "incomplete" | "revoked" | "ready") {
-                if ready && matches!(intent.state.as_str(), "prepared" | "active") {
-                    LogDeliveryRepository::mark_ready(&mut tx, entry.version).await?;
-                }
-                tx.commit().await?;
-                self.spool.remove(entry.version, entry.custody).await?;
-                return Ok(());
-            }
-            if entry.finalize_by <= chrono::Utc::now() {
-                LogDeliveryRepository::mark_incomplete(
-                    &mut tx,
-                    entry.version,
-                    self.worker,
-                    entry.custody,
-                    "deadline",
-                )
-                .await?;
-                tx.commit().await?;
-                self.spool.remove(entry.version, entry.custody).await?;
-                return Ok(());
-            }
-            // Terminal publication activates custody. Do not take source/target
-            // locks for remote delivery while completion still needs those rows.
-            if intent.state == "prepared" {
-                tx.commit().await?;
-                tokio::select! {_=self.stop.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_millis(25))=>{}}
-                continue;
-            }
-            let intent = if intent.delivery_instance != self.instance {
-                LogDeliveryRepository::claim(
-                    &mut tx,
-                    entry.version,
-                    self.worker,
-                    self.instance,
-                    entry.custody,
-                )
-                .await?
-            } else {
-                intent
-            };
-            let token = attune_common::log_delivery::mint(&intent, &self.jwt)?;
-            tx.commit().await?;
             let upload = async {
                 for segment in &entry.segments {
                     let response = self

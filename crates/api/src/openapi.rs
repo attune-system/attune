@@ -434,6 +434,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::sensor_logs::get_sensor_log,
 
         // Internal service endpoints
+        crate::routes::log_delivery_control::reconcile,
         crate::routes::internal_files::download_file,
         crate::routes::internal_files::upload_file,
         crate::routes::internal_files::check_file,
