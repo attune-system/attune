@@ -14,6 +14,16 @@ ignore = [
     # upgrading requires migrating Attune's custom JWT crypto provider. Review by
     # 2026-11-22; cargo-deny 0.20.2 does not support enforced ignore expiry.
     { id = "RUSTSEC-2026-0387", reason = "Upgrade to jsonwebtoken 12 and openidconnect 4.1, including custom JWT provider migration; tracked in PR #14; review by 2026-11-22" },
+    # Temporary acceptance of these specific unmaintained-crate advisories; all
+    # versions are affected and none has a patched release. These exceptions do
+    # not suppress other advisories for the same crates. Review dates are manual,
+    # not enforced expiry dates.
+    # chrono is used directly across Attune and by SQLx, object_store, and OIDC.
+    { id = "RUSTSEC-2026-0543", reason = "Accept chrono maintenance risk while migrating direct timestamp uses and upstream dependencies to maintained alternatives; remove when chrono leaves both workspace and timer graphs; review by 2026-12-17" },
+    # humantime is transitive through object_store in attune-common.
+    { id = "RUSTSEC-2026-0542", reason = "Accept humantime maintenance risk through object_store pending an upstream replacement or maintained storage dependency; remove when humantime leaves the workspace graph; review by 2026-12-17" },
+    # chrono-tz is used directly by the timer and by rrule/tokio-cron-scheduler.
+    { id = "RUSTSEC-2026-0555", reason = "Accept chrono-tz maintenance risk while migrating timer timezone handling and recurrence/scheduling dependencies to maintained alternatives; remove when chrono-tz leaves the timer graph; review by 2026-12-17" },
 ]
 
 [licenses]
