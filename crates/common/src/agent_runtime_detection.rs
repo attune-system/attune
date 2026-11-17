@@ -193,6 +193,21 @@ fn get_version(
     parser: &VersionParser,
     environment: &ChildProcessEnvironment,
 ) -> crate::Result<Option<String>> {
+    // The fixed shell prelude runs only after the configured boundary has been
+    // entered. Its stdout marker distinguishes launcher/namespace failure from
+    // an interpreter that simply does not support this version option.
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            r#"printf '\001attune-runtime-probe-ready\001\n'; exec "$@""#,
+            "attune-runtime-probe",
+        ]);
+        command.arg(binary_path);
+        command
+    };
+    #[cfg(not(unix))]
     let mut command = Command::new(binary_path);
     environment.apply(&mut command);
     command.args(version_args);
@@ -207,11 +222,18 @@ fn get_version(
     let output = command
         .output()
         .map_err(|error| crate::Error::Io(error.to_string()))?;
+    #[cfg(unix)]
+    let stdout_bytes = output
+        .stdout
+        .strip_prefix(b"\x01attune-runtime-probe-ready\x01\n")
+        .ok_or_else(|| crate::Error::execution("Runtime detection sandbox launch failed"))?;
+    #[cfg(not(unix))]
+    let stdout_bytes = output.stdout.as_slice();
     if !output.status.success() {
-        return Err(crate::Error::execution("Runtime detection probe failed"));
+        return Ok(None);
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(stdout_bytes);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{}{}", stdout, stderr);
 
@@ -300,7 +322,8 @@ mod tests {
             &VersionParser::SemverLike,
             &minimal
         )
-        .is_err());
+        .unwrap()
+        .is_none());
         assert_eq!(
             get_version(
                 executable.to_str().unwrap(),
@@ -366,7 +389,8 @@ mod tests {
             &VersionParser::SemverLike,
             &environment
         )
-        .is_err());
+        .unwrap()
+        .is_none());
         let isolated =
             environment.with_workload_sandbox(crate::workload_sandbox::WorkloadSandbox::Bubblewrap);
         assert_eq!(
@@ -390,6 +414,20 @@ mod tests {
             &isolated
         )
         .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_version_option_keeps_the_runtime_without_retrying_outside_boundary() {
+        let environment = ChildProcessEnvironment::from_parent([], &[]).unwrap();
+        assert!(get_version(
+            "/bin/sh",
+            &["-c", "exit 17"],
+            &VersionParser::SemverLike,
+            &environment
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
