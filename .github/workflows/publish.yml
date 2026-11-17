@@ -1115,7 +1115,7 @@ jobs:
           token: ${{ env.HOMEBREW_TAP_TOKEN }}
           path: homebrew-tap
 
-      - name: Update and publish cask
+      - name: Generate cask update
         if: steps.release.outputs.stable == 'true'
         shell: bash
         env:
@@ -1136,17 +1136,24 @@ jobs:
 
           ruby -c homebrew-tap/Casks/attune.rb
 
-          cd homebrew-tap
-          git add Casks/attune.rb
-          if git diff --cached --quiet; then
-            echo "Homebrew cask is already current."
-            exit 0
-          fi
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "attune ${VERSION}"
-          git push origin HEAD:main
+      - name: Open Homebrew cask update pull request
+        if: steps.release.outputs.stable == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8
+        with:
+          token: ${{ env.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+          base: main
+          branch: automation/attune-${{ steps.release.outputs.version }}
+          add-paths: |
+            Casks/attune.rb
+          delete-branch: true
+          commit-message: Update Attune to ${{ steps.release.outputs.version }}
+          title: Update Attune to ${{ steps.release.outputs.version }}
+          body: |
+            Updates Homebrew cask from the published Attune release and its
+            recorded archive checksums. Merge only after the target repository's
+            validation succeeds. This PR is opened with the target-specific token
+            so its pull-request checks run without GITHUB_TOKEN event suppression.
 
   publish-arch-package-repository:
     name: Publish Arch Package Repository
@@ -1238,17 +1245,25 @@ jobs:
               "packaging/aur/${template}.in" > "arch-package/${template}"
           done
 
-          cd arch-package
-          git add PKGBUILD .SRCINFO
-          if git diff --cached --quiet; then
-            echo "Arch package repository is already current."
-            exit 0
-          fi
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "attune-bin ${VERSION}"
-          git push origin HEAD:main
+      - name: Open Arch package metadata update pull request
+        if: steps.release.outputs.stable == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8
+        with:
+          token: ${{ env.ARCH_PACKAGE_TOKEN }}
+          path: arch-package
+          base: main
+          branch: automation/attune-${{ steps.release.outputs.version }}
+          add-paths: |
+            PKGBUILD
+            .SRCINFO
+          delete-branch: true
+          commit-message: Update Attune to ${{ steps.release.outputs.version }}
+          title: Update Attune to ${{ steps.release.outputs.version }}
+          body: |
+            Updates Arch package metadata from the published Attune release and its
+            recorded archive checksums. Merge only after the target repository's
+            validation succeeds. This PR is opened with the target-specific token
+            so its pull-request checks run without GITHUB_TOKEN event suppression.
 
   build-linux-packages:
     name: Build Linux Packages (${{ matrix.arch }})

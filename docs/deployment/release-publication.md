@@ -25,3 +25,21 @@ The Linux `attune` and `attune-mcp` binaries embedded in the agent image remain
 required runtime inputs. Optional standalone packaging does not permit shipping
 an incomplete agent container. Pull-request Windows CLI validation remains a
 normal failing check; optional release packaging does not suppress build defects.
+
+## Package repository updates
+
+Homebrew and Arch CLI metadata updates open pull requests in their target
+repositories instead of pushing directly to `main`. The changes remain optional
+release outputs and still require the corresponding complete CLI archives.
+Neither package PR is automatically merged by this workflow.
+
+`HOMEBREW_TAP_TOKEN` and `ARCH_PACKAGE_TOKEN` must each be restricted to the
+appropriate target repository and grant Contents and Pull requests read/write.
+These are explicit target tokens, rather than the publishing workflow's own
+`GITHUB_TOKEN`, so PR creation triggers the target's pull-request checks. Changing
+this workflow cannot change the scopes of an existing stored token: the token
+owner must verify/update those grants in GitHub if necessary.
+
+Merge Homebrew updates only after the tap's `audit` check succeeds. Merge Arch
+metadata updates only after `aur-attune-bin` reports **Package validation**;
+deploy that repository's validator before enabling the new release path.
