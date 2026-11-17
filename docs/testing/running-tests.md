@@ -83,6 +83,29 @@ agent can distinguish saved progress from merge readiness.
 
 ## Fast local checks
 
+### Final CI gate
+
+The `CI` workflow reports `CI Gate` on push and pull-request runs. It waits for
+every job, requires path detection to succeed, and rejects failed blocking jobs,
+cancelled jobs, missing results, and unexpected skips. Path-filtered jobs may skip
+when their owning change flag is false. Existing web/security advisory failures
+remain warnings; a green gate does not mean their findings were resolved or
+override step-level advisory policy such as Cargo Deny on feature branches.
+
+Manual runs report `CI Gate (manual)` because their input flags can disable
+checks. They must not satisfy a required `CI Gate` check. The manual release
+configuration checks still run regardless of those flags.
+
+Run `python3 scripts/test_ci_gate.py` for offline gate and workflow-selection
+regressions (requires PyYAML). When adding CI jobs or changing conditions, update
+the gate's dependencies and selection policy together. Required-check settings
+are a separate rollout after the gate has been exercised in GitHub; this change
+does not enable branch rules or add merge-queue support.
+The gate covers this workflow's jobs, not checks from separate workflows such as
+Windows CLI, CLI credentials, or pack-format golden vectors.
+
+### Common checks
+
 ```bash
 cargo fmt --all -- --check
 cargo check --all-targets --workspace
