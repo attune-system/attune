@@ -196,6 +196,22 @@ class OptionalCliReleaseTests(unittest.TestCase):
                 self.assertFalse(condition_matches(condition, {}))
                 self.assertFalse(condition_matches(condition, {"publish-github-release": "failure"}, outputs={output: True}))
 
+    def test_package_metadata_publication_opens_scoped_target_prs(self):
+        for name, path, token, files in (
+            ("publish-homebrew-cask", "homebrew-tap", "HOMEBREW_TAP_TOKEN", {"Casks/attune.rb"}),
+            ("publish-arch-package-repository", "arch-package", "ARCH_PACKAGE_TOKEN", {"PKGBUILD", ".SRCINFO"}),
+        ):
+            with self.subTest(job=name):
+                steps = JOBS[name]["steps"]
+                self.assertFalse(any("git push" in step.get("run", "") for step in steps))
+                publisher = next(step for step in steps if step.get("uses", "").startswith("peter-evans/create-pull-request@"))
+                self.assertEqual(publisher["if"], "steps.release.outputs.stable == 'true'")
+                self.assertEqual(publisher["with"]["path"], path)
+                self.assertEqual(publisher["with"]["token"], "${{ env." + token + " }}")
+                self.assertEqual(publisher["with"]["base"], "main")
+                self.assertEqual(set(publisher["with"]["add-paths"].splitlines()), files)
+                self.assertIn("steps.release.outputs.version", publisher["with"]["branch"])
+
     def test_release_checks_include_this_suite(self):
         ci = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
         commands = "\n".join(step.get("run", "") for step in ci["jobs"]["release-checks"]["steps"])
