@@ -1,0 +1,69 @@
+version: 2
+
+# Limit routine version-update noise. Security updates are enabled separately
+# in repository settings and are not restricted by this version-update limit.
+# Do not auto-merge: repository validation and maintainer assessment still apply.
+# Vendored SQLx and tests/sqlx-session are deliberately maintained together by
+# the session-regression procedure, rather than updated as ordinary dependencies.
+# Container digest pinning is a separate rollout with its build validation.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 1
+    groups:
+      routine-actions:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # The workspace and standalone core components have separate lockfiles.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 1
+    groups:
+      routine-rust:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: cargo
+    directory: /crates/core-actions
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 1
+    groups:
+      routine-core-actions:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: cargo
+    directory: /crates/core-timer-sensor
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 1
+    groups:
+      routine-timer:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 1
+    groups:
+      routine-web:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: [minor, patch]
