@@ -8,7 +8,6 @@
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::process::Command;
 
 /// Dependency validation result
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,17 +67,12 @@ pub struct PackDepValidation {
 }
 
 /// Dependency validator
-pub struct DependencyValidator {
-    /// Cache for runtime version checks
-    runtime_cache: HashMap<String, Option<String>>,
-}
+pub struct DependencyValidator;
 
 impl DependencyValidator {
     /// Create a new dependency validator
     pub fn new() -> Self {
-        Self {
-            runtime_cache: HashMap::new(),
-        }
+        Self
     }
 
     /// Validate all dependencies for a pack
@@ -128,49 +122,12 @@ impl DependencyValidator {
         // Parse runtime dependency (e.g., "python3>=3.8", "nodejs^14.0.0")
         let (runtime, version_constraint) = parse_runtime_dep(runtime_dep)?;
 
-        // Check if we have a cached version
-        let detected_version = if let Some(cached) = self.runtime_cache.get(&runtime) {
-            cached.clone()
-        } else {
-            // Detect runtime version
-            let version = detect_runtime_version(&runtime).await;
-            self.runtime_cache.insert(runtime.clone(), version.clone());
-            version
-        };
-
-        // Validate version constraint
-        let satisfied = if let Some(ref constraint) = version_constraint {
-            if let Some(ref detected) = detected_version {
-                match_version_constraint(detected, constraint)?
-            } else {
-                false
-            }
-        } else {
-            // No version constraint, just check if runtime exists
-            detected_version.is_some()
-        };
-
-        let error = if !satisfied {
-            if let Some(ref detected) = detected_version {
-                version_constraint.as_ref().map(|constraint| {
-                    format!(
-                        "Runtime '{}' version {} does not satisfy constraint '{}'",
-                        runtime, detected, constraint
-                    )
-                })
-            } else {
-                Some(format!("Runtime '{}' not found on system", runtime))
-            }
-        } else {
-            None
-        };
-
         Ok(RuntimeDepValidation {
             runtime,
             required_version: version_constraint,
-            detected_version,
-            satisfied,
-            error,
+            detected_version: None,
+            satisfied: false,
+            error: Some("Legacy local runtime dependency probing is unsupported; use registered worker runtime capabilities".to_string()),
         })
     }
 
@@ -233,94 +190,6 @@ fn parse_runtime_dep(runtime_dep: &str) -> Result<(String, Option<String>)> {
 
     // No version constraint
     Ok((runtime_dep.trim().to_string(), None))
-}
-
-/// Detect runtime version on the system
-async fn detect_runtime_version(runtime: &str) -> Option<String> {
-    match runtime {
-        "python3" | "python" => detect_python_version().await,
-        "nodejs" | "node" => detect_nodejs_version().await,
-        "shell" | "bash" | "sh" => detect_shell_version().await,
-        _ => None,
-    }
-}
-
-/// Detect Python version
-async fn detect_python_version() -> Option<String> {
-    // Try python3 first
-    if let Ok(output) = Command::new("python3").arg("--version").output() {
-        if output.status.success() {
-            let version_str = String::from_utf8_lossy(&output.stdout);
-            return parse_python_version(&version_str);
-        }
-    }
-
-    // Fallback to python
-    if let Ok(output) = Command::new("python").arg("--version").output() {
-        if output.status.success() {
-            let version_str = String::from_utf8_lossy(&output.stdout);
-            return parse_python_version(&version_str);
-        }
-    }
-
-    None
-}
-
-/// Parse Python version from output (e.g., "Python 3.9.7" -> "3.9.7")
-fn parse_python_version(output: &str) -> Option<String> {
-    let parts: Vec<&str> = output.split_whitespace().collect();
-    if parts.len() >= 2 {
-        Some(parts[1].trim().to_string())
-    } else {
-        None
-    }
-}
-
-/// Detect Node.js version
-async fn detect_nodejs_version() -> Option<String> {
-    // Try node first
-    if let Ok(output) = Command::new("node").arg("--version").output() {
-        if output.status.success() {
-            let version_str = String::from_utf8_lossy(&output.stdout);
-            return Some(version_str.trim().trim_start_matches('v').to_string());
-        }
-    }
-
-    // Try nodejs
-    if let Ok(output) = Command::new("nodejs").arg("--version").output() {
-        if output.status.success() {
-            let version_str = String::from_utf8_lossy(&output.stdout);
-            return Some(version_str.trim().trim_start_matches('v').to_string());
-        }
-    }
-
-    None
-}
-
-/// Detect shell version
-async fn detect_shell_version() -> Option<String> {
-    // Bash version
-    if let Ok(output) = Command::new("bash").arg("--version").output() {
-        if output.status.success() {
-            let version_str = String::from_utf8_lossy(&output.stdout);
-            if let Some(line) = version_str.lines().next() {
-                // Parse "GNU bash, version 5.1.16(1)-release"
-                if let Some(start) = line.find("version ") {
-                    let version_part = &line[start + 8..];
-                    if let Some(end) = version_part.find(|c: char| !c.is_numeric() && c != '.') {
-                        return Some(version_part[..end].to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    // Default to "1.0.0" if shell exists
-    if Command::new("sh").arg("--version").output().is_ok() {
-        return Some("1.0.0".to_string());
-    }
-
-    None
 }
 
 /// Match version against constraint
@@ -507,15 +376,16 @@ mod tests {
         assert!(!match_tilde_constraint("1.2.2", "1.2.3").unwrap());
     }
 
-    #[test]
-    fn test_parse_python_version() {
-        assert_eq!(
-            parse_python_version("Python 3.9.7"),
-            Some("3.9.7".to_string())
-        );
-        assert_eq!(
-            parse_python_version("Python 2.7.18"),
-            Some("2.7.18".to_string())
-        );
+    #[tokio::test]
+    async fn local_runtime_dependencies_fail_without_executing_host_programs() {
+        let result = DependencyValidator::new()
+            .validate_runtime_dep("shell")
+            .await
+            .unwrap();
+        assert!(!result.satisfied);
+        assert!(result
+            .error
+            .unwrap()
+            .contains("local runtime dependency probing is unsupported"));
     }
 }

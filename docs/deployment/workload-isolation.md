@@ -101,3 +101,10 @@ read-only. The subprocess owner removes the private copy after process teardown.
 Runtime setup mounts its private host staging at the final logical install path,
 so console-script shebangs remain valid after publication. Internal absolute
 links are converted to equivalent relative links before the trusted rename.
+
+The unused legacy `pack_registry::DependencyValidator` no longer executes local
+Python/Node/shell binaries to validate runtime requirements. It returns an
+unsupported result for local runtime probing; use registered worker capability
+validation. Its pure pack-version dependency checks remain available. This
+removes another inherited-environment subprocess path without requiring the API
+host to execute pack runtime code.
