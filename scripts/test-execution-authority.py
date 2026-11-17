@@ -42,6 +42,8 @@ other,other_value=get(p['other'])
 assert other in (403,404) and other_value is None
 if p['plaintext']:
     assert status==200 and isinstance(value,str)
+    if p.get('require_workflow_secret') or 'workflow_secret' in p:
+        assert p.get('workflow_secret')==value
     print(value,file=sys.stderr,flush=True)
     if p.get('fail_once'):
         marker=Path(os.environ['ATTUNE_ARTIFACTS_DIR'])/('retry-'+p['marker'])
@@ -54,7 +56,9 @@ if p['plaintext']:
             pass
 else:
     assert status in (200,403,404) and value is None
-output={'value':value,'credential':token,'unrelated_denied':True,'plaintext':p['plaintext']}
+output={'credential':token,'unrelated_denied':True,'plaintext':p['plaintext']}
+if value is not None:
+    output['value']=value
 if p.get('item_id') is not None:
     output['queue_ack']={'version':1,'items':[{'id':p['item_id'],'status':value if p.get('ack_invalid') else 'completed','summary':{'value':value},'error':{'value':value}}]}
 print(json.dumps(output))
@@ -78,6 +82,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--bin-dir', type=Path, default=ROOT / 'target/debug')
+    parser.add_argument('--workflow-child-inputs-only', action='store_true', help='Run the managed successor/retry/secret-input scenario without the unrelated disclosure and queue cases')
     parser.add_argument('--runtime-stack-bytes',type=int,default=0,help='Default: leave RUST_MIN_STACK unset; a positive value is an explicitly recorded diagnostic override')
     parser.add_argument('--service-image', help='Run the supplied Linux release binaries in this ABI-compatible Docker runtime image on an owned network')
     args = parser.parse_args()
@@ -270,12 +275,34 @@ def main():
         action_ref = pack_ref + '.read_system'
         (pack / 'pack.yaml').write_text(yaml.safe_dump({'ref': pack_ref, 'name': pack_ref, 'version': '1.0.0', 'description': 'Delegated authority acceptance'}))
         (pack / 'runtimes/python.yaml').write_text(yaml.safe_dump({'ref': pack_ref + '.python', 'name': 'Python', 'aliases': ['python3'], 'execution_config': {'interpreter': {'binary': 'python3', 'args': ['-u'], 'file_extension': '.py'}}}))
-        (pack / 'actions/read_system.yaml').write_text(yaml.safe_dump({'ref': action_ref, 'name': 'read_system', 'label': 'Read system Key', 'runner_type': pack_ref + '.python', 'entry_point': 'read_system.py', 'parameter_delivery': 'stdin', 'parameter_format': 'json', 'output_format': 'json', 'parameters': {'key': {'type': 'string', 'required': True}, 'other': {'type': 'string', 'required': True}, 'plaintext': {'type': 'boolean', 'required': True}, 'fail_once': {'type': 'boolean', 'default': False}, 'marker': {'type': 'string', 'default': ''}, 'item_id': {'type':'integer'}, 'ack_invalid': {'type':'boolean','default':False}}}))
+        (pack / 'actions/read_system.yaml').write_text(yaml.safe_dump({'ref': action_ref, 'name': 'read_system', 'label': 'Read system Key', 'runner_type': pack_ref + '.python', 'entry_point': 'read_system.py', 'parameter_delivery': 'stdin', 'parameter_format': 'json', 'output_format': 'json', 'parameters': {'key': {'type': 'string', 'required': True}, 'other': {'type': 'string', 'required': True}, 'plaintext': {'type': 'boolean', 'required': True}, 'fail_once': {'type': 'boolean', 'default': False}, 'marker': {'type': 'string', 'default': ''}, 'item_id': {'type':'integer'}, 'ack_invalid': {'type':'boolean','default':False}, 'workflow_secret': {'type':'string','secret':True}}}))
+        # Runtime API authority and input secrets do not classify outputs.
+        # This fixture deliberately emits a Key value/token, so admit explicit
+        # protected fields and raw diagnostic channels before publication.
+        protected_output = {
+            'value': {'type': 'string', 'secret': True},
+            'credential': {'type': 'string', 'secret': True},
+            'queue_ack': {'type': 'object', 'secret': True},
+            'unrelated_denied': {'type': 'boolean'},
+            'plaintext': {'type': 'boolean'},
+            'first_attempt': {'type': 'boolean'},
+        }
+        protected_channels = {'stdout': 'secret', 'stderr': 'secret', 'error': 'secret'}
+        reader_file = pack / 'actions/read_system.yaml'
+        reader_metadata = yaml.safe_load(reader_file.read_text())
+        reader_metadata['parameters']['require_workflow_secret'] = {'type': 'boolean', 'default': False}
+        reader_metadata.update(output_schema=protected_output, output_policy=protected_channels)
+        reader_file.write_text(yaml.safe_dump(reader_metadata))
         (pack / 'actions/read_system.py').write_text(ACTION)
         (pack / 'actions/workflows').mkdir()
         flow_ref=pack_ref+'.read_flow'
-        (pack / 'actions/read_flow.yaml').write_text(yaml.safe_dump({'ref':flow_ref,'label':'Delegated retry workflow','workflow_file':'workflows/read_flow.workflow.yaml','parameters':{'key':{'type':'string','required':True},'other':{'type':'string','required':True},'plaintext':{'type':'boolean','required':True},'fail_once':{'type':'boolean','default':False},'marker':{'type':'string','default':''}}}))
-        (pack / 'actions/workflows/read_flow.workflow.yaml').write_text(yaml.safe_dump({'version':'1.0.0','tasks':[{'name':'read','action':action_ref,'permission_set_refs':['standard',pack_ref+'.read_system'],'input':{name:'{{ parameters.'+name+' }}' for name in ['key','other','plaintext','fail_once','marker']},'retry':{'count':1,'delay':0},'next':[]}]}))
+        (pack / 'actions/read_flow.yaml').write_text(yaml.safe_dump({'ref':flow_ref,'label':'Delegated successor and retry workflow','workflow_file':'workflows/read_flow.workflow.yaml','parameters':{'key':{'type':'string','required':True},'other':{'type':'string','required':True},'plaintext':{'type':'boolean','required':True},'fail_once':{'type':'boolean','default':False},'marker':{'type':'string','default':''},'workflow_secret':{'type':'string','secret':True,'required':True}}}))
+        flow_input={name:'{{ parameters.'+name+' }}' for name in ['key','other','plaintext','fail_once','marker','workflow_secret']}
+        flow_input['require_workflow_secret'] = True
+        (pack / 'actions/workflows/read_flow.workflow.yaml').write_text(yaml.safe_dump({'version':'1.0.0','tasks':[
+            {'name':'read','action':action_ref,'permission_set_refs':['standard',pack_ref+'.read_system'],'input':flow_input,'retry':{'count':1,'delay':0},'next':[{'when':'{{ succeeded() }}','do':['read_after']}]},
+            {'name':'read_after','action':action_ref,'permission_set_refs':['standard',pack_ref+'.read_system'],'input':dict(flow_input,fail_once=False),'next':[]}
+        ]}))
         tokenless_ref=pack_ref+'.tokenless'
         (pack / 'actions/tokenless.yaml').write_text(yaml.safe_dump({'ref':tokenless_ref,'label':'Tokenless','runner_type':pack_ref+'.python','entry_point':'tokenless.py','parameter_format':'json','output_format':'json','parameters':{'message':{'type':'string','required':True},'item_id':{'type':'integer'}}}))
         (pack / 'actions/tokenless.py').write_text("import json,os,sys\np=json.load(sys.stdin)\nr={'token_present':bool(os.environ.get('ATTUNE_API_TOKEN')),'message':p['message']}\nif 'item_id' in p: r['queue_ack']={'version':1,'items':[{'id':p['item_id'],'status':'completed'}]}\nprint(json.dumps(r))\n")
@@ -286,7 +313,8 @@ def main():
             name = 'private_ack_flow' if private else 'public_ack_flow'
             params = ({'key':{'type':'string','required':True},'other':{'type':'string','required':True},'plaintext':{'type':'boolean','required':True},'item_id':{'type':'integer','required':True}}
                       if private else {'message':{'type':'string','required':True},'item_id':{'type':'integer','required':True}})
-            (pack / ('actions/'+name+'.yaml')).write_text(yaml.safe_dump({'ref':pack_ref+'.'+name,'label':name,'workflow_file':'workflows/'+name+'.workflow.yaml','parameters':params}))
+            output = {'queue_ack': {'type': 'object', 'secret': private}, 'succeeded': {'type': 'boolean'}}
+            (pack / ('actions/'+name+'.yaml')).write_text(yaml.safe_dump({'ref':pack_ref+'.'+name,'label':name,'workflow_file':'workflows/'+name+'.workflow.yaml','parameters':params,'output_format':'json','output_schema':output}))
             task = {'name':'emit','action':action_ref if private else tokenless_ref,
                     'permission_set_refs':['standard',pack_ref+'.read_system'] if private else [],
                     'input':{key:'{{ parameters.'+key+' }}' for key in params},'next':[]}
@@ -298,6 +326,14 @@ def main():
             (pack / ('permission_sets/' + name + '.yaml')).write_text(yaml.safe_dump({'ref': pack_ref + '.' + name, 'scope': 'external', 'grants': [{'resource': 'keys', 'actions': actions, 'constraints': {'refs': [keys[0]], 'owner_types': ['system']}}]}))
         signer_ref=pack_ref+'.sign_system'
         (pack/'actions/sign_system.yaml').write_text(yaml.safe_dump({'ref':signer_ref,'label':'Approved use-only signer','runner_type':pack_ref+'.python','entry_point':'sign_system.py','parameter_format':'json','output_format':'json','parameters':{'signer':{'type':'string','required':True}}}))
+        signer_file = pack / 'actions/sign_system.yaml'
+        signer_metadata = yaml.safe_load(signer_file.read_text())
+        signer_metadata.update(output_schema={
+            'assertion': {'type': 'string', 'secret': True},
+            'raw_denied': {'type': 'boolean'},
+            'profile_denied': {'type': 'boolean'},
+        }, output_policy=protected_channels)
+        signer_file.write_text(yaml.safe_dump(signer_metadata))
         (pack/'actions/sign_system.py').write_text("""
 import json,os,sys,urllib.request,urllib.error
 p=json.load(sys.stdin)
@@ -322,7 +358,7 @@ except urllib.error.HTTPError as e:
 print(json.dumps({'assertion':result['assertion'],'raw_denied':True,'profile_denied':True}))
 """)
         (pack/'permission_sets/sign_system.yaml').write_text(yaml.safe_dump({'ref':signer_ref,'scope':'external','grants':[{'resource':'keys','actions':['use'],'constraints':{'refs':[signer['ref']],'owner_types':['system']}}]}))
-        (pack / 'permission_sets/invoke.yaml').write_text(yaml.safe_dump({'ref': pack_ref + '.invoke', 'scope':'external', 'grants': [{'resource': 'actions', 'actions': ['execute'], 'constraints': {'refs': [action_ref,signer_ref]}}, {'resource': 'executions', 'actions': ['read', 'decrypt'], 'constraints': {'refs': [action_ref,signer_ref]}}, {'resource':'artifacts','actions':['read'],'constraints':{'owner_types':['action'],'owner_refs':[action_ref,signer_ref]}}, {'resource':'queue_items','actions':['create'],'constraints':{'refs':[pack_ref+'.private_ack_queue',pack_ref+'.invalid_ack_queue']}}]}))
+        (pack / 'permission_sets/invoke.yaml').write_text(yaml.safe_dump({'ref': pack_ref + '.invoke', 'scope':'external', 'grants': [{'resource': 'actions', 'actions': ['execute'], 'constraints': {'refs': [action_ref,signer_ref,flow_ref]}}, {'resource': 'executions', 'actions': ['read', 'decrypt'], 'constraints': {'refs': [action_ref,signer_ref,flow_ref]}}, {'resource':'artifacts','actions':['read'],'constraints':{'owner_types':['action'],'owner_refs':[action_ref,signer_ref,flow_ref]}}, {'resource':'queue_items','actions':['create'],'constraints':{'refs':[pack_ref+'.private_ack_queue',pack_ref+'.invalid_ack_queue']}}]}))
         event_ref=pack_ref+'.authority_event'
         emitter_ref=pack_ref+'.emit_event'
         (pack/'triggers/authority_event.yaml').write_text(yaml.safe_dump({'ref':event_ref,'label':'Authority acceptance event','out_schema':{'marker':{'type':'string'}}}))
@@ -351,6 +387,8 @@ print(json.dumps({'assertion':result['assertion'],'raw_denied':True,'profile_den
 
         def execute(refs, plaintext, reference=action_ref, fail_once=False, parameters=None, requester=None):
             parameters = parameters if parameters is not None else {'key': keys[0], 'other': keys[1], 'plaintext': plaintext, 'fail_once':fail_once,'marker':run}
+            if reference == flow_ref:
+                parameters = dict(parameters, workflow_secret=secret)
             response=(requester or admin).post(base+'/api/v1/executions/execute',json={'action_ref':reference,'permission_set_refs':refs,'parameters':parameters},timeout=30)
             assert response.status_code==201, 'execution admission rejected: HTTP '+str(response.status_code)+' '+response.text[:1000]
             ex=response.json()['data']
@@ -362,6 +400,36 @@ print(json.dumps({'assertion':result['assertion'],'raw_denied':True,'profile_den
             row = wait_for(terminal, 90, 'action process completion')
             assert row['status'] == 'completed', 'action failed: ' + str(row['result'])
             return row
+
+        def verify_workflow_child_inputs():
+            # Native workflow fanout and failed-attempt retry retain delegated mode.
+            workflow=execute(['standard',pack_ref+'.read_system'],True,reference=flow_ref,fail_once=True,requester=caller)
+            children=int(psql(f"SELECT count(*) FROM execution WHERE parent={workflow['id']}"))
+            assert children==3, 'two-step workflow must create one retry and one successor'
+            assert psql(f"SELECT count(*) FROM execution WHERE parent={workflow['id']} AND status='completed' AND workflow_task->>'task_name'='read_after'")=='1'
+            assert psql(f"SELECT mode='delegated' AND explicit AND admission IS NULL FROM execution_authority_selection WHERE execution={workflow['id']}")=='t'
+            assert psql(f"SELECT bool_and(s.mode='delegated' AND s.explicit AND s.admission IS NULL AND NOT (e.executable_snapshot->'executable'->'action'->>'is_adhoc')::boolean) AND count(DISTINCT e.executable_snapshot::text)=1 FROM execution e JOIN execution_authority_selection s ON s.execution=e.id WHERE e.parent={workflow['id']}")=='t'
+            assert int(psql(f"SELECT count(*) FROM execution WHERE parent={workflow['id']} AND status='failed'"))>=1
+            assert secret not in json.dumps(workflow)
+            result['checks'] += ['managed two-step successor and retry preserve explicit delegation, executable pins and synthetic secret inputs']
+
+        if args.workflow_child_inputs_only:
+            result['scope'] = 'workflow_child_inputs'
+            verify_workflow_child_inputs()
+            if args.service_image:
+                command(['docker','cp',run+'-api:'+str(evidence/'artifacts_dir')+'/.',str(evidence/'artifacts_dir')],timeout=120)
+                exported=sum(path.is_file() for path in (evidence/'artifacts_dir').rglob('*'))
+                assert exported>0, 'native volume logs must be exported for plaintext checks'
+                result['exported_artifact_files']=exported
+            for path in (evidence / 'artifacts_dir').rglob('*'):
+                if path.is_file():
+                    assert secret.encode() not in path.read_bytes(), 'plaintext workflow secret in artifact storage'
+            for log in logs:
+                log.flush()
+                assert secret not in Path(log.name).read_text(errors='replace'), 'plaintext workflow secret in service logs'
+            result['checks'].append('workflow synthetic secret absent from public result and artifact/service log files')
+            result['status'] = 'passed'
+            return
 
         positive = execute(['standard', pack_ref + '.read_system'], True, requester=caller)
         assert psql(f"SELECT executor FROM execution WHERE id={positive['id']}")==str(caller_identity['id'])
@@ -427,19 +495,12 @@ print(json.dumps({'assertion':result['assertion'],'raw_denied':True,'profile_den
         result['approved_signature_verified']=True
 
         result['checks'] += ['keys:use-only approved signer succeeds without private material; unapproved subject denied']
-        # Native workflow fanout and failed-attempt retry retain delegated mode.
-        workflow=execute(['standard',pack_ref+'.read_system'],True,reference=flow_ref,fail_once=True)
-        children=int(psql(f"SELECT count(*) FROM execution WHERE parent={workflow['id']}"))
-        assert children>=2, 'workflow did not create a retry child'
-        assert psql(f"SELECT bool_and(s.mode='delegated') AND count(DISTINCT e.executable_snapshot::text)=1 FROM execution e JOIN execution_authority_selection s ON s.execution=e.id WHERE e.parent={workflow['id']}")=='t'
-        assert int(psql(f"SELECT count(*) FROM execution WHERE parent={workflow['id']} AND status='failed'"))>=1
-        assert secret not in json.dumps(workflow)
-        result['checks'] += ['workflow fanout and retry preserve delegated mode and executable snapshot']
+        verify_workflow_child_inputs()
         tokenless=execute([],False,reference=tokenless_ref,parameters={'message':'flat stdin input'})
         assert tokenless['result']['data']=={'token_present':False,'message':'flat stdin input'}
         result['checks'] += ['tokenless selection preserves flat input and completion without an API token']
         adhoc_ref=pack_ref+'.adhoc_read'
-        adhoc=api('POST','/actions',json={'ref':adhoc_ref,'pack_ref':pack_ref,'label':'Ordinary ad hoc','entrypoint':'read_system.py','runtime_ref':pack_ref+'.python','param_schema':{'key':{'type':'string','required':True},'other':{'type':'string','required':True},'plaintext':{'type':'boolean','required':True},'fail_once':{'type':'boolean'},'marker':{'type':'string'}},})
+        adhoc=api('POST','/actions',json={'ref':adhoc_ref,'pack_ref':pack_ref,'label':'Ordinary ad hoc','entrypoint':'read_system.py','runtime_ref':pack_ref+'.python','output_format':'json','out_schema':protected_output,'output_policy':protected_channels,'param_schema':{'key':{'type':'string','required':True},'other':{'type':'string','required':True},'plaintext':{'type':'boolean','required':True},'fail_once':{'type':'boolean'},'marker':{'type':'string'}},})
         assert adhoc['is_adhoc'] is True
         execute(['standard',pack_ref+'.read_system'],True,reference=adhoc_ref)
         result['checks'] += ['ordinary API-created ad hoc execution remains supported']

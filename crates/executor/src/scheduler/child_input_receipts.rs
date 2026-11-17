@@ -3,10 +3,12 @@ use super::*;
 use attune_common::repositories::{
     accepted_input::AcceptedInputRepository,
     declared_input_materialization::DeclaredInputMaterializationRepository as Materialize,
+    delegated_execution::DelegatedExecutionRepository,
     execution_admission::ExecutionAdmissionRepository as Admission,
+    execution_runtime_admission::ExistingExecutionAuthority,
     inherited_input::ReceiptContext,
     native_input_origin::{NativeInputClosure, NativeInputOriginRepository},
-    runtime_authority::{ApprovalEffectFence, RuntimeOwner},
+    runtime_authority::ApprovalEffectFence,
 };
 
 pub(super) struct PreparedExecutionInputs {
@@ -72,12 +74,18 @@ impl TransactionInputReceipts {
     ) -> Result<()> {
         anyhow::ensure!(
             !self.contains(execution.id),
-            "Execution input proofs were already retained"
+            attune_common::Error::PermissionDenied(
+                "Execution input proofs were already retained".into()
+            )
         );
-        let recorded = Admission::find(conn, RuntimeOwner::Execution(execution.id)).await?;
-        let (receipts, acceptance, source) = if recorded.is_some() {
+        // Ownership and an absent admission cannot select authority. In
+        // particular, a lost/revoked recorded admission must never borrow IAM.
+        let authority = Admission::existing_authority(conn, execution.id).await?;
+        let (receipts, acceptance, source) = if authority == ExistingExecutionAuthority::Recorded {
             let key = encryption_key.ok_or_else(|| {
-                anyhow::anyhow!("Accepted workflow input encryption is unavailable")
+                attune_common::Error::PermissionDenied(
+                    "Accepted workflow input encryption is unavailable".into(),
+                )
             })?;
             let acceptance =
                 AcceptedInputRepository::revalidate_execution(conn, execution.id, key).await?;
@@ -88,7 +96,7 @@ impl TransactionInputReceipts {
                     .await?;
             (receipts, Some(acceptance), Some(source))
         } else {
-            Self::require_legacy_input_source(conn, execution).await?;
+            Self::require_delegated_input_source(conn, execution).await?;
             (Vec::new(), None, None)
         };
         self.executions.push(ExecutionInputProofs {
@@ -100,55 +108,61 @@ impl TransactionInputReceipts {
         Ok(())
     }
 
-    async fn require_legacy_input_source(
+    async fn require_delegated_input_source(
         conn: &mut PgConnection,
         execution: &Execution,
     ) -> Result<()> {
+        let parent_id = execution.parent.ok_or_else(|| {
+            attune_common::Error::PermissionDenied("Workflow input parent is unavailable".into())
+        })?;
         anyhow::ensure!(
-            execution
-                .executable_snapshot
-                .as_ref()
-                .is_some_and(|snapshot| { snapshot.executable.action.is_adhoc }),
-            "Recorded child input admission is unavailable"
+            Admission::existing_authority(conn, parent_id).await?
+                == ExistingExecutionAuthority::Delegated,
+            attune_common::Error::PermissionDenied(
+                "Delegated workflow input requires a delegated parent".into()
+            )
         );
-        // An ad-hoc TARGET beneath a recorded/managed SOURCE still requires
-        // admission. Mirror the production creation boundary, not its flag alone.
+        // This retains the active owner, immutable executable/schema, open
+        // parent producer and selected-grant ceiling, including `standard`.
+        DelegatedExecutionRepository::validate_child(conn, parent_id, execution.id).await?;
         if let Some(task) = &execution.workflow_task {
             let workflow =
                 WorkflowExecutionRepository::find_by_id(&mut *conn, task.workflow_execution)
                     .await?
-                    .ok_or_else(|| anyhow::anyhow!("Workflow input lineage is unavailable"))?;
+                    .ok_or_else(|| {
+                        attune_common::Error::PermissionDenied(
+                            "Workflow input lineage is unavailable".into(),
+                        )
+                    })?;
             anyhow::ensure!(
                 execution.parent == Some(workflow.execution),
-                "Workflow input parent does not match its workflow"
+                attune_common::Error::PermissionDenied(
+                    "Workflow input parent does not match its workflow".into()
+                )
             );
-        }
-        let parent_id = execution
-            .parent
-            .ok_or_else(|| anyhow::anyhow!("Workflow input parent is unavailable"))?;
-        {
             let parent = ExecutionRepository::find_by_id(&mut *conn, parent_id)
                 .await?
-                .ok_or_else(|| anyhow::anyhow!("Workflow input parent is unavailable"))?;
-            let parent_recorded = Admission::find(conn, RuntimeOwner::Execution(parent_id)).await?;
-            let parent_adhoc = parent
+                .ok_or_else(|| {
+                    attune_common::Error::PermissionDenied(
+                        "Workflow input parent is unavailable".into(),
+                    )
+                })?;
+            let definition = parent
                 .executable_snapshot
                 .as_ref()
-                .map(|snapshot| snapshot.executable.action.is_adhoc)
+                .and_then(|snapshot| snapshot.executable.workflow_definition.as_ref())
                 .ok_or_else(|| {
-                    anyhow::anyhow!("Workflow input parent executable is unavailable")
+                    attune_common::Error::PermissionDenied(
+                        "Workflow input definition is unavailable".into(),
+                    )
                 })?;
             anyhow::ensure!(
-                parent_recorded.is_none() && parent_adhoc,
-                "Recorded child input admission is unavailable"
+                workflow.workflow_def == definition.id,
+                attune_common::Error::PermissionDenied(
+                    "Workflow input definition differs from its pinned executable".into()
+                )
             );
         }
-        attune_common::delegation::require_execution_refs_for_share(
-            conn,
-            execution.executor,
-            &execution.permission_set_refs,
-        )
-        .await?;
         Ok(())
     }
 
@@ -181,7 +195,11 @@ impl TransactionInputReceipts {
             .executions
             .iter()
             .find(|proof| proof.execution == execution)
-            .ok_or_else(|| anyhow::anyhow!("Publication has no retained execution input proofs"))?;
+            .ok_or_else(|| {
+                attune_common::Error::PermissionDenied(
+                    "Publication has no retained execution input proofs".into(),
+                )
+            })?;
         Self::ensure_execution_proof_fresh(proof)
     }
 
@@ -193,7 +211,11 @@ impl TransactionInputReceipts {
             .executions
             .iter()
             .find(|proof| proof.execution == execution)
-            .ok_or_else(|| anyhow::anyhow!("Publication has no retained execution input proofs"))?;
+            .ok_or_else(|| {
+                attune_common::Error::PermissionDenied(
+                    "Publication has no retained execution input proofs".into(),
+                )
+            })?;
         Self::ensure_execution_proof_fresh(proof)?;
         let mut candidates = Vec::new();
         if let Some(acceptance) = &proof.acceptance {
@@ -309,7 +331,9 @@ impl PreparedWorkflowInputPublications {
                 && execution.config == request.config
                 && execution.pack_release == request.release_id
                 && execution.pack_release_digest == request.release_digest,
-            "Pending workflow publication differs from its persisted execution"
+            attune_common::Error::PermissionDenied(
+                "Pending workflow publication differs from its persisted execution".into()
+            )
         );
         Ok(())
     }
@@ -349,28 +373,36 @@ impl PreparedWorkflowInputPublications {
         for ids in owner_ids.chunks(256) {
             anyhow::ensure!(
                 ids.iter().all(|id| *id > 0),
-                "Invalid workflow input owner ID"
+                attune_common::Error::PermissionDenied("Invalid workflow input owner ID".into())
             );
             let rows = ExecutionRepository::find_by_ids(&mut *conn, ids).await?;
             anyhow::ensure!(
                 rows.len() == ids.len(),
-                "Tracked workflow input owner is unavailable"
+                attune_common::Error::PermissionDenied(
+                    "Tracked workflow input owner is unavailable".into()
+                )
             );
             for row in rows {
                 anyhow::ensure!(
                     ids.binary_search(&row.id).is_ok(),
-                    "Unexpected workflow input owner"
+                    attune_common::Error::PermissionDenied(
+                        "Unexpected workflow input owner".into()
+                    )
                 );
                 anyhow::ensure!(
                     executions.insert(row.id, row).is_none(),
-                    "Duplicate workflow input owner row"
+                    attune_common::Error::PermissionDenied(
+                        "Duplicate workflow input owner row".into()
+                    )
                 );
             }
         }
         for request in pending {
-            let execution = executions
-                .get(&request.execution_id)
-                .ok_or_else(|| anyhow::anyhow!("Pending workflow input owner is unavailable"))?;
+            let execution = executions.get(&request.execution_id).ok_or_else(|| {
+                attune_common::Error::PermissionDenied(
+                    "Pending workflow input owner is unavailable".into(),
+                )
+            })?;
             Self::require_pending_matches_execution(execution, request)?;
         }
         // Every ID, including deferred owners with no message, reopens actual

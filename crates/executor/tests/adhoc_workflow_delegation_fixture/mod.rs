@@ -1,7 +1,8 @@
-// Independent human-owned ad-hoc characterization. No managed policy admission.
+// Independent human-delegated fixtures, authored as managed or ad hoc.
+// Neither executable ownership mode fabricates recorded runtime admission.
 const ADHOC_WORKFLOW_PERMISSION_REF: &str = "fixture.adhoc_workflow_execute";
 
-struct AdhocWorkflowDelegationFixture {
+struct WorkflowDelegationFixture {
     database: TestDatabase,
     parent: Execution,
     workflow_execution_id: i64,
@@ -12,12 +13,20 @@ struct AdhocWorkflowDelegationFixture {
     release_files: tempfile::TempDir,
 }
 
-impl AdhocWorkflowDelegationFixture {
+impl WorkflowDelegationFixture {
     async fn create() -> Result<Self> {
         Self::create_with_selection(false).await
     }
 
     async fn create_with_selection(named: bool) -> Result<Self> {
+        Self::create_with_ownership(named, false).await
+    }
+
+    async fn create_managed() -> Result<Self> {
+        Self::create_with_ownership(true, true).await
+    }
+
+    async fn create_with_ownership(named: bool, managed: bool) -> Result<Self> {
         use attune_common::{
             repositories::{
                 executable_snapshot::ExecutableSnapshotRepository,
@@ -60,6 +69,15 @@ tasks:
     retry:
       count: 2
       delay: 0
+  - name: first
+    action: adhoc_workflow_delegation_it.consume
+    permission_set_refs: "{{ parameters.refs }}"
+    next:
+      - when: "{{ succeeded() }}"
+        do: [second]
+  - name: second
+    action: adhoc_workflow_delegation_it.consume
+    permission_set_refs: "{{ parameters.refs }}"
 "#;
         let files = [
             (
@@ -171,7 +189,7 @@ tasks:
                         worker_affinity: serde_json::json!({}),
                         param_schema: None,
                         out_schema: None,
-                        is_adhoc: true,
+                        is_adhoc: !managed,
                         accesses_mcp: false,
                         default_execution_permission_set_refs: Vec::new(),
                         reference_visibility: Default::default(),
@@ -237,9 +255,18 @@ tasks:
             },
         )
         .await?;
-        // Activate the code release only. Stamping these ad-hoc actions as pack
-        // projections or admitting a managed runtime policy would change scope.
-        PackReleaseRepository::activate(&mut activation, pack.id, release.id).await?;
+        if managed {
+            PackReleaseRepository::activate_projected(
+                &mut activation, pack.id, release.id,
+                &attune_common::repositories::component_lifecycle::PackProjectionIds {
+                    actions: actions.iter().map(|action| action.id).collect(),
+                    workflows: vec![definition.id],
+                    ..Default::default()
+                },
+            ).await?;
+        } else {
+            PackReleaseRepository::activate(&mut activation, pack.id, release.id).await?;
+        }
         activation.commit().await?;
 
         let parameters = serde_json::json!({
@@ -257,15 +284,15 @@ tasks:
             ExecutableSnapshotRepository::resolve_for_action(&mut *acceptance, actions[0].id)
                 .await?;
         anyhow::ensure!(
-            snapshot.executable.action.is_adhoc,
-            "root must be authored ad-hoc"
+            snapshot.executable.action.is_adhoc != managed,
+            "root retains its authored ownership mode"
         );
         anyhow::ensure!(
             snapshot.pack_executables[&actions[1].r#ref]
                 .executable
                 .action
-                .is_adhoc,
-            "consumer must be authored ad-hoc"
+                .is_adhoc != managed,
+            "consumer retains its authored ownership mode"
         );
         let binding =
             SchemaContractRepository::materialize_action(&mut acceptance, &snapshot).await?;
@@ -321,8 +348,8 @@ tasks:
             &[],
         )
         .await?;
-        // Ad-hoc inputs use the live-owner path. Do not fabricate managed
-        // accepted-input seals or recorded human authority without an admission.
+        // Delegated inputs use the live-owner path for either ownership mode.
+        // Do not fabricate recorded input seals or human authority.
         let parent = ExecutionRepository::update(
             &mut *acceptance,
             provisional.id,

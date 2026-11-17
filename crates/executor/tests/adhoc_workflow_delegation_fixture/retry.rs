@@ -1,6 +1,6 @@
-async fn ad_hoc_retry_fixture() -> (AdhocWorkflowDelegationFixture, Execution) {
+async fn ad_hoc_retry_fixture() -> (WorkflowDelegationFixture, Execution) {
     use attune_common::repositories::workflow::UpdateWorkflowExecutionInput;
-    let fixture = AdhocWorkflowDelegationFixture::create_with_selection(true).await.unwrap();
+    let fixture = WorkflowDelegationFixture::create_with_selection(true).await.unwrap();
     let pool = fixture.database.pool();
     let mut tx = pool.begin().await.unwrap();
     CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::PinMutation)
