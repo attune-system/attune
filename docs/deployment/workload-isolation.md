@@ -54,3 +54,50 @@ staging and read-only published inputs. Publication tests reject link escapes.
 These tests alone do not establish packaged service, complete runtime setup,
 candidate distribution, log custody, Compose or Kubernetes readiness. Record
 those integration results separately before claiming closure of s-23.
+
+## Container readiness blocker
+
+This change is **not a completed closure of s-23**. Default Docker/Compose and
+Kubernetes deployment readiness remains blocked. Installing Bubblewrap and
+selecting API artifact transport are necessary, but insufficient. On the owned
+Docker 29.9.2 Linux/amd64 probe, the builtin seccomp profile denied Bubblewrap's
+namespace `clone`. A pinned default-deny derivative admitted that exact clone,
+user-namespace unshare and observed mount operations. Fresh PID-namespace procfs
+mounting still failed with `EPERM`; an owned direct probe also rejected
+`subset=pid`. An owned rootless runc bundle with its default proc restrictions
+failed UID-map setup. These failures are gaps, not positive deployment evidence.
+Do not disable parent proc masks or use privileged containers, broad capabilities,
+`seccomp=unconfined` or `systempaths=unconfined` as a workaround.
+
+`docker/seccomp/workload-bwrap-amd64.json` is a **diagnostic profile**, not an
+approved production deployment configuration. It preserves the upstream Moby
+allowlist and default deny from commit
+[`f862455628f78f84c937e967e4a03902fb1dee11`](https://github.com/moby/profiles/blob/f862455628f78f84c937e967e4a03902fb1dee11/seccomp/default.json),
+and adds only the traced amd64 namespace/mount operations. Regenerate it with
+`python3 scripts/generate-workload-seccomp.py` and check its immutable baseline
+and allowance invariants with `python3 scripts/test-workload-seccomp.py`.
+It deliberately grants neither network/cgroup namespace creation nor arbitrary
+`setns`. It is not enabled automatically in Compose.
+
+The exact Debian `bubblewrap 0.8.0-2+deb12u1` package supports the required flags:
+its owned host trace completed procfs/mount setup and enforced
+`--disable-userns` (a further user namespace creation returned `ENOSPC`).
+That host result does not establish compatibility with a container's parent
+proc restrictions. `Dockerfile.workload-runtime` builds the injected runtime
+prerequisites instead of relying on startup package installation in stock
+images. Startup continues to reject incompatible container policy.
+
+For background, see [Docker seccomp](https://docs.docker.com/engine/security/seccomp/),
+[Linux procfs](https://docs.kernel.org/filesystems/proc.html), and
+[Kubernetes security contexts](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/).
+Kubernetes proc policy, node profile distribution, admission and required cluster
+version need their own tested contract. No chart image pins, operator checkbox,
+or host-only test result can establish that contract. The current immutable
+chart images do not implement this boundary; chart support remains a dependency.
+
+Candidate tests receive a private writable copy of their input tree at the same
+logical working path. Their published input tree and selected runtime remain
+read-only. The subprocess owner removes the private copy after process teardown.
+Runtime setup mounts its private host staging at the final logical install path,
+so console-script shebangs remain valid after publication. Internal absolute
+links are converted to equivalent relative links before the trusted rename.

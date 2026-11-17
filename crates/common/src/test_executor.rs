@@ -110,6 +110,7 @@ pub struct TestExecutor {
     candidate_effects: Option<CandidateTestEnvironment>,
     processes: TestProcessOwner,
     cancellation: CancellationToken,
+    workload_sandbox: Option<crate::workload_sandbox::WorkloadSandbox>,
 }
 
 /// Owns subprocess supervisors independently of the future consuming their output.
@@ -142,7 +143,16 @@ impl TestExecutor {
             candidate_effects: None,
             processes: TestProcessOwner::default(),
             cancellation: CancellationToken::new(),
+            workload_sandbox: None,
         }
+    }
+
+    pub fn with_workload_sandbox(
+        mut self,
+        sandbox: crate::workload_sandbox::WorkloadSandbox,
+    ) -> Self {
+        self.workload_sandbox = Some(sandbox);
+        self
     }
 
     pub fn process_owner(&self) -> TestProcessOwner {
@@ -470,13 +480,54 @@ impl TestExecutor {
         if let Some(runtime) = runtime {
             reads.push(runtime);
         }
-        let sandbox = crate::workload_sandbox::WorkloadSandbox::from_environment(true)
-            .map_err(|error| Error::validation(error.to_string()))?;
-        let mut cmd = Command::from(
-            sandbox
-                .wrap(cmd.into_std(), &reads)
+        let sandbox = match self.workload_sandbox {
+            Some(sandbox) => sandbox,
+            None => crate::workload_sandbox::WorkloadSandbox::from_environment(true)
                 .map_err(|error| Error::validation(error.to_string()))?,
-        );
+        };
+        let workspace = if matches!(
+            sandbox,
+            crate::workload_sandbox::WorkloadSandbox::Bubblewrap
+        ) {
+            if working_dir
+                .canonicalize()
+                .map_err(|error| Error::io(error.to_string()))?
+                != working_dir
+            {
+                return Err(Error::validation(
+                    "Candidate workspace must be a canonical path",
+                ));
+            }
+            let workspace = tempfile::tempdir().map_err(|error| Error::io(error.to_string()))?;
+            let prepared = copy_private_test_tree(working_dir, workspace.path()).and_then(|()| {
+                crate::workload_sandbox::prepare_staging(workspace.path(), working_dir)
+            });
+            if let Err(error) = prepared {
+                workspace
+                    .close()
+                    .map_err(|error| Error::io(error.to_string()))?;
+                return Err(Error::io(error.to_string()));
+            }
+            Some(workspace)
+        } else {
+            None
+        };
+        let wrapped = if let Some(workspace) = &workspace {
+            sandbox.wrap_workspace(cmd.into_std(), &reads, workspace.path(), working_dir)
+        } else {
+            sandbox.wrap(cmd.into_std(), &reads)
+        };
+        let mut cmd = match wrapped {
+            Ok(command) => Command::from(command),
+            Err(error) => {
+                if let Some(workspace) = workspace {
+                    workspace
+                        .close()
+                        .map_err(|error| Error::io(error.to_string()))?;
+                }
+                return Err(Error::validation(error.to_string()));
+            }
+        };
         cmd.stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
@@ -486,13 +537,28 @@ impl TestExecutor {
 
         // No await between spawning and transferring ownership to the tracker.
         // Closing the sender signals cancellation even when the consuming task is aborted.
-        let child = cmd.spawn().map_err(|e| {
-            Error::Internal(format!("Failed to spawn command '{}': {}", command, e))
-        })?;
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                if let Some(workspace) = workspace {
+                    workspace
+                        .close()
+                        .map_err(|error| Error::io(error.to_string()))?;
+                }
+                return Err(Error::Internal(format!(
+                    "Failed to spawn command '{command}': {error}"
+                )));
+            }
+        };
         let (consumer, cancelled) = tokio::sync::oneshot::channel::<()>();
         let cancellation = self.cancellation.clone();
         let task = self.processes.tasks.spawn(async move {
             let result = Self::collect_command(child, timeout, cancelled, cancellation).await;
+            if let Some(workspace) = workspace {
+                workspace.close().map_err(|error| {
+                    Error::io(format!("Test workspace cleanup failed: {error}"))
+                })?;
+            }
             if let Err(error) = &result {
                 // The consuming future may have been aborted, so also surface
                 // failures here rather than relying on its JoinHandle result.
@@ -739,6 +805,26 @@ pub(crate) fn confined_test_entrypoint(root: &Path, entry: &str) -> Result<PathB
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    #[ignore = "requires Linux bubblewrap and unprivileged namespaces"]
+    async fn isolated_candidate_writes_private_copy_and_preserves_inputs() {
+        let root = tempfile::tempdir().unwrap();
+        let pack = root.path().join("candidate");
+        std::fs::create_dir(&pack).unwrap();
+        std::fs::write(pack.join("input"), "original").unwrap();
+        let executor = super::TestExecutor::new(root.path().to_path_buf())
+            .with_workload_sandbox(crate::workload_sandbox::WorkloadSandbox::Bubblewrap);
+        let result = executor.run_command("/bin/sh", &["-c".into(), "set -eu; echo modified > input; mkdir output; echo generated > output/result; echo test-ok".into()], &pack, None, std::time::Duration::from_secs(10)).await;
+        executor.process_owner().shutdown().await;
+        let output = result.unwrap();
+        assert_eq!(output.stdout.trim(), "test-ok");
+        assert_eq!(
+            std::fs::read_to_string(pack.join("input")).unwrap(),
+            "original"
+        );
+        assert!(!pack.join("output").exists());
+    }
+
     use super::*;
 
     #[cfg(unix)]
@@ -1232,4 +1318,37 @@ mod tests {
         std::env::remove_var(secret_name);
         assert!(result.is_ok(), "pack test inherited a service secret");
     }
+}
+
+/// Copy executable test inputs without following host links. The sandbox mounts
+/// only this owned copy writable; publication inputs and runtime stay read-only.
+fn copy_private_test_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let source = entry.path();
+        let destination = destination.join(entry.file_name());
+        let metadata = std::fs::symlink_metadata(&source)?;
+        if metadata.file_type().is_symlink() {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(std::fs::read_link(&source)?, destination)?;
+            #[cfg(not(unix))]
+            return Err(std::io::Error::other("Isolated test links require Unix"));
+        } else if metadata.is_dir() {
+            std::fs::create_dir(&destination)?;
+            copy_private_test_tree(&source, &destination)?;
+        } else if metadata.is_file() {
+            std::fs::copy(&source, &destination)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = metadata.permissions().mode() | 0o200;
+                std::fs::set_permissions(destination, std::fs::Permissions::from_mode(mode))?;
+            }
+        } else {
+            return Err(std::io::Error::other(
+                "Unsupported candidate test input type",
+            ));
+        }
+    }
+    Ok(())
 }

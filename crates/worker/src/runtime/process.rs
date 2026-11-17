@@ -98,11 +98,13 @@ fn configure_setup_command(
     command: &mut Command,
     pack_dir: &Path,
     env_dir: &Path,
+    install_path: &Path,
     child_environment: &attune_common::child_process_environment::ChildProcessEnvironment,
     config: &RuntimeExecutionConfig,
 ) {
     child_environment.apply(command.as_std_mut());
-    let vars = config.build_template_vars_with_env(pack_dir, Some(env_dir));
+    let vars =
+        attune_common::runtime_cache::staged_template_vars(config, pack_dir, env_dir, install_path);
     for (key, specification) in &config.env_vars {
         if parameter_passing::is_reserved_runtime_env_var(key) {
             continue;
@@ -116,7 +118,7 @@ fn configure_setup_command(
         let value = specification.resolve(&vars, current);
         command.env(key, value);
     }
-    let setup_home = env_dir.join(".attune-setup");
+    let setup_home = install_path.join(".attune-setup");
     command
         .current_dir(pack_dir)
         .env("HOME", &setup_home)
@@ -295,8 +297,9 @@ impl ProcessRuntime {
         std::fs::create_dir_all(parent)?;
         let temporary = parent.join(format!(".runtime.{}.tmp", uuid::Uuid::new_v4()));
         let result = async {
-            self.setup_pack_environment_in_place(pack_dir, &temporary)
+            self.setup_pack_environment_in_place(pack_dir, &temporary, env_dir)
                 .await?;
+            attune_common::workload_sandbox::prepare_staging(&temporary, env_dir)?;
             if let Some(environment) = self.config.environment.as_ref() {
                 if let Some(interpreter_template) = environment.interpreter_path.as_ref() {
                     let mut vars = HashMap::new();
@@ -312,23 +315,17 @@ impl ProcessRuntime {
                     }
                 }
             }
-            attune_common::workload_sandbox::validate_staging(&temporary)?;
+            attune_common::workload_sandbox::prepare_staging(&temporary, env_dir)?;
             if let Some(key) = cache_key {
                 key.write_ready_marker(&temporary)?;
             } else {
-                let marker = if env_dir
-                    .parent()
-                    .and_then(Path::file_name)
-                    .is_some_and(|name| name == "sha256")
-                {
-                    env_dir
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "ready".to_string())
-                } else {
-                    "ready".to_string()
-                };
-                std::fs::write(temporary.join(READY_MARKER), marker)?;
+                let marker = env_dir
+                    .file_name()
+                    .ok_or_else(|| {
+                        RuntimeError::SetupError("Runtime destination has no name".to_string())
+                    })?
+                    .to_string_lossy();
+                std::fs::write(temporary.join(READY_MARKER), marker.as_bytes())?;
             }
             if let Some(key) = cache_key {
                 key.publish(&temporary, env_dir)?;
@@ -357,7 +354,9 @@ impl ProcessRuntime {
         &self,
         pack_dir: &Path,
         env_dir: &Path,
+        destination: &Path,
     ) -> RuntimeResult<()> {
+        let install_path = self.child_environment.setup_path(env_dir, destination);
         let env_cfg = match &self.config.environment {
             Some(cfg) if cfg.env_type != "none" => cfg,
             _ => {
@@ -369,13 +368,16 @@ impl ProcessRuntime {
             }
         };
 
-        let vars = self
-            .config
-            .build_template_vars_with_env(pack_dir, Some(env_dir));
+        let vars = attune_common::runtime_cache::staged_template_vars(
+            &self.config,
+            pack_dir,
+            env_dir,
+            install_path,
+        );
 
         if !env_dir.exists() {
             // Environment does not exist yet — create it.
-            self.create_environment(env_cfg, pack_dir, env_dir, &vars)
+            self.create_environment(env_cfg, pack_dir, env_dir, destination, &vars)
                 .await?;
         } else {
             // Environment directory exists — verify the interpreter is usable.
@@ -390,17 +392,20 @@ impl ProcessRuntime {
                         e,
                     );
                     // Still try to install dependencies even if we couldn't recreate
-                    self.install_dependencies(pack_dir, env_dir).await?;
+                    self.install_dependencies_at(pack_dir, env_dir, destination)
+                        .await?;
                     return Ok(());
                 }
 
-                self.create_environment(env_cfg, pack_dir, env_dir, &vars)
+                self.create_environment(env_cfg, pack_dir, env_dir, destination, &vars)
                     .await?;
             }
         }
 
+        attune_common::workload_sandbox::prepare_staging(env_dir, destination)?;
         // Install dependencies if configured and manifest file exists
-        self.install_dependencies(pack_dir, env_dir).await?;
+        self.install_dependencies_at(pack_dir, env_dir, destination)
+            .await?;
 
         Ok(())
     }
@@ -478,6 +483,7 @@ impl ProcessRuntime {
         env_cfg: &EnvironmentConfig,
         pack_dir: &Path,
         env_dir: &Path,
+        destination: &Path,
         vars: &std::collections::HashMap<&str, String>,
     ) -> RuntimeResult<()> {
         if env_cfg.create_command.is_empty() {
@@ -518,13 +524,14 @@ impl ProcessRuntime {
             &mut command,
             pack_dir,
             env_dir,
+            self.child_environment.setup_path(env_dir, destination),
             &self.child_environment,
             &self.config,
         );
         std::fs::create_dir_all(env_dir)?;
         let command = self
             .child_environment
-            .sandbox_setup(command.into_std(), pack_dir, env_dir)
+            .sandbox_install(command.into_std(), pack_dir, env_dir, destination)
             .map(Command::from)?;
         let output = process_executor::run_command_output_owned(command)
             .await
@@ -562,6 +569,16 @@ impl ProcessRuntime {
     /// * `pack_dir` - Absolute path to the pack directory (for manifest files)
     /// * `env_dir` - Absolute path to the environment directory
     pub async fn install_dependencies(&self, pack_dir: &Path, env_dir: &Path) -> RuntimeResult<()> {
+        self.install_dependencies_at(pack_dir, env_dir, env_dir)
+            .await
+    }
+
+    async fn install_dependencies_at(
+        &self,
+        pack_dir: &Path,
+        env_dir: &Path,
+        destination: &Path,
+    ) -> RuntimeResult<()> {
         let dep_cfg = match &self.config.dependencies {
             Some(cfg) => cfg,
             None => {
@@ -612,9 +629,12 @@ impl ProcessRuntime {
         }
 
         // Build template vars with the external env_dir
-        let vars = self
-            .config
-            .build_template_vars_with_env(pack_dir, Some(env_dir));
+        let vars = attune_common::runtime_cache::staged_template_vars(
+            &self.config,
+            pack_dir,
+            env_dir,
+            self.child_environment.setup_path(env_dir, destination),
+        );
         let resolved_cmd = RuntimeExecutionConfig::resolve_command(&dep_cfg.install_command, &vars);
 
         let (program, args) = resolved_cmd
@@ -633,13 +653,14 @@ impl ProcessRuntime {
             &mut command,
             pack_dir,
             env_dir,
+            self.child_environment.setup_path(env_dir, destination),
             &self.child_environment,
             &self.config,
         );
         std::fs::create_dir_all(env_dir)?;
         let command = self
             .child_environment
-            .sandbox_setup(command.into_std(), pack_dir, env_dir)
+            .sandbox_install(command.into_std(), pack_dir, env_dir, destination)
             .map(Command::from)?;
         let output = process_executor::run_command_output_owned(command)
             .await
@@ -668,7 +689,7 @@ impl ProcessRuntime {
             output.stdout.len()
         );
 
-        attune_common::workload_sandbox::validate_staging(env_dir)?;
+        attune_common::workload_sandbox::prepare_staging(env_dir, destination)?;
         // Write the checksum marker so subsequent calls skip the install.
         if let Some(checksum) = current_checksum {
             if let Err(e) = tokio::fs::write(&marker_path, checksum.as_bytes()).await {
@@ -1834,6 +1855,7 @@ mod tests {
             &mut command,
             pack_dir,
             env_dir,
+            env_dir,
             &Default::default(),
             &Default::default(),
         );
@@ -1925,6 +1947,80 @@ mod tests {
         assert!(rendered.contains("exit 17"));
         assert!(rendered.contains("stderr_bytes=42"));
         assert!(!rendered.contains("credential-secret"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Linux bubblewrap and unprivileged namespaces"]
+    async fn sandbox_setup_keeps_console_paths_after_atomic_publication() {
+        for content_addressed in [false, true] {
+            let root = TempDir::new().unwrap();
+            let pack = root.path().join("pack");
+            std::fs::create_dir(&pack).unwrap();
+            let key = RuntimeCacheKey::new(
+                &"a".repeat(64),
+                &sha256_bytes(&[]),
+                "test",
+                "1",
+                "worker-v1",
+            )
+            .unwrap();
+            let destination = if content_addressed {
+                key.path(&root.path().join("runtime"))
+            } else {
+                root.path().join("ordinary")
+            };
+            let environment =
+                attune_common::child_process_environment::ChildProcessEnvironment::from_parent(
+                    [],
+                    &[],
+                )
+                .unwrap()
+                .with_workload_sandbox(
+                    attune_common::workload_sandbox::WorkloadSandbox::Bubblewrap,
+                );
+            let runtime = ProcessRuntime::new(
+                "test".into(),
+                make_atomic_test_config(
+                    r#"
+set -eu
+mkdir -p "$1/bin"
+cp /bin/sh "$1/bin/sh"
+printf '#!%s/bin/sh\necho installed-console\n' "$1" > "$1/bin/console"
+chmod +x "$1/bin/console"
+ln -s "$1/bin/console" "$1/link"
+"#,
+                ),
+                root.path().to_path_buf(),
+                root.path().join("runtime"),
+            )
+            .with_child_environment(environment.clone());
+            let selected_key = content_addressed.then_some(&key);
+            let (first, second) = tokio::join!(
+                runtime.setup_pack_environment_with_key(&pack, &destination, selected_key),
+                runtime.setup_pack_environment_with_key(&pack, &destination, selected_key)
+            );
+            first.unwrap();
+            second.unwrap();
+            runtime
+                .setup_pack_environment_with_key(&pack, &destination, selected_key)
+                .await
+                .unwrap();
+            for executable in [destination.join("bin/console"), destination.join("link")] {
+                let mut command = std::process::Command::new(executable);
+                environment.apply(&mut command);
+                let output = environment
+                    .sandbox_workload(command, &[&destination])
+                    .unwrap()
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(output.stdout, b"installed-console\n");
+            }
+        }
     }
 
     #[tokio::test]

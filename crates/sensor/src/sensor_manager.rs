@@ -152,13 +152,21 @@ fn build_sensor_setup_command(
     args: &[String],
     pack_dir: &std::path::Path,
     env_dir: &std::path::Path,
+    destination: &std::path::Path,
     exec_config: &RuntimeExecutionConfig,
     environment: &ChildProcessEnvironment,
 ) -> io::Result<Command> {
     let mut command = Command::new(program);
     environment.apply(command.as_std_mut());
-    apply_runtime_env_vars(&mut command, exec_config, pack_dir, Some(env_dir));
-    let home = env_dir.join(".attune-setup");
+    let install_path = environment.setup_path(env_dir, destination);
+    let vars = attune_common::runtime_cache::staged_template_vars(
+        exec_config,
+        pack_dir,
+        env_dir,
+        install_path,
+    );
+    apply_runtime_env_vars_with_vars(&mut command, exec_config, &vars);
+    let home = install_path.join(".attune-setup");
     command
         .args(args)
         .current_dir(pack_dir)
@@ -172,7 +180,7 @@ fn build_sensor_setup_command(
         );
     std::fs::create_dir_all(env_dir)?;
     environment
-        .sandbox_setup(command.into_std(), pack_dir, env_dir)
+        .sandbox_install(command.into_std(), pack_dir, env_dir, destination)
         .map(Command::from)
 }
 
@@ -187,6 +195,14 @@ fn apply_runtime_env_vars(
     }
 
     let vars = exec_config.build_template_vars_with_env(pack_dir, env_dir);
+    apply_runtime_env_vars_with_vars(cmd, exec_config, &vars);
+}
+
+fn apply_runtime_env_vars_with_vars(
+    cmd: &mut Command,
+    exec_config: &RuntimeExecutionConfig,
+    vars: &HashMap<&str, String>,
+) {
     for (key, env_var_config) in &exec_config.env_vars {
         if key.starts_with("ATTUNE_") {
             warn!(
@@ -195,7 +211,7 @@ fn apply_runtime_env_vars(
             );
             continue;
         }
-        let resolved = env_var_config.resolve(&vars, existing_command_env(cmd, key).as_deref());
+        let resolved = env_var_config.resolve(vars, existing_command_env(cmd, key).as_deref());
         debug!(env_var = %key, "Setting sensor runtime environment variable");
         cmd.env(key, resolved);
     }
@@ -322,6 +338,7 @@ impl Drop for StartupProcessGuard {
 pub(crate) async fn cancellable_command_output(cmd: &mut Command) -> io::Result<Output> {
     configure_sensor_process(cmd)?;
     cmd.kill_on_drop(true)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let child = cmd.spawn()?;
@@ -954,9 +971,11 @@ impl SensorManager {
                 exec_config,
                 pack_dir,
                 &temporary,
+                env_dir,
                 &self.inner.child_environment,
             )
             .await?;
+            attune_common::workload_sandbox::prepare_staging(&temporary, env_dir)?;
             if let Some(interpreter_template) = exec_config
                 .environment
                 .as_ref()
@@ -974,7 +993,7 @@ impl SensorManager {
                     ));
                 }
             }
-            attune_common::workload_sandbox::validate_staging(&temporary)?;
+            attune_common::workload_sandbox::prepare_staging(&temporary, env_dir)?;
             cache_key.write_ready_marker(&temporary)?;
             cache_key.publish(&temporary, env_dir)?;
             Ok(())
@@ -988,6 +1007,7 @@ impl SensorManager {
         exec_config: &RuntimeExecutionConfig,
         pack_dir: &std::path::Path,
         env_dir: &std::path::Path,
+        destination: &std::path::Path,
         child_environment: &ChildProcessEnvironment,
     ) -> Result<()> {
         let env_cfg = match &exec_config.environment {
@@ -995,7 +1015,12 @@ impl SensorManager {
             _ => return Ok(()),
         };
 
-        let vars = exec_config.build_template_vars_with_env(pack_dir, Some(env_dir));
+        let vars = attune_common::runtime_cache::staged_template_vars(
+            exec_config,
+            pack_dir,
+            env_dir,
+            child_environment.setup_path(env_dir, destination),
+        );
 
         if !env_dir.exists() {
             if env_cfg.create_command.is_empty() {
@@ -1035,6 +1060,7 @@ impl SensorManager {
                 args,
                 pack_dir,
                 env_dir,
+                destination,
                 exec_config,
                 child_environment,
             )?)
@@ -1050,8 +1076,14 @@ impl SensorManager {
             }
         }
 
+        attune_common::workload_sandbox::prepare_staging(env_dir, destination)?;
         // Environment creation makes its interpreter available for dependency templates.
-        let vars = exec_config.build_template_vars_with_env(pack_dir, Some(env_dir));
+        let vars = attune_common::runtime_cache::staged_template_vars(
+            exec_config,
+            pack_dir,
+            env_dir,
+            child_environment.setup_path(env_dir, destination),
+        );
 
         let dep_cfg = match &exec_config.dependencies {
             Some(cfg) => cfg,
@@ -1084,6 +1116,7 @@ impl SensorManager {
             args,
             pack_dir,
             env_dir,
+            destination,
             exec_config,
             child_environment,
         )?)
@@ -1098,7 +1131,7 @@ impl SensorManager {
             ));
         }
 
-        attune_common::workload_sandbox::validate_staging(env_dir)?;
+        attune_common::workload_sandbox::prepare_staging(env_dir, destination)?;
         tokio::fs::write(&install_marker, b"ok")
             .await
             .map_err(|e| {
@@ -4237,9 +4270,11 @@ mod tests {
                 "{env_dir}".into(),
             ],
         });
-        SensorManager::ensure_runtime_environment_in_place(&config, &pack_dir, &env_dir, &baseline)
-            .await
-            .unwrap();
+        SensorManager::ensure_runtime_environment_in_place(
+            &config, &pack_dir, &env_dir, &env_dir, &baseline,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(env_dir.join("installed")).unwrap(),
             "safe installer"
@@ -4577,6 +4612,7 @@ mod tests {
         SensorManager::ensure_runtime_environment_in_place(
             &exec_config,
             &pack_dir,
+            &env_dir,
             &env_dir,
             &Default::default(),
         )

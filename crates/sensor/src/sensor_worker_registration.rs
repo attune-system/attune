@@ -572,7 +572,7 @@ async fn verify_registered_runtime_version(
             let mut process = Command::new(binary);
             child_environment.apply(process.as_std_mut());
             process.args(args);
-            let Ok(process) = child_environment.sandbox_workload(process.into_std(), &[]) else {
+            let Ok(process) = child_environment.sandbox_probe(process.into_std()) else {
                 continue;
             };
             let mut process = Command::from(process);
@@ -616,7 +616,7 @@ async fn verify_registered_runtime_version(
     let mut command = Command::new(binary);
     child_environment.apply(command.as_std_mut());
     command.arg("--version");
-    let Ok(command) = child_environment.sandbox_workload(command.into_std(), &[]) else {
+    let Ok(command) = child_environment.sandbox_probe(command.into_std()) else {
         return false;
     };
     let mut command = Command::from(command);

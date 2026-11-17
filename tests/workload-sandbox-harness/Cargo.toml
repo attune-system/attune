@@ -1,0 +1,15 @@
+[package]
+name = "attune-workload-sandbox-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Compile the production boundary itself, without the database/service graph.
+[lib]
+path = "../../crates/common/src/workload_sandbox.rs"
+
+[workspace]
+
+[dependencies]
+libc = "=0.2.189"
+tempfile = "=3.27.0"

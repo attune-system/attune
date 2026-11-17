@@ -127,6 +127,35 @@ impl ChildProcessEnvironment {
         )
     }
 
+    /// Verification may expose only its selected executable, never its parent
+    /// directory (which can contain sibling credentials or writable runtimes).
+    pub fn sandbox_probe(&self, command: Command) -> std::io::Result<Command> {
+        let program = std::path::Path::new(command.get_program());
+        let selected = if program.is_absolute() {
+            program.to_path_buf()
+        } else {
+            self.get("PATH")
+                .and_then(|path| {
+                    std::env::split_paths(path)
+                        .filter(|root| root.is_absolute())
+                        .map(|root| root.join(program))
+                        .find(|path| path.is_file())
+                })
+                .ok_or_else(|| {
+                    std::io::Error::other("verification executable not found in selected PATH")
+                })?
+        };
+        let system = ["/usr", "/bin", "/sbin", "/lib", "/lib64"]
+            .iter()
+            .any(|root| selected.starts_with(root));
+        let paths = if system {
+            Vec::new()
+        } else {
+            vec![selected.as_path()]
+        };
+        self.sandbox_workload(command, &paths)
+    }
+
     pub fn sandbox_setup(
         &self,
         command: Command,
@@ -135,6 +164,32 @@ impl ChildProcessEnvironment {
     ) -> std::io::Result<Command> {
         self.workload_sandbox
             .wrap_stage(command, &[pack], &[staging])
+    }
+
+    pub fn setup_path<'a>(
+        &self,
+        stage: &'a std::path::Path,
+        destination: &'a std::path::Path,
+    ) -> &'a std::path::Path {
+        if matches!(
+            self.workload_sandbox,
+            crate::workload_sandbox::WorkloadSandbox::Disabled
+        ) {
+            stage
+        } else {
+            destination
+        }
+    }
+
+    pub fn sandbox_install(
+        &self,
+        command: Command,
+        pack: &std::path::Path,
+        stage: &std::path::Path,
+        destination: &std::path::Path,
+    ) -> std::io::Result<Command> {
+        self.workload_sandbox
+            .wrap_install(command, pack, stage, destination)
     }
 
     pub fn get(&self, name: &str) -> Option<&OsStr> {

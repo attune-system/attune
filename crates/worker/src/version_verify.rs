@@ -402,7 +402,7 @@ async fn run_verification_command(
     child_environment.apply(command.as_std_mut());
     command.args(&cmd.args);
     let mut command = child_environment
-        .sandbox_workload(command.into_std(), &[])
+        .sandbox_probe(command.into_std())
         .map(Command::from)
         .map_err(|error| error.to_string())?;
     let output = command
@@ -452,7 +452,7 @@ async fn run_basic_binary_check(binary: &str, child_environment: &ChildProcessEn
     let mut command = Command::new(binary);
     child_environment.apply(command.as_std_mut());
     command.arg("--version");
-    let Ok(command) = child_environment.sandbox_workload(command.into_std(), &[]) else {
+    let Ok(command) = child_environment.sandbox_probe(command.into_std()) else {
         return false;
     };
     let mut command = Command::from(command);

@@ -470,24 +470,16 @@ services:
   # from the shared agent_bin volume instead of baking attune-worker into each image.
   worker-shell:
     <<: *attune-service-logging
-    image: debian:bookworm-slim
+    image: attune-worker-shell-runtime:local
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.workload-runtime
+      args:
+        RUNTIME_IMAGE: debian:bookworm-slim
     container_name: attune-worker-shell
     group_add:
       - "1000"
-    entrypoint:
-      - /bin/sh
-      - -c
-      - |
-        if ! command -v curl >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then
-          installed=false
-          for attempt in 1 2 3; do
-            if DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates git >/dev/null 2>&1; then installed=true; break; fi
-            sleep 2
-          done
-          [ "$$installed" = true ] || exit 1
-        fi
-        command -v git >/dev/null 2>&1 || exit 1
-        exec setpriv --reuid=1000 --regid=1000 --clear-groups /opt/attune/agent/attune-agent
+    entrypoint: ["setpriv", "--reuid=1000", "--regid=1000", "--clear-groups", "/opt/attune/agent/attune-agent"]
     stop_grace_period: 45s
     environment:
       RUST_LOG: info
@@ -500,6 +492,7 @@ services:
       ATTUNE__DATABASE__URL: postgresql://attune:attune@postgres:5432/attune
       ATTUNE__DATABASE__SCHEMA: attune
       ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672
+      ATTUNE__ARTIFACTS__TRANSPORT: api
       ATTUNE_API_URL: http://attune-api:8080
     volumes:
       - agent_bin:/opt/attune/agent:ro
@@ -540,24 +533,16 @@ services:
   # Python worker - official Python image with agent auto-detection
   worker-python:
     <<: *attune-service-logging
-    image: python:3.12-slim
+    image: attune-worker-python-runtime:local
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.workload-runtime
+      args:
+        RUNTIME_IMAGE: python:3.12-slim-bookworm
     container_name: attune-worker-python
     group_add:
       - "1000"
-    entrypoint:
-      - /bin/sh
-      - -c
-      - |
-        if ! command -v curl >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then
-          installed=false
-          for attempt in 1 2 3; do
-            if DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates git >/dev/null 2>&1; then installed=true; break; fi
-            sleep 2
-          done
-          [ "$$installed" = true ] || exit 1
-        fi
-        command -v git >/dev/null 2>&1 || exit 1
-        exec setpriv --reuid=1000 --regid=1000 --clear-groups /opt/attune/agent/attune-agent
+    entrypoint: ["setpriv", "--reuid=1000", "--regid=1000", "--clear-groups", "/opt/attune/agent/attune-agent"]
     stop_grace_period: 45s
     environment:
       RUST_LOG: info
@@ -570,6 +555,7 @@ services:
       ATTUNE__DATABASE__URL: postgresql://attune:attune@postgres:5432/attune
       ATTUNE__DATABASE__SCHEMA: attune
       ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672
+      ATTUNE__ARTIFACTS__TRANSPORT: api
       ATTUNE_API_URL: http://attune-api:8080
     volumes:
       - agent_bin:/opt/attune/agent:ro
@@ -610,24 +596,16 @@ services:
   # Node worker - official Node.js image with agent auto-detection
   worker-node:
     <<: *attune-service-logging
-    image: node:22-slim
+    image: attune-worker-node-runtime:local
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.workload-runtime
+      args:
+        RUNTIME_IMAGE: node:22-bookworm-slim
     container_name: attune-worker-node
     group_add:
       - "1000"
-    entrypoint:
-      - /bin/sh
-      - -c
-      - |
-        if ! command -v curl >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then
-          installed=false
-          for attempt in 1 2 3; do
-            if DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates git >/dev/null 2>&1; then installed=true; break; fi
-            sleep 2
-          done
-          [ "$$installed" = true ] || exit 1
-        fi
-        command -v git >/dev/null 2>&1 || exit 1
-        exec setpriv --reuid=1000 --regid=1000 --clear-groups /opt/attune/agent/attune-agent
+    entrypoint: ["setpriv", "--reuid=1000", "--regid=1000", "--clear-groups", "/opt/attune/agent/attune-agent"]
     stop_grace_period: 45s
     environment:
       RUST_LOG: info
@@ -640,6 +618,7 @@ services:
       ATTUNE__DATABASE__URL: postgresql://attune:attune@postgres:5432/attune
       ATTUNE__DATABASE__SCHEMA: attune
       ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672
+      ATTUNE__ARTIFACTS__TRANSPORT: api
       ATTUNE_API_URL: http://attune-api:8080
     volumes:
       - agent_bin:/opt/attune/agent:ro
@@ -680,24 +659,16 @@ services:
   # Full worker - Python + Node image with manual native capability override
   worker-full:
     <<: *attune-service-logging
-    image: nikolaik/python-nodejs:python3.12-nodejs22-slim
+    image: attune-worker-full-runtime:local
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.workload-runtime
+      args:
+        RUNTIME_IMAGE: nikolaik/python-nodejs:python3.12-nodejs22-slim
     container_name: attune-worker-full
     group_add:
       - "1000"
-    entrypoint:
-      - /bin/sh
-      - -c
-      - |
-        if ! command -v curl >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then
-          installed=false
-          for attempt in 1 2 3; do
-            if DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates git >/dev/null 2>&1; then installed=true; break; fi
-            sleep 2
-          done
-          [ "$$installed" = true ] || exit 1
-        fi
-        command -v git >/dev/null 2>&1 || exit 1
-        exec setpriv --reuid=1000 --regid=1000 --clear-groups /opt/attune/agent/attune-agent
+    entrypoint: ["setpriv", "--reuid=1000", "--regid=1000", "--clear-groups", "/opt/attune/agent/attune-agent"]
     stop_grace_period: 45s
     environment:
       RUST_LOG: info
@@ -711,6 +682,7 @@ services:
       ATTUNE__DATABASE__URL: postgresql://attune:attune@postgres:5432/attune
       ATTUNE__DATABASE__SCHEMA: attune
       ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672
+      ATTUNE__ARTIFACTS__TRANSPORT: api
       ATTUNE_API_URL: http://attune-api:8080
     volumes:
       - agent_bin:/opt/attune/agent:ro
@@ -751,7 +723,12 @@ services:
   # Default sensor service now uses the injected sensor agent inside a stock runtime image.
   sensor: &sensor-service
     <<: *attune-service-logging
-    image: nikolaik/python-nodejs:python3.12-nodejs22-slim
+    image: attune-sensor-runtime:local
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.workload-runtime
+      args:
+        RUNTIME_IMAGE: nikolaik/python-nodejs:python3.12-nodejs22-slim
     container_name: attune-sensor
     user: "1000:1000"
     group_add:

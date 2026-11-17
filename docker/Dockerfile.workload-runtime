@@ -1,0 +1,10 @@
+# Runtime prerequisites for injected worker and sensor agents. Building this
+# image does not establish kernel/seccomp/procfs compatibility: service startup
+# performs a real sandbox probe and fails closed on incompatible hosts.
+ARG RUNTIME_IMAGE=python:3.12-slim-bookworm
+FROM ${RUNTIME_IMAGE}
+ARG BUBBLEWRAP_PACKAGE_VERSION=0.8.0-2+deb12u1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bubblewrap=${BUBBLEWRAP_PACKAGE_VERSION} ca-certificates curl git util-linux \
+    && /usr/bin/bwrap --help | grep -- --disable-userns \
+    && rm -rf /var/lib/apt/lists/*

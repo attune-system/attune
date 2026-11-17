@@ -213,6 +213,8 @@ RUN ls -lh /build/attune /build/attune-agent /build/attune-sensor-agent /build/a
 # Useful when you only need to extract the binary (e.g., via COPY --from).
 FROM scratch AS agent-binary
 
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
 COPY --from=builder /build/attune /usr/local/bin/attune
 COPY --from=builder /build/attune-agent /usr/local/bin/attune-agent
 COPY --from=builder /build/attune-sensor-agent /usr/local/bin/attune-sensor-agent
