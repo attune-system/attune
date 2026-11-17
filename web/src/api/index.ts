@@ -139,6 +139,8 @@ export type { ComponentCounts } from "./models/ComponentCounts";
 export type { ComponentSummary } from "./models/ComponentSummary";
 export type { ConcurrencyPolicyRequest } from "./models/ConcurrencyPolicyRequest";
 export type { ConcurrencyPolicyResponse } from "./models/ConcurrencyPolicyResponse";
+export type { ControlRequest } from "./models/ControlRequest";
+export type { ControlResponse } from "./models/ControlResponse";
 export type { CordonWorkerRequest } from "./models/CordonWorkerRequest";
 export type { CreateActionRequest } from "./models/CreateActionRequest";
 export type { CreateArtifactRequest } from "./models/CreateArtifactRequest";

@@ -2,6 +2,8 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { ControlRequest } from "../models/ControlRequest";
+import type { ControlResponse } from "../models/ControlResponse";
 import type { CancelablePromise } from "../core/CancelablePromise";
 import { OpenAPI } from "../core/OpenAPI";
 import { request as __request } from "../core/request";
@@ -114,6 +116,25 @@ export class InternalService {
         400: `Invalid file path`,
         401: `Unauthorized`,
         404: `File not found`,
+      },
+    });
+  }
+  /**
+   * @returns ControlResponse
+   * @throws ApiError
+   */
+  public static reconcile({
+    requestBody,
+  }: {
+    requestBody: ControlRequest;
+  }): CancelablePromise<ControlResponse> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/internal/log-delivery/control",
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        403: `Custody unavailable`,
       },
     });
   }
