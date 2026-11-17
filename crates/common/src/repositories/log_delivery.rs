@@ -399,7 +399,7 @@ impl LogDeliveryRepository {
 pub enum ControlDecision {
     Waiting,
     Settled,
-    Deliver(LogDeliveryFence),
+    Deliver(Box<LogDeliveryFence>),
 }
 
 impl LogDeliveryRepository {
@@ -410,7 +410,7 @@ impl LogDeliveryRepository {
         request: &crate::log_delivery::ControlRequest,
         credential_deadline: i64,
     ) -> Result<ControlDecision> {
-        use super::{artifact::ArtifactVersionRepository, FindById};
+        use super::artifact::ArtifactVersionRepository;
         let fresh = || {
             if credential_deadline <= Utc::now().timestamp() {
                 Err(denied())
@@ -485,7 +485,7 @@ impl LogDeliveryRepository {
                 tx.commit().await?;
                 fresh()?;
                 fence.ensure_fresh()?;
-                return Ok(ControlDecision::Deliver(fence));
+                return Ok(ControlDecision::Deliver(Box::new(fence)));
             };
         fresh()?;
         tx.commit().await?;
