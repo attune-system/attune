@@ -152,6 +152,7 @@ jobs:
           python3 scripts/test_check_core_component_versions.py
           python3 scripts/test_publish_image_provenance.py
           python3 scripts/test_ci_rust_resources.py
+          python3 scripts/test_ci_gate.py
 
       - name: Validate init-packs package image
         run: |
@@ -687,3 +688,34 @@ jobs:
       - name: Semgrep
         run: ./scripts/run-semgrep.sh
         continue-on-error: true
+
+  ci-gate:
+    # A manual run can disable checks, so it must not satisfy the normal gate.
+    name: ${{ github.event_name == 'workflow_dispatch' && 'CI Gate (manual)' || 'CI Gate' }}
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs:
+      - changes
+      - rust-fmt
+      - rust-clippy
+      - rust-test
+      - e2e-smoke
+      - rust-audit
+      - release-checks
+      - web-blocking
+      - security-blocking
+      - web-advisory
+      - security-advisory
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Evaluate CI results
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+          CI_EVENT: ${{ github.event_name }}
+          CI_INPUTS: ${{ toJSON(inputs) }}
+        run: python3 scripts/check_ci_gate.py
