@@ -11,6 +11,10 @@
 //! - Processing `publish` directives from transitions
 //! - Expanding `with_items` into parallel child executions
 
+#[path = "scheduler/advance_sources.rs"]
+mod advance_sources;
+#[path = "scheduler/advancement_failure.rs"]
+mod advancement_failure;
 #[path = "scheduler/child_input_receipts.rs"]
 mod child_input_receipts;
 #[path = "scheduler/native_iteration.rs"]
@@ -2741,35 +2745,38 @@ impl ExecutionScheduler {
         })
     }
 
-    async fn persist_execution_config_secrets_with_conn(
-        conn: &mut PgConnection,
-        encryption_key: Option<&str>,
+    fn persist_execution_config_secrets_with_conn<'a>(
+        conn: &'a mut PgConnection,
+        encryption_key: Option<&'a str>,
         child_execution_id: i64,
-        supplied: &JsonValue,
+        supplied: &'a JsonValue,
         secret_inputs: Vec<SecretValueInput>,
-    ) -> Result<Execution> {
-        // Actual outer commit owners reopen canonical retained input proofs
-        // after all mutations. No proof or deadline is recreated by this wrapper.
-        let prepared = Self::persist_prepared_execution_inputs_with_conn(
-            conn,
-            encryption_key,
-            child_execution_id,
-            supplied,
-            secret_inputs,
-        )
-        .await?;
-        Ok(prepared.execution)
+    ) -> futures::future::BoxFuture<'a, Result<Execution>> {
+        Box::pin(async move {
+            // Actual outer commit owners reopen canonical retained input proofs
+            // after all mutations. No proof or deadline is recreated by this wrapper.
+            let prepared = Self::persist_prepared_execution_inputs_with_conn(
+                conn,
+                encryption_key,
+                child_execution_id,
+                supplied,
+                secret_inputs,
+            )
+            .await?;
+            Ok(prepared.execution)
+        })
     }
 
-    async fn persist_prepared_execution_inputs_with_conn(
-        conn: &mut PgConnection,
-        encryption_key: Option<&str>,
+    fn persist_prepared_execution_inputs_with_conn<'a>(
+        conn: &'a mut PgConnection,
+        encryption_key: Option<&'a str>,
         child_execution_id: i64,
-        supplied: &JsonValue,
+        supplied: &'a JsonValue,
         secret_inputs: Vec<SecretValueInput>,
-    ) -> Result<PreparedExecutionInputs> {
-        attune_common::repositories::execution_admission::ExecutionAdmissionRepository::existing_authority(conn, child_execution_id).await?;
-        let recorded =
+    ) -> futures::future::BoxFuture<'a, Result<PreparedExecutionInputs>> {
+        Box::pin(async move {
+            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::existing_authority(conn, child_execution_id).await?;
+            let recorded =
             attune_common::repositories::execution_admission::ExecutionAdmissionRepository::find(
                 conn,
                 attune_common::repositories::runtime_authority::RuntimeOwner::Execution(
@@ -2777,52 +2784,52 @@ impl ExecutionScheduler {
                 ),
             )
             .await?;
-        let generic_fence = if recorded.is_some() {
-            Some(attune_common::repositories::native_input_origin::NativeInputOriginRepository::capture(conn, child_execution_id, &[]).await?)
-        } else {
-            None
-        };
-        let (initial_config, secret_inputs) = if recorded.is_some() {
-            let (config, inputs) = attune_common::repositories::declared_input_materialization::DeclaredInputMaterializationRepository::workflow_child_defaults(conn, child_execution_id, supplied, secret_inputs, encryption_key).await?;
-            (Some(config), inputs)
-        } else {
-            (None, secret_inputs)
-        };
-        if let Some(closure) = &generic_fence {
-            closure.authorize_delivery(conn, &secret_inputs).await?;
-        }
-        attune_common::repositories::declared_input_materialization::DeclaredInputMaterializationRepository::workflow_deliveries(conn, child_execution_id, &secret_inputs).await?;
-        let prepared = if secret_inputs.is_empty() {
-            Vec::new()
-        } else {
-            let encryption_key = encryption_key.ok_or_else(|| {
-                anyhow::anyhow!(
+            let generic_fence = if recorded.is_some() {
+                Some(attune_common::repositories::native_input_origin::NativeInputOriginRepository::capture(conn, child_execution_id, &[]).await?)
+            } else {
+                None
+            };
+            let (initial_config, secret_inputs) = if recorded.is_some() {
+                let (config, inputs) = attune_common::repositories::declared_input_materialization::DeclaredInputMaterializationRepository::workflow_child_defaults(conn, child_execution_id, supplied, secret_inputs, encryption_key).await?;
+                (Some(config), inputs)
+            } else {
+                (None, secret_inputs)
+            };
+            if let Some(closure) = &generic_fence {
+                closure.authorize_delivery(conn, &secret_inputs).await?;
+            }
+            attune_common::repositories::declared_input_materialization::DeclaredInputMaterializationRepository::workflow_deliveries(conn, child_execution_id, &secret_inputs).await?;
+            let prepared = if secret_inputs.is_empty() {
+                Vec::new()
+            } else {
+                let encryption_key = encryption_key.ok_or_else(|| {
+                    anyhow::anyhow!(
                 "Cannot store secret workflow execution parameters without security.encryption_key"
             )
-            })?;
-            prepare_secret_values(secret_inputs, encryption_key)?
-        };
-        if let Some(record) = recorded {
-            let row = ExecutionRepository::find_by_id(&mut *conn, child_execution_id)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("Child input destination unavailable"))?;
-            let snapshot = row
-                .executable_snapshot
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Child executable unavailable"))?;
-            let initialized = ExecutionRepository::initialize_config_with_conn(
-                conn,
-                child_execution_id,
-                Some(record.id),
-                snapshot,
-                initial_config,
-                &prepared,
-            )
-            .await?;
-            // Finalize the accepted input in its original creation transaction,
-            // after schema, contributors, config and encrypted fields exist.
-            // This also validates the exact first-delivery receipt contract.
-            let input_receipts = attune_common::repositories::declared_input_materialization::DeclaredInputMaterializationRepository::seal_execution_inputs(
+                })?;
+                prepare_secret_values(secret_inputs, encryption_key)?
+            };
+            if let Some(record) = recorded {
+                let row = ExecutionRepository::find_by_id(&mut *conn, child_execution_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("Child input destination unavailable"))?;
+                let snapshot = row
+                    .executable_snapshot
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Child executable unavailable"))?;
+                let initialized = ExecutionRepository::initialize_config_with_conn(
+                    conn,
+                    child_execution_id,
+                    Some(record.id),
+                    snapshot,
+                    initial_config,
+                    &prepared,
+                )
+                .await?;
+                // Finalize the accepted input in its original creation transaction,
+                // after schema, contributors, config and encrypted fields exist.
+                // This also validates the exact first-delivery receipt contract.
+                let input_receipts = attune_common::repositories::declared_input_materialization::DeclaredInputMaterializationRepository::seal_execution_inputs(
                 conn,
                 child_execution_id,
                 encryption_key.ok_or_else(|| anyhow::anyhow!(
@@ -2830,35 +2837,36 @@ impl ExecutionScheduler {
                 ))?,
             )
             .await?;
+                if let Some(fence) = &generic_fence {
+                    fence.ensure_fresh_on(conn).await?;
+                }
+                return Ok(PreparedExecutionInputs::new(
+                    initialized,
+                    input_receipts,
+                    generic_fence,
+                ));
+            }
+            if !prepared.is_empty() {
+                ExecutionSecretValueRepository::upsert_many_with_conn(
+                    conn,
+                    ENTITY_EXECUTION_CONFIG,
+                    child_execution_id,
+                    &prepared,
+                )
+                .await?;
+            }
             if let Some(fence) = &generic_fence {
                 fence.ensure_fresh_on(conn).await?;
             }
-            return Ok(PreparedExecutionInputs::new(
-                initialized,
-                input_receipts,
+            let execution = ExecutionRepository::find_by_id(&mut *conn, child_execution_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Child input destination unavailable"))?;
+            Ok(PreparedExecutionInputs::new(
+                execution,
+                Vec::new(),
                 generic_fence,
-            ));
-        }
-        if !prepared.is_empty() {
-            ExecutionSecretValueRepository::upsert_many_with_conn(
-                conn,
-                ENTITY_EXECUTION_CONFIG,
-                child_execution_id,
-                &prepared,
-            )
-            .await?;
-        }
-        if let Some(fence) = &generic_fence {
-            fence.ensure_fresh_on(conn).await?;
-        }
-        let execution = ExecutionRepository::find_by_id(&mut *conn, child_execution_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Child input destination unavailable"))?;
-        Ok(PreparedExecutionInputs::new(
-            execution,
-            Vec::new(),
-            generic_fence,
-        ))
+            ))
+        })
     }
 
     /// Transaction callers use a concrete PgConnection to avoid higher-ranked
@@ -4212,24 +4220,24 @@ impl ExecutionScheduler {
         pending_completions: &'a mut Vec<PendingExecutionCompleted>,
         input_plan: Option<&'a attune_common::repositories::native_transition_materialization::PreparedNativeTransitions>,
     ) -> futures::future::BoxFuture<'a, Result<()>> {
+        // Ordinary tasks do not poll the much larger wait-registration future.
+        // Keep this branch outside that async block on the completion stack.
+        let Some(wait_for) = &task_node.wait_for else {
+            return Self::dispatch_workflow_task_with_input_plan(
+                conn,
+                round_robin_counter,
+                parent_execution,
+                workflow_execution_id,
+                task_node,
+                wf_ctx,
+                encryption_key,
+                triggered_by,
+                pending_messages,
+                pending_completions,
+                input_plan,
+            );
+        };
         Box::pin(async move {
-            let Some(wait_for) = &task_node.wait_for else {
-                return Self::dispatch_workflow_task_with_input_plan(
-                    conn,
-                    round_robin_counter,
-                    parent_execution,
-                    workflow_execution_id,
-                    task_node,
-                    wf_ctx,
-                    encryption_key,
-                    triggered_by,
-                    pending_messages,
-                    pending_completions,
-                    input_plan,
-                )
-                .await;
-            };
-
             let invalid_prerequisite = |detail: String| {
                 anyhow::Error::new(TaskWaitPrerequisiteError {
                     task_name: task_node.name.clone(),
@@ -4834,124 +4842,127 @@ impl ExecutionScheduler {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn dispatch_workflow_task_with_input_plan(
-        conn: &mut PgConnection,
-        _round_robin_counter: &AtomicUsize,
-        parent_execution: &Execution,
-        workflow_execution_id: &i64,
-        task_node: &crate::workflow::graph::TaskNode,
-        wf_ctx: &WorkflowContext,
-        encryption_key: Option<&str>,
-        triggered_by: Option<&str>,
-        pending_messages: &mut WorkflowPublications,
-        pending_completions: &mut Vec<PendingExecutionCompleted>,
-        input_plan: Option<&attune_common::repositories::native_transition_materialization::PreparedNativeTransitions>,
-    ) -> Result<()> {
-        let action_ref: String = match &task_node.action {
-            Some(a) => workflow_action_ref(a, wf_ctx)?,
-            None => {
-                warn!(
-                    "Workflow task '{}' has no action reference, skipping",
-                    task_node.name
-                );
-                return Ok(());
-            }
-        };
+    fn dispatch_workflow_task_with_input_plan<'a>(
+        conn: &'a mut PgConnection,
+        _round_robin_counter: &'a AtomicUsize,
+        parent_execution: &'a Execution,
+        workflow_execution_id: &'a i64,
+        task_node: &'a crate::workflow::graph::TaskNode,
+        wf_ctx: &'a WorkflowContext,
+        encryption_key: Option<&'a str>,
+        triggered_by: Option<&'a str>,
+        pending_messages: &'a mut WorkflowPublications,
+        pending_completions: &'a mut Vec<PendingExecutionCompleted>,
+        input_plan: Option<&'a attune_common::repositories::native_transition_materialization::PreparedNativeTransitions>,
+    ) -> futures::future::BoxFuture<'a, Result<()>> {
+        // Keep dispatch state out of every activation branch's native poll frame.
+        Box::pin(async move {
+            let action_ref: String = match &task_node.action {
+                Some(a) => workflow_action_ref(a, wf_ctx)?,
+                None => {
+                    warn!(
+                        "Workflow task '{}' has no action reference, skipping",
+                        task_node.name
+                    );
+                    return Ok(());
+                }
+            };
 
-        let task_snapshot = Self::workflow_task_snapshot_with_conn(
-            conn,
-            parent_execution,
-            &action_ref,
-            &task_node.name,
-        )
-        .await?;
-        let task_action = task_snapshot.executable.action.clone();
-
-        if task_node.iterate_cache.is_some() {
-            return Self::dispatch_cache_iteration_task_with_conn(
+            let task_snapshot = Self::workflow_task_snapshot_with_conn(
                 conn,
                 parent_execution,
-                workflow_execution_id,
-                task_node,
-                &task_action,
-                &task_snapshot,
                 &action_ref,
-                wf_ctx,
-                encryption_key,
-                triggered_by,
-                pending_messages,
-                pending_completions,
+                &task_node.name,
             )
-            .await;
-        }
+            .await?;
+            let task_action = task_snapshot.executable.action.clone();
 
-        if let Some(ref with_items_expr) = task_node.with_items {
-            return Self::dispatch_with_items_task_with_conn(
-                conn,
-                parent_execution,
-                workflow_execution_id,
-                task_node,
-                &task_action,
-                &task_snapshot,
-                &action_ref,
-                with_items_expr,
-                wf_ctx,
-                encryption_key,
-                triggered_by,
-                pending_messages,
-            )
-            .await;
-        }
-
-        let parent_execution_config = Self::restore_secret_entity(
-            &mut *conn,
-            encryption_key,
-            ENTITY_EXECUTION_CONFIG,
-            parent_execution.id,
-            parent_execution.config.clone().unwrap_or(JsonValue::Null),
-            parent_execution.id,
-        )
-        .await?;
-        let legacy_task_context = if input_plan.is_none() {
-            Some(
-                Self::bind_workflow_task_keys(
-                    &mut *conn,
+            if task_node.iterate_cache.is_some() {
+                return Self::dispatch_cache_iteration_task_with_conn(
+                    conn,
                     parent_execution,
+                    workflow_execution_id,
                     task_node,
+                    &task_action,
+                    &task_snapshot,
+                    &action_ref,
                     wf_ctx,
                     encryption_key,
+                    triggered_by,
+                    pending_messages,
+                    pending_completions,
                 )
-                .await?,
+                .await;
+            }
+
+            if let Some(ref with_items_expr) = task_node.with_items {
+                return Self::dispatch_with_items_task_with_conn(
+                    conn,
+                    parent_execution,
+                    workflow_execution_id,
+                    task_node,
+                    &task_action,
+                    &task_snapshot,
+                    &action_ref,
+                    with_items_expr,
+                    wf_ctx,
+                    encryption_key,
+                    triggered_by,
+                    pending_messages,
+                )
+                .await;
+            }
+
+            let parent_execution_config = Self::restore_secret_entity(
+                &mut *conn,
+                encryption_key,
+                ENTITY_EXECUTION_CONFIG,
+                parent_execution.id,
+                parent_execution.config.clone().unwrap_or(JsonValue::Null),
+                parent_execution.id,
             )
-        } else {
-            None
-        };
-        let child_binding = attune_common::repositories::execution_admission::ExecutionAdmissionRepository::workflow_schema(
+            .await?;
+            let legacy_task_context = if input_plan.is_none() {
+                Some(
+                    Self::bind_workflow_task_keys(
+                        &mut *conn,
+                        parent_execution,
+                        task_node,
+                        wf_ctx,
+                        encryption_key,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            let child_binding = attune_common::repositories::execution_admission::ExecutionAdmissionRepository::workflow_schema(
             &mut *conn, parent_execution.id, &task_snapshot,
         ).await?;
-        let contract = attune_common::value_schema::CompiledContract::new(&child_binding.input)?;
-        let canonical = match input_plan {
-            Some(plan) => plan.supports_task_input(&task_node.input, &contract)?,
-            None => false,
-        };
-        // A genuine frame owns this profile's one evaluation. Do not first
-        // render it through the cloneable context's flattened source transport.
-        let rendered_input = if canonical {
-            None
-        } else {
-            let task_context = if let Some(context) = legacy_task_context {
-                context
-            } else {
-                Self::bind_workflow_task_keys(
-                    &mut *conn,
-                    parent_execution,
-                    task_node,
-                    wf_ctx,
-                    encryption_key,
-                )
-                .await?
+            let contract =
+                attune_common::value_schema::CompiledContract::new(&child_binding.input)?;
+            let canonical = match input_plan {
+                Some(plan) => plan.supports_task_input(&task_node.input, &contract)?,
+                None => false,
             };
-            Some(Self::render_workflow_task_input(
+            // A genuine frame owns this profile's one evaluation. Do not first
+            // render it through the cloneable context's flattened source transport.
+            let rendered_input = if canonical {
+                None
+            } else {
+                let task_context = if let Some(context) = legacy_task_context {
+                    context
+                } else {
+                    Self::bind_workflow_task_keys(
+                        &mut *conn,
+                        parent_execution,
+                        task_node,
+                        wf_ctx,
+                        encryption_key,
+                    )
+                    .await?
+                };
+                Some(Self::render_workflow_task_input(
                 parent_execution,
                 &parent_execution_config,
                 task_node,
@@ -4959,42 +4970,42 @@ impl ExecutionScheduler {
                 &task_context,
 attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut *conn, parent_execution.id).await?,
 )?)
-        };
-        let task_config = rendered_input.as_ref().and_then(|rendered| {
-            if rendered.value.is_object() && !rendered.value.as_object().unwrap().is_empty() {
-                Some(rendered.value.clone())
-            } else {
-                parent_execution.config.clone()
-            }
-        });
+            };
+            let task_config = rendered_input.as_ref().and_then(|rendered| {
+                if rendered.value.is_object() && !rendered.value.as_object().unwrap().is_empty() {
+                    Some(rendered.value.clone())
+                } else {
+                    parent_execution.config.clone()
+                }
+            });
 
-        let permission_set_refs =
-            Self::workflow_task_permission_set_refs(task_node, &task_action, wf_ctx)?;
-        let (worker_selector, worker_tolerations, worker_affinity) =
-            Self::workflow_task_placement_overrides(task_node, wf_ctx)?;
-        let task_timeout_seconds = Self::resolve_workflow_task_timeout(task_node, wf_ctx)?;
+            let permission_set_refs =
+                Self::workflow_task_permission_set_refs(task_node, &task_action, wf_ctx)?;
+            let (worker_selector, worker_tolerations, worker_affinity) =
+                Self::workflow_task_placement_overrides(task_node, wf_ctx)?;
+            let task_timeout_seconds = Self::resolve_workflow_task_timeout(task_node, wf_ctx)?;
 
-        let workflow_task = WorkflowTaskMetadata {
-            workflow_execution: *workflow_execution_id,
-            task_name: task_node.name.clone(),
-            triggered_by: triggered_by.map(String::from),
-            task_index: None,
-            task_batch: None,
-            retry_count: 0,
-            max_retries: task_node
-                .retry
-                .as_ref()
-                .map(|r| r.count as i32)
-                .unwrap_or(0),
-            next_retry_at: None,
-            timeout_seconds: task_timeout_seconds.map(|seconds| seconds as i32),
-            timed_out: false,
-            duration_ms: None,
-            started_at: None,
-            completed_at: None,
-        };
+            let workflow_task = WorkflowTaskMetadata {
+                workflow_execution: *workflow_execution_id,
+                task_name: task_node.name.clone(),
+                triggered_by: triggered_by.map(String::from),
+                task_index: None,
+                task_batch: None,
+                retry_count: 0,
+                max_retries: task_node
+                    .retry
+                    .as_ref()
+                    .map(|r| r.count as i32)
+                    .unwrap_or(0),
+                next_retry_at: None,
+                timeout_seconds: task_timeout_seconds.map(|seconds| seconds as i32),
+                timed_out: false,
+                duration_ms: None,
+                started_at: None,
+                completed_at: None,
+            };
 
-        let child_execution_result =
+            let child_execution_result =
             attune_common::repositories::execution_admission::ExecutionAdmissionRepository::create_workflow_task_if_absent_pinned_with_conn(
                 &mut *conn,
                 CreateExecutionInput {
@@ -5036,76 +5047,78 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
                 None,
             )
             .await?;
-        let mut child_execution = child_execution_result.execution;
-        if child_execution_result.created {
-            pending_messages.register_created(child_execution.id);
-            attune_common::repositories::schema_contract::SchemaContractRepository::attach(
-                &mut *conn,
-                attune_common::repositories::schema_contract::BindingOwner::Execution,
-                child_execution.id,
-                &child_binding,
-            )
-            .await?;
-            let (supplied, secret_inputs) = if canonical {
-                let key = encryption_key
-                    .ok_or_else(|| anyhow::anyhow!("Native child input encryption unavailable"))?;
-                let prepared = input_plan
-                    .ok_or_else(|| anyhow::anyhow!("Native child input frame unavailable"))?
-                    .prepare_task_input(
-                        &mut *conn,
-                        &task_node.name,
-                        &action_ref,
-                        &task_node.input,
-                        &contract,
-                        key,
-                    )
-                    .await?;
-                let supplied = prepared.supplied().clone();
-                let secret_inputs = prepared
-                    .record_child(&mut *conn, child_execution.id, &supplied, key)
-                    .await?;
-                (supplied, secret_inputs)
-            } else {
-                let rendered = rendered_input
-                    .ok_or_else(|| anyhow::anyhow!("Workflow child input unavailable"))?;
-                (rendered.supplied, rendered.secret_inputs)
-            };
-            child_execution = Self::persist_execution_config_secrets_with_conn(
-                &mut *conn,
-                encryption_key,
-                child_execution.id,
-                &supplied,
-                secret_inputs,
-            )
-            .await?;
-        }
+            let mut child_execution = child_execution_result.execution;
+            if child_execution_result.created {
+                pending_messages.register_created(child_execution.id);
+                attune_common::repositories::schema_contract::SchemaContractRepository::attach(
+                    &mut *conn,
+                    attune_common::repositories::schema_contract::BindingOwner::Execution,
+                    child_execution.id,
+                    &child_binding,
+                )
+                .await?;
+                let (supplied, secret_inputs) = if canonical {
+                    let key = encryption_key.ok_or_else(|| {
+                        anyhow::anyhow!("Native child input encryption unavailable")
+                    })?;
+                    let prepared = input_plan
+                        .ok_or_else(|| anyhow::anyhow!("Native child input frame unavailable"))?
+                        .prepare_task_input(
+                            &mut *conn,
+                            &task_node.name,
+                            &action_ref,
+                            &task_node.input,
+                            &contract,
+                            key,
+                        )
+                        .await?;
+                    let supplied = prepared.supplied().clone();
+                    let secret_inputs = prepared
+                        .record_child(&mut *conn, child_execution.id, &supplied, key)
+                        .await?;
+                    (supplied, secret_inputs)
+                } else {
+                    let rendered = rendered_input
+                        .ok_or_else(|| anyhow::anyhow!("Workflow child input unavailable"))?;
+                    (rendered.supplied, rendered.secret_inputs)
+                };
+                child_execution = Self::persist_execution_config_secrets_with_conn(
+                    &mut *conn,
+                    encryption_key,
+                    child_execution.id,
+                    &supplied,
+                    secret_inputs,
+                )
+                .await?;
+            }
 
-        if child_execution_result.created {
-            info!(
+            if child_execution_result.created {
+                info!(
                 "Created child execution {} for workflow task '{}' (action '{}', workflow_execution {})",
                 child_execution.id, task_node.name, action_ref, workflow_execution_id
             );
-        } else {
-            debug!(
-                "Reusing child execution {} for workflow task '{}' (workflow_execution {})",
-                child_execution.id, task_node.name, workflow_execution_id
-            );
-        }
+            } else {
+                debug!(
+                    "Reusing child execution {} for workflow task '{}' (workflow_execution {})",
+                    child_execution.id, task_node.name, workflow_execution_id
+                );
+            }
 
-        if child_execution.status == ExecutionStatus::Requested {
-            pending_messages.push(PendingExecutionRequested {
-                execution_id: child_execution.id,
-                action_id: task_action.id,
-                action_ref: action_ref.clone(),
-                parent_id: parent_execution.id,
-                enforcement_id: parent_execution.enforcement,
-                config: child_execution.config.clone(),
-                release_id: child_execution.pack_release,
-                release_digest: child_execution.pack_release_digest.clone(),
-            });
-        }
+            if child_execution.status == ExecutionStatus::Requested {
+                pending_messages.push(PendingExecutionRequested {
+                    execution_id: child_execution.id,
+                    action_id: task_action.id,
+                    action_ref: action_ref.clone(),
+                    parent_id: parent_execution.id,
+                    enforcement_id: parent_execution.enforcement,
+                    config: child_execution.config.clone(),
+                    release_id: child_execution.pack_release,
+                    release_digest: child_execution.pack_release_digest.clone(),
+                });
+            }
 
-        Ok(())
+            Ok(())
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8033,267 +8046,303 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
             let mut transaction = Some(sqlx::Connection::begin(&mut *lock_conn).await?);
             let mut commit_attempted = false;
             let mut committed = false;
-            let result = async {
-            let lock_conn = &mut **transaction.as_mut()
-                .ok_or_else(|| anyhow::anyhow!("Workflow advancement transaction unavailable"))?;
-            CacheEntryRepository::protect_transaction(
-                lock_conn,
-                CacheTransactionMode::PinMutation,
-            )
-            .await?;
-            attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
-                lock_conn,
-            )
-            .await?;
-
-            // Hold ordinary failure source observations before OUTER targets.
-            // This is not a generated-output receipt or a new write permission.
-            native_failure = if execution.id > 0
-                && workflow_task.task_index.is_none()
-                && workflow_task.retry_count == 0
-            {
-                attune_common::repositories::native_failure_materialization::NativeFailureMaterializationRepository::prepare_for_completion(
-                    lock_conn, execution.id,
-                ).await?
-            } else {
-                None
-            };
-            if let Some(plan) = &native_failure {
-                plan.require_completed_execution(execution)?;
-            }
-
-            // Plan the canonical selected reads and exact destinations BEFORE
-            // either the outer workflow advisory lock or workflow/cache row locks.
-            let transitions = if let Some(key) = encryption_key {
-                attune_common::repositories::native_transition_materialization::NativeTransitionMaterializationRepository::prepare_for_completion(
-                    lock_conn, execution, key,
-                ).await?
-            } else { None };
-            native_transitions.set(transitions)
-                .map_err(|_| anyhow::anyhow!("Native transition owner already initialized"))?;
-            let transitions = native_transitions.get().and_then(Option::as_ref);
-            if execution.id > 0 && execution.status == ExecutionStatus::Completed {
-                if let (Some(plan), Some(key)) = (transitions, encryption_key) {
-                    native_success_output = attune_common::repositories::native_failure_materialization::NativeFailureMaterializationRepository::prepare_success_output(
-                        lock_conn, plan.execution(), plan.workflow().id, execution.id, plan, key,
-                    ).await?.map(Box::new);
-                }
-            }
-            native_sources = if let Some(plan) = transitions {
-                Some(attune_common::repositories::native_input_origin::NativeInputOriginRepository::capture_workflow_with_key(
-                    lock_conn, plan.execution(), encryption_key,
-                ).await?)
-            } else if let Some(state) = &native_failure {
-                Some(attune_common::repositories::native_input_origin::NativeInputOriginRepository::capture_workflow_with_key(
-                    lock_conn, state.execution(), encryption_key,
-                ).await?)
-            } else { None };
-            if let Some(state) = &native_failure {
-                if state.requires_transition_plan()? && transitions.is_none() {
-                    return Err(anyhow::anyhow!("Native failure completion requires its prepared transition decisions"));
-                }
-                let controls = transitions
-                    .map(|plan| plan.completion_decisions()).unwrap_or_default();
-                native_failure_output = Some(
-                    attune_common::repositories::native_failure_materialization::NativeFailureMaterializationRepository::prepare_output(
-                        lock_conn, state, &controls,
-                        encryption_key.ok_or_else(|| anyhow::anyhow!("Native failure output encryption is unavailable"))?,
-                    ).await?,
-                );
-            }
-            let native_context = if let (Some(plan), Some(sources)) = (transitions, &native_sources) {
-                Some(Self::prepare_native_transition_context(lock_conn, plan, sources, encryption_key).await?)
-            } else { None };
-            sqlx::query("SELECT pg_advisory_lock($1)")
-                .bind(workflow_execution_id)
-                .execute(&mut *lock_conn)
-                .await?;
-            workflow_locked = true;
-
-            if let Some(output) = &native_success_output {
-                output.require_completed_execution(execution)?;
-                let parent = ExecutionRepository::find_by_id(&mut *lock_conn, execution.parent.ok_or_else(|| anyhow::anyhow!("Native success parent is absent"))?).await?
-                    .ok_or_else(|| anyhow::anyhow!("Native success parent disappeared"))?;
-                let workflow = WorkflowExecutionRepository::find_by_id_for_update(&mut *lock_conn, workflow_execution_id).await?
-                    .ok_or_else(|| anyhow::anyhow!("Native success workflow disappeared"))?;
-                // A's own original-row marker precedes even the first log write.
-                output.require_original_rows(&parent, &workflow)?;
-            }
-
-            logger
-                .log_with_conn(
+            let mut result = async {
+                let lock_conn = &mut **transaction.as_mut().ok_or_else(|| {
+                    anyhow::anyhow!("Workflow advancement transaction unavailable")
+                })?;
+                CacheEntryRepository::protect_transaction(
                     lock_conn,
-                    LogLevel::Info,
-                    format!(
-                        "Task '{}'{} {}",
-                        workflow_task.task_name, item_suffix, task_outcome_label
-                    ),
+                    CacheTransactionMode::PinMutation,
+                )
+                .await?;
+                attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
+                    lock_conn,
                 )
                 .await?;
 
-            let advance_result = Self::advance_workflow_prepared(
-                lock_conn,
-                round_robin_counter,
-                encryption_key,
-                execution,
-                metadata_caches,
-                transitions,
-                native_sources.as_ref(),
-                native_context.as_ref(),
-                native_failure.as_ref(),
-                native_failure_output.as_ref(),
-                native_success_output.as_deref(),
-            )
-            .await;
+                let prepared = Self::prepare_workflow_advance_sources(
+                    lock_conn,
+                    execution,
+                    &workflow_task,
+                    encryption_key,
+                    &native_transitions,
+                )
+                .await?;
+                native_failure = prepared.failure;
+                native_failure_output = prepared.failure_output;
+                native_success_output = prepared.success_output;
+                native_sources = prepared.sources;
+                let native_context = prepared.context;
+                let transitions = native_transitions.get().and_then(Option::as_ref);
+                sqlx::query("SELECT pg_advisory_lock($1)")
+                    .bind(workflow_execution_id)
+                    .execute(&mut *lock_conn)
+                    .await?;
+                workflow_locked = true;
 
-            match advance_result {
-                Ok(outcome) => {
-                    for pending in &outcome.execution_requests {
-                        if let Some(child) =
-                            ExecutionRepository::find_by_id(&mut *lock_conn, pending.execution_id)
-                                .await?
-                        {
-                            if let Some(child_workflow_task) = child.workflow_task.as_ref() {
-                                let item_suffix = child_workflow_task
-                                    .task_index
-                                    .map(|index| format!(" (item {index})"))
-                                    .unwrap_or_default();
-                                let trigger_suffix = child_workflow_task
-                                    .triggered_by
-                                    .as_deref()
-                                    .map(|trigger| format!(", triggered by '{trigger}'"))
-                                    .unwrap_or_default();
-                                logger
-                                    .log_with_conn(
-                                        lock_conn,
-                                        LogLevel::Info,
-                                        format!(
-                                            "Dispatched task '{}'{}{}",
-                                            child_workflow_task.task_name,
-                                            item_suffix,
-                                            trigger_suffix
-                                        ),
-                                    )
-                                    .await?;
-                            }
-                        }
-                    }
-
-                    if let Some(workflow) = WorkflowExecutionRepository::find_by_id(
+                if let Some(output) = &native_success_output {
+                    output.require_completed_execution(execution)?;
+                    let parent = ExecutionRepository::find_by_id(
+                        &mut *lock_conn,
+                        execution
+                            .parent
+                            .ok_or_else(|| anyhow::anyhow!("Native success parent is absent"))?,
+                    )
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("Native success parent disappeared"))?;
+                    let workflow = WorkflowExecutionRepository::find_by_id_for_update(
                         &mut *lock_conn,
                         workflow_execution_id,
                     )
                     .await?
-                    {
-                        let terminal = match workflow.status {
-                            ExecutionStatus::Completed => {
-                                Some((LogLevel::Info, "Workflow Completed"))
+                    .ok_or_else(|| anyhow::anyhow!("Native success workflow disappeared"))?;
+                    // A's own original-row marker precedes even the first log write.
+                    output.require_original_rows(&parent, &workflow)?;
+                }
+
+                logger
+                    .log_with_conn(
+                        lock_conn,
+                        LogLevel::Info,
+                        format!(
+                            "Task '{}'{} {}",
+                            workflow_task.task_name, item_suffix, task_outcome_label
+                        ),
+                    )
+                    .await?;
+
+                let advance_result = Self::advance_workflow_prepared(
+                    lock_conn,
+                    round_robin_counter,
+                    encryption_key,
+                    execution,
+                    metadata_caches,
+                    transitions,
+                    native_sources.as_ref(),
+                    native_context.as_ref(),
+                    native_failure.as_ref(),
+                    native_failure_output.as_ref(),
+                    native_success_output.as_deref(),
+                )
+                .await;
+
+                match advance_result {
+                    Ok(outcome) => {
+                        for pending in &outcome.execution_requests {
+                            if let Some(child) = ExecutionRepository::find_by_id(
+                                &mut *lock_conn,
+                                pending.execution_id,
+                            )
+                            .await?
+                            {
+                                if let Some(child_workflow_task) = child.workflow_task.as_ref() {
+                                    let item_suffix = child_workflow_task
+                                        .task_index
+                                        .map(|index| format!(" (item {index})"))
+                                        .unwrap_or_default();
+                                    let trigger_suffix = child_workflow_task
+                                        .triggered_by
+                                        .as_deref()
+                                        .map(|trigger| format!(", triggered by '{trigger}'"))
+                                        .unwrap_or_default();
+                                    logger
+                                        .log_with_conn(
+                                            lock_conn,
+                                            LogLevel::Info,
+                                            format!(
+                                                "Dispatched task '{}'{}{}",
+                                                child_workflow_task.task_name,
+                                                item_suffix,
+                                                trigger_suffix
+                                            ),
+                                        )
+                                        .await?;
+                                }
                             }
-                            ExecutionStatus::Failed => Some((LogLevel::Error, "Workflow Failed")),
-                            ExecutionStatus::Cancelled => {
-                                Some((LogLevel::Warn, "Workflow Cancelled"))
-                            }
-                            _ => None,
-                        };
-                        if let Some((level, message)) = terminal {
-                            logger.log_with_conn(lock_conn, level, message).await?;
-                            logger.seal_with_conn(lock_conn).await?;
                         }
-                    }
 
-                    // Later, instance-local owning barrier. The actual child
-                    // has been prepared by production before this callback.
-                    // Final original-proof reopening and COMMIT stay below it.
-                    #[cfg(test)]
-                    if let Some(observer) = observer {
-                        observer.after_input_mutations(lock_conn, &outcome.execution_requests).await?;
-                    }
-                    let input_publications = PreparedWorkflowInputPublications::prepare(
-                        lock_conn, &outcome.execution_requests, encryption_key,
-                    ).await?;
-                    if let Some(plan) = transitions { plan.ensure_fresh_on(lock_conn).await?; }
-                    if let Some(output) = &native_success_output { output.ensure_fresh_on(lock_conn).await?; }
-                    if let Some(sources) = &native_sources { sources.ensure_fresh_on(lock_conn).await?; }
-                    if let Some(plan) = &native_failure {
-                        plan.ensure_fresh_on(lock_conn).await?;
-                    }
-                    if let Some(output) = &native_failure_output {
-                        output.ensure_fresh_on(lock_conn).await?;
-                    }
-                    input_publications.ensure_fresh_on(lock_conn).await?;
-                    // Consuming the original root is the sole commit attempt.
-                    // No transaction is reopened after an uncertain COMMIT.
-                    commit_attempted = true;
-                    transaction.take()
-                        .ok_or_else(|| anyhow::anyhow!("Workflow advancement transaction already ended"))?
-                        .commit().await?;
-                    committed = true;
-                    input_publications.ensure_fresh()?;
-                    if let Some(plan) = &native_failure {
-                        plan.ensure_fresh()?;
-                    }
-                    if let Some(output) = &native_failure_output {
-                        output.ensure_fresh()?;
-                    }
-                    if let Some(plan) = transitions { plan.ensure_fresh()?; }
-                    if let Some(output) = &native_success_output { output.ensure_fresh()?; }
-                    if let Some(sources) = &native_sources { sources.ensure_fresh()?; }
+                        if let Some(workflow) = WorkflowExecutionRepository::find_by_id(
+                            &mut *lock_conn,
+                            workflow_execution_id,
+                        )
+                        .await?
+                        {
+                            let terminal = match workflow.status {
+                                ExecutionStatus::Completed => {
+                                    Some((LogLevel::Info, "Workflow Completed"))
+                                }
+                                ExecutionStatus::Failed => {
+                                    Some((LogLevel::Error, "Workflow Failed"))
+                                }
+                                ExecutionStatus::Cancelled => {
+                                    Some((LogLevel::Warn, "Workflow Cancelled"))
+                                }
+                                _ => None,
+                            };
+                            if let Some((level, message)) = terminal {
+                                logger.log_with_conn(lock_conn, level, message).await?;
+                                logger.seal_with_conn(lock_conn).await?;
+                            }
+                        }
 
-                    for pending in outcome.execution_requests.into_messages_after_preparation() {
+                        // Later, instance-local owning barrier. The actual child
+                        // has been prepared by production before this callback.
+                        // Final original-proof reopening and COMMIT stay below it.
                         #[cfg(test)]
                         if let Some(observer) = observer {
-                            observer.before_child_publication(&pending).await?;
+                            observer
+                                .after_input_mutations(lock_conn, &outcome.execution_requests)
+                                .await?;
                         }
-                        if let Some(output) = &native_success_output { output.ensure_fresh()?; }
-                        if let Some(sources) = &native_sources { sources.ensure_fresh()?; }
-                        input_publications.ensure_child_fresh(pending.execution_id)?;
-                        let execution = pending.execution_id;
-                        Self::publish_execution_requested_payload_guarded(
-                            publisher, pending, input_publications.publication_wait_deadline(execution)?,
-                            &|| {
-                                if let Some(output) = &native_success_output { output.ensure_fresh()?; }
-                                if let Some(sources) = &native_sources { sources.ensure_fresh()?; }
-                                if let Some(plan) = transitions { plan.ensure_fresh()?; }
-                                if let Some(plan) = &native_failure { plan.ensure_fresh()?; }
-                                if let Some(output) = &native_failure_output { output.ensure_fresh()?; }
-                                input_publications.ensure_child_fresh(execution)
-                            },
-                        ).await?;
-                        if let Some(output) = &native_success_output { output.ensure_fresh()?; }
-                        if let Some(sources) = &native_sources { sources.ensure_fresh()?; }
-                    }
-                    for completed in outcome.completed_children {
-                        if let Some(output) = &native_success_output { output.ensure_fresh()?; }
-                        if let Some(sources) = &native_sources { sources.ensure_fresh()?; }
-                        Self::publish_execution_completed_payload(publisher, completed).await?;
-                        if let Some(output) = &native_success_output { output.ensure_fresh()?; }
-                        if let Some(sources) = &native_sources { sources.ensure_fresh()?; }
-                    }
+                        let input_publications = PreparedWorkflowInputPublications::prepare(
+                            lock_conn,
+                            &outcome.execution_requests,
+                            encryption_key,
+                        )
+                        .await?;
+                        if let Some(plan) = transitions {
+                            plan.ensure_fresh_on(lock_conn).await?;
+                        }
+                        if let Some(output) = &native_success_output {
+                            output.ensure_fresh_on(lock_conn).await?;
+                        }
+                        if let Some(sources) = &native_sources {
+                            sources.ensure_fresh_on(lock_conn).await?;
+                        }
+                        if let Some(plan) = &native_failure {
+                            plan.ensure_fresh_on(lock_conn).await?;
+                        }
+                        if let Some(output) = &native_failure_output {
+                            output.ensure_fresh_on(lock_conn).await?;
+                        }
+                        input_publications.ensure_fresh_on(lock_conn).await?;
+                        // Consuming the original root is the sole commit attempt.
+                        // No transaction is reopened after an uncertain COMMIT.
+                        commit_attempted = true;
+                        transaction
+                            .take()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("Workflow advancement transaction already ended")
+                            })?
+                            .commit()
+                            .await?;
+                        committed = true;
+                        input_publications.ensure_fresh()?;
+                        if let Some(plan) = &native_failure {
+                            plan.ensure_fresh()?;
+                        }
+                        if let Some(output) = &native_failure_output {
+                            output.ensure_fresh()?;
+                        }
+                        if let Some(plan) = transitions {
+                            plan.ensure_fresh()?;
+                        }
+                        if let Some(output) = &native_success_output {
+                            output.ensure_fresh()?;
+                        }
+                        if let Some(sources) = &native_sources {
+                            sources.ensure_fresh()?;
+                        }
 
-                    if let Some(completed) = outcome.completed_execution {
-                        if let Some(output) = &native_success_output { output.ensure_fresh()?; }
-                        if let Some(sources) = &native_sources { sources.ensure_fresh()?; }
-                        Self::publish_execution_completed_payload(publisher, completed).await?;
-                        if let Some(output) = &native_success_output { output.ensure_fresh()?; }
-                        if let Some(sources) = &native_sources { sources.ensure_fresh()?; }
-                    }
+                        for pending in outcome.execution_requests.into_messages_after_preparation()
+                        {
+                            #[cfg(test)]
+                            if let Some(observer) = observer {
+                                observer.before_child_publication(&pending).await?;
+                            }
+                            if let Some(output) = &native_success_output {
+                                output.ensure_fresh()?;
+                            }
+                            if let Some(sources) = &native_sources {
+                                sources.ensure_fresh()?;
+                            }
+                            input_publications.ensure_child_fresh(pending.execution_id)?;
+                            let execution = pending.execution_id;
+                            Self::publish_execution_requested_payload_guarded(
+                                publisher,
+                                pending,
+                                input_publications.publication_wait_deadline(execution)?,
+                                &|| {
+                                    if let Some(output) = &native_success_output {
+                                        output.ensure_fresh()?;
+                                    }
+                                    if let Some(sources) = &native_sources {
+                                        sources.ensure_fresh()?;
+                                    }
+                                    if let Some(plan) = transitions {
+                                        plan.ensure_fresh()?;
+                                    }
+                                    if let Some(plan) = &native_failure {
+                                        plan.ensure_fresh()?;
+                                    }
+                                    if let Some(output) = &native_failure_output {
+                                        output.ensure_fresh()?;
+                                    }
+                                    input_publications.ensure_child_fresh(execution)
+                                },
+                            )
+                            .await?;
+                            if let Some(output) = &native_success_output {
+                                output.ensure_fresh()?;
+                            }
+                            if let Some(sources) = &native_sources {
+                                sources.ensure_fresh()?;
+                            }
+                        }
+                        for completed in outcome.completed_children {
+                            if let Some(output) = &native_success_output {
+                                output.ensure_fresh()?;
+                            }
+                            if let Some(sources) = &native_sources {
+                                sources.ensure_fresh()?;
+                            }
+                            Self::publish_execution_completed_payload(publisher, completed).await?;
+                            if let Some(output) = &native_success_output {
+                                output.ensure_fresh()?;
+                            }
+                            if let Some(sources) = &native_sources {
+                                sources.ensure_fresh()?;
+                            }
+                        }
 
-                    if let Some(plan) = transitions { plan.ensure_fresh()?; }
-                    if let Some(output) = &native_success_output { output.ensure_fresh()?; }
-                    if let Some(sources) = &native_sources { sources.ensure_fresh()?; }
-                    if let Some(plan) = &native_failure {
-                        plan.ensure_fresh()?;
-                    }
-                    if let Some(output) = &native_failure_output {
-                        output.ensure_fresh()?;
-                    }
+                        if let Some(completed) = outcome.completed_execution {
+                            if let Some(output) = &native_success_output {
+                                output.ensure_fresh()?;
+                            }
+                            if let Some(sources) = &native_sources {
+                                sources.ensure_fresh()?;
+                            }
+                            Self::publish_execution_completed_payload(publisher, completed).await?;
+                            if let Some(output) = &native_success_output {
+                                output.ensure_fresh()?;
+                            }
+                            if let Some(sources) = &native_sources {
+                                sources.ensure_fresh()?;
+                            }
+                        }
 
-                    Ok(())
+                        if let Some(plan) = transitions {
+                            plan.ensure_fresh()?;
+                        }
+                        if let Some(output) = &native_success_output {
+                            output.ensure_fresh()?;
+                        }
+                        if let Some(sources) = &native_sources {
+                            sources.ensure_fresh()?;
+                        }
+                        if let Some(plan) = &native_failure {
+                            plan.ensure_fresh()?;
+                        }
+                        if let Some(output) = &native_failure_output {
+                            output.ensure_fresh()?;
+                        }
+
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
                 }
-                Err(err) => Err(err),
             }
-        }
-        .await;
+            .await;
             let mut rollback_succeeded = true;
             if let Some(pending) = transaction.take() {
                 if let Err(rollback_error) = pending.rollback().await {
@@ -8307,6 +8356,87 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
             // End the borrow before unlocking the same physical session. Publication
             // errors after a confirmed commit have no live root to roll back.
             drop(transaction);
+            let should_reject = !commit_attempted
+                && rollback_succeeded
+                && result
+                    .as_ref()
+                    .err()
+                    .is_some_and(advancement_failure::is_rejection);
+            let mut rejected = false;
+            if should_reject {
+                error!(
+                    workflow_execution_id,
+                    "Workflow advancement rejected before commit"
+                );
+                // Keep the cancellation-safe session owner, but release the old
+                // workflow lock before reacquiring graph admission. The failure
+                // transaction must use the same admission-before-parent order.
+                let recovery = async {
+                    if workflow_locked {
+                        sqlx::query("SELECT pg_advisory_unlock($1)")
+                            .bind(workflow_execution_id)
+                            .execute(&mut *lock_conn)
+                            .await?;
+                        workflow_locked = false;
+                    }
+                    let mut failure = sqlx::Connection::begin(&mut *lock_conn).await?;
+                    CacheEntryRepository::protect_transaction(
+                        &mut failure,
+                        CacheTransactionMode::PinMutation,
+                    )
+                    .await?;
+                    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
+                        &mut failure,
+                    )
+                    .await?;
+                    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                        .bind(workflow_execution_id)
+                        .execute(&mut *failure)
+                        .await?;
+                    let pending = match Self::reject_workflow_advance(
+                        &mut failure,
+                        execution,
+                        encryption_key,
+                    )
+                    .await
+                    {
+                        Ok(advancement_failure::RejectionOutcome::Handled(pending)) => pending,
+                        Ok(advancement_failure::RejectionOutcome::PreserveRecorded) => {
+                            failure.rollback().await?;
+                            return Ok(false);
+                        }
+                        Err(error) => {
+                            failure.rollback().await?;
+                            return Err(error);
+                        }
+                    };
+                    commit_attempted = true;
+                    committed = false;
+                    failure.commit().await?;
+                    committed = true;
+                    if let Some(pending) = pending {
+                        Self::publish_execution_completed_payload(publisher, pending).await?;
+                    }
+                    Ok(true)
+                }
+                .await;
+                let recovery_failed = recovery.is_err();
+                match recovery {
+                    Ok(true) => {
+                        result = Ok(());
+                        rejected = true;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        result = Err(error);
+                    }
+                }
+                if recovery_failed && !committed {
+                    // Recovery may itself lose a transaction/lock acknowledgement.
+                    // Conservative disposal also covers failed recovery rollback.
+                    rollback_succeeded = false;
+                }
+            }
             let unlock_result = if workflow_locked {
                 sqlx::query("SELECT pg_advisory_unlock($1)")
                     .bind(workflow_execution_id)
@@ -8335,6 +8465,9 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
             }
             result?;
             unlock_result?;
+            if rejected {
+                return Ok(());
+            }
             if let Some(plan) = native_transitions.get().and_then(Option::as_ref) {
                 plan.ensure_fresh()?;
             }
@@ -11331,6 +11464,11 @@ mod tests {
         "/tests/session_cancellation/mod.rs"
     ));
 
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/workflow_child_inputs/mod.rs"
+    ));
+
     struct InquirySchedulerFixture {
         database: TestDatabase,
         parent: Execution,
@@ -11970,7 +12108,7 @@ true,
         use attune_common::repositories::identity::{
             CreatePermissionAssignmentInput, PermissionAssignmentRepository,
         };
-        let fixture = AdhocWorkflowDelegationFixture::create()
+        let fixture = WorkflowDelegationFixture::create()
             .await
             .expect("create independently authored ad-hoc fixture");
         let pool = fixture.database.pool();
@@ -12056,7 +12194,7 @@ true,
         unchanged.rollback().await.unwrap();
         fixture.cleanup().await.unwrap();
         // A new invocation explicitly selects and covers the named ceiling.
-        let fixture = AdhocWorkflowDelegationFixture::create_with_selection(true)
+        let fixture = WorkflowDelegationFixture::create_with_selection(true)
             .await
             .unwrap();
         let pool = fixture.database.pool();

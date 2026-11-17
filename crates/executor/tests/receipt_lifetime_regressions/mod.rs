@@ -147,9 +147,7 @@ async fn adhoc_target_under_recorded_parent_cannot_reopen_without_child_admissio
         }
     };
     assert!(
-        error
-            .to_string()
-            .contains("Recorded child input admission is unavailable"),
+        matches!(error.downcast_ref::<attune_common::Error>(), Some(attune_common::Error::PermissionDenied(_))),
         "{error}"
     );
 }
@@ -162,7 +160,7 @@ async fn legitimate_adhoc_reuse_reopens_and_standalone_fanout_rejects_payload_mi
     };
     // Reuse starts from a caller-covered selection at admission. Granting the
     // owner more IAM afterward cannot widen the parent's frozen child ceiling.
-    let fixture = AdhocWorkflowDelegationFixture::create_with_selection(true)
+    let fixture = WorkflowDelegationFixture::create_with_selection(true)
         .await
         .unwrap();
     let pool = fixture.database.pool();

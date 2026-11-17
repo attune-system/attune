@@ -312,6 +312,29 @@ disclosure/closure fencing and the coordinated populated-database cutover descri
 in [PostgreSQL deployment](../deployment/postgresql-only.md#execution-authority-cutover).
 These scoped tests do not replace the broader authorization/service CI gate.
 
+The owned authority runner includes a managed two-step workflow under the narrow
+requester. A failed first attempt retries, then its successor receives a synthetic
+secret from the parent and completes. It checks the explicit delegated selections,
+immutable executable pins and exactly one committed successor. Keep the default
+runtime stack for acceptance; a diagnostic `--runtime-stack-bytes` run does not
+certify that the default stack works.
+Use `--workflow-child-inputs-only` to run just this successor/retry/secret-input
+scenario. Its result records that narrower scope; it does not certify the
+runner's separate disclosure, signing, rule and queue cases. Synthetic readers
+declare protected output fields/channels explicitly; API authority and input
+secrets do not substitute for output classification.
+
+The normal executor scheduler suite covers managed/ad-hoc input reopening,
+deferred owners, reused Requested children and denied authority/lineage. The
+additional `managed_delegated_advancement_distinguishes_rejection_rollback_and_publication_recovery`
+test requires an owned PostgreSQL database and the owned RabbitMQ vhost
+`workflow-child-inputs`. With `ATTUNE_TEST_CACHE_BROKER_URL` set to that broker's
+base URL, run it explicitly with `--ignored --nocapture --test-threads=4` and a
+unique `ATTUNE_TEST_RUN_ID`. Its real transaction owner distinguishes a terminal
+precommit rejection, a rolled-back database failure and a postcommit publication
+failure. Await broker/database teardown; its default ignored count is not passing
+coverage.
+
 ## Concurrency policy
 
 - Default database/service integration concurrency is **4**. The Make, Docker, benchmark, and CI entry points reject lower values.

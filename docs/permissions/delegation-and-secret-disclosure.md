@@ -214,6 +214,24 @@ not retrospectively authorize delegation or rewrite recorded approvals. See
 Fresh ordinary API-created ad hoc and managed executions use the same explicit
 delegation path.
 
+Workflow child-input publication also validates that persisted selection, rather
+than deriving it from executable ownership or a missing admission. Delegated
+children retain the active sponsor, parent producer fence, selected-grant ceiling,
+immutable executable/schema and workflow lineage. Reopening recorded inputs
+retains their original acceptance, receipts and deadlines; it never reseals them.
+
+A deterministic authority or input-contract rejection before an advancement
+commit rolls back its new children. For explicitly delegated workflows, a separate
+transaction then fails the parent and workflow with code
+`workflow_input_admission_rejected`, cancels pending prerequisites and closes the
+native producer. The diagnostic contains no denied values or underlying error
+text and follows the bound error-channel policy. Already running children may
+finish, but their callbacks cannot schedule further tasks in the failed workflow.
+Recorded rejection/recovery keeps its original source-proof contract. Database
+failures and failures after a commit attempt do not take this terminal path;
+committed Requested children remain available to the existing publication
+recovery path with their original IDs and authority.
+
 Successful delegated plaintext Key reads record immutable owner-qualified origins
 under the execution and worker attempt before returning bytes. Completion closes
 the attempt before collecting those origins. API-capable delegated processes use
