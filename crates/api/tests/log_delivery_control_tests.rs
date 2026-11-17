@@ -14,7 +14,7 @@ use attune_common::{
         artifact::{ArtifactRepository, ArtifactVersionRepository, CreateArtifactInput},
         log_stream::LogStreamRepository,
         runtime::{CreateWorkerInput, WorkerRepository},
-        Create,
+        Create, FindById,
     },
 };
 use axum::http::StatusCode;
@@ -169,5 +169,222 @@ async fn control_requires_current_worker_binding_and_exact_custody() -> Result<(
         .await?
         .assert_status(StatusCode::FORBIDDEN);
     ctx.cleanup().await?;
+    Ok(())
+}
+
+struct LiveCustody {
+    ctx: TestContext,
+    worker: i64,
+    tokens: WorkerTokenProvider,
+    binding: ControlRequest,
+    preparation: attune_common::repositories::log_delivery::PrepareLogDelivery,
+}
+
+impl LiveCustody {
+    async fn new() -> Result<Self> {
+        use attune_common::repositories::{
+            delegated_execution::DelegatedExecutionRepository, execution::ExecutionRepository,
+            runtime::UpdateWorkerInput, Update,
+        };
+        use sha2::{Digest, Sha256};
+        attune_common::auth::install_crypto_provider();
+        let ctx = TestContext::new().await?.with_admin_auth().await?;
+        let process_token = helpers::delegated_source::token(
+            &ctx,
+            ctx.user.as_ref().unwrap().id,
+            &["standard".into()],
+        )
+        .await?;
+        let claims =
+            attune_common::auth::jwt::validate_token(&process_token, &ctx.state.jwt_config)?;
+        let execution_id = claims.metadata.as_ref().unwrap()["execution_id"]
+            .as_i64()
+            .unwrap();
+        let execution = ExecutionRepository::find_by_id(&ctx.pool, execution_id)
+            .await?
+            .unwrap();
+        let worker = execution.worker.unwrap();
+        let tokens =
+            WorkerTokenProvider::new(1, worker.to_string(), (*ctx.state.jwt_config).clone());
+        WorkerRepository::update(
+            &ctx.pool,
+            worker,
+            UpdateWorkerInput {
+                capabilities: Some(json!({"log_delivery_instance":tokens.instance_id()})),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let artifact = ArtifactRepository::create(
+            &ctx.pool,
+            CreateArtifactInput {
+                r#ref: format!("{}.stdout.log", execution.action_ref),
+                scope: OwnerType::Action,
+                owner: execution.action_ref.clone(),
+                r#type: ArtifactType::FileText,
+                visibility: ArtifactVisibility::Private,
+                classification: ArtifactClassification::RuntimeLog,
+                retention_policy: RetentionPolicyType::Versions,
+                retention_limit: 5,
+                name: None,
+                description: None,
+                content_type: None,
+                data: None,
+            },
+        )
+        .await?;
+        let mut tx = ctx.pool.begin().await?;
+        let version = ArtifactVersionRepository::create_log_pending_with_conn(
+            &mut tx,
+            artifact.id,
+            &artifact.r#ref,
+            LogStreamBackend::ObjectSegments,
+            execution.id,
+            json!({"stream":"stdout"}),
+        )
+        .await?;
+        let stream = LogStreamRepository::create_with_backend_with_conn(
+            &mut tx,
+            version.id,
+            LogStreamBackend::ObjectSegments,
+            1024,
+            100,
+        )
+        .await?;
+        ArtifactVersionRepository::protect_delegated_logs(&mut tx, execution.id, &[version.id])
+            .await?;
+        let attempt = DelegatedExecutionRepository::current_attempt(&mut tx, execution.id).await?;
+        tx.commit().await?;
+        let binding = ControlRequest {
+            execution: execution.id,
+            version: version.id,
+            stream: stream.id,
+            attempt,
+            source_instance: tokens.instance_id(),
+            custody: Uuid::new_v4(),
+        };
+        let digest: String = Sha256::digest(b"x")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let preparation = attune_common::repositories::log_delivery::PrepareLogDelivery {
+            execution: binding.execution,
+            version: binding.version,
+            stream: binding.stream,
+            worker,
+            instance: binding.source_instance,
+            custody: binding.custody,
+            segments: vec![attune_common::repositories::log_delivery::DeliverySegment {
+                sequence: 0,
+                size_bytes: 1,
+                sha256: digest.clone(),
+            }],
+            total_bytes: 1,
+            sha256: digest,
+            truncated: false,
+            authenticated_manifest: None,
+            finalize_by: chrono::Utc::now() + chrono::Duration::seconds(60),
+        };
+        Ok(Self {
+            ctx,
+            worker,
+            tokens,
+            binding,
+            preparation,
+        })
+    }
+}
+
+#[tokio::test]
+async fn delivery_issuance_is_scoped_and_revocation_cannot_be_restored() -> Result<()> {
+    use attune_common::{
+        models::ExecutionStatus,
+        repositories::{
+            delegated_execution::DelegatedExecutionRepository,
+            execution::ExecutionRepository,
+            identity::{IdentityRepository, UpdateIdentityInput},
+            log_delivery::LogDeliveryRepository,
+            Update,
+        },
+    };
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+    let fixture = LiveCustody::new().await?;
+    let mut tx = fixture.ctx.pool.begin().await?;
+    LogDeliveryRepository::prepare(&mut tx, fixture.preparation.clone()).await?;
+    ExecutionRepository::transition_worker(
+        &mut *tx,
+        fixture.binding.execution,
+        Some(fixture.worker),
+        ExecutionStatus::Completed,
+        None,
+    )
+    .await?;
+    DelegatedExecutionRepository::close(&mut tx, fixture.binding.execution).await?;
+    tx.commit().await?;
+    let worker_token = fixture.tokens.token()?;
+    let ControlResponse::Deliver { token } = fixture
+        .ctx
+        .post(ROUTE, &fixture.binding, Some(&worker_token))
+        .await?
+        .assert_status(StatusCode::OK)
+        .json::<ControlResponse>()
+        .await?
+    else {
+        return Err("delivery credential missing".into());
+    };
+    let claims = attune_common::auth::jwt::validate_token(&token, &fixture.ctx.state.jwt_config)?;
+    let scope =
+        attune_common::log_delivery::credential(&claims)?.ok_or("delivery scope missing")?;
+    assert_eq!(
+        (scope.worker, scope.instance, scope.version),
+        (
+            fixture.worker,
+            fixture.tokens.instance_id(),
+            fixture.binding.version
+        )
+    );
+    let owner = fixture.ctx.user.as_ref().unwrap().id;
+    IdentityRepository::update(
+        &fixture.ctx.pool,
+        owner,
+        UpdateIdentityInput {
+            frozen: Some(true),
+            ..Default::default()
+        },
+    )
+    .await?;
+    IdentityRepository::update(
+        &fixture.ctx.pool,
+        owner,
+        UpdateIdentityInput {
+            frozen: Some(false),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let response = fixture
+        .ctx
+        .post(ROUTE, &fixture.binding, Some(&worker_token))
+        .await?
+        .assert_status(StatusCode::OK)
+        .json::<ControlResponse>()
+        .await?;
+    assert!(matches!(response, ControlResponse::Settled));
+    let request = Request::builder()
+        .method("PUT")
+        .uri(format!(
+            "/api/v1/internal/logs/{}/segments/0",
+            fixture.binding.version
+        ))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(b"x".to_vec()))?;
+    let response = fixture.ctx.app.clone().oneshot(request).await?;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let intent = LogDeliveryRepository::find(&fixture.ctx.pool, fixture.binding.version)
+        .await?
+        .unwrap();
+    assert_eq!(intent.state, "revoked");
+    fixture.ctx.cleanup().await?;
     Ok(())
 }
