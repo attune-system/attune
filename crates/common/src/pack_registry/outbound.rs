@@ -361,6 +361,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let mut server_task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
+            crate::pack_registry::read_test_request_headers(&mut stream).await;
             stream
                 .write_all(b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/\r\nContent-Length: 0\r\n\r\n")
                 .await
