@@ -26,6 +26,7 @@ const ROUTE: &str = "/api/v1/internal/log-delivery/control";
 
 #[tokio::test]
 async fn control_requires_current_worker_binding_and_exact_custody() -> Result<()> {
+    attune_common::auth::install_crypto_provider();
     let ctx = TestContext::new().await?.with_admin_auth().await?;
     let tokens = WorkerTokenProvider::new(1, "unregistered", (*ctx.state.jwt_config).clone());
     let incarnation = Uuid::new_v4();

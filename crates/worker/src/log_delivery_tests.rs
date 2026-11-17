@@ -24,6 +24,7 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        attune_common::auth::install_crypto_provider();
         let mut config = Config::load_from_file(&format!(
             "{}/../../config.test.yaml",
             env!("CARGO_MANIFEST_DIR")
