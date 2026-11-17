@@ -337,6 +337,29 @@ fn target_libc() -> &'static str {
     }
 }
 
+/// Resolve setup executables using the real unpublished directory, then expose
+/// stable installation paths to the isolated command. Host existence checks
+/// must never silently choose a system interpreter because the final path is
+/// intentionally absent until publication.
+pub fn staged_template_vars(
+    config: &crate::models::runtime::RuntimeExecutionConfig,
+    pack: &Path,
+    stage: &Path,
+    installed: &Path,
+) -> std::collections::HashMap<&'static str, String> {
+    let mut vars = config.build_template_vars_with_env(pack, Some(stage));
+    vars.insert("env_dir", installed.to_string_lossy().into_owned());
+    if let Some(interpreter) = vars.get("interpreter") {
+        if let Ok(relative) = Path::new(interpreter).strip_prefix(stage) {
+            vars.insert(
+                "interpreter",
+                installed.join(relative).to_string_lossy().into_owned(),
+            );
+        }
+    }
+    vars
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,27 +546,4 @@ mod tests {
             );
         }
     }
-}
-
-/// Resolve setup executables using the real unpublished directory, then expose
-/// stable installation paths to the isolated command. Host existence checks
-/// must never silently choose a system interpreter because the final path is
-/// intentionally absent until publication.
-pub fn staged_template_vars(
-    config: &crate::models::runtime::RuntimeExecutionConfig,
-    pack: &Path,
-    stage: &Path,
-    installed: &Path,
-) -> std::collections::HashMap<&'static str, String> {
-    let mut vars = config.build_template_vars_with_env(pack, Some(stage));
-    vars.insert("env_dir", installed.to_string_lossy().into_owned());
-    if let Some(interpreter) = vars.get("interpreter") {
-        if let Ok(relative) = Path::new(interpreter).strip_prefix(stage) {
-            vars.insert(
-                "interpreter",
-                installed.join(relative).to_string_lossy().into_owned(),
-            );
-        }
-    }
-    vars
 }

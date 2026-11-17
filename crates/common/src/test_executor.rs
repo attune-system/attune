@@ -803,6 +803,39 @@ pub(crate) fn confined_test_entrypoint(root: &Path, entry: &str) -> Result<PathB
     Ok(resolved)
 }
 
+/// Copy executable test inputs without following host links. The sandbox mounts
+/// only this owned copy writable; publication inputs and runtime stay read-only.
+fn copy_private_test_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let source = entry.path();
+        let destination = destination.join(entry.file_name());
+        let metadata = std::fs::symlink_metadata(&source)?;
+        if metadata.file_type().is_symlink() {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(std::fs::read_link(&source)?, destination)?;
+            #[cfg(not(unix))]
+            return Err(std::io::Error::other("Isolated test links require Unix"));
+        } else if metadata.is_dir() {
+            std::fs::create_dir(&destination)?;
+            copy_private_test_tree(&source, &destination)?;
+        } else if metadata.is_file() {
+            std::fs::copy(&source, &destination)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = metadata.permissions().mode() | 0o200;
+                std::fs::set_permissions(destination, std::fs::Permissions::from_mode(mode))?;
+            }
+        } else {
+            return Err(std::io::Error::other(
+                "Unsupported candidate test input type",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #[tokio::test]
@@ -1318,37 +1351,4 @@ mod tests {
         std::env::remove_var(secret_name);
         assert!(result.is_ok(), "pack test inherited a service secret");
     }
-}
-
-/// Copy executable test inputs without following host links. The sandbox mounts
-/// only this owned copy writable; publication inputs and runtime stay read-only.
-fn copy_private_test_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
-        let source = entry.path();
-        let destination = destination.join(entry.file_name());
-        let metadata = std::fs::symlink_metadata(&source)?;
-        if metadata.file_type().is_symlink() {
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(std::fs::read_link(&source)?, destination)?;
-            #[cfg(not(unix))]
-            return Err(std::io::Error::other("Isolated test links require Unix"));
-        } else if metadata.is_dir() {
-            std::fs::create_dir(&destination)?;
-            copy_private_test_tree(&source, &destination)?;
-        } else if metadata.is_file() {
-            std::fs::copy(&source, &destination)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = metadata.permissions().mode() | 0o200;
-                std::fs::set_permissions(destination, std::fs::Permissions::from_mode(mode))?;
-            }
-        } else {
-            return Err(std::io::Error::other(
-                "Unsupported candidate test input type",
-            ));
-        }
-    }
-    Ok(())
 }
