@@ -72,8 +72,8 @@ fn main() -> Result<()> {
             .with_workload_sandbox(
                 attune_common::workload_sandbox::WorkloadSandbox::from_environment(true)?,
             );
-        let bootstrap = bootstrap_runtime_env("ATTUNE_SENSOR_RUNTIMES", &environment);
-        print_detect_only_report("ATTUNE_SENSOR_RUNTIMES", &bootstrap, &environment);
+        let bootstrap = bootstrap_runtime_env("ATTUNE_SENSOR_RUNTIMES", &environment)?;
+        print_detect_only_report("ATTUNE_SENSOR_RUNTIMES", &bootstrap, &environment)?;
         return Ok(());
     }
 
@@ -107,7 +107,7 @@ fn main() -> Result<()> {
                 config.artifacts.transport == attune_common::artifact_transport::TransportMode::Api,
             )?,
         );
-    let bootstrap = bootstrap_runtime_env("ATTUNE_SENSOR_RUNTIMES", &child_environment);
+    let bootstrap = bootstrap_runtime_env("ATTUNE_SENSOR_RUNTIMES", &child_environment)?;
     let agent_detected_runtimes = bootstrap.detected_runtimes.clone();
 
     let runtime = tokio::runtime::Runtime::new()?;

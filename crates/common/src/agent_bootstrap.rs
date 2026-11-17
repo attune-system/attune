@@ -19,7 +19,7 @@ pub struct RuntimeBootstrapResult {
 pub fn bootstrap_runtime_env(
     env_var_name: &str,
     environment: &ChildProcessEnvironment,
-) -> RuntimeBootstrapResult {
+) -> crate::Result<RuntimeBootstrapResult> {
     let runtimes_override = std::env::var(env_var_name).ok();
     let mut detected_runtimes = None;
 
@@ -30,7 +30,7 @@ pub fn bootstrap_runtime_env(
         );
         info!("Running auto-detection for override-specified runtimes...");
 
-        let detected = detect_runtimes(environment);
+        let detected = detect_runtimes(environment)?;
         let override_names: Vec<&str> = override_value.split(',').map(|s| s.trim()).collect();
 
         let filtered: Vec<_> = detected
@@ -64,7 +64,7 @@ pub fn bootstrap_runtime_env(
     } else {
         info!("No {} override — running auto-detection...", env_var_name);
 
-        let detected = detect_runtimes(environment);
+        let detected = detect_runtimes(environment)?;
 
         if detected.is_empty() {
             warn!("No runtimes detected! The agent may not be able to execute any work.");
@@ -84,17 +84,17 @@ pub fn bootstrap_runtime_env(
         }
     }
 
-    RuntimeBootstrapResult {
+    Ok(RuntimeBootstrapResult {
         runtimes_override,
         detected_runtimes,
-    }
+    })
 }
 
 pub fn print_detect_only_report(
     env_var_name: &str,
     result: &RuntimeBootstrapResult,
     environment: &ChildProcessEnvironment,
-) {
+) -> crate::Result<()> {
     if result.runtimes_override.is_some() {
         info!("--detect-only: re-running detection to show what is available on this system...");
         println!(
@@ -104,12 +104,13 @@ pub fn print_detect_only_report(
         println!("      Showing what auto-detection would find on this system:");
         println!();
 
-        let detected = detect_runtimes(environment);
+        let detected = detect_runtimes(environment)?;
         print_detection_report_for_env(env_var_name, &detected);
     } else if let Some(ref detected) = result.detected_runtimes {
         print_detection_report_for_env(env_var_name, detected);
     } else {
-        let detected = detect_runtimes(environment);
+        let detected = detect_runtimes(environment)?;
         print_detection_report_for_env(env_var_name, &detected);
     }
+    Ok(())
 }

@@ -475,7 +475,7 @@ impl SensorWorkerRegistration {
         for (key, value) in detected_capabilities {
             self.capabilities.insert(key, value);
         }
-        self.set_detected_runtimes(detect_runtimes(&self.child_environment));
+        self.set_detected_runtimes(detect_runtimes(&self.child_environment)?);
         self.add_registered_runtime_versions().await?;
 
         info!(

@@ -97,13 +97,15 @@ fn candidates() -> Vec<RuntimeCandidate> {
 }
 
 /// Detect available runtimes by probing the local system.
-pub fn detect_runtimes(environment: &ChildProcessEnvironment) -> Vec<DetectedRuntime> {
+pub fn detect_runtimes(
+    environment: &ChildProcessEnvironment,
+) -> crate::Result<Vec<DetectedRuntime>> {
     info!("Starting runtime auto-detection...");
 
     let mut detected = Vec::new();
 
     for candidate in candidates() {
-        match detect_single_runtime(&candidate, environment) {
+        match detect_single_runtime(&candidate, environment)? {
             Some(runtime) => {
                 info!("  ✓ Detected: {}", runtime);
                 detected.push(runtime);
@@ -124,13 +126,13 @@ pub fn detect_runtimes(environment: &ChildProcessEnvironment) -> Vec<DetectedRun
             .join(", ")
     );
 
-    detected
+    Ok(detected)
 }
 
 fn detect_single_runtime(
     candidate: &RuntimeCandidate,
     environment: &ChildProcessEnvironment,
-) -> Option<DetectedRuntime> {
+) -> crate::Result<Option<DetectedRuntime>> {
     for binary in candidate.binaries {
         if let Some(path) = which_binary(binary, environment) {
             let version = get_version(
@@ -138,59 +140,51 @@ fn detect_single_runtime(
                 candidate.version_args,
                 &candidate.version_parser,
                 environment,
-            );
+            )?;
 
-            return Some(DetectedRuntime {
+            return Ok(Some(DetectedRuntime {
                 name: candidate.name.to_string(),
                 path,
                 version,
-            });
+            }));
         }
     }
 
-    None
+    Ok(None)
 }
 
+/// Resolve selected PATH entries without executing a container-provided `which`
+/// or shell. Relative PATH entries are deliberately excluded from detection.
 fn which_binary(binary: &str, environment: &ChildProcessEnvironment) -> Option<String> {
+    let mut paths = Vec::new();
     if binary == "bash" || binary == "sh" {
-        let absolute_path = format!("/bin/{}", binary);
-        if std::path::Path::new(&absolute_path).exists() {
-            return Some(absolute_path);
-        }
+        paths.push(std::path::PathBuf::from(format!("/bin/{binary}")));
     }
-
-    let mut command = Command::new("which");
-    environment.apply(&mut command);
-    match command.arg(binary).output() {
-        Ok(output) if output.status.success() => {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if path.is_empty() {
-                None
-            } else {
-                Some(path)
+    if let Some(path) = environment.get("PATH") {
+        paths.extend(
+            std::env::split_paths(path)
+                .filter(|path| path.is_absolute())
+                .map(|path| path.join(binary)),
+        );
+    }
+    paths.into_iter().find_map(|path| {
+        let metadata = path.metadata().ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                return None;
             }
         }
-        Ok(_) => None,
-        Err(e) => {
-            debug!("'which' command failed ({}), trying 'command -v'", e);
-            let mut command = Command::new("sh");
-            environment.apply(&mut command);
-            match command
-                .args(["-c", &format!("command -v {}", binary)])
-                .output()
-            {
-                Ok(output) if output.status.success() => {
-                    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    if path.is_empty() {
-                        None
-                    } else {
-                        Some(path)
-                    }
-                }
-                _ => None,
-            }
-        }
-    }
+        path.canonicalize()
+            .ok()?
+            .into_os_string()
+            .into_string()
+            .ok()
+    })
 }
 
 fn get_version(
@@ -198,25 +192,33 @@ fn get_version(
     version_args: &[&str],
     parser: &VersionParser,
     environment: &ChildProcessEnvironment,
-) -> Option<String> {
+) -> crate::Result<Option<String>> {
     let mut command = Command::new(binary_path);
     environment.apply(&mut command);
-    let output = match command.args(version_args).output() {
-        Ok(output) => output,
-        Err(e) => {
-            debug!("Failed to run version command for {}: {}", binary_path, e);
-            return None;
-        }
-    };
+    command.args(version_args);
+    let binary = std::path::Path::new(binary_path);
+    let system = ["/usr", "/bin", "/sbin", "/lib", "/lib64"]
+        .iter()
+        .any(|root| binary.starts_with(root));
+    let read_paths = if system { Vec::new() } else { vec![binary] };
+    let mut command = environment
+        .sandbox_workload(command, &read_paths)
+        .map_err(|error| crate::Error::Io(error.to_string()))?;
+    let output = command
+        .output()
+        .map_err(|error| crate::Error::Io(error.to_string()))?;
+    if !output.status.success() {
+        return Err(crate::Error::execution("Runtime detection probe failed"));
+    }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{}{}", stdout, stderr);
 
-    match parser {
+    Ok(match parser {
         VersionParser::SemverLike => parse_semver_like(&combined),
         VersionParser::JavaStyle => parse_java_version(&combined),
-    }
+    })
 }
 
 fn parse_semver_like(output: &str) -> Option<String> {
@@ -292,15 +294,13 @@ mod tests {
         let minimal = ChildProcessEnvironment::from_parent(parent.clone(), &[]).unwrap();
         let selected =
             ChildProcessEnvironment::from_parent(parent, &["LD_LIBRARY_PATH".into()]).unwrap();
-        assert_eq!(
-            get_version(
-                executable.to_str().unwrap(),
-                &[],
-                &VersionParser::SemverLike,
-                &minimal
-            ),
-            None
-        );
+        assert!(get_version(
+            executable.to_str().unwrap(),
+            &[],
+            &VersionParser::SemverLike,
+            &minimal
+        )
+        .is_err());
         assert_eq!(
             get_version(
                 executable.to_str().unwrap(),
@@ -308,9 +308,88 @@ mod tests {
                 &VersionParser::SemverLike,
                 &selected
             )
+            .unwrap()
             .as_deref(),
             Some("3.14.15")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_resolution_never_executes_lookup_helpers_or_relative_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("lookup-ran");
+        for name in ["which", "sh", "python3"] {
+            let path = root.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let environment = ChildProcessEnvironment::from_parent(
+            [("PATH".into(), root.path().as_os_str().to_owned())],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            which_binary("python3", &environment),
+            Some(root.path().join("python3").to_str().unwrap().into())
+        );
+        assert!(which_binary("missing-runtime", &environment).is_none());
+        assert!(!marker.exists());
+        let relative =
+            ChildProcessEnvironment::from_parent([("PATH".into(), ".".into())], &[]).unwrap();
+        assert!(which_binary("python3", &relative).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux bubblewrap and unprivileged user/PID namespaces"]
+    fn bubblewrap_version_probe_cannot_read_unselected_host_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("manager-secret");
+        std::fs::write(&marker, "dummy-host-secret").unwrap();
+        let executable = root.path().join("runtime");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\ntest ! -r '{}' || exit 28\nprintf 'v3.14.15\\n'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let environment = ChildProcessEnvironment::from_parent([], &[]).unwrap();
+        assert!(get_version(
+            executable.to_str().unwrap(),
+            &[],
+            &VersionParser::SemverLike,
+            &environment
+        )
+        .is_err());
+        let isolated =
+            environment.with_workload_sandbox(crate::workload_sandbox::WorkloadSandbox::Bubblewrap);
+        assert_eq!(
+            get_version(
+                executable.to_str().unwrap(),
+                &[],
+                &VersionParser::SemverLike,
+                &isolated
+            )
+            .unwrap()
+            .as_deref(),
+            Some("3.14.15")
+        );
+        // A rejected alias must never fall back to running the unwrapped command.
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&executable, &alias).unwrap();
+        assert!(get_version(
+            alias.to_str().unwrap(),
+            &[],
+            &VersionParser::SemverLike,
+            &isolated
+        )
+        .is_err());
     }
 
     #[test]
