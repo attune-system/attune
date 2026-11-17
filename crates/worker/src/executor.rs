@@ -412,11 +412,6 @@ impl ActionExecutor {
             if config.max_finalizers == 0 || config.max_spool_bytes == 0 {
                 return Err(Error::validation("Log delivery budgets must be positive"));
             }
-            let key = self
-                .secret_manager
-                .encryption_key()
-                .ok_or_else(|| Error::validation("Asynchronous logs require an encryption key"))?
-                .to_owned();
             let worker = self.worker_id.load(Ordering::Acquire);
             let root = config
                 .spool_dir
@@ -429,7 +424,6 @@ impl ActionExecutor {
             let manager = crate::log_delivery::LogDeliveryManager::open(
                 self.pool.clone(),
                 root,
-                key,
                 worker,
                 self.worker_instance,
                 self.jwt_config.clone(),

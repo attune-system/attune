@@ -38,7 +38,6 @@ impl Fixture {
         let manager = LogDeliveryManager::open(
             database.pool().clone(),
             directory.path().join("spool"),
-            "0123456789abcdef0123456789abcdef".into(),
             4,
             Uuid::new_v4(),
             JwtConfig {

@@ -1,11 +1,10 @@
 //! Worker-owned encrypted custody for a bounded, immutable log delivery handoff.
 //!
 //! A saved entry is acknowledged only after its contents and directory entry are
-//! synchronized. Recovery requires the same worker identity and encryption key.
+//! synchronized. Recovery requires the same worker identity and private custody key.
 //! This is process/container restart durability, not node/volume durability.
 use attune_common::{crypto, Error, Result};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -112,6 +111,58 @@ fn sync_directory(path: &Path) -> Result<()> {
         .map_err(io)
 }
 
+/// Called only after acquiring the spool's exclusive owner lease. A lost or
+/// malformed key never silently rotates over retained deliveries.
+#[cfg(unix)]
+fn load_custody_key(root: &Path) -> Result<[u8; 32]> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let path = root.join("custody.key");
+    let open = || {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(&path)
+    };
+    let mut file = match open() {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            for entry in fs::read_dir(root).map_err(io)? {
+                let entry = entry.map_err(io)?;
+                if spool_version(&entry.file_name().to_string_lossy()).is_some() {
+                    return Err(Error::invalid_state(
+                        "Log custody key missing for retained deliveries",
+                    ));
+                }
+            }
+            let key = crypto::random_bytes::<32>();
+            let temporary = root.join(format!("pending-{}", Uuid::new_v4()));
+            let mut file = open_private(&temporary, true)?;
+            file.write_all(&key).map_err(io)?;
+            file.sync_all().map_err(io)?;
+            // Do not replace an unexpected key, even with the owner lease held.
+            fs::hard_link(&temporary, &path).map_err(io)?;
+            fs::remove_file(&temporary).map_err(io)?;
+            sync_directory(root)?;
+            open().map_err(io)?
+        }
+        Err(error) => return Err(io(error)),
+    };
+    let metadata = file.metadata().map_err(io)?;
+    // SAFETY: geteuid has no prerequisites and returns the process owner.
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.is_file()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+        || metadata.len() != 32
+    {
+        return Err(Error::invalid_state("Invalid log custody key file"));
+    }
+    let mut key = [0; 32];
+    file.read_exact(&mut key).map_err(io)?;
+    Ok(key)
+}
+
 impl LogDeliverySpool {
     /// Open one worker's private persistent root. The caller supplies a directory
     /// dedicated to this spool, never a pack-controlled or shared scratch root.
@@ -119,13 +170,11 @@ impl LogDeliverySpool {
     pub async fn open(
         root: PathBuf,
         worker: i64,
-        encryption_key: &str,
         max_bytes: u64,
         max_entry_bytes: u64,
         max_payload_bytes: u64,
     ) -> Result<Self> {
         if worker <= 0
-            || encryption_key.len() < 32
             || max_payload_bytes == 0
             || max_entry_bytes <= (MAGIC.len() + NONCE_BYTES + 16) as u64
             || max_entry_bytes == u64::MAX
@@ -133,10 +182,6 @@ impl LogDeliverySpool {
         {
             return Err(Error::validation("Invalid log spool configuration"));
         }
-        let mut digest = Sha256::new();
-        digest.update(b"attune.worker.log_spool.v1\0");
-        digest.update(encryption_key.as_bytes());
-        let key: [u8; 32] = digest.finalize().into();
         tokio::task::spawn_blocking(move || {
             fs::create_dir_all(&root).map_err(io)?;
             let metadata = fs::symlink_metadata(&root).map_err(io)?;
@@ -163,6 +208,7 @@ impl LogDeliverySpool {
                 }
             }
             sync_directory(&root)?;
+            let key = load_custody_key(&root)?;
             Ok(Self(Arc::new(OwnedSpool {
                 root,
                 worker,
@@ -371,7 +417,6 @@ impl OwnedSpool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    const KEY: &str = "spool-test-key-with-at-least-thirty-two-bytes";
     fn delivery(version: i64) -> SpoolDelivery {
         SpoolDelivery {
             execution: 1,
@@ -391,7 +436,7 @@ mod tests {
         }
     }
     async fn spool(root: &Path) -> LogDeliverySpool {
-        LogDeliverySpool::open(root.to_owned(), 4, KEY, 8192, 4096, 1024)
+        LogDeliverySpool::open(root.to_owned(), 4, 8192, 4096, 1024)
             .await
             .unwrap()
     }
@@ -418,7 +463,7 @@ mod tests {
         let entry = delivery(2);
         let budget =
             (serde_json::to_vec(&entry).unwrap().len() + MAGIC.len() + NONCE_BYTES + 16) as u64;
-        let owner = LogDeliverySpool::open(root.path().to_owned(), 4, KEY, budget, budget, 1024)
+        let owner = LogDeliverySpool::open(root.path().to_owned(), 4, budget, budget, 1024)
             .await
             .unwrap();
         owner.save(entry.clone()).await.unwrap();
@@ -430,28 +475,92 @@ mod tests {
         assert_eq!(owner.versions().await.unwrap(), vec![2]);
     }
     #[tokio::test]
-    async fn concurrent_owner_and_wrong_key_are_rejected() {
+    async fn concurrent_owner_and_replaced_key_are_rejected() {
         let root = tempfile::tempdir().unwrap();
         let owner = spool(root.path()).await;
         owner.save(delivery(2)).await.unwrap();
         assert!(
-            LogDeliverySpool::open(root.path().to_owned(), 4, KEY, 8192, 4096, 1024)
+            LogDeliverySpool::open(root.path().to_owned(), 4, 8192, 4096, 1024)
                 .await
                 .is_err()
         );
         drop(owner);
-        let other = LogDeliverySpool::open(
-            root.path().to_owned(),
-            4,
-            "different-key-with-thirty-two-characters",
-            8192,
-            4096,
-            1024,
-        )
-        .await
-        .unwrap();
+        fs::write(root.path().join("custody.key"), [7; 32]).unwrap();
+        let other = LogDeliverySpool::open(root.path().to_owned(), 4, 8192, 4096, 1024)
+            .await
+            .unwrap();
         assert!(other.load(2).await.is_err());
     }
+    #[tokio::test]
+    async fn interrupted_key_publication_recovers_without_key_rotation() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = spool(root.path()).await;
+        let entry = delivery(2);
+        owner.save(entry.clone()).await.unwrap();
+        drop(owner);
+        let key = fs::read(root.path().join("custody.key")).unwrap();
+        let temporary = root.path().join(format!("pending-{}", Uuid::new_v4()));
+        fs::hard_link(root.path().join("custody.key"), &temporary).unwrap();
+        let owner = spool(root.path()).await;
+        assert!(!temporary.exists());
+        assert_eq!(fs::read(root.path().join("custody.key")).unwrap(), key);
+        assert!(owner.load(2).await.unwrap() == entry);
+    }
+
+    #[tokio::test]
+    async fn missing_key_never_rotates_over_retained_deliveries() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = spool(root.path()).await;
+        owner.save(delivery(2)).await.unwrap();
+        drop(owner);
+        fs::remove_file(root.path().join("custody.key")).unwrap();
+        assert!(
+            LogDeliverySpool::open(root.path().to_owned(), 4, 8192, 4096, 1024)
+                .await
+                .is_err()
+        );
+        assert!(!root.path().join("custody.key").exists());
+        assert!(root.path().join("2.spool").exists());
+    }
+
+    #[tokio::test]
+    async fn custody_keys_are_private_independent_and_reject_unsafe_files() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        drop(spool(first.path()).await);
+        drop(spool(second.path()).await);
+        let path = first.path().join("custody.key");
+        let key = fs::read(&path).unwrap();
+        assert_eq!(key.len(), 32);
+        assert_ne!(key, fs::read(second.path().join("custody.key")).unwrap());
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            LogDeliverySpool::open(first.path().to_owned(), 4, 8192, 4096, 1024)
+                .await
+                .is_err()
+        );
+        fs::remove_file(&path).unwrap();
+        symlink(second.path().join("custody.key"), &path).unwrap();
+        assert!(
+            LogDeliverySpool::open(first.path().to_owned(), 4, 8192, 4096, 1024)
+                .await
+                .is_err()
+        );
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, [1; 31]).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            LogDeliverySpool::open(first.path().to_owned(), 4, 8192, 4096, 1024)
+                .await
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn tampering_and_cross_version_replay_fail_authentication() {
         let root = tempfile::tempdir().unwrap();

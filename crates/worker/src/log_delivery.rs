@@ -79,7 +79,6 @@ impl LogDeliveryManager {
     pub async fn open(
         pool: sqlx::PgPool,
         root: std::path::PathBuf,
-        key: String,
         worker: i64,
         instance: Uuid,
         jwt: JwtConfig,
@@ -95,7 +94,6 @@ impl LogDeliveryManager {
         let spool = LogDeliverySpool::open(
             root,
             worker,
-            &key,
             config.max_spool_bytes,
             entry_bytes,
             max_payload,
