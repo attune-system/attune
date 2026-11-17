@@ -103,7 +103,10 @@ fn main() -> Result<()> {
         let environment =
             attune_common::child_process_environment::ChildProcessEnvironment::capture(
                 &passthrough,
-            )?;
+            )?
+            .with_workload_sandbox(
+                attune_common::workload_sandbox::WorkloadSandbox::from_environment(true)?,
+            );
         let bootstrap = bootstrap_runtime_env("ATTUNE_WORKER_RUNTIMES", &environment);
         print_detect_only_report("ATTUNE_WORKER_RUNTIMES", &bootstrap, &environment);
         return Ok(());
@@ -129,7 +132,12 @@ fn main() -> Result<()> {
                 .as_ref()
                 .map(|worker| worker.passthrough_env.as_slice())
                 .unwrap_or(&[]),
-        )?;
+        )?
+        .with_workload_sandbox(
+            attune_common::workload_sandbox::WorkloadSandbox::from_environment(
+                config.artifacts.transport == attune_common::artifact_transport::TransportMode::Api,
+            )?,
+        );
     let bootstrap = bootstrap_runtime_env("ATTUNE_WORKER_RUNTIMES", &child_environment);
     let agent_detected_runtimes = bootstrap.detected_runtimes.clone();
 
