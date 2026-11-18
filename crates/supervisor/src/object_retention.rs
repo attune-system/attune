@@ -130,6 +130,52 @@ pub async fn run_cycle_with_budget(
         }
     }
     metrics.metadata_scan_pending |= Launches::output_maintenance_pending(pool).await?;
+    // Public launch inputs reserve provider ownership before preparation.
+    // Source revocation cancels publication first; the same create-only native
+    // fence then settles delayed/uncertain PUTs across API and host restarts.
+    for _ in 0..limit.min(64) {
+        match tokio::time::timeout(budget.page_timeout, Launches::reconcile_inputs(pool, 1)).await {
+            Ok(Ok(changed)) => metrics.metadata_rows_changed += changed,
+            _ => {
+                metrics.metadata_complete = false;
+                metrics.failures += 1;
+            }
+        }
+        if !Launches::input_reconcile_pending(pool).await? {
+            break;
+        }
+    }
+    for plan in Launches::input_cleanup_candidates(pool, limit).await? {
+        let key = plan.key()?;
+        let settled = tokio::time::timeout(
+            budget.page_timeout.max(std::time::Duration::from_secs(10)),
+            attune_common::blob_store::settle_atomic_file_put(
+                blob_store.as_ref(),
+                &key,
+                plan.token(),
+            ),
+        )
+        .await;
+        match settled {
+            Ok(Ok(settlement)) => match tokio::time::timeout(
+                budget.page_timeout,
+                Launches::acknowledge_input_cleanup(pool, &plan, &settlement),
+            )
+            .await
+            {
+                Ok(Ok(())) => metrics.metadata_rows_changed += 1,
+                _ => {
+                    metrics.metadata_complete = false;
+                    metrics.failures += 1;
+                }
+            },
+            _ => {
+                metrics.metadata_complete = false;
+                metrics.failures += 1;
+            }
+        }
+    }
+    metrics.metadata_scan_pending |= Launches::input_maintenance_pending(pool).await?;
     let _ = metadata_value(
         &mut metrics, "object_log_close_recovery",
         attune_common::repositories::log_stream::LogStreamRepository::recover_expired_closes_bounded(

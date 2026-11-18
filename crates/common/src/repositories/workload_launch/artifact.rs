@@ -7,14 +7,17 @@ use crate::{
     workload_artifact::{validate_inventory, ArtifactLimits, PreparedArtifactFile},
 };
 
-pub struct ArtifactAllocation {
+pub struct ArtifactAllocation<'tx, 'connection> {
     publication: i64,
     launch: i64,
     target: LaunchTarget,
     deadline: DateTime<Utc>,
-    transaction_id: String,
+    transaction: &'tx mut Transaction<'connection, Postgres>,
 }
-impl ArtifactAllocation {
+impl ArtifactAllocation<'_, '_> {
+    pub fn connection(&mut self) -> &mut sqlx::PgConnection {
+        self.transaction
+    }
     pub fn ensure_fresh(&self) -> Result<()> {
         if self.deadline <= Utc::now() {
             return Err(denied());
@@ -27,11 +30,11 @@ impl WorkloadLaunchRepository {
     /// Trusted token consumers resolve `target` from their authenticated exact
     /// attempt/host binding, never from an artifact request. Invoke before any
     /// target artifact lock. Use this SAME transaction for bind_artifact_file.
-    pub async fn authorize_artifact_allocation(
-        tx: &mut Transaction<'_, Postgres>,
+    pub async fn authorize_artifact_allocation<'tx, 'connection>(
+        tx: &'tx mut Transaction<'connection, Postgres>,
         target: &LaunchTarget,
         owner: i64,
-    ) -> Result<ArtifactAllocation> {
+    ) -> Result<ArtifactAllocation<'tx, 'connection>> {
         let purpose = match target {
             LaunchTarget::Execution { .. } => "action",
             LaunchTarget::Sensor { .. } => "sensor",
@@ -79,9 +82,7 @@ impl WorkloadLaunchRepository {
             deadline: source_deadline.map_or(record.operation.lease_deadline, |deadline| {
                 deadline.min(record.operation.lease_deadline)
             }),
-            transaction_id: sqlx::query_scalar("SELECT pg_current_xact_id()::text")
-                .fetch_one(&mut **tx)
-                .await?,
+            transaction: tx,
         })
     }
 
@@ -89,26 +90,23 @@ impl WorkloadLaunchRepository {
     /// This method is not an upload grant and does not classify artifact bytes.
     /// Existing output policy/origin admission must precede this call.
     pub async fn bind_artifact_file(
-        tx: &mut Transaction<'_, Postgres>,
-        allocation: &ArtifactAllocation,
+        allocation: &mut ArtifactAllocation<'_, '_>,
         version: i64,
         max_bytes: u64,
     ) -> Result<()> {
         allocation.ensure_fresh()?;
-        let transaction_id: String = sqlx::query_scalar("SELECT pg_current_xact_id()::text")
-            .fetch_one(&mut **tx)
-            .await?;
-        if transaction_id != allocation.transaction_id
-            || allocation.deadline <= Self::now(tx).await?
-        {
+        let deadline = allocation.deadline;
+        let tx = &mut *allocation.transaction;
+        if deadline <= Self::now(tx).await? {
             return Err(denied());
         }
         let max_bytes = i64::try_from(max_bytes).map_err(|_| denied())?;
         if version <= 0 || max_bytes <= 0 {
             return Err(denied());
         }
-        // Requiring the still-held operation fence prevents using a proof in a
-        // later transaction after close. No source locks are acquired here.
+        // The borrowed transaction retains admission even across savepoints;
+        // it cannot be committed/rolled back while this proof exists. No source
+        // locks are acquired after the artifact version lock.
         let open: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM workload_launch l JOIN workload_artifact_publication p ON p.launch=l.id \
              WHERE l.id=$1 AND p.id=$2 AND p.state='open' AND l.manifest->'target'=$3 \
@@ -189,8 +187,7 @@ impl WorkloadLaunchRepository {
         if !exact {
             return Err(denied());
         }
-        allocation.ensure_fresh()?;
-        if allocation.deadline <= Self::now(tx).await? {
+        if deadline <= Utc::now() || deadline <= Self::now(tx).await? {
             return Err(denied());
         }
         Ok(())

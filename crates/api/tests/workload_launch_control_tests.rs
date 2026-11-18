@@ -25,13 +25,29 @@ struct Fixture {
     credential: String,
     image: i64,
     spec: LaunchSpec,
+    archive: Option<OwnedRelease>,
+}
+struct OwnedRelease {
+    _root: tempfile::TempDir,
+    path: std::path::PathBuf,
 }
 impl Fixture {
     async fn new() -> Result<Self> {
+        Self::with_real_archive(false).await
+    }
+    async fn with_real_archive(real: bool) -> Result<Self> {
         attune_common::auth::install_crypto_provider();
         let ctx = TestContext::new().await?.with_admin_auth().await?;
         let owner = ctx.user.as_ref().unwrap().id;
-        let source = helpers::delegated_source::token(&ctx, owner, &["standard".into()]).await?;
+        let (source, archive) = if real {
+            let (source, archive) = Self::create_release_source(&ctx, owner).await?;
+            (source, Some(archive))
+        } else {
+            (
+                helpers::delegated_source::token(&ctx, owner, &["standard".into()]).await?,
+                None,
+            )
+        };
         let claims = validate_token(&source, &ctx.state.jwt_config)?;
         let execution = claims.metadata.unwrap()["execution_id"].as_i64().unwrap();
         let execution = ExecutionRepository::find_by_id(&ctx.pool, execution)
@@ -114,7 +130,87 @@ impl Fixture {
             credential,
             image,
             spec,
+            archive,
         })
+    }
+    async fn create_release_source(
+        ctx: &TestContext,
+        owner: i64,
+    ) -> Result<(String, OwnedRelease)> {
+        use attune_common::{
+            pack_format,
+            repositories::{
+                component_lifecycle::PackProjectionIds,
+                pack_release::{CreatePackReleaseInput, PackReleaseRepository},
+            },
+        };
+        let reference = format!("owned_release_{}", Uuid::new_v4().simple());
+        let pack = helpers::create_test_pack(&ctx.pool, &reference).await?;
+        let action_ref = format!("{reference}.source");
+        let action =
+            helpers::create_test_action(&ctx.pool, pack.id, &reference, &action_ref).await?;
+        let root = tempfile::tempdir()?;
+        let source = root.path().join("source");
+        std::fs::create_dir_all(source.join("actions"))?;
+        std::fs::write(
+            source.join("pack.yaml"),
+            format!("ref: {reference}\nversion: {}\n", pack.version),
+        )?;
+        std::fs::write(
+            source.join("actions/source.yaml"),
+            format!("ref: {action_ref}\nrunner_type: python\nentry_point: main.py\n"),
+        )?;
+        std::fs::write(source.join("actions/main.py"), b"print('owned')\n")?;
+        let path = root.path().join("release.tar.gz");
+        let release = pack_format::build(
+            &pack_format::BuildOptions {
+                source: source.clone(),
+                artifacts: vec![],
+                executables: vec![],
+            },
+            &path,
+            pack_format::Limits::default(),
+        )?;
+        let mut tx = ctx.pool.begin().await?;
+        let row = PackReleaseRepository::create_or_get(
+            &mut tx,
+            CreatePackReleaseInput {
+                pack: pack.id,
+                pack_ref: reference,
+                version: pack.version,
+                digest: release.sha256.clone(),
+                object_key: format!("owned-pack/{}", Uuid::new_v4()),
+                provider_version: "e:owned-release".into(),
+                content_path: source.to_string_lossy().into_owned(),
+                archive_size: release.compressed_size.try_into()?,
+                manifest: serde_json::to_value(release.manifest())?,
+            },
+        )
+        .await?;
+        PackReleaseRepository::activate_projected(
+            &mut tx,
+            pack.id,
+            row.id,
+            &PackProjectionIds {
+                actions: vec![action.id],
+                ..Default::default()
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        let execution = helpers::delegated_source::create(
+            &ctx.pool,
+            attune_common::repositories::execution::CreateExecutionInput {
+                action: Some(action.id),
+                action_ref,
+                executor: Some(owner),
+                permission_set_refs: vec!["standard".into()],
+                ..Default::default()
+            },
+        )
+        .await?;
+        let token = helpers::delegated_source::execution_token(ctx, execution.id).await?;
+        Ok((token, OwnedRelease { _root: root, path }))
     }
     fn master(&self) -> &str {
         self.ctx
@@ -1280,17 +1376,17 @@ async fn run_close_waits_for_file_allocation_and_seals_exact_inventory() -> Resu
     )
     .await?;
     let mut allocation_tx = fixture.ctx.pool.begin().await?;
-    let proof = Ledger::authorize_artifact_allocation(
+    let mut proof = Ledger::authorize_artifact_allocation(
         &mut allocation_tx,
         &fixture.spec.manifest.target,
         fixture.spec.manifest.owner_identity_id,
     )
     .await?;
     let allocator_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *allocation_tx)
+        .fetch_one(proof.connection())
         .await?;
     let version = ArtifactVersionRepository::create_file_backed_with_conn(
-        &mut allocation_tx,
+        proof.connection(),
         artifact.id,
         &artifact.r#ref,
         "text/plain".into(),
@@ -1335,7 +1431,7 @@ async fn run_close_waits_for_file_allocation_and_seals_exact_inventory() -> Resu
         fixture.ctx.cleanup().await?;
         return Err("Run close did not reach the observed allocation fence".into());
     }
-    Ledger::bind_artifact_file(&mut allocation_tx, &proof, version.id, 4096).await?;
+    Ledger::bind_artifact_file(&mut proof, version.id, 4096).await?;
     allocation_tx.commit().await?;
     let response = (&mut stop).await??;
     assert_eq!(response.status(), StatusCode::OK);
@@ -1364,13 +1460,117 @@ async fn run_close_waits_for_file_allocation_and_seals_exact_inventory() -> Resu
         status, "running",
         "Run closure independently fences new allocation"
     );
-    let mut later_transaction = fixture.ctx.pool.begin().await?;
+    fixture.ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn public_input_reservation_retains_revocation_and_settles_a_late_put() -> Result<()> {
+    use attune_common::{
+        blob_store::{settle_atomic_file_put, BlobStore, FilesystemBlobStore},
+        pack_format,
+        workload_archive::ArchivePolicy,
+        workload_pack_input::{release_zip, ReleaseInputPin},
+    };
+    use futures::StreamExt;
+    let fixture = Fixture::with_real_archive(true).await?;
+    let archive = &fixture.archive.as_ref().unwrap().path;
+    let verified = pack_format::verify(archive, pack_format::Limits::default())?;
+    let pin = ReleaseInputPin {
+        pack_ref: verified.manifest().pack.r#ref.clone(),
+        size_bytes: verified.compressed_size,
+        sha256: Sha256Digest::parse(verified.sha256.clone())?,
+    };
+    let body = release_zip(
+        std::fs::File::open(archive)?,
+        &pin,
+        pack_format::Limits::default(),
+        &ArchivePolicy {
+            root: LaunchInputKind::Pack,
+            max_compressed_bytes: 1024 * 1024,
+            max_expanded_bytes: 1024 * 1024,
+            max_files: 100,
+        },
+    )?;
+    let root = Ledger::reserve_action_admission(
+        &fixture.ctx.pool,
+        &fixture.spec.manifest.target,
+        fixture.spec.manifest.owner_identity_id,
+        fixture.image,
+    )
+    .await?;
+    let permit = Ledger::reserve_pack_input(&fixture.ctx.pool, root, &body).await?;
+    let key = permit.key()?;
+    let digest: [u8; 32] = hex::decode(permit.sha256().as_str())?.try_into().unwrap();
+    let size = permit.size_bytes();
+    let bytes = std::fs::read(body.into_file().path())?;
+    // The owned request is delayed after its durable reservation. Both source
+    // changes commit before the native PUT is released; no sleeps or timeouts.
+    let owner = fixture.spec.manifest.owner_identity_id;
+    for frozen in [true, false] {
+        sqlx::query("UPDATE identity SET frozen=$2 WHERE id=$1")
+            .bind(owner)
+            .bind(frozen)
+            .execute(&fixture.ctx.pool)
+            .await?;
+    }
+    let storage_root = tempfile::tempdir()?;
+    let store = FilesystemBlobStore::new(storage_root.path())?;
+    let body = futures::stream::once({
+        let bytes = bytes.clone();
+        async move { Ok(axum::body::Bytes::from(bytes)) }
+    })
+    .boxed();
+    let stored = store.put_file_atomic(&key, body, size, digest).await?;
     assert!(
-        Ledger::bind_artifact_file(&mut later_transaction, &proof, version.id, 4096)
+        Ledger::publish_pack_input(&fixture.ctx.pool, &permit, &stored)
             .await
             .is_err()
     );
-    later_transaction.rollback().await?;
+    Ledger::reconcile_inputs(&fixture.ctx.pool, 64).await?;
+    let plans = Ledger::input_cleanup_candidates(&fixture.ctx.pool, 64).await?;
+    let plan = plans
+        .iter()
+        .find(|plan| plan.key().is_ok_and(|candidate| candidate == key))
+        .ok_or("owned cleanup missing")?;
+    let settlement = settle_atomic_file_put(&store, &key, plan.token()).await?;
+    Ledger::acknowledge_input_cleanup(&fixture.ctx.pool, plan, &settlement).await?;
+    // Cleanup acknowledges native settlement, never mere network cancellation.
+    // A released duplicate body cannot overwrite the permanent create-only fence.
+    let late = futures::stream::once(async move { Ok(axum::body::Bytes::from(bytes)) }).boxed();
+    assert!(store
+        .put_file_atomic(&key, late, size, digest)
+        .await
+        .is_err());
+    assert!(
+        Ledger::publish_pack_input(&fixture.ctx.pool, &permit, &stored)
+            .await
+            .is_err()
+    );
+    let (state, settled): (String, bool) = sqlx::query_as(
+        "SELECT state,cleanup_settled FROM workload_input_materialization WHERE object_key=$1",
+    )
+    .bind(key.as_str())
+    .fetch_one(&fixture.ctx.pool)
+    .await?;
+    assert_eq!((state.as_str(), settled), ("cancelled", true));
+    let objects: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM workload_launch_object WHERE object_key=$1")
+            .bind(key.as_str())
+            .fetch_one(&fixture.ctx.pool)
+            .await?;
+    assert_eq!(
+        objects, 0,
+        "late preparation creates no admitted input object"
+    );
+    let erased = sqlx::query("DELETE FROM workload_input_materialization WHERE object_key=$1")
+        .bind(key.as_str())
+        .execute(&fixture.ctx.pool)
+        .await;
+    assert!(
+        erased.is_err(),
+        "cleanup cannot erase the old idempotency key"
+    );
     fixture.ctx.cleanup().await?;
     Ok(())
 }

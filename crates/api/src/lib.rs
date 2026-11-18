@@ -37,6 +37,7 @@ pub mod server;
 pub mod state;
 pub mod validation;
 pub mod webhook_security;
+pub mod workload_planning;
 
 // Cross-crate reader fixtures share one database lifecycle implementation.
 #[cfg(test)]

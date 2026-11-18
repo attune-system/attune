@@ -20,8 +20,10 @@ use crate::{
 };
 
 mod artifact;
+mod materialization;
 mod output;
 pub use artifact::ArtifactAllocation;
+pub use materialization::{PackInputReservation, PublicInputCleanup};
 pub use output::{LaunchOutputCleanup, OutputBodyPermit};
 
 const COLUMNS: &str = "id,engine,image,owner,manifest,admitted_digest,encrypted_context,source_epochs,operation,dispatch_hash,lease_hash,controller";
@@ -200,6 +202,7 @@ impl WorkloadLaunchRepository {
             .await?)
     }
     async fn actor(tx: &mut Transaction<'_, Postgres>, actor: ControllerActor) -> Result<()> {
+        super::schema_type::SchemaTypeRepository::lock_selection(tx).await?;
         let valid: Option<i64> = sqlx::query_scalar("SELECT c.id FROM workload_controller c JOIN identity i ON i.id=c.identity JOIN workload_engine e ON e.id=c.engine WHERE c.id=$1 AND c.identity=$2 AND c.engine=$3 AND c.incarnation=$4 AND c.revoked_at IS NULL AND NOT i.frozen AND $5>extract(epoch FROM clock_timestamp()) FOR SHARE OF c,i")
             .bind(actor.controller).bind(actor.identity).bind(actor.engine).bind(actor.incarnation).bind(actor.expires_at).fetch_optional(&mut **tx).await?;
         if valid.is_none() {
@@ -263,6 +266,7 @@ impl WorkloadLaunchRepository {
         target: &LaunchTarget,
         expected_owner: i64,
     ) -> Result<SourceProof> {
+        super::schema_type::SchemaTypeRepository::lock_selection(tx).await?;
         Self::source_for(tx, target, expected_owner, false).await
     }
     async fn source_for(
@@ -472,7 +476,7 @@ impl WorkloadLaunchRepository {
         // Execution registration's incarnation is distinct from log-delivery's
         // restart-persistent source instance. Never interchange the two fences.
         let current: Option<Uuid> = sqlx::query_scalar(
-            "SELECT (meta->>'registration_incarnation')::UUID FROM worker WHERE id=$1 AND status IN ('active','busy') FOR SHARE",
+            "SELECT (meta->>'registration_incarnation')::UUID FROM worker WHERE id=$1 AND status IN ('active','busy') AND last_heartbeat>clock_timestamp()-interval '90 seconds' FOR SHARE",
         )
         .bind(worker)
         .fetch_optional(&mut **tx)
@@ -529,6 +533,7 @@ impl WorkloadLaunchRepository {
         record: &Record,
         capture: bool,
     ) -> Result<(Vec<SourceEpoch>, Option<DateTime<Utc>>)> {
+        super::schema_type::SchemaTypeRepository::lock_selection(tx).await?;
         let mut sources =
             Self::source_for(tx, &record.manifest.target, record.owner, capture).await?;
         if !capture {
