@@ -218,6 +218,20 @@ compose() {
   docker compose --project-name "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILES[@]}" "$@"
 }
 
+initial_build_with_diagnostics() {
+  local group="$1" diagnostic_file
+  shift
+  mkdir -p "$PROJECT_ROOT/.scratch/e2e-diagnostics"
+  diagnostic_file="$(mktemp "$PROJECT_ROOT/.scratch/e2e-diagnostics/${RUN_ID}.build.XXXXXX.jsonl")"
+  # Capture the first attempt, not an expensive diagnostic rebuild. Drain plain
+  # progress without echoing raw source/commands/env/URLs; retain allowlisted
+  # compiler codes, source locations and the exact build exit status instead.
+  python3 "$PROJECT_ROOT/scripts/capture_build_diagnostics.py" \
+    --output "$diagnostic_file" --group "$group" -- \
+    docker compose --progress plain --project-name "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILES[@]}" build \
+    --build-arg CARGO_BUILD_JOBS="${ATTUNE_E2E_CARGO_BUILD_JOBS:-2}" "$@"
+}
+
 assert_fresh_project() {
   local existing_containers existing_volumes existing_networks
   if ! existing_containers="$(compose ps -aq 2>/dev/null)" ||
@@ -351,11 +365,10 @@ if [[ "$DO_BUILD" == true ]]; then
       # These services use published images and have no build definition.
       case "$service" in migrations|init-user|init-packs) continue ;; esac
       log_info "Building ${service} sequentially..."
-      compose build --build-arg CARGO_BUILD_JOBS="${ATTUNE_E2E_CARGO_BUILD_JOBS:-2}" "$service"
+      initial_build_with_diagnostics "initial-${service}" "$service"
     done
   else
-    compose build --quiet \
-      --build-arg CARGO_BUILD_JOBS="${ATTUNE_E2E_CARGO_BUILD_JOBS:-2}" "${BUILD_SERVICES[@]}"
+    initial_build_with_diagnostics initial-services "${BUILD_SERVICES[@]}"
   fi
   log_success "Build complete"
 fi

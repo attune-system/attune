@@ -30,6 +30,10 @@ on:
       - 'scripts/test-workload-runner.py'
       - 'scripts/test_native_http_action.py'
       - 'docker/Dockerfile.agent'
+      - 'docker/Dockerfile.optimized'
+      - 'scripts/capture_build_diagnostics.py'
+      - 'scripts/test_capture_build_diagnostics.py'
+      - 'scripts/test_docker_source_graph.py'
   workflow_dispatch:
 permissions:
   contents: read
@@ -43,7 +47,10 @@ jobs:
         with:
           persist-credentials: false
       - name: Verify public config and separate controller/proxy authority
-        run: python3 scripts/test-workload-controller-compose.py
+        run: |
+          python3 scripts/test-workload-controller-compose.py
+          python3 scripts/test_capture_build_diagnostics.py
+          python3 scripts/test_docker_source_graph.py
   controller-project:
     name: Actual external controller project (${{ matrix.arch }})
     strategy:
@@ -62,6 +69,13 @@ jobs:
           persist-credentials: false
       - name: Build actual source image and validate owned HTTPS project
         run: python3 scripts/test-workload-controller-project.py --owned-engine-socket /var/run/docker.sock
+      - name: Retain sanitized first-attempt build diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: controller-project-build-${{ matrix.arch }}
+          path: .scratch/e2e-diagnostics/*.jsonl
+          if-no-files-found: warn
   host-boundary:
     name: Linux host workload boundary
     runs-on: ubuntu-24.04

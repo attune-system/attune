@@ -169,6 +169,16 @@ ATTUNE_E2E_SERIAL_BUILD=1 ATTUNE_E2E_CARGO_BUILD_JOBS=1 \
   bash scripts/run-integration-tests.sh --tier 1 -x
 ```
 
+The first image build uses plain BuildKit progress through
+`scripts/capture_build_diagnostics.py`; it never triggers a diagnostic rebuild.
+The wrapper drains output and preserves bounded compiler error codes, repository
+source locations, known build-condition categories and the original exit status
+under `.scratch/e2e-diagnostics/`. Raw commands, source excerpts, URLs and
+environment values are discarded. CI retains these sanitized JSONL records even
+when a build fails before the stack starts. A signal-9 category records the
+observed signal, not a proven out-of-memory cause. Missing or truncated diagnostic
+evidence must not be treated as a successful build.
+
 ### Private pack-source authentication
 
 The normal API suite includes managed-index HTTPS Git installation and

@@ -1,7 +1,7 @@
-# Multi-stage Dockerfile for Attune Rust services (api, executor, notifier, supervisor)
+# Multi-stage Dockerfile for Attune Rust services and the launch controller
 #
-# Simple and robust: build the entire workspace, then copy the target binary.
-# No dummy sources, no selective crate copying, no fragile hacks.
+# Fetch the full workspace graph using temporary stubs, then replace every
+# selected service and normal local dependency with real sources before build.
 #
 # Usage:
 #   DOCKER_BUILDKIT=1 docker build --build-arg SERVICE=api -f docker/Dockerfile.optimized -t attune-api .

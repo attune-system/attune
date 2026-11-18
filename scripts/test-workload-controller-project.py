@@ -22,6 +22,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from workload_startup_diagnostics import command as bounded_command
 
 ROOT = Path(__file__).resolve().parent.parent
 PROBE = "debian@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587"
@@ -31,6 +32,41 @@ PEER = "python@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9
 PROXY = "ghcr.io/attune-system/attune/web@sha256:4966b7f9f57be74a00f1c7b924c1b657aa27ffe574ac6166d0e65cbf6e82654c"
 DUMMY_SESSION = "owned-controller-session-not-a-production-credential"
 PRIVATE_MARKER = "owned-private-payload-must-not-be-logged"
+
+
+def diagnose(docker_command, owner):
+    raw, code, truncated = bounded_command([*docker_command, "ps", "-aq", "--filter", f"label=com.docker.compose.project={owner}"], 16384)
+    if code or truncated:
+        return [{"diagnostic": "owned_project_listing_failed"}]
+    reports = []
+    signatures = {
+        "private_session_invalid": "invalid private controller session state",
+        "controller_file_invalid": "controller file ownership/mode/size invalid",
+        "tls_roots_missing": "No CA certificates were loaded from the system",
+        "control_transport_failed": "Control(Transport)",
+        "control_denied": "Control(Rejected(403))",
+        "engine_policy_failed": "Policy(",
+        "parent_protection_failed": "could not protect controller parent",
+        "root_owner_required": "trusted controller requires root ownership",
+    }
+    for identifier in raw.splitlines()[:8]:
+        data, code, truncated = bounded_command([*docker_command, "inspect", "--format",
+            '{"owner":{{json (index .Config.Labels "io.attune.test.owner")}},'
+            '"service":{{json (index .Config.Labels "com.docker.compose.service")}},'
+            '"state":{{json .State.Status}},"exit":{{.State.ExitCode}},"oom":{{.State.OOMKilled}}}', identifier], 4096)
+        try:
+            info = json.loads(data) if not code and not truncated else {}
+        except ValueError:
+            info = {}
+        if info.get("owner") != owner or info.get("service") not in {"launch-controller", "launch-proxy"}:
+            continue
+        logs, code, truncated = bounded_command([*docker_command, "logs", "--tail", "80", identifier])
+        reports.append({"service": info["service"], "state": info.get("state"),
+            "exit": info.get("exit"), "oom": info.get("oom"),
+            "categories": {key: logs.count(value) for key, value in signatures.items() if value in logs},
+            "log_bytes_examined": len(logs.encode()), "log_failed": code != 0, "log_truncated": truncated,
+            "private_marker_present": any(value in logs for value in [DUMMY_SESSION, PRIVATE_MARKER, "owned-wrong-grant"])})
+    return reports
 
 
 def run(command, **kwargs):
@@ -113,9 +149,13 @@ def main():
         return run([*docker_command, *values], **kwargs)
     print(json.dumps({"owner": owner, "engine_id": engine_id, "image": image,
                       "cache_volume": cache_name, "state_volume": state_name}), flush=True)
-    docker("build", "--label", f"io.attune.test.owner={owner}",
+    diagnostics = ROOT / ".scratch/e2e-diagnostics"
+    diagnostics.mkdir(parents=True, exist_ok=True)
+    run(["python3", str(ROOT / "scripts/capture_build_diagnostics.py"),
+           "--output", str(diagnostics / (owner + ".build.jsonl")), "--group", "controller-project", "--",
+           *docker_command, "build", "--progress=plain", "--label", f"io.attune.test.owner={owner}",
            "--build-arg", "SERVICE=launch-controller", "--build-arg", "SERVICE_USER=root",
-           "--build-arg", "CARGO_BUILD_JOBS=2", "-f", str(ROOT / "docker/Dockerfile.optimized"), "-t", image, str(ROOT))
+           "--build-arg", "CARGO_BUILD_JOBS=2", "-f", str(ROOT / "docker/Dockerfile.optimized"), "-t", image, str(ROOT)])
     for selected in [PROBE, PEER, PROXY]:
         docker("pull", selected)
     info = json.loads(docker("info", "--format", "{{json .}}", capture_output=True, text=True).stdout)
@@ -138,6 +178,7 @@ def main():
         ready = False
         test_error = None
         cleanup_errors = []
+        phase = "public-config-and-private-session"
         try:
             config = root / "config.json"
             run(["python3", str(ROOT / "scripts/generate-workload-controller-config.py"),
@@ -166,6 +207,7 @@ def main():
             for service in model["services"].values():
                 service.setdefault("labels", {})["io.attune.test.owner"] = owner
             source.write_text(json.dumps(model))
+            phase = "project-start"
             started = True
             run([*compose, "up", "-d", "--no-build"], env=environment)
             ids = {name: run([*compose, "ps", "-q", name], capture_output=True, text=True).stdout.strip()
@@ -184,6 +226,7 @@ def main():
             client = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context))
             origin = f"https://127.0.0.1:{port}"
             deadline = time.monotonic() + 120
+            phase = "actual-startup-and-binding"
             while time.monotonic() < deadline:
                 try:
                     if client.open(origin + "/health", timeout=3).status == 200:
@@ -194,6 +237,7 @@ def main():
                 time.sleep(0.1)
             if not ready:
                 raise RuntimeError("actual controller/proxy startup prerequisites failed")
+            phase = "tls-and-caller-denials"
             # A trust failure must happen before any HTTP/caller credential.
             for trusted, hostname in [(False, "127.0.0.1"), (True, "wrong-owned-hostname.invalid")]:
                 tls = ssl.create_default_context(cafile=str(root / "ca.crt")) if trusted else ssl.create_default_context()
@@ -240,17 +284,21 @@ def main():
                     raise RuntimeError("project entrypoint received general manager configuration")
             networks = json.loads(docker("inspect", "--format", "{{json .NetworkSettings.Networks}}", ids["launch-controller"], capture_output=True, text=True).stdout)
             address = networks[owner + "_default"]["IPAddress"]
+            phase = "external-plaintext-negative-control"
             docker("run", "--rm", "--name", owner + "-peer", "--label", f"io.attune.test.owner={owner}",
                    "--network", owner + "_default", "--user", "1000:1000", "--read-only", "--cap-drop=ALL",
                    "--security-opt=no-new-privileges:true", "--entrypoint", "python3", PEER, "-c",
                    "import socket,sys; s=socket.socket(); s.settimeout(3); result=s.connect_ex((sys.argv[1],8092)); s.close(); assert result!=0, 'plaintext backend reachable outside proxy netns'", address)
             for identifier in ids.values():
-                logs = docker("logs", identifier, capture_output=True, text=True)
-                if any(value in logs.stdout + logs.stderr for value in [DUMMY_SESSION, PRIVATE_MARKER, "owned-wrong-grant"]):
+                logs, code, truncated = bounded_command([*docker_command, "logs", "--tail", "80", identifier])
+                if code or truncated:
+                    raise RuntimeError("private log absence cannot be established from incomplete diagnostics")
+                if any(value in logs for value in [DUMMY_SESSION, PRIVATE_MARKER, "owned-wrong-grant"]):
                     raise RuntimeError("private marker appeared in project logs")
             print("actual source controller/project TLS, confinement and caller-denial checks passed; CP effects/host loops not proved", flush=True)
         except BaseException as error:
             test_error = error
+            print(json.dumps({"phase": phase, "owned_project_diagnostics": diagnose(docker_command, owner)}), flush=True)
         finally:
             if started:
                 try:
