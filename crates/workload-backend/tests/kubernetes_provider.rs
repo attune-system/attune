@@ -288,11 +288,13 @@ assert open(root + '/bin/owned-console').readline().strip() == '#!' + root + '/b
         quota_bytes: 128 * 1024 * 1024,
         quota_files: 4096,
     });
+    eprintln!("stage fixture phase=setup-run");
     let (resource, exit, _, _) = f.run_retained(&setup, Vec::new()).await?;
     let result = async {
         if exit.exit_code != 0 || exit.oom_killed {
             return Err("owned Python setup did not succeed".into());
         }
+        eprintln!("stage fixture phase=archive-initial");
         let mut archive = f.launcher.archive_stopped_stage(&setup, &resource).await?;
         // Repeated transfer returns the exact retained body, not a regenerated ZIP.
         use std::io::{Read, Seek};
@@ -310,6 +312,7 @@ assert open(root + '/bin/owned-console').readline().strip() == '#!' + root + '/b
             Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
         }
         let digest = hash(&mut archive)?;
+        eprintln!("stage fixture phase=archive-replay");
         let mut replay = f.launcher.archive_stopped_stage(&setup, &resource).await?;
         if digest != hash(&mut replay)? {
             return Err("stage transfer replay changed exact bytes".into());
@@ -318,6 +321,7 @@ assert open(root + '/bin/owned-console').readline().strip() == '#!' + root + '/b
             object_version: "owned-setup-publication".into(), kind: LaunchInputKind::Runtime,
             size_bytes: archive.metadata()?.len(), sha256: Sha256Digest::parse(digest)?,
             max_expanded_bytes: 128 * 1024 * 1024, max_files: 4096 };
+        eprintln!("stage fixture phase=cache-install");
         f.cache.install_input(&pin, &mut archive)?;
         let verify = r#"import os, subprocess
 subprocess.run(['/opt/attune/runtime/bin/owned-console'], check=True)
@@ -329,6 +333,7 @@ else: raise AssertionError('published runtime writable')
 "#;
         let mut action = f.spec(vec!["/usr/bin/python3".into(), "-c".into(), verify.into()])?;
         action.inputs.push(pin);
+        eprintln!("stage fixture phase=runtime-start-and-seed");
         let (exit, out, err) = f.run(&action, Vec::new()).await?;
         if exit.exit_code != 0 || exit.oom_killed
             || out != b"owned-console-ok\nowned-link-ok\n" || !err.is_empty()
@@ -338,6 +343,7 @@ else: raise AssertionError('published runtime writable')
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
     }.await;
     if result.is_ok() {
+        eprintln!("stage fixture phase=setup-remove");
         f.launcher.remove_stopped(&setup, &resource).await?;
     } else {
         f.cleanup(&resource).await?;
