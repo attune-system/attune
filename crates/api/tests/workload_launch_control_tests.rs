@@ -967,3 +967,53 @@ async fn removed_setup_publication_replays_exact_receipt_and_requires_real_build
     fixture.ctx.cleanup().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn controller_session_renewal_retains_exact_target_and_rejects_withdrawal() -> Result<()> {
+    use attune_common::workload_session::WorkloadSession;
+    let fixture = Fixture::new().await?;
+    let (status, value) = fixture
+        .request(
+            "/api/v1/workload-launches/session",
+            &json!({}),
+            Some(&fixture.credential),
+            None,
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let renewed: WorkloadSession = serde_json::from_value(value)?;
+    let claims = validate_token(renewed.token.as_str(), &fixture.ctx.state.jwt_config)?;
+    let actor = attune_common::workload_controller::actor(&claims)?;
+    let original = fixture.actor();
+    assert_eq!(
+        (
+            actor.controller,
+            actor.identity,
+            actor.engine,
+            actor.incarnation
+        ),
+        (
+            original.controller,
+            original.identity,
+            original.engine,
+            original.incarnation
+        )
+    );
+    assert_eq!(actor.expires_at, renewed.expires_at.timestamp());
+    assert!(actor.expires_at <= chrono::Utc::now().timestamp() + 300);
+    sqlx::query("UPDATE workload_controller SET revoked_at=clock_timestamp() WHERE id=$1")
+        .bind(original.controller)
+        .execute(&fixture.ctx.pool)
+        .await?;
+    let (status, _) = fixture
+        .request(
+            "/api/v1/workload-launches/session",
+            &json!({}),
+            Some(renewed.token.as_str()),
+            None,
+        )
+        .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    fixture.ctx.cleanup().await?;
+    Ok(())
+}

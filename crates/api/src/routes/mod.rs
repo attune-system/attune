@@ -75,4 +75,5 @@ pub use work_queues::routes as work_queue_routes;
 pub use workers::routes as worker_routes;
 pub use workflows::routes as workflow_routes;
 
+pub mod workload_hosts;
 pub mod workload_launch;

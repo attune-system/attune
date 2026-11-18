@@ -71,6 +71,27 @@ fn response<T>(actor: ControllerActor, value: T) -> ApiResult<Json<T>> {
     Ok(Json(value))
 }
 
+#[utoipa::path(operation_id="workload_launch_session",post,path="/api/v1/workload-launches/session",request_body=attune_common::workload_session::RenewWorkloadSession,responses((status=200,body=attune_common::workload_session::WorkloadSession),(status=403,description="Controller session unavailable")),tag="workload-control")]
+pub async fn session(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Json(_request): Json<attune_common::workload_session::RenewWorkloadSession>,
+) -> ApiResult<(
+    HeaderMap,
+    Json<attune_common::workload_session::WorkloadSession>,
+)> {
+    let actor = actor(&user)?;
+    let result = Ledger::renew_session(&state.db, actor, &state.jwt_config).await?;
+    let Json(value) = response(actor, result)?;
+    Ok((
+        HeaderMap::from_iter([(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        )]),
+        Json(value),
+    ))
+}
+
 #[utoipa::path(operation_id="workload_launch_engine_binding",get,path="/api/v1/workload-launches/engine",responses((status=200,body=LaunchEngineBinding),(status=403,description="Engine unavailable")),tag="workload-control")]
 pub async fn engine_binding(
     State(state): State<Arc<AppState>>,
@@ -359,6 +380,7 @@ pub async fn authorize_io(
 }
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/workload-launches/session", post(session))
         .route("/workload-launches/engine", get(engine_binding))
         .route("/workload-launches/{id}/outputs", post(reserve_output))
         .route(

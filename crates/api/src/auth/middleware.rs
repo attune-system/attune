@@ -249,6 +249,28 @@ impl axum::extract::FromRequestParts<crate::state::SharedState> for RequireAuth<
             extract_claims(&parts.headers, &state.jwt_config)?
         };
 
+        if claims.scope.as_deref() == Some(attune_common::workload_host::HOST_SCOPE) {
+            attune_common::workload_host::host_actor(&claims)
+                .map_err(|_| AuthError::InvalidToken)?;
+            if parts
+                .extensions
+                .get::<crate::routes::workload_hosts::WorkloadHostConsumer>()
+                .is_none()
+            {
+                return Err(AuthError::Unauthorized);
+            }
+        }
+        if claims.scope.as_deref() == Some(attune_common::workload_host::ENROLLMENT_SCOPE) {
+            attune_common::workload_host::enrollment_actor(&claims)
+                .map_err(|_| AuthError::InvalidToken)?;
+            if parts
+                .extensions
+                .get::<crate::routes::workload_hosts::WorkloadHostEnrollmentConsumer>()
+                .is_none()
+            {
+                return Err(AuthError::Unauthorized);
+            }
+        }
         if claims.scope.as_deref() == Some(attune_common::workload_controller::SCOPE) {
             attune_common::workload_controller::actor(&claims)
                 .map_err(|_| AuthError::InvalidToken)?;

@@ -134,6 +134,35 @@ impl WorkloadLaunchRepository {
         tx.commit().await?;
         Ok(result)
     }
+    /// A current, persisted controller renews its dedicated machine session.
+    /// Source row locks cover signing; caller expiry is checked after commit as
+    /// well, before any new credential can leave the trusted control plane.
+    pub async fn renew_session(
+        pool: &PgPool,
+        actor: ControllerActor,
+        jwt: &crate::auth::jwt::JwtConfig,
+    ) -> Result<crate::workload_session::WorkloadSession> {
+        let mut tx = pool.begin().await?;
+        Self::actor(&mut tx, actor).await?;
+        let expires_at =
+            chrono::DateTime::from_timestamp(Utc::now().timestamp() + 300, 0).ok_or_else(denied)?;
+        if actor.expires_at <= Self::now(&mut tx).await?.timestamp() {
+            return Err(denied());
+        }
+        let token = LaunchToken::new(crate::workload_controller::mint(
+            ControllerActor {
+                expires_at: expires_at.timestamp(),
+                ..actor
+            },
+            jwt,
+        )?)?;
+        Self::actor(&mut tx, actor).await?;
+        tx.commit().await?;
+        if actor.expires_at <= Utc::now().timestamp() {
+            return Err(denied());
+        }
+        Ok(crate::workload_session::WorkloadSession { token, expires_at })
+    }
     async fn now(tx: &mut Transaction<'_, Postgres>) -> Result<DateTime<Utc>> {
         Ok(sqlx::query_scalar("SELECT clock_timestamp()")
             .fetch_one(&mut **tx)

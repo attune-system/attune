@@ -80,6 +80,7 @@ impl Server {
             .merge(routes::internal_file_routes())
             .merge(routes::log_delivery_control::routes())
             .merge(routes::workload_launch::routes())
+            .merge(routes::workload_hosts::routes())
             .merge(routes::sensor_log_routes())
             .merge(routes::trace_routes())
             .merge(routes::info::routes())
