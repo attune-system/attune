@@ -458,7 +458,23 @@ async fn reserve_revoke_restore_claim_never_revives_old_launch_but_new_admission
         .await?;
     assert_eq!(create.disposition, CreateDisposition::StopOnly);
     assert!(create.create_nonce.is_nil());
-    let newer = fixture.reserve().await?;
+    assert!(
+        fixture.reserve().await.is_err(),
+        "restoration cannot allocate another launch for the old attempt"
+    );
+    let mut fresh = fixture.spec.clone();
+    fresh.manifest.purpose = LaunchPurpose::RuntimeProbe;
+    fresh.manifest.target = Ledger::prerequisite(
+        &fixture.ctx.pool,
+        &fixture.spec.manifest.target,
+        fixture.spec.manifest.owner_identity_id,
+        fixture.image,
+        LaunchPurpose::RuntimeProbe,
+        None,
+        chrono::Utc::now() + chrono::Duration::minutes(5),
+    )
+    .await?;
+    let newer = Ledger::freeze(&fixture.ctx.pool, fixture.image, fresh, fixture.master()).await?;
     let claimed: ClaimedLaunch = fixture
         .ok(
             &newer,
@@ -479,6 +495,34 @@ async fn reserve_revoke_restore_claim_never_revives_old_launch_but_new_admission
         )
         .await?;
     assert_eq!(status, StatusCode::FORBIDDEN);
+    fixture.ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_reservation_replay_keeps_one_identity_and_rejects_changed_plan() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let (first, replay) = tokio::join!(fixture.reserve(), fixture.reserve());
+    let first = first?;
+    let replay = replay?;
+    assert_eq!(first.request, replay.request);
+    assert_eq!(
+        first.dispatch_token.as_str(),
+        replay.dispatch_token.as_str()
+    );
+    let mut changed = fixture.spec.clone();
+    changed.invocation.argv.push("changed-invocation".into());
+    assert!(
+        Ledger::freeze(&fixture.ctx.pool, fixture.image, changed, fixture.master())
+            .await
+            .is_err()
+    );
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM workload_launch WHERE manifest->'target'=$1")
+            .bind(sqlx::types::Json(&fixture.spec.manifest.target))
+            .fetch_one(&fixture.ctx.pool)
+            .await?;
+    assert_eq!(count, 1);
     fixture.ctx.cleanup().await?;
     Ok(())
 }

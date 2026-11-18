@@ -421,7 +421,7 @@ impl LaunchManifest {
 /// Private CP materialization of the encrypted context. Never accept this from
 /// a runner request, hash it into a public digest, or include its values in logs.
 /// Per-stream keys, engine credentials and reusable enrollment are not fields.
-#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchInvocation {
     pub argv: Vec<String>,

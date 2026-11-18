@@ -209,6 +209,9 @@ CREATE TABLE workload_launch (
     CHECK (operation#>>'{status,request,admitted_digest}'=admitted_digest),
     CHECK ((operation#>>'{status,request,launch_id}')::BIGINT=id)
 );
+-- One launch identity for one admitted purpose/target. Tombstones are retained;
+-- retry/replacement requires a new attempt, generation or prerequisite admission.
+CREATE UNIQUE INDEX workload_launch_target_once ON workload_launch((manifest->>'purpose'),(manifest->'target'));
 CREATE INDEX workload_launch_cleanup ON workload_launch(engine,updated)
 WHERE operation#>>'{status,state}'<>'stopped' OR operation#>>'{status,publication}' IN ('pending','uploading') OR operation#>>'{status,capture}'='pending';
 CREATE FUNCTION guard_workload_launch() RETURNS trigger LANGUAGE plpgsql AS $$

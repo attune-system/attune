@@ -54,6 +54,14 @@ struct Record {
     #[sqlx(skip)]
     effect_deadline: Option<DateTime<Utc>>,
 }
+#[derive(sqlx::FromRow)]
+struct ReservationReplay {
+    manifest: Json<LaunchManifest>,
+    encrypted_context: String,
+    source_epochs: Json<Vec<SourceEpoch>>,
+    encrypted_dispatch: String,
+    admitted_digest: String,
+}
 /// Validated identity supplied only by the dedicated RequireAuth consumer. DB
 /// binding is rechecked inside each transaction, including cleanup operations.
 #[derive(Clone, Copy)]
@@ -731,25 +739,6 @@ impl WorkloadLaunchRepository {
                 return Err(denied());
             }
         }
-        let id: i64 =
-            sqlx::query_scalar("SELECT nextval(pg_get_serial_sequence('workload_launch','id'))")
-                .fetch_one(&mut *tx)
-                .await?;
-        spec.manifest.launch_id = id;
-        spec.manifest.engine_name_nonce = Uuid::new_v4();
-        let plaintext = serde_json::to_string(&FrozenContext {
-            launch_id: id,
-            owner: spec.manifest.owner_identity_id,
-            purpose: spec.manifest.purpose,
-            target: spec.manifest.target.clone(),
-            invocation: spec.invocation.clone(),
-        })?;
-        let encrypted_context = crypto::encrypt(&plaintext, master)?;
-        spec.manifest.context = FrozenContextRef {
-            id,
-            version: 1,
-            ciphertext_sha256: Sha256Digest::of_bytes(encrypted_context.as_bytes()),
-        };
         if let LaunchTarget::Setup { admission, attempt } = &spec.manifest.target {
             let binding:Json<RuntimeStageBinding>=sqlx::query_scalar("SELECT stage_binding FROM workload_launch_prerequisite WHERE id=$1 AND attempt=$2 AND purpose='setup'")
                 .bind(admission).bind(attempt).fetch_one(&mut *tx).await?;
@@ -771,6 +760,81 @@ impl WorkloadLaunchRepository {
             spec.manifest.stage.as_mut().ok_or_else(denied)?.cache_key =
                 Sha256Digest::of_bytes(&bytes).as_str().into();
         }
+        // Transaction-owned target admission, after live sources and epochs.
+        // The hash covers public identity only; collisions merely serialize.
+        // A retained unique index is the final fence even across restarts.
+        let target_key = serde_json::to_string(&(spec.manifest.purpose, &spec.manifest.target))?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,71387301))")
+            .bind(target_key)
+            .execute(&mut *tx)
+            .await?;
+        let existing: Option<ReservationReplay> =
+            sqlx::query_as("SELECT manifest,encrypted_context,source_epochs,encrypted_dispatch,admitted_digest FROM workload_launch WHERE manifest->>'purpose'=$1 AND manifest->'target'=$2 FOR UPDATE")
+                .bind(serde_json::to_value(spec.manifest.purpose)?.as_str().ok_or_else(denied)?)
+                .bind(Json(&spec.manifest.target)).fetch_optional(&mut *tx).await?;
+        if let Some(ReservationReplay {
+            manifest,
+            encrypted_context: encrypted,
+            source_epochs: old_epochs,
+            encrypted_dispatch: dispatch,
+            admitted_digest: digest,
+        }) = existing
+        {
+            let context: FrozenContext =
+                serde_json::from_str(&crypto::decrypt(&encrypted, master).map_err(|_| denied())?)?;
+            if !Self::same_epochs(&epochs, &old_epochs, false)
+                || manifest.owner_identity_id != spec.manifest.owner_identity_id
+                || manifest.engine_id != spec.manifest.engine_id
+                || manifest.image != spec.manifest.image
+                || manifest.inputs != spec.manifest.inputs
+                || manifest.pack_access != spec.manifest.pack_access
+                || manifest.stage != spec.manifest.stage
+                || manifest.timeout_ms != spec.manifest.timeout_ms
+                || context.launch_id != manifest.launch_id
+                || context.owner != manifest.owner_identity_id
+                || context.purpose != manifest.purpose
+                || context.target != manifest.target
+                || context.invocation != spec.invocation
+            {
+                return Err(denied());
+            }
+            if sources
+                .deadline
+                .is_some_and(|deadline| deadline <= Utc::now())
+            {
+                return Err(denied());
+            }
+            let result = ReservedLaunch {
+                request: LaunchRequest {
+                    launch_id: manifest.launch_id,
+                    admitted_digest: Sha256Digest::parse(digest)?,
+                },
+                dispatch_token: LaunchToken::new(
+                    crypto::decrypt(&dispatch, master).map_err(|_| denied())?,
+                )?,
+            };
+            tx.commit().await?;
+            return Ok(result);
+        }
+        let id: i64 =
+            sqlx::query_scalar("SELECT nextval(pg_get_serial_sequence('workload_launch','id'))")
+                .fetch_one(&mut *tx)
+                .await?;
+        spec.manifest.launch_id = id;
+        spec.manifest.engine_name_nonce = Uuid::new_v4();
+        let plaintext = serde_json::to_string(&FrozenContext {
+            launch_id: id,
+            owner: spec.manifest.owner_identity_id,
+            purpose: spec.manifest.purpose,
+            target: spec.manifest.target.clone(),
+            invocation: spec.invocation.clone(),
+        })?;
+        let encrypted_context = crypto::encrypt(&plaintext, master)?;
+        spec.manifest.context = FrozenContextRef {
+            id,
+            version: 1,
+            ciphertext_sha256: Sha256Digest::of_bytes(encrypted_context.as_bytes()),
+        };
         spec.validate_shape()?;
         let now = Self::now(&mut tx).await?;
         if spec.manifest.lease_deadline <= now
