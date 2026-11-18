@@ -374,14 +374,21 @@ impl LogDeliveryManager {
             backoff = (backoff * 2).min(Duration::from_secs(2));
         }
     }
+    /// Stop delivery after its producers have joined, retaining every
+    /// unacknowledged custody entry for the next owner. This is shutdown,
+    /// never evidence of remote absence or permission to delete a spool.
+    pub async fn stop_and_join(&self) {
+        self.tasks.close();
+        self.stop.cancel();
+        self.tasks.wait().await;
+    }
     pub async fn drain(&self) {
         self.tasks.close();
         if tokio::time::timeout(Duration::from_secs(65), self.tasks.wait())
             .await
             .is_err()
         {
-            self.stop.cancel();
-            self.tasks.wait().await;
+            self.stop_and_join().await;
         }
     }
 }

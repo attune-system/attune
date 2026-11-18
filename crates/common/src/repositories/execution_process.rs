@@ -2,7 +2,6 @@
 //! admission/origin policy is rechecked before the one-shot stdin commit.
 use super::{
     execution_input::{ExecutionInputRepository, FrozenInputSnapshot, SelectedExecutionInput},
-    workload_launch::WorkloadLaunchRepository,
     workload_source::{self, SourceEpoch},
 };
 use crate::{
@@ -107,8 +106,130 @@ impl Record {
     }
 }
 
+struct SourceProof {
+    sources: Vec<(&'static str, i64)>,
+    deadline: Option<DateTime<Utc>>,
+}
+
 pub struct ExecutionProcessRepository;
 impl ExecutionProcessRepository {
+    /// Reuse the existing execution authority choice and attempt fence. The
+    /// retired controller relay contributes no policy or scheduling state.
+    async fn source(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        target: &LaunchTarget,
+        expected_owner: i64,
+    ) -> Result<SourceProof> {
+        super::schema_type::SchemaTypeRepository::lock_selection(tx).await?;
+        Self::source_for(tx, target, expected_owner, false).await
+    }
+    async fn source_for(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        target: &LaunchTarget,
+        expected_owner: i64,
+        allow_canceling: bool,
+    ) -> Result<SourceProof> {
+        use super::{
+            delegated_execution::DelegatedExecutionRepository,
+            execution_runtime_admission::{
+                ExecutionAdmissionRepository, ExistingExecutionAuthority,
+            },
+            runtime_authority::{
+                RuntimeAuthorityRepository, RuntimeCredentialBinding, RuntimeOwner,
+            },
+        };
+        match target {
+            LaunchTarget::Execution {
+                execution,
+                worker,
+                worker_instance,
+                attempt,
+            } => {
+                let mut deadline = None;
+                let selected =
+                    ExecutionAdmissionRepository::selected_authority(tx, *execution).await?;
+                match selected {
+                    ExistingExecutionAuthority::Delegated => {
+                        let authority =
+                            DelegatedExecutionRepository::validate(tx, *execution).await?;
+                        if authority.owner != Some(expected_owner) || !authority.explicit {
+                            return Err(denied());
+                        }
+                        let current: Option<Uuid>=sqlx::query_scalar("SELECT a.attempt FROM execution e JOIN delegated_execution_attempt a ON a.execution=e.id WHERE e.id=$1 AND e.worker=$2 AND a.worker=$2 AND NOT a.closed AND a.producer_kind='worker' AND (e.status='running' OR ($3 AND e.status='canceling')) FOR SHARE OF e,a")
+                            .bind(execution).bind(worker).bind(allow_canceling).fetch_optional(&mut **tx).await?;
+                        if current != Some(*attempt) {
+                            return Err(denied());
+                        }
+                        DelegatedExecutionRepository::validate(tx, *execution).await?;
+                    }
+                    ExistingExecutionAuthority::Recorded => {
+                        let (record, fence) = ExecutionAdmissionRepository::require_with_fence(
+                            tx,
+                            RuntimeOwner::Execution(*execution),
+                        )
+                        .await?;
+                        if record.authority.owner.sponsor_identity_id != expected_owner {
+                            return Err(denied());
+                        }
+                        let current: Option<Uuid>=sqlx::query_scalar("SELECT f.attempt FROM execution e JOIN runtime_authority_execution_fence f ON f.execution=e.id WHERE e.id=$1 AND e.worker=$2 AND (e.status='running' OR ($4 AND e.status='canceling')) AND f.admission=$3 FOR SHARE OF e,f")
+                            .bind(execution).bind(worker).bind(record.id).bind(allow_canceling).fetch_optional(&mut **tx).await?;
+                        if current != Some(*attempt) {
+                            return Err(denied());
+                        }
+                        if !allow_canceling {
+                            RuntimeAuthorityRepository::validate_execution_source(
+                                tx,
+                                &RuntimeCredentialBinding {
+                                    execution_id: *execution,
+                                    admission_id: record.id,
+                                    sponsor_identity_id: expected_owner,
+                                    action_ref: record.authority.binding.action_ref().into(),
+                                    attempt: *attempt,
+                                },
+                            )
+                            .await?
+                            .ensure_fresh_on(tx)
+                            .await?;
+                        }
+                        fence.ensure_fresh_on(tx).await?;
+                        deadline = fence.approval_deadline();
+                    }
+                }
+                if !allow_canceling {
+                    let execution_deadline:Option<DateTime<Utc>>=sqlx::query_scalar("SELECT started_at+make_interval(secs=>timeout_seconds) FROM execution WHERE id=$1 AND started_at IS NOT NULL AND timeout_seconds>0")
+                        .bind(execution).fetch_optional(&mut **tx).await?;
+                    let execution_deadline = execution_deadline.ok_or_else(denied)?;
+                    deadline = Some(deadline.map_or(execution_deadline, |approval| {
+                        approval.min(execution_deadline)
+                    }));
+                    fresh_on(tx, Some(execution_deadline)).await?;
+                }
+                Self::worker(tx, *worker, *worker_instance).await?;
+                let mut sources = vec![
+                    ("owner", expected_owner),
+                    ("execution", *execution),
+                    ("worker", *worker),
+                ];
+                if !allow_canceling {
+                    sources.push(("execution_input", *execution));
+                }
+                Ok(SourceProof { sources, deadline })
+            }
+            _ => Err(denied()),
+        }
+    }
+    async fn worker(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        worker: i64,
+        instance: Uuid,
+    ) -> Result<()> {
+        let current:Option<Uuid>=sqlx::query_scalar("SELECT (meta->>'registration_incarnation')::UUID FROM worker WHERE id=$1 AND status IN ('active','busy') AND last_heartbeat>clock_timestamp()-interval '90 seconds' FOR SHARE")
+            .bind(worker).fetch_optional(&mut **tx).await?;
+        if current != Some(instance) {
+            return Err(denied());
+        }
+        Ok(())
+    }
     /// Runtime token consumers retain this fence through their own effect
     /// transaction. Native exit/stop waits for admitted calls, then closes new
     /// allocation even while execution remains Running for log custody drain.
@@ -197,7 +318,7 @@ impl ExecutionProcessRepository {
         let serialized = serde_json::to_string(&context).map_err(|_| denied())?;
         let encrypted = crypto::encrypt(&serialized, master).map_err(|_| denied())?;
         let mut tx = pool.begin().await?;
-        let proof = WorkloadLaunchRepository::source(&mut tx, &spec.target, owner).await?;
+        let proof = Self::source(&mut tx, &spec.target, owner).await?;
         let mut input = ExecutionInputRepository::restore(
             &mut tx,
             selected.snapshot.execution(),
@@ -259,8 +380,7 @@ impl ExecutionProcessRepository {
             return Ok(ProcessCreateDisposition::ReconcileOnly);
         }
         let context = snapshot.context(master)?;
-        let proof =
-            WorkloadLaunchRepository::source(&mut tx, &context.target, context.owner).await?;
+        let proof = Self::source(&mut tx, &context.target, context.owner).await?;
         let epochs = workload_source::snapshot(&mut tx, proof.sources).await?;
         let record: Record = sqlx::query_as(&format!(
             "SELECT {COLUMNS} FROM execution_process_effect WHERE intent=$1 FOR UPDATE"
@@ -332,8 +452,7 @@ impl ExecutionProcessRepository {
         .await?
         .ok_or_else(denied)?;
         let context = snapshot.context(master)?;
-        let proof =
-            WorkloadLaunchRepository::source(&mut tx, &context.target, context.owner).await?;
+        let proof = Self::source(&mut tx, &context.target, context.owner).await?;
         let expected = context.input.public_snapshot()?;
         let mut input = ExecutionInputRepository::restore(
             &mut tx,
@@ -500,8 +619,7 @@ impl ExecutionProcessRepository {
                 execution: current,
             }));
         }
-        let mut proof =
-            WorkloadLaunchRepository::source_for(tx, &context.target, context.owner, true).await?;
+        let mut proof = Self::source_for(tx, &context.target, context.owner, true).await?;
         // Take the mutable execution source lock BEFORE epoch/operation locks.
         // Input callers can finish without waiting behind an operation whose
         // owner is itself waiting to upgrade their shared execution lock.

@@ -724,6 +724,13 @@ impl WorkerService {
         self.worker_token_provider
             .set_worker_id(worker_id.to_string());
         self.executor.set_worker_id(worker_id);
+        let incarnation = self
+            .registration
+            .read()
+            .await
+            .registered_incarnation()
+            .ok_or_else(|| Error::invalid_state("Worker registration incarnation unavailable"))?;
+        self.executor.set_process_incarnation(incarnation)?;
         self.executor
             .start_log_delivery(
                 self.config

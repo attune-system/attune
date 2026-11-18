@@ -271,16 +271,10 @@ impl axum::extract::FromRequestParts<crate::state::SharedState> for RequireAuth<
                 return Err(AuthError::Unauthorized);
             }
         }
+        // The standalone controller relay is retired. Its scoped machine
+        // credential must never fall through to the subject's ambient IAM.
         if claims.scope.as_deref() == Some(attune_common::workload_controller::SCOPE) {
-            attune_common::workload_controller::actor(&claims)
-                .map_err(|_| AuthError::InvalidToken)?;
-            if parts
-                .extensions
-                .get::<crate::routes::workload_launch::WorkloadLaunchConsumer>()
-                .is_none()
-            {
-                return Err(AuthError::Unauthorized);
-            }
+            return Err(AuthError::Unauthorized);
         }
         if claims.scope.as_deref() == Some("log_delivery") {
             attune_common::log_delivery::credential(&claims)

@@ -76,4 +76,3 @@ pub use workers::routes as worker_routes;
 pub use workflows::routes as workflow_routes;
 
 pub mod workload_hosts;
-pub mod workload_launch;

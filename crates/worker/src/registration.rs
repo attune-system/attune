@@ -389,7 +389,12 @@ impl WorkerRegistration {
         Ok(())
     }
 
-    /// Get the registered worker ID
+    /// Only an acknowledged registration can bind native process ownership.
+    pub fn registered_incarnation(&self) -> Option<uuid::Uuid> {
+        self.worker_id.map(|_| self.incarnation)
+    }
+
+    /// Get the registered worker ID.
     pub fn worker_id(&self) -> Option<i64> {
         self.worker_id
     }

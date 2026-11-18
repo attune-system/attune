@@ -738,6 +738,8 @@ dependencies = [
  "futures",
  "hostname",
  "jsonwebtoken",
+ "k8s-openapi",
+ "kube",
  "lapin",
  "libc",
  "regex",
@@ -756,6 +758,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "windows-sys 0.61.2",
+ "zip",
 ]
 
 [[package]]
