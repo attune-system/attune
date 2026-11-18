@@ -25,7 +25,7 @@ use kube::{
 use serde_json::json;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tokio::{
-    io::{AsyncWrite, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::Mutex,
 };
 
@@ -241,6 +241,85 @@ impl KubernetesLauncher {
         }
         Ok(pod)
     }
+    /// Factual Setup transfer only. The caller validates/publishes the runtime
+    /// and retains this Pod until its existing publication receipt is durable.
+    /// No current invocation, stdin authority or Pod deletion is granted here.
+    pub async fn archive_stopped_stage(
+        &self,
+        spec: &ProcessSpec,
+        resource: &ResourceIdentity,
+    ) -> Result<std::fs::File> {
+        let limits = self
+            .cache
+            .native_stage_limits(spec)
+            .map_err(|_| invalid())?;
+        require_successful_payload(&self.exact(spec, resource).await?)?;
+        let file = tokio::time::timeout(Duration::from_secs(120), async {
+            let mut streams = crate::kubernetes_io::exec(
+                &self.client,
+                &self.pods(),
+                &pod_name(spec),
+                TRANSFER_CONTAINER,
+                vec![
+                    BOOTSTRAP_RUNNER.into(),
+                    "archive".into(),
+                    limits.compressed_bytes.to_string(),
+                    limits.expanded_bytes.to_string(),
+                    limits.files.to_string(),
+                ],
+            )
+            .await?;
+            let mut file = tokio::fs::File::from_std(tempfile::tempfile().map_err(|_| invalid())?);
+            let write = async { streams.stdin.shutdown().await.map_err(|_| invalid()) };
+            let read = async {
+                let count = tokio::io::copy(
+                    &mut (&mut streams.stdout).take(limits.compressed_bytes + 1),
+                    &mut file,
+                )
+                .await
+                .map_err(|_| invalid())?;
+                if count == 0 || count > limits.compressed_bytes {
+                    return Err(invalid());
+                }
+                file.flush().await.map_err(|_| invalid())?;
+                Ok(())
+            };
+            let errors = async {
+                let count = tokio::io::copy(
+                    &mut (&mut streams.stderr).take(16 * 1024 + 1),
+                    &mut tokio::io::sink(),
+                )
+                .await
+                .map_err(|_| invalid())?;
+                if count > 16 * 1024 {
+                    return Err(invalid());
+                }
+                Ok(())
+            };
+            tokio::try_join!(write, read, errors)?;
+            streams.success().await?;
+            Ok::<_, attune_common::Error>(file.into_std().await)
+        })
+        .await
+        .map_err(|_| invalid())??;
+        require_successful_payload(&self.exact(spec, resource).await?)?;
+        tokio::task::spawn_blocking(move || {
+            let mut file = file;
+            file.sync_all().map_err(|_| invalid())?;
+            attune_common::workload_archive::validate_zip(
+                &mut file,
+                &attune_common::workload_archive::ArchivePolicy {
+                    root: attune_common::workload_launch::LaunchInputKind::Runtime,
+                    max_compressed_bytes: limits.compressed_bytes,
+                    max_expanded_bytes: limits.expanded_bytes,
+                    max_files: limits.files,
+                },
+            )?;
+            Ok(file)
+        })
+        .await
+        .map_err(|_| invalid())?
+    }
     /// The trusted owning loop first commits terminal state/custody and proves
     /// the ordinary-file inventory empty or durably published. This method is
     /// only the exact provider effect, never a custody/publication ACK.
@@ -375,6 +454,20 @@ impl KubernetesLauncher {
         }
         Ok(())
     }
+}
+fn require_successful_payload(pod: &Pod) -> Result<()> {
+    let terminated = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.container_statuses.as_ref())
+        .and_then(|s| s.iter().find(|s| s.name == PAYLOAD_CONTAINER))
+        .and_then(|s| s.state.as_ref())
+        .and_then(|s| s.terminated.as_ref())
+        .ok_or_else(invalid)?;
+    if terminated.exit_code != 0 || terminated.reason.as_deref() == Some("OOMKilled") {
+        return Err(invalid());
+    }
+    Ok(())
 }
 #[async_trait]
 impl ProcessLauncher for KubernetesLauncher {
@@ -714,6 +807,33 @@ mod tests {
             arm.spec.unwrap().node_selector.unwrap()["kubernetes.io/arch"],
             "arm64"
         );
+    }
+    #[test]
+    fn stage_transfer_requires_positive_payload_success_not_sidecar_or_pod_phase() {
+        for (state, accepted) in [
+            (json!({"running":{}}), false),
+            (json!({"waiting":{"reason":"ContainerCreating"}}), false),
+            (
+                json!({"terminated":{"exitCode":1,"startedAt":null,"finishedAt":null}}),
+                false,
+            ),
+            (
+                json!({"terminated":{"exitCode":0,"reason":"OOMKilled"}}),
+                false,
+            ),
+            (
+                json!({"terminated":{"exitCode":0,"reason":"Completed"}}),
+                true,
+            ),
+        ] {
+            let pod: Pod = serde_json::from_value(json!({"metadata":{},"status":{
+                "phase":"Succeeded", "containerStatuses":[
+                    {"name":PAYLOAD_CONTAINER,"image":"owned","imageID":"owned","ready":false,"restartCount":0,"state":state},
+                    {"name":TRANSFER_CONTAINER,"image":"owned","imageID":"owned","ready":true,"restartCount":0,"state":{"running":{}}}
+                ]}})).unwrap();
+            assert_eq!(require_successful_payload(&pod).is_ok(), accepted);
+        }
+        assert!(require_successful_payload(&Pod::default()).is_err());
     }
     #[test]
     fn effective_policy_rejects_injected_credentials_mounts_capabilities_and_shared_namespaces() {

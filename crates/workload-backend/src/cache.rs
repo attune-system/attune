@@ -131,6 +131,90 @@ impl CacheStore {
     pub fn artifact_limits(&self) -> ArtifactLimits {
         self.artifact_limits
     }
+    pub(crate) fn native_stage_limits(
+        &self,
+        spec: &attune_common::isolated_process::ProcessSpec,
+    ) -> Result<CacheLimits> {
+        use attune_common::workload_launch::{LaunchInputKind, LaunchPurpose};
+        let stage = spec.stage.as_ref().ok_or(CacheError::PinMismatch)?;
+        if spec.purpose != LaunchPurpose::Setup
+            || spec
+                .inputs
+                .iter()
+                .any(|p| p.kind == LaunchInputKind::Runtime)
+            || stage.quota_bytes == 0
+            || stage.quota_files == 0
+        {
+            return Err(CacheError::PinMismatch);
+        }
+        Ok(CacheLimits {
+            compressed_bytes: self.limits.compressed_bytes.min(1024 * 1024 * 1024),
+            expanded_bytes: self
+                .limits
+                .expanded_bytes
+                .min(stage.quota_bytes)
+                .min(4 * 1024 * 1024 * 1024),
+            files: self.limits.files.min(stage.quota_files).min(100_000),
+        })
+    }
+    /// Only the Docker adapter calls this after exact successful container Wait.
+    /// Retain one exact body across retry/restart; publication remains caller-owned.
+    pub(crate) fn archive_native_stage(
+        &self,
+        spec: &attune_common::isolated_process::ProcessSpec,
+    ) -> Result<File> {
+        let limits = self.native_stage_limits(spec)?;
+        let digest =
+            crate::process_policy::public_digest(spec).map_err(|_| CacheError::PinMismatch)?;
+        let _lock = self.lock()?;
+        let parent = self.root.join(format!("private/{}", spec.intent.simple()));
+        if !fs::symlink_metadata(&parent)?.is_dir()
+            || fs::read(parent.join("native-policy"))? != digest.as_str().as_bytes()
+        {
+            return Err(CacheError::AttemptConflict);
+        }
+        let destination = parent.join("publication.zip");
+        match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&destination)
+        {
+            Ok(mut file) => {
+                let metadata = file.metadata()?;
+                if !metadata.is_file()
+                    || metadata.nlink() != 1
+                    || metadata.uid() != unsafe { libc::geteuid() }
+                {
+                    return Err(CacheError::UnsafeEntry);
+                }
+                attune_common::workload_archive::validate_zip(
+                    &mut file,
+                    &archive_policy(
+                        attune_common::workload_launch::RUNTIME_ROOT,
+                        limits.compressed_bytes,
+                        limits.expanded_bytes,
+                        limits.files,
+                    )?,
+                )
+                .map_err(|_| CacheError::UnsafeEntry)?;
+                Ok(file)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let pending = tempfile::NamedTempFile::new_in(&parent)?;
+                archive_fixed_root(
+                    &parent.join("runtime"),
+                    pending.as_file().try_clone()?,
+                    limits,
+                )?;
+                let file = pending
+                    .persist_noclobber(destination)
+                    .map_err(|e| e.error)?;
+                File::open(parent)?.sync_all()?;
+                Ok(file)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
     /// Filesystem logic tests run as the CI runner, which need not be uid 1000.
     /// This internal test seam is absent from production and request DTOs; the
     /// packaged Engine test retains and proves the fixed uid/gid 1000 contract.
@@ -1352,6 +1436,132 @@ fn ensure_parents(root: &Path, relative: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn native_setup() -> attune_common::isolated_process::ProcessSpec {
+        use attune_common::workload_launch::*;
+        let old =
+            crate::test_support::spec(format!("fixture.invalid/runtime@sha256:{}", "a".repeat(64)));
+        attune_common::isolated_process::ProcessSpec {
+            intent: uuid::Uuid::new_v4(),
+            purpose: LaunchPurpose::Setup,
+            target: LaunchTarget::Setup {
+                admission: 1,
+                attempt: uuid::Uuid::new_v4(),
+            },
+            image: old.manifest.image,
+            platform: LaunchPlatform::LinuxAmd64,
+            inputs: vec![],
+            pack_access: PackAccess::ReadOnly,
+            stage: Some(PrivateStage {
+                cache_key: "owned-test-stage".into(),
+                quota_bytes: 65536,
+                quota_files: 32,
+            }),
+            timeout_ms: Some(1000),
+            invocation: old.invocation,
+        }
+    }
+    #[test]
+    fn native_stage_archive_keeps_exact_body_across_restart_and_checks_ownership() {
+        let root = tempfile::tempdir().unwrap();
+        let limits = CacheLimits {
+            compressed_bytes: 65536,
+            expanded_bytes: 65536,
+            files: 32,
+        };
+        let spec = native_setup();
+        let store = CacheStore::open(root.path().into(), limits)
+            .unwrap()
+            .for_current_test_user();
+        store.prepare_native_private(&spec).unwrap();
+        let runtime = root
+            .path()
+            .join(format!("private/{}/runtime", spec.intent.simple()));
+        fs::create_dir(runtime.join("bin")).unwrap();
+        fs::write(
+            runtime.join("bin/tool"),
+            b"#!/opt/attune/runtime/bin/python\n",
+        )
+        .unwrap();
+        fs::set_permissions(runtime.join("bin/tool"), fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(
+            "/opt/attune/runtime/bin/tool",
+            runtime.join("absolute-link"),
+        )
+        .unwrap();
+        let mut first = Vec::new();
+        store
+            .archive_native_stage(&spec)
+            .unwrap()
+            .read_to_end(&mut first)
+            .unwrap();
+        assert!(!first.is_empty());
+        // Changes cannot regenerate bytes after the first body was retained.
+        fs::write(runtime.join("bin/tool"), b"changed after first archive").unwrap();
+        drop(store);
+        let store = CacheStore::open(root.path().into(), limits)
+            .unwrap()
+            .for_current_test_user();
+        let mut replay = Vec::new();
+        store
+            .archive_native_stage(&spec)
+            .unwrap()
+            .read_to_end(&mut replay)
+            .unwrap();
+        assert_eq!(first, replay);
+        let mut changed = spec.clone();
+        changed.stage.as_mut().unwrap().cache_key = "another-binding".into();
+        assert!(store.archive_native_stage(&changed).is_err());
+        changed = spec.clone();
+        changed.purpose = attune_common::workload_launch::LaunchPurpose::Action;
+        assert!(store.archive_native_stage(&changed).is_err());
+        let archive = root
+            .path()
+            .join(format!("private/{}/publication.zip", spec.intent.simple()));
+        fs::remove_file(&archive).unwrap();
+        std::os::unix::fs::symlink(runtime.join("bin/tool"), &archive).unwrap();
+        assert!(store.archive_native_stage(&spec).is_err());
+    }
+    #[test]
+    fn native_stage_tree_rejects_escaping_cycles_hardlinks_and_special_files() {
+        for case in 0..5 {
+            let root = tempfile::tempdir().unwrap();
+            let store = CacheStore::open(
+                root.path().into(),
+                CacheLimits {
+                    compressed_bytes: 65536,
+                    expanded_bytes: 65536,
+                    files: 32,
+                },
+            )
+            .unwrap()
+            .for_current_test_user();
+            let spec = native_setup();
+            store.prepare_native_private(&spec).unwrap();
+            let runtime = root
+                .path()
+                .join(format!("private/{}/runtime", spec.intent.simple()));
+            match case {
+                0 => std::os::unix::fs::symlink("/etc/passwd", runtime.join("escape")).unwrap(),
+                1 => {
+                    std::os::unix::fs::symlink("second", runtime.join("first")).unwrap();
+                    std::os::unix::fs::symlink("first", runtime.join("second")).unwrap();
+                }
+                2 => {
+                    fs::write(runtime.join("first"), b"owned").unwrap();
+                    fs::hard_link(runtime.join("first"), runtime.join("second")).unwrap();
+                }
+                3 => {
+                    let _socket =
+                        std::os::unix::net::UnixListener::bind(runtime.join("socket")).unwrap();
+                }
+                4 => fs::write(runtime.join("oversized"), vec![0; 65537]).unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(store.archive_native_stage(&spec).is_err(), "case {case}");
+            assert!(!runtime.parent().unwrap().join("publication.zip").exists());
+        }
+    }
 
     #[test]
     fn public_manifest_restart_evidence_is_digest_bound_private_and_never_an_invocation() {

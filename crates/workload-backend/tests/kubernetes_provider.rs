@@ -41,6 +41,7 @@ struct Fixture {
     client: Client,
     launcher: KubernetesLauncher,
     policy: KubernetesPolicy,
+    cache: Arc<CacheStore>,
     _root: tempfile::TempDir,
 }
 impl Fixture {
@@ -79,11 +80,13 @@ impl Fixture {
                 files: 4096,
             },
         )?;
-        let launcher = KubernetesLauncher::new(client.clone(), policy.clone(), Arc::new(cache));
+        let cache = Arc::new(cache);
+        let launcher = KubernetesLauncher::new(client.clone(), policy.clone(), cache.clone());
         Ok(Self {
             client,
             launcher,
             policy,
+            cache,
             _root: root,
         })
     }
@@ -160,6 +163,15 @@ impl Fixture {
         spec: &ProcessSpec,
         input: Vec<u8>,
     ) -> TestResult<(LaunchExitOutcome, Vec<u8>, Vec<u8>)> {
+        let (resource, exit, out, err) = self.run_retained(spec, input).await?;
+        self.launcher.remove_stopped(spec, &resource).await?;
+        Ok((exit, out, err))
+    }
+    async fn run_retained(
+        &self,
+        spec: &ProcessSpec,
+        input: Vec<u8>,
+    ) -> TestResult<(ResourceIdentity, LaunchExitOutcome, Vec<u8>, Vec<u8>)> {
         let resource = self
             .launcher
             .prepare(spec, ProcessCreateDisposition::CreateOnce)
@@ -216,16 +228,17 @@ impl Fixture {
         .await;
         // Test teardown joins exact provider removal even when an assertion or
         // effect fails. Never remove unrelated Pods/volumes by name prefix/age.
-        let cleanup = if matches!(&result, Ok(Ok(_))) {
-            self.launcher
-                .remove_stopped(spec, &resource)
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-        } else {
-            self.cleanup(&resource).await
-        };
-        cleanup?;
-        result?
+        match result {
+            Ok(Ok((exit, out, err))) => Ok((resource, exit, out, err)),
+            Ok(Err(error)) => {
+                self.cleanup(&resource).await?;
+                Err(error)
+            }
+            Err(error) => {
+                self.cleanup(&resource).await?;
+                Err(error.into())
+            }
+        }
     }
 }
 #[tokio::test]
@@ -241,6 +254,95 @@ async fn native_stdin_separate_capture_and_no_replay() -> TestResult {
     assert_eq!(out, b"owned-native-exact-stdin");
     assert!(err.is_empty());
     Ok(())
+}
+#[tokio::test]
+#[ignore = "requires explicitly owned disposable Kubernetes cluster, namespace-scoped config and exact candidate images; required provider CI includes this test"]
+async fn python_setup_archive_reuse_preserves_console_script_and_absolute_link() -> TestResult {
+    let f = Fixture::new().await?;
+    // Local wheel, pip and ensurepip only; no network/package-index dependency.
+    let program = r#"import os, subprocess, sys, zipfile
+root = '/opt/attune/runtime'
+subprocess.run([sys.executable, '-m', 'venv', '--copies', root], check=True)
+files = {
+ 'ownedtool.py': 'def main():\n print("owned-console-ok")\n',
+ 'ownedtool-1.0.dist-info/METADATA': 'Metadata-Version: 2.1\nName: ownedtool\nVersion: 1.0\n',
+ 'ownedtool-1.0.dist-info/WHEEL': 'Wheel-Version: 1.0\nGenerator: owned-fixture\nRoot-Is-Purelib: true\nTag: py3-none-any\n',
+ 'ownedtool-1.0.dist-info/entry_points.txt': '[console_scripts]\nowned-console = ownedtool:main\n',
+}
+files['ownedtool-1.0.dist-info/RECORD'] = ''.join(k + ',,\n' for k in files) + 'ownedtool-1.0.dist-info/RECORD,,\n'
+wheel = '/tmp/ownedtool-1.0-py3-none-any.whl'
+with zipfile.ZipFile(wheel, 'w') as z:
+ for path, data in files.items(): z.writestr(path, data)
+subprocess.run([root + '/bin/python', '-m', 'pip', 'install', '--no-index', '--no-deps', wheel], check=True)
+os.symlink(root + '/bin/python', root + '/bin/internal-python')
+assert open(root + '/bin/owned-console').readline().strip() == '#!' + root + '/bin/python'
+"#;
+    let mut setup = f.spec(vec!["/usr/bin/python3".into(), "-c".into(), program.into()])?;
+    setup.purpose = LaunchPurpose::Setup;
+    setup.target = LaunchTarget::Setup {
+        admission: 1,
+        attempt: Uuid::new_v4(),
+    };
+    setup.stage = Some(PrivateStage {
+        cache_key: "owned-python-setup".into(),
+        quota_bytes: 128 * 1024 * 1024,
+        quota_files: 4096,
+    });
+    let (resource, exit, _, _) = f.run_retained(&setup, Vec::new()).await?;
+    let result = async {
+        if exit.exit_code != 0 || exit.oom_killed {
+            return Err("owned Python setup did not succeed".into());
+        }
+        let mut archive = f.launcher.archive_stopped_stage(&setup, &resource).await?;
+        // Repeated transfer returns the exact retained body, not a regenerated ZIP.
+        use std::io::{Read, Seek};
+        use sha2::{Digest, Sha256};
+        fn hash(file: &mut std::fs::File) -> std::io::Result<String> {
+            file.rewind()?;
+            let mut hash = Sha256::new();
+            let mut buffer = [0; 65536];
+            loop {
+                let count = file.read(&mut buffer)?;
+                if count == 0 { break; }
+                hash.update(&buffer[..count]);
+            }
+            file.rewind()?;
+            Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
+        }
+        let digest = hash(&mut archive)?;
+        let mut replay = f.launcher.archive_stopped_stage(&setup, &resource).await?;
+        if digest != hash(&mut replay)? {
+            return Err("stage transfer replay changed exact bytes".into());
+        }
+        let pin = PinnedLaunchInput { pin_id: 1, object_id: 1,
+            object_version: "owned-setup-publication".into(), kind: LaunchInputKind::Runtime,
+            size_bytes: archive.metadata()?.len(), sha256: Sha256Digest::parse(digest)?,
+            max_expanded_bytes: 128 * 1024 * 1024, max_files: 4096 };
+        f.cache.install_input(&pin, &mut archive)?;
+        let verify = r#"import os, subprocess
+subprocess.run(['/opt/attune/runtime/bin/owned-console'], check=True)
+subprocess.run(['/opt/attune/runtime/bin/internal-python', '-c', 'print("owned-link-ok")'], check=True)
+try: open('/opt/attune/runtime/poison', 'w')
+except OSError as e:
+ assert e.errno == 30
+else: raise AssertionError('published runtime writable')
+"#;
+        let mut action = f.spec(vec!["/usr/bin/python3".into(), "-c".into(), verify.into()])?;
+        action.inputs.push(pin);
+        let (exit, out, err) = f.run(&action, Vec::new()).await?;
+        if exit.exit_code != 0 || exit.oom_killed
+            || out != b"owned-console-ok\nowned-link-ok\n" || !err.is_empty()
+        {
+            return Err("published console script/link/readonly regression failed".into());
+        }
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    }.await;
+    if result.is_ok() {
+        f.launcher.remove_stopped(&setup, &resource).await?;
+    } else {
+        f.cleanup(&resource).await?;
+    }
+    result
 }
 #[tokio::test]
 #[ignore = "requires explicitly owned disposable Kubernetes cluster, namespace-scoped config and exact candidate images; required provider CI includes this test"]

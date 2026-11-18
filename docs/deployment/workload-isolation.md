@@ -99,6 +99,17 @@ confined to the selected fixed root; image-external venv interpreter links need
 `--copies`. Setup must create, archive, publish and execute real console scripts
 and internal links successfully in the same admitted immutable image/platform.
 
+The concrete adapters' `archive_stopped_stage` effect accepts Setup only and
+requires exact resource ownership plus successful payload termination, including
+no OOM. Kubernetes reads a fixed retained ZIP from the credential-free transfer
+container; Docker reads only the owned private stage after successful Wait.
+Both validate the bounded ZIP locally and preserve its exact bytes on retry.
+This file is transfer evidence, not a runtime-publication receipt. The owning
+runtime workflow must commit validation/publication before removing the retained
+Pod/container or stage. The real Python venv/pip console-script and absolute-link
+Pod regression is part of the required external provider lane; compiling it does
+not establish that it passed.
+
 Archive/output bounds, free-space/admission/concurrency checks and owned cleanup
 are not a universal live filesystem byte/inode quota. Named-volume exhaustion
 remains a residual availability risk unless a tested filesystem quota
