@@ -123,6 +123,8 @@ pub struct ControlExecutionPreparation {
     pub context: ExecutionContext,
     pub schema: ActionSchemaBinding,
     pub input_secret_paths: Option<Vec<String>>,
+    pub input_snapshot:
+        Option<attune_common::repositories::execution_input::ExecutionInputSnapshot>,
 }
 /// CP callers receive no local execute/setup/probe methods.
 pub struct ControlPlaneActionPreparer {
@@ -343,6 +345,7 @@ impl ExecutionLogArtifactStream {
 struct ExecutionPreparation {
     binding: ActionSchemaBinding,
     parameter_secret_paths: Option<Vec<String>>,
+    input_snapshot: Option<attune_common::repositories::execution_input::ExecutionInputSnapshot>,
     stdout_path: Arc<OnceLock<PathBuf>>,
     stderr_path: Arc<OnceLock<PathBuf>>,
 }
@@ -725,6 +728,7 @@ impl ActionExecutor {
                 }
             },
             parameter_secret_paths: None,
+            input_snapshot: None,
             stdout_path: Arc::new(OnceLock::new()),
             stderr_path: Arc::new(OnceLock::new()),
         };
@@ -1160,6 +1164,7 @@ impl ActionExecutor {
         let mut preparation = ExecutionPreparation {
             binding: self.schema_binding(execution_id).await?,
             parameter_secret_paths: None,
+            input_snapshot: None,
             stdout_path: Arc::new(OnceLock::new()),
             stderr_path: Arc::new(OnceLock::new()),
         };
@@ -1170,6 +1175,7 @@ impl ActionExecutor {
             context,
             schema: preparation.binding,
             input_secret_paths: preparation.parameter_secret_paths,
+            input_snapshot: preparation.input_snapshot,
         })
     }
 
@@ -1201,12 +1207,19 @@ impl ActionExecutor {
         // is the parameters map (e.g. {"url": "...", "method": "GET"}).
         let mut parameters = HashMap::new();
 
-        let restored_config = if let Some(config) = &execution.config {
-            let (config, paths) = self
+        let selected_config = execution
+            .config
+            .clone()
+            .or_else(|| control_attempt.map(|_| serde_json::json!({})));
+        let restored_config = if let Some(config) = selected_config {
+            let (config, paths, snapshot) = self
                 .secret_manager
-                .restore_execution_parameters_with_paths(execution.id, config.clone())
+                .restore_execution_parameters_with_snapshot(execution.id, config)
                 .await?;
             preparation.parameter_secret_paths = Some(paths);
+            if control_attempt.is_some() {
+                preparation.input_snapshot = Some(snapshot);
+            }
             Some(config)
         } else {
             None

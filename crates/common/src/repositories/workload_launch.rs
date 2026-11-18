@@ -8,6 +8,10 @@ use uuid::Uuid;
 
 use super::{
     delegated_execution::DelegatedExecutionRepository,
+    execution_input::{
+        ExecutionInputRepository, ExecutionInputSnapshot, FrozenInputSnapshot,
+        SelectedExecutionInput,
+    },
     execution_runtime_admission::{ExecutionAdmissionRepository, ExistingExecutionAuthority},
     managed_sensor_metadata::ManagedSensorMetadataRepository,
     runtime_authority::{RuntimeAuthorityRepository, RuntimeCredentialBinding, RuntimeOwner},
@@ -29,6 +33,37 @@ pub use output::{LaunchOutputCleanup, OutputBodyPermit};
 const COLUMNS: &str = "id,engine,image,owner,manifest,admitted_digest,encrypted_context,source_epochs,operation,dispatch_hash,lease_hash,controller";
 fn denied() -> Error {
     Error::PermissionDenied("Workload launch unavailable".into())
+}
+
+#[cfg(test)]
+mod selected_input_epoch_tests {
+    use super::*;
+    #[test]
+    fn input_mutation_fences_run_without_reclassifying_retained_capture() {
+        let source = |kind: &str, epoch| SourceEpoch {
+            kind: kind.into(),
+            subject: 1,
+            epoch,
+        };
+        let admitted = vec![source("execution_input", 0), source("owner", 0)];
+        let input_changed = vec![source("execution_input", 2), source("owner", 0)];
+        assert!(!WorkloadLaunchRepository::same_epochs(
+            &input_changed,
+            &admitted,
+            false
+        ));
+        assert!(WorkloadLaunchRepository::same_epochs(
+            &input_changed,
+            &admitted,
+            true
+        ));
+        let owner_revoked = vec![source("execution_input", 2), source("owner", 1)];
+        assert!(!WorkloadLaunchRepository::same_epochs(
+            &owner_revoked,
+            &admitted,
+            true
+        ));
+    }
 }
 fn same_input(left: Option<&str>, right: Option<&str>) -> Result<bool> {
     match (left, right) {
@@ -96,6 +131,19 @@ struct FrozenContext {
     // Private selected input is authenticated by the randomized ciphertext
     // reference. It is never embedded in a public input archive or plan hash.
     stdin_json: Option<String>,
+    selected_input: Option<FrozenInputSnapshot>,
+}
+struct PrivateInput {
+    stdin_json: Option<String>,
+    snapshot: Option<ExecutionInputSnapshot>,
+}
+impl PrivateInput {
+    fn unbound(stdin_json: Option<String>) -> Self {
+        Self {
+            stdin_json,
+            snapshot: None,
+        }
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -344,12 +392,16 @@ impl WorkloadLaunchRepository {
                     }
                 }
                 Self::worker(tx, *worker, *worker_instance).await?;
+                let mut sources = vec![
+                    ("owner", expected_owner),
+                    ("execution", *execution),
+                    ("worker", *worker),
+                ];
+                if !allow_canceling {
+                    sources.push(("execution_input", *execution));
+                }
                 Ok(SourceProof {
-                    sources: vec![
-                        ("owner", expected_owner),
-                        ("execution", *execution),
-                        ("worker", *worker),
-                    ],
+                    sources,
                     deadline,
                     retained: None,
                     image: None,
@@ -498,7 +550,11 @@ impl WorkloadLaunchRepository {
                 .iter()
                 .filter(|(kind, _)| *kind != "admission")
                 .collect();
-            if retained.len() != required.len()
+            if retained
+                .iter()
+                .filter(|entry| !capture || entry.kind != "execution_input")
+                .count()
+                != required.len()
                 || required.iter().any(|(kind, subject)| {
                     !retained
                         .iter()
@@ -513,7 +569,11 @@ impl WorkloadLaunchRepository {
                 retained
                     .iter()
                     .filter(|expected| {
-                        !capture || !matches!(expected.kind.as_str(), "image" | "engine")
+                        !capture
+                            || !matches!(
+                                expected.kind.as_str(),
+                                "image" | "engine" | "execution_input"
+                            )
                     })
                     .any(|expected| !current.contains(expected))
             })
@@ -584,10 +644,12 @@ impl WorkloadLaunchRepository {
     fn same_epochs(current: &[SourceEpoch], expected: &[SourceEpoch], capture: bool) -> bool {
         current
             .iter()
-            .filter(|entry| !capture || !matches!(entry.kind.as_str(), "image" | "engine"))
-            .eq(expected
-                .iter()
-                .filter(|entry| !capture || !matches!(entry.kind.as_str(), "image" | "engine")))
+            .filter(|entry| {
+                !capture || !matches!(entry.kind.as_str(), "image" | "engine" | "execution_input")
+            })
+            .eq(expected.iter().filter(|entry| {
+                !capture || !matches!(entry.kind.as_str(), "image" | "engine" | "execution_input")
+            }))
     }
     /// Acquire sources and epochs before locking the operation. Permission loss
     /// closes the operation durably; cleanup may proceed without private context.
@@ -849,7 +911,7 @@ impl WorkloadLaunchRepository {
             spec,
             master,
             expected_runtime,
-            stdin_json,
+            PrivateInput::unbound(stdin_json),
             None,
         )
         .await
@@ -871,7 +933,38 @@ impl WorkloadLaunchRepository {
             spec,
             master,
             expected_runtime,
-            stdin_json,
+            PrivateInput::unbound(stdin_json),
+            Some(admission),
+        )
+        .await
+    }
+    /// Product action producer: bind original selected input AND recorded
+    /// origins inside the same randomized encrypted context. No host-submitted
+    /// plan or plaintext input digest is accepted.
+    pub async fn freeze_selected_execution(
+        pool: &PgPool,
+        admission: i64,
+        image_id: i64,
+        spec: LaunchSpec,
+        master: &str,
+        expected_runtime: Option<&RuntimeStageBinding>,
+        selected: SelectedExecutionInput,
+    ) -> Result<ReservedLaunch> {
+        if spec.manifest.purpose != LaunchPurpose::Action
+            || !matches!(spec.manifest.target, LaunchTarget::Execution { execution, .. } if execution == selected.snapshot.execution())
+        {
+            return Err(denied());
+        }
+        Self::freeze_materialized(
+            pool,
+            image_id,
+            spec,
+            master,
+            expected_runtime,
+            PrivateInput {
+                stdin_json: Some(selected.stdin_json),
+                snapshot: Some(selected.snapshot),
+            },
             Some(admission),
         )
         .await
@@ -882,9 +975,13 @@ impl WorkloadLaunchRepository {
         mut spec: LaunchSpec,
         master: &str,
         expected_runtime: Option<&RuntimeStageBinding>,
-        stdin_json: Option<String>,
+        selected: PrivateInput,
         admission: Option<i64>,
     ) -> Result<ReservedLaunch> {
+        let PrivateInput {
+            stdin_json,
+            snapshot,
+        } = selected;
         if let Some(input) = &stdin_json {
             if input.len() > 8 * 1024 * 1024
                 || !serde_json::from_str::<serde_json::Value>(input)
@@ -903,6 +1000,27 @@ impl WorkloadLaunchRepository {
             spec.manifest.owner_identity_id,
         )
         .await?;
+        let input_expiry = if let Some(expected) = &snapshot {
+            let mut input = ExecutionInputRepository::restore(
+                &mut tx,
+                expected.execution(),
+                Some(master),
+                Some(expected),
+            )
+            .await?;
+            let provided: serde_json::Value =
+                serde_json::from_str(stdin_json.as_deref().ok_or_else(denied)?)
+                    .map_err(|_| denied())?;
+            if &provided != input.value() {
+                return Err(denied());
+            }
+            input.ensure_fresh().await?;
+            let (_, _, _, expiry) = input.into_parts();
+            Some(expiry)
+        } else {
+            None
+        };
+        let selected_input = snapshot.as_ref().map(FrozenInputSnapshot::from);
         let image: Option<i64>=sqlx::query_scalar("SELECT i.id FROM workload_execution_image i JOIN workload_engine e ON e.id=i.engine WHERE i.id=$1 AND i.engine=$2 AND i.reference=$3 AND i.sha256=$4 AND i.revoked_at IS NULL AND NOT e.disabled AND i.platform=e.platform FOR SHARE OF i,e")
             .bind(image_id).bind(spec.manifest.engine_id).bind(&spec.manifest.image.reference).bind(spec.manifest.image.sha256.as_str()).fetch_optional(&mut *tx).await?;
         if image.is_none() {
@@ -1047,6 +1165,7 @@ impl WorkloadLaunchRepository {
                 || context.target != manifest.target
                 || context.invocation != spec.invocation
                 || !same_input(context.stdin_json.as_deref(), stdin_json.as_deref())?
+                || context.selected_input != selected_input
             {
                 return Err(denied());
             }
@@ -1065,7 +1184,13 @@ impl WorkloadLaunchRepository {
                     crypto::decrypt(&dispatch, master).map_err(|_| denied())?,
                 )?,
             };
+            if let Some(expiry) = &input_expiry {
+                expiry.ensure_fresh_on(&mut tx).await?;
+            }
             tx.commit().await?;
+            if let Some(expiry) = &input_expiry {
+                expiry.ensure_fresh()?;
+            }
             return Ok(result);
         }
         let id: i64 =
@@ -1081,6 +1206,7 @@ impl WorkloadLaunchRepository {
             target: spec.manifest.target.clone(),
             invocation: spec.invocation.clone(),
             stdin_json,
+            selected_input,
         })?;
         let encrypted_context = crypto::encrypt(&plaintext, master)?;
         spec.manifest.context = FrozenContextRef {
@@ -1120,7 +1246,13 @@ impl WorkloadLaunchRepository {
                 .bind(id).bind(i64::try_from(limits.max_total_bytes).map_err(|_|denied())?)
                 .bind(i64::try_from(limits.max_entries).map_err(|_|denied())?).execute(&mut *tx).await?;
         }
+        if let Some(expiry) = &input_expiry {
+            expiry.ensure_fresh_on(&mut tx).await?;
+        }
         tx.commit().await?;
+        if let Some(expiry) = &input_expiry {
+            expiry.ensure_fresh()?;
+        }
         Ok(ReservedLaunch {
             request: operation.status.request,
             dispatch_token: token,

@@ -249,6 +249,91 @@ impl ExecutionSecretValueRepository {
             .collect())
     }
 
+    /// Bounded destination snapshot for private workload input. Budget in SQL
+    /// before transporting ciphertext/origin text into the API process. An
+    /// overflow row or withheld field rejects the whole snapshot.
+    pub async fn find_bounded_stored_by_entity(
+        connection: &mut PgConnection,
+        entity_type: &str,
+        entity_id: Id,
+    ) -> Result<Vec<StoredSecretValue>> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            json_path: Option<String>,
+            source_kind: Option<String>,
+            source_ref: Option<String>,
+            encrypted_value: Option<JsonValue>,
+            encryption_key_hash: Option<String>,
+            allowed: bool,
+        }
+        let rows: Vec<Row> = sqlx::query_as(
+            "WITH bounded AS ( \
+               SELECT json_path,source_kind,source_ref,encrypted_value,encryption_key_hash \
+               FROM execution_secret_value WHERE entity_type=$1 AND entity_id=$2 \
+               ORDER BY json_path LIMIT 257 \
+             ), budgeted AS ( \
+               SELECT json_path,source_kind,source_ref,encrypted_value,encryption_key_hash, \
+                 SUM(octet_length(json_path)+octet_length(source_kind)+COALESCE(octet_length(source_ref),0) \
+                   +octet_length(encrypted_value::text)+COALESCE(octet_length(encryption_key_hash),0)) \
+                   OVER (ORDER BY json_path) <= 16777216 AS allowed FROM bounded \
+             ) SELECT CASE WHEN allowed THEN json_path END AS json_path, \
+                 CASE WHEN allowed THEN source_kind END AS source_kind, \
+                 CASE WHEN allowed THEN source_ref END AS source_ref, \
+                 CASE WHEN allowed THEN encrypted_value END AS encrypted_value, \
+                 CASE WHEN allowed THEN encryption_key_hash END AS encryption_key_hash,allowed \
+               FROM budgeted ORDER BY json_path",
+        )
+        .bind(entity_type)
+        .bind(entity_id)
+        .fetch_all(connection)
+        .await?;
+        let denied = || crate::Error::PermissionDenied("Execution input exceeds its bound".into());
+        if rows.len() > 256 || rows.iter().any(|row| !row.allowed) {
+            return Err(denied());
+        }
+        rows.into_iter()
+            .map(|row| {
+                Ok(StoredSecretValue {
+                    json_path: row.json_path.ok_or_else(denied)?,
+                    source_kind: row.source_kind.ok_or_else(denied)?,
+                    source_ref: row.source_ref,
+                    encrypted_value: row.encrypted_value.ok_or_else(denied)?,
+                    encryption_key_hash: row.encryption_key_hash,
+                })
+            })
+            .collect()
+    }
+
+    /// After contributor admission and the owning execution row lock, bind all
+    /// selected ciphertext/origin rows, not only those carrying input receipts.
+    /// A final bounded reread also rejects removed or newly added destinations.
+    pub async fn bind_bounded_snapshot(
+        connection: &mut PgConnection,
+        entity_type: &str,
+        entity_id: Id,
+        expected: &[StoredSecretValue],
+    ) -> Result<()> {
+        let denied = || crate::Error::PermissionDenied("Execution input changed".into());
+        if expected.len() > 256 {
+            return Err(denied());
+        }
+        for value in expected {
+            if Self::find_stored_at(connection, entity_type, entity_id, &value.json_path)
+                .await?
+                .as_ref()
+                != Some(value)
+            {
+                return Err(denied());
+            }
+        }
+        if Self::find_bounded_stored_by_entity(connection, entity_type, entity_id).await?
+            != expected
+        {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
     /// Bind a prepared input buffer to the actual typed source row through
     /// restoration. Call during source preparation, before destination locks.
     pub async fn find_stored_at(

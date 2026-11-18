@@ -15,8 +15,9 @@
 //! vice versa.
 
 use attune_common::error::{Error, Result};
-use attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository;
-use attune_common::secret_values::{restore_secret_values, ENTITY_EXECUTION_CONFIG};
+use attune_common::repositories::execution_input::{
+    ExecutionInputRepository, ExecutionInputSnapshot,
+};
 use serde_json::Value as JsonValue;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -63,86 +64,32 @@ impl SecretManager {
         execution_id: i64,
         redacted_config: JsonValue,
     ) -> Result<(JsonValue, Vec<String>)> {
+        self.restore_execution_parameters_with_snapshot(execution_id, redacted_config)
+            .await
+            .map(|(value, paths, _)| (value, paths))
+    }
+
+    pub(crate) async fn restore_execution_parameters_with_snapshot(
+        &self,
+        execution_id: i64,
+        redacted_config: JsonValue,
+    ) -> Result<(JsonValue, Vec<String>, ExecutionInputSnapshot)> {
         let mut transaction = self.pool.begin().await?;
-        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
+        let mut input = ExecutionInputRepository::restore(
             &mut transaction,
+            execution_id,
+            self.encryption_key.as_deref(),
+            None,
         )
         .await?;
-        let secrets = ExecutionSecretValueRepository::find_stored_by_entity(
-            &mut *transaction,
-            ENTITY_EXECUTION_CONFIG,
-            execution_id,
-        )
-        .await?;
-        let paths = secrets
-            .iter()
-            .map(|secret| secret.json_path.clone())
-            .collect();
-        use attune_common::repositories::FindById;
-        let execution = attune_common::repositories::execution::ExecutionRepository::find_by_id(
-            &mut *transaction,
-            execution_id,
-        )
-        .await?
-        .ok_or_else(|| Error::invalid_state("Execution secret owner is unavailable"))?;
-        if secrets.is_empty() {
-            attune_common::key_access::authorize_execution_parameter_key_origins_with_conn(
-                &mut transaction,
-                execution_id,
-                execution.executor,
-                &secrets,
-            )
-            .await?;
-            transaction.commit().await?;
-            return Ok((redacted_config, paths));
+        if !input.snapshot().matches_config(&redacted_config) {
+            return Err(Error::PermissionDenied("Execution input changed".into()));
         }
-
-        let encryption_key = self
-            .encryption_key
-            .as_ref()
-            .ok_or_else(|| Error::Internal("No encryption key configured".to_string()))?;
-
-        let (ordinary, receipts) =
-            attune_common::repositories::immutable_input_origin::prepare_input_receipts(
-                &mut transaction,
-                ENTITY_EXECUTION_CONFIG,
-                execution_id,
-                &secrets,
-                encryption_key,
-            )
-            .await?;
-        if !ordinary.is_empty() {
-            attune_common::key_access::authorize_execution_parameter_key_origins_with_conn(
-                &mut transaction,
-                execution_id,
-                execution.executor,
-                &ordinary,
-            )
-            .await?;
-        }
-        attune_common::repositories::immutable_input_origin::bind_input_receipt_buffers(
-            &mut transaction,
-            ENTITY_EXECUTION_CONFIG,
-            execution_id,
-            &secrets,
-        )
-        .await?;
-
-        let restored =
-            restore_secret_values(redacted_config, &secrets, encryption_key).map_err(|e| {
-                Error::Internal(format!(
-                    "Failed to restore secret parameters for execution {}: {}",
-                    execution_id, e
-                ))
-            })?;
-        for receipt in &receipts {
-            receipt.ensure_fresh_on(&mut transaction).await?;
-        }
+        input.ensure_fresh().await?;
+        let (value, paths, snapshot, expiry) = input.into_parts();
         transaction.commit().await?;
-        for receipt in &receipts {
-            receipt.ensure_fresh()?;
-        }
-        Ok((restored, paths))
+        expiry.ensure_fresh()?;
+        Ok((value, paths, snapshot))
     }
 
     /// Compute hash of the encryption key.

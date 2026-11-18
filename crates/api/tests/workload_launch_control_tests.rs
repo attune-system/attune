@@ -1249,6 +1249,149 @@ async fn private_stdin_is_bound_to_frozen_context_and_never_returned_to_controll
 }
 
 #[tokio::test]
+async fn selected_action_freeze_rejects_changed_private_value_and_retains_original_sources(
+) -> Result<()> {
+    use attune_common::repositories::execution_input::{
+        ExecutionInputRepository, SelectedExecutionInput,
+    };
+    let fixture = Fixture::new().await?;
+    let execution = match fixture.spec.manifest.target {
+        LaunchTarget::Execution { execution, .. } => execution,
+        _ => unreachable!(),
+    };
+    sqlx::query("UPDATE execution SET config=$2 WHERE id=$1")
+        .bind(execution)
+        .bind(json!({"value":"one"}))
+        .execute(&fixture.ctx.pool)
+        .await?;
+    let mut tx = fixture.ctx.pool.begin().await?;
+    let input =
+        ExecutionInputRepository::restore(&mut tx, execution, Some(fixture.master()), None).await?;
+    let (value, _, snapshot, expiry) = input.into_parts();
+    tx.commit().await?;
+    expiry.ensure_fresh()?;
+    let root = Ledger::reserve_action_admission(
+        &fixture.ctx.pool,
+        &fixture.spec.manifest.target,
+        fixture.spec.manifest.owner_identity_id,
+        fixture.image,
+    )
+    .await?;
+    // Equal-length private substitution cannot be authenticated by a count.
+    let changed = SelectedExecutionInput::new(json!({"value":"two"}), snapshot.clone())?;
+    assert!(Ledger::freeze_selected_execution(
+        &fixture.ctx.pool,
+        root,
+        fixture.image,
+        fixture.spec.clone(),
+        fixture.master(),
+        None,
+        changed
+    )
+    .await
+    .is_err());
+    let selected = SelectedExecutionInput::new(value, snapshot)?;
+    let reserved = Ledger::freeze_selected_execution(
+        &fixture.ctx.pool,
+        root,
+        fixture.image,
+        fixture.spec.clone(),
+        fixture.master(),
+        None,
+        selected,
+    )
+    .await?;
+    let (manifest, encrypted): (Value, String) =
+        sqlx::query_as("SELECT manifest,encrypted_context FROM workload_launch WHERE id=$1")
+            .bind(reserved.request.launch_id)
+            .fetch_one(&fixture.ctx.pool)
+            .await?;
+    assert!(!manifest.to_string().contains("one"));
+    let private: Value = serde_json::from_str(&attune_common::crypto::decrypt(
+        &encrypted,
+        fixture.master(),
+    )?)?;
+    assert_eq!(private["selected_input"]["execution"], execution);
+    assert_eq!(private["selected_input"]["config"], json!({"value":"one"}));
+    fixture.ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn selected_input_mutation_and_restoration_cannot_revive_reserved_action() -> Result<()> {
+    for change_origin_rows in [false, true] {
+        let fixture = Fixture::new().await?;
+        let execution = match fixture.spec.manifest.target {
+            LaunchTarget::Execution { execution, .. } => execution,
+            _ => unreachable!(),
+        };
+        let original: Option<Value> =
+            sqlx::query_scalar("SELECT config FROM execution WHERE id=$1")
+                .bind(execution)
+                .fetch_one(&fixture.ctx.pool)
+                .await?;
+        let root = Ledger::reserve_action_admission(
+            &fixture.ctx.pool,
+            &fixture.spec.manifest.target,
+            fixture.spec.manifest.owner_identity_id,
+            fixture.image,
+        )
+        .await?;
+        if change_origin_rows {
+            // Exercise insert/delete epoch retention only. This temporary row
+            // is never authorized, restored, frozen or treated as a grant.
+            sqlx::query("INSERT INTO execution_secret_value(entity_type,entity_id,json_path,source_kind,source_ref,encrypted_value) VALUES('execution_config',$1,'/temporary','provenance','{}','\"unconsumed-fixture\"'::jsonb)")
+                .bind(execution).execute(&fixture.ctx.pool).await?;
+            sqlx::query("DELETE FROM execution_secret_value WHERE entity_type='execution_config' AND entity_id=$1 AND json_path='/temporary'")
+                .bind(execution).execute(&fixture.ctx.pool).await?;
+        } else {
+            sqlx::query("UPDATE execution SET config=$2 WHERE id=$1")
+                .bind(execution)
+                .bind(json!({"temporary":true}))
+                .execute(&fixture.ctx.pool)
+                .await?;
+            sqlx::query("UPDATE execution SET config=$2 WHERE id=$1")
+                .bind(execution)
+                .bind(original)
+                .execute(&fixture.ctx.pool)
+                .await?;
+        }
+        assert!(Ledger::freeze_admitted_input(
+            &fixture.ctx.pool,
+            root,
+            fixture.image,
+            fixture.spec.clone(),
+            fixture.master(),
+            None,
+            Some("{}".into())
+        )
+        .await
+        .is_err());
+        assert!(Ledger::reserve_action_admission(
+            &fixture.ctx.pool,
+            &fixture.spec.manifest.target,
+            fixture.spec.manifest.owner_identity_id,
+            fixture.image
+        )
+        .await
+        .is_err());
+        let epoch: i64 = sqlx::query_scalar(
+            "SELECT epoch FROM workload_source_epoch WHERE kind='execution_input' AND subject=$1",
+        )
+        .bind(execution)
+        .fetch_one(&fixture.ctx.pool)
+        .await?;
+        assert!(epoch >= 2);
+        let launches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workload_launch")
+            .fetch_one(&fixture.ctx.pool)
+            .await?;
+        assert_eq!(launches, 0);
+        fixture.ctx.cleanup().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn action_preparation_reservation_cannot_revive_after_owner_restoration() -> Result<()> {
     let fixture = Fixture::new().await?;
     let owner = fixture.spec.manifest.owner_identity_id;
