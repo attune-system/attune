@@ -32,6 +32,7 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual([row["service"] for row in result], ["worker-python", "sensor"])
         self.assertEqual(result[0]["log_categories"], {
             "sandbox_prerequisite_failed": 1, "sandbox_proc_mount_denied": 1,
+            "operation_not_permitted": 1,
         })
         self.assertNotIn("supersecret", json.dumps(result))
         self.assertFalse(any(call[1] == "logs" and call[-1] == ids[2] for call in calls))

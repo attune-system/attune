@@ -20,6 +20,8 @@ SIGNATURES = {
     "sandbox_launcher_unavailable": "isolated workloads require usable /usr/bin/bwrap",
     "sandbox_uid_map_denied": "setting up uid map: Permission denied",
     "sandbox_proc_mount_denied": "mount /proc: Operation not permitted",
+    "sandbox_proc_mount_failed": "Can't mount proc on",
+    "operation_not_permitted": "Operation not permitted",
     "namespace_creation_denied": "Creating new namespace failed: Operation not permitted",
     "invalid_sandbox_mode": "invalid ATTUNE_WORKLOAD_SANDBOX mode",
     "database_connect_failed": "error communicating with database",
@@ -97,6 +99,7 @@ def collect(project):
             "docker", "logs", "--tail", "80", container,
         ])
         report["log_categories"] = classify(logs)
+        report["log_bytes_examined"] = len(logs.encode("utf-8"))
         report["log_collection_failed"] = code != 0
         report["log_truncated"] = truncated
         reports.append(report)

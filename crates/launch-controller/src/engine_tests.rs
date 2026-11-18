@@ -148,7 +148,7 @@ async fn daemon_replacement_and_wrong_platform_image_are_rejected_before_create(
             &policy,
             &PinnedImage {
                 reference: image,
-                sha256: Sha256Digest::parse(&"a".repeat(64)).unwrap(),
+                sha256: Sha256Digest::parse("a".repeat(64)).unwrap(),
             },
         )
         .await;
@@ -427,6 +427,7 @@ async fn publication_fixture(
         .ensure_capacity(&setup.manifest, 128 * 1024 * 1024)
         .unwrap();
     cache.prepare_private(&setup.manifest).unwrap();
+    assert_eq!(cache.stage_owner(&setup.manifest).unwrap(), (1000, 1000));
     let (exit, resource, _, _) = run_captured(engine, policy, &setup).await?;
     assert_eq!(exit.exit_code, 0);
     assert!(!exit.oom_killed);

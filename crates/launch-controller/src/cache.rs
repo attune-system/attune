@@ -45,6 +45,12 @@ pub struct CacheLimits {
 pub struct CacheStore {
     root: PathBuf,
     limits: CacheLimits,
+    workload_owner: WorkloadOwner,
+}
+#[derive(Clone, Copy)]
+struct WorkloadOwner {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
 }
 /// Public random binding sentinel; never an input pin or credential. Directory
 /// stays owned until the corresponding probe container removal is acknowledged.
@@ -91,7 +97,31 @@ impl CacheStore {
                 return Err(CacheError::UnsafeEntry);
             }
         }
-        Ok(Self { root, limits })
+        Ok(Self {
+            root,
+            limits,
+            workload_owner: WorkloadOwner {
+                uid: 1000,
+                gid: 1000,
+            },
+        })
+    }
+    /// Filesystem logic tests run as the CI runner, which need not be uid 1000.
+    /// This internal test seam is absent from production and request DTOs; the
+    /// packaged Engine test retains and proves the fixed uid/gid 1000 contract.
+    #[cfg(test)]
+    fn for_current_test_user(mut self) -> Self {
+        self.workload_owner = WorkloadOwner {
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+        };
+        self
+    }
+    #[cfg(test)]
+    pub(crate) fn stage_owner(&self, manifest: &LaunchManifest) -> Result<(u32, u32)> {
+        let metadata =
+            fs::symlink_metadata(self.root.join(crate::engine::stage_subpath(manifest)))?;
+        Ok((metadata.uid(), metadata.gid()))
     }
     pub(crate) fn prepare_binding(&self) -> Result<BindingSentinel> {
         let _lock = self.lock()?;
@@ -195,7 +225,7 @@ impl CacheStore {
         if manifest.stage.is_some() {
             let stage = path.join("runtime");
             fs::create_dir(&stage)?;
-            make_workload_owned(&stage)?;
+            make_workload_owned(&stage, self.workload_owner)?;
         }
         if manifest.pack_access == attune_common::workload_launch::PackAccess::CandidateCopy {
             let pin = manifest
@@ -207,7 +237,7 @@ impl CacheStore {
                 .root
                 .join(crate::engine::input_subpath(pin.kind, &pin.sha256));
             let output = path.join("pack");
-            copy_private(&source, &output)?;
+            copy_private(&source, &output, self.workload_owner)?;
         }
         Ok(())
     }
@@ -716,16 +746,16 @@ fn seal_tree(root: &Path, container_root: &str) -> Result<()> {
     fs::set_permissions(root, fs::Permissions::from_mode(0o555))?;
     Ok(())
 }
-fn make_workload_owned(path: &Path) -> Result<()> {
+fn make_workload_owned(path: &Path, owner: WorkloadOwner) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let name =
         std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| CacheError::UnsafeEntry)?;
-    if unsafe { libc::lchown(name.as_ptr(), 1000, 1000) } != 0 {
+    if unsafe { libc::lchown(name.as_ptr(), owner.uid, owner.gid) } != 0 {
         return Err(io::Error::last_os_error().into());
     }
     Ok(())
 }
-fn copy_private(source: &Path, output: &Path) -> Result<()> {
+fn copy_private(source: &Path, output: &Path, owner: WorkloadOwner) -> Result<()> {
     let entries = inspect_tree(
         source,
         u64::MAX,
@@ -748,9 +778,9 @@ fn copy_private(source: &Path, output: &Path) -> Result<()> {
                 fs::Permissions::from_mode(if entry.executable { 0o755 } else { 0o644 }),
             )?;
         }
-        make_workload_owned(&path)?;
+        make_workload_owned(&path, owner)?;
     }
-    make_workload_owned(output)?;
+    make_workload_owned(output, owner)?;
     Ok(())
 }
 
@@ -942,7 +972,9 @@ mod tests {
             expanded_bytes: 65536,
             files: 32,
         };
-        let store = CacheStore::open(root.path().to_path_buf(), limits).unwrap();
+        let store = CacheStore::open(root.path().to_path_buf(), limits)
+            .unwrap()
+            .for_current_test_user();
         let mut spec = crate::test_support::spec(format!("sha256:{}", "a".repeat(64)));
         spec.manifest.purpose = LaunchPurpose::Setup;
         spec.manifest.target = LaunchTarget::Setup {
@@ -955,6 +987,10 @@ mod tests {
             quota_files: 32,
         });
         store.prepare_private(&spec.manifest).unwrap();
+        assert_eq!(
+            store.stage_owner(&spec.manifest).unwrap(),
+            (unsafe { libc::geteuid() }, unsafe { libc::getegid() })
+        );
         let stage = root
             .path()
             .join(crate::engine::stage_subpath(&spec.manifest));
@@ -994,7 +1030,9 @@ mod tests {
             .cleanup_settled_private(&spec.manifest, &status)
             .is_err());
         drop(store);
-        let restarted = CacheStore::open(root.path().to_path_buf(), limits).unwrap();
+        let restarted = CacheStore::open(root.path().to_path_buf(), limits)
+            .unwrap()
+            .for_current_test_user();
         let mut again = Vec::new();
         restarted
             .archive_settled_stage(&spec.manifest, &status)
