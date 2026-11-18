@@ -63,7 +63,12 @@ impl LaunchService {
             .route("/v1/launches/{id}/status", post(status))
             .route("/v1/launches/{id}/cancel", post(cancel))
             .route("/v1/launches/{id}/stage-result", post(stage_result))
-            .route("/v1/launches/{id}/stdin", put(stdin))
+            .route(
+                "/v1/launches/{id}/stdin",
+                put(stdin).layer(DefaultBodyLimit::max(
+                    attune_common::workload_stdin::MAX_PRIVATE_STDIN_BYTES,
+                )),
+            )
             .route("/v1/launches/{id}/{channel}", get(read))
             .layer(DefaultBodyLimit::max(1024 * 1024))
             .with_state(self)
@@ -564,6 +569,41 @@ mod tests {
             .unwrap();
         let observed_status = observed.status();
         let body = observed.json::<LaunchStatus>().await;
+        let mut stdin_url = front_url.join("v1/launches/1/stdin").unwrap();
+        stdin_url
+            .query_pairs_mut()
+            .append_pair("admitted_digest", request.admitted_digest.as_str());
+        let input_above_old_limit = client
+            .put(stdin_url.clone())
+            .header(LAUNCH_IO_HEADER, "target-stdin")
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(vec![0; 1024 * 1024 + 1])
+            .send()
+            .await
+            .unwrap()
+            .status();
+        let oversized_input = client
+            .put(stdin_url)
+            .header(LAUNCH_IO_HEADER, "target-stdin")
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(vec![
+                0;
+                attune_common::workload_stdin::MAX_PRIVATE_STDIN_BYTES
+                    + 1
+            ])
+            .send()
+            .await
+            .unwrap()
+            .status();
+        let oversized_dispatch = client
+            .post(front_url.join("v1/launches/1/status").unwrap())
+            .header(LAUNCH_DISPATCH_HEADER, "target-dispatch")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(vec![b' '; 1024 * 1024 + 1])
+            .send()
+            .await
+            .unwrap()
+            .status();
         service.shutdown().await;
         front_stop.send(()).unwrap();
         front_task.await.unwrap();
@@ -574,6 +614,11 @@ mod tests {
         assert_eq!(broad_bearer, StatusCode::UNAUTHORIZED);
         assert_eq!(observed_status, StatusCode::OK);
         assert_eq!(body.unwrap().request, request);
+        // Body bounds alone grant no input authority: the valid-size stdin
+        // request still has no admitted running session and writes no bytes.
+        assert_eq!(input_above_old_limit, StatusCode::CONFLICT);
+        assert_eq!(oversized_input, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(oversized_dispatch, StatusCode::PAYLOAD_TOO_LARGE);
         assert!(service.entries.lock().await.is_empty());
     }
 }

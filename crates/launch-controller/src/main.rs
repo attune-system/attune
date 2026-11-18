@@ -94,10 +94,14 @@ async fn main() -> Result<()> {
     let path =
         std::env::var_os("ATTUNE_LAUNCH_CONFIG").ok_or("ATTUNE_LAUNCH_CONFIG is required")?;
     let config: ControllerConfig = read_owned(Path::new(&path))?;
-    if !config.listen.ip().is_loopback() || !config.docker_socket.is_absolute() {
-        return Err(
-            "controller backend must bind literal loopback and use a fixed Unix socket".into(),
-        );
+    let api_origin: reqwest::Url = config.api_origin.parse()?;
+    if api_origin.scheme() != "https" && !config.development_plain_http {
+        return Err("production controller CP origin requires HTTPS; plaintext is an explicit trusted development policy only".into());
+    }
+    if config.listen.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        || !config.docker_socket.is_absolute()
+    {
+        return Err("controller backend must bind 127.0.0.1 and use a fixed Unix socket".into());
     }
     for image in config
         .allowed_images
@@ -133,7 +137,7 @@ async fn main() -> Result<()> {
     } else {
         LaunchHttpPolicy::TlsOrLoopback
     };
-    let cp = ControlPlane::with_policy(config.api_origin.parse()?, session.token, policy)?;
+    let cp = ControlPlane::with_policy(api_origin, session.token, policy)?;
     let engine = DockerEngine::connect(&config.docker_socket)?;
     let engine_policy = EnginePolicy {
         engine_id: config.engine_id,

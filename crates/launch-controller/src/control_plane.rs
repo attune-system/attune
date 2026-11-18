@@ -31,6 +31,7 @@ pub struct ControlPlane {
     client: Client,
     base: Url,
     credential: Arc<tokio::sync::RwLock<LaunchToken>>,
+    private_plain_http: bool,
 }
 impl ControlPlane {
     pub fn new(base: Url, credential: LaunchToken) -> Result<Self> {
@@ -67,6 +68,10 @@ impl ControlPlane {
             client,
             base,
             credential: Arc::new(tokio::sync::RwLock::new(credential)),
+            private_plain_http: matches!(
+                policy,
+                attune_common::workload_launch_io::LaunchHttpPolicy::DevelopmentPlainHttp
+            ),
         })
     }
     /// Replace only with a CP-issued, engine/pool-scoped session credential.
@@ -242,6 +247,53 @@ impl ControlPlane {
         }
         Ok(page)
     }
+    /// Compare the exact private bytes with CP's authenticated frozen input.
+    /// The caller retains this same immutable payload through the one write.
+    /// No generic count authorization, public hash or insecure implicit loopback
+    /// transport may stand in for this request. A lost ACK is not retried here.
+    pub async fn authorize_stdin(
+        &self,
+        lease: &LaunchLease,
+        token: &LaunchToken,
+        payload: &attune_common::workload_stdin::LaunchStdinPayload,
+    ) -> Result<LaunchIoAuthorization> {
+        if (self.base.scheme() != "https" && !self.private_plain_http)
+            || lease.purpose != LaunchLeasePurpose::Run
+            || lease.handle.lease_deadline <= chrono::Utc::now()
+        {
+            return Err(ControlError::Configuration);
+        }
+        let remaining = (lease.handle.lease_deadline - chrono::Utc::now())
+            .to_std()
+            .map_err(|_| ControlError::Response)?;
+        let response = self
+            .client
+            .post(self.url(lease.handle.launch_id, &["authorize-stdin"])?)
+            .bearer_auth(self.credential().await.as_str())
+            .header(LAUNCH_LEASE_HEADER, secret(&lease.token)?)
+            .header(LAUNCH_IO_HEADER, secret(token)?)
+            .json(
+                &attune_common::workload_stdin::AuthorizeLaunchStdinRequest {
+                    handle: lease.handle.clone(),
+                    payload: payload.clone(),
+                },
+            )
+            .timeout(remaining.min(Duration::from_secs(30)))
+            .send()
+            .await
+            .map_err(|_| ControlError::Transport)?;
+        let authorization: LaunchIoAuthorization = decode(response).await?;
+        if authorization.handle != lease.handle
+            || authorization.channel != LaunchIoChannel::Stdin
+            || authorization.max_bytes != payload.as_bytes().len() as u64
+            || authorization.expires_at <= chrono::Utc::now()
+            || authorization.expires_at > lease.handle.lease_deadline
+        {
+            return Err(ControlError::Response);
+        }
+        Ok(authorization)
+    }
+
     pub async fn authorize_io(
         &self,
         lease: &LaunchLease,

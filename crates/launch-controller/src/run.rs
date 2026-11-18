@@ -21,6 +21,7 @@ struct LiveIo {
     stdin: Option<InputWriter>,
     stdin_taken: bool,
 }
+
 /// Only the owning controller retains raw output; this is not durable custody.
 /// A new process cannot claim that a lost in-memory buffer reached EOF.
 pub struct RunSession {
@@ -79,38 +80,34 @@ impl RunSession {
         token: &LaunchToken,
         bytes: &[u8],
     ) -> Result<()> {
-        if bytes.len() > 1024 * 1024 {
+        if bytes.len() > attune_common::workload_stdin::MAX_PRIVATE_STDIN_BYTES {
             return Err(ActuatorError::Authority);
         }
+        let payload = attune_common::workload_stdin::LaunchStdinPayload::from_bytes(bytes.to_vec())
+            .map_err(|_| ActuatorError::Authority)?;
         // Holding this lock serializes the durable CP one-shot authorization
         // with local consumption. Lost ACK is consumed, never retried/reminted.
         let mut io = self.io.lock().await;
         if io.stdin_taken || io.stdin.is_none() {
             return Err(ActuatorError::Authority);
         }
-        let lease = io.lease.as_ref().ok_or(ActuatorError::Authority)?;
+        let lease = io.lease.clone().ok_or(ActuatorError::Authority)?;
         if lease.purpose != LaunchLeasePurpose::Run {
             return Err(ActuatorError::Authority);
         }
-        let auth = cp
-            .authorize_io(
-                lease,
-                token,
-                &AuthorizeLaunchIoRequest {
-                    request: self.request.clone(),
-                    channel: LaunchIoChannel::Stdin,
-                    offset: 0,
-                    bytes: bytes.len() as u64,
-                },
-            )
-            .await?;
+        // Consume before sending authorization. Its ACK can be lost after CP
+        // commits the one-shot marker; this controller must not send it again.
         io.stdin_taken = true;
         let mut writer = io.stdin.take().ok_or(ActuatorError::Authority)?;
+        let auth = cp.authorize_stdin(&lease, token, &payload).await?;
+        // A slow container reader must not block lease renewal/cancellation.
+        // Local consumption is already final and the exact payload is owned.
+        drop(io);
         let deadline = (auth.expires_at - Utc::now())
             .to_std()
             .map_err(|_| ActuatorError::Authority)?;
         tokio::time::timeout(deadline, async {
-            writer.write_all(bytes).await?;
+            writer.write_all(payload.as_bytes()).await?;
             writer.shutdown().await
         })
         .await
@@ -503,5 +500,179 @@ impl Actuator {
             }
         }
         Ok(stopped)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use attune_common::{
+        workload_launch_io::LaunchHttpPolicy,
+        workload_stdin::{AuthorizeLaunchStdinRequest, LaunchStdinPayload},
+    };
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn exact_private_stdin_and_local_one_shot_survive_lost_or_invalid_ack() {
+        // Transport/writer proof only. Actual CP frozen context/origin and
+        // transaction fences require owning API integration, not this mock.
+        for outcome in [
+            "authorized",
+            "backpressure",
+            "lost-ack",
+            "wrong-count",
+            "denied",
+        ] {
+            let bytes =
+                b"{\"selected\":\"owned-private-input\",\"escaped\":\"\\u0000\"}\n".to_vec();
+            let request = LaunchRequest {
+                launch_id: 1,
+                admitted_digest: Sha256Digest::of_bytes(b"manifest"),
+            };
+            let lease = LaunchLease {
+                purpose: LaunchLeasePurpose::Run,
+                handle: LaunchHandle {
+                    launch_id: 1,
+                    admitted_digest: request.admitted_digest.clone(),
+                    lease_id: uuid::Uuid::new_v4(),
+                    lease_generation: 1,
+                    lease_deadline: Utc::now() + chrono::Duration::seconds(60),
+                    engine_id: 5,
+                    engine_name_nonce: uuid::Uuid::new_v4(),
+                },
+                token: LaunchToken::new("owned-lease".into()).unwrap(),
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let expected_handle = lease.handle.clone();
+            let expected_bytes = bytes.clone();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut received = Vec::new();
+                let mut buffer = [0; 4096];
+                let end = loop {
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    received.extend_from_slice(&buffer[..count]);
+                    assert!(received.len() <= 16384);
+                    if let Some(end) = received.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = String::from_utf8(received[..end].to_vec())
+                    .unwrap()
+                    .to_ascii_lowercase();
+                assert!(headers
+                    .starts_with("post /api/v1/workload-launches/1/authorize-stdin http/1.1\r\n"));
+                for expected in [
+                    "authorization: bearer owned-controller",
+                    "x-attune-launch-lease: owned-lease",
+                    "x-attune-launch-io: owned-stdin",
+                ] {
+                    assert!(headers.contains(expected));
+                }
+                assert!(!headers.contains("x-attune-launch-dispatch:"));
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert!(length < 8192);
+                while received.len() - end < length {
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    received.extend_from_slice(&buffer[..count]);
+                    assert!(received.len() <= 16384);
+                }
+                let input: AuthorizeLaunchStdinRequest =
+                    serde_json::from_slice(&received[end..end + length]).unwrap();
+                assert_eq!(input.handle, expected_handle);
+                assert_eq!(input.payload.as_bytes(), expected_bytes);
+                if outcome != "lost-ack" {
+                    let response = if outcome == "denied" {
+                        serde_json::json!({})
+                    } else {
+                        serde_json::to_value(LaunchIoAuthorization {
+                            handle: expected_handle,
+                            channel: LaunchIoChannel::Stdin,
+                            max_bytes: expected_bytes.len() as u64
+                                + u64::from(outcome == "wrong-count"),
+                            expires_at: Utc::now() + chrono::Duration::seconds(30),
+                        })
+                        .unwrap()
+                    };
+                    let body = serde_json::to_vec(&response).unwrap();
+                    let status = if outcome == "denied" {
+                        "403 Forbidden"
+                    } else {
+                        "200 OK"
+                    };
+                    socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).as_bytes()).await.unwrap();
+                    socket.write_all(&body).await.unwrap();
+                }
+                socket.shutdown().await.unwrap();
+            });
+            let token = LaunchToken::new("owned-stdin".into()).unwrap();
+            // Literal-loopback allowance for public/status tests must not
+            // silently permit private selected input over plaintext.
+            let strict = ControlPlane::new(
+                format!("http://{address}/").parse().unwrap(),
+                LaunchToken::new("owned-controller".into()).unwrap(),
+            )
+            .unwrap();
+            let payload = LaunchStdinPayload::from_bytes(bytes.clone()).unwrap();
+            assert!(matches!(
+                strict.authorize_stdin(&lease, &token, &payload).await,
+                Err(crate::control_plane::ControlError::Configuration)
+            ));
+            let cp = ControlPlane::with_policy(
+                format!("http://{address}/").parse().unwrap(),
+                LaunchToken::new("owned-controller".into()).unwrap(),
+                LaunchHttpPolicy::DevelopmentPlainHttp,
+            )
+            .unwrap();
+            let session = Arc::new(RunSession::new(request, 4096).unwrap());
+            session.replace_lease(lease).await;
+            let (writer, mut reader) =
+                tokio::io::duplex(if outcome == "backpressure" { 1 } else { 4096 });
+            session.io.lock().await.stdin = Some(Box::new(writer));
+            let writing = tokio::spawn({
+                let session = session.clone();
+                let cp = cp.clone();
+                let token = token.clone();
+                let bytes = bytes.clone();
+                async move { session.write_stdin(&cp, &token, &bytes).await }
+            });
+            server.await.unwrap();
+            let lease_available = if outcome == "backpressure" {
+                tokio::time::timeout(Duration::from_secs(2), session.lease())
+                    .await
+                    .is_ok()
+            } else {
+                true
+            };
+            let mut written = Vec::new();
+            reader.read_to_end(&mut written).await.unwrap();
+            let result = writing.await.unwrap();
+            let authorized = matches!(outcome, "authorized" | "backpressure");
+            assert!(
+                lease_available,
+                "stdin backpressure blocked lease/cancel owner"
+            );
+            assert_eq!(result.is_ok(), authorized);
+            assert_eq!(
+                written,
+                if authorized {
+                    bytes.clone()
+                } else {
+                    Vec::new()
+                }
+            );
+            assert!(matches!(
+                session.write_stdin(&cp, &token, &bytes).await,
+                Err(ActuatorError::Authority)
+            ));
+        }
     }
 }
