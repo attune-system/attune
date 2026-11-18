@@ -1262,6 +1262,24 @@ impl ActionExecutor {
         let (runtime_config_override, runtime_env_dir_suffix, selected_runtime_version) = self
             .resolve_runtime_version(&runtime_record, execution, action)
             .await;
+        // Parent configuration is captured too, even without registered versions.
+        // Never substitute this worker's later authoring copy of the runtime.
+        if let Some(runtime) = &runtime_record {
+            attune_common::execution_env::validate_runtime_environment(&runtime.execution_config)?;
+            if runtime.execution_config.get("lifecycle").is_some()
+                && action.runtime_version_constraint.is_some()
+                && selected_runtime_version.is_none()
+            {
+                return Err(Error::validation(
+                    "No verified toolchain version satisfies the captured action constraint",
+                ));
+            }
+        }
+        let runtime_config_override = runtime_config_override.or_else(|| {
+            runtime_record
+                .as_ref()
+                .map(|runtime| runtime.parsed_execution_config())
+        });
 
         // Recheck the exact captured config selected after worker placement.
         attune_common::execution_env::validate_selected_environment(

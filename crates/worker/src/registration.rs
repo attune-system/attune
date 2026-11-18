@@ -214,7 +214,12 @@ impl WorkerRegistration {
     /// ]
     /// ```
     pub fn set_detected_runtimes(&mut self, runtimes: Vec<DetectedRuntime>) {
-        let mut runtime_versions: HashMap<String, Vec<String>> = HashMap::new();
+        let mut runtime_versions: HashMap<String, Vec<String>> = self
+            .capabilities
+            .get(RUNTIME_VERSIONS_CAPABILITY_KEY)
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
         let interpreters: Vec<serde_json::Value> = runtimes
             .iter()
             .map(|rt| {
@@ -310,6 +315,28 @@ impl WorkerRegistration {
             runtimes.push(json!("native"));
         }
 
+        let filter = std::env::var("ATTUNE_WORKER_RUNTIMES")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|name| name.trim().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .or_else(|| {
+                config_capabilities
+                    .and_then(|caps| caps.get("runtimes"))
+                    .and_then(|value| value.as_array())
+                    .map(|names| {
+                        names
+                            .iter()
+                            .filter_map(|name| name.as_str().map(str::to_owned))
+                            .collect()
+                    })
+            });
+        detector
+            .enrich_recipe_capabilities(&mut self.capabilities, filter.as_deref())
+            .await?;
         info!("Worker capabilities detected: {:?}", self.capabilities);
 
         Ok(())

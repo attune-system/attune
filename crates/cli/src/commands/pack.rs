@@ -1720,7 +1720,14 @@ async fn handle_test(
         .ok_or_else(|| anyhow::anyhow!("Invalid pack directory"))?
         .to_path_buf();
 
-    let executor = TestExecutor::new(pack_base_dir);
+    let lifecycle_environment =
+        attune_common::child_process_environment::ChildProcessEnvironment::capture(&[])?;
+    let runtime_root = tempfile::Builder::new()
+        .prefix("attune-pack-test-")
+        .tempdir()?
+        .keep();
+    let executor = TestExecutor::new(pack_base_dir)
+        .with_runtime_lifecycle(lifecycle_environment, runtime_root.clone());
 
     // Print test start message
     if output_format == OutputFormat::Table {
@@ -1731,8 +1738,18 @@ async fn handle_test(
 
     // Execute tests
     let result = executor
-        .execute_pack_tests(&pack_ref, &pack_version, &test_config)
-        .await?;
+        .execute_pack_tests_at(&pack_dir, &pack_ref, &pack_version, &test_config)
+        .await;
+    executor.process_owner().shutdown().await;
+    if runtime_root.read_dir()?.next().is_none() {
+        std::fs::remove_dir(&runtime_root)?;
+    } else {
+        output::print_warning(&format!(
+            "Private runtime generations remain quarantined at {}",
+            runtime_root.display()
+        ));
+    }
+    let result = result?;
 
     // Display results
     match output_format {

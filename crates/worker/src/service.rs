@@ -424,7 +424,15 @@ impl WorkerService {
                         }
                     }
 
+                    attune_common::execution_env::validate_runtime_environment(
+                        &rt.execution_config,
+                    )?;
                     let exec_config = rt.parsed_execution_config();
+                    // Recipes use the shared process runner with the captured
+                    // definition. A display name must not shadow native/local.
+                    if exec_config.lifecycle.is_some() {
+                        continue;
+                    }
                     let process_runtime = ProcessRuntime::new(
                         rt_name.clone(),
                         exec_config,
@@ -456,6 +464,7 @@ impl WorkerService {
             let shell_runtime = ProcessRuntime::new(
                 "shell".to_string(),
                 attune_common::models::runtime::RuntimeExecutionConfig {
+                    lifecycle: None,
                     interpreter: attune_common::models::runtime::InterpreterConfig {
                         binary: "/bin/bash".to_string(),
                         args: vec![],
@@ -2459,8 +2468,12 @@ async fn handle_pack_test(
         None
     };
 
-    let mut executor =
-        TestExecutor::new(PathBuf::from(packs_base_dir)).with_cancellation(cancellation);
+    let mut executor = TestExecutor::new(PathBuf::from(packs_base_dir))
+        .with_cancellation(cancellation)
+        .with_runtime_lifecycle(
+            child_environment.clone(),
+            PathBuf::from(runtime_envs_dir).join("lifecycle-generations"),
+        );
     let candidate_lease = if test_config.candidate_api_effects {
         use attune_common::repositories::candidate_effect::CandidateEffectRepository;
         if payload.candidate_path.is_none() {

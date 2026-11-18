@@ -348,6 +348,10 @@ impl ExecutionResult {
 /// Runtime trait for executing actions
 #[async_trait]
 pub trait Runtime: Send + Sync {
+    /// Internal dispatch capability; display names never select recipe authority.
+    fn supports_toolchain_recipes(&self) -> bool {
+        false
+    }
     /// Get the runtime name
     fn name(&self) -> &str;
 
@@ -393,6 +397,22 @@ impl RuntimeRegistry {
 
     /// Get a runtime that can execute the given context
     pub fn get_runtime(&self, context: &ExecutionContext) -> RuntimeResult<&dyn Runtime> {
+        if context
+            .runtime_config_override
+            .as_ref()
+            .is_some_and(|config| config.lifecycle.is_some())
+        {
+            return self
+                .runtimes
+                .iter()
+                .find(|runtime| runtime.supports_toolchain_recipes())
+                .map(|runtime| runtime.as_ref())
+                .ok_or_else(|| {
+                    RuntimeError::RuntimeNotFound(
+                        "No generic toolchain process runner is registered".into(),
+                    )
+                });
+        }
         // If runtime_name is specified, use it to select the runtime directly
         if let Some(ref runtime_name) = context.runtime_name {
             return self

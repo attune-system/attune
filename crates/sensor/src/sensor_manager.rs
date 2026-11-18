@@ -1381,6 +1381,7 @@ impl SensorManager {
             )
             .await?;
 
+        attune_common::execution_env::validate_runtime_environment(&runtime.execution_config)?;
         let exec_config = version_config_override
             .clone()
             .unwrap_or_else(|| runtime.parsed_execution_config());
@@ -1393,6 +1394,30 @@ impl SensorManager {
             .unwrap_or(&rt_name)
             .to_string();
         let runtime_env_suffix = version_env_suffix.unwrap_or(base_runtime_suffix);
+
+        let prepared_target = if let Some(recipe) = &exec_config.lifecycle {
+            Some(
+                recipe
+                    .prepare(
+                        &pack_dir,
+                        attune_common::runtime_lifecycle::RuntimeSource::File(
+                            std::path::Path::new(&sensor_script),
+                        ),
+                        &std::path::Path::new(&self.inner.runtime_envs_dir)
+                            .join("lifecycle-generations"),
+                        &self.inner.child_environment,
+                    )
+                    .await
+                    .map_err(|error| anyhow!("Sensor runtime preparation failed: {error}"))?,
+            )
+        } else {
+            None
+        };
+        if let (Some(target), Some(expected)) = (&prepared_target, &selected_version) {
+            target
+                .validate_selected_version(expected)
+                .map_err(|error| anyhow!("Sensor toolchain selection changed: {error}"))?;
+        }
 
         info!(
             "Sensor {} runtime details: id={}, ref='{}', name='{}', selected_version={:?}, env_suffix='{}'",
@@ -1422,17 +1447,22 @@ impl SensorManager {
             &std::env::var("ATTUNE_WORKER_IMAGE_FORMAT_VERSION")
                 .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string()),
         )?;
-        let env_dir = cache_key.path(std::path::Path::new(&self.inner.runtime_envs_dir));
-        if let Err(e) = self
-            .ensure_runtime_environment(&exec_config, &pack_dir, &env_dir, &cache_key)
-            .await
-        {
-            warn!(
-                "Failed to ensure sensor runtime environment for {} at {}: {}",
-                sensor.r#ref,
-                env_dir.display(),
-                e
-            );
+        let env_dir = prepared_target
+            .as_ref()
+            .map(|target| target.generation.clone())
+            .unwrap_or_else(|| cache_key.path(std::path::Path::new(&self.inner.runtime_envs_dir)));
+        if prepared_target.is_none() {
+            if let Err(e) = self
+                .ensure_runtime_environment(&exec_config, &pack_dir, &env_dir, &cache_key)
+                .await
+            {
+                warn!(
+                    "Failed to ensure sensor runtime environment for {} at {}: {}",
+                    sensor.r#ref,
+                    env_dir.display(),
+                    e
+                );
+            }
         }
         if cache_key.is_ready(&env_dir) {
             cache_key.write_pack_ref_marker(&env_dir, pack_ref)?;
@@ -1512,14 +1542,24 @@ impl SensorManager {
 
         // Build the command: use the interpreter for non-native runtimes,
         // execute the script directly for native binaries.
-        let (spawn_binary, mut cmd) = build_sensor_command(
-            &sensor_script,
-            is_native,
-            &exec_config,
-            &pack_dir,
-            env_dir_opt,
-            &self.inner.child_environment,
-        );
+        let (spawn_binary, mut cmd) = if let Some(target) = &prepared_target {
+            let mut command = Command::new(&target.command[0]);
+            self.inner.child_environment.apply(command.as_std_mut());
+            command
+                .args(&target.command[1..])
+                .current_dir(&target.working_dir)
+                .envs(&target.env);
+            (target.command[0].clone(), command)
+        } else {
+            build_sensor_command(
+                &sensor_script,
+                is_native,
+                &exec_config,
+                &pack_dir,
+                env_dir_opt,
+                &self.inner.child_environment,
+            )
+        };
 
         info!(
             sensor_id = sensor.id,
@@ -1694,7 +1734,7 @@ impl SensorManager {
             .await;
         startup_process_guard.disarm();
 
-        let instance = SensorInstance::new_standalone(
+        let mut instance = SensorInstance::new_standalone(
             sensor,
             child,
             (stdout_handle, stderr_handle),
@@ -1703,6 +1743,7 @@ impl SensorManager {
             pack_revision,
             definition_updated,
         );
+        instance.prepared_target = prepared_target;
         instance
             .token_rotation
             .generation_binding
@@ -2093,8 +2134,9 @@ impl SensorManager {
                 &instance.token_rotation
             })
         };
-        if let Some(instance) = instance {
+        if let Some(mut instance) = instance {
             instance.cancel_token_rotation();
+            instance.stop().await;
             if let Err(error) =
                 SensorWorkloadRepository::release(&self.inner.db, instance.workload.fence()).await
             {
@@ -3849,6 +3891,7 @@ impl SensorManager {
 
 /// Sensor instance managing a running sensor
 struct SensorInstance {
+    prepared_target: Option<attune_common::runtime_lifecycle::PreparedTarget>,
     sensor: Sensor,
     sensor_ref: String,
     status: Arc<RwLock<SensorStatus>>,
@@ -3876,6 +3919,7 @@ impl SensorInstance {
         let sensor_ref = sensor.r#ref.clone();
         let (stdout_handle, stderr_handle) = output_handles;
         Self {
+            prepared_target: None,
             sensor,
             sensor_ref,
             status: Arc::new(RwLock::new(SensorStatus {
@@ -3906,6 +3950,9 @@ impl SensorInstance {
             status.running = false;
         }
 
+        // Capture ownership before wait() can erase the leader ID. A missing
+        // ID is not proof that descendants have stopped.
+        let recipe_group = self.child_process.as_ref().and_then(Child::id);
         // Kill child process if exists
         if let Some(ref mut child) = self.child_process {
             terminate_sensor_child(child, &self.sensor_ref).await;
@@ -3923,6 +3970,17 @@ impl SensorInstance {
         }
         for task in output_tasks {
             let _ = task.await;
+        }
+        if let Some(target) = self.prepared_target.take() {
+            match attune_common::runtime_lifecycle::stop_owned_process_group(recipe_group).await {
+                Ok(()) => {
+                    if let Err(error) = target.cleanup().await {
+                        error!(%error, "Failed to clean owned sensor runtime generation");
+                    }
+                }
+                Err(error) => warn!(%error, generation = %target.generation.display(),
+                    "Retaining sensor generation because process-group teardown is unconfirmed"),
+            }
         }
     }
 

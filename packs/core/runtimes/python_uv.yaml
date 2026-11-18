@@ -1,0 +1,30 @@
+ref: core.python_uv
+pack_ref: core
+name: PythonUv
+aliases: [pythonuv, python_uv]
+description: Opt-in trusted Python environments prepared with uv
+distributions: {}
+execution_config:
+  lifecycle:
+    tools:
+      - name: python
+        binaries: [python3]
+        args: [--version]
+        version_pattern: 'Python (?<version>3\.\d+\.\d+)'
+        primary: true
+      - name: uv
+        binaries: [uv]
+        args: [--version]
+        version_pattern: 'uv (?<version>\d+\.\d+\.\d+)'
+    extensions: [py]
+    prepare:
+      - command: ['{tool_uv}', venv, --python, '{tool_python}', '{env_dir}/venv']
+      - command: ['{tool_uv}', pip, install, --python, '{env_dir}/venv/bin/python', -r, '{pack_dir}/requirements.txt']
+        when_file_exists: requirements.txt
+    launch:
+      command: ['{env_dir}/venv/bin/python', -u, '{source_file}']
+      cwd: '{pack_dir}'
+    env:
+      UV_NO_CONFIG: '1'
+      UV_PYTHON_DOWNLOADS: never
+      PYTHONPATH: '{pack_dir}/lib'

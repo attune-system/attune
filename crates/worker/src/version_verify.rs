@@ -264,6 +264,13 @@ async fn verify_single_version(
     version: &RuntimeVersion,
     child_environment: &ChildProcessEnvironment,
 ) -> bool {
+    if version.execution_config.get("lifecycle").is_some() {
+        return attune_common::runtime_lifecycle::verify_registered_version(
+            version,
+            child_environment,
+        )
+        .await;
+    }
     let commands = extract_verification_commands(&version.distributions);
 
     if commands.is_empty() {

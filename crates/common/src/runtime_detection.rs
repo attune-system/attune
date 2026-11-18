@@ -15,7 +15,8 @@ use crate::child_process_environment::ChildProcessEnvironment;
 use crate::config::Config;
 use crate::error::Result;
 use crate::models::Runtime;
-use crate::repositories::runtime::SELECT_COLUMNS;
+use crate::repositories::runtime::RuntimeRepository;
+use crate::repositories::List;
 use serde_json::json;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -167,10 +168,7 @@ impl RuntimeDetector {
         info!("Querying database for runtime definitions...");
 
         // Query all runtimes from database
-        let query = format!("SELECT {} FROM runtime ORDER BY ref", SELECT_COLUMNS);
-        let runtimes = sqlx::query_as::<_, Runtime>(&query)
-            .fetch_all(&self.pool)
-            .await?;
+        let runtimes = RuntimeRepository::list(&self.pool).await?;
 
         info!("Found {} runtime(s) in database", runtimes.len());
 
@@ -196,6 +194,17 @@ impl RuntimeDetector {
 
     /// Verify if a runtime is available on this system
     pub async fn verify_runtime_available(&self, runtime: &Runtime) -> bool {
+        if runtime.execution_config.get("lifecycle").is_some() {
+            return match serde_json::from_value::<crate::models::runtime::RuntimeExecutionConfig>(
+                runtime.execution_config.clone(),
+            ) {
+                Ok(config) => match config.lifecycle {
+                    Some(recipe) => recipe.discover(&self.child_environment).await.is_ok(),
+                    None => false,
+                },
+                Err(_) => false,
+            };
+        }
         // Check if runtime is always available (e.g., shell, native)
         if let Some(verification) = runtime.distributions.get("verification") {
             if let Some(always_available) = verification.get("always_available") {
@@ -241,6 +250,100 @@ impl RuntimeDetector {
 
         // No verification metadata or all checks failed
         false
+    }
+
+    /// Exact recipe identities supplement name-based placement. An operator name
+    /// filter narrows admission; it can never grant permission to execute a probe.
+    pub async fn enrich_recipe_capabilities(
+        &self,
+        capabilities: &mut HashMap<String, serde_json::Value>,
+        filter: Option<&[String]>,
+    ) -> Result<()> {
+        let mut instances = serde_json::Map::new();
+        let registered_versions =
+            crate::repositories::runtime_version::RuntimeVersionRepository::list(&self.pool)
+                .await?;
+        for runtime in RuntimeRepository::list(&self.pool).await? {
+            if filter.is_some_and(|filter| {
+                !runtime_aliases_match_filter(&runtime.aliases, filter)
+                    && !runtime_aliases_match_filter(std::slice::from_ref(&runtime.name), filter)
+            }) {
+                continue;
+            }
+            let Some(raw) = runtime.execution_config.get("lifecycle") else {
+                continue;
+            };
+            let Ok(recipe) =
+                serde_json::from_value::<crate::runtime_lifecycle::RuntimeRecipe>(raw.clone())
+            else {
+                continue;
+            };
+            let Ok(tools) = recipe.discover(&self.child_environment).await else {
+                continue;
+            };
+            let digest = recipe
+                .digest()
+                .map_err(|error| crate::Error::validation(error.to_string()))?;
+            instances.insert(
+                runtime.r#ref.clone(),
+                json!({"digest":digest,"tools":tools}),
+            );
+            let mut versions = Vec::new();
+            if !registered_versions
+                .iter()
+                .any(|version| version.runtime == runtime.id)
+            {
+                if let Some(primary) = recipe
+                    .tools
+                    .iter()
+                    .find(|tool| tool.primary)
+                    .and_then(|tool| tools.get(&tool.name))
+                {
+                    versions.push(json!(primary.version));
+                }
+            }
+            for version in registered_versions
+                .iter()
+                .filter(|version| version.runtime == runtime.id)
+            {
+                if crate::runtime_lifecycle::verify_registered_version(
+                    version,
+                    &self.child_environment,
+                )
+                .await
+                {
+                    versions.push(json!(version.version));
+                }
+            }
+            if let Some(map) = capabilities
+                .entry("runtime_versions".into())
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+            {
+                for name in runtime.aliases.iter().chain(std::iter::once(&runtime.name)) {
+                    map.insert(normalize_runtime_name(name), json!(versions));
+                }
+            }
+            let runtimes = capabilities
+                .entry("runtimes".into())
+                .or_insert_with(|| json!([]));
+            if let Some(names) = runtimes.as_array_mut() {
+                for name in runtime.aliases.iter().chain(std::iter::once(&runtime.name)) {
+                    let name = normalize_runtime_name(name);
+                    if !names
+                        .iter()
+                        .any(|candidate| candidate.as_str() == Some(&name))
+                    {
+                        names.push(json!(name));
+                    }
+                }
+            }
+        }
+        capabilities.insert(
+            "runtime_toolchains".into(),
+            serde_json::Value::Object(instances),
+        );
+        Ok(())
     }
 
     /// Try executing a verification command to check if runtime is available

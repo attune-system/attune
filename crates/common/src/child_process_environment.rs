@@ -40,6 +40,7 @@ const WINDOWS_BASE_VARIABLES: &[&str] = &[
 #[derive(Clone)]
 pub struct ChildProcessEnvironment {
     values: BTreeMap<OsString, OsString>,
+    runtime_recipe_digests: BTreeSet<String>,
     workload_sandbox: crate::workload_sandbox::WorkloadSandbox,
 }
 
@@ -68,6 +69,32 @@ impl ChildProcessEnvironment {
         passthrough: &[String],
     ) -> crate::Result<Self> {
         validate_passthrough_env(passthrough)?;
+        let parent: Vec<_> = parent.into_iter().collect();
+        let runtime_recipe_digests = parent
+            .iter()
+            .find(|(name, _)| name == "ATTUNE_RUNTIME_RECIPE_DIGESTS")
+            .map(|(_, value)| {
+                value
+                    .to_str()
+                    .ok_or_else(|| crate::Error::validation("Runtime recipe digests must be UTF-8"))
+            })
+            .transpose()?
+            .unwrap_or("")
+            .split(',')
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        for digest in &runtime_recipe_digests {
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err(crate::Error::validation(
+                    "Runtime recipe admission requires lowercase SHA-256 digests",
+                ));
+            }
+        }
         let mut names: BTreeSet<&str> = BASE_VARIABLES.iter().copied().collect();
         names.extend(passthrough.iter().map(String::as_str));
         #[cfg(windows)]
@@ -89,6 +116,7 @@ impl ChildProcessEnvironment {
             .collect();
         Ok(Self {
             values,
+            runtime_recipe_digests,
             workload_sandbox: Default::default(),
         })
     }
@@ -96,6 +124,11 @@ impl ChildProcessEnvironment {
     /// Clear inheritance before applying the selected baseline and explicit overlays.
     pub fn apply(&self, command: &mut Command) {
         command.env_clear().envs(&self.values);
+    }
+
+    /// Operator policy captured at startup, never inherited by workload children.
+    pub fn admits_runtime_recipe(&self, digest: &str) -> bool {
+        self.runtime_recipe_digests.contains(digest)
     }
 
     pub fn with_workload_sandbox(

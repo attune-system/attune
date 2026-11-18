@@ -54,6 +54,10 @@ Supported template variables:
 - **nodejs.yaml** - Node.js runtime for JavaScript-based actions and sensors
 - **shell.yaml** - Shell (bash/sh) runtime - always available
 - **native.yaml** - Native compiled runtime (Rust, Go, C, etc.) - executes binaries directly without an interpreter
+- **bun.yaml**, **python_uv.yaml**, **python_uv_project.yaml**, **deno.yaml**,
+  **pypy.yaml** - Opt-in pack-defined toolchains. These use the shared lifecycle
+  contract and require exact operator recipe-digest admission; publication alone
+  does not enable probes or execution. See [trusted toolchain deployment](../../../docs/deployment/runtime-toolchains.md).
 
 ## Loading
 
@@ -65,7 +69,8 @@ When adding a new runtime YAML:
 
 1. Set a lowercase `ref` (`<pack_ref>.<runtime_name>`) and include `pack_ref`.
 2. Define `aliases` for expected runtime names (`node`, `nodejs`, etc.).
-3. Add `distributions.verification` commands (or `always_available: true` when appropriate).
+3. For lifecycle recipes, declare required tool probes inside `execution_config.lifecycle`.
+   Interpreter definitions use `distributions.verification` commands.
 4. Provide `execution_config` for interpreter-managed runtimes; use `{}` only for native/direct execution runtimes.
 5. If you need explicit version targeting, add `versions[]` entries with version-specific `execution_config`.
 

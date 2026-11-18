@@ -30,6 +30,7 @@ impl LocalRuntime {
     /// since this is a fallback when runtimes haven't been loaded from the database.
     pub fn new() -> Self {
         let python_config = RuntimeExecutionConfig {
+            lifecycle: None,
             interpreter: InterpreterConfig {
                 binary: "python3".to_string(),
                 args: vec![],
@@ -42,6 +43,7 @@ impl LocalRuntime {
         };
 
         let shell_config = RuntimeExecutionConfig {
+            lifecycle: None,
             interpreter: InterpreterConfig {
                 binary: "/bin/bash".to_string(),
                 args: vec![],

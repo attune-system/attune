@@ -117,6 +117,74 @@ async fn setup_db() -> attune_common::test_database::TestDatabase {
         .expect("Failed to create test pool")
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn lifecycle_publication_does_not_admit_probes_or_alias_based_placement() {
+    use attune_common::child_process_environment::ChildProcessEnvironment;
+    use attune_common::runtime_detection::RuntimeDetector;
+    let database = setup_db().await;
+    let fixture = RuntimeFixture::new("recipe_admission");
+    let recipe:attune_common::runtime_lifecycle::RuntimeRecipe=serde_json::from_value(json!({
+        "tools":[{"name":"fixture","binaries":["/bin/sh"],"args":["-c","printf 'fixture-9.8.7'"],"version_pattern":"fixture-(?<version>[0-9.]+)","primary":true}],
+        "launch":{"command":["{tool_fixture}","{source_file}"]}
+    })).unwrap();
+    let mut input = fixture.create_minimal_input("recipe");
+    input.aliases = vec![input.name.clone(), "fixture-alias".into()];
+    input.execution_config = json!({"lifecycle":recipe});
+    input.distributions = json!({"verification":{"always_available":true}});
+    let runtime = RuntimeRepository::create(&database, input.clone())
+        .await
+        .unwrap();
+    let detector = RuntimeDetector::new(database.pool().clone())
+        .with_child_environment(ChildProcessEnvironment::from_parent([], &[]).unwrap());
+    assert!(
+        !detector.verify_runtime_available(&runtime).await,
+        "always_available cannot bypass recipe admission"
+    );
+    drop(detector);
+    let digest = recipe.digest().unwrap();
+    let detector = RuntimeDetector::new(database.pool().clone()).with_child_environment(
+        ChildProcessEnvironment::from_parent(
+            [(
+                "ATTUNE_RUNTIME_RECIPE_DIGESTS".into(),
+                digest.clone().into(),
+            )],
+            &[],
+        )
+        .unwrap(),
+    );
+    assert!(detector.verify_runtime_available(&runtime).await);
+    let mut capabilities = std::collections::HashMap::new();
+    detector
+        .enrich_recipe_capabilities(&mut capabilities, Some(&["fixture-alias".into()]))
+        .await
+        .unwrap();
+    assert_eq!(
+        capabilities["runtime_toolchains"][&runtime.r#ref]["digest"],
+        digest
+    );
+    assert_eq!(
+        capabilities["runtime_toolchains"][&runtime.r#ref]["tools"]["fixture"]["version"],
+        "9.8.7"
+    );
+    assert!(capabilities["runtimes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|name| name == "fixture-alias"));
+    let mut invalid = input;
+    invalid.r#ref = fixture.unique_ref("invalid");
+    invalid.execution_config["lifecycle"]["env"] = json!({"ATTUNE_API_TOKEN":"dummy-secret"});
+    let error = RuntimeRepository::create(&database, invalid)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("reserved runtime environment"));
+    assert!(!error.contains("dummy-secret"));
+    drop(detector);
+    database.cleanup().await.unwrap();
+}
+
 // ============================================================================
 // Basic CRUD Tests
 // ============================================================================

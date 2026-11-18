@@ -1,0 +1,33 @@
+ref: core.python_uv_project
+pack_ref: core
+name: PythonUvProject
+aliases: [pythonuvproject, python_uv_project]
+description: Opt-in trusted locked uv project with default production dependencies
+distributions: {}
+execution_config:
+  lifecycle:
+    tools:
+      - name: python
+        binaries: [python3]
+        args: [--version]
+        version_pattern: 'Python (?<version>3\.\d+\.\d+)'
+        primary: true
+      - name: uv
+        binaries: [uv]
+        args: [--version]
+        version_pattern: 'uv (?<version>\d+\.\d+\.\d+)'
+    extensions: [py]
+    workspace: true
+    prepare:
+      - command: [test, -f, '{workspace_dir}/pyproject.toml']
+      - command: [test, -f, '{workspace_dir}/uv.lock']
+      - command: ['{tool_uv}', sync, --frozen, --no-dev, --no-editable, --python, '{tool_python}']
+    launch:
+      command: ['{env_dir}/venv/bin/python', -u, '{source_file}']
+      cwd: '{workspace_dir}'
+    env:
+      UV_NO_CONFIG: '1'
+      UV_NO_ENV_FILE: '1'
+      UV_PYTHON_DOWNLOADS: never
+      UV_PROJECT_ENVIRONMENT: '{env_dir}/venv'
+      PYTHONPATH: '{workspace_dir}/lib'

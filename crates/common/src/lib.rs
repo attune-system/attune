@@ -64,6 +64,7 @@ pub mod runtime_authority;
 pub mod runtime_cache;
 pub mod runtime_detection;
 pub mod runtime_file_body;
+pub mod runtime_lifecycle;
 pub mod runtime_log_completion;
 pub mod runtime_log_mirror;
 pub mod runtime_read_log;

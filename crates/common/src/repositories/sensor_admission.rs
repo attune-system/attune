@@ -597,6 +597,27 @@ fn worker_supports_runtime(
     runtime_versions: &[RuntimeVersion],
     sensor: &Sensor,
 ) -> bool {
+    if let Some(raw) = runtime.execution_config.get("lifecycle") {
+        let Ok(recipe) =
+            serde_json::from_value::<crate::runtime_lifecycle::RuntimeRecipe>(raw.clone())
+        else {
+            return false;
+        };
+        let Ok(digest) = recipe.digest() else {
+            return false;
+        };
+        if worker
+            .capabilities
+            .as_ref()
+            .and_then(|caps| caps.get("runtime_toolchains"))
+            .and_then(|instances| instances.get(&runtime.r#ref))
+            .and_then(|instance| instance.get("digest"))
+            .and_then(|value| value.as_str())
+            != Some(digest.as_str())
+        {
+            return false;
+        }
+    }
     let Some(capabilities) = worker
         .capabilities
         .as_ref()

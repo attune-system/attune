@@ -10585,6 +10585,24 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
     /// This checks the worker's capabilities.runtimes array against the runtime's aliases.
     /// If aliases are missing, fall back to the runtime's canonical name.
     fn worker_supports_runtime(worker: &attune_common::models::Worker, runtime: &Runtime) -> bool {
+        if let Some(raw) = runtime.execution_config.get("lifecycle") {
+            let Ok(recipe) = serde_json::from_value::<
+                attune_common::runtime_lifecycle::RuntimeRecipe,
+            >(raw.clone()) else {
+                return false;
+            };
+            let Ok(digest) = recipe.digest() else {
+                return false;
+            };
+            return worker
+                .capabilities
+                .as_ref()
+                .and_then(|caps| caps.get("runtime_toolchains"))
+                .and_then(|instances| instances.get(&runtime.r#ref))
+                .and_then(|instance| instance.get("digest"))
+                .and_then(|value| value.as_str())
+                == Some(digest.as_str());
+        }
         let runtime_names = Self::runtime_capability_names(runtime);
 
         // Try to parse capabilities and check runtimes array
@@ -13591,6 +13609,40 @@ true,
         };
 
         assert!(ExecutionScheduler::worker_supports_runtime(
+            &worker, &runtime
+        ));
+    }
+
+    #[test]
+    fn test_worker_supports_runtime_recipe_requires_exact_ref_and_digest() {
+        use serde_json::json;
+        let mut worker = create_test_worker("recipe-worker", 5);
+        let recipe:attune_common::runtime_lifecycle::RuntimeRecipe=serde_json::from_value(json!({
+            "tools":[{"name":"tool","binaries":["tool"],"version_pattern":"(?<version>[0-9]+)","primary":true}],
+            "launch":{"command":["{tool_tool}","{source_file}"]}
+        })).unwrap();
+        let mut runtime:Runtime=serde_json::from_value(json!({
+            "id":1,"ref":"example.fixed","pack":null,"pack_ref":"example","description":null,
+            "name":"Shell","aliases":["shell"],"distributions":{},"installation":null,"installers":{},
+            "execution_config":{"lifecycle":recipe},"auto_detected":false,"detection_config":{},
+            "retired_at":null,"created":Utc::now(),"updated":Utc::now()
+        })).unwrap();
+        assert!(!ExecutionScheduler::worker_supports_runtime(
+            &worker, &runtime
+        ));
+        worker.capabilities = Some(
+            json!({"runtimes":["shell"],"runtime_toolchains":{"other.fixed":{"digest":recipe.digest().unwrap()}}}),
+        );
+        assert!(!ExecutionScheduler::worker_supports_runtime(
+            &worker, &runtime
+        ));
+        worker.capabilities.as_mut().unwrap()["runtime_toolchains"]["example.fixed"] =
+            json!({"digest":recipe.digest().unwrap()});
+        assert!(ExecutionScheduler::worker_supports_runtime(
+            &worker, &runtime
+        ));
+        runtime.execution_config["lifecycle"]["env"] = json!({"APP_REGION":"changed"});
+        assert!(!ExecutionScheduler::worker_supports_runtime(
             &worker, &runtime
         ));
     }

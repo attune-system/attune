@@ -52,6 +52,20 @@ impl TestConfig {
         }
         let mut total_timeout = 60_u64;
         for (name, runner) in &self.runners {
+            if let Some(recipe) = &runner.lifecycle {
+                if runner.r#type != "runtime" {
+                    return Err(Error::validation(
+                        "Lifecycle test runners must use type runtime",
+                    ));
+                }
+                recipe
+                    .validate()
+                    .map_err(|error| Error::validation(error.to_string()))?;
+            } else if runner.r#type == "runtime" {
+                return Err(Error::validation(
+                    "Runtime test runner requires a lifecycle recipe",
+                ));
+            }
             let timeout = runner.timeout.unwrap_or(300);
             if !(1..=3600).contains(&timeout) {
                 return Err(crate::pack_registry::diagnostics::metadata_error(
@@ -97,6 +111,8 @@ pub struct DiscoveryConfig {
 /// Test runner configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunnerConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<crate::runtime_lifecycle::RuntimeRecipe>,
     pub r#type: String,
     pub entry_point: String,
     pub timeout: Option<u64>,
@@ -105,6 +121,8 @@ pub struct RunnerConfig {
 
 /// Test executor for running pack tests
 pub struct TestExecutor {
+    lifecycle_environment: crate::child_process_environment::ChildProcessEnvironment,
+    lifecycle_root: Option<PathBuf>,
     /// Base directory for pack files
     pack_base_dir: PathBuf,
     candidate_effects: Option<CandidateTestEnvironment>,
@@ -139,6 +157,8 @@ impl TestExecutor {
     pub fn new(pack_base_dir: PathBuf) -> Self {
         Self {
             pack_base_dir,
+            lifecycle_environment: Default::default(),
+            lifecycle_root: None,
             candidate_effects: None,
             processes: TestProcessOwner::default(),
             cancellation: CancellationToken::new(),
@@ -151,6 +171,16 @@ impl TestExecutor {
 
     pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
         self.cancellation = cancellation;
+        self
+    }
+
+    pub fn with_runtime_lifecycle(
+        mut self,
+        environment: crate::child_process_environment::ChildProcessEnvironment,
+        root: PathBuf,
+    ) -> Self {
+        self.lifecycle_environment = environment;
+        self.lifecycle_root = Some(root);
         self
     }
 
@@ -347,7 +377,33 @@ impl TestExecutor {
         // Absolute canonical paths also prevent a leading '-' from becoming an option.
         let relative_entry_point = entry_point.to_string_lossy().into_owned();
 
+        let target = if let Some(recipe) = &runner_config.lifecycle {
+            let root = self.lifecycle_root.as_deref().ok_or_else(|| {
+                Error::validation(
+                    "Runtime test preparation requires an operator-owned generation root",
+                )
+            })?;
+            let preparation = recipe.prepare(
+                pack_dir,
+                crate::runtime_lifecycle::RuntimeSource::File(&entry_point),
+                root,
+                &self.lifecycle_environment,
+            );
+            Some(tokio::select! {
+                result = preparation => result.map_err(|error| Error::validation(error.to_string()))?,
+                _ = self.cancellation.cancelled() => return Err(Error::validation("Runtime test preparation cancelled")),
+            })
+        } else {
+            None
+        };
+
         let (command, args) = match runner_config.r#type.as_str() {
+            "runtime" => {
+                let target = target
+                    .as_ref()
+                    .ok_or_else(|| Error::validation("Runtime test target is missing"))?;
+                (target.command[0].clone(), target.command[1..].to_vec())
+            }
             "script" => {
                 // Execute as shell script
                 let shell = if entry_point.extension().and_then(|s| s.to_str()) == Some("sh") {
@@ -395,16 +451,42 @@ impl TestExecutor {
         };
 
         // Execute test command with pack_dir as working directory
-        let timeout_duration = Duration::from_secs(runner_config.timeout.unwrap_or(300));
-        let output = self
-            .run_command(
+        let timeout_seconds = runner_config.timeout.unwrap_or(300);
+        let timeout_seconds = runner_config
+            .lifecycle
+            .as_ref()
+            .map(|recipe| timeout_seconds.min(recipe.launch.timeout_seconds))
+            .unwrap_or(timeout_seconds);
+        let timeout_duration = Duration::from_secs(timeout_seconds);
+        let outcome = if target.is_some() {
+            self.run_command_prepared(
+                &command,
+                &args,
+                pack_dir,
+                python_interpreter.and_then(Path::parent),
+                timeout_duration,
+                target.as_ref(),
+            )
+            .await
+        } else {
+            self.run_command(
                 &command,
                 &args,
                 pack_dir,
                 python_interpreter.and_then(Path::parent),
                 timeout_duration,
             )
-            .await?;
+            .await
+        };
+        if outcome.is_ok() {
+            if let Some(target) = target {
+                target
+                    .cleanup()
+                    .await
+                    .map_err(|error| Error::validation(error.to_string()))?;
+            }
+        }
+        let output = outcome?;
 
         let duration_ms = start_time.elapsed().as_millis() as i64;
 
@@ -437,6 +519,19 @@ impl TestExecutor {
         runtime_bin_dir: Option<&Path>,
         timeout: Duration,
     ) -> Result<CommandOutput> {
+        self.run_command_prepared(command, args, working_dir, runtime_bin_dir, timeout, None)
+            .await
+    }
+
+    async fn run_command_prepared(
+        &self,
+        command: &str,
+        args: &[String],
+        working_dir: &Path,
+        runtime_bin_dir: Option<&Path>,
+        timeout: Duration,
+        target: Option<&crate::runtime_lifecycle::PreparedTarget>,
+    ) -> Result<CommandOutput> {
         debug!(
             "Executing command: {} {} (timeout: {:?})",
             command,
@@ -464,6 +559,10 @@ impl TestExecutor {
             .stderr(Stdio::piped())
             .stdin(Stdio::null());
         cmd.kill_on_drop(true);
+        if let Some(target) = target {
+            self.lifecycle_environment.apply(cmd.as_std_mut());
+            cmd.envs(&target.env).current_dir(&target.working_dir);
+        }
         if let Some(candidate) = &self.candidate_effects {
             cmd.env("ATTUNE_CANDIDATE_EFFECTS_URL", &candidate.url)
                 .env("ATTUNE_CANDIDATE_EFFECTS_TOKEN", &candidate.token);
@@ -478,8 +577,11 @@ impl TestExecutor {
         })?;
         let (consumer, cancelled) = tokio::sync::oneshot::channel::<()>();
         let cancellation = self.cancellation.clone();
+        let require_group_exit = target.is_some();
         let task = self.processes.tasks.spawn(async move {
-            let result = Self::collect_command(child, timeout, cancelled, cancellation).await;
+            let result =
+                Self::collect_command(child, timeout, cancelled, cancellation, require_group_exit)
+                    .await;
             if let Err(error) = &result {
                 // The consuming future may have been aborted, so also surface
                 // failures here rather than relying on its JoinHandle result.
@@ -499,6 +601,7 @@ impl TestExecutor {
         timeout: Duration,
         mut cancelled: tokio::sync::oneshot::Receiver<()>,
         cancellation: CancellationToken,
+        require_group_exit: bool,
     ) -> Result<CommandOutput> {
         let start = Instant::now();
         #[cfg(unix)]
@@ -557,6 +660,16 @@ impl TestExecutor {
                     })?
             }
         };
+        if require_group_exit {
+            #[cfg(unix)]
+            crate::runtime_lifecycle::stop_owned_process_group(group)
+                .await
+                .map_err(|error| Error::validation(error.to_string()))?;
+            #[cfg(not(unix))]
+            return Err(Error::validation(
+                "Recipe process-tree teardown is unavailable on this platform",
+            ));
+        }
         let status = result?;
         Ok(CommandOutput {
             exit_code: status.code().unwrap_or(-1),
@@ -752,6 +865,7 @@ mod tests {
             "escape-dir/outside.sh",
         ] {
             let runner = RunnerConfig {
+                lifecycle: None,
                 r#type: "script".into(),
                 entry_point: entry.into(),
                 timeout: Some(5),
@@ -767,6 +881,7 @@ mod tests {
             assert!(!marker.exists());
         }
         let runner = RunnerConfig {
+            lifecycle: None,
             r#type: "script".into(),
             entry_point: "safe.sh".into(),
             timeout: Some(5),
@@ -792,6 +907,7 @@ mod tests {
         config.runners.insert(
             "isolated".into(),
             RunnerConfig {
+                lifecycle: None,
                 r#type: "script".into(),
                 entry_point: "run.sh".into(),
                 timeout: Some(10),
@@ -896,6 +1012,7 @@ mod tests {
         config.runners.insert(
             "slow".to_string(),
             RunnerConfig {
+                lifecycle: None,
                 r#type: "script".to_string(),
                 entry_point: "tests/run.sh".to_string(),
                 timeout: Some(3601),
@@ -1131,6 +1248,7 @@ mod tests {
                 runners: HashMap::from([(
                     "script".into(),
                     RunnerConfig {
+                        lifecycle: None,
                         r#type: "script".into(),
                         entry_point: "test.sh".into(),
                         timeout: Some(30),
