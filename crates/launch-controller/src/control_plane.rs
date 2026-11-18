@@ -309,6 +309,12 @@ impl ControlPlane {
         {
             return Err(ControlError::Response);
         }
+        let remaining = (lease.handle.lease_deadline - chrono::Utc::now())
+            .to_std()
+            .map_err(|_| ControlError::Response)?;
+        if remaining.is_zero() {
+            return Err(ControlError::Response);
+        }
         let authorization: LaunchIoAuthorization = decode(
             self.client
                 .post(self.url(lease.handle.launch_id, &["authorize-io"])?)
@@ -316,6 +322,9 @@ impl ControlPlane {
                 .header(LAUNCH_LEASE_HEADER, secret(&lease.token)?)
                 .header(LAUNCH_IO_HEADER, secret(token)?)
                 .json(operation)
+                // Read authorization holds the per-session lease lock. A
+                // stalled CP must not block renewal/stop beyond this lease.
+                .timeout(remaining.min(Duration::from_secs(30)))
                 .send()
                 .await
                 .map_err(|_| ControlError::Transport)?,

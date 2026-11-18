@@ -33,8 +33,21 @@ pub enum CacheError {
     AttemptConflict,
     #[error("file artifact publication remains unacknowledged; private staging retained")]
     ArtifactPending,
+    #[error("private file artifact staging is missing; not a selected missing file")]
+    LostArtifactStaging,
 }
 pub type Result<T> = std::result::Result<T, CacheError>;
+const ARTIFACT_QUEUE_LIMIT: usize = 256;
+const ARTIFACT_EVIDENCE_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// Historical public removal evidence, never invocation or authority. Fresh CP
+/// receipt authentication is independently required before local deletion.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArtifactCleanupEvidence {
+    pub manifest: LaunchManifest,
+    pub status: attune_common::workload_launch::LaunchStatus,
+}
 
 #[derive(Clone, Copy)]
 pub struct CacheLimits {
@@ -94,7 +107,13 @@ impl CacheStore {
         {
             return Err(CacheError::UnsafeEntry);
         }
-        for child in ["inputs", "private", "pending", "manifests"] {
+        for child in [
+            "inputs",
+            "private",
+            "pending",
+            "manifests",
+            "artifact-cleanup",
+        ] {
             let path = root.join(child);
             if !path.exists() {
                 fs::create_dir(&path)?;
@@ -134,7 +153,7 @@ impl CacheStore {
     /// This internal test seam is absent from production and request DTOs; the
     /// packaged Engine test retains and proves the fixed uid/gid 1000 contract.
     #[cfg(test)]
-    fn for_current_test_user(mut self) -> Self {
+    pub(crate) fn for_current_test_user(mut self) -> Self {
         self.workload_owner = WorkloadOwner {
             uid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },
@@ -366,6 +385,195 @@ impl CacheStore {
         }
         Ok(manifest)
     }
+    /// Fsync public removal evidence BEFORE the first artifact claim, which
+    /// may immediately return a terminal receipt and end CP discovery.
+    pub(crate) fn begin_artifact_cleanup(
+        &self,
+        request: &attune_common::workload_launch::LaunchRequest,
+        status: &attune_common::workload_launch::LaunchStatus,
+    ) -> Result<LaunchManifest> {
+        let _lock = self.lock()?;
+        let manifest = self.read_manifest_locked(request)?;
+        validate_artifact_status(&manifest, status)?;
+        let path = self.artifact_cleanup_path(request);
+        match self.read_artifact_cleanup_locked(request) {
+            Ok(previous) => {
+                if serde_json::to_vec(&previous.manifest).map_err(|_| CacheError::PinMismatch)?
+                    != serde_json::to_vec(&manifest).map_err(|_| CacheError::PinMismatch)?
+                    || previous.status.runtime_state != status.runtime_state
+                    || previous.status.resource != status.resource
+                    || previous.status.exit_outcome != status.exit_outcome
+                    || previous.status.stop_reason != status.stop_reason
+                {
+                    return Err(CacheError::PinMismatch);
+                }
+                return Ok(manifest);
+            }
+            Err(CacheError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let directory = self.root.join("artifact-cleanup");
+        if fs::read_dir(&directory)?.take(ARTIFACT_QUEUE_LIMIT).count() >= ARTIFACT_QUEUE_LIMIT {
+            return Err(CacheError::Quota);
+        }
+        let evidence = ArtifactCleanupEvidence {
+            manifest: manifest.clone(),
+            status: status.clone(),
+        };
+        let bytes = serde_json::to_vec(&evidence).map_err(|_| CacheError::PinMismatch)?;
+        if bytes.len() as u64 > ARTIFACT_EVIDENCE_LIMIT {
+            return Err(CacheError::Quota);
+        }
+        let mut pending = tempfile::NamedTempFile::new_in(&directory)?;
+        use std::io::Write;
+        pending.write_all(&bytes)?;
+        pending.as_file().sync_all()?;
+        pending
+            .persist_noclobber(path)
+            .map_err(|error| CacheError::Io(error.error))?;
+        File::open(directory)?.sync_all()?;
+        Ok(manifest)
+    }
+    fn artifact_cleanup_path(
+        &self,
+        request: &attune_common::workload_launch::LaunchRequest,
+    ) -> PathBuf {
+        self.root.join("artifact-cleanup").join(format!(
+            "{}-{}.json",
+            request.launch_id,
+            request.admitted_digest.as_str()
+        ))
+    }
+    fn read_artifact_cleanup_locked(
+        &self,
+        request: &attune_common::workload_launch::LaunchRequest,
+    ) -> Result<ArtifactCleanupEvidence> {
+        if request.launch_id <= 0 {
+            return Err(CacheError::PinMismatch);
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(self.artifact_cleanup_path(request))?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o077 != 0
+            || metadata.len() > ARTIFACT_EVIDENCE_LIMIT
+        {
+            return Err(CacheError::UnsafeEntry);
+        }
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(ARTIFACT_EVIDENCE_LIMIT + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > ARTIFACT_EVIDENCE_LIMIT {
+            return Err(CacheError::Quota);
+        }
+        let evidence: ArtifactCleanupEvidence =
+            serde_json::from_slice(&bytes).map_err(|_| CacheError::PinMismatch)?;
+        evidence
+            .manifest
+            .validate_shape()
+            .map_err(|_| CacheError::PinMismatch)?;
+        validate_artifact_status(&evidence.manifest, &evidence.status)?;
+        if &evidence.status.request != request
+            || serde_json::to_vec(&evidence).map_err(|_| CacheError::PinMismatch)? != bytes
+        {
+            return Err(CacheError::PinMismatch);
+        }
+        Ok(evidence)
+    }
+    pub(crate) fn artifact_cleanup_evidence(
+        &self,
+        request: &attune_common::workload_launch::LaunchRequest,
+    ) -> Result<ArtifactCleanupEvidence> {
+        let _lock = self.lock()?;
+        self.read_artifact_cleanup_locked(request)
+    }
+    /// Bounded owned local recovery, including receipt ACKs lost after CP
+    /// discovery ended. Corrupt/unowned evidence fails rather than vanishing.
+    pub fn pending_artifact_cleanups(
+        &self,
+    ) -> Result<Vec<attune_common::workload_launch::LaunchRequest>> {
+        let _lock = self.lock()?;
+        let mut pending = Vec::new();
+        for entry in fs::read_dir(self.root.join("artifact-cleanup"))? {
+            if pending.len() >= ARTIFACT_QUEUE_LIMIT {
+                return Err(CacheError::Quota);
+            }
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_str().ok_or(CacheError::UnsafeEntry)?;
+            let (id, digest) = name
+                .strip_suffix(".json")
+                .and_then(|name| name.split_once('-'))
+                .ok_or(CacheError::UnsafeEntry)?;
+            let request = attune_common::workload_launch::LaunchRequest {
+                launch_id: id.parse().map_err(|_| CacheError::UnsafeEntry)?,
+                admitted_digest: Sha256Digest::parse(digest)
+                    .map_err(|_| CacheError::UnsafeEntry)?,
+            };
+            if self.artifact_cleanup_path(&request).file_name()
+                != Some(entry.file_name().as_os_str())
+            {
+                return Err(CacheError::UnsafeEntry);
+            }
+            self.read_artifact_cleanup_locked(&request)?;
+            pending.push(request);
+        }
+        pending.sort_by_key(|request| request.launch_id);
+        Ok(pending)
+    }
+    pub(crate) fn finish_artifact_cleanup(
+        &self,
+        request: &attune_common::workload_launch::LaunchRequest,
+        receipt: &attune_common::workload_artifact::ArtifactPublicationReceipt,
+    ) -> Result<()> {
+        let _lock = self.lock()?;
+        let evidence = self.read_artifact_cleanup_locked(request)?;
+        use attune_common::workload_artifact::ArtifactPublicationState;
+        if &receipt.request != request
+            || receipt.publication_id <= 0
+            || receipt.cleanup_receipt_id <= 0
+            || !matches!(
+                receipt.state,
+                ArtifactPublicationState::Complete | ArtifactPublicationState::Incomplete
+            )
+        {
+            return Err(CacheError::PinMismatch);
+        }
+        let nonce = evidence.manifest.engine_name_nonce.simple().to_string();
+        match fs::symlink_metadata(self.root.join("private").join(&nonce)) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+            Ok(_) => return Err(CacheError::ArtifactPending),
+        }
+        let mut persisted = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(self.root.join("artifacts-settled").join(nonce))?;
+        let metadata = persisted.metadata()?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o077 != 0
+            || metadata.len() > 8192
+        {
+            return Err(CacheError::UnsafeEntry);
+        }
+        let mut bytes = Vec::new();
+        (&mut persisted).take(8193).read_to_end(&mut bytes)?;
+        if bytes != serde_json::to_vec(receipt).map_err(|_| CacheError::PinMismatch)? {
+            return Err(CacheError::PinMismatch);
+        }
+        // Caller must first persist authenticated settlement and fsync owned
+        // nonce deletion. This removes only the exact validated queue record.
+        fs::remove_file(self.artifact_cleanup_path(request))?;
+        File::open(self.root.join("artifact-cleanup"))?.sync_all()?;
+        Ok(())
+    }
     /// File-backed artifact transport is separate from runtime publication.
     /// The fixed private subpath is not activated by the Engine builder until
     /// the CP artifact grant/state contract is integrated; never discard it as
@@ -429,7 +637,7 @@ impl CacheStore {
             "private/{}/artifacts",
             manifest.engine_name_nonce.simple()
         ));
-        self.validate_artifact_tree(&root)?;
+        self.validate_artifact_tree(&root, self.artifact_limits)?;
         let mut path = root;
         let components = Path::new(relative).components().collect::<Vec<_>>();
         for (index, component) in components.iter().enumerate() {
@@ -455,8 +663,70 @@ impl CacheStore {
         }
         Ok(file)
     }
-    fn validate_artifact_tree(&self, root: &Path) -> Result<()> {
-        let root_metadata = fs::symlink_metadata(root)?;
+    /// Validate the retained root before interpreting a selected file's
+    /// NotFound as Missing. A lost root/marker is LostStaging, not an empty
+    /// inventory. This is called only after authenticated removal settlement.
+    pub fn validate_settled_artifact_staging(
+        &self,
+        manifest: &LaunchManifest,
+        status: &attune_common::workload_launch::LaunchStatus,
+        limits: ArtifactLimits,
+    ) -> Result<()> {
+        use attune_common::workload_launch::{LaunchPurpose, LaunchState};
+        if !matches!(
+            manifest.purpose,
+            LaunchPurpose::Action | LaunchPurpose::Sensor | LaunchPurpose::CandidateTest
+        ) || status.validate_shape().is_err()
+            || status.state != LaunchState::Stopped
+            || status.request.launch_id != manifest.launch_id
+            || status.request.admitted_digest
+                != manifest
+                    .admitted_digest()
+                    .map_err(|_| CacheError::PinMismatch)?
+            || status.resource.as_ref().is_some_and(|resource| {
+                resource.engine_id != manifest.engine_id
+                    || resource.engine_name_nonce != manifest.engine_name_nonce
+                    || resource.admitted_digest != status.request.admitted_digest
+            })
+        {
+            return Err(CacheError::PinMismatch);
+        }
+        attune_common::workload_artifact::validate_inventory(&[], limits)
+            .map_err(|_| CacheError::Quota)?;
+        let _lock = self.lock()?;
+        let parent = self
+            .root
+            .join(format!("private/{}", manifest.engine_name_nonce.simple()));
+        let parent_metadata = fs::symlink_metadata(&parent)?;
+        let marker = fs::symlink_metadata(parent.join("artifact.pending"))?;
+        if !parent_metadata.is_dir()
+            || parent_metadata.uid() != unsafe { libc::geteuid() }
+            || !marker.is_file()
+            || marker.nlink() != 1
+            || marker.uid() != unsafe { libc::geteuid() }
+            || marker.mode() & 0o077 != 0
+            || marker.len() != 0
+        {
+            return Err(CacheError::UnsafeEntry);
+        }
+        self.validate_artifact_tree(
+            &parent.join("artifacts"),
+            ArtifactLimits {
+                max_total_bytes: limits
+                    .max_total_bytes
+                    .min(self.artifact_limits.max_total_bytes),
+                max_entries: limits.max_entries.min(self.artifact_limits.max_entries),
+            },
+        )
+    }
+    fn validate_artifact_tree(&self, root: &Path, limits: ArtifactLimits) -> Result<()> {
+        let root_metadata = fs::symlink_metadata(root).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                CacheError::LostArtifactStaging
+            } else {
+                CacheError::Io(error)
+            }
+        })?;
         if !root_metadata.is_dir() {
             return Err(CacheError::UnsafeEntry);
         }
@@ -467,14 +737,14 @@ impl CacheStore {
                 let entry = entry?;
                 let metadata = fs::symlink_metadata(entry.path())?;
                 files = files.checked_add(1).ok_or(CacheError::Quota)?;
-                if files > self.artifact_limits.max_entries {
+                if files > limits.max_entries {
                     return Err(CacheError::Quota);
                 }
                 if metadata.is_dir() {
                     directories.push(entry.path());
                 } else if metadata.is_file() && metadata.nlink() == 1 {
                     bytes = bytes.checked_add(metadata.len()).ok_or(CacheError::Quota)?;
-                    if bytes > self.artifact_limits.max_total_bytes {
+                    if bytes > limits.max_total_bytes {
                         return Err(CacheError::Quota);
                     }
                 } else {
@@ -1076,6 +1346,31 @@ fn seal_tree(root: &Path, container_root: &str) -> Result<()> {
     fs::set_permissions(root, fs::Permissions::from_mode(0o555))?;
     Ok(())
 }
+fn validate_artifact_status(
+    manifest: &LaunchManifest,
+    status: &attune_common::workload_launch::LaunchStatus,
+) -> Result<()> {
+    use attune_common::workload_launch::{LaunchPurpose, LaunchState};
+    if !matches!(
+        manifest.purpose,
+        LaunchPurpose::Action | LaunchPurpose::Sensor | LaunchPurpose::CandidateTest
+    ) || status.validate_shape().is_err()
+        || status.state != LaunchState::Stopped
+        || status.request.launch_id != manifest.launch_id
+        || status.request.admitted_digest
+            != manifest
+                .admitted_digest()
+                .map_err(|_| CacheError::PinMismatch)?
+        || status.resource.as_ref().is_some_and(|resource| {
+            resource.engine_id != manifest.engine_id
+                || resource.engine_name_nonce != manifest.engine_name_nonce
+                || resource.admitted_digest != status.request.admitted_digest
+        })
+    {
+        return Err(CacheError::PinMismatch);
+    }
+    Ok(())
+}
 fn make_workload_owned(path: &Path, owner: WorkloadOwner) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let name =
@@ -1493,6 +1788,27 @@ mod tests {
             .read_to_end(&mut bytes)
             .unwrap();
         assert_eq!(bytes, b"owned-file");
+        store
+            .validate_settled_artifact_staging(
+                &spec.manifest,
+                &status,
+                ArtifactLimits {
+                    max_total_bytes: 32,
+                    max_entries: 4,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            store.validate_settled_artifact_staging(
+                &spec.manifest,
+                &status,
+                ArtifactLimits {
+                    max_total_bytes: 8,
+                    max_entries: 4
+                }
+            ),
+            Err(CacheError::Quota)
+        ));
         fs::write(directory.join("empty"), []).unwrap();
         assert_eq!(
             store

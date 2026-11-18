@@ -107,7 +107,13 @@ authority remains controller-only and that missing inputs fail rendering. Its
 synthetic pins/files are not installable images, sessions or TLS evidence.
 
 `scripts/test-workload-controller-project.py --owned-engine-socket <socket>` is
-the real image/project lane. It builds the candidate controller image, uses owned
+the real image/project lane. Before a cold build it tests the pinned Nginx image
+as uid1000 with no capabilities, read-only root and bounded private tmp: actual
+bound-key readability, `nginx -t` and foreground master startup. Every compiled
+module's temporary path stays under that tmp. The probes acknowledge owned
+Stop+Wait+Remove; early sanitized category/status records are retained under
+`.scratch/e2e-diagnostics/` without raw Nginx logs or private key bytes.
+It then builds the candidate controller image, uses owned
 TLS keys/public CA and a deliberately denying CP protocol fixture, then checks
 actual startup/binding, HTTPS trust/hostname failures, proxy grants, external
 plaintext denial, authority mounts/capabilities and private-marker log absence.

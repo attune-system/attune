@@ -675,4 +675,79 @@ mod tests {
             ));
         }
     }
+
+    #[tokio::test]
+    async fn stalled_output_authorization_releases_session_lock_by_lease_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}/", listener.local_addr().unwrap());
+        let cp = ControlPlane::new(
+            origin.parse().unwrap(),
+            LaunchToken::new("owned-controller".into()).unwrap(),
+        )
+        .unwrap();
+        let request = LaunchRequest {
+            launch_id: 1,
+            admitted_digest: Sha256Digest::of_bytes(b"manifest"),
+        };
+        let lease = LaunchLease {
+            purpose: LaunchLeasePurpose::Run,
+            handle: LaunchHandle {
+                launch_id: 1,
+                admitted_digest: request.admitted_digest.clone(),
+                lease_id: uuid::Uuid::new_v4(),
+                lease_generation: 1,
+                lease_deadline: Utc::now() + chrono::Duration::seconds(1),
+                engine_id: 5,
+                engine_name_nonce: uuid::Uuid::new_v4(),
+            },
+            token: LaunchToken::new("owned-lease".into()).unwrap(),
+        };
+        let session = Arc::new(RunSession::new(request, 4096).unwrap());
+        session.replace_lease(lease).await;
+        let (entered, received) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            assert!(socket.read(&mut bytes).await.unwrap() > 0);
+            entered.send(()).unwrap();
+            let _ = released.await;
+            socket.shutdown().await.unwrap();
+        });
+        let reading = tokio::spawn({
+            let cp = cp.clone();
+            let session = session.clone();
+            async move {
+                session
+                    .read(
+                        &cp,
+                        &LaunchToken::new("owned-output".into()).unwrap(),
+                        LaunchIoChannel::Stdout,
+                        0,
+                        64,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), received)
+            .await
+            .unwrap()
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), reading)
+            .await
+            .unwrap()
+            .unwrap();
+        let available = tokio::time::timeout(Duration::from_secs(1), session.lease())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+        assert!(available.handle.lease_deadline <= Utc::now());
+        assert!(matches!(
+            session.renew(&cp).await,
+            Err(ActuatorError::Authority)
+        ));
+        release.send(()).unwrap();
+        server.await.unwrap();
+    }
 }

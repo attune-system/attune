@@ -224,6 +224,20 @@ reporting. A failure remains not-ready until CP native-operation fencing returns
 an authenticated incomplete cleanup receipt. These transport/FS tests do not
 prove actual CP publication/discovery effects, which remain incomplete.
 
+The inactive artifact reconciler persists a canonical public cleanup record
+before its first artifact claim, including a claim that can immediately settle
+an empty inventory. This root-owned, single-link, nofollow `0600` record contains
+the exact immutable manifest and authenticated Stopped status, never invocation,
+input or tokens. The queue is bounded to 256 records of at most 4MiB each.
+Restart recovery uses that historical removal evidence and a freshly
+authenticated dedicated-controller claim to replay the native-settlement
+receipt, without dispatch reconstruction or private resolve. Stage deletion and
+the retained receipt are fsynced before queue deletion. Lost/malformed evidence
+is incomplete recovery, not permission to guess a directory or remove it.
+Whole-tree loss/invalidity uses explicit failure dispositions; it is never
+reported as a selected missing file. This reconciler remains unscheduled until
+actual CP effects and the artifact mount are integrated and validated.
+
 Count-only `authorize-io` is rejected for stdin. The controller now sends the
 exact immutable bounded bytes to dedicated `authorize-stdin` over HTTPS, with
 explicit development-only plaintext policy for owned fixtures. It consumes the
@@ -235,6 +249,10 @@ missing/denied authorization still fails closed without a generic fallback. No p
 plan submission substitutes for that authorization. Packaged Engine fixtures
 exercise actual stdin delivery directly as boundary tests; they do not attest
 this unfinished CP authority/host-consumer contract.
+
+Finite raw-output authorization is bounded by the current lease deadline, so a
+stalled CP request cannot retain the session lock beyond that lease and postpone
+local renewal failure/stop. Authorization failure never returns buffered output.
 
 The separate external Engine/controller Compose project and its public config
 generator are described in [the draft deployment contract](docker-launch-controller.md).
