@@ -216,7 +216,14 @@ impl Fixture {
         .await;
         // Test teardown joins exact provider removal even when an assertion or
         // effect fails. Never remove unrelated Pods/volumes by name prefix/age.
-        let cleanup = self.cleanup(&resource).await;
+        let cleanup = if matches!(&result, Ok(Ok(_))) {
+            self.launcher
+                .remove_stopped(spec, &resource)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        } else {
+            self.cleanup(&resource).await
+        };
         cleanup?;
         result?
     }
@@ -271,7 +278,9 @@ async fn reconcile_missing_intent_never_creates_and_changed_uid_never_starts() -
         *pod_uid = Uuid::new_v4().to_string();
     }
     let rejected = f.launcher.start(&spec, &changed).await.is_err();
+    let rejected_cleanup = f.launcher.remove_stopped(&spec, &changed).await.is_err();
     f.cleanup(&resource).await?;
     assert!(rejected);
+    assert!(rejected_cleanup);
     Ok(())
 }
