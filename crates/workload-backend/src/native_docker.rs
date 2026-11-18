@@ -355,6 +355,35 @@ impl DockerLauncher {
         }
         Ok(())
     }
+    /// Read the fixed private Setup stage only after exact successful Wait.
+    /// No Engine archive API or caller pathname; existing runtime publication
+    /// and its receipt remain the trusted owning loop's responsibility.
+    pub async fn archive_stopped_stage(
+        &self,
+        spec: &ProcessSpec,
+        resource: &ResourceIdentity,
+    ) -> attune_common::Result<std::fs::File> {
+        self.cache
+            .native_stage_limits(spec)
+            .map_err(|_| common_error(EngineError::OwnershipMismatch))?;
+        let (id, state) = self
+            .cleanup_exact(spec, resource)
+            .await
+            .map_err(common_error)?;
+        if state != "exited" {
+            return Err(common_error(EngineError::OwnershipMismatch));
+        }
+        let outcome = self.wait_id(&id).await.map_err(common_error)?;
+        if outcome.exit_code != 0 || outcome.oom_killed {
+            return Err(common_error(EngineError::OwnershipMismatch));
+        }
+        let cache = self.cache.clone();
+        let selected = spec.clone();
+        tokio::task::spawn_blocking(move || cache.archive_native_stage(&selected))
+            .await
+            .map_err(|_| common_error(EngineError::Transport))?
+            .map_err(|_| common_error(EngineError::OwnershipMismatch))
+    }
     async fn wait_id(&self, id: &str) -> Result<LaunchExitOutcome> {
         let response = self
             .engine

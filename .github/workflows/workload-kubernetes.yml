@@ -35,11 +35,25 @@ jobs:
             kubectl_sha: 922df28df248cc00a9e025f947704f1d1482de64ece54cfe57e61f19eaf1eef3
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: attune
+          POSTGRES_PASSWORD: attune
+          POSTGRES_DB: postgres
+        ports:
+          - 5432/tcp
+        options: >-
+          --shm-size 256m
+          --health-cmd "pg_isready -U attune -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     env:
       SQLX_OFFLINE: 'true'
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_TEST_DEBUG: '0'
-      ATTUNE_TEST_RUN_ID: k8s-${{ matrix.arch }}
       ATTUNE_ISOLATION_TEST_PLATFORM: linux/${{ matrix.arch }}
       TEST_ARCH: ${{ matrix.arch }}
       RUST_TARGET: ${{ matrix.target }}
@@ -76,7 +90,20 @@ jobs:
           echo "$RUNNER_TEMP/workload-zig/bin" >> "$GITHUB_PATH"
           cargo install --locked cargo-zigbuild --version 0.23.4
       - name: Verify TLS client construction before image and cluster work
+        env:
+          ATTUNE_TEST_RUN_ID: kubetls-${{ matrix.arch }}
         run: cargo test --locked -p attune-workload-backend --test kubernetes_tls_client -- --nocapture --test-threads=4
+      - name: Prepare this job's disposable PostgreSQL database
+        env:
+          TEST_DB_ADMIN_URL: postgresql://attune:attune@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/postgres
+          TEST_DB_URL: postgresql://attune:attune@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/attune_test
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install --yes --no-install-recommends postgresql-client
+          cargo install --locked sqlx-cli --version 0.9.0 --no-default-features --features postgres,rustls
+          make db-test-setup
       - name: Build exact candidate Runner and native echo once
         shell: bash
         run: |
@@ -190,7 +217,17 @@ jobs:
           test "$denied_status" -eq 1
           test "$denied_answer" = no
       - name: Run actual Pod effects and boundary assertions
+        env:
+          ATTUNE_TEST_RUN_ID: kubepod-${{ matrix.arch }}
         run: cargo test --locked -p attune-workload-backend --test kubernetes_provider -- --include-ignored --nocapture --test-threads=4
+      - name: Run owning worker capture custody completion and restart through the Pod
+        env:
+          ATTUNE_TEST_RUN_ID: kubeworker-${{ matrix.arch }}
+          TEST_DB_ADMIN_URL: postgresql://attune:attune@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/postgres
+          TEST_DB_URL: postgresql://attune:attune@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/attune_test
+          DATABASE_URL: postgresql://attune:attune@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/attune_test
+          ATTUNE__DATABASE__URL: postgresql://attune:attune@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/attune_test
+        run: cargo test --locked -p attune-worker --test isolated_action_provider_tests -- --include-ignored --nocapture --test-threads=4
       - name: Remove and acknowledge only this run's cluster
         if: ${{ always() }}
         shell: bash
