@@ -629,6 +629,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "attune-launch-controller"
+version = "0.11.1"
+dependencies = [
+ "async-trait",
+ "attune-common",
+ "axum",
+ "bytes",
+ "chrono",
+ "futures",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "zip",
+]
+
+[[package]]
 name = "attune-notifier"
 version = "0.11.1"
 dependencies = [

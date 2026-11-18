@@ -44,10 +44,12 @@ COPY crates/worker/Cargo.toml ./crates/worker/Cargo.toml
 COPY crates/notifier/Cargo.toml ./crates/notifier/Cargo.toml
 COPY crates/supervisor/Cargo.toml ./crates/supervisor/Cargo.toml
 COPY crates/cli/Cargo.toml ./crates/cli/Cargo.toml
+COPY crates/launch-controller/Cargo.toml ./crates/launch-controller/Cargo.toml
 
 # Create minimal stub sources so cargo can resolve the workspace and fetch deps.
 # These are ONLY used for `cargo fetch` — never compiled.
-RUN mkdir -p crates/common/src && echo "" > crates/common/src/lib.rs && \
+RUN mkdir -p crates/launch-controller/src && echo "" > crates/launch-controller/src/lib.rs && \
+    mkdir -p crates/common/src && echo "" > crates/common/src/lib.rs && \
     mkdir -p crates/api/src && echo "fn main(){}" > crates/api/src/main.rs && \
     mkdir -p crates/executor/src && echo "fn main(){}" > crates/executor/src/main.rs && \
     mkdir -p crates/executor/benches && echo "fn main(){}" > crates/executor/benches/context_clone.rs && \

@@ -1,5 +1,12 @@
 # Pack workload isolation
 
+**Implementation status: work in progress.** The current Compose/container
+entrypoints do not yet satisfy the complete supported isolation contract. The
+host Bubblewrap boundary below fails closed where namespace prerequisites are
+unavailable; host test success does not make the primary deployment supported.
+The Docker launch-controller candidate is being implemented separately and is
+not yet an enabled or complete execution backend.
+
 Worker and sensor services use Linux Bubblewrap by default. Unset
 `ATTUNE_WORKLOAD_SANDBOX` and `bubblewrap` select isolation.
 `ATTUNE_WORKLOAD_SANDBOX=trusted-only` explicitly permits host execution of
@@ -108,3 +115,41 @@ unsupported result for local runtime probing; use registered worker capability
 validation. Its pure pack-version dependency checks remain available. This
 removes another inherited-environment subprocess path without requiring the API
 host to execute pack runtime code.
+
+## Docker launch-controller candidate
+
+`crates/launch-controller` currently contains the typed control-plane client,
+fixed-policy Docker Engine API transport, bounded ephemeral raw-stream capture,
+and controller-owned input/stage cache primitives. Service lifecycle, recovery,
+runtime adapters and deployment integration remain incomplete. These primitives
+are not an authorization path for callers to submit commands or Docker config.
+Only control-plane admitted launch IDs and manifest digests may select execution;
+the private invocation comes from the authenticated control plane.
+
+The candidate requires a colocated Unix-socket Engine and a fixed named volume.
+Workloads receive only selected subpaths: immutable inputs read-only and a unique
+attempt-private stage or candidate copy writable. They receive neither the
+Engine socket nor control-plane/manager credentials. The Engine supplies normal
+private procfs; the rejected empty-proc prototype is not a supported ABI.
+Startup must prove exact controller/Engine volume binding before accepting work.
+The control plane and secret-bearing managers belong outside the workload host;
+the full placement and enrollment contract remains part of integration work.
+
+All Pack, Runtime, Runner and StageArchive bodies use canonical `application/zip`.
+`common::workload_archive` supplies one pure validator for both the controller and
+API publication. It checks compressed/decompressed/file-count bounds, full CRC
+reads, canonical POSIX paths, implicit directories and the complete internal
+symlink graph. Absolute links within the selected fixed root retain their exact
+bytes; external links, link cycles, file/link parents and escaping compositions
+are rejected. Runtime creation uses a stable `/opt/attune/runtime` install path;
+Python venvs require `--copies` because image-external interpreter links are not
+portable archive inputs. Filesystem staging additionally rejects hardlinks and
+special files without following them. Publication requires successful setup and
+acknowledged container Wait **and Remove**, with fresh control-plane authority.
+
+Archive/output bounds, free-space admission, concurrency limits and owned cleanup
+are availability controls, **not live filesystem byte/inode quotas**. A writable
+named-volume stage can exhaust host disk before validation. This residual risk
+must be assessed explicitly during security review; no hard-quota guarantee is
+claimed. Network isolation is also not provided; admitted API access remains
+necessary. Current chart/image defaults do not implement this candidate.
