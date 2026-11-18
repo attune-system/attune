@@ -2153,7 +2153,8 @@ impl ActionExecutor {
             .ok_or_else(|| Error::PermissionDenied("Isolated action owner unavailable".into()))?;
         tx.commit().await?;
         Effects::reserve(&self.pool, &spec, owner, &selected, master).await?;
-        let resource = launcher.prepare(&spec).await?;
+        let create = Effects::begin_create(&self.pool, spec.intent, master).await?;
+        let resource = launcher.prepare(&spec, create).await?;
         Effects::record_resource(&self.pool, spec.intent, &resource).await?;
         let process = launcher.start(&spec, &resource).await?;
         if process.resource != resource {

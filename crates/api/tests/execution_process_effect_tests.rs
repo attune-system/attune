@@ -33,6 +33,10 @@ async fn admitted(
     let instance = Uuid::new_v4();
     sqlx::query("UPDATE worker SET meta=COALESCE(meta,'{}'::jsonb)||jsonb_build_object('registration_incarnation',$2::text) WHERE id=$1")
         .bind(worker).bind(instance.to_string()).execute(&ctx.pool).await?;
+    attune_common::repositories::runtime::WorkerRepository::heartbeat_incarnation(
+        &ctx.pool, worker, instance,
+    )
+    .await?;
     sqlx::query("UPDATE execution SET timeout_seconds=300,config=$2 WHERE id=$1")
         .bind(execution)
         .bind(json!({"value":"owned-private-parameters"}))
@@ -98,6 +102,22 @@ async fn exact_process_input_is_encrypted_and_consumed_once_across_recovery() ->
     let owner = ctx.user.as_ref().unwrap().id;
     let master = ctx.state.config.security.encryption_key.as_deref().unwrap();
     Effects::reserve(&ctx.pool, &spec, owner, &selected, master).await?;
+    assert_eq!(
+        Effects::begin_create(&ctx.pool, spec.intent, master).await?,
+        attune_common::isolated_process::ProcessCreateDisposition::CreateOnce
+    );
+    // A recovered caller cannot receive another first-submit decision when an
+    // earlier provider request has no recorded outcome/resource.
+    let absent: bool =
+        sqlx::query_scalar("SELECT resource IS NULL FROM execution_process_effect WHERE intent=$1")
+            .bind(spec.intent)
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert!(absent);
+    assert_eq!(
+        Effects::begin_create(&ctx.pool, spec.intent, master).await?,
+        attune_common::isolated_process::ProcessCreateDisposition::ReconcileOnly
+    );
     Effects::record_resource(&ctx.pool, spec.intent, &resource).await?;
     let ciphertext: String = sqlx::query_scalar(
         "SELECT encrypted_context FROM execution_process_effect WHERE intent=$1",
@@ -113,6 +133,10 @@ async fn exact_process_input_is_encrypted_and_consumed_once_across_recovery() ->
     // fresh write, even though the original immutable plan remains available.
     let retained = Effects::retained_spec(&ctx.pool, spec.intent, master).await?;
     assert_eq!(retained.intent, spec.intent);
+    assert_eq!(
+        Effects::begin_create(&ctx.pool, spec.intent, master).await?,
+        attune_common::isolated_process::ProcessCreateDisposition::ReconcileOnly
+    );
     assert!(
         Effects::consume_stdin(&ctx.pool, spec.intent, &resource, master)
             .await
@@ -133,6 +157,10 @@ async fn process_gate_rejects_changed_pod_uid_stop_and_revoke_restore() -> Resul
     let owner = ctx.user.as_ref().unwrap().id;
     let (spec, selected, resource) = admitted(&ctx).await?;
     Effects::reserve(&ctx.pool, &spec, owner, &selected, master).await?;
+    assert_eq!(
+        Effects::begin_create(&ctx.pool, spec.intent, master).await?,
+        attune_common::isolated_process::ProcessCreateDisposition::CreateOnce
+    );
     Effects::record_resource(&ctx.pool, spec.intent, &resource).await?;
     let mut changed = resource.clone();
     if let ResourceIdentity::Kubernetes { pod_uid, .. } = &mut changed {
@@ -162,6 +190,10 @@ async fn process_gate_rejects_changed_pod_uid_stop_and_revoke_restore() -> Resul
     // Restoration permits a separate newly admitted operation, never revival.
     let (new, selected, new_resource) = admitted(&ctx).await?;
     Effects::reserve(&ctx.pool, &new, owner, &selected, master).await?;
+    assert_eq!(
+        Effects::begin_create(&ctx.pool, new.intent, master).await?,
+        attune_common::isolated_process::ProcessCreateDisposition::CreateOnce
+    );
     Effects::record_resource(&ctx.pool, new.intent, &new_resource).await?;
     Effects::request_stop(&ctx.pool, new.intent).await?;
     assert!(
@@ -171,6 +203,10 @@ async fn process_gate_rejects_changed_pod_uid_stop_and_revoke_restore() -> Resul
     );
     let (fresh, selected, fresh_resource) = admitted(&ctx).await?;
     Effects::reserve(&ctx.pool, &fresh, owner, &selected, master).await?;
+    assert_eq!(
+        Effects::begin_create(&ctx.pool, fresh.intent, master).await?,
+        attune_common::isolated_process::ProcessCreateDisposition::CreateOnce
+    );
     Effects::record_resource(&ctx.pool, fresh.intent, &fresh_resource).await?;
     assert!(
         Effects::consume_stdin(&ctx.pool, fresh.intent, &fresh_resource, master)

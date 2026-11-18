@@ -61,6 +61,10 @@ impl Fixture {
         let instance = Uuid::new_v4();
         sqlx::query("UPDATE worker SET meta=COALESCE(meta,'{}'::jsonb)||jsonb_build_object('registration_incarnation',$2::text) WHERE id=$1")
             .bind(worker).bind(instance.to_string()).execute(&ctx.pool).await?;
+        attune_common::repositories::runtime::WorkerRepository::heartbeat_incarnation(
+            &ctx.pool, worker, instance,
+        )
+        .await?;
         let mut tx = ctx.pool.begin().await?;
         let attempt = DelegatedExecutionRepository::current_attempt(&mut tx, execution.id).await?;
         tx.commit().await?;

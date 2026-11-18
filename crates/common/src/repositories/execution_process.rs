@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{
     crypto,
-    isolated_process::{ProcessSpec, ResourceIdentity},
+    isolated_process::{ProcessCreateDisposition, ProcessSpec, ResourceIdentity},
     workload_launch::{
         LaunchInvocation, LaunchPlatform, LaunchPurpose, LaunchTarget, PackAccess, PinnedImage,
         PinnedLaunchInput, PrivateStage,
@@ -21,7 +21,7 @@ use sqlx::{types::Json, PgPool};
 use uuid::Uuid;
 
 const COLUMNS: &str =
-    "intent,target,encrypted_context,source_epochs,resource,stdin_consumed,stop_requested";
+    "intent,target,encrypted_context,source_epochs,resource,stdin_consumed,stop_requested,create_submitted";
 fn denied() -> Error {
     Error::PermissionDenied("Execution process effect unavailable".into())
 }
@@ -86,6 +86,7 @@ struct Record {
     resource: Option<Json<ResourceIdentity>>,
     stdin_consumed: bool,
     stop_requested: bool,
+    create_submitted: bool,
 }
 impl Record {
     fn context(&self, master: &str) -> Result<FrozenProcess> {
@@ -164,6 +165,56 @@ impl ExecutionProcessRepository {
         fresh(proof.deadline)
     }
 
+    /// The acknowledged durable first-submit decision precedes any provider
+    /// create. All subsequent calls are reconciliation-only, including after a
+    /// lost COMMIT acknowledgement or source revocation. Reconciliation cannot
+    /// release the payload gate or prove provider absence from a 404.
+    pub async fn begin_create(
+        pool: &PgPool,
+        intent: Uuid,
+        master: &str,
+    ) -> Result<ProcessCreateDisposition> {
+        let mut tx = pool.begin().await?;
+        let snapshot: Record = sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM execution_process_effect WHERE intent=$1"
+        ))
+        .bind(intent)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(denied)?;
+        if snapshot.create_submitted || snapshot.stop_requested {
+            return Ok(ProcessCreateDisposition::ReconcileOnly);
+        }
+        let context = snapshot.context(master)?;
+        let proof =
+            WorkloadLaunchRepository::source(&mut tx, &context.target, context.owner).await?;
+        let epochs = workload_source::snapshot(&mut tx, proof.sources).await?;
+        let record: Record = sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM execution_process_effect WHERE intent=$1 FOR UPDATE"
+        ))
+        .bind(intent)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(denied)?;
+        if record.create_submitted || record.stop_requested {
+            return Ok(ProcessCreateDisposition::ReconcileOnly);
+        }
+        if record.encrypted_context != snapshot.encrypted_context
+            || record.source_epochs.0 != epochs
+        {
+            return Err(denied());
+        }
+        fresh_on(&mut tx, proof.deadline).await?;
+        sqlx::query("UPDATE execution_process_effect SET create_submitted=TRUE WHERE intent=$1")
+            .bind(intent)
+            .execute(&mut *tx)
+            .await?;
+        fresh_on(&mut tx, proof.deadline).await?;
+        tx.commit().await?;
+        fresh(proof.deadline)?;
+        Ok(ProcessCreateDisposition::CreateOnce)
+    }
+
     /// Provider identity remains recordable after source revocation so cleanup
     /// can retain exact ownership. It never grants start/input authority.
     pub async fn record_resource(
@@ -235,6 +286,7 @@ impl ExecutionProcessRepository {
         .ok_or_else(denied)?;
         if record.encrypted_context != snapshot.encrypted_context
             || record.source_epochs.0 != epochs
+            || !record.create_submitted
             || record.stdin_consumed
             || record.stop_requested
             || record.resource.as_ref().map(|r| &r.0) != Some(resource)
