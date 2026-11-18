@@ -225,6 +225,31 @@ pub struct ArtifactFileDispositionReceipt {
     pub disposition: ArtifactFileDisposition,
 }
 
+/// Finite public reason classes only. Raw OS errors, file names and bytes never
+/// become a second unstructured output channel in failure/audit metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactPublicationFailureReason {
+    InvalidTree,
+    LimitExceeded,
+    Unreadable,
+    LostStaging,
+}
+
+/// Negative settlement request, not a proof of provider absence. The CP closes
+/// unstarted inventory first, then fences all owned native operations before a
+/// terminal cleanup receipt can be issued. Missing is a distinct exact-file
+/// report; it must never stand in for these whole-tree failures.
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FailArtifactPublication {
+    pub request: LaunchRequest,
+    pub publication_id: i64,
+    pub lease_id: Uuid,
+    pub generation: i64,
+    pub reason: ArtifactPublicationFailureReason,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
