@@ -9,8 +9,8 @@ use crate::{
     crypto,
     isolated_process::{ProcessCreateDisposition, ProcessSpec, ResourceIdentity},
     workload_launch::{
-        LaunchInvocation, LaunchPlatform, LaunchPurpose, LaunchTarget, PackAccess, PinnedImage,
-        PinnedLaunchInput, PrivateStage,
+        LaunchExitOutcome, LaunchInvocation, LaunchPlatform, LaunchPurpose, LaunchTarget,
+        PackAccess, PinnedImage, PinnedLaunchInput, PrivateStage,
     },
     workload_stdin::LaunchStdinPayload,
     Error, Result,
@@ -21,7 +21,7 @@ use sqlx::{types::Json, PgPool};
 use uuid::Uuid;
 
 const COLUMNS: &str =
-    "intent,target,encrypted_context,source_epochs,resource,stdin_consumed,stop_requested,create_submitted";
+    "intent,target,encrypted_context,source_epochs,resource,stdin_consumed,stop_requested,create_submitted,exit_outcome";
 fn denied() -> Error {
     Error::PermissionDenied("Execution process effect unavailable".into())
 }
@@ -87,6 +87,14 @@ struct Record {
     stdin_consumed: bool,
     stop_requested: bool,
     create_submitted: bool,
+    exit_outcome: Option<Json<LaunchExitOutcome>>,
+}
+
+#[derive(sqlx::FromRow)]
+struct RuntimeFence {
+    intent: Uuid,
+    target: Json<LaunchTarget>,
+    source_epochs: Json<Vec<SourceEpoch>>,
 }
 impl Record {
     fn context(&self, master: &str) -> Result<FrozenProcess> {
@@ -101,6 +109,70 @@ impl Record {
 
 pub struct ExecutionProcessRepository;
 impl ExecutionProcessRepository {
+    /// Runtime token consumers retain this fence through their own effect
+    /// transaction. Native exit/stop waits for admitted calls, then closes new
+    /// allocation even while execution remains Running for log custody drain.
+    pub(crate) async fn retain_runtime_run(
+        connection: &mut sqlx::PgConnection,
+        execution: i64,
+        attempt: Uuid,
+    ) -> Result<()> {
+        let snapshot: Option<RuntimeFence> = sqlx::query_as(
+            "SELECT intent,target,source_epochs FROM execution_process_effect \
+             WHERE target->>'kind'='execution' AND (target->>'execution')::BIGINT=$1 \
+             AND target->>'attempt'=$2",
+        )
+        .bind(execution)
+        .bind(attempt.to_string())
+        .fetch_optional(&mut *connection)
+        .await?;
+        let Some(snapshot) = snapshot else {
+            // Non-process producers retain their existing admission contracts.
+            // Isolated process evidence cannot disappear: its deletion guard
+            // retains the original attempt's closure/tombstone independently.
+            return Ok(());
+        };
+        let LaunchTarget::Execution {
+            worker,
+            worker_instance,
+            ..
+        } = snapshot.target.0
+        else {
+            return Err(denied());
+        };
+        let current: Option<Uuid> = sqlx::query_scalar(
+            "SELECT (meta->>'registration_incarnation')::UUID FROM worker \
+             WHERE id=$1 AND status IN ('active','busy') \
+             AND last_heartbeat>clock_timestamp()-interval '90 seconds' FOR SHARE",
+        )
+        .bind(worker)
+        .fetch_optional(&mut *connection)
+        .await?;
+        if current != Some(worker_instance) {
+            return Err(denied());
+        }
+        let sources = snapshot
+            .source_epochs
+            .iter()
+            .map(|epoch| (epoch.kind.as_str(), epoch.subject))
+            .collect();
+        let current = workload_source::snapshot(connection, sources).await?;
+        if current != snapshot.source_epochs.0 {
+            return Err(denied());
+        }
+        let open: bool = sqlx::query_scalar(
+            "SELECT NOT stop_requested AND exit_outcome IS NULL AND stdin_consumed \
+             AND resource IS NOT NULL FROM execution_process_effect WHERE intent=$1 FOR SHARE",
+        )
+        .bind(snapshot.intent)
+        .fetch_one(connection)
+        .await?;
+        if !open {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
     /// Reserve BEFORE provider creation. A retry with changed private context
     /// is denied; randomized ciphertext has no public plaintext-secret digest.
     pub async fn reserve(
@@ -155,6 +227,7 @@ impl ExecutionProcessRepository {
             || record.source_epochs.0 != epochs
             || record.stop_requested
             || record.stdin_consumed
+            || record.exit_outcome.is_some()
         {
             return Err(denied());
         }
@@ -289,6 +362,7 @@ impl ExecutionProcessRepository {
             || !record.create_submitted
             || record.stdin_consumed
             || record.stop_requested
+            || record.exit_outcome.is_some()
             || record.resource.as_ref().map(|r| &r.0) != Some(resource)
         {
             return Err(denied());
@@ -307,6 +381,152 @@ impl ExecutionProcessRepository {
         LaunchStdinPayload::from_bytes(context.stdin.into_bytes())
     }
 
+    /// Record only the exact native resource's terminal outcome. It closes
+    /// runtime API effects while capture/publication may still be finalizing.
+    pub async fn record_exit(
+        pool: &PgPool,
+        intent: Uuid,
+        resource: &ResourceIdentity,
+        outcome: LaunchExitOutcome,
+    ) -> Result<()> {
+        let mut tx = pool.begin().await?;
+        let record: Record = sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM execution_process_effect WHERE intent=$1 FOR UPDATE"
+        ))
+        .bind(intent)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(denied)?;
+        if record.resource.as_ref().map(|value| &value.0) != Some(resource)
+            || !record.create_submitted
+            || record
+                .exit_outcome
+                .as_ref()
+                .is_some_and(|value| value.0 != outcome)
+        {
+            return Err(denied());
+        }
+        sqlx::query("UPDATE execution_process_effect SET exit_outcome=$2 WHERE intent=$1")
+            .bind(intent)
+            .bind(Json(outcome))
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Hold native attempt and publication fences through the caller's output
+    /// protection and terminal transition transaction. A historical committed
+    /// terminal transition is acknowledged without replaying result writes.
+    pub async fn lock_completion(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        intent: Uuid,
+        master: &str,
+    ) -> Result<Option<super::execution::ExecutionTransition>> {
+        use super::{execution::ExecutionRepository, FindById};
+        use crate::models::ExecutionStatus;
+        let snapshot: Record = sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM execution_process_effect WHERE intent=$1"
+        ))
+        .bind(intent)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(denied)?;
+        let context = snapshot.context(master)?;
+        let LaunchTarget::Execution {
+            execution,
+            worker,
+            attempt,
+            ..
+        } = context.target
+        else {
+            return Err(denied());
+        };
+        // Transaction-owned serialization precedes all source locks. It avoids
+        // two completion callers both holding shared source locks while trying
+        // to upgrade the same execution row. No session lock spans COMMIT.
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtextextended('execution-process-completion',$1))",
+        )
+        .bind(execution)
+        .execute(&mut **tx)
+        .await?;
+        let current = ExecutionRepository::find_by_id(&mut **tx, execution)
+            .await?
+            .ok_or_else(denied)?;
+        let terminal = matches!(
+            current.status,
+            ExecutionStatus::Completed
+                | ExecutionStatus::Failed
+                | ExecutionStatus::Timeout
+                | ExecutionStatus::Cancelled
+        );
+        if terminal {
+            let current = ExecutionRepository::find_by_id_for_update(tx, execution)
+                .await?
+                .ok_or_else(denied)?;
+            let mode =
+            super::execution_runtime_admission::ExecutionAdmissionRepository::selected_authority(
+                tx, execution,
+            )
+            .await?;
+            let same_attempt: bool = match mode {
+            super::execution_runtime_admission::ExistingExecutionAuthority::Delegated => {
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM delegated_execution_attempt WHERE execution=$1 AND worker=$2 AND attempt=$3)")
+                    .bind(execution).bind(worker).bind(attempt).fetch_one(&mut **tx).await?
+            }
+            super::execution_runtime_admission::ExistingExecutionAuthority::Recorded => {
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM runtime_authority_execution_fence WHERE execution=$1 AND attempt=$2)")
+                    .bind(execution).bind(attempt).fetch_one(&mut **tx).await?
+            }
+        };
+            let record: Record = sqlx::query_as(&format!(
+                "SELECT {COLUMNS} FROM execution_process_effect WHERE intent=$1 FOR UPDATE"
+            ))
+            .bind(intent)
+            .fetch_one(&mut **tx)
+            .await?;
+            if current.worker != Some(worker)
+                || !same_attempt
+                || !record.stdin_consumed
+                || record.resource.is_none()
+                || record.exit_outcome.is_none()
+                || record.encrypted_context != snapshot.encrypted_context
+            {
+                return Err(denied());
+            }
+            return Ok(Some(super::execution::ExecutionTransition {
+                previous_status: current.status,
+                execution: current,
+            }));
+        }
+        let mut proof =
+            WorkloadLaunchRepository::source_for(tx, &context.target, context.owner, true).await?;
+        // Take the mutable execution source lock BEFORE epoch/operation locks.
+        // Input callers can finish without waiting behind an operation whose
+        // owner is itself waiting to upgrade their shared execution lock.
+        ExecutionRepository::find_by_id_for_update(tx, execution)
+            .await?
+            .ok_or_else(denied)?;
+        proof.sources.push(("execution_input", execution));
+        let epochs = workload_source::snapshot(tx, proof.sources).await?;
+        let record: Record = sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM execution_process_effect WHERE intent=$1 FOR UPDATE"
+        ))
+        .bind(intent)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !record.stdin_consumed
+            || record.resource.is_none()
+            || record.exit_outcome.is_none()
+            || record.encrypted_context != snapshot.encrypted_context
+            || record.source_epochs.0 != epochs
+        {
+            return Err(denied());
+        }
+        Ok(None)
+    }
+
     /// Retain the exact frozen plan for trusted recovery; this is not execution
     /// authorization. Recovery must consume the same source/attempt gate.
     pub async fn retained_spec(pool: &PgPool, intent: Uuid, master: &str) -> Result<ProcessSpec> {
@@ -318,6 +538,19 @@ impl ExecutionProcessRepository {
         .await?
         .ok_or_else(denied)?;
         Ok(record.context(master)?.spec())
+    }
+    /// Exact provider evidence for trusted cleanup. Absence is not a provider
+    /// settlement receipt; callers retain uncertain creation/publication.
+    pub async fn retained_resource(
+        pool: &PgPool,
+        intent: Uuid,
+    ) -> Result<Option<ResourceIdentity>> {
+        let resource: Option<Option<Json<ResourceIdentity>>> =
+            sqlx::query_scalar("SELECT resource FROM execution_process_effect WHERE intent=$1")
+                .bind(intent)
+                .fetch_optional(pool)
+                .await?;
+        Ok(resource.ok_or_else(denied)?.map(|value| value.0))
     }
     pub async fn request_stop(pool: &PgPool, intent: Uuid) -> Result<()> {
         let row =

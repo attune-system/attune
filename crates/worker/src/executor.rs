@@ -34,9 +34,7 @@ use attune_common::repositories::artifact::{
     classify_artifact, default_content_type_for_artifact, ArtifactRepository,
     ArtifactVersionRepository, CreateArtifactInput, UpdateArtifactInput,
 };
-use attune_common::repositories::execution::{
-    ExecutionRepository, ExecutionTransition, UpdateExecutionInput,
-};
+use attune_common::repositories::execution::{ExecutionRepository, ExecutionTransition};
 use attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository;
 use attune_common::repositories::runtime::WorkerRepository;
 use attune_common::repositories::runtime::SELECT_COLUMNS as RUNTIME_SELECT_COLUMNS;
@@ -103,55 +101,47 @@ pub struct ActionExecutor {
     runtime_versions_cache_by_runtime_id: Arc<MetadataCache<String, Vec<RuntimeVersionModel>>>,
 }
 
-/// Trusted CP configuration only. Deliberately neither serde nor Debug: JWT
-/// signing and master decryption material must never become a host/profile DTO.
-pub struct ControlExecutionSettings {
-    pub worker: i64,
-    pub instance: uuid::Uuid,
-    pub api_origin: reqwest::Url,
-    pub http_policy: attune_common::workload_launch_io::LaunchHttpPolicy,
-    pub jwt: JwtConfig,
-    pub encryption_key: String,
-    pub max_stdout_bytes: usize,
-    pub max_stderr_bytes: usize,
-    pub segments: attune_common::log_stream::SegmentedLogConfig,
-    pub recorded_readiness: crate::recorded_credentials::RecordedConsumerReadiness,
+/// Provider exit is durable evidence, not completion policy. This wrapper
+/// belongs to the existing trusted executor; it never enters a payload Pod.
+struct RecordingProcessControl {
+    inner: Arc<dyn attune_common::isolated_process::ProcessControl>,
+    pool: PgPool,
+    intent: uuid::Uuid,
+    resource: attune_common::isolated_process::ResourceIdentity,
 }
-
-/// Private selected data for the CP planner/completion path, never an external
-/// response. Retain schema and input paths when freezing the admitted context.
-pub struct ControlExecutionPreparation {
-    pub context: ExecutionContext,
-    pub schema: ActionSchemaBinding,
-    pub input_secret_paths: Option<Vec<String>>,
-    pub input_snapshot:
-        Option<attune_common::repositories::execution_input::ExecutionInputSnapshot>,
-}
-/// CP callers receive no local execute/setup/probe methods.
-pub struct ControlPlaneActionPreparer {
-    executor: ActionExecutor,
-}
-impl ControlPlaneActionPreparer {
-    pub async fn prepare_control_context(
+#[async_trait::async_trait]
+impl attune_common::isolated_process::ProcessControl for RecordingProcessControl {
+    async fn write_stdin_once(
         &self,
-        execution: i64,
-        attempt: uuid::Uuid,
-    ) -> Result<ControlExecutionPreparation> {
-        self.executor
-            .prepare_control_context(execution, attempt)
-            .await
+        payload: attune_common::workload_stdin::LaunchStdinPayload,
+    ) -> Result<()> {
+        self.inner.write_stdin_once(payload).await
     }
-}
-impl std::fmt::Debug for ControlExecutionPreparation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ControlExecutionPreparation")
-            .field("execution", &self.context.execution_id)
-            .field("parameter_count", &self.context.parameters.len())
-            .field(
-                "secret_path_count",
-                &self.input_secret_paths.as_ref().map(Vec::len),
-            )
-            .finish_non_exhaustive()
+    async fn wait(&self) -> Result<attune_common::workload_launch::LaunchExitOutcome> {
+        let outcome = self.inner.wait().await?;
+        attune_common::repositories::execution_process::ExecutionProcessRepository::record_exit(
+            &self.pool,
+            self.intent,
+            &self.resource,
+            outcome,
+        )
+        .await?;
+        Ok(outcome)
+    }
+    async fn stop(
+        &self,
+        reason: attune_common::workload_launch::LaunchStopReason,
+    ) -> Result<attune_common::workload_launch::LaunchExitOutcome> {
+        let fenced=attune_common::repositories::execution_process::ExecutionProcessRepository::request_stop(&self.pool,self.intent).await;
+        // Even a CP outage must not leave the exact owned payload running.
+        // Unknown persistence/stop acknowledgements never permit publication.
+        let outcome = self.inner.stop(reason).await?;
+        let recorded=attune_common::repositories::execution_process::ExecutionProcessRepository::record_exit(
+            &self.pool,self.intent,&self.resource,outcome,
+        ).await;
+        fenced?;
+        recorded?;
+        Ok(outcome)
     }
 }
 
@@ -344,6 +334,7 @@ impl ExecutionLogArtifactStream {
 /// Execution-scoped immutable contract and the authorized input paths observed
 /// while restoring parameters. Runtime reads/origins remain live at completion.
 struct ExecutionPreparation {
+    process_intent: Option<uuid::Uuid>,
     binding: ActionSchemaBinding,
     parameter_secret_paths: Option<Vec<String>>,
     input_snapshot: Option<attune_common::repositories::execution_input::ExecutionInputSnapshot>,
@@ -374,67 +365,6 @@ struct LogAllocationSettings {
 }
 
 impl ActionExecutor {
-    /// Empty runtime registry: this producer can prepare admitted values but
-    /// cannot execute a pack, setup hook or verification command on the CP.
-    pub fn for_control_plane(
-        pool: PgPool,
-        settings: ControlExecutionSettings,
-    ) -> Result<ControlPlaneActionPreparer> {
-        use attune_common::{
-            workload_artifact::ARTIFACTS_ROOT,
-            workload_launch::{PACK_ROOT, RUNTIME_ROOT},
-            workload_launch_io::LaunchHttpPolicy,
-        };
-        if settings.worker <= 0
-            || settings.instance.is_nil()
-            || settings.encryption_key.len() < 32
-            || settings.jwt.secret.len() < 32
-            || settings.max_stdout_bytes == 0
-            || settings.max_stderr_bytes == 0
-            || !settings.http_policy.allows_origin(&settings.api_origin)
-            || (settings.api_origin.scheme() != "https"
-                && !matches!(settings.http_policy, LaunchHttpPolicy::DevelopmentPlainHttp))
-            || settings.api_origin.path() != "/"
-            || settings.api_origin.username() != ""
-            || settings.api_origin.password().is_some()
-            || settings.api_origin.query().is_some()
-            || settings.api_origin.fragment().is_some()
-        {
-            return Err(Error::configuration(
-                "Invalid trusted control execution settings",
-            ));
-        }
-        let api_origin = settings.api_origin.to_string();
-        let mut executor = Self::new(
-            pool.clone(),
-            RuntimeRegistry::new(),
-            ArtifactManager::new(PathBuf::from(ARTIFACTS_ROOT)),
-            SecretManager::new(pool, Some(settings.encryption_key))?,
-            settings.max_stdout_bytes,
-            settings.max_stderr_bytes,
-            false,
-            false,
-            "trusted-control-plane".into(),
-            settings.instance,
-            settings.segments,
-            None,
-            None,
-            PathBuf::from(PACK_ROOT),
-            PathBuf::from(ARTIFACTS_ROOT),
-            PathBuf::from(RUNTIME_ROOT),
-            api_origin.clone(),
-            settings.jwt,
-            Arc::new(attune_common::artifact_transport::VolumeTransport::new(
-                ARTIFACTS_ROOT,
-            )),
-        );
-        // The legacy local worker constructor normalizes wildcard bind URLs.
-        // A remote CP profile's explicitly selected origin must remain exact.
-        executor.api_url = api_origin;
-        executor.recorded_readiness = settings.recorded_readiness;
-        executor.set_worker_id(settings.worker);
-        Ok(ControlPlaneActionPreparer { executor })
-    }
     /// Integration startup must prove all consumers are ready before enabling
     /// recorded issuance. No production caller enables this yet.
     pub fn with_recorded_readiness(
@@ -773,6 +703,7 @@ impl ActionExecutor {
 
         let preparation_started = std::time::Instant::now();
         let mut preparation = ExecutionPreparation {
+            process_intent: isolated.as_ref().map(|(spec, _)| spec.intent),
             binding: match self.schema_binding(execution_id).await {
                 Ok(binding) => binding,
                 Err(error) => {
@@ -795,17 +726,14 @@ impl ActionExecutor {
         };
         // The immutable contract is shared by validation, capture and redaction.
         let mut context = match self
-            .prepare_execution_context(
-                &execution,
-                &action,
-                &mut preparation,
-                true,
-                isolated_attempt,
-            )
+            .prepare_execution_context(&execution, &action, &mut preparation, isolated_attempt)
             .await
         {
             Ok(ctx) => ctx,
             Err(e) => {
+                if isolated_attempt.is_some() {
+                    return Err(e);
+                }
                 error!("Failed to prepare execution context: {}", e);
                 let transition = self
                     .handle_execution_failure(
@@ -845,6 +773,9 @@ impl ActionExecutor {
         let result = match action_result {
             Ok(result) => result,
             Err(e) => {
+                if isolated_attempt.is_some() {
+                    return Err(e);
+                }
                 error!("Action execution failed catastrophically: {}", e);
                 if let Err(finalize_err) = self.finalize_file_artifacts(execution_id).await {
                     warn!(
@@ -1181,85 +1112,12 @@ impl ActionExecutor {
         }
     }
 
-    /// Trusted CP preparation reuses the existing admitted schemas, explicit
-    /// authority selection, input origins, API opt-in and runtime-version rules.
-    /// This performs no pack execution and returns no local capture authority.
-    /// The caller must freeze a CP-selected plan and revalidate the attempt and
-    /// input origins at the later disclosure/effect boundary.
-    pub async fn prepare_control_context(
-        &self,
-        execution_id: i64,
-        attempt: uuid::Uuid,
-    ) -> Result<ControlExecutionPreparation> {
-        let worker = self.worker_id.load(Ordering::Acquire);
-        if worker <= 0 || attempt.is_nil() {
-            return Err(Error::PermissionDenied(
-                "Control execution source unavailable".into(),
-            ));
-        }
-        let mut tx = self.pool.begin().await?;
-        let execution = ExecutionRepository::find_by_id(&mut *tx, execution_id)
-            .await?
-            .filter(|execution| {
-                execution.worker == Some(worker)
-                    && execution.status == ExecutionStatus::Running
-                    && execution.executable_snapshot.is_some()
-            })
-            .ok_or_else(|| {
-                Error::PermissionDenied("Control execution source unavailable".into())
-            })?;
-        use attune_common::repositories::execution_runtime_admission::{
-            ExecutionAdmissionRepository, ExistingExecutionAuthority,
-        };
-        let current:uuid::Uuid=match ExecutionAdmissionRepository::selected_authority(&mut tx,execution_id).await? {
-            ExistingExecutionAuthority::Delegated=>attune_common::repositories::delegated_execution::DelegatedExecutionRepository::current_attempt(&mut tx,execution_id).await?,
-            ExistingExecutionAuthority::Recorded=>{
-                self.recorded_readiness.require_ready()?;
-                attune_common::repositories::runtime_authority::RuntimeAuthorityRepository::execution_admission(&mut tx,execution_id).await?
-                    .ok_or_else(||Error::PermissionDenied("Recorded execution source unavailable".into()))?;
-                attune_common::repositories::runtime_authority::RuntimeAuthorityRepository::current_worker_attempt(&mut tx,execution_id,worker).await?
-            }
-        };
-        if current != attempt {
-            return Err(Error::PermissionDenied(
-                "Control execution attempt changed".into(),
-            ));
-        }
-        tx.commit().await?;
-        let action = self.load_action(&execution).await?;
-        if action.parameter_delivery != attune_common::models::ParameterDelivery::Stdin
-            || action.parameter_format != attune_common::models::ParameterFormat::Json
-        {
-            return Err(Error::validation(
-                "Control workloads require flat stdin JSON parameters",
-            ));
-        }
-        let mut preparation = ExecutionPreparation {
-            binding: self.schema_binding(execution_id).await?,
-            parameter_secret_paths: None,
-            input_snapshot: None,
-            stdout_path: Arc::new(OnceLock::new()),
-            stderr_path: Arc::new(OnceLock::new()),
-        };
-        let context = self
-            .prepare_execution_context(&execution, &action, &mut preparation, false, Some(attempt))
-            .await?;
-        Ok(ControlExecutionPreparation {
-            context,
-            schema: preparation.binding,
-            input_secret_paths: preparation.parameter_secret_paths,
-            input_snapshot: preparation.input_snapshot,
-        })
-    }
-
-    /// Prepare execution context from execution and action data
     async fn prepare_execution_context(
         &self,
         execution: &Execution,
         action: &Action,
         preparation: &mut ExecutionPreparation,
-        capture_locally: bool,
-        control_attempt: Option<uuid::Uuid>,
+        isolated_attempt: Option<uuid::Uuid>,
     ) -> Result<ExecutionContext> {
         debug!(
             "Preparing execution context for execution: {}",
@@ -1283,14 +1141,14 @@ impl ActionExecutor {
         let selected_config = execution
             .config
             .clone()
-            .or_else(|| control_attempt.map(|_| serde_json::json!({})));
+            .or_else(|| isolated_attempt.map(|_| serde_json::json!({})));
         let restored_config = if let Some(config) = selected_config {
             let (config, paths, snapshot) = self
                 .secret_manager
                 .restore_execution_parameters_with_snapshot(execution.id, config)
                 .await?;
             preparation.parameter_secret_paths = Some(paths);
-            if control_attempt.is_some() {
+            if isolated_attempt.is_some() {
                 preparation.input_snapshot = Some(snapshot);
             }
             Some(config)
@@ -1339,7 +1197,7 @@ impl ActionExecutor {
         env.insert("ATTUNE_API_URL".to_string(), self.api_url.clone());
         env.insert(
             "ATTUNE_ARTIFACTS_DIR".to_string(),
-            if control_attempt.is_some() {
+            if isolated_attempt.is_some() {
                 attune_common::workload_artifact::ARTIFACTS_ROOT.into()
             } else {
                 self.artifacts_dir.to_string_lossy().to_string()
@@ -1347,7 +1205,7 @@ impl ActionExecutor {
         );
         env.insert(
             "ATTUNE_RUNTIME_ENVS_DIR".to_string(),
-            if control_attempt.is_some() {
+            if isolated_attempt.is_some() {
                 attune_common::workload_launch::RUNTIME_ROOT.into()
             } else {
                 self.runtime_envs_dir.to_string_lossy().to_string()
@@ -1394,7 +1252,7 @@ impl ActionExecutor {
                     &self.pool,
                     execution,
                     self.worker_id.load(Ordering::SeqCst),
-                    control_attempt.unwrap_or_else(uuid::Uuid::new_v4),
+                    isolated_attempt.unwrap_or_else(uuid::Uuid::new_v4),
                     execution_timeout as i64,
                     &self.jwt_config,
                     self.recorded_readiness,
@@ -1445,7 +1303,7 @@ impl ActionExecutor {
 
         // The execution-only protocol delivers ALL parameters through stdin.
         // Keep the old local-worker context projection out of CP invocations.
-        if control_attempt.is_none() {
+        if isolated_attempt.is_none() {
             if let Some(config) = &restored_config {
                 if let Some(JsonValue::Object(map)) = config.get("context") {
                     for (key, value) in map {
@@ -1534,7 +1392,7 @@ impl ActionExecutor {
         // runtime's config so the ProcessRuntime uses a version-specific
         // interpreter binary, environment commands, etc.
         let (runtime_config_override, runtime_env_dir_suffix, selected_runtime_version) =
-            if control_attempt.is_some() {
+            if isolated_attempt.is_some() {
                 let snapshot = execution.executable_snapshot.as_ref().ok_or_else(|| {
                     Error::PermissionDenied("Pinned control runtime unavailable".into())
                 })?;
@@ -1599,7 +1457,7 @@ impl ActionExecutor {
         )?;
 
         // Determine the pack directory for this action
-        let pack_dir = if control_attempt.is_some() {
+        let pack_dir = if isolated_attempt.is_some() {
             PathBuf::from(attune_common::workload_launch::PACK_ROOT)
         } else {
             execution
@@ -1620,11 +1478,11 @@ impl ActionExecutor {
         // Pack actions have their script files in packs/{pack_ref}/actions/{entrypoint}
         let code_path = if action.launch.is_some() {
             None
-        } else if control_attempt.is_some() && !action.is_adhoc {
+        } else if isolated_attempt.is_some() && !action.is_adhoc {
             let entry =
                 attune_common::artifact_transport::ValidatedRelativePath::new(&entry_point)?;
             Some(pack_dir.join("actions").join(entry.as_path()))
-        } else if control_attempt.is_some() {
+        } else if isolated_attempt.is_some() {
             None
         } else if action.pack_ref.starts_with("core") || !action.is_adhoc {
             // This is a pack action, construct the file path
@@ -1685,7 +1543,7 @@ impl ActionExecutor {
         // Resolve the working directory from the runtime's execution_config.
         // The ProcessRuntime also does this internally, but setting it in the
         // context allows the executor to override if needed.
-        let working_dir: Option<StdPathBuf> = if control_attempt.is_some() {
+        let working_dir: Option<StdPathBuf> = if isolated_attempt.is_some() {
             Some(pack_dir)
         } else if pack_dir.exists() {
             Some(if action.launch.is_some() {
@@ -1700,7 +1558,7 @@ impl ActionExecutor {
         };
         // CP planning uses pinned image/release metadata. Never inspect or
         // resolve programs against the control-plane machine's PATH or ARCH.
-        let native_invocation = if control_attempt.is_some() {
+        let native_invocation = if isolated_attempt.is_some() {
             None
         } else if let Some(launch) = &action.launch {
             let snapshot = execution.executable_snapshot.as_ref().ok_or_else(|| {
@@ -1819,23 +1677,11 @@ impl ActionExecutor {
         } else {
             None
         };
-        let (stdout_log_writer, stderr_log_writer) = if capture_locally {
-            let logs = self
-                .allocate_execution_log_artifacts(execution, action, preparation)
-                .await?;
-            (Some(logs.stdout_writer), Some(logs.stderr_writer))
-        } else {
-            // The CP records silent attempts too. The execution-only custodian
-            // allocates/writes streams later through target-scoped control APIs.
-            crate::completion::register(
-                &self.pool,
-                execution,
-                self.worker_id.load(Ordering::Acquire),
-                self.worker_instance,
-            )
+        let logs = self
+            .allocate_execution_log_artifacts(execution, action, preparation)
             .await?;
-            (None, None)
-        };
+        let (stdout_log_writer, stderr_log_writer) =
+            (Some(logs.stdout_writer), Some(logs.stderr_writer));
 
         let context = ExecutionContext {
             native_invocation,
@@ -2156,7 +2002,7 @@ impl ActionExecutor {
         let create = Effects::begin_create(&self.pool, spec.intent, master).await?;
         let resource = launcher.prepare(&spec, create).await?;
         Effects::record_resource(&self.pool, spec.intent, &resource).await?;
-        let process = launcher.start(&spec, &resource).await?;
+        let mut process = launcher.start(&spec, &resource).await?;
         if process.resource != resource {
             let _ = process
                 .control
@@ -2166,6 +2012,12 @@ impl ActionExecutor {
                 "Isolated action resource changed".into(),
             ));
         }
+        process.control = Arc::new(RecordingProcessControl {
+            inner: process.control,
+            pool: self.pool.clone(),
+            intent: spec.intent,
+            resource: resource.clone(),
+        });
         let payload = match Effects::consume_stdin(&self.pool, spec.intent, &resource, master).await
         {
             Ok(payload) => payload,
@@ -2830,22 +2682,12 @@ impl ActionExecutor {
         }
 
         record_runtime_log_capture(&mut result_data, result, Some(preparation.log_allocation()));
-        result_data = self
-            .redact_execution_result_data(execution_id, action, result_data, Some(preparation))
-            .await?;
-
-        let input = UpdateExecutionInput {
-            status: Some(ExecutionStatus::Completed),
-            result: Some(result_data),
-            ..Default::default()
-        };
-
-        ExecutionRepository::transition_worker(
-            &self.pool,
+        self.persist_execution_result(
             execution_id,
-            Some(self.worker_id.load(Ordering::Acquire)).filter(|id| *id > 0),
-            input.status.expect("terminal status"),
-            input.result,
+            Some(action),
+            result_data,
+            Some(preparation),
+            ExecutionStatus::Completed,
         )
         .await
     }
@@ -2862,28 +2704,70 @@ impl ActionExecutor {
         }
     }
 
-    async fn redact_execution_result_data(
+    async fn persist_execution_result(
         &self,
         execution_id: i64,
-        _action: &Action,
+        action: Option<&Action>,
+        result_data: JsonValue,
+        preparation: Option<&ExecutionPreparation>,
+        status: ExecutionStatus,
+    ) -> Result<ExecutionTransition> {
+        let mut tx = self.pool.begin().await?;
+        if let Some(intent) = preparation.and_then(|value| value.process_intent) {
+            let master = self.secret_manager.encryption_key().ok_or_else(|| {
+                Error::PermissionDenied("Process completion encryption unavailable".into())
+            })?;
+            if let Some(historical) = attune_common::repositories::execution_process::ExecutionProcessRepository::lock_completion(&mut tx,intent,master).await? {
+                tx.commit().await?;
+                return Ok(historical);
+            }
+        }
+        let result_data = if action.is_some() {
+            self.redact_execution_result_data_in(execution_id, &mut tx, result_data, preparation)
+                .await?
+        } else {
+            result_data
+        };
+        let transition = ExecutionRepository::transition_worker(
+            &mut *tx,
+            execution_id,
+            Some(self.worker_id.load(Ordering::Acquire)).filter(|id| *id > 0),
+            status,
+            Some(result_data.clone()),
+        )
+        .await?;
+        tx.commit().await?;
+        // This best-effort artifact contains only the classified public result.
+        // Historical acknowledgement never repeats this write.
+        if let Err(error) = self
+            .store_execution_artifacts(execution_id, &result_data)
+            .await
+        {
+            warn!(execution_id,%error,"Failed to store classified result artifact");
+        }
+        Ok(transition)
+    }
+
+    async fn redact_execution_result_data_in(
+        &self,
+        execution_id: i64,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         result_data: JsonValue,
         preparation: Option<&ExecutionPreparation>,
     ) -> Result<JsonValue> {
-        let mut origin_tx = self.pool.begin().await?;
         let mut runtime_reads =
             attune_common::repositories::runtime_read::RuntimeReadRepository::close_execution(
-                &mut origin_tx,
+                tx,
                 execution_id,
             )
             .await?;
-        origin_tx.commit().await?;
         let loaded_paths;
         let paths = match preparation.and_then(|context| context.parameter_secret_paths.as_deref())
         {
             Some(paths) => paths,
             None => {
                 loaded_paths = ExecutionSecretValueRepository::find_stored_by_entity(
-                    &self.pool,
+                    &mut **tx,
                     attune_common::secret_values::ENTITY_EXECUTION_CONFIG,
                     execution_id,
                 )
@@ -2898,12 +2782,14 @@ impl ActionExecutor {
         let binding = match preparation {
             Some(context) => &context.binding,
             None => {
-                loaded_binding = self.schema_binding(execution_id).await?;
+                loaded_binding = attune_common::repositories::schema_contract::SchemaContractRepository::find_with_executor(
+                    &mut **tx, attune_common::repositories::schema_contract::BindingOwner::Execution, execution_id,
+                ).await?.ok_or_else(||Error::validation("Execution schema binding unavailable"))?;
                 &loaded_binding
             }
         };
         let mut runtime_origins = attune_common::repositories::execution_key_read::ExecutionKeyReadRepository::origins_for_executions(
-            &self.pool, &[execution_id],
+            &mut **tx, &[execution_id],
         ).await?;
         let runtime_origins = runtime_origins.remove(&execution_id).unwrap_or_default();
         runtime_reads.extend(
@@ -2935,12 +2821,6 @@ impl ActionExecutor {
             &origins,
         )?;
         let result_data = classified.public_result;
-        if let Err(error) = self
-            .store_execution_artifacts(execution_id, &result_data)
-            .await
-        {
-            warn!(execution_id, %error, "Failed to store classified result artifact");
-        }
         let secret_inputs = classified.structured_secrets;
         let channel_inputs = classified.channel_secrets;
         if result_data.get("output_validation_warning").is_some() {
@@ -2959,22 +2839,20 @@ impl ActionExecutor {
             .ok_or_else(|| Error::Internal("No encryption key configured".to_string()))?;
         let prepared = prepare_secret_values(secret_inputs, encryption_key)?;
         let channels = prepare_secret_values(channel_inputs, encryption_key)?;
-        let mut tx = self.pool.begin().await?;
         ExecutionSecretValueRepository::replace_entity_with_conn(
-            &mut tx,
+            tx,
             ENTITY_EXECUTION_RESULT,
             execution_id,
             &prepared,
         )
         .await?;
         ExecutionSecretValueRepository::replace_entity_with_conn(
-            &mut tx,
+            tx,
             attune_common::output_classification::ENTITY_EXECUTION_OUTPUT_CHANNEL,
             execution_id,
             &channels,
         )
         .await?;
-        tx.commit().await?;
 
         Ok(result_data)
     }
@@ -3111,24 +2989,12 @@ impl ActionExecutor {
                 preparation.map(ExecutionPreparation::log_allocation),
             );
         }
-        if let Some(action) = action {
-            result_data = self
-                .redact_execution_result_data(execution_id, action, result_data, preparation)
-                .await?;
-        }
-
-        let input = UpdateExecutionInput {
-            status: Some(ExecutionStatus::Failed),
-            result: Some(result_data),
-            ..Default::default()
-        };
-
-        ExecutionRepository::transition_worker(
-            &self.pool,
+        self.persist_execution_result(
             execution_id,
-            Some(self.worker_id.load(Ordering::Acquire)).filter(|id| *id > 0),
-            input.status.expect("terminal status"),
-            input.result,
+            action,
+            result_data,
+            preparation,
+            ExecutionStatus::Failed,
         )
         .await
     }
@@ -3177,22 +3043,12 @@ impl ActionExecutor {
 
         record_runtime_log_capture(&mut result_data, result, Some(preparation.log_allocation()));
 
-        result_data = self
-            .redact_execution_result_data(execution_id, action, result_data, Some(preparation))
-            .await?;
-
-        let input = UpdateExecutionInput {
-            status: Some(ExecutionStatus::Cancelled),
-            result: Some(result_data),
-            ..Default::default()
-        };
-
-        ExecutionRepository::transition_worker(
-            &self.pool,
+        self.persist_execution_result(
             execution_id,
-            Some(self.worker_id.load(Ordering::Acquire)).filter(|id| *id > 0),
-            input.status.expect("terminal status"),
-            input.result,
+            Some(action),
+            result_data,
+            Some(preparation),
+            ExecutionStatus::Cancelled,
         )
         .await
     }
@@ -3246,22 +3102,12 @@ impl ActionExecutor {
 
         record_runtime_log_capture(&mut result_data, result, Some(preparation.log_allocation()));
 
-        result_data = self
-            .redact_execution_result_data(execution_id, action, result_data, Some(preparation))
-            .await?;
-
-        let input = UpdateExecutionInput {
-            status: Some(ExecutionStatus::Timeout),
-            result: Some(result_data),
-            ..Default::default()
-        };
-
-        ExecutionRepository::transition_worker(
-            &self.pool,
+        self.persist_execution_result(
             execution_id,
-            Some(self.worker_id.load(Ordering::Acquire)).filter(|id| *id > 0),
-            input.status.expect("terminal status"),
-            input.result,
+            Some(action),
+            result_data,
+            Some(preparation),
+            ExecutionStatus::Timeout,
         )
         .await
     }
@@ -3277,68 +3123,6 @@ mod tests {
     use attune_common::repositories::Create;
     use attune_common::test_database::TestDatabase;
     use chrono::Utc;
-
-    #[tokio::test]
-    async fn control_preparation_has_no_local_runtime_and_preserves_explicit_https_origin() {
-        use attune_common::workload_launch_io::LaunchHttpPolicy;
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://owned:owned@127.0.0.1:1/unused")
-            .unwrap();
-        let settings = |origin: &str, policy| ControlExecutionSettings {
-            worker: 1,
-            instance: uuid::Uuid::new_v4(),
-            api_origin: reqwest::Url::parse(origin).unwrap(),
-            http_policy: policy,
-            jwt: JwtConfig {
-                secret: "owned-cp-test-signing-key-at-least-32-bytes".into(),
-                access_token_expiration: 300,
-                refresh_token_expiration: 300,
-            },
-            encryption_key: "owned-cp-test-master-key-at-least-32-bytes".into(),
-            max_stdout_bytes: 1024,
-            max_stderr_bytes: 1024,
-            segments: attune_common::config::ArtifactsConfig::default().log_segment_writer_config(),
-            recorded_readiness: Default::default(),
-        };
-        // An explicit remote profile origin is not normalized using local
-        // worker bind-address rules, including a domain with a numeric prefix.
-        let origin = "https://0.0.0.0.owned.invalid/";
-        let producer = ActionExecutor::for_control_plane(
-            pool.clone(),
-            settings(origin, LaunchHttpPolicy::TlsOrLoopback),
-        )
-        .unwrap();
-        assert_eq!(producer.executor.api_url, origin);
-        assert!(producer
-            .executor
-            .runtime_registry
-            .list_runtimes()
-            .is_empty());
-        assert!(producer.executor.worker_tokens.is_none());
-        assert!(ActionExecutor::for_control_plane(
-            pool.clone(),
-            settings("http://127.0.0.1:8080/", LaunchHttpPolicy::TlsOrLoopback)
-        )
-        .is_err());
-        assert!(ActionExecutor::for_control_plane(
-            pool.clone(),
-            settings(
-                "http://127.0.0.1:8080/",
-                LaunchHttpPolicy::DevelopmentPlainHttp
-            )
-        )
-        .is_ok());
-        assert!(ActionExecutor::for_control_plane(
-            pool.clone(),
-            settings(
-                "https://owned.invalid/?token=private",
-                LaunchHttpPolicy::TlsOrLoopback
-            )
-        )
-        .is_err());
-        drop(producer);
-        pool.close().await;
-    }
 
     #[test]
     fn successful_truncated_stdout_keeps_its_protection_reason() {

@@ -487,10 +487,14 @@ impl DelegatedExecutionRepository {
         }
         let attempt: Uuid =
             serde_json::from_value(meta.get("delegated_attempt").cloned().ok_or_else(denied)?)?;
-        let open:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM delegated_execution_attempt WHERE execution=$1 AND attempt=$2 AND producer_kind='worker' AND worker=$3 AND NOT closed)").bind(execution).bind(attempt).bind(row.worker).fetch_one(conn).await?;
-        if !open {
+        let open:Option<Id>=sqlx::query_scalar("SELECT execution FROM delegated_execution_attempt WHERE execution=$1 AND attempt=$2 AND producer_kind='worker' AND worker=$3 AND NOT closed FOR SHARE").bind(execution).bind(attempt).bind(row.worker).fetch_optional(&mut *conn).await?;
+        if open.is_none() {
             return Err(denied());
         }
+        super::execution_process::ExecutionProcessRepository::retain_runtime_run(
+            conn, execution, attempt,
+        )
+        .await?;
         Ok(Some((execution, attempt)))
     }
     /// Retain a bounded disclosure's source attempt through its final commit.

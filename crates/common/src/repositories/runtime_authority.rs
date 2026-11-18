@@ -1793,6 +1793,23 @@ impl RuntimeAuthorityRepository {
         connection: &mut PgConnection,
         credential: &RuntimeCredentialBinding,
     ) -> Result<ValidatedRuntimeAuthority> {
+        let authority = Self::validate_execution_source(connection, credential).await?;
+        super::execution_process::ExecutionProcessRepository::retain_runtime_run(
+            connection,
+            credential.execution_id,
+            credential.attempt,
+        )
+        .await?;
+        Ok(authority)
+    }
+
+    /// Trusted preparation validates the same immutable admission before a
+    /// process exists. Runtime token consumers additionally retain the native
+    /// run fence above; the source phase must precede epoch/operation locks.
+    pub(crate) async fn validate_execution_source(
+        connection: &mut PgConnection,
+        credential: &RuntimeCredentialBinding,
+    ) -> Result<ValidatedRuntimeAuthority> {
         positive_id(credential.execution_id)?;
         positive_id(credential.admission_id)?;
         SchemaTypeRepository::lock_selection(&mut *connection).await?;

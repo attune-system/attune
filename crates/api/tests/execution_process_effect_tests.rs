@@ -11,8 +11,8 @@ use attune_common::{
         FindById,
     },
     workload_launch::{
-        LaunchInvocation, LaunchPlatform, LaunchPurpose, LaunchRoot, LaunchTarget, PackAccess,
-        PinnedImage, Sha256Digest,
+        LaunchExitOutcome, LaunchInvocation, LaunchPlatform, LaunchPurpose, LaunchRoot,
+        LaunchTarget, PackAccess, PinnedImage, Sha256Digest,
     },
 };
 use helpers::{Result, TestContext};
@@ -213,6 +213,187 @@ async fn process_gate_rejects_changed_pod_uid_stop_and_revoke_restore() -> Resul
             .await
             .is_ok()
     );
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_exit_closes_runtime_before_completion_and_commit_replay_is_historical() -> Result<()>
+{
+    use attune_common::{
+        models::ExecutionStatus, repositories::runtime_read::RuntimeReadRepository,
+    };
+    attune_common::auth::install_crypto_provider();
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let (spec, selected, resource) = admitted(&ctx).await?;
+    let master = ctx.state.config.security.encryption_key.as_deref().unwrap();
+    let owner = ctx.user.as_ref().unwrap().id;
+    let LaunchTarget::Execution {
+        execution, worker, ..
+    } = spec.target
+    else {
+        unreachable!()
+    };
+    Effects::reserve(&ctx.pool, &spec, owner, &selected, master).await?;
+    Effects::begin_create(&ctx.pool, spec.intent, master).await?;
+    Effects::record_resource(&ctx.pool, spec.intent, &resource).await?;
+    Effects::consume_stdin(&ctx.pool, spec.intent, &resource, master).await?;
+    let token = helpers::delegated_source::execution_token(&ctx, execution).await?;
+    let claims = attune_common::auth::jwt::validate_token(&token, &ctx.state.jwt_config)?;
+    let mut tx = ctx.pool.begin().await?;
+    assert!(
+        DelegatedExecutionRepository::validate_claims(&mut tx, &claims)
+            .await?
+            .is_some()
+    );
+    tx.commit().await?;
+    // A caller cannot fabricate a terminal result from a live native process.
+    let mut tx = ctx.pool.begin().await?;
+    assert!(Effects::lock_completion(&mut tx, spec.intent, master)
+        .await
+        .is_err());
+    tx.rollback().await?;
+    let exit = LaunchExitOutcome {
+        exit_code: 0,
+        oom_killed: false,
+    };
+    Effects::record_exit(&ctx.pool, spec.intent, &resource, exit).await?;
+    Effects::record_exit(&ctx.pool, spec.intent, &resource, exit).await?;
+    assert!(Effects::record_exit(
+        &ctx.pool,
+        spec.intent,
+        &resource,
+        LaunchExitOutcome {
+            exit_code: 1,
+            oom_killed: false
+        }
+    )
+    .await
+    .is_err());
+    let mut tx = ctx.pool.begin().await?;
+    assert!(
+        DelegatedExecutionRepository::validate_claims(&mut tx, &claims)
+            .await
+            .is_err()
+    );
+    tx.rollback().await?;
+    assert_eq!(
+        ExecutionRepository::find_by_id(&ctx.pool, execution)
+            .await?
+            .unwrap()
+            .status,
+        ExecutionStatus::Running
+    );
+
+    // Closure and terminal state roll back together on cancellation/error.
+    let mut tx = ctx.pool.begin().await?;
+    assert!(Effects::lock_completion(&mut tx, spec.intent, master)
+        .await?
+        .is_none());
+    RuntimeReadRepository::close_execution(&mut tx, execution).await?;
+    ExecutionRepository::transition_worker(
+        &mut *tx,
+        execution,
+        Some(worker),
+        ExecutionStatus::Completed,
+        Some(json!({"exit_code":0,"data":"original"})),
+    )
+    .await?;
+    tx.rollback().await?;
+    assert_eq!(
+        ExecutionRepository::find_by_id(&ctx.pool, execution)
+            .await?
+            .unwrap()
+            .status,
+        ExecutionStatus::Running
+    );
+    let mut tx = ctx.pool.begin().await?;
+    assert!(Effects::lock_completion(&mut tx, spec.intent, master)
+        .await?
+        .is_none());
+    RuntimeReadRepository::close_execution(&mut tx, execution).await?;
+    ExecutionRepository::transition_worker(
+        &mut *tx,
+        execution,
+        Some(worker),
+        ExecutionStatus::Completed,
+        Some(json!({"exit_code":0,"data":"original"})),
+    )
+    .await?;
+    tx.commit().await?;
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution_history WHERE entity_id=$1")
+            .bind(execution)
+            .fetch_one(&ctx.pool)
+            .await?;
+    // Lose the original completion ACK; recovery reads its exact committed
+    // result without closing another attempt or replaying any result writes.
+    let mut tx = ctx.pool.begin().await?;
+    let historical = Effects::lock_completion(&mut tx, spec.intent, master)
+        .await?
+        .ok_or("Missing completion receipt")?;
+    assert_eq!(historical.execution.status, ExecutionStatus::Completed);
+    assert_eq!(historical.execution.result.unwrap()["data"], "original");
+    tx.commit().await?;
+    let after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution_history WHERE entity_id=$1")
+            .bind(execution)
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(count, after);
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn replacement_registration_cannot_reuse_an_existing_native_attempt() -> Result<()> {
+    attune_common::auth::install_crypto_provider();
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let (spec, selected, resource) = admitted(&ctx).await?;
+    let master = ctx.state.config.security.encryption_key.as_deref().unwrap();
+    let owner = ctx.user.as_ref().unwrap().id;
+    let LaunchTarget::Execution {
+        execution, worker, ..
+    } = spec.target
+    else {
+        unreachable!()
+    };
+    Effects::reserve(&ctx.pool, &spec, owner, &selected, master).await?;
+    Effects::begin_create(&ctx.pool, spec.intent, master).await?;
+    Effects::record_resource(&ctx.pool, spec.intent, &resource).await?;
+    Effects::consume_stdin(&ctx.pool, spec.intent, &resource, master).await?;
+    let token = helpers::delegated_source::execution_token(&ctx, execution).await?;
+    let claims = attune_common::auth::jwt::validate_token(&token, &ctx.state.jwt_config)?;
+    let replacement = Uuid::new_v4();
+    sqlx::query("UPDATE worker SET meta=meta||jsonb_build_object('registration_incarnation',$2::text) WHERE id=$1")
+        .bind(worker).bind(replacement.to_string()).execute(&ctx.pool).await?;
+    attune_common::repositories::runtime::WorkerRepository::heartbeat_incarnation(
+        &ctx.pool,
+        worker,
+        replacement,
+    )
+    .await?;
+    let mut tx = ctx.pool.begin().await?;
+    assert!(
+        DelegatedExecutionRepository::validate_claims(&mut tx, &claims)
+            .await
+            .is_err()
+    );
+    tx.rollback().await?;
+    let mut next = spec.clone();
+    next.intent = Uuid::new_v4();
+    if let LaunchTarget::Execution {
+        worker_instance, ..
+    } = &mut next.target
+    {
+        *worker_instance = replacement;
+    }
+    assert!(Effects::reserve(&ctx.pool, &next, owner, &selected, master)
+        .await
+        .is_err());
+    let count:i64=sqlx::query_scalar("SELECT COUNT(*) FROM execution_process_effect WHERE target->>'kind'='execution' AND (target->>'execution')::BIGINT=$1")
+        .bind(execution).fetch_one(&ctx.pool).await?;
+    assert_eq!(count, 1);
     ctx.cleanup().await?;
     Ok(())
 }
