@@ -569,6 +569,22 @@ mod tests {
             .unwrap();
         let observed_status = observed.status();
         let body = observed.json::<LaunchStatus>().await;
+        // Exact packaged Python probe wire, through the real frontend and CP
+        // HTTP client. The fixture intentionally has no admitted launch here.
+        let public_probe = serde_json::json!({"launch_id":1,"admitted_digest":"a".repeat(64)});
+        let mut caller_denials = Vec::new();
+        for (grant, bearer) in [(false, false), (true, false), (true, true)] {
+            let mut attempt = client
+                .post(front_url.join("v1/launches/1/status").unwrap())
+                .json(&public_probe);
+            if grant {
+                attempt = attempt.header(LAUNCH_DISPATCH_HEADER, "owned-wrong-grant");
+            }
+            if bearer {
+                attempt = attempt.header(header::AUTHORIZATION, "Bearer inappropriate-manager");
+            }
+            caller_denials.push(attempt.send().await.unwrap().status());
+        }
         let mut stdin_url = front_url.join("v1/launches/1/stdin").unwrap();
         stdin_url
             .query_pairs_mut()
@@ -614,6 +630,14 @@ mod tests {
         assert_eq!(broad_bearer, StatusCode::UNAUTHORIZED);
         assert_eq!(observed_status, StatusCode::OK);
         assert_eq!(body.unwrap().request, request);
+        assert_eq!(
+            caller_denials,
+            vec![
+                StatusCode::UNAUTHORIZED,
+                StatusCode::FORBIDDEN,
+                StatusCode::UNAUTHORIZED
+            ]
+        );
         // Body bounds alone grant no input authority: the valid-size stdin
         // request still has no admitted running session and writes no bytes.
         assert_eq!(input_above_old_limit, StatusCode::CONFLICT);

@@ -4,6 +4,35 @@ import ssl
 import urllib.error
 import urllib.request
 
+ASSERTIONS = {
+    "proxy received controller authority/storage": "proxy_authority_mount",
+    "controller received proxy TLS private key": "controller_private_tls_mount",
+    "public CP trust roots were not read-only": "public_ca_mount_not_readonly",
+    "project process confinement changed": "process_policy_mismatch",
+    "project capabilities changed": "capability_ceiling_mismatch",
+    "project security policy was relaxed": "security_policy_mismatch",
+    "project process inherited extra environment": "environment_clearing_missing",
+    "project entrypoint received general manager configuration": "manager_configuration_exposed",
+    "private log absence cannot be established from incomplete diagnostics": "incomplete_log_evidence",
+    "private marker appeared in project logs": "private_marker_detected",
+}
+
+
+def assertion_category(error):
+    # Match only this script's fixed assertions. Never serialize an arbitrary
+    # exception message, subprocess argv, request body, token or certificate.
+    if isinstance(error, RuntimeError) and len(error.args) == 1 and isinstance(error.args[0], str) and len(error.args[0]) <= 256:
+        return ASSERTIONS.get(error.args[0], "other_assertion")
+    return "not_a_known_assertion"
+
+
+def capability_evidence(policy):
+    added = set(policy.get("CapAdd") or [])
+    recognized = {name for name in added if name in {"CHOWN", "DAC_OVERRIDE", "FOWNER", "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FOWNER"}}
+    return {"known_added_capabilities": len(recognized), "unexpected_added_capabilities": len(added - recognized),
+            "prefixed_known_capabilities": sum(name.startswith("CAP_") for name in recognized),
+            "drops_all_capabilities": set(policy.get("CapDrop") or []) == {"ALL"}}
+
 
 def exception_category(error):
     if isinstance(error, urllib.error.URLError):

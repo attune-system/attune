@@ -24,7 +24,7 @@ import urllib.request
 import uuid
 from workload_startup_diagnostics import command as bounded_command
 from workload_proxy_diagnostics import classify as classify_proxy
-from workload_project_probes import caller_rejection, exception_category, tls_rejection
+from workload_project_probes import assertion_category, caller_rejection, capability_evidence, exception_category, tls_rejection
 
 ROOT = Path(__file__).resolve().parent.parent
 PROBE = "debian@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587"
@@ -347,6 +347,8 @@ def main():
                     raise RuntimeError("project process confinement changed")
                 allowed = {"CHOWN", "DAC_OVERRIDE", "FOWNER"} if name == "launch-controller" else set()
                 if set(policy["CapAdd"] or []) != allowed or set(policy["CapDrop"] or []) != {"ALL"}:
+                    proxy_report({"phase": phase, "subphase": "capability_ceiling", "service": name,
+                                  **capability_evidence(policy)})
                     raise RuntimeError("project capabilities changed")
                 if not any(value.startswith("no-new-privileges") for value in policy["SecurityOpt"] or []) or any("unconfined" in value for value in policy["SecurityOpt"] or []):
                     raise RuntimeError("project security policy was relaxed")
@@ -373,6 +375,7 @@ def main():
             test_error = error
             proxy_report({"phase": phase, "subphase": subphase,
                           "exception_category": exception_category(error),
+                          "assertion_category": assertion_category(error),
                           "owned_project_diagnostics": diagnose(docker_command, owner)})
         finally:
             if started:

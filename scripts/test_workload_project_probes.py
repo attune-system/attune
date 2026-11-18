@@ -11,7 +11,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
-from workload_project_probes import caller_rejection, tls_rejection
+from workload_project_probes import assertion_category, caller_rejection, capability_evidence, tls_rejection
 
 
 class TlsServer(http.server.BaseHTTPRequestHandler):
@@ -25,6 +25,14 @@ class TlsServer(http.server.BaseHTTPRequestHandler):
 
 
 class ProjectProbeTests(unittest.TestCase):
+    def test_authority_failure_categories_never_relay_arbitrary_error_or_capability_labels(self):
+        self.assertEqual(assertion_category(RuntimeError("project capabilities changed")), "capability_ceiling_mismatch")
+        self.assertEqual(assertion_category(RuntimeError("owned-private-body")), "other_assertion")
+        evidence = capability_evidence({"CapAdd": ["CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FOWNER", "owned-private-label"], "CapDrop": ["ALL"]})
+        self.assertEqual(evidence, {"known_added_capabilities": 3, "unexpected_added_capabilities": 1,
+                                    "prefixed_known_capabilities": 3, "drops_all_capabilities": True})
+        self.assertNotIn("owned-private", json.dumps(evidence))
+
     def test_trusted_positive_and_real_untrusted_ca_wrong_hostname_negatives(self):
         with tempfile.TemporaryDirectory(prefix="attune-owned-tls-probe-") as directory:
             root = Path(directory)
