@@ -3049,10 +3049,6 @@ impl ActionExecutor {
                 Error::invalid_state("Allocated native artifact path unavailable")
             })?;
             let relative = ValidatedRelativePath::new(path)?;
-            let source = backend
-                .read_stopped_artifact(&spec, &resource, &relative, i64::MAX as u64)
-                .await?
-                .ok_or_else(|| Error::invalid_state("Allocated native artifact was not written"))?;
             let mut conn = self.pool.acquire().await?;
             let recorded = attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(
                 &mut conn, execution_id,
@@ -3080,6 +3076,24 @@ impl ActionExecutor {
                     &self.api_url, provider, self.transport.base_dir(),
                 )?)
             };
+            if version.body_state == Some(attune_common::models::enums::ArtifactBodyState::Ready) {
+                // API-capable actions may have uploaded directly; no guest
+                // file is required for an already immutable published body.
+                let expected = version
+                    .size_bytes
+                    .and_then(|n| u64::try_from(n).ok())
+                    .ok_or_else(|| Error::invalid_state("Published artifact size unavailable"))?;
+                if transport.complete_file(path).await? != Some(expected) {
+                    return Err(Error::invalid_state(
+                        "Published artifact acknowledgement mismatch",
+                    ));
+                }
+                continue;
+            }
+            let source = backend
+                .read_stopped_artifact(&spec, &resource, &relative, i64::MAX as u64)
+                .await?
+                .ok_or_else(|| Error::invalid_state("Allocated native artifact was not written"))?;
             crate::completion::publish_stopped_file(
                 transport.as_ref(),
                 source,

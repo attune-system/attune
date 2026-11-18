@@ -4812,6 +4812,7 @@ async fn authorize_version_mutation_source(
         None
     };
     let mut worker = None;
+    let mut native_binding = None;
     if let Some(credential) =
         attune_common::worker_delivery::credential(&user.claims).map_err(map_transport_error)?
     {
@@ -4821,7 +4822,7 @@ async fn authorize_version_mutation_source(
                 "Worker delivery version mismatch".into(),
             ));
         }
-        worker = Some(
+        let delivery =
             attune_common::repositories::worker_delivery::WorkerDeliveryRepository::require(
                 tx,
                 credential.permit,
@@ -4830,8 +4831,9 @@ async fn authorize_version_mutation_source(
                 version.id,
             )
             .await
-            .map_err(map_transport_error)?,
-        );
+            .map_err(map_transport_error)?;
+        native_binding = Some((delivery.0.execution, delivery.0.attempt));
+        worker = Some(delivery);
     } else if attune_common::log_delivery::credential(&user.claims)
         .map_err(map_transport_error)?
         .is_none()
@@ -4856,9 +4858,25 @@ async fn authorize_version_mutation_source(
                 attune_common::repositories::delegated_execution::DelegatedExecutionRepository::require_native_log(tx,execution).await.map_err(map_transport_error)?;
             } else {
                 attune_common::repositories::delegated_execution::DelegatedExecutionRepository::require_completion(tx,execution,pack_candidate_worker_id(user)?).await.map_err(map_transport_error)?;
+                let attempt = attune_common::repositories::delegated_execution::DelegatedExecutionRepository::current_attempt(tx, execution).await.map_err(map_transport_error)?;
+                native_binding = Some((execution, attempt));
             }
         }
     }
+    // Source/worker locks precede input-origin locks. Only after both are
+    // retained do we acquire native epochs/operation protection below.
+    // Ready is an immutable historical receipt, not a new publication effect.
+    let native = if version.body_state != Some(ArtifactBodyState::Ready) {
+        if let Some((execution, attempt)) = native_binding {
+            attune_common::repositories::execution_process::ExecutionProcessRepository::prepare_file_publication(
+                tx, version.id, execution, attempt,
+            ).await.map_err(map_transport_error)?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let file_origin_budget = if process.is_some() || worker.is_some() {
         Box::pin(crate::file_origins::prepare_existing(
             tx,
@@ -4892,6 +4910,11 @@ async fn authorize_version_mutation_source(
     } else {
         None
     };
+    let native_publication_expiry = if let Some(native) = native {
+        Some(native.retain(tx).await.map_err(map_transport_error)?)
+    } else {
+        None
+    };
     let proof = crate::recorded_files::FileMutationProof {
         log_delivery,
         credential_deadline: user.claims.exp,
@@ -4899,6 +4922,7 @@ async fn authorize_version_mutation_source(
         process_delivery,
         worker,
         file_origin_budget,
+        native_publication_expiry,
     };
     Ok(proof)
 }
