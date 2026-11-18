@@ -6,6 +6,7 @@ import type { AuthorizeLaunchIoRequest } from "../models/AuthorizeLaunchIoReques
 import type { CanonicalLaunchZip } from "../models/CanonicalLaunchZip";
 import type { ClaimedLaunch } from "../models/ClaimedLaunch";
 import type { LaunchCreateIntent } from "../models/LaunchCreateIntent";
+import type { LaunchEngineBinding } from "../models/LaunchEngineBinding";
 import type { LaunchIoAuthorization } from "../models/LaunchIoAuthorization";
 import type { LaunchIoGrant } from "../models/LaunchIoGrant";
 import type { LaunchIoGrantRequest } from "../models/LaunchIoGrantRequest";
@@ -28,6 +29,19 @@ import type { CancelablePromise } from "../core/CancelablePromise";
 import { OpenAPI } from "../core/OpenAPI";
 import { request as __request } from "../core/request";
 export class WorkloadControlService {
+  /**
+   * @returns LaunchEngineBinding
+   * @throws ApiError
+   */
+  public static workloadLaunchEngineBinding(): CancelablePromise<LaunchEngineBinding> {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/api/v1/workload-launches/engine",
+      errors: {
+        403: `Engine unavailable`,
+      },
+    });
+  }
   /**
    * @returns ReconcileLaunchesPage
    * @throws ApiError
