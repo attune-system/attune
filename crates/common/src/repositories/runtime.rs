@@ -740,6 +740,58 @@ impl WorkerRepository {
         Ok(query.build_query_as().fetch_all(executor).await?)
     }
 
+    /// Obtain a stable logical ID before acquiring worker-persistent custody.
+    /// Existing rows are never changed here. New rows remain inactive, without
+    /// an incarnation/capabilities, until the owner acknowledges registration.
+    pub async fn reserve_registration_slot(
+        pool: &sqlx::PgPool,
+        input: CreateWorkerInput,
+        role: crate::models::WorkerRole,
+    ) -> Result<Id> {
+        let mut tx = pool.begin().await?;
+        sqlx::query("INSERT INTO worker(name,worker_type,worker_role,runtime,host,port,status) VALUES($1,$2,$3,$4,$5,$6,'inactive') ON CONFLICT(name) DO NOTHING")
+            .bind(&input.name).bind(input.worker_type).bind(role).bind(input.runtime)
+            .bind(input.host).bind(input.port).execute(&mut *tx).await?;
+        let worker = Self::find_by_name(&mut *tx, &input.name)
+            .await?
+            .ok_or_else(|| {
+                crate::Error::PermissionDenied("Worker registration slot unavailable".into())
+            })?;
+        if worker.worker_role != role {
+            return Err(crate::Error::PermissionDenied(
+                "Worker registration slot unavailable".into(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(worker.id)
+    }
+
+    /// Register only the previously reserved row after custody is exclusively
+    /// held. Deletion/replacement of that row cannot redirect its filesystem
+    /// ownership to a newly allocated ID or another logical worker.
+    pub async fn register_reserved_incarnation(
+        pool: &sqlx::PgPool,
+        input: CreateWorkerInput,
+        role: crate::models::WorkerRole,
+        incarnation: uuid::Uuid,
+        worker: Id,
+    ) -> Result<Worker> {
+        if worker <= 0 || incarnation.is_nil() {
+            return Err(crate::Error::PermissionDenied(
+                "Worker registration slot unavailable".into(),
+            ));
+        }
+        sqlx::query_as::<_, Worker>(&format!(
+            "UPDATE worker SET status='active',last_heartbeat=NOW(),host=$2,port=$3,capabilities=$4, \
+             meta=COALESCE(meta,'{{}}'::jsonb)||jsonb_build_object('registration_incarnation',$5::text),updated=NOW() \
+             WHERE id=$1 AND name=$6 AND worker_role=$7 RETURNING {WORKER_SELECT_COLUMNS}"
+        ))
+        .bind(worker).bind(input.host).bind(input.port).bind(input.capabilities)
+        .bind(incarnation.to_string()).bind(input.name).bind(role)
+        .fetch_optional(pool).await?
+        .ok_or_else(|| crate::Error::PermissionDenied("Worker registration slot unavailable".into()))
+    }
+
     /// Atomically replace registration ownership while preserving operator metadata
     /// and cordons. This marker fences worker-row maintenance, not delivery grants.
     pub async fn register_incarnation(

@@ -99,6 +99,40 @@ impl LogDeliveryManager {
             max_payload,
         )
         .await?;
+        Self::open_owned(
+            pool,
+            spool,
+            worker,
+            instance,
+            tokens,
+            api,
+            config,
+            max_payload,
+            segment_bytes,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Previously acquired custody and existing worker delivery configuration"
+    )]
+    pub(crate) async fn open_owned(
+        pool: sqlx::PgPool,
+        spool: LogDeliverySpool,
+        worker: i64,
+        instance: Uuid,
+        tokens: Arc<WorkerTokenProvider>,
+        api: String,
+        config: attune_common::config::LogDeliveryConfig,
+        max_payload: u64,
+        segment_bytes: usize,
+    ) -> Result<Arc<Self>> {
+        if worker <= 0 || instance.is_nil() || config.max_finalizers == 0 || segment_bytes == 0 {
+            return Err(Error::validation(
+                "Invalid log delivery ownership or budgets",
+            ));
+        }
         let result = Arc::new(Self {
             pool,
             spool,
@@ -116,7 +150,15 @@ impl LogDeliveryManager {
             max_payload,
             segment_bytes,
         });
-        result.recover().await?;
+        // Normal initialization errors join every spawned recovery owner.
+        // Caller cancellation also signals those tasks; their retained Arc keeps
+        // the filesystem lease until they stop, never releasing it underneath IO.
+        let initializing = result.stop.clone().drop_guard();
+        if let Err(error) = result.recover().await {
+            result.stop_and_join().await;
+            return Err(error);
+        }
+        let _ = initializing.disarm();
         Ok(result)
     }
     pub async fn writer(

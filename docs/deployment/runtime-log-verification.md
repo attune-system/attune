@@ -62,6 +62,15 @@ the classified action outcome can still settle. This local spool is not the log
 artifact backend: `artifacts.transport: api` and the configured object store
 continue to own delivery and published logs.
 
+Startup first finds the logical worker slot, creating it inactive when absent.
+It acquires that ID's existing custody directory and key before replacing the
+active registration incarnation. A failed overlapping lease or invalid key does
+not replace the live manager or advertise a new worker. Registration is then
+conditional on the exact reserved ID/name/role; a changed or deleted slot cannot
+redirect custody to another ID. The same filesystem lease remains held through
+registration acknowledgement, manager initialization and recovery. There is no
+custody-path migration or automatic key rotation in this startup sequence.
+
 Before upgrading from a build whose spool keys were master-derived, cordon the
 worker to stop new assignments, allow existing executions and background log
 finalizers to finish, and confirm their log versions are Ready or explicitly

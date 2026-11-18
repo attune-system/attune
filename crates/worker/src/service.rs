@@ -691,7 +691,13 @@ impl WorkerService {
     pub async fn start(&mut self) -> Result<()> {
         info!("Starting Worker Service");
 
-        // Detect runtime capabilities and register worker
+        let delivery = self
+            .config
+            .worker
+            .as_ref()
+            .map(|worker| worker.log_delivery.clone())
+            .unwrap_or_default();
+        // Exclusive custody is acquired before replacing a live incarnation.
         let worker_id = {
             let mut reg = self.registration.write().await;
             reg.detect_capabilities(&self.config).await?;
@@ -718,7 +724,9 @@ impl WorkerService {
                 "log_delivery_instance".into(),
                 serde_json::json!(self.worker_token_provider.instance_id()),
             );
-            reg.register().await?
+            self.executor
+                .register_worker_with_custody(&mut reg, &delivery)
+                .await?
         };
         self.worker_id = Some(worker_id);
         self.worker_token_provider
@@ -731,15 +739,7 @@ impl WorkerService {
             .registered_incarnation()
             .ok_or_else(|| Error::invalid_state("Worker registration incarnation unavailable"))?;
         self.executor.set_process_incarnation(incarnation)?;
-        self.executor
-            .start_log_delivery(
-                self.config
-                    .worker
-                    .as_ref()
-                    .map(|w| w.log_delivery.clone())
-                    .unwrap_or_default(),
-            )
-            .await?;
+        self.executor.start_log_delivery(delivery).await?;
 
         info!("Worker registered with ID: {}", worker_id);
 
