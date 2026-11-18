@@ -481,6 +481,7 @@ dependencies = [
  "uuid",
  "validator",
  "wiremock",
+ "zip",
 ]
 
 [[package]]

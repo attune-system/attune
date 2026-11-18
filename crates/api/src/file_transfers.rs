@@ -105,6 +105,31 @@ impl FileTransfers {
             _task: self.tasks.token(),
         })
     }
+    /// ZIP central-directory/link metadata is bounded by both the compressed
+    /// body and admitted entry count. Reserve before parsing or allocating it.
+    pub(crate) fn archive_upload(
+        &self,
+        compressed: u64,
+        files: u64,
+    ) -> Result<FileUploadLease, String> {
+        let closed = self.closed.lock().expect("file admission lock poisoned");
+        if *closed {
+            return Err("Archive publication is shutting down".into());
+        }
+        let bytes = compressed
+            .checked_mul(16)
+            .and_then(|n| {
+                files
+                    .checked_mul(4096)
+                    .and_then(|entries| n.checked_add(entries))
+            })
+            .and_then(|n| n.checked_add(8 * UNIT))
+            .ok_or_else(|| "Archive admission accounting overflow".to_string())?;
+        Ok(FileUploadLease {
+            _memory: self.memory_lease_bytes(bytes)?,
+            _task: self.tasks.token(),
+        })
+    }
     pub(crate) fn reader(&self, plaintext: u64) -> Result<FileMemoryLease, String> {
         let closed = self.closed.lock().expect("file admission lock poisoned");
         if *closed {

@@ -15,6 +15,8 @@ use axum::{
     routing::post,
     Extension, Json, Router,
 };
+pub mod output;
+pub use output::{output_body, reserve_output, stage_result};
 use std::sync::Arc;
 
 #[derive(Clone, Copy)]
@@ -48,6 +50,13 @@ fn key(id: i64, request: &LaunchRequest) -> ApiResult<()> {
 }
 fn handle(id: i64, request: &LaunchHandle) -> ApiResult<()> {
     if id <= 0 || id != request.launch_id {
+        Err(denied())
+    } else {
+        Ok(())
+    }
+}
+fn fresh_deadline(deadline: chrono::DateTime<chrono::Utc>) -> ApiResult<()> {
+    if deadline <= chrono::Utc::now() {
         Err(denied())
     } else {
         Ok(())
@@ -101,6 +110,13 @@ pub async fn claim(
             .ok_or_else(denied)?,
     )
     .await?;
+    match &result {
+        ClaimedLaunch::Capture { lease, .. }
+        | ClaimedLaunch::Active { lease, .. }
+        | ClaimedLaunch::Cleanup { lease, .. }
+        | ClaimedLaunch::Publication { lease, .. } => fresh_deadline(lease.handle.lease_deadline)?,
+        ClaimedLaunch::Stopped { .. } => {}
+    }
     response(actor, result)
 }
 
@@ -146,6 +162,7 @@ pub async fn create_intent(
     let actor = actor(&user)?;
     let credential = token(&headers, LAUNCH_LEASE_HEADER)?;
     let result = Ledger::create_intent(&state.db, actor, &request, &credential).await?;
+    fresh_deadline(result.handle.lease_deadline)?;
     response(actor, result)
 }
 
@@ -161,6 +178,7 @@ pub async fn start(
     let actor = actor(&user)?;
     let credential = token(&headers, LAUNCH_LEASE_HEADER)?;
     let result = Ledger::start_intent(&state.db, actor, &request, &credential).await?;
+    fresh_deadline(result.handle.lease_deadline)?;
     response(actor, result)
 }
 
@@ -176,6 +194,7 @@ pub async fn renew(
     let actor = actor(&user)?;
     let credential = token(&headers, LAUNCH_LEASE_HEADER)?;
     let result = Ledger::renew(&state.db, actor, &request, &credential).await?;
+    fresh_deadline(result.handle.lease_deadline)?;
     response(actor, result)
 }
 
@@ -288,8 +307,57 @@ pub async fn reconcile(
     .await?;
     response(actor, result)
 }
+#[utoipa::path(post,path="/api/v1/workload-launches/{id}/io-grants",params(("id"=i64,Path)),request_body=LaunchIoGrantRequest,responses((status=200,body=LaunchIoGrant),(status=403,description="Launch unavailable")),tag="workload-control")]
+pub async fn io_grants(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    RequireAuth(user): RequireAuth,
+    headers: HeaderMap,
+    Json(request): Json<LaunchIoGrantRequest>,
+) -> ApiResult<Json<LaunchIoGrant>> {
+    key(id, &request.request)?;
+    let actor = actor(&user)?;
+    let result = Ledger::io_grant(
+        &state.db,
+        actor,
+        &request,
+        &token(&headers, LAUNCH_DISPATCH_HEADER)?,
+    )
+    .await?;
+    fresh_deadline(result.expires_at)?;
+    response(actor, result)
+}
+#[utoipa::path(post,path="/api/v1/workload-launches/{id}/authorize-io",params(("id"=i64,Path)),request_body=AuthorizeLaunchIoRequest,responses((status=200,body=LaunchIoAuthorization),(status=403,description="Launch unavailable")),tag="workload-control")]
+pub async fn authorize_io(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    RequireAuth(user): RequireAuth,
+    headers: HeaderMap,
+    Json(request): Json<AuthorizeLaunchIoRequest>,
+) -> ApiResult<Json<LaunchIoAuthorization>> {
+    key(id, &request.request)?;
+    let actor = actor(&user)?;
+    let result = Ledger::authorize_io(
+        &state.db,
+        actor,
+        &request,
+        &token(&headers, LAUNCH_LEASE_HEADER)?,
+        &token(&headers, LAUNCH_IO_HEADER)?,
+    )
+    .await?;
+    fresh_deadline(result.expires_at)?;
+    response(actor, result)
+}
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/workload-launches/{id}/outputs", post(reserve_output))
+        .route(
+            "/workload-launches/{id}/outputs/{output_id}/body",
+            post(output_body),
+        )
+        .route("/workload-launches/{id}/stage-result", post(stage_result))
+        .route("/workload-launches/{id}/io-grants", post(io_grants))
+        .route("/workload-launches/{id}/authorize-io", post(authorize_io))
         .route("/workload-launches/reconcile", post(reconcile))
         .route("/workload-launches/{id}/resolve", post(resolve))
         .route("/workload-launches/{id}/claim", post(claim))

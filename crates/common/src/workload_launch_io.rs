@@ -378,6 +378,8 @@ mod tests {
             resource: None,
             stop_reason: None,
             publication: LaunchPublicationState::NotRequired,
+            capture: crate::workload_launch::LaunchCaptureState::Pending,
+            capture_deadline: None,
         }
     }
     fn grant(launch: &ReservedLaunch, channel: LaunchIoChannel) -> LaunchIoGrant {

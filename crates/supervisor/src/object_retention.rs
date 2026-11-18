@@ -81,6 +81,55 @@ pub async fn run_cycle_with_budget(
         metadata_complete: true,
         ..Default::default()
     };
+    // Workload ZIP publication has its own retained source/operation ledger.
+    // Each cursor unit advances durably before work; timeout never certifies
+    // native absence, and a failed first row cannot starve the rest of a pass.
+    use attune_common::repositories::workload_launch::WorkloadLaunchRepository as Launches;
+    for _ in 0..limit.min(64) {
+        match tokio::time::timeout(budget.page_timeout, Launches::reconcile_outputs(pool, 1)).await
+        {
+            Ok(Ok(changed)) => metrics.metadata_rows_changed += changed,
+            _ => {
+                metrics.metadata_complete = false;
+                metrics.failures += 1;
+            }
+        }
+        if !Launches::output_reconcile_pending(pool).await? {
+            break;
+        }
+    }
+    let workload_plans = Launches::output_cleanup_candidates(pool, limit).await?;
+    for plan in workload_plans {
+        let key = plan.key()?;
+        let settled = tokio::time::timeout(
+            budget.page_timeout.max(std::time::Duration::from_secs(10)),
+            attune_common::blob_store::settle_atomic_file_put(
+                blob_store.as_ref(),
+                &key,
+                plan.token(),
+            ),
+        )
+        .await;
+        match settled {
+            Ok(Ok(settlement)) => match tokio::time::timeout(
+                budget.page_timeout,
+                Launches::acknowledge_output_cleanup(pool, &plan, &settlement),
+            )
+            .await
+            {
+                Ok(Ok(())) => metrics.metadata_rows_changed += 1,
+                _ => {
+                    metrics.metadata_complete = false;
+                    metrics.failures += 1;
+                }
+            },
+            _ => {
+                metrics.metadata_complete = false;
+                metrics.failures += 1;
+            }
+        }
+    }
+    metrics.metadata_scan_pending |= Launches::output_maintenance_pending(pool).await?;
     let _ = metadata_value(
         &mut metrics, "object_log_close_recovery",
         attune_common::repositories::log_stream::LogStreamRepository::recover_expired_closes_bounded(
@@ -332,7 +381,7 @@ pub async fn run_cycle_with_budget(
         }
     }
     metrics.pending_collection = ObjectMaintenanceRepository::pending_count(pool).await?;
-    metrics.metadata_scan_pending = ObjectMaintenanceRepository::deletion_scan_pending(pool)
+    metrics.metadata_scan_pending |= ObjectMaintenanceRepository::deletion_scan_pending(pool)
         .await?
         || Evidence::audit_scan_pending(pool).await?
         || StorageMaintenanceRepository::abandoned_discovery_pending(pool).await?;

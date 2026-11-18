@@ -19,6 +19,9 @@ use crate::{
     workload_launch_state::LaunchOperation, Error, Result,
 };
 
+mod output;
+pub use output::{LaunchOutputCleanup, OutputBodyPermit};
+
 const COLUMNS: &str = "id,engine,image,owner,manifest,admitted_digest,encrypted_context,source_epochs,operation,dispatch_hash,lease_hash,controller";
 fn denied() -> Error {
     Error::PermissionDenied("Workload launch unavailable".into())
@@ -79,9 +82,21 @@ pub struct LaunchInputBody {
     pub sha256: String,
 }
 
+/// Trusted planner snapshot, not a host-supplied cache selector. Configuration
+/// hashes random-nonce ciphertext; runtime definitions and inputs are public pins.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeStageBinding {
+    pub image_sha256: Sha256Digest,
+    pub pack_sha256: Sha256Digest,
+    pub configuration_ciphertext_sha256: Sha256Digest,
+    pub runtime_definition_sha256: Sha256Digest,
+}
 struct SourceProof {
     sources: Vec<(&'static str, i64)>,
     deadline: Option<DateTime<Utc>>,
+    retained: Option<Vec<SourceEpoch>>,
+    image: Option<i64>,
 }
 
 pub struct WorkloadLaunchRepository;
@@ -156,6 +171,14 @@ impl WorkloadLaunchRepository {
         target: &LaunchTarget,
         expected_owner: i64,
     ) -> Result<SourceProof> {
+        Self::source_for(tx, target, expected_owner, false).await
+    }
+    async fn source_for(
+        tx: &mut Transaction<'_, Postgres>,
+        target: &LaunchTarget,
+        expected_owner: i64,
+        allow_canceling: bool,
+    ) -> Result<SourceProof> {
         match target {
             LaunchTarget::Execution {
                 execution,
@@ -173,8 +196,8 @@ impl WorkloadLaunchRepository {
                         if authority.owner != Some(expected_owner) || !authority.explicit {
                             return Err(denied());
                         }
-                        let current: Option<Uuid>=sqlx::query_scalar("SELECT a.attempt FROM execution e JOIN delegated_execution_attempt a ON a.execution=e.id WHERE e.id=$1 AND e.worker=$2 AND a.worker=$2 AND NOT a.closed AND a.producer_kind='worker' AND e.status='running' FOR SHARE OF e,a")
-                            .bind(execution).bind(worker).fetch_optional(&mut **tx).await?;
+                        let current: Option<Uuid>=sqlx::query_scalar("SELECT a.attempt FROM execution e JOIN delegated_execution_attempt a ON a.execution=e.id WHERE e.id=$1 AND e.worker=$2 AND a.worker=$2 AND NOT a.closed AND a.producer_kind='worker' AND (e.status='running' OR ($3 AND e.status='canceling')) FOR SHARE OF e,a")
+                            .bind(execution).bind(worker).bind(allow_canceling).fetch_optional(&mut **tx).await?;
                         if current != Some(*attempt) {
                             return Err(denied());
                         }
@@ -189,26 +212,39 @@ impl WorkloadLaunchRepository {
                         if record.authority.owner.sponsor_identity_id != expected_owner {
                             return Err(denied());
                         }
-                        let current: Option<Uuid>=sqlx::query_scalar("SELECT f.attempt FROM execution e JOIN runtime_authority_execution_fence f ON f.execution=e.id WHERE e.id=$1 AND e.worker=$2 AND e.status='running' AND f.admission=$3 FOR SHARE OF e,f")
-                            .bind(execution).bind(worker).bind(record.id).fetch_optional(&mut **tx).await?;
+                        let current: Option<Uuid>=sqlx::query_scalar("SELECT f.attempt FROM execution e JOIN runtime_authority_execution_fence f ON f.execution=e.id WHERE e.id=$1 AND e.worker=$2 AND (e.status='running' OR ($4 AND e.status='canceling')) AND f.admission=$3 FOR SHARE OF e,f")
+                            .bind(execution).bind(worker).bind(record.id).bind(allow_canceling).fetch_optional(&mut **tx).await?;
                         if current != Some(*attempt) {
                             return Err(denied());
                         }
-                        RuntimeAuthorityRepository::validate_execution_credential(
-                            tx,
-                            &RuntimeCredentialBinding {
-                                execution_id: *execution,
-                                admission_id: record.id,
-                                sponsor_identity_id: expected_owner,
-                                action_ref: record.authority.binding.action_ref().into(),
-                                attempt: *attempt,
-                            },
-                        )
-                        .await?
-                        .ensure_fresh_on(tx)
-                        .await?;
+                        if !allow_canceling {
+                            RuntimeAuthorityRepository::validate_execution_credential(
+                                tx,
+                                &RuntimeCredentialBinding {
+                                    execution_id: *execution,
+                                    admission_id: record.id,
+                                    sponsor_identity_id: expected_owner,
+                                    action_ref: record.authority.binding.action_ref().into(),
+                                    attempt: *attempt,
+                                },
+                            )
+                            .await?
+                            .ensure_fresh_on(tx)
+                            .await?;
+                        }
                         fence.ensure_fresh_on(tx).await?;
                         deadline = fence.approval_deadline();
+                    }
+                }
+                if !allow_canceling {
+                    let execution_deadline:Option<DateTime<Utc>>=sqlx::query_scalar("SELECT started_at+make_interval(secs=>timeout_seconds) FROM execution WHERE id=$1 AND started_at IS NOT NULL AND timeout_seconds>0")
+                        .bind(execution).fetch_optional(&mut **tx).await?;
+                    let execution_deadline = execution_deadline.ok_or_else(denied)?;
+                    deadline = Some(deadline.map_or(execution_deadline, |approval| {
+                        approval.min(execution_deadline)
+                    }));
+                    if execution_deadline <= Self::now(tx).await? {
+                        return Err(denied());
                     }
                 }
                 Self::worker(tx, *worker, *worker_instance).await?;
@@ -219,6 +255,8 @@ impl WorkloadLaunchRepository {
                         ("worker", *worker),
                     ],
                     deadline,
+                    retained: None,
+                    image: None,
                 })
             }
             LaunchTarget::Sensor {
@@ -260,6 +298,8 @@ impl WorkloadLaunchRepository {
                         ("worker", *worker),
                     ],
                     deadline,
+                    retained: None,
+                    image: None,
                 })
             }
             LaunchTarget::CandidateTest {
@@ -281,6 +321,8 @@ impl WorkloadLaunchRepository {
                 Ok(SourceProof {
                     sources: vec![("owner", expected_owner), ("install", *install)],
                     deadline,
+                    retained: None,
+                    image: None,
                 })
             }
             LaunchTarget::Setup { admission, attempt }
@@ -290,16 +332,23 @@ impl WorkloadLaunchRepository {
                 } else {
                     "runtime_probe"
                 };
-                let source: Option<Json<LaunchTarget>>=sqlx::query_scalar("SELECT source_target FROM workload_launch_prerequisite WHERE id=$1 AND attempt=$2 AND purpose=$3 AND revoked_at IS NULL AND expires_at>clock_timestamp() FOR SHARE")
+                let source: Option<(Json<LaunchTarget>,Json<Vec<SourceEpoch>>,i64)>=sqlx::query_as("SELECT source_target,source_epochs,image FROM workload_launch_prerequisite WHERE id=$1 AND attempt=$2 AND purpose=$3 AND revoked_at IS NULL AND expires_at>clock_timestamp() FOR SHARE")
                     .bind(admission).bind(attempt).bind(purpose).fetch_optional(&mut **tx).await?;
-                let source = source.ok_or_else(denied)?.0;
+                let (source, epochs, image) = source.ok_or_else(denied)?;
+                let source = source.0;
                 if matches!(
                     source,
                     LaunchTarget::Setup { .. } | LaunchTarget::RuntimeProbe { .. }
                 ) {
                     return Err(denied());
                 }
-                let mut sources = Box::pin(Self::source(tx, &source, expected_owner)).await?;
+                let mut sources = Box::pin(Self::source_for(
+                    tx,
+                    &source,
+                    expected_owner,
+                    allow_canceling,
+                ))
+                .await?;
                 let deadline: DateTime<Utc> = sqlx::query_scalar(
                     "SELECT expires_at FROM workload_launch_prerequisite WHERE id=$1",
                 )
@@ -312,6 +361,8 @@ impl WorkloadLaunchRepository {
                         .map_or(deadline, |existing| existing.min(deadline)),
                 );
                 sources.sources.push(("admission", *admission));
+                sources.retained = Some(epochs.0);
+                sources.image = Some(image);
                 Ok(sources)
             }
         }
@@ -330,21 +381,72 @@ impl WorkloadLaunchRepository {
         }
         Ok(())
     }
+    fn retained_epochs(
+        proof: &SourceProof,
+        current: &[SourceEpoch],
+        image: i64,
+        capture: bool,
+    ) -> Result<()> {
+        if let Some(retained) = &proof.retained {
+            let required: Vec<_> = proof
+                .sources
+                .iter()
+                .filter(|(kind, _)| *kind != "admission")
+                .collect();
+            if retained.len() != required.len()
+                || required.iter().any(|(kind, subject)| {
+                    !retained
+                        .iter()
+                        .any(|epoch| epoch.kind == *kind && epoch.subject == *subject)
+                })
+            {
+                return Err(denied());
+            }
+        }
+        if proof.image.is_some_and(|expected| expected != image)
+            || proof.retained.as_ref().is_some_and(|retained| {
+                retained
+                    .iter()
+                    .filter(|expected| !capture || expected.kind != "image")
+                    .any(|expected| !current.contains(expected))
+            })
+        {
+            return Err(denied());
+        }
+        Ok(())
+    }
     async fn epochs(
         tx: &mut Transaction<'_, Postgres>,
         record: &Record,
     ) -> Result<(Vec<SourceEpoch>, Option<DateTime<Utc>>)> {
-        let mut sources = Self::source(tx, &record.manifest.target, record.owner).await?;
-        let image:Option<i64>=sqlx::query_scalar("SELECT i.id FROM workload_execution_image i JOIN workload_engine e ON e.id=i.engine WHERE i.id=$1 AND i.engine=$2 AND i.sha256=$3 AND i.reference=$4 AND i.revoked_at IS NULL AND NOT e.disabled FOR SHARE OF i,e")
+        Self::epochs_for(tx, record, false).await
+    }
+    async fn epochs_for(
+        tx: &mut Transaction<'_, Postgres>,
+        record: &Record,
+        capture: bool,
+    ) -> Result<(Vec<SourceEpoch>, Option<DateTime<Utc>>)> {
+        let mut sources =
+            Self::source_for(tx, &record.manifest.target, record.owner, capture).await?;
+        if !capture {
+            let image:Option<i64>=sqlx::query_scalar("SELECT i.id FROM workload_execution_image i JOIN workload_engine e ON e.id=i.engine WHERE i.id=$1 AND i.engine=$2 AND i.sha256=$3 AND i.reference=$4 AND i.revoked_at IS NULL AND NOT e.disabled FOR SHARE OF i,e")
             .bind(record.image).bind(record.engine).bind(record.manifest.image.sha256.as_str()).bind(&record.manifest.image.reference).fetch_optional(&mut **tx).await?;
-        if image.is_none() {
-            return Err(denied());
+            if image.is_none() {
+                return Err(denied());
+            }
         }
         sources.sources.push(("image", record.image));
-        Ok((
-            workload_source::snapshot(tx, sources.sources).await?,
-            sources.deadline,
-        ))
+        let epochs = workload_source::snapshot(tx, sources.sources.clone()).await?;
+        Self::retained_epochs(&sources, &epochs, record.image, capture)?;
+        Ok((epochs, sources.deadline))
+    }
+    fn same_epochs(current: &[SourceEpoch], expected: &[SourceEpoch], capture: bool) -> bool {
+        current
+            .iter()
+            .filter(|entry| !capture || entry.kind != "image")
+            .eq(expected
+                .iter()
+                .filter(|entry| !capture || entry.kind != "image"))
     }
     /// Acquire sources and epochs before locking the operation. Permission loss
     /// closes the operation durably; cleanup may proceed without private context.
@@ -358,38 +460,58 @@ impl WorkloadLaunchRepository {
         if snapshot.engine != actor.engine {
             return Err(denied());
         }
+        let capture =
+            snapshot.operation.cleanup_only() && !snapshot.operation.publication_pending();
         let mut effect_deadline = None;
-        let admitted =
-            if snapshot.operation.cleanup_only() && !snapshot.operation.publication_pending() {
-                false
-            } else {
-                match Self::epochs(tx, &snapshot).await {
-                    Ok((epochs, deadline)) => {
-                        effect_deadline = deadline;
-                        epochs == snapshot.source_epochs.0
-                    }
-                    Err(Error::PermissionDenied(_)) => false,
-                    Err(error) => return Err(error),
+        let admitted = if snapshot.operation.cleanup_only()
+            && !snapshot.operation.publication_pending()
+            && !snapshot.operation.capture_pending()
+        {
+            false
+        } else {
+            match Self::epochs_for(tx, &snapshot, capture).await {
+                Ok((epochs, deadline)) => {
+                    effect_deadline = deadline;
+                    Self::same_epochs(&epochs, &snapshot.source_epochs.0, capture)
                 }
-            };
+                Err(Error::PermissionDenied(_)) => false,
+                Err(error) => return Err(error),
+            }
+        };
         let mut record = Self::record(tx, request, true).await?;
         record.effect_deadline = effect_deadline;
+        record.operation.expire_capture(Self::now(tx).await?);
         let now = Self::now(tx).await?;
         if record
             .effect_deadline
             .is_some_and(|deadline| deadline <= now)
         {
-            record.operation.stop(LaunchStopReason::SourceRevoked);
+            record
+                .operation
+                .stop_at(LaunchStopReason::SourceRevoked, Self::now(tx).await?);
+            if capture && record.operation.capture_pending() {
+                record.operation.status.capture = LaunchCaptureState::Incomplete;
+            }
         }
-        if !admitted && (!record.operation.cleanup_only() || record.operation.publication_pending())
+        if !admitted
+            && (!record.operation.cleanup_only()
+                || record.operation.publication_pending()
+                || record.operation.capture_pending())
         {
-            record.operation.stop(LaunchStopReason::SourceRevoked);
+            record
+                .operation
+                .stop_at(LaunchStopReason::SourceRevoked, Self::now(tx).await?);
+            if capture && record.operation.capture_pending() {
+                record.operation.status.capture = LaunchCaptureState::Incomplete;
+            }
         }
         if record.operation.lease_generation > 0
             && record.operation.lease_deadline <= Self::now(tx).await?
             && !record.operation.cleanup_only()
         {
-            record.operation.stop(LaunchStopReason::LeaseExpired);
+            record
+                .operation
+                .stop_at(LaunchStopReason::LeaseExpired, now);
         }
         Ok(record)
     }
@@ -427,14 +549,83 @@ impl WorkloadLaunchRepository {
         }
         Ok(context.invocation)
     }
+    /// One Setup admission covers the entire selected setup sequence in a
+    /// single container; only its settled successful exit can publish a stage.
+    /// Probe admissions retain the same immutable source and image boundary.
+    pub async fn prerequisite(
+        pool: &PgPool,
+        target: &LaunchTarget,
+        owner: i64,
+        image: i64,
+        purpose: LaunchPurpose,
+        binding: Option<RuntimeStageBinding>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<LaunchTarget> {
+        if !matches!(purpose, LaunchPurpose::Setup | LaunchPurpose::RuntimeProbe)
+            || matches!(
+                target,
+                LaunchTarget::Setup { .. } | LaunchTarget::RuntimeProbe { .. }
+            )
+        {
+            return Err(denied());
+        }
+        let mut tx = pool.begin().await?;
+        let mut proof = Self::source(&mut tx, target, owner).await?;
+        let image_digest:String=sqlx::query_scalar("SELECT i.sha256 FROM workload_execution_image i JOIN workload_engine e ON e.id=i.engine WHERE i.id=$1 AND i.revoked_at IS NULL AND NOT e.disabled FOR SHARE OF i,e").bind(image).fetch_optional(&mut *tx).await?.ok_or_else(denied)?;
+        if purpose == LaunchPurpose::Setup {
+            let binding = binding.as_ref().ok_or_else(denied)?;
+            if binding.image_sha256.as_str() != image_digest {
+                return Err(denied());
+            }
+            let pack:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workload_launch_object WHERE source_target=$1 AND kind='pack' AND sha256=$2 AND retired_at IS NULL)").bind(Json(target)).bind(binding.pack_sha256.as_str()).fetch_one(&mut *tx).await?;
+            if !pack {
+                return Err(denied());
+            }
+        }
+        proof.sources.push(("image", image));
+        let epochs = workload_source::snapshot(&mut tx, proof.sources).await?;
+        let now = Self::now(&mut tx).await?;
+        if expires_at <= now || expires_at > now + chrono::Duration::hours(1) {
+            return Err(denied());
+        }
+        let attempt = Uuid::new_v4();
+        let name = if purpose == LaunchPurpose::Setup {
+            "setup"
+        } else {
+            "runtime_probe"
+        };
+        let id:i64=sqlx::query_scalar("INSERT INTO workload_launch_prerequisite(purpose,attempt,source_target,image,source_epochs,stage_binding,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id")
+            .bind(name).bind(attempt).bind(Json(target)).bind(image).bind(Json(epochs)).bind(binding.as_ref().map(Json)).bind(expires_at).fetch_one(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(if purpose == LaunchPurpose::Setup {
+            LaunchTarget::Setup {
+                admission: id,
+                attempt,
+            }
+        } else {
+            LaunchTarget::RuntimeProbe {
+                admission: id,
+                attempt,
+            }
+        })
+    }
     /// Called by trusted CP planners after materializing the exact admitted
     /// archive/context. This is deliberately not a raw-spec HTTP endpoint.
     /// Generated IDs/nonces/context pins override any placeholders in the plan.
     pub async fn freeze(
         pool: &PgPool,
         image_id: i64,
+        spec: LaunchSpec,
+        master: &str,
+    ) -> Result<ReservedLaunch> {
+        Self::freeze_with_runtime_binding(pool, image_id, spec, master, None).await
+    }
+    pub async fn freeze_with_runtime_binding(
+        pool: &PgPool,
+        image_id: i64,
         mut spec: LaunchSpec,
         master: &str,
+        expected_runtime: Option<&RuntimeStageBinding>,
     ) -> Result<ReservedLaunch> {
         let mut tx = pool.begin().await?;
         let sources = Self::source(
@@ -448,9 +639,22 @@ impl WorkloadLaunchRepository {
         if image.is_none() {
             return Err(denied());
         }
+        let input_target = match &spec.manifest.target {
+            LaunchTarget::Setup { admission, .. }
+            | LaunchTarget::RuntimeProbe { admission, .. } => {
+                sqlx::query_scalar::<_, Json<LaunchTarget>>(
+                    "SELECT source_target FROM workload_launch_prerequisite WHERE id=$1",
+                )
+                .bind(admission)
+                .fetch_one(&mut *tx)
+                .await?
+                .0
+            }
+            target => target.clone(),
+        };
         for input in &spec.manifest.inputs {
-            let valid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workload_launch_object WHERE id=$1 AND source_target=$2 AND kind=$3 AND provider_version=$4 AND size_bytes=$5 AND sha256=$6 AND max_expanded_bytes=$7 AND max_files=$8)")
-                .bind(input.object_id).bind(Json(&spec.manifest.target)).bind(serde_json::to_value(input.kind)?.as_str().ok_or_else(denied)?)
+            let valid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workload_launch_object WHERE retired_at IS NULL AND id=$1 AND source_target=$2 AND kind=$3 AND provider_version=$4 AND size_bytes=$5 AND sha256=$6 AND max_expanded_bytes=$7 AND max_files=$8)")
+                .bind(input.object_id).bind(Json(&input_target)).bind(serde_json::to_value(input.kind)?.as_str().ok_or_else(denied)?)
                 .bind(&input.object_version).bind(i64::try_from(input.size_bytes).map_err(|_|denied())?).bind(input.sha256.as_str())
                 .bind(i64::try_from(input.max_expanded_bytes).map_err(|_|denied())?).bind(i64::try_from(input.max_files).map_err(|_|denied())?).fetch_one(&mut *tx).await?;
             if !valid {
@@ -459,7 +663,34 @@ impl WorkloadLaunchRepository {
         }
         let mut sources = sources;
         sources.sources.push(("image", image_id));
-        let epochs = workload_source::snapshot(&mut tx, sources.sources).await?;
+        let epochs = workload_source::snapshot(&mut tx, sources.sources.clone()).await?;
+        Self::retained_epochs(&sources, &epochs, image_id, false)?;
+        for input in spec
+            .manifest
+            .inputs
+            .iter()
+            .filter(|input| input.kind == LaunchInputKind::Runtime)
+        {
+            let expected = expected_runtime.ok_or_else(denied)?;
+            if expected.image_sha256 != spec.manifest.image.sha256
+                || !spec.manifest.inputs.iter().any(|pin| {
+                    pin.kind == LaunchInputKind::Pack && pin.sha256 == expected.pack_sha256
+                })
+            {
+                return Err(denied());
+            }
+            let build:Option<(Json<RuntimeStageBinding>,Json<Vec<SourceEpoch>>)>=sqlx::query_as("SELECT o.stage_binding,b.source_epochs FROM workload_launch_object o JOIN workload_launch b ON b.id=o.build_launch WHERE o.id=$1 AND o.kind='runtime' AND o.retired_at IS NULL AND o.built_image_sha256=$2 AND o.built_image_sha256=b.manifest#>>'{image,sha256}' AND b.manifest->>'purpose'='setup' AND b.operation#>>'{status,state}'='stopped' AND b.operation#>>'{status,runtime_state}'='exited' AND b.operation#>>'{status,publication}'='published' AND b.operation#>'{status,stop_reason}'='null'::jsonb AND b.operation#>>'{status,exit_outcome,exit_code}'='0' AND b.operation#>>'{status,exit_outcome,oom_killed}'='false'")
+                .bind(input.object_id).bind(expected.image_sha256.as_str()).fetch_optional(&mut *tx).await?;
+            let (binding, build_epochs) = build.ok_or_else(denied)?;
+            if binding.0 != *expected
+                || build_epochs
+                    .iter()
+                    .filter(|epoch| epoch.kind != "admission")
+                    .any(|epoch| !epochs.contains(epoch))
+            {
+                return Err(denied());
+            }
+        }
         let id: i64 =
             sqlx::query_scalar("SELECT nextval(pg_get_serial_sequence('workload_launch','id'))")
                 .fetch_one(&mut *tx)
@@ -479,6 +710,25 @@ impl WorkloadLaunchRepository {
             version: 1,
             ciphertext_sha256: Sha256Digest::of_bytes(encrypted_context.as_bytes()),
         };
+        if let LaunchTarget::Setup { admission, attempt } = &spec.manifest.target {
+            let binding:Json<RuntimeStageBinding>=sqlx::query_scalar("SELECT stage_binding FROM workload_launch_prerequisite WHERE id=$1 AND attempt=$2 AND purpose='setup'")
+                .bind(admission).bind(attempt).fetch_one(&mut *tx).await?;
+            let pack = spec
+                .manifest
+                .inputs
+                .iter()
+                .find(|input| input.kind == LaunchInputKind::Pack)
+                .ok_or_else(denied)?;
+            if binding.image_sha256 != spec.manifest.image.sha256
+                || binding.pack_sha256 != pack.sha256
+            {
+                return Err(denied());
+            }
+            let bytes =
+                serde_json::to_vec(&("attune-runtime-stage-v1", admission, attempt, binding.0))?;
+            spec.manifest.stage.as_mut().ok_or_else(denied)?.cache_key =
+                Sha256Digest::of_bytes(&bytes).as_str().into();
+        }
         spec.validate_shape()?;
         let now = Self::now(&mut tx).await?;
         if spec.manifest.lease_deadline <= now
@@ -527,7 +777,7 @@ impl WorkloadLaunchRepository {
             .iter()
             .find(|pin| pin.pin_id == pin_id)
             .ok_or_else(denied)?;
-        let body:LaunchInputBody=sqlx::query_as("SELECT object_key,provider_version,size_bytes,sha256 FROM workload_launch_object WHERE id=$1")
+        let body:LaunchInputBody=sqlx::query_as("SELECT object_key,provider_version,size_bytes,sha256 FROM workload_launch_object WHERE id=$1 AND retired_at IS NULL")
             .bind(input.object_id).fetch_optional(&mut *tx).await?.ok_or_else(denied)?;
         if body.provider_version != input.object_version
             || body.size_bytes < 0
@@ -552,7 +802,7 @@ impl WorkloadLaunchRepository {
         }
         let mut tx = pool.begin().await?;
         Self::actor(&mut tx, actor).await?;
-        let mut rows:Vec<(i64,String,String)>=sqlx::query_as("SELECT id,admitted_digest,encrypted_dispatch FROM workload_launch WHERE engine=$1 AND id>$2 AND (operation#>>'{status,state}'<>'stopped' OR operation#>>'{status,publication}' IN ('pending','uploading')) ORDER BY id LIMIT $3")
+        let mut rows:Vec<(i64,String,String)>=sqlx::query_as("SELECT id,admitted_digest,encrypted_dispatch FROM workload_launch WHERE engine=$1 AND id>$2 AND (operation#>>'{status,state}'<>'stopped' OR operation#>>'{status,publication}' IN ('pending','uploading') OR operation#>>'{status,capture}'='pending') ORDER BY id LIMIT $3")
             .bind(actor.engine).bind(request.after.unwrap_or(0)).bind(i64::from(request.limit)+1).fetch_all(&mut *tx).await?;
         let more = rows.len() > request.limit as usize;
         rows.truncate(request.limit as usize);
@@ -607,6 +857,7 @@ impl WorkloadLaunchRepository {
         }
         if record.operation.status.state == LaunchState::Stopped
             && !record.operation.publication_pending()
+            && !record.operation.capture_pending()
         {
             Self::save(&mut tx, &record).await?;
             tx.commit().await?;
@@ -616,7 +867,9 @@ impl WorkloadLaunchRepository {
         }
         let now = Self::now(&mut tx).await?;
         if record.operation.lease_generation == 0 && record.manifest.lease_deadline <= now {
-            record.operation.stop(LaunchStopReason::LeaseExpired);
+            record
+                .operation
+                .stop_at(LaunchStopReason::LeaseExpired, now);
         }
         let deadline = (now + chrono::Duration::seconds(30))
             .min(DateTime::from_timestamp(actor.expires_at, 0).ok_or_else(denied)?);
@@ -625,6 +878,17 @@ impl WorkloadLaunchRepository {
             record
                 .effect_deadline
                 .map_or(deadline, |source| source.min(deadline))
+        } else {
+            deadline
+        };
+        let deadline = if record.operation.status.state == LaunchState::Stopped
+            && !record.operation.publication_pending()
+        {
+            record
+                .operation
+                .status
+                .capture_deadline
+                .map_or(deadline, |capture| capture.min(deadline))
         } else {
             deadline
         };
@@ -638,7 +902,13 @@ impl WorkloadLaunchRepository {
             purpose,
             token,
         };
-        let response = if purpose == LaunchLeasePurpose::Publication {
+        let response = if purpose == LaunchLeasePurpose::Capture {
+            ClaimedLaunch::Capture {
+                manifest: Box::new(record.manifest.0.clone()),
+                status: record.operation.status.clone(),
+                lease,
+            }
+        } else if purpose == LaunchLeasePurpose::Publication {
             ClaimedLaunch::Publication {
                 manifest: Box::new(record.manifest.0.clone()),
                 status: record.operation.status.clone(),
@@ -696,7 +966,9 @@ impl WorkloadLaunchRepository {
         if record.engine != actor.engine || record.dispatch_hash != credential_hash(dispatch) {
             return Err(denied());
         }
-        record.operation.stop(request.reason);
+        record
+            .operation
+            .stop_at(request.reason, Self::now(&mut tx).await?);
         Self::save(&mut tx, &record).await?;
         Self::actor(&mut tx, actor).await?;
         tx.commit().await?;
@@ -771,7 +1043,9 @@ impl WorkloadLaunchRepository {
             token,
             Self::now(&mut tx).await?,
         )?;
-        record.operation.observe(&request.observation)?;
+        record
+            .operation
+            .observe_at(&request.observation, Self::now(&mut tx).await?)?;
         Self::save(&mut tx, &record).await?;
         Self::actor(&mut tx, actor).await?;
         tx.commit().await?;
@@ -798,6 +1072,17 @@ impl WorkloadLaunchRepository {
             record
                 .effect_deadline
                 .map_or(deadline, |source| source.min(deadline))
+        } else {
+            deadline
+        };
+        let deadline = if record.operation.status.state == LaunchState::Stopped
+            && !record.operation.publication_pending()
+        {
+            record
+                .operation
+                .status
+                .capture_deadline
+                .map_or(deadline, |capture| capture.min(deadline))
         } else {
             deadline
         };
@@ -840,5 +1125,171 @@ impl WorkloadLaunchRepository {
         Self::actor(&mut tx, actor).await?;
         tx.commit().await?;
         Ok(record.operation.status.clone())
+    }
+    /// Finite raw I/O grants are independent of log encryption keys. Controller
+    /// and manager credentials never enter the pack invocation/environment.
+    pub async fn io_grant(
+        pool: &PgPool,
+        actor: ControllerActor,
+        request: &LaunchIoGrantRequest,
+        dispatch: &LaunchToken,
+    ) -> Result<LaunchIoGrant> {
+        let mut tx = pool.begin().await?;
+        let record = if request.channel == LaunchIoChannel::Stdin {
+            Self::admitted(&mut tx, actor, &request.request).await?
+        } else {
+            Self::admitted_for_capture(&mut tx, actor, &request.request).await?
+        };
+        if record.dispatch_hash != credential_hash(dispatch)
+            || record.operation.status.capture == LaunchCaptureState::Incomplete
+        {
+            return Err(denied());
+        }
+        if request.channel == LaunchIoChannel::Stdin
+            && (record.operation.cleanup_only() || record.operation.stdin_authorized)
+        {
+            return Err(denied());
+        }
+        let now = Self::now(&mut tx).await?;
+        let expires_at = (now + chrono::Duration::seconds(30))
+            .min(DateTime::from_timestamp(actor.expires_at, 0).ok_or_else(denied)?);
+        let expires_at = record
+            .effect_deadline
+            .map_or(expires_at, |source| source.min(expires_at));
+        // Each grant is bounded independently; a sensor's growing stream is read
+        // in finite slices. Offset addition is checked again by authorize_io.
+        if request.channel != LaunchIoChannel::Stdin && !record.operation.capture_pending() {
+            return Err(denied());
+        }
+        let expires_at = record
+            .operation
+            .status
+            .capture_deadline
+            .map_or(expires_at, |capture| capture.min(expires_at));
+        let max_bytes = if request.channel == LaunchIoChannel::Stdin {
+            8 * 1024 * 1024
+        } else {
+            1024 * 1024
+        };
+        let token = new_token()?;
+        sqlx::query("INSERT INTO workload_launch_io_grant(launch,channel,token_hash,max_bytes,expires_at) VALUES($1,$2,$3,$4,$5) ON CONFLICT(launch,channel) DO UPDATE SET token_hash=EXCLUDED.token_hash,max_bytes=EXCLUDED.max_bytes,expires_at=EXCLUDED.expires_at")
+            .bind(record.id).bind(serde_json::to_value(request.channel)?.as_str().ok_or_else(denied)?)
+            .bind(credential_hash(&token)).bind(max_bytes as i64).bind(expires_at).execute(&mut *tx).await?;
+        Self::save(&mut tx, &record).await?;
+        Self::actor(&mut tx, actor).await?;
+        tx.commit().await?;
+        Ok(LaunchIoGrant {
+            request: request.request.clone(),
+            channel: request.channel,
+            token,
+            max_bytes,
+            expires_at,
+        })
+    }
+    async fn admitted_for_capture(
+        tx: &mut Transaction<'_, Postgres>,
+        actor: ControllerActor,
+        request: &LaunchRequest,
+    ) -> Result<Record> {
+        Self::fresh_record(tx, actor, request, true).await
+    }
+    async fn admitted_for_publication(
+        tx: &mut Transaction<'_, Postgres>,
+        actor: ControllerActor,
+        request: &LaunchRequest,
+    ) -> Result<Record> {
+        Self::fresh_record(tx, actor, request, false).await
+    }
+    async fn fresh_record(
+        tx: &mut Transaction<'_, Postgres>,
+        actor: ControllerActor,
+        request: &LaunchRequest,
+        capture: bool,
+    ) -> Result<Record> {
+        Self::actor(tx, actor).await?;
+        let snapshot = Self::record(tx, request, false).await?;
+        if snapshot.engine != actor.engine {
+            return Err(denied());
+        }
+        let (epochs, deadline) = Self::epochs_for(tx, &snapshot, capture).await?;
+        let mut record = Self::record(tx, request, true).await?;
+        record.effect_deadline = deadline;
+        record.operation.expire_capture(Self::now(tx).await?);
+        if !Self::same_epochs(&epochs, &record.source_epochs.0, capture)
+            || (capture && record.operation.status.capture == LaunchCaptureState::Incomplete)
+        {
+            return Err(denied());
+        }
+        if deadline.is_some_and(|deadline| deadline <= Utc::now()) {
+            return Err(denied());
+        }
+        Ok(record)
+    }
+    pub async fn authorize_io(
+        pool: &PgPool,
+        actor: ControllerActor,
+        request: &AuthorizeLaunchIoRequest,
+        lease: &LaunchToken,
+        grant: &LaunchToken,
+    ) -> Result<LaunchIoAuthorization> {
+        let mut tx = pool.begin().await?;
+        let mut record = if request.channel == LaunchIoChannel::Stdin {
+            Self::admitted(&mut tx, actor, &request.request).await?
+        } else {
+            Self::admitted_for_capture(&mut tx, actor, &request.request).await?
+        };
+        let now = Self::now(&mut tx).await?;
+        Self::require_lease(&record, actor, &record.operation.handle(), lease, now)?;
+        let permission:Option<(i64,DateTime<Utc>)>=sqlx::query_as("SELECT max_bytes,expires_at FROM workload_launch_io_grant WHERE launch=$1 AND channel=$2 AND token_hash=$3 AND expires_at>clock_timestamp() FOR SHARE")
+            .bind(record.id).bind(serde_json::to_value(request.channel)?.as_str().ok_or_else(denied)?)
+            .bind(credential_hash(grant)).fetch_optional(&mut *tx).await?;
+        let (max_bytes, expires_at) = permission.ok_or_else(denied)?;
+        if request.bytes == 0
+            || request.bytes > max_bytes as u64
+            || request.offset.checked_add(request.bytes).is_none()
+        {
+            return Err(denied());
+        }
+        if request.channel != LaunchIoChannel::Stdin {
+            if !record.operation.capture_pending()
+                || record
+                    .operation
+                    .status
+                    .capture_deadline
+                    .is_some_and(|deadline| deadline <= now)
+            {
+                return Err(denied());
+            }
+        }
+        if request.channel == LaunchIoChannel::Stdin {
+            if request.offset != 0
+                || record.operation.cleanup_only()
+                || record.operation.stdin_authorized
+            {
+                return Err(denied());
+            }
+            // Reservation precedes external byte effects. An uncertain write is
+            // never retried by replacing/minting another stdin grant.
+            record.operation.stdin_authorized = true;
+        }
+        let expires_at = record
+            .effect_deadline
+            .map_or(expires_at, |source| source.min(expires_at))
+            .min(record.operation.lease_deadline);
+        let expires_at = record
+            .operation
+            .status
+            .capture_deadline
+            .map_or(expires_at, |capture| capture.min(expires_at));
+        let result = LaunchIoAuthorization {
+            handle: record.operation.handle(),
+            channel: request.channel,
+            max_bytes: request.bytes,
+            expires_at,
+        };
+        Self::save(&mut tx, &record).await?;
+        Self::actor(&mut tx, actor).await?;
+        tx.commit().await?;
+        Ok(result)
     }
 }

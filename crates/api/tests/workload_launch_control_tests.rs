@@ -37,6 +37,10 @@ impl Fixture {
         let execution = ExecutionRepository::find_by_id(&ctx.pool, execution)
             .await?
             .unwrap();
+        sqlx::query("UPDATE execution SET timeout_seconds=300 WHERE id=$1")
+            .bind(execution.id)
+            .execute(&ctx.pool)
+            .await?;
         let worker = execution.worker.unwrap();
         let instance = Uuid::new_v4();
         sqlx::query("UPDATE worker SET meta=COALESCE(meta,'{}'::jsonb)||jsonb_build_object('registration_incarnation',$2::text) WHERE id=$1")
@@ -475,6 +479,352 @@ async fn reserve_revoke_restore_claim_never_revives_old_launch_but_new_admission
         )
         .await?;
     assert_eq!(status, StatusCode::FORBIDDEN);
+    fixture.ctx.cleanup().await?;
+    Ok(())
+}
+
+fn archive(name: &str, contents: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    zip.start_file(
+        name,
+        zip::write::SimpleFileOptions::default().unix_permissions(0o755),
+    )
+    .unwrap();
+    zip.write_all(contents).unwrap();
+    zip.finish().unwrap().into_inner()
+}
+impl Fixture {
+    fn actor(&self) -> ControllerActor {
+        attune_common::workload_controller::actor(
+            &validate_token(&self.credential, &self.ctx.state.jwt_config).unwrap(),
+        )
+        .unwrap()
+    }
+    async fn setup(
+        &mut self,
+    ) -> Result<(
+        LaunchSpec,
+        attune_common::repositories::workload_launch::RuntimeStageBinding,
+    )> {
+        use attune_common::{
+            blob_store::{body_from_bytes, sha256, ObjectKey},
+            repositories::workload_launch::RuntimeStageBinding,
+        };
+        let mut action = self.spec.clone();
+        let pack = archive("pack.yaml", b"ref: owned-fixture\n");
+        let key = ObjectKey::new(format!("workload-input/{}", Uuid::new_v4().simple()))?;
+        let stored = self
+            .ctx
+            .state
+            .blob_store
+            .put_file_atomic(
+                &key,
+                body_from_bytes(pack.clone().into()),
+                pack.len() as u64,
+                sha256(&pack),
+            )
+            .await?;
+        let digest = Sha256Digest::of_bytes(&pack);
+        let object:i64=sqlx::query_scalar("INSERT INTO workload_launch_object(source_target,kind,object_key,provider_version,size_bytes,sha256,max_expanded_bytes,max_files) VALUES($1,'pack',$2,$3,$4,$5,1048576,32) RETURNING id")
+            .bind(sqlx::types::Json(&action.manifest.target)).bind(key.as_str()).bind(stored.provider_version.as_stored()).bind(pack.len() as i64).bind(digest.as_str()).fetch_one(&self.ctx.pool).await?;
+        let pin = PinnedLaunchInput {
+            pin_id: object,
+            object_id: object,
+            kind: LaunchInputKind::Pack,
+            object_version: stored.provider_version.as_stored().into(),
+            size_bytes: pack.len() as u64,
+            sha256: digest.clone(),
+            max_expanded_bytes: 1048576,
+            max_files: 32,
+        };
+        action.manifest.inputs = vec![pin.clone()];
+        let binding = RuntimeStageBinding {
+            image_sha256: action.manifest.image.sha256.clone(),
+            pack_sha256: digest,
+            configuration_ciphertext_sha256: Sha256Digest::of_bytes(
+                &attune_common::crypto::random_bytes::<32>(),
+            ),
+            runtime_definition_sha256: Sha256Digest::of_bytes(b"owned-public-runtime-definition"),
+        };
+        self.spec.manifest.purpose = LaunchPurpose::Setup;
+        self.spec.manifest.target = Ledger::prerequisite(
+            &self.ctx.pool,
+            &action.manifest.target,
+            action.manifest.owner_identity_id,
+            self.image,
+            LaunchPurpose::Setup,
+            Some(binding.clone()),
+            chrono::Utc::now() + chrono::Duration::minutes(5),
+        )
+        .await?;
+        self.spec.manifest.inputs = vec![pin];
+        self.spec.manifest.stage = Some(PrivateStage {
+            cache_key: "caller-placeholder-must-be-replaced".into(),
+            quota_bytes: 1048576,
+            quota_files: 32,
+        });
+        self.spec.invocation.working_root = LaunchRoot::Stage;
+        Ok((action, binding))
+    }
+    async fn removed_setup(&self, reserved: &ReservedLaunch) -> Result<LaunchLease> {
+        let active = Ledger::claim(
+            &self.ctx.pool,
+            self.actor(),
+            &reserved.request,
+            &reserved.dispatch_token,
+            self.master(),
+        )
+        .await?;
+        let (manifest, lease) = match active {
+            ClaimedLaunch::Active { spec, lease } => (spec.manifest, lease),
+            _ => panic!("expected active setup"),
+        };
+        assert_ne!(
+            manifest.stage.as_ref().unwrap().cache_key,
+            "caller-placeholder-must-be-replaced"
+        );
+        let create = Ledger::create_intent(
+            &self.ctx.pool,
+            self.actor(),
+            &LaunchLeaseRequest {
+                handle: lease.handle.clone(),
+            },
+            &lease.token,
+        )
+        .await?;
+        let resource = EngineResourceEvidence {
+            engine_id: manifest.engine_id,
+            engine_name_nonce: manifest.engine_name_nonce,
+            resource_id: "owned-setup-container".into(),
+            admitted_digest: reserved.request.admitted_digest.clone(),
+            public_manifest_digest: Sha256Digest::of_bytes(b"owned-fixed-engine-policy"),
+        };
+        Ledger::observe(
+            &self.ctx.pool,
+            self.actor(),
+            &ObserveLaunchRequest {
+                handle: lease.handle.clone(),
+                observation: LaunchObservation::Created {
+                    create_nonce: create.create_nonce,
+                    resource: resource.clone(),
+                },
+            },
+            &lease.token,
+        )
+        .await?;
+        let start = Ledger::start_intent(
+            &self.ctx.pool,
+            self.actor(),
+            &LaunchLeaseRequest {
+                handle: lease.handle.clone(),
+            },
+            &lease.token,
+        )
+        .await?;
+        Ledger::observe(
+            &self.ctx.pool,
+            self.actor(),
+            &ObserveLaunchRequest {
+                handle: lease.handle.clone(),
+                observation: LaunchObservation::Exited {
+                    start_nonce: start.start_nonce,
+                    resource: resource.clone(),
+                    exit_code: 0,
+                    oom_killed: false,
+                },
+            },
+            &lease.token,
+        )
+        .await?;
+        let cleanup = Ledger::claim(
+            &self.ctx.pool,
+            self.actor(),
+            &reserved.request,
+            &reserved.dispatch_token,
+            self.master(),
+        )
+        .await?;
+        let lease = match cleanup {
+            ClaimedLaunch::Cleanup { lease, .. } => lease,
+            _ => panic!("expected immediate cleanup"),
+        };
+        Ledger::stop_ack(
+            &self.ctx.pool,
+            self.actor(),
+            &StopLaunchAcknowledgement {
+                handle: lease.handle.clone(),
+                create: ProviderCreateSettlement::Created {
+                    create_nonce: create.create_nonce,
+                    resource: resource.clone(),
+                },
+                removed_resource: Some(resource),
+            },
+            &lease.token,
+        )
+        .await?;
+        let publication = Ledger::claim(
+            &self.ctx.pool,
+            self.actor(),
+            &reserved.request,
+            &reserved.dispatch_token,
+            self.master(),
+        )
+        .await?;
+        Ok(match publication {
+            ClaimedLaunch::Publication { lease, .. } => lease,
+            _ => panic!("expected publication-only recovery"),
+        })
+    }
+    async fn upload_archive(
+        &self,
+        reserved: &ReservedLaunch,
+        lease: &LaunchLease,
+        grant: &LaunchOutputGrant,
+        bytes: Vec<u8>,
+    ) -> Result<(StatusCode, Value)> {
+        let path = format!(
+            "/api/v1/workload-launches/{}/outputs/{}/body?admitted_digest={}",
+            reserved.request.launch_id,
+            grant.output_id,
+            reserved.request.admitted_digest.as_str()
+        );
+        let request = Request::post(path)
+            .header("authorization", format!("Bearer {}", self.credential))
+            .header("content-type", LAUNCH_ARCHIVE_CONTENT_TYPE)
+            .header("content-length", bytes.len().to_string())
+            .header(LAUNCH_LEASE_HEADER, lease.token.as_str())
+            .header(LAUNCH_OUTPUT_HEADER, grant.token.as_str())
+            .body(Body::from(bytes))?;
+        let response = self.ctx.app.clone().oneshot(request).await?;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await?;
+        Ok((status, serde_json::from_slice(&bytes)?))
+    }
+}
+#[tokio::test]
+async fn removed_setup_publication_replays_exact_receipt_and_requires_real_build_image_binding(
+) -> Result<()> {
+    let mut fixture = Fixture::new().await?;
+    let (mut action, binding) = fixture.setup().await?;
+    let reserved = fixture.reserve().await?;
+    let publication = fixture.removed_setup(&reserved).await?;
+    let bytes = archive("bin/helper", b"#!/bin/sh\nprintf owned\n");
+    let request = ReserveLaunchOutput {
+        handle: publication.handle.clone(),
+        kind: LaunchOutputKind::StageArchive,
+        size_bytes: bytes.len() as u64,
+        sha256: Sha256Digest::of_bytes(&bytes),
+    };
+    let grant = Ledger::reserve_output(
+        &fixture.ctx.pool,
+        fixture.actor(),
+        &request,
+        &publication.token,
+        fixture.master(),
+    )
+    .await?;
+    let (status, result) = fixture
+        .upload_archive(&reserved, &publication, &grant, bytes.clone())
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let result: LaunchStageResult = serde_json::from_value(result)?;
+    let replay: LaunchStageResult = fixture
+        .ok(
+            &reserved,
+            "stage-result",
+            &reserved.request,
+            LAUNCH_DISPATCH_HEADER,
+            &reserved.dispatch_token,
+        )
+        .await?;
+    assert_eq!(result.output_id, replay.output_id);
+    assert_eq!(result.validation_receipt, replay.validation_receipt);
+    assert_eq!(result.object_version, replay.object_version);
+    let (status, again) = fixture
+        .upload_archive(&reserved, &publication, &grant, bytes)
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM workload_launch_object WHERE build_launch=$1")
+            .bind(reserved.request.launch_id)
+            .fetch_one(&fixture.ctx.pool)
+            .await?;
+    assert_eq!(count, 1);
+    action.manifest.inputs.push(PinnedLaunchInput {
+        pin_id: result.object_id,
+        object_id: result.object_id,
+        kind: LaunchInputKind::Runtime,
+        object_version: result.object_version.clone(),
+        size_bytes: result.size_bytes,
+        sha256: result.sha256.clone(),
+        max_expanded_bytes: 1048576,
+        max_files: 32,
+    });
+    assert!(
+        Ledger::freeze(
+            &fixture.ctx.pool,
+            fixture.image,
+            action.clone(),
+            fixture.master()
+        )
+        .await
+        .is_err(),
+        "manifest co-admission is not build proof"
+    );
+    Ledger::freeze_with_runtime_binding(
+        &fixture.ctx.pool,
+        fixture.image,
+        action.clone(),
+        fixture.master(),
+        Some(&binding),
+    )
+    .await?;
+    let mut wrong = binding.clone();
+    wrong.runtime_definition_sha256 = Sha256Digest::of_bytes(b"different-runtime-definition");
+    assert!(Ledger::freeze_with_runtime_binding(
+        &fixture.ctx.pool,
+        fixture.image,
+        action.clone(),
+        fixture.master(),
+        Some(&wrong)
+    )
+    .await
+    .is_err());
+    let other = Sha256Digest::of_bytes(b"different-owned-image");
+    let reference = format!("sha256:{}", other.as_str());
+    let image:i64=sqlx::query_scalar("INSERT INTO workload_execution_image(engine,reference,sha256,platform) VALUES($1,$2,$3,'linux/amd64') RETURNING id").bind(fixture.actor().engine).bind(&reference).bind(other.as_str()).fetch_one(&fixture.ctx.pool).await?;
+    action.manifest.image = PinnedImage {
+        reference,
+        sha256: other.clone(),
+    };
+    wrong = binding.clone();
+    wrong.image_sha256 = other;
+    assert!(
+        Ledger::freeze_with_runtime_binding(
+            &fixture.ctx.pool,
+            image,
+            action,
+            fixture.master(),
+            Some(&wrong)
+        )
+        .await
+        .is_err(),
+        "runtime built for another image must be denied"
+    );
+    let owner = fixture.spec.manifest.owner_identity_id;
+    sqlx::query("UPDATE identity SET frozen=true WHERE id=$1")
+        .bind(owner)
+        .execute(&fixture.ctx.pool)
+        .await?;
+    sqlx::query("UPDATE identity SET frozen=false WHERE id=$1")
+        .bind(owner)
+        .execute(&fixture.ctx.pool)
+        .await?;
+    assert!(
+        fixture.reserve().await.is_err(),
+        "old setup ticket cannot be reused after revoke/restore"
+    );
     fixture.ctx.cleanup().await?;
     Ok(())
 }

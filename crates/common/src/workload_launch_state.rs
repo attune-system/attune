@@ -15,6 +15,7 @@ pub(crate) struct LaunchOperation {
     pub engine_name_nonce: Uuid,
     pub create_nonce: Option<Uuid>,
     pub start_nonce: Option<Uuid>,
+    pub stdin_authorized: bool,
     pub lease_id: Uuid,
     pub lease_generation: i64,
     pub lease_purpose: LaunchLeasePurpose,
@@ -33,6 +34,8 @@ impl LaunchOperation {
                 },
                 state: LaunchState::Reserved,
                 runtime_state: LaunchRuntimeState::Unstarted,
+                capture: LaunchCaptureState::Pending,
+                capture_deadline: None,
                 exit_outcome: None,
                 publication: if manifest.purpose == LaunchPurpose::Setup {
                     LaunchPublicationState::Pending
@@ -46,6 +49,7 @@ impl LaunchOperation {
             engine_name_nonce: manifest.engine_name_nonce,
             create_nonce: None,
             start_nonce: None,
+            stdin_authorized: false,
             lease_id: Uuid::new_v4(),
             lease_generation: 0,
             lease_purpose: LaunchLeasePurpose::Run,
@@ -75,6 +79,24 @@ impl LaunchOperation {
             LaunchState::CleanupRequired | LaunchState::StopRequired | LaunchState::Stopped
         )
     }
+    pub fn capture_pending(&self) -> bool {
+        self.status.capture == LaunchCaptureState::Pending
+    }
+    pub fn expire_capture(&mut self, now: DateTime<Utc>) {
+        if self.capture_pending()
+            && self
+                .status
+                .capture_deadline
+                .is_some_and(|deadline| deadline <= now)
+        {
+            self.status.capture = LaunchCaptureState::Incomplete;
+        }
+    }
+    fn capture_close(&mut self, now: DateTime<Utc>) {
+        if self.capture_pending() && self.status.capture_deadline.is_none() {
+            self.status.capture_deadline = Some(now + chrono::Duration::seconds(60));
+        }
+    }
     pub fn publication_pending(&self) -> bool {
         self.status.state == LaunchState::Stopped
             && self.status.permits_stage_publication()
@@ -89,7 +111,10 @@ impl LaunchOperation {
         now: DateTime<Utc>,
         same_cleanup_owner: bool,
     ) -> Result<LaunchLeasePurpose> {
-        if (self.status.state == LaunchState::Stopped && !self.publication_pending())
+        self.expire_capture(now);
+        if (self.status.state == LaunchState::Stopped
+            && !self.publication_pending()
+            && !self.capture_pending())
             || deadline <= now
         {
             return Err(denied());
@@ -102,13 +127,15 @@ impl LaunchOperation {
             return Err(denied());
         }
         if self.lease_generation > 0 && !self.cleanup_only() {
-            self.stop(LaunchStopReason::LeaseExpired);
+            self.stop_at(LaunchStopReason::LeaseExpired, now);
         }
         self.lease_generation = self.lease_generation.checked_add(1).ok_or_else(denied)?;
         self.lease_id = Uuid::new_v4();
         self.lease_deadline = deadline;
         self.lease_purpose = if self.publication_pending() {
             LaunchLeasePurpose::Publication
+        } else if self.status.state == LaunchState::Stopped && self.capture_pending() {
+            LaunchLeasePurpose::Capture
         } else if self.cleanup_only() {
             LaunchLeasePurpose::Cleanup
         } else {
@@ -125,7 +152,9 @@ impl LaunchOperation {
         self.require_handle(handle, now)?;
         if deadline <= now
             || deadline < self.lease_deadline
-            || (self.status.state == LaunchState::Stopped && !self.publication_pending())
+            || (self.status.state == LaunchState::Stopped
+                && !self.publication_pending()
+                && !self.capture_pending())
         {
             return Err(denied());
         }
@@ -190,7 +219,15 @@ impl LaunchOperation {
         }
         Ok(())
     }
+    #[cfg(test)]
     pub fn observe(&mut self, observation: &LaunchObservation) -> Result<()> {
+        self.observe_at(observation, Utc::now())
+    }
+    pub fn observe_at(
+        &mut self,
+        observation: &LaunchObservation,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
         if self.status.state == LaunchState::Stopped {
             return Err(denied());
         }
@@ -249,6 +286,7 @@ impl LaunchOperation {
                         return Err(denied());
                     }
                     self.status.exit_outcome = Some(outcome);
+                    self.capture_close(now);
                     if (outcome.exit_code != 0 || outcome.oom_killed)
                         && self.status.publication != LaunchPublicationState::NotRequired
                     {
@@ -275,7 +313,12 @@ impl LaunchOperation {
     }
     /// Closing authority precedes engine stop/wait/remove. The first reason is
     /// retained; successful exit remains reasonless unless explicitly revoked.
+    #[cfg(test)]
     pub fn stop(&mut self, reason: LaunchStopReason) {
+        self.stop_at(reason, Utc::now())
+    }
+    pub fn stop_at(&mut self, reason: LaunchStopReason, now: DateTime<Utc>) {
+        self.capture_close(now);
         if matches!(
             self.status.publication,
             LaunchPublicationState::Pending | LaunchPublicationState::Uploading
@@ -326,6 +369,12 @@ impl LaunchOperation {
                 self.status.resource = Some(resource.clone());
             }
         }
+        if self.capture_pending()
+            && self.status.runtime_state == LaunchRuntimeState::Unstarted
+            && self.start_nonce.is_none()
+        {
+            self.status.capture = LaunchCaptureState::Complete;
+        }
         self.status.state = LaunchState::Stopped;
         self.status.validate_shape()
     }
@@ -344,6 +393,8 @@ mod tests {
                 },
                 state: LaunchState::Reserved,
                 runtime_state: LaunchRuntimeState::Unstarted,
+                capture: LaunchCaptureState::Pending,
+                capture_deadline: None,
                 exit_outcome: None,
                 publication: LaunchPublicationState::NotRequired,
                 resource: None,
@@ -353,6 +404,7 @@ mod tests {
             engine_name_nonce: Uuid::new_v4(),
             create_nonce: None,
             start_nonce: None,
+            stdin_authorized: false,
             lease_id: Uuid::new_v4(),
             lease_generation: 0,
             lease_purpose: LaunchLeasePurpose::Run,
@@ -540,7 +592,50 @@ mod tests {
             LaunchPublicationState::Rejected
         );
         assert!(!restarted.publication_pending());
-        assert!(restarted.claim(time(100), time(91), false).is_err());
+        // Capture has a distinct target-aware grant, not publication authority.
+        assert_eq!(
+            restarted.claim(time(100), time(91), false).unwrap(),
+            LaunchLeasePurpose::Capture
+        );
+        assert!(restarted.start_intent().is_err());
+    }
+    #[test]
+    fn removed_action_capture_is_finite_without_reopening_run_or_stdin() {
+        let mut op = operation();
+        let resource = created(&mut op);
+        let start = op.start_intent().unwrap();
+        op.observe_at(
+            &LaunchObservation::Exited {
+                start_nonce: start.start_nonce,
+                resource: resource.clone(),
+                exit_code: 0,
+                oom_killed: false,
+            },
+            time(2),
+        )
+        .unwrap();
+        assert_eq!(op.status.capture_deadline, Some(time(62)));
+        assert_eq!(
+            op.claim(time(40), time(3), true).unwrap(),
+            LaunchLeasePurpose::Cleanup
+        );
+        op.acknowledge_removed(&StopLaunchAcknowledgement {
+            handle: op.handle(),
+            create: ProviderCreateSettlement::Created {
+                create_nonce: op.create_nonce.unwrap(),
+                resource: resource.clone(),
+            },
+            removed_resource: Some(resource),
+        })
+        .unwrap();
+        assert_eq!(
+            op.claim(time(50), time(4), true).unwrap(),
+            LaunchLeasePurpose::Capture
+        );
+        assert!(op.create_intent().is_err());
+        assert!(op.start_intent().is_err());
+        assert!(op.claim(time(90), time(63), false).is_err());
+        assert_eq!(op.status.capture, LaunchCaptureState::Incomplete);
     }
     #[test]
     fn lease_handover_is_cleanup_only_and_denies_old_handle() {

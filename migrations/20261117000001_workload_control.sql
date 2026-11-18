@@ -182,7 +182,7 @@ CREATE TABLE workload_launch (
     manifest JSONB NOT NULL CHECK (jsonb_typeof(manifest)='object'),
     admitted_digest TEXT NOT NULL CHECK (admitted_digest ~ '^[0-9a-f]{64}$'),
     encrypted_context TEXT NOT NULL,
-    source_epochs JSONB NOT NULL CHECK (jsonb_typeof(source_epochs)='array'),
+    source_epochs JSONB NOT NULL CHECK (jsonb_typeof(source_epochs)='array' AND jsonb_array_length(source_epochs)>0),
     operation JSONB NOT NULL CHECK (jsonb_typeof(operation)='object'),
     encrypted_dispatch TEXT NOT NULL,
     dispatch_hash TEXT NOT NULL CHECK (dispatch_hash ~ '^[0-9a-f]{64}$'),
@@ -197,7 +197,7 @@ CREATE TABLE workload_launch (
     CHECK ((operation#>>'{status,request,launch_id}')::BIGINT=id)
 );
 CREATE INDEX workload_launch_cleanup ON workload_launch(engine,updated)
-WHERE operation#>>'{status,state}'<>'stopped' OR operation#>>'{status,publication}' IN ('pending','uploading');
+WHERE operation#>>'{status,state}'<>'stopped' OR operation#>>'{status,publication}' IN ('pending','uploading') OR operation#>>'{status,capture}'='pending';
 CREATE FUNCTION guard_workload_launch() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     IF ROW(NEW.id,NEW.engine,NEW.image,NEW.owner,NEW.manifest,NEW.admitted_digest,
@@ -206,8 +206,11 @@ BEGIN
         OLD.encrypted_context,OLD.source_epochs,OLD.encrypted_dispatch,OLD.dispatch_hash,OLD.created)
         OR (NEW.operation->>'lease_generation')::BIGINT < (OLD.operation->>'lease_generation')::BIGINT
         OR (OLD.operation->>'create_nonce' IS NOT NULL AND NEW.operation->>'create_nonce' IS DISTINCT FROM OLD.operation->>'create_nonce')
+        OR (COALESCE((OLD.operation->>'stdin_authorized')::BOOLEAN,false) AND NOT COALESCE((NEW.operation->>'stdin_authorized')::BOOLEAN,false))
         OR (OLD.operation->>'start_nonce' IS NOT NULL AND NEW.operation->>'start_nonce' IS DISTINCT FROM OLD.operation->>'start_nonce')
         OR (OLD.operation#>>'{status,state}'='stopped' AND NEW.operation#>>'{status,state}'<>'stopped')
+        OR (OLD.operation#>>'{status,capture}' IN ('complete','incomplete') AND NEW.operation#>>'{status,capture}' IS DISTINCT FROM OLD.operation#>>'{status,capture}')
+        OR (OLD.operation#>'{status,capture_deadline}'<>'null'::jsonb AND NEW.operation#>'{status,capture_deadline}' IS DISTINCT FROM OLD.operation#>'{status,capture_deadline}')
         OR (OLD.operation#>>'{status,publication}' IN ('published','rejected','not_required') AND NEW.operation#>>'{status,publication}' IS DISTINCT FROM OLD.operation#>>'{status,publication}')
         OR (OLD.operation#>>'{status,stop_reason}' IS NOT NULL AND NEW.operation#>>'{status,stop_reason}' IS DISTINCT FROM OLD.operation#>>'{status,stop_reason}')
         OR (OLD.operation#>'{status,exit_outcome}'<>'null'::jsonb AND NEW.operation#>'{status,exit_outcome}' IS DISTINCT FROM OLD.operation#>'{status,exit_outcome}')
@@ -258,6 +261,9 @@ CREATE TABLE workload_launch_prerequisite (
     purpose TEXT NOT NULL CHECK (purpose IN ('setup','runtime_probe')),
     attempt UUID NOT NULL,
     source_target JSONB NOT NULL CHECK (source_target->>'kind' IN ('execution','sensor','candidate_test')),
+    stage_binding JSONB,
+    image BIGINT NOT NULL CHECK (image>0),
+    source_epochs JSONB NOT NULL CHECK (jsonb_typeof(source_epochs)='array' AND jsonb_array_length(source_epochs)>0),
     revoked_at TIMESTAMPTZ,
     expires_at TIMESTAMPTZ NOT NULL,
     created TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
@@ -281,8 +287,90 @@ CREATE TABLE workload_launch_object (
     size_bytes BIGINT NOT NULL CHECK (size_bytes>0),
     sha256 TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
     max_expanded_bytes BIGINT NOT NULL CHECK (max_expanded_bytes>0),
-    max_files BIGINT NOT NULL CHECK (max_files>0)
+    max_files BIGINT NOT NULL CHECK (max_files>0),
+    retired_at TIMESTAMPTZ,
+    built_image_sha256 TEXT CHECK (built_image_sha256 ~ '^[0-9a-f]{64}$'),
+    build_launch BIGINT,
+    stage_binding JSONB,
+    validation_receipt BIGINT,
+    CHECK ((kind='runtime')=(built_image_sha256 IS NOT NULL AND build_launch IS NOT NULL AND stage_binding IS NOT NULL AND validation_receipt IS NOT NULL))
 );
 CREATE FUNCTION guard_workload_launch_object() RETURNS trigger LANGUAGE plpgsql AS $$
-BEGIN RAISE EXCEPTION 'Launch object pins are immutable'; END $$;
+BEGIN
+    IF (to_jsonb(NEW)-'retired_at') IS DISTINCT FROM (to_jsonb(OLD)-'retired_at')
+      OR (OLD.retired_at IS NOT NULL AND NEW.retired_at IS DISTINCT FROM OLD.retired_at)
+    THEN RAISE EXCEPTION 'Launch object pins are immutable'; END IF;
+    RETURN NEW;
+END $$;
 CREATE TRIGGER workload_launch_object_guard BEFORE UPDATE ON workload_launch_object FOR EACH ROW EXECUTE FUNCTION guard_workload_launch_object();
+CREATE TABLE workload_launch_io_grant (
+    id BIGSERIAL PRIMARY KEY,
+    launch BIGINT NOT NULL,
+    channel TEXT NOT NULL CHECK (channel IN ('stdin','stdout','stderr')),
+    token_hash TEXT NOT NULL,
+    max_bytes BIGINT NOT NULL CHECK (max_bytes>0),
+    expires_at TIMESTAMPTZ NOT NULL,
+    UNIQUE(launch,channel)
+);
+CREATE TABLE workload_launch_output (
+    id BIGSERIAL PRIMARY KEY,
+    launch BIGINT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('stdout','stderr','runtime_result','candidate_result','stage_archive')),
+    size_bytes BIGINT NOT NULL CHECK (size_bytes>0),
+    sha256 TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    object_key TEXT NOT NULL UNIQUE,
+    token_hash TEXT NOT NULL,
+    encrypted_token TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('reserved','uploaded','published','rejected')),
+    provider_version TEXT,
+    validation_receipt BIGINT,
+    object_id BIGINT,
+    cleanup_token UUID NOT NULL,
+    cleanup_required BOOLEAN NOT NULL DEFAULT FALSE,
+    cleanup_settled BOOLEAN NOT NULL DEFAULT FALSE,
+    cleanup_provider_version TEXT,
+    expires_at TIMESTAMPTZ NOT NULL,
+    lease_generation BIGINT NOT NULL CHECK (lease_generation>0),
+    created TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    UNIQUE(launch,kind),
+    CHECK ((state='published')=(validation_receipt IS NOT NULL)),
+    CHECK ((state='published')=(object_id IS NOT NULL)),
+    CHECK (NOT cleanup_settled OR (cleanup_required AND cleanup_provider_version IS NOT NULL))
+);
+CREATE TRIGGER workload_output_retain BEFORE DELETE ON workload_launch_output FOR EACH ROW EXECUTE FUNCTION retain_workload_control_tombstone();
+CREATE FUNCTION guard_workload_launch_output() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF ROW(NEW.id,NEW.launch,NEW.kind,NEW.size_bytes,NEW.sha256,NEW.object_key,NEW.cleanup_token,NEW.created)
+      IS DISTINCT FROM ROW(OLD.id,OLD.launch,OLD.kind,OLD.size_bytes,OLD.sha256,OLD.object_key,OLD.cleanup_token,OLD.created)
+      OR (OLD.state IN ('published','rejected') AND NEW.state IS DISTINCT FROM OLD.state)
+      OR NEW.lease_generation<OLD.lease_generation
+      OR (NEW.lease_generation=OLD.lease_generation AND ROW(NEW.token_hash,NEW.encrypted_token) IS DISTINCT FROM ROW(OLD.token_hash,OLD.encrypted_token))
+      OR (OLD.cleanup_required AND NOT NEW.cleanup_required)
+      OR (OLD.cleanup_settled AND NOT NEW.cleanup_settled)
+      OR (OLD.cleanup_provider_version IS NOT NULL AND NEW.cleanup_provider_version IS DISTINCT FROM OLD.cleanup_provider_version)
+      OR (OLD.provider_version IS NOT NULL AND NEW.provider_version IS DISTINCT FROM OLD.provider_version)
+    THEN RAISE EXCEPTION 'Launch output payload and terminal evidence are immutable'; END IF;
+    RETURN NEW;
+END $$;
+CREATE TRIGGER workload_output_guard BEFORE UPDATE ON workload_launch_output FOR EACH ROW EXECUTE FUNCTION guard_workload_launch_output();
+
+CREATE INDEX workload_output_reconcile ON workload_launch_output(id) WHERE NOT cleanup_required;
+CREATE INDEX workload_output_cleanup ON workload_launch_output(id) WHERE cleanup_required AND NOT cleanup_settled;
+CREATE TABLE workload_launch_maintenance (
+    id BIGINT PRIMARY KEY CHECK (id IN (1,2)),
+    after_id BIGINT NOT NULL DEFAULT 0,
+    high_water BIGINT NOT NULL DEFAULT 0,
+    CHECK (after_id>=0 AND high_water>=after_id)
+);
+INSERT INTO workload_launch_maintenance(id) VALUES(1),(2);
+
+CREATE TRIGGER workload_object_retain BEFORE DELETE ON workload_launch_object FOR EACH ROW EXECUTE FUNCTION retain_workload_control_tombstone();
+
+CREATE FUNCTION revoke_workload_pack_owner_epoch() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP='DELETE' OR ROW(OLD.pack,OLD.identity) IS DISTINCT FROM ROW(NEW.pack,NEW.identity) THEN
+        PERFORM bump_workload_source_epoch('owner',OLD.identity);
+    END IF;
+    RETURN NULL;
+END $$;
+CREATE TRIGGER workload_pack_owner_epoch AFTER UPDATE OR DELETE ON pack_runtime_identity FOR EACH ROW EXECUTE FUNCTION revoke_workload_pack_owner_epoch();
