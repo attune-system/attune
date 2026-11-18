@@ -420,14 +420,22 @@ impl DockerLauncher {
         .map_err(|_| common_error(EngineError::Transport))?
         .map_err(|_| common_error(EngineError::OwnershipMismatch))
     }
-    /// Idempotently returns durable exact Wait+Remove evidence. Private host
-    /// staging remains retained for the caller's existing publication receipts.
+    /// Final cleanup, called only after the owning loop's terminal/custody and
+    /// file/runtime receipts. Byte-read paths use seal_removed directly and
+    /// retain staging; this path reclaims bytes but keeps exact removal evidence.
     pub async fn remove_stopped(
         &self,
         spec: &ProcessSpec,
         resource: &ResourceIdentity,
     ) -> attune_common::Result<()> {
-        self.seal_removed(spec, resource, false).await.map(|_| ())
+        self.seal_removed(spec, resource, false).await?;
+        let cache = self.cache.clone();
+        let spec = spec.clone();
+        let resource = resource.clone();
+        tokio::task::spawn_blocking(move || cache.cleanup_native_private(&spec, &resource))
+            .await
+            .map_err(|_| common_error(EngineError::Transport))?
+            .map_err(|_| common_error(EngineError::OwnershipMismatch))
     }
     /// Read the retained private Setup stage only after exact successful Wait
     /// and acknowledged removal, with durable original ownership evidence.

@@ -183,9 +183,15 @@ from 404 or timeout; invalid/missing evidence leaves publication incomplete.
 Both validate the bounded ZIP locally and preserve its exact bytes on retry.
 This file is transfer evidence, not a runtime-publication receipt. The owning
 runtime workflow must commit validation/publication before removing the retained
-Kubernetes Pod or private host stage. The real Python venv/pip console-script and absolute-link
-Pod regression is part of the required external provider lane; compiling it does
-not establish that it passed.
+Kubernetes Pod or private host stage. The final Docker `remove_stopped` call
+reclaims only that intent's private byte trees and retained publication ZIP,
+preserving the small policy/removal record for idempotent recovery. Reading or
+archiving never takes this cleanup path. Published input/runtime caches and
+manager encrypted custody are independent. A failed or uncertain local cleanup
+remains an error; an unexpected reread of reclaimed staging is lost-staging,
+never a selected missing file. Real Python venv/pip console-script and absolute
+internal-link regressions exercise both concrete providers, including reuse
+after builder removal; compiling those tests does not establish that they passed.
 
 For action, sensor and candidate-test file outputs, the concrete
 `read_stopped_artifact` effect accepts only the owning loop's validated relative
