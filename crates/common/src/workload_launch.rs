@@ -18,6 +18,7 @@ use crate::{Error, Result};
 
 pub const LAUNCH_DISPATCH_HEADER: &str = "x-attune-launch-dispatch";
 pub const LAUNCH_LEASE_HEADER: &str = "x-attune-launch-lease";
+pub const LAUNCH_OUTPUT_HEADER: &str = "x-attune-launch-output";
 pub const LAUNCH_IO_HEADER: &str = "x-attune-launch-io";
 pub const LAUNCH_ARCHIVE_CONTENT_TYPE: &str = "application/zip";
 pub const LAUNCH_IO_NEXT_OFFSET_HEADER: &str = "x-attune-launch-next-offset";
@@ -461,6 +462,8 @@ pub enum LaunchLeasePurpose {
     Cleanup,
     /// Successful removed Setup only; no engine/invocation/input authority.
     Publication,
+    /// Finite retained stdout/stderr only after engine removal.
+    Capture,
 }
 
 /// Identity only. The secret lease credential travels in LAUNCH_LEASE_HEADER.
@@ -483,10 +486,7 @@ pub struct LaunchHandle {
 pub struct LaunchToken(String);
 impl LaunchToken {
     pub fn new(value: String) -> Result<Self> {
-        if value.is_empty()
-            || value.len() > 16384
-            || value.bytes().any(|b| b.is_ascii_control() || b == b' ')
-        {
+        if value.is_empty() || value.len() > 16384 || value.bytes().any(|b| !b.is_ascii_graphic()) {
             return Err(Error::validation("Invalid launch credential"));
         }
         Ok(Self(value))
@@ -542,6 +542,11 @@ pub enum ClaimedLaunch {
     Cleanup {
         manifest: Box<LaunchManifest>,
         /// Recorded original evidence remains usable after source/image revocation.
+        status: LaunchStatus,
+        lease: LaunchLease,
+    },
+    Capture {
+        manifest: Box<LaunchManifest>,
         status: LaunchStatus,
         lease: LaunchLease,
     },
@@ -684,6 +689,13 @@ pub enum LaunchPublicationState {
     Published,
     Rejected,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchCaptureState {
+    Pending,
+    Complete,
+    Incomplete,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchStatus {
@@ -692,6 +704,8 @@ pub struct LaunchStatus {
     pub runtime_state: LaunchRuntimeState,
     pub exit_outcome: Option<LaunchExitOutcome>,
     pub publication: LaunchPublicationState,
+    pub capture: LaunchCaptureState,
+    pub capture_deadline: Option<DateTime<Utc>>,
     pub resource: Option<EngineResourceEvidence>,
     pub stop_reason: Option<LaunchStopReason>,
 }
@@ -718,6 +732,9 @@ impl LaunchStatus {
         if self.request.launch_id <= 0
             || (self.runtime_state == LaunchRuntimeState::Exited) != self.exit_outcome.is_some()
             || (self.runtime_state == LaunchRuntimeState::Exited && self.resource.is_none())
+            || (self.state == LaunchState::Stopped
+                && self.capture == LaunchCaptureState::Pending
+                && self.capture_deadline.is_none())
             || (self.state == LaunchState::CleanupRequired
                 && (self.runtime_state != LaunchRuntimeState::Exited || self.stop_reason.is_some()))
             || (self.state == LaunchState::StopRequired && self.stop_reason.is_none())
@@ -785,6 +802,11 @@ pub struct LaunchIoReadQuery {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
+pub struct LaunchOutputBodyQuery {
+    pub admitted_digest: Sha256Digest,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LaunchStageResult {
     pub output_id: i64,
     pub object_id: i64,
@@ -847,7 +869,7 @@ mod tests {
     }
     #[test]
     fn credential_deserialization_cannot_bypass_validation() {
-        for value in ["", "with space", "with\ncontrol"] {
+        for value in ["", "with space", "with\ncontrol", "with\u{0085}control"] {
             assert!(serde_json::from_value::<LaunchToken>(serde_json::json!(value)).is_err());
         }
         assert!(
@@ -871,6 +893,8 @@ mod tests {
             },
             state: LaunchState::CleanupRequired,
             publication: LaunchPublicationState::Pending,
+            capture: LaunchCaptureState::Pending,
+            capture_deadline: Some(Utc::now() + chrono::Duration::seconds(60)),
             runtime_state: LaunchRuntimeState::Exited,
             exit_outcome: Some(LaunchExitOutcome {
                 exit_code: 0,
