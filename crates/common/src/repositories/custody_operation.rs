@@ -1,11 +1,7 @@
 //! Durable reserve/prepare/cancel protocol. Every entry retains the caller's
 //! SQLx transaction through graph admission, source checks and publication.
-use super::workload_host::WorkloadHostRepository;
-use crate::{
-    log_custody::{
-        CustodyAbsence, CustodyOperationAck, CustodyOperationState, PrepareCustody, ReserveCustody,
-    },
-    workload_host::HostActor,
+use crate::log_custody::{
+    CustodyAbsence, CustodyOperationAck, CustodyOperationState, PrepareCustody, ReserveCustody,
 };
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
@@ -145,44 +141,35 @@ impl CustodyOperationRepository {
         Self::reserve_in(transaction, input.worker, input.instance, &request).await?;
         Self::prepare_in(transaction, input, attempt).await
     }
-    async fn fresh(
-        conn: &mut PgConnection,
-        actor: HostActor,
-        deadline: DateTime<Utc>,
-    ) -> Result<()> {
+    async fn fresh(conn: &mut PgConnection, deadline: DateTime<Utc>) -> Result<()> {
         let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
             .fetch_one(conn)
             .await?;
-        if actor.expires_at <= now.timestamp() || deadline <= now {
+        if deadline <= now {
             return Err(denied());
         }
         Ok(())
     }
-    fn after_commit(actor: HostActor, deadline: DateTime<Utc>) -> Result<()> {
-        if actor.expires_at <= Utc::now().timestamp() || deadline <= Utc::now() {
+    fn after_commit(deadline: DateTime<Utc>) -> Result<()> {
+        if deadline <= Utc::now() {
             return Err(denied());
         }
         Ok(())
     }
+    /// Trusted manager admission. No relay identity or reusable host bearer is
+    /// involved; the current delivery incarnation and exact source are locked.
     pub async fn reserve(
         pool: &PgPool,
-        actor: HostActor,
+        worker: i64,
+        current_instance: Uuid,
         request: &ReserveCustody,
     ) -> Result<CustodyOperationAck> {
         let mut tx = pool.begin().await?;
         Graph::lock_capture(&mut tx).await?;
-        let (host_deadline, current_instance) =
-            WorkloadHostRepository::admit_custody(&mut tx, actor).await?;
         if request.binding.source_instance != current_instance {
             return Err(denied());
         }
-        Self::reserve_in(
-            &mut tx,
-            actor.worker,
-            request.binding.source_instance,
-            request,
-        )
-        .await?;
+        Self::reserve_in(&mut tx, worker, request.binding.source_instance, request).await?;
         let operation = Self::find(&mut tx, request.binding.custody)
             .await?
             .ok_or_else(denied)?;
@@ -191,10 +178,10 @@ impl CustodyOperationRepository {
             "prepared" => CustodyOperationState::Prepared,
             _ => return Err(denied()),
         };
-        let deadline = host_deadline.min(micros(request.finalize_by)?);
-        Self::fresh(&mut tx, actor, deadline).await?;
+        let deadline = micros(request.finalize_by)?;
+        Self::fresh(&mut tx, deadline).await?;
         tx.commit().await?;
-        Self::after_commit(actor, deadline)?;
+        Self::after_commit(deadline)?;
         Ok(CustodyOperationAck {
             custody: request.binding.custody,
             state,
@@ -202,7 +189,8 @@ impl CustodyOperationRepository {
     }
     pub async fn prepare(
         pool: &PgPool,
-        actor: HostActor,
+        worker: i64,
+        current_instance: Uuid,
         request: &PrepareCustody,
     ) -> Result<CustodyOperationAck> {
         let b = &request.reservation.binding;
@@ -217,7 +205,7 @@ impl CustodyOperationRepository {
             execution: b.execution,
             version: b.version,
             stream: b.stream,
-            worker: actor.worker,
+            worker,
             instance: b.source_instance,
             custody: b.custody,
             segments: request.segments.clone(),
@@ -229,35 +217,31 @@ impl CustodyOperationRepository {
         };
         let mut tx = pool.begin().await?;
         Graph::lock_capture(&mut tx).await?;
-        let (host_deadline, current_instance) =
-            WorkloadHostRepository::admit_custody(&mut tx, actor).await?;
         if b.source_instance != current_instance {
             return Err(denied());
         }
         Self::prepare_in(&mut tx, input, b.attempt).await?;
-        let deadline = host_deadline.min(micros(request.reservation.finalize_by)?);
-        Self::fresh(&mut tx, actor, deadline).await?;
+        let deadline = micros(request.reservation.finalize_by)?;
+        Self::fresh(&mut tx, deadline).await?;
         tx.commit().await?;
-        Self::after_commit(actor, deadline)?;
+        Self::after_commit(deadline)?;
         Ok(CustodyOperationAck {
             custody: b.custody,
             state: CustodyOperationState::Prepared,
         })
     }
+    /// Negative settlement is valid after the deadline too, but only after the
+    /// exact retained proof has been fenced by a committed durable tombstone.
     pub async fn cancel_absent(
         pool: &PgPool,
-        actor: HostActor,
+        worker: i64,
+        current_instance: Uuid,
         request: &ReserveCustody,
     ) -> Result<CustodyAbsence> {
         let mut tx = pool.begin().await?;
         Graph::lock_reclamation(&mut tx).await?;
-        let (host_deadline, current_instance) =
-            WorkloadHostRepository::admit_custody(&mut tx, actor).await?;
-        let absent =
-            Self::cancel_absent_in(&mut tx, actor.worker, current_instance, request).await?;
-        Self::fresh(&mut tx, actor, host_deadline).await?;
+        let absent = Self::cancel_absent_in(&mut tx, worker, current_instance, request).await?;
         tx.commit().await?;
-        Self::after_commit(actor, host_deadline)?;
         Ok(CustodyAbsence {
             custody: request.binding.custody,
             absent,

@@ -182,10 +182,21 @@ storage budget. Missing EOF is incomplete capture and is never sealed as complet
 The action deadline, cancellation, and total finalization budget still bound the
 worker's wait. Increasing this budget can keep a worker slot occupied longer
 during storage failures and must fit deployment shutdown budgets. Successful
-requests return immediately. There is no durable retry job after worker loss
-or deadline exhaustion, and a dropped request may have committed remotely.
-Use `logs_incomplete` and finalization warnings to identify affected executions;
-do not interpret action success as proof that logs were sealed.
+requests return immediately. Delegated object-log delivery retains encrypted
+worker-local custody across manager restarts; its upload authority still ends at
+the recorded deadline. Other log transports retain their own finalization limits.
+A dropped request may have committed remotely. Use `logs_incomplete` and
+finalization warnings to identify affected executions; do not interpret action
+success as proof that logs were sealed.
+
+Trusted custody preparation and negative settlement use repository transactions,
+without host enrollment or a separate control relay. The genuine worker-file API
+can settle an absent intent only using exact retained operation proof. When local
+preparation fails after saving a spool, its trusted owner can additionally supply
+the saved binding and deadline to the same cancellation gate. Exclusive graph
+admission and a committed tombstone must fence delayed preparation before deletion;
+a timeout, cancellation, missing row or stale source is never absence evidence.
+Missing retained target proof keeps the spool for recovery rather than clearing it.
 
 ## Interpret delivery outcomes
 

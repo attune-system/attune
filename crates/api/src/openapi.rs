@@ -435,11 +435,6 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
 
         // Internal service endpoints
         crate::routes::log_delivery_control::reconcile,
-        crate::routes::workload_hosts::register,
-        crate::routes::workload_hosts::session,
-        crate::routes::workload_hosts::custody::reserve,
-        crate::routes::workload_hosts::custody::prepare,
-        crate::routes::workload_hosts::custody::cancel_absent,
 
         crate::routes::internal_files::download_file,
         crate::routes::internal_files::upload_file,
@@ -1058,12 +1053,12 @@ mod tests {
             .sum();
 
         assert_eq!(
-            path_count, 222,
+            path_count, 217,
             "Expected every mounted API path in the OpenAPI spec"
         );
 
         assert_eq!(
-            operation_count, 286,
+            operation_count, 281,
             "Expected every mounted API operation in the OpenAPI spec"
         );
 
@@ -1082,31 +1077,16 @@ mod tests {
                 .as_object()
                 .unwrap()
                 .keys()
-                .all(|path| !path.starts_with("/api/v1/workload-launches")),
+                .all(|path| !path.starts_with("/api/v1/workload-launches")
+                    && !path.starts_with("/api/v1/workload-hosts")),
             "Retired relay routes must not be mounted"
         );
-        for (path, request, response) in [
-            (
-                "/api/v1/workload-hosts/custody/reserve",
-                "ReserveCustody",
-                "CustodyOperationAck",
-            ),
-            (
-                "/api/v1/workload-hosts/custody/prepare",
-                "PrepareCustody",
-                "CustodyOperationAck",
-            ),
-            (
-                "/api/v1/workload-hosts/custody/cancel-absent",
-                "ReserveCustody",
-                "CustodyAbsence",
-            ),
-            (
+        {
+            let (path, request, response) = (
                 "/api/v1/internal/log-delivery/control",
                 "ControlRequest",
                 "ControlResponse",
-            ),
-        ] {
+            );
             let operation = &spec["paths"][path]["post"];
             assert!(
                 operation.is_object(),

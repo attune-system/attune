@@ -319,6 +319,31 @@ impl LogDeliveryManager {
                     return Ok(());
                 }
                 attune_common::log_delivery::ControlResponse::Waiting => {
+                    // This trusted manager holds the exact authenticated private
+                    // spool, including the deadline omitted by the HTTP control
+                    // request. Preparation has ended before `ready` is handed
+                    // off. Fence delayed/unknown preparation under exclusive
+                    // graph admission before reclaiming a valid local orphan.
+                    let absent = attune_common::repositories::custody_operation::CustodyOperationRepository::cancel_absent(
+                        &self.pool,
+                        self.worker,
+                        self.instance,
+                        &attune_common::log_custody::ReserveCustody {
+                            binding: attune_common::log_delivery::ControlRequest {
+                                execution: entry.execution,
+                                version: entry.version,
+                                stream: entry.stream,
+                                attempt: entry.attempt,
+                                source_instance: entry.source_instance,
+                                custody: entry.custody,
+                            },
+                            finalize_by: entry.finalize_by,
+                        },
+                    ).await?;
+                    if absent.absent {
+                        self.spool.remove(entry.version, entry.custody).await?;
+                        return Ok(());
+                    }
                     tokio::select! {_=self.stop.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_millis(25))=>{}}
                     continue;
                 }
