@@ -708,7 +708,14 @@ cargo test -p attune-worker --test security_tests
 cargo test -p attune-worker --test integration_test -- --ignored
 ```
 
-#### Service Status: ✅ PRODUCTION READY
+#### Historical worker service snapshot
+
+> This is a historical implementation snapshot, not current release/security
+> acceptance. The former PythonVenvManager is removed. See the current
+> [dependency environment guide](../dependencies/dependency-isolation.md) and
+> [workload isolation migration status](../deployment/workload-isolation.md).
+> Virtual environments alone do not establish the required execution boundary;
+> the old counts below are not evidence for the current native adapters.
 
 **Implementation Complete**:
 - ✅ All components implemented and tested
@@ -738,7 +745,7 @@ cargo test -p attune-worker --test integration_test -- --ignored
 - ✅ `work-summary/2026-01-27-worker-service-complete.md` - Service completion summary
 - ✅ `work-summary/2026-01-14-worker-service-implementation.md` - Implementation details
 - ✅ `work-summary/2025-01-secret-passing-complete.md` - Secret security details
-- ✅ `docs/dependency-isolation.md` - Complete dependency isolation guide
+- ✅ `docs/dependencies/dependency-isolation.md` - Dependency environment guide (revised; migration incomplete)
 
 **Dependency Isolation Features**:
 - ✅ Generic DependencyManager trait for multi-language support
