@@ -212,3 +212,21 @@ yet activated in the Engine mount builder or connected to actual CP upload
 operations; the current tmpfs artifact mount remains a known gap until that
 integration and restart/lost-acknowledgement tests pass. Setup and RuntimeProbe
 have no action file-publication authority.
+
+
+The controller now durably indexes each authenticated **public** manifest by
+launch ID and admitted digest before Engine creation. Recovery verifies private
+file ownership/mode, nofollow/single-link constraints and the exact digest; it
+never stores the invocation or uses a fresh private-context resolve fallback.
+The finite artifact HTTP client implements exact inventory/grant/receipt checks,
+zero-byte uploads, empty-body ReceiptOnly replay and explicit whole-tree failure
+reporting. A failure remains not-ready until CP native-operation fencing returns
+an authenticated incomplete cleanup receipt. These transport/FS tests do not
+prove actual CP publication/discovery effects, which remain incomplete.
+
+Count-only `authorize-io` is rejected for stdin. Until the dedicated CP exact-byte
+comparison with the privately frozen selected input is integrated, the new
+controller input path fails closed. No public plaintext input hash or host raw
+plan submission substitutes for that authorization. Packaged Engine fixtures
+exercise actual stdin delivery directly as boundary tests; they do not attest
+this unfinished CP authority/host-consumer contract.
