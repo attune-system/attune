@@ -651,6 +651,7 @@ mod tests {
                 .unwrap(),
             ),
             sensor: None,
+            workload: None,
             packs_base_dir: "/tmp/packs".to_string(),
             packs: attune_common::config::PacksConfig::default(),
             runtime_envs_dir: "/tmp/runtime_envs".to_string(),
