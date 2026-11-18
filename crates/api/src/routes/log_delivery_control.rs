@@ -43,7 +43,7 @@ fn denied() -> ApiError {
     ApiError::Forbidden("Log custody control unavailable".into())
 }
 
-#[utoipa::path(
+#[utoipa::path(operation_id="log_delivery_control_reconcile",
     post,
     path = "/api/v1/internal/log-delivery/control",
     request_body = ControlRequest,

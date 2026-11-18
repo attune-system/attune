@@ -1110,6 +1110,34 @@ mod tests {
                 format!("#/components/schemas/{response}")
             );
         }
+        for (path, headers) in [
+            (
+                "/api/v1/workload-launches/{id}/claim",
+                &["x-attune-launch-dispatch"][..],
+            ),
+            (
+                "/api/v1/workload-launches/{id}/authorize-io",
+                &["x-attune-launch-lease", "x-attune-launch-io"][..],
+            ),
+            (
+                "/api/v1/workload-launches/{id}/outputs/{output_id}/body",
+                &["x-attune-launch-lease", "x-attune-launch-output"][..],
+            ),
+        ] {
+            let parameters = spec["paths"][path]["post"]["parameters"]
+                .as_array()
+                .expect("Control grant parameters");
+            for header in headers {
+                assert!(
+                    parameters
+                        .iter()
+                        .any(|parameter| parameter["in"] == "header"
+                            && parameter["name"] == *header
+                            && parameter["required"] == true),
+                    "Missing required grant header {header} on {path}"
+                );
+            }
+        }
         let reveal = &spec["paths"]["/api/v1/triggers/{ref}/webhooks/reveal"]["post"];
         assert!(
             reveal.is_object(),

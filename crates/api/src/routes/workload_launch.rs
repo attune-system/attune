@@ -71,7 +71,7 @@ fn response<T>(actor: ControllerActor, value: T) -> ApiResult<Json<T>> {
     Ok(Json(value))
 }
 
-#[utoipa::path(post,path="/api/v1/workload-launches/{id}/resolve",params(("id"=i64,Path)),request_body=LaunchRequest,responses((status=200,body=LaunchManifest),(status=403,description="Launch unavailable")),tag="workload-control")]
+#[utoipa::path(operation_id="workload_launch_resolve",post,path="/api/v1/workload-launches/{id}/resolve",params(("id"=i64,Path),("x-attune-launch-dispatch"=String,Header,description="Exact target-scoped grant")),request_body=LaunchRequest,responses((status=200,body=LaunchManifest),(status=403,description="Launch unavailable")),tag="workload-control")]
 pub async fn resolve(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -86,7 +86,7 @@ pub async fn resolve(
     response(actor, result)
 }
 
-#[utoipa::path(post,path="/api/v1/workload-launches/{id}/claim",params(("id"=i64,Path)),request_body=LaunchRequest,responses((status=200,body=ClaimedLaunch),(status=403,description="Launch unavailable")),tag="workload-control")]
+#[utoipa::path(operation_id="workload_launch_claim",post,path="/api/v1/workload-launches/{id}/claim",params(("id"=i64,Path),("x-attune-launch-dispatch"=String,Header,description="Exact target-scoped grant")),request_body=LaunchRequest,responses((status=200,body=ClaimedLaunch),(status=403,description="Launch unavailable")),tag="workload-control")]
 pub async fn claim(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -120,7 +120,7 @@ pub async fn claim(
     response(actor, result)
 }
 
-#[utoipa::path(post,path="/api/v1/workload-launches/{id}/status",params(("id"=i64,Path)),request_body=LaunchRequest,responses((status=200,body=LaunchStatus),(status=403,description="Launch unavailable")),tag="workload-control")]
+#[utoipa::path(operation_id="workload_launch_status",post,path="/api/v1/workload-launches/{id}/status",params(("id"=i64,Path),("x-attune-launch-dispatch"=String,Header,description="Exact target-scoped grant")),request_body=LaunchRequest,responses((status=200,body=LaunchStatus),(status=403,description="Launch unavailable")),tag="workload-control")]
 pub async fn status(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -135,7 +135,7 @@ pub async fn status(
     response(actor, result)
 }
 
-#[utoipa::path(post,path="/api/v1/workload-launches/{id}/stop",params(("id"=i64,Path)),request_body=StopLaunchRequest,responses((status=200,body=LaunchStatus),(status=403,description="Launch unavailable")),tag="workload-control")]
+#[utoipa::path(operation_id="workload_launch_stop",post,path="/api/v1/workload-launches/{id}/stop",params(("id"=i64,Path),("x-attune-launch-dispatch"=String,Header,description="Exact target-scoped grant")),request_body=StopLaunchRequest,responses((status=200,body=LaunchStatus),(status=403,description="Launch unavailable")),tag="workload-control")]
 pub async fn stop(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -150,7 +150,7 @@ pub async fn stop(
     response(actor, result)
 }
 
-#[utoipa::path(post,path="/api/v1/workload-launches/{id}/create-intent",params(("id"=i64,Path)),request_body=LaunchLeaseRequest,responses((status=200,body=LaunchCreateIntent),(status=403,description="Launch unavailable")),tag="workload-control")]
+#[utoipa::path(operation_id="workload_launch_create_intent",post,path="/api/v1/workload-launches/{id}/create-intent",params(("id"=i64,Path),("x-attune-launch-lease"=String,Header,description="Exact target-scoped grant")),request_body=LaunchLeaseRequest,responses((status=200,body=LaunchCreateIntent),(status=403,description="Launch unavailable")),tag="workload-control")]
 pub async fn create_intent(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -166,7 +166,7 @@ pub async fn create_intent(
     response(actor, result)
 }
 
-#[utoipa::path(post,path="/api/v1/workload-launches/{id}/start",params(("id"=i64,Path)),request_body=LaunchLeaseRequest,responses((status=200,body=LaunchStartIntent),(status=403,description="Launch unavailable")),tag="workload-control")]
+#[utoipa::path(operation_id="workload_launch_start",post,path="/api/v1/workload-launches/{id}/start",params(("id"=i64,Path),("x-attune-launch-lease"=String,Header,description="Exact target-scoped grant")),request_body=LaunchLeaseRequest,responses((status=200,body=LaunchStartIntent),(status=403,description="Launch unavailable")),tag="workload-control")]
 pub async fn start(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -182,7 +182,7 @@ pub async fn start(
     response(actor, result)
 }
 
-#[utoipa::path(post,path="/api/v1/workload-launches/{id}/renew",params(("id"=i64,Path)),request_body=LaunchLeaseRequest,responses((status=200,body=LaunchLease),(status=403,description="Launch unavailable")),tag="workload-control")]
+#[utoipa::path(operation_id="workload_launch_renew",post,path="/api/v1/workload-launches/{id}/renew",params(("id"=i64,Path),("x-attune-launch-lease"=String,Header,description="Exact target-scoped grant")),request_body=LaunchLeaseRequest,responses((status=200,body=LaunchLease),(status=403,description="Launch unavailable")),tag="workload-control")]
 pub async fn renew(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -198,7 +198,7 @@ pub async fn renew(
     response(actor, result)
 }
 
-#[utoipa::path(post,path="/api/v1/workload-launches/{id}/observe",params(("id"=i64,Path)),request_body=ObserveLaunchRequest,responses((status=200,body=LaunchStatus),(status=403,description="Launch unavailable")),tag="workload-control")]
+#[utoipa::path(operation_id="workload_launch_observe",post,path="/api/v1/workload-launches/{id}/observe",params(("id"=i64,Path),("x-attune-launch-lease"=String,Header,description="Exact target-scoped grant")),request_body=ObserveLaunchRequest,responses((status=200,body=LaunchStatus),(status=403,description="Launch unavailable")),tag="workload-control")]
 pub async fn observe(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -213,7 +213,7 @@ pub async fn observe(
     response(actor, result)
 }
 
-#[utoipa::path(post,path="/api/v1/workload-launches/{id}/stop-ack",params(("id"=i64,Path)),request_body=StopLaunchAcknowledgement,responses((status=200,body=LaunchStatus),(status=403,description="Launch unavailable")),tag="workload-control")]
+#[utoipa::path(operation_id="workload_launch_stop_ack",post,path="/api/v1/workload-launches/{id}/stop-ack",params(("id"=i64,Path),("x-attune-launch-lease"=String,Header,description="Exact target-scoped grant")),request_body=StopLaunchAcknowledgement,responses((status=200,body=LaunchStatus),(status=403,description="Launch unavailable")),tag="workload-control")]
 pub async fn stop_ack(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -228,7 +228,7 @@ pub async fn stop_ack(
     response(actor, result)
 }
 
-#[utoipa::path(post,path="/api/v1/workload-launches/{id}/inputs/{pin_id}/body",params(("id"=i64,Path),("pin_id"=i64,Path)),request_body=LaunchLeaseRequest,responses((status=200,description="Exact pinned ZIP body",content_type="application/zip"),(status=403,description="Launch unavailable")),tag="workload-control")]
+#[utoipa::path(operation_id="workload_launch_input_body",post,path="/api/v1/workload-launches/{id}/inputs/{pin_id}/body",params(("id"=i64,Path),("pin_id"=i64,Path),("x-attune-launch-lease"=String,Header,description="Exact target-scoped grant")),request_body=LaunchLeaseRequest,responses((status=200,description="Exact pinned ZIP body",content_type="application/zip"),(status=403,description="Launch unavailable")),tag="workload-control")]
 pub async fn input_body(
     State(state): State<Arc<AppState>>,
     Path((id, pin_id)): Path<(i64, i64)>,
@@ -286,7 +286,7 @@ pub async fn input_body(
         .body(axum::body::Body::from_stream(body))
         .map_err(|_| denied())
 }
-#[utoipa::path(post,path="/api/v1/workload-launches/reconcile",request_body=ReconcileLaunchesRequest,responses((status=200,body=ReconcileLaunchesPage),(status=403,description="Launch unavailable")),tag="workload-control")]
+#[utoipa::path(operation_id="workload_launch_reconcile",post,path="/api/v1/workload-launches/reconcile",request_body=ReconcileLaunchesRequest,responses((status=200,body=ReconcileLaunchesPage),(status=403,description="Launch unavailable")),tag="workload-control")]
 pub async fn reconcile(
     State(state): State<Arc<AppState>>,
     RequireAuth(user): RequireAuth,
@@ -307,7 +307,7 @@ pub async fn reconcile(
     .await?;
     response(actor, result)
 }
-#[utoipa::path(post,path="/api/v1/workload-launches/{id}/io-grants",params(("id"=i64,Path)),request_body=LaunchIoGrantRequest,responses((status=200,body=LaunchIoGrant),(status=403,description="Launch unavailable")),tag="workload-control")]
+#[utoipa::path(operation_id="workload_launch_io_grants",post,path="/api/v1/workload-launches/{id}/io-grants",params(("id"=i64,Path),("x-attune-launch-dispatch"=String,Header,description="Exact target-scoped grant")),request_body=LaunchIoGrantRequest,responses((status=200,body=LaunchIoGrant),(status=403,description="Launch unavailable")),tag="workload-control")]
 pub async fn io_grants(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -327,7 +327,7 @@ pub async fn io_grants(
     fresh_deadline(result.expires_at)?;
     response(actor, result)
 }
-#[utoipa::path(post,path="/api/v1/workload-launches/{id}/authorize-io",params(("id"=i64,Path)),request_body=AuthorizeLaunchIoRequest,responses((status=200,body=LaunchIoAuthorization),(status=403,description="Launch unavailable")),tag="workload-control")]
+#[utoipa::path(operation_id="workload_launch_authorize_io",post,path="/api/v1/workload-launches/{id}/authorize-io",params(("id"=i64,Path),("x-attune-launch-lease"=String,Header,description="Exact target-scoped grant"),("x-attune-launch-io"=String,Header,description="Exact target-scoped grant")),request_body=AuthorizeLaunchIoRequest,responses((status=200,body=LaunchIoAuthorization),(status=403,description="Launch unavailable")),tag="workload-control")]
 pub async fn authorize_io(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,

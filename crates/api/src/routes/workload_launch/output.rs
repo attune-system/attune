@@ -15,7 +15,7 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 #[schema(value_type=String,format=Binary)]
 pub struct CanonicalLaunchZip(pub Vec<u8>);
 
-#[utoipa::path(post,path="/api/v1/workload-launches/{id}/outputs",params(("id"=i64,Path)),request_body=ReserveLaunchOutput,responses((status=200,body=LaunchOutputGrant),(status=403,description="Launch unavailable")),tag="workload-control")]
+#[utoipa::path(operation_id="workload_launch_reserve_output",post,path="/api/v1/workload-launches/{id}/outputs",params(("id"=i64,Path),("x-attune-launch-lease"=String,Header,description="Exact target-scoped grant")),request_body=ReserveLaunchOutput,responses((status=200,body=LaunchOutputGrant),(status=403,description="Launch unavailable")),tag="workload-control")]
 pub async fn reserve_output(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -41,7 +41,7 @@ pub async fn reserve_output(
     fresh_deadline(result.expires_at)?;
     response(actor, result)
 }
-#[utoipa::path(post,path="/api/v1/workload-launches/{id}/stage-result",params(("id"=i64,Path)),request_body=LaunchRequest,responses((status=200,body=LaunchStageResult),(status=403,description="Launch unavailable")),tag="workload-control")]
+#[utoipa::path(operation_id="workload_launch_stage_result",post,path="/api/v1/workload-launches/{id}/stage-result",params(("id"=i64,Path),("x-attune-launch-dispatch"=String,Header,description="Exact target-scoped grant")),request_body=LaunchRequest,responses((status=200,body=LaunchStageResult),(status=403,description="Launch unavailable")),tag="workload-control")]
 pub async fn stage_result(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -62,7 +62,7 @@ pub async fn stage_result(
         .await?,
     )
 }
-#[utoipa::path(post,path="/api/v1/workload-launches/{id}/outputs/{output_id}/body",params(("id"=i64,Path),("output_id"=i64,Path),("admitted_digest"=Sha256Digest,Query)),request_body(content=CanonicalLaunchZip,content_type="application/zip"),responses((status=200,body=LaunchStageResult),(status=403,description="Launch unavailable")),tag="workload-control")]
+#[utoipa::path(operation_id="workload_launch_output_body",post,path="/api/v1/workload-launches/{id}/outputs/{output_id}/body",params(("id"=i64,Path),("output_id"=i64,Path),("admitted_digest"=Sha256Digest,Query),("x-attune-launch-lease"=String,Header,description="Exact target-scoped grant"),("x-attune-launch-output"=String,Header,description="Exact target-scoped grant")),request_body(content=CanonicalLaunchZip,content_type="application/zip"),responses((status=200,body=LaunchStageResult),(status=403,description="Launch unavailable")),tag="workload-control")]
 pub async fn output_body(
     State(state): State<Arc<AppState>>,
     Path((id, output_id)): Path<(i64, i64)>,
