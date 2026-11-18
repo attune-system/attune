@@ -1631,3 +1631,110 @@ async fn count_only_stdin_authorization_is_denied_even_with_a_live_bound_grant()
     fixture.ctx.cleanup().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn artifact_discovery_survives_stopped_complete_capture_without_setup_publication(
+) -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let reserved = fixture.reserve().await?;
+    let _: LaunchStatus = fixture
+        .ok(
+            &reserved,
+            "stop",
+            &StopLaunchRequest {
+                request: reserved.request.clone(),
+                reason: LaunchStopReason::Cancelled,
+            },
+            LAUNCH_DISPATCH_HEADER,
+            &reserved.dispatch_token,
+        )
+        .await?;
+    let cleanup: ClaimedLaunch = fixture
+        .ok(
+            &reserved,
+            "claim",
+            &reserved.request,
+            LAUNCH_DISPATCH_HEADER,
+            &reserved.dispatch_token,
+        )
+        .await?;
+    let ClaimedLaunch::Cleanup { lease, .. } = cleanup else {
+        return Err("cleanup claim required".into());
+    };
+    let stopped: LaunchStatus = fixture
+        .ok(
+            &reserved,
+            "stop-ack",
+            &StopLaunchAcknowledgement {
+                handle: lease.handle,
+                create: ProviderCreateSettlement::NeverSubmitted,
+                removed_resource: None,
+            },
+            LAUNCH_LEASE_HEADER,
+            &lease.token,
+        )
+        .await?;
+    assert_eq!(stopped.state, LaunchState::Stopped);
+    assert_eq!(
+        stopped.capture,
+        LaunchCaptureState::Complete,
+        "a never-submitted container has no raw output to recover"
+    );
+    assert_eq!(stopped.publication, LaunchPublicationState::NotRequired);
+    let (status, value) = fixture
+        .request(
+            "/api/v1/workload-launches/reconcile",
+            &ReconcileLaunchesRequest {
+                after: None,
+                limit: 100,
+            },
+            Some(&fixture.credential),
+            None,
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    let page: ReconcileLaunchesPage = serde_json::from_value(value)?;
+    assert!(
+        page.items
+            .iter()
+            .any(|item| item.request == reserved.request),
+        "independent artifact obligation survives stopped/capture-complete"
+    );
+    let claimed: ClaimedLaunch = fixture
+        .ok(
+            &reserved,
+            "claim",
+            &reserved.request,
+            LAUNCH_DISPATCH_HEADER,
+            &reserved.dispatch_token,
+        )
+        .await?;
+    assert!(
+        matches!(claimed, ClaimedLaunch::Stopped { .. }),
+        "artifact discovery must not reopen a Run/Capture lease or private invocation"
+    );
+    // Only seed the orthogonal terminal artifact receipt. No engine create,
+    // file allocation or native upload existed in this zero-resource fixture;
+    // upload/custody settlement is not claimed as covered by this test.
+    sqlx::query("UPDATE workload_artifact_publication SET state='incomplete',cleanup_receipt=id WHERE launch=$1")
+        .bind(reserved.request.launch_id).execute(&fixture.ctx.pool).await?;
+    let (status, value) = fixture
+        .request(
+            "/api/v1/workload-launches/reconcile",
+            &ReconcileLaunchesRequest {
+                after: None,
+                limit: 100,
+            },
+            Some(&fixture.credential),
+            None,
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    let page: ReconcileLaunchesPage = serde_json::from_value(value)?;
+    assert!(!page
+        .items
+        .iter()
+        .any(|item| item.request == reserved.request));
+    fixture.ctx.cleanup().await?;
+    Ok(())
+}

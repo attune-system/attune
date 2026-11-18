@@ -23,6 +23,60 @@ fn unavailable() -> ApiError {
     ApiError::InternalServerError("Pinned workload input preparation unavailable".into())
 }
 
+/// `api_origin` and transport policy are selected from trusted CP deployment /
+/// pool configuration, never from a host assignment request. No host Config,
+/// database URL, master key or signer is accepted by the external host API.
+pub async fn prepare_action_context(
+    state: &AppState,
+    source: &ClaimedActionSource,
+    api_origin: reqwest::Url,
+    http_policy: attune_common::workload_launch_io::LaunchHttpPolicy,
+    readiness: attune_common::execution_authority::RecordedConsumerReadiness,
+) -> ApiResult<attune_worker::executor::ControlExecutionPreparation> {
+    let (worker, instance, attempt) = match source.target {
+        attune_common::workload_launch::LaunchTarget::Execution {
+            worker,
+            worker_instance,
+            attempt,
+            ..
+        } => (worker, worker_instance, attempt),
+        _ => return Err(unavailable()),
+    };
+    let key = state
+        .config
+        .security
+        .encryption_key
+        .clone()
+        .ok_or_else(unavailable)?;
+    let producer = attune_worker::executor::ActionExecutor::for_control_plane(
+        state.db.clone(),
+        attune_worker::executor::ControlExecutionSettings {
+            worker,
+            instance,
+            api_origin,
+            http_policy,
+            jwt: (*state.jwt_config).clone(),
+            encryption_key: key,
+            max_stdout_bytes: state
+                .config
+                .worker
+                .as_ref()
+                .map_or(10 * 1024 * 1024, |config| config.max_stdout_bytes),
+            max_stderr_bytes: state
+                .config
+                .worker
+                .as_ref()
+                .map_or(10 * 1024 * 1024, |config| config.max_stderr_bytes),
+            segments: state.config.artifacts.log_segment_writer_config(),
+            recorded_readiness: readiness,
+        },
+    )?;
+    producer
+        .prepare_control_context(source.execution.id, attempt)
+        .await
+        .map_err(Into::into)
+}
+
 /// Acquire only the execution's immutable provider version. The public release
 /// becomes a validated launch ZIP; selected config, parameters and credentials
 /// are never passed to this materializer or embedded in the archive.

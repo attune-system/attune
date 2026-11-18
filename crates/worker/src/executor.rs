@@ -102,6 +102,56 @@ pub struct ActionExecutor {
     runtime_versions_cache_by_runtime_id: Arc<MetadataCache<String, Vec<RuntimeVersionModel>>>,
 }
 
+/// Trusted CP configuration only. Deliberately neither serde nor Debug: JWT
+/// signing and master decryption material must never become a host/profile DTO.
+pub struct ControlExecutionSettings {
+    pub worker: i64,
+    pub instance: uuid::Uuid,
+    pub api_origin: reqwest::Url,
+    pub http_policy: attune_common::workload_launch_io::LaunchHttpPolicy,
+    pub jwt: JwtConfig,
+    pub encryption_key: String,
+    pub max_stdout_bytes: usize,
+    pub max_stderr_bytes: usize,
+    pub segments: attune_common::log_stream::SegmentedLogConfig,
+    pub recorded_readiness: crate::recorded_credentials::RecordedConsumerReadiness,
+}
+
+/// Private selected data for the CP planner/completion path, never an external
+/// response. Retain schema and input paths when freezing the admitted context.
+pub struct ControlExecutionPreparation {
+    pub context: ExecutionContext,
+    pub schema: ActionSchemaBinding,
+    pub input_secret_paths: Option<Vec<String>>,
+}
+/// CP callers receive no local execute/setup/probe methods.
+pub struct ControlPlaneActionPreparer {
+    executor: ActionExecutor,
+}
+impl ControlPlaneActionPreparer {
+    pub async fn prepare_control_context(
+        &self,
+        execution: i64,
+        attempt: uuid::Uuid,
+    ) -> Result<ControlExecutionPreparation> {
+        self.executor
+            .prepare_control_context(execution, attempt)
+            .await
+    }
+}
+impl std::fmt::Debug for ControlExecutionPreparation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlExecutionPreparation")
+            .field("execution", &self.context.execution_id)
+            .field("parameter_count", &self.context.parameters.len())
+            .field(
+                "secret_path_count",
+                &self.input_secret_paths.as_ref().map(Vec::len),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 use tokio_util::sync::CancellationToken;
 
 /// Normalize a server bind address into a connectable URL.
@@ -320,6 +370,67 @@ struct LogAllocationSettings {
 }
 
 impl ActionExecutor {
+    /// Empty runtime registry: this producer can prepare admitted values but
+    /// cannot execute a pack, setup hook or verification command on the CP.
+    pub fn for_control_plane(
+        pool: PgPool,
+        settings: ControlExecutionSettings,
+    ) -> Result<ControlPlaneActionPreparer> {
+        use attune_common::{
+            workload_artifact::ARTIFACTS_ROOT,
+            workload_launch::{PACK_ROOT, RUNTIME_ROOT},
+            workload_launch_io::LaunchHttpPolicy,
+        };
+        if settings.worker <= 0
+            || settings.instance.is_nil()
+            || settings.encryption_key.len() < 32
+            || settings.jwt.secret.len() < 32
+            || settings.max_stdout_bytes == 0
+            || settings.max_stderr_bytes == 0
+            || !settings.http_policy.allows_origin(&settings.api_origin)
+            || (settings.api_origin.scheme() != "https"
+                && !matches!(settings.http_policy, LaunchHttpPolicy::DevelopmentPlainHttp))
+            || settings.api_origin.path() != "/"
+            || settings.api_origin.username() != ""
+            || settings.api_origin.password().is_some()
+            || settings.api_origin.query().is_some()
+            || settings.api_origin.fragment().is_some()
+        {
+            return Err(Error::configuration(
+                "Invalid trusted control execution settings",
+            ));
+        }
+        let api_origin = settings.api_origin.to_string();
+        let mut executor = Self::new(
+            pool.clone(),
+            RuntimeRegistry::new(),
+            ArtifactManager::new(PathBuf::from(ARTIFACTS_ROOT)),
+            SecretManager::new(pool, Some(settings.encryption_key))?,
+            settings.max_stdout_bytes,
+            settings.max_stderr_bytes,
+            false,
+            false,
+            "trusted-control-plane".into(),
+            settings.instance,
+            settings.segments,
+            None,
+            None,
+            PathBuf::from(PACK_ROOT),
+            PathBuf::from(ARTIFACTS_ROOT),
+            PathBuf::from(RUNTIME_ROOT),
+            api_origin.clone(),
+            settings.jwt,
+            Arc::new(attune_common::artifact_transport::VolumeTransport::new(
+                ARTIFACTS_ROOT,
+            )),
+        );
+        // The legacy local worker constructor normalizes wildcard bind URLs.
+        // A remote CP profile's explicitly selected origin must remain exact.
+        executor.api_url = api_origin;
+        executor.recorded_readiness = settings.recorded_readiness;
+        executor.set_worker_id(settings.worker);
+        Ok(ControlPlaneActionPreparer { executor })
+    }
     /// Integration startup must prove all consumers are ready before enabling
     /// recorded issuance. No production caller enables this yet.
     pub fn with_recorded_readiness(
@@ -1002,7 +1113,7 @@ impl ActionExecutor {
         &self,
         execution_id: i64,
         attempt: uuid::Uuid,
-    ) -> Result<ExecutionContext> {
+    ) -> Result<ControlExecutionPreparation> {
         let worker = self.worker_id.load(Ordering::Acquire);
         if worker <= 0 || attempt.is_nil() {
             return Err(Error::PermissionDenied(
@@ -1045,8 +1156,14 @@ impl ActionExecutor {
             stdout_path: Arc::new(OnceLock::new()),
             stderr_path: Arc::new(OnceLock::new()),
         };
-        self.prepare_execution_context(&execution, &action, &mut preparation, false, Some(attempt))
-            .await
+        let context = self
+            .prepare_execution_context(&execution, &action, &mut preparation, false, Some(attempt))
+            .await?;
+        Ok(ControlExecutionPreparation {
+            context,
+            schema: preparation.binding,
+            input_secret_paths: preparation.parameter_secret_paths,
+        })
     }
 
     /// Prepare execution context from execution and action data
@@ -2848,6 +2965,68 @@ mod tests {
     use attune_common::repositories::Create;
     use attune_common::test_database::TestDatabase;
     use chrono::Utc;
+
+    #[tokio::test]
+    async fn control_preparation_has_no_local_runtime_and_preserves_explicit_https_origin() {
+        use attune_common::workload_launch_io::LaunchHttpPolicy;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://owned:owned@127.0.0.1:1/unused")
+            .unwrap();
+        let settings = |origin: &str, policy| ControlExecutionSettings {
+            worker: 1,
+            instance: uuid::Uuid::new_v4(),
+            api_origin: reqwest::Url::parse(origin).unwrap(),
+            http_policy: policy,
+            jwt: JwtConfig {
+                secret: "owned-cp-test-signing-key-at-least-32-bytes".into(),
+                access_token_expiration: 300,
+                refresh_token_expiration: 300,
+            },
+            encryption_key: "owned-cp-test-master-key-at-least-32-bytes".into(),
+            max_stdout_bytes: 1024,
+            max_stderr_bytes: 1024,
+            segments: attune_common::config::ArtifactsConfig::default().log_segment_writer_config(),
+            recorded_readiness: Default::default(),
+        };
+        // An explicit remote profile origin is not normalized using local
+        // worker bind-address rules, including a domain with a numeric prefix.
+        let origin = "https://0.0.0.0.owned.invalid/";
+        let producer = ActionExecutor::for_control_plane(
+            pool.clone(),
+            settings(origin, LaunchHttpPolicy::TlsOrLoopback),
+        )
+        .unwrap();
+        assert_eq!(producer.executor.api_url, origin);
+        assert!(producer
+            .executor
+            .runtime_registry
+            .list_runtimes()
+            .is_empty());
+        assert!(producer.executor.worker_tokens.is_none());
+        assert!(ActionExecutor::for_control_plane(
+            pool.clone(),
+            settings("http://127.0.0.1:8080/", LaunchHttpPolicy::TlsOrLoopback)
+        )
+        .is_err());
+        assert!(ActionExecutor::for_control_plane(
+            pool.clone(),
+            settings(
+                "http://127.0.0.1:8080/",
+                LaunchHttpPolicy::DevelopmentPlainHttp
+            )
+        )
+        .is_ok());
+        assert!(ActionExecutor::for_control_plane(
+            pool.clone(),
+            settings(
+                "https://owned.invalid/?token=private",
+                LaunchHttpPolicy::TlsOrLoopback
+            )
+        )
+        .is_err());
+        drop(producer);
+        pool.close().await;
+    }
 
     #[test]
     fn successful_truncated_stdout_keeps_its_protection_reason() {

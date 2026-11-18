@@ -1175,7 +1175,7 @@ impl WorkloadLaunchRepository {
         }
         let mut tx = pool.begin().await?;
         Self::actor(&mut tx, actor).await?;
-        let mut rows:Vec<(i64,String,String)>=sqlx::query_as("SELECT id,admitted_digest,encrypted_dispatch FROM workload_launch WHERE engine=$1 AND id>$2 AND (operation#>>'{status,state}'<>'stopped' OR operation#>>'{status,publication}' IN ('pending','uploading') OR operation#>>'{status,capture}'='pending') ORDER BY id LIMIT $3")
+        let mut rows:Vec<(i64,String,String)>=sqlx::query_as("SELECT l.id,l.admitted_digest,l.encrypted_dispatch FROM workload_launch l WHERE l.engine=$1 AND l.id>$2 AND (l.operation#>>'{status,state}'<>'stopped' OR l.operation#>>'{status,publication}' IN ('pending','uploading') OR l.operation#>>'{status,capture}'='pending' OR EXISTS(SELECT 1 FROM workload_artifact_publication p WHERE p.launch=l.id AND p.state<>'open' AND p.cleanup_receipt IS NULL)) ORDER BY l.id LIMIT $3")
             .bind(actor.engine).bind(request.after.unwrap_or(0)).bind(i64::from(request.limit)+1).fetch_all(&mut *tx).await?;
         let more = rows.len() > request.limit as usize;
         rows.truncate(request.limit as usize);
@@ -1540,7 +1540,7 @@ impl WorkloadLaunchRepository {
             .capture_deadline
             .map_or(expires_at, |capture| capture.min(expires_at));
         let max_bytes = if request.channel == LaunchIoChannel::Stdin {
-            8 * 1024 * 1024
+            crate::workload_stdin::MAX_PRIVATE_STDIN_BYTES as u64
         } else {
             1024 * 1024
         };
