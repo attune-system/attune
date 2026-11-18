@@ -1054,16 +1054,11 @@ mod tests {
         require_auth: bool,
     ) -> tokio::task::JoinHandle<String> {
         tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::io::AsyncWriteExt;
 
             tokio::time::timeout(Duration::from_secs(5), async {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                while !request.ends_with(b"\r\n\r\n") {
-                    let byte = stream.read_u8().await.unwrap();
-                    request.push(byte);
-                    assert!(request.len() < 16 * 1024);
-                }
+                let request = crate::pack_registry::read_test_request_headers(&mut stream).await;
                 let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
                 let authenticated = request.contains("authorization: bearer registry-test\r\n")
                     && request.contains("x-api-key: registry-key\r\n");
@@ -1251,6 +1246,7 @@ mod tests {
         let archive_for_server = archive.clone();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
+            crate::pack_registry::read_test_request_headers(&mut stream).await;
             let headers = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/gzip\r\nContent-Disposition: attachment; filename=not-an-archive.txt\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 archive_for_server.len()
@@ -1675,6 +1671,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
+            crate::pack_registry::read_test_request_headers(&mut stream).await;
             let headers = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 archive.len()
@@ -1742,6 +1739,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
+            crate::pack_registry::read_test_request_headers(&mut stream).await;
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ninvalid",

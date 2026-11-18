@@ -978,6 +978,7 @@ mod tests {
         let mut server_task = tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
             let (mut stream, _) = listener.accept().await.unwrap();
+            crate::pack_registry::read_test_request_headers(&mut stream).await;
             stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nabcdef\r\n0\r\n\r\n").await.unwrap();
         });
         let response = reqwest::Client::new()

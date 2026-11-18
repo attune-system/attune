@@ -344,6 +344,32 @@ impl std::str::FromStr for Checksum {
     }
 }
 
+/// Wait for a complete request before a mock server sends its response. Otherwise
+/// the client can receive an unsolicited response while its connection is idle.
+#[cfg(test)]
+async fn read_test_request_headers(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(
+                stream
+                    .read_u8()
+                    .await
+                    .expect("mock HTTP client closed before sending request headers"),
+            );
+            assert!(
+                request.len() < 16 * 1024,
+                "mock HTTP request headers too large"
+            );
+        }
+        request
+    })
+    .await
+    .expect("mock HTTP request headers timed out")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
