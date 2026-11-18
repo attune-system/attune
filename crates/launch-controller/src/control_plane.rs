@@ -7,6 +7,9 @@ use std::{path::Path, sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
+#[path = "artifact_client.rs"]
+mod artifact_client;
+
 const JSON_LIMIT: usize = 4 * 1024 * 1024;
 #[derive(Debug, Error)]
 pub enum ControlError {
@@ -245,7 +248,11 @@ impl ControlPlane {
         token: &LaunchToken,
         operation: &AuthorizeLaunchIoRequest,
     ) -> Result<LaunchIoAuthorization> {
-        if operation.request.launch_id != lease.handle.launch_id
+        // Stdin requires CP comparison with the privately frozen exact bytes.
+        // A count-only grant must never activate pack-controlled input, even
+        // against an older CP that still accepts this generic channel request.
+        if operation.channel == LaunchIoChannel::Stdin
+            || operation.request.launch_id != lease.handle.launch_id
             || operation.request.admitted_digest != lease.handle.admitted_digest
         {
             return Err(ControlError::Response);
@@ -783,6 +790,45 @@ async fn decode<T: DeserializeOwned>(mut response: Response) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn generic_count_only_io_cannot_authorize_stdin() {
+        let request = LaunchRequest {
+            launch_id: 1,
+            admitted_digest: Sha256Digest::of_bytes(b"manifest"),
+        };
+        let lease = LaunchLease {
+            purpose: LaunchLeasePurpose::Run,
+            handle: LaunchHandle {
+                launch_id: 1,
+                admitted_digest: request.admitted_digest.clone(),
+                lease_id: uuid::Uuid::new_v4(),
+                lease_generation: 1,
+                lease_deadline: chrono::Utc::now() + chrono::Duration::seconds(60),
+                engine_id: 5,
+                engine_name_nonce: uuid::Uuid::new_v4(),
+            },
+            token: LaunchToken::new("owned-lease".into()).unwrap(),
+        };
+        let cp = ControlPlane::new(
+            "http://127.0.0.1:1/".parse().unwrap(),
+            LaunchToken::new("owned-controller".into()).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            cp.authorize_io(
+                &lease,
+                &LaunchToken::new("owned-stdin".into()).unwrap(),
+                &AuthorizeLaunchIoRequest {
+                    request,
+                    channel: LaunchIoChannel::Stdin,
+                    offset: 0,
+                    bytes: 1
+                }
+            )
+            .await,
+            Err(ControlError::Response)
+        ));
+    }
     #[tokio::test]
     async fn cloned_clients_use_replaced_cp_credential_without_local_signing() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
