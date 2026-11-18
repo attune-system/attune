@@ -338,7 +338,11 @@ async fn owning_case(real_provider: bool) -> Result<()> {
         max_expanded_bytes: 128 << 20,
         max_files: 4096,
     };
-    cache.install_input(&pack_pin, zip.into_file().as_file_mut())?;
+    // The real producer installs its own admitted pin, including observed ZIP
+    // bounds. Only the process double uses this manually supplied Pack pin.
+    if !real_provider {
+        cache.install_input(&pack_pin, zip.into_file().as_file_mut())?;
+    }
     let runner_archive = root.path().join("runner.zip");
     runner_zip(&runner_archive, &runner, platform)?;
     let runner_pin = pin(
@@ -565,10 +569,17 @@ async fn owning_case(real_provider: bool) -> Result<()> {
             }
         })
         .await??;
-        intent = Effects::retained_for_attempt(database.pool(), execution.id, attempt, MASTER)
-            .await?
-            .context("trusted producer did not retain its native intent")?
-            .intent;
+        let retained =
+            Effects::retained_for_attempt(database.pool(), execution.id, attempt, MASTER)
+                .await?
+                .context("trusted producer did not retain its native intent")?;
+        intent = retained.intent;
+        let retained_pack = retained
+            .inputs
+            .iter()
+            .find(|input| input.kind == LaunchInputKind::Pack)
+            .context("retained native intent has no Pack pin")?;
+        cache.open_input_archive(retained_pack)?;
         ensure!(outcome.exit_code == 0, "native action failed");
         let stored = ExecutionRepository::find_by_id(&database, execution.id)
             .await?
