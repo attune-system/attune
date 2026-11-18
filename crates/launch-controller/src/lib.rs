@@ -3,6 +3,8 @@
 pub mod cache;
 pub mod engine;
 pub mod run;
+pub mod service;
+pub mod session_store;
 
 pub mod actuator;
 pub mod capture;

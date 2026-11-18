@@ -633,6 +633,7 @@ name = "attune-launch-controller"
 version = "0.11.1"
 dependencies = [
  "attune-common",
+ "axum",
  "chrono",
  "futures",
  "libc",

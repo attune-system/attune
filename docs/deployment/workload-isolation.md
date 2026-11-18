@@ -120,8 +120,9 @@ host to execute pack runtime code.
 
 `crates/launch-controller` currently contains the typed control-plane client,
 fixed-policy Docker Engine API transport, bounded ephemeral raw-stream capture,
-and controller-owned input/stage cache primitives. Service lifecycle, recovery,
-runtime adapters and deployment integration remain incomplete. These primitives
+and controller-owned input/stage cache, lifecycle and scoped frontend code.
+End-to-end lifecycle validation, runtime adapters and deployment integration
+remain incomplete. This draft implementation
 are not an authorization path for callers to submit commands or Docker config.
 Only control-plane admitted launch IDs and manifest digests may select execution;
 the private invocation comes from the authenticated control plane.
@@ -132,6 +133,11 @@ attempt-private stage or candidate copy writable. They receive neither the
 Engine socket nor control-plane/manager credentials. The Engine supplies normal
 private procfs; the rejected empty-proc prototype is not a supported ABI.
 Startup must prove exact controller/Engine volume binding before accepting work.
+It also fetches the CP-registered immutable engine ID, daemon identity and Linux
+platform, verifies Docker Info against them and inspects/pulls only that platform.
+Replacing the daemon/platform requires a new CP engine identity. Runtime reuse
+requires the CP-recorded successful build's same engine, platform and image;
+co-admitting two index digests is not runtime compatibility evidence.
 The control plane and secret-bearing managers belong outside the workload host;
 the full placement and enrollment contract remains part of integration work.
 
@@ -153,3 +159,31 @@ named-volume stage can exhaust host disk before validation. This residual risk
 must be assessed explicitly during security review; no hard-quota guarantee is
 claimed. Network isolation is also not provided; admitted API access remains
 necessary. Current chart/image defaults do not implement this candidate.
+
+The controller entrypoint loads only its strict JSON `ATTUNE_LAUNCH_CONFIG` and
+an operator-supplied CP-issued `WorkloadSession` file, never the general service
+configuration or DB/MQ/master/signing keys. The session file must be a bounded,
+regular, single-link file owned by the controller user with no group/other access.
+It renews through `POST /api/v1/workload-launches/session` using its current
+dedicated controller bearer, updates the shared credential slot and respects the
+original deadline when renewal fails. Expiry stops admission and joins owned
+lifecycle tasks. Restart after a long outage still requires explicit CP bootstrap;
+there is no unlimited-token or local-signing fallback.
+
+The HTTP backend binds literal loopback; a colocated TLS proxy must supply the
+CP-registered external HTTPS origin. Frontend calls carry only target dispatch or
+channel grants. An HTTP launch response acknowledges scheduling, so execution
+hosts poll authenticated `status()` for Running or terminal state, refresh their
+assignment/channel grants and deliver stdin once. A lost write acknowledgement
+never authorizes replay. Historical stage `None` means authenticated not-ready;
+CP denial and transport failures remain errors. Retained raw output is bounded
+ephemeral capture, not an acknowledgement of encrypted durable manager custody.
+
+The trusted packaged controller runs as root to enforce stage UID/GID 1000 and
+read/validate owned output after teardown. Its required container capabilities
+are CHOWN, DAC_OVERRIDE and FOWNER; workload containers still drop **all**
+capabilities and receive no controller filesystem or credential. The Engine
+binding probe and Python archive/publication fixture exercise actual ownership
+and writable-stage behavior in this configuration. Filesystem-only host tests use
+an internal test owner matching the CI runner; that seam is absent in production.
+These focused fixtures do not certify the unfinished complete service stack.

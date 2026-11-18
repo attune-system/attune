@@ -28,6 +28,7 @@ pub struct RunSession {
     io: Mutex<LiveIo>,
     pub stdout: Capture,
     pub stderr: Capture,
+    capture_attached: std::sync::atomic::AtomicBool,
 }
 impl RunSession {
     pub fn new(request: LaunchRequest, capture_bytes: usize) -> std::io::Result<Self> {
@@ -40,6 +41,7 @@ impl RunSession {
             }),
             stdout: Capture::new(capture_bytes)?,
             stderr: Capture::new(capture_bytes)?,
+            capture_attached: false.into(),
         })
     }
     pub fn request(&self) -> &LaunchRequest {
@@ -156,6 +158,42 @@ impl RunSession {
         self.stdout.fail();
         self.stderr.fail();
     }
+    /// A finished lifecycle can retain output longer than one lease. Refresh
+    /// only retained authority; a read never reopens Run or engine input.
+    pub(crate) async fn maintain_retained_io(
+        &self,
+        cp: &ControlPlane,
+        reserved: &ReservedLaunch,
+    ) -> Result<()> {
+        let mut io = self.io.lock().await;
+        if let Some(lease) = &io.lease {
+            if lease.handle.lease_deadline > Utc::now() + chrono::Duration::seconds(5) {
+                return Ok(());
+            }
+            if matches!(
+                lease.purpose,
+                LaunchLeasePurpose::Capture | LaunchLeasePurpose::Publication
+            ) && lease.handle.lease_deadline > Utc::now()
+            {
+                let remaining = (lease.handle.lease_deadline - Utc::now())
+                    .to_std()
+                    .map_err(|_| ActuatorError::Authority)?;
+                let lease = tokio::time::timeout(remaining, cp.renew(lease))
+                    .await
+                    .map_err(|_| ActuatorError::Authority)??;
+                io.lease = Some(lease);
+                return Ok(());
+            }
+        }
+        let lease = match cp.claim(reserved).await? {
+            ClaimedLaunch::Capture { lease, .. } | ClaimedLaunch::Publication { lease, .. } => {
+                lease
+            }
+            _ => return Err(ActuatorError::Authority),
+        };
+        io.lease = Some(lease);
+        Ok(())
+    }
 }
 
 impl Actuator {
@@ -179,7 +217,8 @@ impl Actuator {
                 lease,
             } => {
                 session.replace_lease(lease.clone()).await;
-                return self.cleanup(&manifest, &status, &lease).await;
+                let stopped = self.cleanup(&manifest, &status, &lease).await?;
+                return self.finish_removed(request, session, stopped).await;
             }
             ClaimedLaunch::Publication {
                 manifest,
@@ -188,12 +227,19 @@ impl Actuator {
             } => {
                 session.replace_lease(lease.clone()).await;
                 self.publish(&manifest, &status, &lease).await?;
-                return Ok(self.cp.status(request).await?);
+                let published = self.cp.status(request).await?;
+                self.cleanup_private(&manifest, &published).await?;
+                return self.finish_removed(request, session, published).await;
             }
             ClaimedLaunch::Capture { status, lease, .. } => {
                 session.replace_lease(lease).await;
                 // Restart recovery cannot manufacture previously captured bytes.
-                session.fail_capture();
+                if !session
+                    .capture_attached
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    session.fail_capture();
+                }
                 return Ok(status);
             }
             ClaimedLaunch::Stopped { status } => return Ok(status),
@@ -224,7 +270,8 @@ impl Actuator {
             } else {
                 LaunchStopReason::LaunchFailure
             };
-            let _closed = self.cp.stop(request, reason).await;
+            let _closed =
+                tokio::time::timeout(Duration::from_secs(2), self.cp.stop(request, reason)).await;
             if let Some(container) = &resource {
                 let _settled = self.engine.stop_and_wait(container, 10).await;
             }
@@ -327,6 +374,9 @@ impl Actuator {
         session.io.lock().await.stdin = Some(Box::new(sink));
         let stdout = session.stdout.clone();
         let stderr = session.stderr.clone();
+        session
+            .capture_attached
+            .store(true, std::sync::atomic::Ordering::Release);
         *reader = Some(tokio::spawn(demultiplex(source, stdout, stderr)));
         let lease = session.renew(&self.cp).await?;
         let start = self.cp.start_intent(&lease).await?;
@@ -366,7 +416,14 @@ impl Actuator {
             if remaining.is_zero() {
                 return Err(ActuatorError::Authority);
             }
-            let tick = remaining.min(Duration::from_secs(5));
+            let mut tick = remaining.min(Duration::from_secs(5));
+            if let Some(limit) = timeout {
+                let left = limit.saturating_sub(started.elapsed());
+                if left.is_zero() {
+                    return Err(ActuatorError::Timeout);
+                }
+                tick = tick.min(left);
+            }
             let exit = tokio::select! {
                 result = &mut wait => Some(result?),
                 _ = tokio::time::sleep(tick) => None,
@@ -408,7 +465,15 @@ impl Actuator {
             _ => return Err(ActuatorError::Authority),
         };
         session.replace_lease(lease.clone()).await;
-        let mut stopped = self.cleanup(&manifest, &status, &lease).await?;
+        let stopped = self.cleanup(&manifest, &status, &lease).await?;
+        self.finish_removed(request, session, stopped).await
+    }
+    async fn finish_removed(
+        &self,
+        request: &ReservedLaunch,
+        session: &RunSession,
+        mut stopped: LaunchStatus,
+    ) -> Result<LaunchStatus> {
         if stopped.permits_stage_publication()
             && matches!(
                 stopped.publication,
@@ -424,6 +489,7 @@ impl Actuator {
                 session.replace_lease(lease.clone()).await;
                 self.publish(&manifest, &status, &lease).await?;
                 stopped = self.cp.status(request).await?;
+                self.cleanup_private(&manifest, &stopped).await?;
             } else {
                 return Err(ActuatorError::Authority);
             }

@@ -75,6 +75,65 @@ impl ControlPlane {
     async fn credential(&self) -> LaunchToken {
         self.credential.read().await.clone()
     }
+    /// Renewal is CP-issued and target-bound. A lost response does not extend
+    /// the old credential locally; callers must stop using it at its deadline.
+    pub async fn renew_session(
+        &self,
+        current_expires_at: chrono::DateTime<chrono::Utc>,
+        persist: impl FnOnce(&attune_common::workload_session::WorkloadSession) -> std::io::Result<()>,
+    ) -> Result<attune_common::workload_session::WorkloadSession> {
+        use attune_common::workload_session::{RenewWorkloadSession, WorkloadSession};
+        let now = chrono::Utc::now();
+        let remaining = (current_expires_at - now)
+            .to_std()
+            .map_err(|_| ControlError::Response)?;
+        if remaining.is_zero() {
+            return Err(ControlError::Response);
+        }
+        let previous = self.credential().await;
+        let mut url = self.base.clone();
+        url.set_path("/api/v1/workload-launches/session");
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(previous.as_str())
+            .json(&RenewWorkloadSession {})
+            .timeout(remaining.min(Duration::from_secs(30)))
+            .send()
+            .await
+            .map_err(|_| ControlError::Transport)?;
+        if !response.status().is_success() {
+            return Err(ControlError::Rejected(response.status().as_u16()));
+        }
+        if response
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            != Some("no-store")
+        {
+            return Err(ControlError::Response);
+        }
+        let session: WorkloadSession = decode(response).await?;
+        let now = chrono::Utc::now();
+        if now >= current_expires_at
+            || session.expires_at <= now
+            || session.expires_at > now + chrono::Duration::seconds(300)
+        {
+            return Err(ControlError::Response);
+        }
+        let mut slot = self.credential.write().await;
+        if slot.as_str() != previous.as_str() {
+            return Err(ControlError::Response);
+        }
+        // The exclusive provider must publish+fsync before RAM replacement.
+        // Any persistence error is fatal to admission, never RAM-only renewal.
+        persist(&session)?;
+        if chrono::Utc::now() >= current_expires_at || chrono::Utc::now() >= session.expires_at {
+            return Err(ControlError::Response);
+        }
+        *slot = session.token.clone();
+        Ok(session)
+    }
     fn url(&self, id: i64, suffix: &[&str]) -> Result<Url> {
         if id <= 0 {
             return Err(ControlError::Configuration);
@@ -774,5 +833,87 @@ mod tests {
         .await;
         server.await.unwrap();
         result.unwrap();
+    }
+    #[tokio::test]
+    async fn renewal_requires_durable_publication_before_credential_replacement() {
+        use attune_common::workload_session::{RenewWorkloadSession, WorkloadSession};
+        use axum::{
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::post,
+            Json, Router,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        async fn renew(
+            State(deny): State<Arc<AtomicBool>>,
+            headers: HeaderMap,
+            Json(_): Json<RenewWorkloadSession>,
+        ) -> axum::response::Response {
+            if deny.load(Ordering::SeqCst)
+                || headers.get("authorization").and_then(|v| v.to_str().ok())
+                    != Some("Bearer cp-original")
+                || headers.contains_key(LAUNCH_LEASE_HEADER)
+                || headers.contains_key(LAUNCH_DISPATCH_HEADER)
+            {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+            (
+                [("cache-control", "no-store")],
+                Json(WorkloadSession {
+                    token: LaunchToken::new("cp-renewed".into()).unwrap(),
+                    expires_at: chrono::Utc::now() + chrono::Duration::seconds(120),
+                }),
+            )
+                .into_response()
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let deny = Arc::new(AtomicBool::new(false));
+        let router = Router::new()
+            .route("/api/v1/workload-launches/session", post(renew))
+            .with_state(deny.clone());
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+        let client = ControlPlane::new(
+            Url::parse(&format!("http://{address}/")).unwrap(),
+            LaunchToken::new("cp-original".into()).unwrap(),
+        )
+        .unwrap();
+        let expiry = chrono::Utc::now() + chrono::Duration::seconds(90);
+        let failed = client
+            .renew_session(expiry, |_| {
+                Err(std::io::Error::other("owned persistence failure"))
+            })
+            .await;
+        let unchanged = client.credential().await;
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let store = crate::session_store::SessionStore::open(root.path().into()).unwrap();
+        let renewed = client
+            .renew_session(expiry, |session| store.persist(session))
+            .await;
+        let installed = client.credential().await;
+        let retained = store.retained();
+        deny.store(true, Ordering::SeqCst);
+        let rejected = client.renew_session(expiry, |_| Ok(())).await;
+        stop.send(()).unwrap();
+        server.await.unwrap();
+        assert!(matches!(failed, Err(ControlError::Io(_))));
+        assert_eq!(unchanged.as_str(), "cp-original");
+        assert_eq!(renewed.unwrap().token.as_str(), "cp-renewed");
+        assert_eq!(installed.as_str(), "cp-renewed");
+        assert_eq!(retained.unwrap().unwrap().token.as_str(), "cp-renewed");
+        assert!(matches!(rejected, Err(ControlError::Rejected(403))));
     }
 }

@@ -48,7 +48,7 @@ COPY crates/launch-controller/Cargo.toml ./crates/launch-controller/Cargo.toml
 
 # Create minimal stub sources so cargo can resolve the workspace and fetch deps.
 # These are ONLY used for `cargo fetch` — never compiled.
-RUN mkdir -p crates/launch-controller/src && echo "" > crates/launch-controller/src/lib.rs && \
+RUN mkdir -p crates/launch-controller/src && echo "" > crates/launch-controller/src/lib.rs && echo "fn main(){}" > crates/launch-controller/src/main.rs && \
     mkdir -p crates/common/src && echo "" > crates/common/src/lib.rs && \
     mkdir -p crates/api/src && echo "fn main(){}" > crates/api/src/main.rs && \
     mkdir -p crates/executor/src && echo "fn main(){}" > crates/executor/src/main.rs && \
@@ -56,6 +56,7 @@ RUN mkdir -p crates/launch-controller/src && echo "" > crates/launch-controller/
     mkdir -p crates/sensor/src && echo "fn main(){}" > crates/sensor/src/main.rs && \
     mkdir -p crates/worker/src && echo "fn main(){}" > crates/worker/src/main.rs && \
     echo "fn main(){}" > crates/worker/src/agent_main.rs && \
+    echo "fn main(){}" > crates/worker/src/workload_runner_main.rs && \
     mkdir -p crates/notifier/src && echo "fn main(){}" > crates/notifier/src/main.rs && \
     mkdir -p crates/supervisor/src && echo "fn main(){}" > crates/supervisor/src/main.rs && \
     mkdir -p crates/cli/src && echo "fn main(){}" > crates/cli/src/main.rs
@@ -75,6 +76,7 @@ COPY crates/api/ ./crates/api/
 COPY crates/executor/ ./crates/executor/
 COPY crates/notifier/ ./crates/notifier/
 COPY crates/supervisor/ ./crates/supervisor/
+COPY crates/launch-controller/ ./crates/launch-controller/
 # `sqlx::migrate!` resolves this directory while compiling attune-common.
 COPY migrations/ ./migrations/
 
@@ -95,7 +97,7 @@ ARG ATTUNE_BUILD_GIT_SHA
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry-v2,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,id=attune-cargo-git-v2,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
-    for service in api executor notifier supervisor; do \
+    for service in api executor notifier supervisor launch-controller; do \
         binary="/build/target/release/attune-${service}"; \
         if [ -f "$binary" ] && [ ! -s "$binary" ]; then rm "$binary"; fi; \
     done && \
@@ -105,15 +107,17 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry
     --bin attune-executor \
     --bin attune-notifier \
     --bin attune-supervisor \
+    --bin attune-launch-controller \
     -j "${CARGO_BUILD_JOBS}" && \
-    for service in api executor notifier supervisor; do \
+    for service in api executor notifier supervisor launch-controller; do \
         test -s "/build/target/release/attune-${service}" || exit 1; \
     done && \
     mkdir -p /build/service-binaries && \
     cp /build/target/release/attune-api /build/service-binaries/api && \
     cp /build/target/release/attune-executor /build/service-binaries/executor && \
     cp /build/target/release/attune-notifier /build/service-binaries/notifier && \
-    cp /build/target/release/attune-supervisor /build/service-binaries/supervisor
+    cp /build/target/release/attune-supervisor /build/service-binaries/supervisor && \
+    cp /build/target/release/attune-launch-controller /build/service-binaries/launch-controller
 
 # Extract the requested service binary from the architecture-specific builder layer.
 # This is the only layer that varies per SERVICE value.
@@ -124,6 +128,7 @@ RUN cp /build/service-binaries/${SERVICE} /build/attune-service-binary
 # Stage 2: Runtime - Minimal image with just the service binary
 # ============================================================================
 FROM debian:${DEBIAN_VERSION}-slim AS runtime
+ARG SERVICE_USER=attune
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
@@ -137,6 +142,8 @@ RUN apt-get update && apt-get install -y \
 # Create non-root user and directories
 # /opt/attune/packs is mounted as a volume at runtime, not copied in
 RUN useradd -m -u 1000 attune && \
+    mkdir -p /var/lib/attune/controller /var/lib/attune/launch && \
+    chmod 0700 /var/lib/attune/controller && \
     mkdir -p /opt/attune/packs /opt/attune/logs /opt/attune/runtime_envs /opt/attune/config /opt/attune/blobs && \
     chown -R attune:attune /opt/attune
 
@@ -151,7 +158,7 @@ COPY migrations/ ./migrations/
 
 RUN chown -R attune:attune /opt/attune
 
-USER attune
+USER ${SERVICE_USER}
 
 ENV RUST_LOG=info
 ENV ATTUNE_CONFIG=/opt/attune/config/config.yaml

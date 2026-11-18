@@ -6,8 +6,13 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[[bin]]
+name = "attune-launch-controller"
+path = "src/main.rs"
+
 [dependencies]
 attune-common = { path = "../common" }
+axum = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 libc = "0.2"

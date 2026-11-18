@@ -89,11 +89,26 @@ impl Actuator {
                 lease,
             } => {
                 self.publish(&manifest, &status, &lease).await?;
-                Ok(self.cp.status(request).await?)
+                let published = self.cp.status(request).await?;
+                self.cleanup_private(&manifest, &published).await?;
+                Ok(published)
             }
             ClaimedLaunch::Capture { status, .. } | ClaimedLaunch::Stopped { status } => Ok(status),
             ClaimedLaunch::Active { .. } => Err(ActuatorError::Authority),
         }
+    }
+    pub(crate) async fn cleanup_private(
+        &self,
+        manifest: &LaunchManifest,
+        status: &LaunchStatus,
+    ) -> Result<()> {
+        let cache = self.cache.clone();
+        let manifest = manifest.clone();
+        let status = status.clone();
+        tokio::task::spawn_blocking(move || cache.cleanup_settled_private(&manifest, &status))
+            .await
+            .map_err(|_| ActuatorError::FilesystemTask)??;
+        Ok(())
     }
     pub(crate) async fn cleanup(
         &self,
