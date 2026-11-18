@@ -420,21 +420,51 @@ async fn retired_controller_scope_cannot_fall_through_to_ambient_iam() -> Result
         scope: Some("workload_controller".into()),
         metadata: Some(json!({"controller":1,"engine":1,"incarnation":Uuid::new_v4()})),
     };
-    let token = jsonwebtoken::encode(
-        &jsonwebtoken::Header::default(),
-        &claims,
-        &jsonwebtoken::EncodingKey::from_secret(ctx.state.jwt_config.secret.as_bytes()),
-    )?;
-    let response = ctx
-        .app
-        .clone()
-        .oneshot(
-            Request::get("/api/v1/packs")
-                .header("authorization", format!("Bearer {token}"))
-                .body(Body::empty())?,
-        )
-        .await?;
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    for scope in [
+        "workload_controller",
+        "workload_host",
+        "workload_host_enrollment",
+        "unknown_worker_scope",
+    ] {
+        let claims = Claims {
+            scope: Some(scope.into()),
+            ..claims.clone()
+        };
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(ctx.state.jwt_config.secret.as_bytes()),
+        )?;
+        let response = ctx
+            .app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/packs")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    for route in [
+        "/api/v1/workload-hosts/register",
+        "/api/v1/workload-hosts/session",
+        "/api/v1/workload-hosts/custody/reserve",
+        "/api/v1/workload-hosts/custody/prepare",
+        "/api/v1/workload-hosts/custody/cancel-absent",
+    ] {
+        let response = ctx
+            .app
+            .clone()
+            .oneshot(
+                Request::post(route)
+                    .header("authorization", format!("Bearer {}", ctx.token().unwrap()))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
     let response = ctx
         .app
         .clone()

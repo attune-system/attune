@@ -134,10 +134,14 @@ impl attune_common::isolated_process::ProcessControl for RecordingProcessControl
         &self,
         reason: attune_common::workload_launch::LaunchStopReason,
     ) -> Result<attune_common::workload_launch::LaunchExitOutcome> {
-        let fenced=attune_common::repositories::execution_process::ExecutionProcessRepository::request_stop(&self.pool,self.intent).await;
-        // Even a CP outage must not leave the exact owned payload running.
-        // Unknown persistence/stop acknowledgements never permit publication.
-        let outcome = self.inner.stop(reason).await?;
+        // Stop the exact owned payload even while DB fencing is waiting or
+        // unavailable. Join both owners; physical termination alone is never a
+        // durable stop/completion acknowledgement.
+        let (fenced, stopped) = tokio::join!(
+            attune_common::repositories::execution_process::ExecutionProcessRepository::request_stop(&self.pool, self.intent),
+            self.inner.stop(reason),
+        );
+        let outcome = stopped?;
         let recorded=attune_common::repositories::execution_process::ExecutionProcessRepository::record_exit(
             &self.pool,self.intent,&self.resource,outcome,
         ).await;
@@ -2200,13 +2204,10 @@ impl ActionExecutor {
             Err(error) => {
                 // No effect may open the gate on unknown COMMIT/expiry/revocation.
                 // Retain identity and stop evidence if provider cleanup is uncertain.
-                let recorded = Effects::request_stop(&self.pool, spec.intent).await;
-                let stopped = process
+                process
                     .control
                     .stop(attune_common::workload_launch::LaunchStopReason::SourceRevoked)
-                    .await;
-                recorded?;
-                stopped?;
+                    .await?;
                 return Err(error);
             }
         };
@@ -3299,6 +3300,104 @@ mod tests {
     use attune_common::repositories::Create;
     use attune_common::test_database::TestDatabase;
     use chrono::Utc;
+
+    #[tokio::test]
+    async fn physical_stop_is_not_blocked_by_durable_stop_lock_wait() -> anyhow::Result<()> {
+        use attune_common::{
+            isolated_process::{ProcessControl, ResourceIdentity},
+            workload_launch::{LaunchExitOutcome, LaunchStopReason},
+            workload_stdin::LaunchStdinPayload,
+        };
+        struct OwnedStop(Arc<tokio::sync::Notify>);
+        #[async_trait::async_trait]
+        impl ProcessControl for OwnedStop {
+            async fn write_stdin_once(&self, _: LaunchStdinPayload) -> Result<()> {
+                Err(Error::execution("test has no stdin"))
+            }
+            async fn wait(&self) -> Result<LaunchExitOutcome> {
+                Err(Error::execution("test must stop"))
+            }
+            async fn stop(&self, _: LaunchStopReason) -> Result<LaunchExitOutcome> {
+                self.0.notify_one();
+                Ok(LaunchExitOutcome {
+                    exit_code: 137,
+                    oom_killed: false,
+                })
+            }
+        }
+        let config = Config::load_from_file(&format!(
+            "{}/../../config.test.yaml",
+            env!("CARGO_MANIFEST_DIR")
+        ))?;
+        let database = TestDatabase::create(&config.database)
+            .await?
+            .with_cleanup_on_drop();
+        let intent = uuid::Uuid::new_v4();
+        let resource = ResourceIdentity::Kubernetes {
+            cluster: "owned".into(),
+            namespace: "owned".into(),
+            pod_name: "owned".into(),
+            pod_uid: uuid::Uuid::new_v4().to_string(),
+        };
+        let target = attune_common::workload_launch::LaunchTarget::Execution {
+            execution: 1,
+            worker: 1,
+            worker_instance: uuid::Uuid::new_v4(),
+            attempt: uuid::Uuid::new_v4(),
+        };
+        sqlx::query("INSERT INTO execution_process_effect(intent,target,encrypted_context,source_epochs,resource,create_submitted) VALUES($1,$2,'unused-test-context','[]',$3,TRUE)")
+            .bind(intent).bind(sqlx::types::Json(target)).bind(sqlx::types::Json(&resource)).execute(database.pool()).await?;
+        let mut barrier = database.pool().begin().await?;
+        let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *barrier)
+            .await?;
+        let _: i64 = sqlx::query_scalar(
+            "SELECT id FROM execution_process_effect WHERE intent=$1 FOR UPDATE",
+        )
+        .bind(intent)
+        .fetch_one(&mut *barrier)
+        .await?;
+        let stopped = Arc::new(tokio::sync::Notify::new());
+        let control = RecordingProcessControl {
+            inner: Arc::new(OwnedStop(stopped.clone())),
+            pool: database.pool().clone(),
+            intent,
+            resource,
+        };
+        let mut task = tokio::spawn(async move { control.stop(LaunchStopReason::Cancelled).await });
+        let observed = async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), stopped.notified()).await?;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))")
+                        .bind(blocker).fetch_one(database.pool()).await?;
+                    if waiting { return Ok::<_, sqlx::Error>(()); }
+                    tokio::task::yield_now().await;
+                }
+            }).await??;
+            anyhow::ensure!(!task.is_finished(), "physical stop must not ACK durable settlement");
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        barrier.rollback().await?;
+        if observed.is_err() {
+            task.abort();
+        }
+        let joined = (&mut task).await;
+        let check =
+            async {
+                observed?;
+                let outcome = joined??;
+                anyhow::ensure!(outcome.exit_code == 137);
+                let (fenced, exit): (bool, Option<serde_json::Value>) = sqlx::query_as(
+                "SELECT stop_requested,exit_outcome FROM execution_process_effect WHERE intent=$1")
+                .bind(intent).fetch_one(database.pool()).await?;
+                anyhow::ensure!(fenced && exit.is_some(), "stop/evidence were not committed");
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+        database.cleanup().await?;
+        check
+    }
 
     #[test]
     fn successful_truncated_stdout_keeps_its_protection_reason() {
