@@ -122,6 +122,50 @@ pub struct LaunchRequest {
     pub admitted_digest: Sha256Digest,
 }
 
+/// Engine identity is immutable across controller restarts. Replacing a daemon
+/// or changing its native platform requires a new engine ID; runtime cache
+/// compatibility is never inferred from a multiarch index digest alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub enum LaunchPlatform {
+    #[serde(rename = "linux/amd64")]
+    LinuxAmd64,
+    #[serde(rename = "linux/arm64")]
+    LinuxArm64,
+}
+impl LaunchPlatform {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LinuxAmd64 => "linux/amd64",
+            Self::LinuxArm64 => "linux/arm64",
+        }
+    }
+    pub fn native_arch(self) -> &'static str {
+        match self {
+            Self::LinuxAmd64 => "amd64",
+            Self::LinuxArm64 => "arm64",
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchEngineBinding {
+    pub engine_id: i64,
+    pub daemon_id: String,
+    pub platform: LaunchPlatform,
+}
+impl LaunchEngineBinding {
+    pub fn validate_shape(&self) -> Result<()> {
+        if self.engine_id <= 0
+            || self.daemon_id.is_empty()
+            || self.daemon_id.len() > 256
+            || self.daemon_id.bytes().any(|byte| !byte.is_ascii_graphic())
+        {
+            return Err(Error::validation("Invalid admitted engine binding"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PinnedImage {
