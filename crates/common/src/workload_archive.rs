@@ -1,5 +1,5 @@
-//! Canonical v1 workload ZIP validation, shared by CP publication and controller
-//! input staging. Pure validation performs no filesystem access or extraction.
+//! Canonical v1 workload ZIP validation, shared by trusted publication and input
+//! staging. Pure validation performs no filesystem access or extraction.
 //! Links retain their bytes; they may resolve only within the selected fixed
 //! container root. Image-external interpreter links require e.g. venv --copies.
 use crate::{workload_launch::LaunchInputKind, Error, Result};
@@ -57,6 +57,37 @@ pub fn validate_zip<R: Read + Seek>(
     let length = reader.seek(SeekFrom::End(0)).map_err(|_| invalid())?;
     if length == 0 || length > policy.max_compressed_bytes {
         return Err(quota());
+    }
+    reader.seek(SeekFrom::Start(0)).map_err(|_| invalid())?;
+    {
+        // ZipArchive preallocates its central index from the raw declared
+        // count. Check that count with the pinned library's non-indexing reader
+        // FIRST, including duplicates that an indexed name map could collapse.
+        // Parse every selected central/local header before constructing the
+        // index so malformed metadata cannot induce fallback to another footer.
+        let mut metadata =
+            zip::unstable::read::ZipIterable::try_new(&mut *reader, zip::read::Config::default())
+                .map_err(|_| invalid())?
+                .enforce_header_consistency(true);
+        if metadata.len() as u64 > policy.max_files {
+            return Err(quota());
+        }
+        let mut declared_bytes = 0u64;
+        for entry in metadata.files().map_err(|_| invalid())? {
+            let checked = entry.map_err(|_| invalid())?;
+            let name = checked.name().map_err(|_| invalid())?;
+            validate_name(if checked.is_dir() {
+                name.strip_suffix('/').ok_or_else(invalid)?
+            } else {
+                &name
+            })?;
+            declared_bytes = declared_bytes
+                .checked_add(checked.size())
+                .ok_or_else(quota)?;
+            if declared_bytes > policy.max_expanded_bytes {
+                return Err(quota());
+            }
+        }
     }
     reader.seek(SeekFrom::Start(0)).map_err(|_| invalid())?;
     let entries = {
@@ -446,5 +477,40 @@ mod tests {
             }
             assert!(validate_zip(&mut Cursor::new(bytes), &policy()).is_err());
         }
+    }
+    #[test]
+    fn raw_entry_quota_precedes_full_index_and_malformed_header_expansion() {
+        let mut buffer = Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut buffer);
+            zip.start_file(
+                "owned",
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+            zip.write_all(&[b'x'; 4096]).unwrap();
+            zip.finish().unwrap();
+        }
+        let bytes = buffer.into_inner();
+        let end = bytes.len() - 22;
+        assert_eq!(&bytes[end..end + 4], b"PK\x05\x06");
+        let start = u32::from_le_bytes(bytes[end + 16..end + 20].try_into().unwrap()) as usize;
+        let mut footer = bytes[end..].to_vec();
+        // Space is sufficient for the claimed count, but only the first header
+        // exists. An indexed parser allocates and then discovers invalid data;
+        // the non-indexing count guard must report quota without that expansion.
+        const COUNT: u16 = 1000;
+        let directory_size = u32::from(COUNT) * 46;
+        footer[8..10].copy_from_slice(&COUNT.to_le_bytes());
+        footer[10..12].copy_from_slice(&COUNT.to_le_bytes());
+        footer[12..16].copy_from_slice(&directory_size.to_le_bytes());
+        let mut forged = bytes[..end].to_vec();
+        forged.resize(start + directory_size as usize, 0);
+        forged.extend_from_slice(&footer);
+        let mut policy = policy();
+        policy.max_compressed_bytes = 65536;
+        policy.max_files = 2;
+        let error = validate_zip(&mut Cursor::new(forged), &policy).unwrap_err();
+        assert!(error.to_string().contains("exceeds admitted bounds"));
     }
 }

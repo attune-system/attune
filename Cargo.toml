@@ -108,7 +108,8 @@ walkdir = "2.5"
 # Archive/compression
 tar = "0.4"
 flate2 = "1.1"
-zip = { version = "9.0", default-features = false, features = ["deflate"] }
+# The workload validator uses this exact version's incremental metadata API.
+zip = { version = "=9.6.1", default-features = false, features = ["deflate"] }
 ignore = "0.4"
 
 # WebSocket client
