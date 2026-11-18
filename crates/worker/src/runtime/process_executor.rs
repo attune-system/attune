@@ -35,6 +35,10 @@ use tokio::time::{timeout, Duration, Instant as TokioInstant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn, Instrument};
 
+#[cfg(test)]
+#[path = "isolated_capture_tests.rs"]
+mod isolated_capture_tests;
+
 tokio::task_local! {
     static RUNTIME_TASKS: tokio_util::task::TaskTracker;
 }
@@ -486,20 +490,8 @@ pub async fn execute_streaming_cancellable(
     }
     .resolve(out_schema, output_format)
     .map_err(|error| RuntimeError::InvalidAction(error.to_string()))?;
-    let delay_action_mirror = action_output_requires_delayed_mirror(output_policy);
     let execution_deadline = timeout_secs
         .and_then(|seconds| TokioInstant::now().checked_add(Duration::from_secs(seconds)));
-    let log_finalization_timeout_ms = stdout_log_writer
-        .as_ref()
-        .map(BoundedLogFileWriter::finalization_timeout_ms)
-        .into_iter()
-        .chain(
-            stderr_log_writer
-                .as_ref()
-                .map(BoundedLogFileWriter::finalization_timeout_ms),
-        )
-        .max()
-        .unwrap_or(1_000);
 
     configure_child_process(&mut cmd)?;
 
@@ -538,53 +530,15 @@ pub async fn execute_streaming_cancellable(
     #[cfg(windows)]
     let process_tree = WindowsProcessTree::assign(&child)?;
 
-    // Create bounded writers
-    let stdout_writer = BoundedLogWriter::new_stdout(max_stdout_bytes);
-    let stderr_writer = BoundedLogWriter::new_stderr(max_stderr_bytes);
-
-    // Take stdout and stderr streams
-    let stdout = child.stdout.take().expect("stdout not captured");
-    let stderr = child.stderr.take().expect("stderr not captured");
-
-    // Create buffered readers
-    let stdout_reader = BufReader::new(stdout);
-    let stderr_reader = BufReader::new(stderr);
-    let output_cancel = CancellationToken::new();
-    let _capture_cancel = output_cancel.clone().drop_guard();
-    let pipe_drain = CancellationToken::new();
-    let stdout_cancel = output_cancel.clone();
-    let stderr_cancel = output_cancel.clone();
-
-    let stdout_task = spawn_capture(
-        capture_pipe(
-            stdout_reader,
-            stdout_writer,
-            stdout_log_writer,
-            stdout_cancel,
-            pipe_drain.clone(),
-            RuntimeLogStream::Stdout,
-            output_policy.stdout == StdoutPolicy::Public,
-        )
-        .instrument(tracing::debug_span!(
-            "runtime_log_capture",
-            stream = "stdout"
-        )),
+    let capture = ProcessCapture::new(
+        child.stdout.take().expect("stdout not captured"),
+        child.stderr.take().expect("stderr not captured"),
+        stdout_log_writer,
+        stderr_log_writer,
+        (max_stdout_bytes, max_stderr_bytes),
+        output_policy,
     );
-    let stderr_task = spawn_capture(
-        capture_pipe(
-            stderr_reader,
-            stderr_writer,
-            stderr_log_writer,
-            stderr_cancel,
-            pipe_drain.clone(),
-            RuntimeLogStream::Stderr,
-            output_policy.stderr == OutputVisibility::Public,
-        )
-        .instrument(tracing::debug_span!(
-            "runtime_log_capture",
-            stream = "stderr"
-        )),
-    );
+    let output_cancel = capture.output_cancel.clone();
 
     // Stdin delivery is part of the action's execution budget. Output capture
     // starts first so a child that writes before reading stdin cannot deadlock.
@@ -656,120 +610,410 @@ pub async fn execute_streaming_cancellable(
             )
         }
     };
-    // Freeze process timing before any post-exit pipe or remote log settlement.
-    let process_duration = start.elapsed();
-    let duration_ms = process_duration.as_millis() as u64;
-    let process_wait_elapsed_us = process_duration.as_micros() as u64;
-    info!(
-        duration_ms,
-        cancelled = wait.1,
-        timed_out = wait.2,
-        "Process wait finished"
-    );
-    let settlement_started = Instant::now();
-    tracing::debug!(
-        phase = "process_wait",
-        elapsed_us = process_wait_elapsed_us,
-        "Worker lifecycle phase"
-    );
-    let (wait_result, mut was_cancelled, was_timed_out, stdin_write_error) = wait;
+    let process_wait_ok = wait.0.is_ok();
+    let interrupted = wait.1 || wait.2;
+    let result = capture
+        .finish(
+            start,
+            CapturePolicy {
+                timeout_secs,
+                execution_deadline,
+                output_format,
+                output_policy,
+                out_schema,
+                cancel_token: cancel_token.clone(),
+            },
+            (
+                wait.0.map(|status| status.code().unwrap_or(-1)),
+                wait.1,
+                wait.2,
+                wait.3,
+            ),
+        )
+        .await?;
+    // Retain process-tree ownership through shared capture/custody settlement.
+    #[cfg(unix)]
+    if process_wait_ok
+        && !interrupted
+        && !result.logs_incomplete
+        && !cancel_token
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+    {
+        process_group_guard.0 = None;
+    }
+    #[cfg(not(unix))]
+    let _ = (process_wait_ok, interrupted);
+    Ok(result)
+}
 
-    let output_results = async {
-        let (stdout, stderr) = tokio::join!(stdout_task, stderr_task);
-        let stdout = stdout.map_err(|error| {
-            RuntimeError::ExecutionFailed(format!("stdout task failed: {error}"))
-        })?;
-        let stderr = stderr.map_err(|error| {
-            RuntimeError::ExecutionFailed(format!("stderr task failed: {error}"))
-        })?;
-        // Capture can finish at EOF before child wait. Accept durable custody
-        // only now, so an early-closed pipe cannot consume its delivery deadline
-        // while the process is still running.
-        let (stdout, stderr) = tokio::join!(
-            stdout.finish_delivery(output_cancel.clone(), RuntimeLogStream::Stdout),
-            stderr.finish_delivery(output_cancel.clone(), RuntimeLogStream::Stderr),
-        );
-        Ok::<_, RuntimeError>((stdout, stderr))
+/// Existing execution policy applied to isolated attach streams. Log writers
+/// remain in the trusted worker; no encryption/custody key enters ProcessIo.
+pub struct IsolatedCaptureOptions<'a> {
+    pub timeout_secs: Option<u64>,
+    pub max_stdout_bytes: usize,
+    pub max_stderr_bytes: usize,
+    pub output_format: OutputFormat,
+    pub output_policy: ResolvedOutputPolicy,
+    pub out_schema: Option<&'a attune_common::value_schema::Contract>,
+    pub cancel_token: Option<CancellationToken>,
+    pub stdout_log_writer: Option<BoundedLogFileWriter>,
+    pub stderr_log_writer: Option<BoundedLogFileWriter>,
+}
+
+/// Consume an already-attached, still-gated isolated process. The trusted
+/// caller must commit the exact attempt/input one-shot fence before entry.
+/// No uncertain write is retried, and no provider exit implies log readiness.
+pub async fn execute_isolated_cancellable(
+    process: attune_common::isolated_process::ProcessIo,
+    payload: attune_common::workload_stdin::LaunchStdinPayload,
+    options: IsolatedCaptureOptions<'_>,
+) -> RuntimeResult<ExecutionResult> {
+    use attune_common::workload_launch::LaunchStopReason;
+
+    let start = Instant::now();
+    let IsolatedCaptureOptions {
+        timeout_secs,
+        max_stdout_bytes,
+        max_stderr_bytes,
+        output_format,
+        output_policy,
+        out_schema,
+        cancel_token,
+        stdout_log_writer,
+        stderr_log_writer,
+    } = options;
+    let control = process.control;
+    let validation = OutputPolicy {
+        stdout: Some(output_policy.stdout),
+        stderr: Some(output_policy.stderr),
+        error: Some(output_policy.error),
+    }
+    .resolve(out_schema, output_format);
+    if validation.is_err() {
+        // The gate must remain closed even when preparation and capture policy
+        // disagree. Stop is still required; failure leaves provider uncertainty.
+        control
+            .stop(LaunchStopReason::LaunchFailure)
+            .await
+            .map_err(|_| {
+                RuntimeError::ExecutionFailed("Isolated process cleanup is uncertain".into())
+            })?;
+        return Err(RuntimeError::InvalidAction("Invalid output policy".into()));
+    }
+    let execution_deadline = timeout_secs
+        .and_then(|seconds| TokioInstant::now().checked_add(Duration::from_secs(seconds)));
+    let capture = ProcessCapture::new(
+        process.stdout,
+        process.stderr,
+        stdout_log_writer,
+        stderr_log_writer,
+        (max_stdout_bytes, max_stderr_bytes),
+        output_policy,
+    );
+    let policy = CapturePolicy {
+        timeout_secs,
+        execution_deadline,
+        output_format,
+        output_policy,
+        out_schema,
+        cancel_token: cancel_token.clone(),
     };
-    tokio::pin!(output_results);
-    let mut logs_incomplete = false;
-    let finalization_started = TokioInstant::now();
-    let outputs = if was_cancelled || was_timed_out {
-        output_cancel.cancel();
-        output_results.await?
+    // Do not open a held gate when cancellation/deadline is already observed.
+    let initial_interrupt = if cancel_token
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        Some(ExecutionInterrupt::Cancelled)
+    } else if execution_deadline.is_some_and(|deadline| deadline <= TokioInstant::now()) {
+        Some(ExecutionInterrupt::TimedOut)
     } else {
-        let finalization_deadline = TokioInstant::now()
-            .checked_add(Duration::from_millis(log_finalization_timeout_ms))
-            .unwrap_or_else(TokioInstant::now);
-        let effective_deadline = execution_deadline
-            .map(|deadline| deadline.min(finalization_deadline))
-            .unwrap_or(finalization_deadline);
-        let drain_deadline = finalization_started + POST_EXIT_PIPE_DRAIN_TIMEOUT;
-        let mut drain_expired = false;
-        loop {
-            tokio::select! {
-                result = &mut output_results => break result?,
-                _ = tokio::time::sleep_until(drain_deadline), if !drain_expired => {
-                    drain_expired = true;
-                    pipe_drain.cancel();
-                },
-                _ = async {
-                    if let Some(token) = cancel_token.as_ref() {
-                        token.cancelled().await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => {
-                    was_cancelled = true;
-                    logs_incomplete = true;
-                    output_cancel.cancel();
-                    break output_results.await?
-                }
-                _ = tokio::time::sleep_until(effective_deadline) => {
-                    // The process has already exited. A delivery deadline cannot
-                    // retroactively turn its successful exit into a runtime timeout.
-                    let action_deadline_reached = execution_deadline.is_some_and(|deadline| deadline <= effective_deadline);
-                    logs_incomplete = true;
-                    warn!(budget_ms = log_finalization_timeout_ms, action_deadline_reached,
-                        "Runtime log finalization deadline exceeded; remote outcome may be unknown");
-                    output_cancel.cancel();
-                    break output_results.await?
-                }
-            }
+        None
+    };
+    let input = match initial_interrupt {
+        Some(interrupt) => Err(interrupt),
+        None => {
+            await_execution(
+                control.write_stdin_once(payload),
+                cancel_token.as_ref(),
+                execution_deadline,
+            )
+            .await
         }
     };
-    let (stdout_output, stderr_output) = outputs;
-    info!(
-        elapsed_ms = finalization_started.elapsed().as_millis() as u64,
-        budget_ms = log_finalization_timeout_ms,
-        interrupted = logs_incomplete,
-        stdout_incomplete = stdout_output.logs_incomplete,
-        stderr_incomplete = stderr_output.logs_incomplete,
-        stdout_seal_failed = stdout_output.seal_error.is_some(),
-        stderr_seal_failed = stderr_output.seal_error.is_some(),
-        "Runtime log finalization finished"
+    let (outcome, input_error) = match input {
+        Ok(Ok(())) => (
+            await_execution(control.wait(), cancel_token.as_ref(), execution_deadline).await,
+            None,
+        ),
+        Ok(Err(_)) => (
+            Ok(control.stop(LaunchStopReason::LaunchFailure).await),
+            Some("Isolated stdin delivery uncertain; input was not replayed".to_owned()),
+        ),
+        Err(interrupt) => (Err(interrupt), None),
+    };
+    let (outcome, cancelled, timed_out) = match outcome {
+        Ok(result) => (result, false, false),
+        Err(interrupt) => {
+            let reason = match interrupt {
+                ExecutionInterrupt::Cancelled => LaunchStopReason::Cancelled,
+                ExecutionInterrupt::TimedOut => LaunchStopReason::Timeout,
+            };
+            capture.output_cancel.cancel();
+            (
+                control.stop(reason).await,
+                matches!(interrupt, ExecutionInterrupt::Cancelled),
+                matches!(interrupt, ExecutionInterrupt::TimedOut),
+            )
+        }
+    };
+    if input_error.is_some() || outcome.is_err() {
+        capture.output_cancel.cancel();
+    }
+    let wait = (
+        outcome
+            .map(|exit| exit.exit_code)
+            .map_err(|_| io::Error::other("Isolated process settlement is uncertain")),
+        cancelled,
+        timed_out,
+        input_error,
     );
-    let stdout_incomplete = stdout_output.logs_incomplete || stdout_output.seal_error.is_some();
-    let stderr_incomplete = stderr_output.logs_incomplete || stderr_output.seal_error.is_some();
-    logs_incomplete |= stdout_incomplete || stderr_incomplete;
-    for (stream, failed) in [
-        ("stdout", stdout_output.seal_error.is_some()),
-        ("stderr", stderr_output.seal_error.is_some()),
-    ] {
-        if failed {
-            warn!(
-                stream,
-                "Runtime log sealing failed; process exit status is unchanged"
-            );
+    capture.finish(start, policy, wait).await
+}
+
+/// One capture/custody implementation for local legacy pipes and isolated
+/// non-TTY attach streams. Provider observation does not establish log custody.
+struct ProcessCapture {
+    stdout_task: tokio::task::JoinHandle<CapturedPipe>,
+    stderr_task: tokio::task::JoinHandle<CapturedPipe>,
+    output_cancel: CancellationToken,
+    pipe_drain: CancellationToken,
+    log_finalization_timeout_ms: u64,
+    cancel_guard: tokio_util::sync::DropGuard,
+}
+struct CapturePolicy<'a> {
+    timeout_secs: Option<u64>,
+    execution_deadline: Option<TokioInstant>,
+    output_format: OutputFormat,
+    output_policy: ResolvedOutputPolicy,
+    out_schema: Option<&'a attune_common::value_schema::Contract>,
+    cancel_token: Option<CancellationToken>,
+}
+impl ProcessCapture {
+    fn new<R, E>(
+        stdout: R,
+        stderr: E,
+        stdout_log_writer: Option<BoundedLogFileWriter>,
+        stderr_log_writer: Option<BoundedLogFileWriter>,
+        limits: (usize, usize),
+        output_policy: ResolvedOutputPolicy,
+    ) -> Self
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+        E: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
+        let log_finalization_timeout_ms = stdout_log_writer
+            .as_ref()
+            .map(BoundedLogFileWriter::finalization_timeout_ms)
+            .into_iter()
+            .chain(
+                stderr_log_writer
+                    .as_ref()
+                    .map(BoundedLogFileWriter::finalization_timeout_ms),
+            )
+            .max()
+            .unwrap_or(1_000);
+
+        // Create bounded writers
+        let stdout_writer = BoundedLogWriter::new_stdout(limits.0);
+        let stderr_writer = BoundedLogWriter::new_stderr(limits.1);
+
+        // Create buffered readers
+        let stdout_reader = BufReader::new(stdout);
+        let stderr_reader = BufReader::new(stderr);
+        let output_cancel = CancellationToken::new();
+        let cancel_guard = output_cancel.clone().drop_guard();
+        let pipe_drain = CancellationToken::new();
+        let stdout_cancel = output_cancel.clone();
+        let stderr_cancel = output_cancel.clone();
+
+        let stdout_task = spawn_capture(
+            capture_pipe(
+                stdout_reader,
+                stdout_writer,
+                stdout_log_writer,
+                stdout_cancel,
+                pipe_drain.clone(),
+                RuntimeLogStream::Stdout,
+                output_policy.stdout == StdoutPolicy::Public,
+            )
+            .instrument(tracing::debug_span!(
+                "runtime_log_capture",
+                stream = "stdout"
+            )),
+        );
+        let stderr_task = spawn_capture(
+            capture_pipe(
+                stderr_reader,
+                stderr_writer,
+                stderr_log_writer,
+                stderr_cancel,
+                pipe_drain.clone(),
+                RuntimeLogStream::Stderr,
+                output_policy.stderr == OutputVisibility::Public,
+            )
+            .instrument(tracing::debug_span!(
+                "runtime_log_capture",
+                stream = "stderr"
+            )),
+        );
+
+        Self {
+            stdout_task,
+            stderr_task,
+            output_cancel,
+            pipe_drain,
+            log_finalization_timeout_ms,
+            cancel_guard,
         }
     }
+    async fn finish(
+        self,
+        start: Instant,
+        policy: CapturePolicy<'_>,
+        wait: (io::Result<i32>, bool, bool, Option<String>),
+    ) -> RuntimeResult<ExecutionResult> {
+        let CapturePolicy {
+            timeout_secs,
+            execution_deadline,
+            output_format,
+            output_policy,
+            out_schema,
+            cancel_token,
+        } = policy;
+        let Self {
+            stdout_task,
+            stderr_task,
+            output_cancel,
+            pipe_drain,
+            log_finalization_timeout_ms,
+            cancel_guard: _cancel_guard,
+        } = self;
+        let delay_action_mirror = action_output_requires_delayed_mirror(output_policy);
+        // Freeze process timing before any post-exit pipe or remote log settlement.
+        let process_duration = start.elapsed();
+        let duration_ms = process_duration.as_millis() as u64;
+        let process_wait_elapsed_us = process_duration.as_micros() as u64;
+        info!(
+            duration_ms,
+            cancelled = wait.1,
+            timed_out = wait.2,
+            "Process wait finished"
+        );
+        let settlement_started = Instant::now();
+        tracing::debug!(
+            phase = "process_wait",
+            elapsed_us = process_wait_elapsed_us,
+            "Worker lifecycle phase"
+        );
+        let (wait_result, mut was_cancelled, was_timed_out, stdin_write_error) = wait;
 
-    // Get results from bounded writers
-    let stdout_result = stdout_output.writer.into_result();
-    let stderr_result = stderr_output.writer.into_result();
+        let output_results = async {
+            let (stdout, stderr) = tokio::join!(stdout_task, stderr_task);
+            let stdout = stdout.map_err(|error| {
+                RuntimeError::ExecutionFailed(format!("stdout task failed: {error}"))
+            })?;
+            let stderr = stderr.map_err(|error| {
+                RuntimeError::ExecutionFailed(format!("stderr task failed: {error}"))
+            })?;
+            // Capture can finish at EOF before child wait. Accept durable custody
+            // only now, so an early-closed pipe cannot consume its delivery deadline
+            // while the process is still running.
+            let (stdout, stderr) = tokio::join!(
+                stdout.finish_delivery(output_cancel.clone(), RuntimeLogStream::Stdout),
+                stderr.finish_delivery(output_cancel.clone(), RuntimeLogStream::Stderr),
+            );
+            Ok::<_, RuntimeError>((stdout, stderr))
+        };
+        tokio::pin!(output_results);
+        let mut logs_incomplete = false;
+        let finalization_started = TokioInstant::now();
+        let outputs = if was_cancelled || was_timed_out {
+            output_cancel.cancel();
+            output_results.await?
+        } else {
+            let finalization_deadline = TokioInstant::now()
+                .checked_add(Duration::from_millis(log_finalization_timeout_ms))
+                .unwrap_or_else(TokioInstant::now);
+            let effective_deadline = execution_deadline
+                .map(|deadline| deadline.min(finalization_deadline))
+                .unwrap_or(finalization_deadline);
+            let drain_deadline = finalization_started + POST_EXIT_PIPE_DRAIN_TIMEOUT;
+            let mut drain_expired = false;
+            loop {
+                tokio::select! {
+                    result = &mut output_results => break result?,
+                    _ = tokio::time::sleep_until(drain_deadline), if !drain_expired => {
+                        drain_expired = true;
+                        pipe_drain.cancel();
+                    },
+                    _ = async {
+                        if let Some(token) = cancel_token.as_ref() {
+                            token.cancelled().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        was_cancelled = true;
+                        logs_incomplete = true;
+                        output_cancel.cancel();
+                        break output_results.await?
+                    }
+                    _ = tokio::time::sleep_until(effective_deadline) => {
+                        // The process has already exited. A delivery deadline cannot
+                        // retroactively turn its successful exit into a runtime timeout.
+                        let action_deadline_reached = execution_deadline.is_some_and(|deadline| deadline <= effective_deadline);
+                        logs_incomplete = true;
+                        warn!(budget_ms = log_finalization_timeout_ms, action_deadline_reached,
+                            "Runtime log finalization deadline exceeded; remote outcome may be unknown");
+                        output_cancel.cancel();
+                        break output_results.await?
+                    }
+                }
+            }
+        };
+        let (stdout_output, stderr_output) = outputs;
+        info!(
+            elapsed_ms = finalization_started.elapsed().as_millis() as u64,
+            budget_ms = log_finalization_timeout_ms,
+            interrupted = logs_incomplete,
+            stdout_incomplete = stdout_output.logs_incomplete,
+            stderr_incomplete = stderr_output.logs_incomplete,
+            stdout_seal_failed = stdout_output.seal_error.is_some(),
+            stderr_seal_failed = stderr_output.seal_error.is_some(),
+            "Runtime log finalization finished"
+        );
+        let stdout_incomplete = stdout_output.logs_incomplete || stdout_output.seal_error.is_some();
+        let stderr_incomplete = stderr_output.logs_incomplete || stderr_output.seal_error.is_some();
+        logs_incomplete |= stdout_incomplete || stderr_incomplete;
+        for (stream, failed) in [
+            ("stdout", stdout_output.seal_error.is_some()),
+            ("stderr", stderr_output.seal_error.is_some()),
+        ] {
+            if failed {
+                warn!(
+                    stream,
+                    "Runtime log sealing failed; process exit status is unchanged"
+                );
+            }
+        }
 
-    if delay_action_mirror {
-        match safe_action_output_mirror(ActionOutputMirrorInput {
+        // Get results from bounded writers
+        let stdout_result = stdout_output.writer.into_result();
+        let stderr_result = stderr_output.writer.into_result();
+
+        if delay_action_mirror {
+            match safe_action_output_mirror(ActionOutputMirrorInput {
             stdout: &stdout_result.content,
             stderr: &stderr_result.content,
             output_format,
@@ -799,61 +1043,123 @@ pub async fn execute_streaming_cancellable(
             ),
             ActionOutputMirrorDecision::Live => {}
         }
-    }
-
-    // Handle process wait result
-    tracing::debug!(
-        phase = "log_capture_settlement",
-        elapsed_us = settlement_started.elapsed().as_micros() as u64,
-        "Worker lifecycle phase"
-    );
-    let (exit_code, process_error) = match wait_result {
-        Ok(status) => (status.code().unwrap_or(-1), None),
-        Err(e) => {
-            warn!("Process wait failed but captured output: {}", e);
-            (-1, Some(format!("Process wait failed: {}", e)))
         }
-    };
 
-    // A leader exiting does not release ownership of its remaining process
-    // group. Retain the guard through log finalization so cancellation, failed
-    // capture or abort cannot leave a pipe-holding descendant behind. Preserve
-    // normal, fully captured completion semantics by disarming only here.
-    #[cfg(unix)]
-    if !was_cancelled && !was_timed_out && !logs_incomplete && process_error.is_none() {
-        process_group_guard.0 = None;
-    }
+        // Handle process wait result
+        tracing::debug!(
+            phase = "log_capture_settlement",
+            elapsed_us = settlement_started.elapsed().as_micros() as u64,
+            "Worker lifecycle phase"
+        );
+        let (exit_code, process_error) = match wait_result {
+            Ok(code) => (code, None),
+            Err(e) => {
+                warn!("Process wait failed but captured output: {}", e);
+                (-1, Some(format!("Process wait failed: {}", e)))
+            }
+        };
 
-    if was_timed_out {
-        return Ok(ExecutionResult {
-            exit_code: -1,
-            stdout: stdout_result.content.clone(),
-            stderr: stderr_result.content.clone(),
-            result: None,
-            duration_ms,
-            error: Some(format!(
-                "Execution timed out after {} seconds",
-                timeout_secs.unwrap()
-            )),
-            stdout_truncated: stdout_result.truncated,
-            stderr_truncated: stderr_result.truncated,
-            stdout_bytes_truncated: stdout_result.bytes_truncated,
-            stderr_bytes_truncated: stderr_result.bytes_truncated,
-            timed_out: true,
-            logs_incomplete,
-            log_capture_incomplete: Some((stdout_incomplete, stderr_incomplete)),
-        });
-    }
+        if was_timed_out {
+            return Ok(ExecutionResult {
+                exit_code: -1,
+                stdout: stdout_result.content.clone(),
+                stderr: stderr_result.content.clone(),
+                result: None,
+                duration_ms,
+                error: Some(format!(
+                    "Execution timed out after {} seconds",
+                    timeout_secs.unwrap()
+                )),
+                stdout_truncated: stdout_result.truncated,
+                stderr_truncated: stderr_result.truncated,
+                stdout_bytes_truncated: stdout_result.bytes_truncated,
+                stderr_bytes_truncated: stderr_result.bytes_truncated,
+                timed_out: true,
+                logs_incomplete,
+                log_capture_incomplete: Some((stdout_incomplete, stderr_incomplete)),
+            });
+        }
 
-    // If the process was cancelled, return a specific result
-    if was_cancelled {
-        return Ok(ExecutionResult {
+        // If the process was cancelled, return a specific result
+        if was_cancelled {
+            return Ok(ExecutionResult {
+                exit_code,
+                stdout: stdout_result.content.clone(),
+                stderr: stderr_result.content.clone(),
+                result: None,
+                duration_ms,
+                error: Some("Execution cancelled".to_string()),
+                stdout_truncated: stdout_result.truncated,
+                stderr_truncated: stderr_result.truncated,
+                stdout_bytes_truncated: stdout_result.bytes_truncated,
+                stderr_bytes_truncated: stderr_result.bytes_truncated,
+                timed_out: false,
+                logs_incomplete,
+                log_capture_incomplete: Some((stdout_incomplete, stderr_incomplete)),
+            });
+        }
+
+        debug!(
+        "Process execution completed: exit_code={}, duration={}ms, stdout_truncated={}, stderr_truncated={}",
+        exit_code, duration_ms, stdout_result.truncated, stderr_result.truncated
+    );
+
+        // Parse result from stdout based on output_format
+        let result = if exit_code == 0 && !stdout_result.content.trim().is_empty() {
+            parse_output(&stdout_result.content, output_format)
+        } else {
+            None
+        };
+
+        // Determine error message
+        let error = if let Some(proc_err) = process_error {
+            Some(proc_err)
+        } else if let Some(stdin_err) = stdin_write_error {
+            // Ignore broken pipe errors for fast-exiting successful actions.
+            // These occur when the process exits before we finish writing secrets to stdin.
+            let is_broken_pipe =
+                stdin_err.contains("Broken pipe") || stdin_err.contains("os error 32");
+            let is_fast_exit = duration_ms < 500;
+            let is_success = exit_code == 0;
+
+            if is_broken_pipe && is_fast_exit && is_success {
+                debug!(
+                    "Ignoring broken pipe error for fast-exiting successful action ({}ms)",
+                    duration_ms
+                );
+                None
+            } else {
+                Some(stdin_err)
+            }
+        } else if exit_code != 0 {
+            Some(if stderr_result.content.is_empty() {
+                format!("Command exited with code {}", exit_code)
+            } else {
+                // Use last line of stderr as error, or full stderr if short
+                if stderr_result.content.lines().count() > 5 {
+                    stderr_result
+                        .content
+                        .lines()
+                        .last()
+                        .unwrap_or("")
+                        .to_string()
+                } else {
+                    stderr_result.content.clone()
+                }
+            })
+        } else {
+            None
+        };
+
+        Ok(ExecutionResult {
             exit_code,
+            // Completion classifies the public projection and stores protected raw
+            // originals separately; parsing must not discard the original channel.
             stdout: stdout_result.content.clone(),
             stderr: stderr_result.content.clone(),
-            result: None,
+            result,
             duration_ms,
-            error: Some("Execution cancelled".to_string()),
+            error,
             stdout_truncated: stdout_result.truncated,
             stderr_truncated: stderr_result.truncated,
             stdout_bytes_truncated: stdout_result.bytes_truncated,
@@ -861,77 +1167,8 @@ pub async fn execute_streaming_cancellable(
             timed_out: false,
             logs_incomplete,
             log_capture_incomplete: Some((stdout_incomplete, stderr_incomplete)),
-        });
-    }
-
-    debug!(
-        "Process execution completed: exit_code={}, duration={}ms, stdout_truncated={}, stderr_truncated={}",
-        exit_code, duration_ms, stdout_result.truncated, stderr_result.truncated
-    );
-
-    // Parse result from stdout based on output_format
-    let result = if exit_code == 0 && !stdout_result.content.trim().is_empty() {
-        parse_output(&stdout_result.content, output_format)
-    } else {
-        None
-    };
-
-    // Determine error message
-    let error = if let Some(proc_err) = process_error {
-        Some(proc_err)
-    } else if let Some(stdin_err) = stdin_write_error {
-        // Ignore broken pipe errors for fast-exiting successful actions.
-        // These occur when the process exits before we finish writing secrets to stdin.
-        let is_broken_pipe = stdin_err.contains("Broken pipe") || stdin_err.contains("os error 32");
-        let is_fast_exit = duration_ms < 500;
-        let is_success = exit_code == 0;
-
-        if is_broken_pipe && is_fast_exit && is_success {
-            debug!(
-                "Ignoring broken pipe error for fast-exiting successful action ({}ms)",
-                duration_ms
-            );
-            None
-        } else {
-            Some(stdin_err)
-        }
-    } else if exit_code != 0 {
-        Some(if stderr_result.content.is_empty() {
-            format!("Command exited with code {}", exit_code)
-        } else {
-            // Use last line of stderr as error, or full stderr if short
-            if stderr_result.content.lines().count() > 5 {
-                stderr_result
-                    .content
-                    .lines()
-                    .last()
-                    .unwrap_or("")
-                    .to_string()
-            } else {
-                stderr_result.content.clone()
-            }
         })
-    } else {
-        None
-    };
-
-    Ok(ExecutionResult {
-        exit_code,
-        // Completion classifies the public projection and stores protected raw
-        // originals separately; parsing must not discard the original channel.
-        stdout: stdout_result.content.clone(),
-        stderr: stderr_result.content.clone(),
-        result,
-        duration_ms,
-        error,
-        stdout_truncated: stdout_result.truncated,
-        stderr_truncated: stderr_result.truncated,
-        stdout_bytes_truncated: stdout_result.bytes_truncated,
-        stderr_bytes_truncated: stderr_result.bytes_truncated,
-        timed_out: false,
-        logs_incomplete,
-        log_capture_incomplete: Some((stdout_incomplete, stderr_incomplete)),
-    })
+    }
 }
 
 fn mirror_delayed_action_output(source: RuntimeLogSource, stream: RuntimeLogStream, content: &str) {
