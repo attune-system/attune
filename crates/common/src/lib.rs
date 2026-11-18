@@ -101,4 +101,5 @@ mod tests {
     }
 }
 
+pub mod workload_launch;
 pub mod workload_sandbox;
