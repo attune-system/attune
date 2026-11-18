@@ -224,9 +224,18 @@ reporting. A failure remains not-ready until CP native-operation fencing returns
 an authenticated incomplete cleanup receipt. These transport/FS tests do not
 prove actual CP publication/discovery effects, which remain incomplete.
 
-Count-only `authorize-io` is rejected for stdin. Until the dedicated CP exact-byte
-comparison with the privately frozen selected input is integrated, the new
-controller input path fails closed. No public plaintext input hash or host raw
+Count-only `authorize-io` is rejected for stdin. The controller now sends the
+exact immutable bounded bytes to dedicated `authorize-stdin` over HTTPS, with
+explicit development-only plaintext policy for owned fixtures. It consumes the
+local input slot before that request and retains the same payload through the
+one Engine write, so a lost ACK never permits retry. The stdin-only frontend
+and HTTP handle share the canonical 8MiB bound; other frontend bodies stay 1MiB.
+The actual CP frozen-origin/atomic-consumption effects remain incomplete, so
+missing/denied authorization still fails closed without a generic fallback. No public plaintext input hash or host raw
 plan submission substitutes for that authorization. Packaged Engine fixtures
 exercise actual stdin delivery directly as boundary tests; they do not attest
 this unfinished CP authority/host-consumer contract.
+
+The separate external Engine/controller Compose project and its public config
+generator are described in [the draft deployment contract](docker-launch-controller.md).
+Config/model tests are not packaged service or production topology evidence.

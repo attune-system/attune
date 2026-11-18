@@ -20,6 +20,11 @@ on:
       - 'scripts/ci-workload-isolation-prerequisites.sh'
       - 'docker/Dockerfile.workload-runtime'
       - 'docker-compose.yaml'
+      - 'docker-compose.workload-host.yaml'
+      - 'docker/workload-launch-proxy.conf'
+      - 'scripts/generate-workload-controller-config.py'
+      - 'scripts/test-workload-controller-compose.py'
+      - 'scripts/test-workload-controller-project.py'
       - 'scripts/test-workload-runtime-images.py'
       - 'scripts/test-launch-controller-container.py'
       - 'scripts/test-workload-runner.py'
@@ -29,6 +34,34 @@ on:
 permissions:
   contents: read
 jobs:
+  controller-config:
+    name: External controller configuration contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Verify public config and separate controller/proxy authority
+        run: python3 scripts/test-workload-controller-compose.py
+  controller-project:
+    name: Actual external controller project (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Build actual source image and validate owned HTTPS project
+        run: python3 scripts/test-workload-controller-project.py --owned-engine-socket /var/run/docker.sock
   host-boundary:
     name: Linux host workload boundary
     runs-on: ubuntu-24.04
