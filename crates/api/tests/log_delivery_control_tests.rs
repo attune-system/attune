@@ -220,8 +220,13 @@ impl LiveCustody {
             .bind(self.worker)
             .fetch_one(&self.ctx.pool)
             .await?;
-        let enrollment:i64=sqlx::query_scalar("INSERT INTO workload_host_enrollment(profile,identity,worker_name,worker,expires_at) VALUES($1,$2,$3,$4,clock_timestamp()+interval '1 hour') RETURNING id")
-            .bind(profile).bind(identity).bind(name).bind(self.worker).fetch_one(&self.ctx.pool).await?;
+        // Adopt the fixture's already-assigned logical slot with a complete
+        // prior registration binding. Normal register performs the handover,
+        // advances its generation and installs the current incarnation/heartbeat.
+        let enrollment:i64=sqlx::query_scalar("INSERT INTO workload_host_enrollment(profile,identity,worker_name,worker,instance,custody_instance,expires_at) VALUES($1,$2,$3,$4,$5,$6,clock_timestamp()+interval '1 hour') RETURNING id")
+            .bind(profile).bind(identity).bind(name).bind(self.worker)
+            .bind(Uuid::new_v4()).bind(self.binding.source_instance)
+            .fetch_one(&self.ctx.pool).await?;
         Ok(WorkloadHostRepository::register(
             &self.ctx.pool,
             EnrollmentActor {
