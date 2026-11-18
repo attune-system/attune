@@ -903,13 +903,14 @@ mod tests {
     #[tokio::test]
     async fn runner_entrypoint_paths_and_candidate_tree_are_validated_before_execution() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("pack");
+        let temp_root = temp.path().canonicalize().unwrap();
+        let root = temp_root.join("pack");
         std::fs::create_dir(&root).unwrap();
-        let marker = temp.path().join("executed");
-        let outside = temp.path().join("outside.sh");
+        let marker = temp_root.join("executed");
+        let outside = temp_root.join("outside.sh");
         std::fs::write(&outside, format!("touch '{}'\n", marker.display())).unwrap();
         std::os::unix::fs::symlink(&outside, root.join("escape.sh")).unwrap();
-        std::os::unix::fs::symlink(temp.path(), root.join("escape-dir")).unwrap();
+        std::os::unix::fs::symlink(&temp_root, root.join("escape-dir")).unwrap();
         std::fs::write(
             root.join("safe.sh"),
             "printf 'Total Tests: 1\nPassed: 1\nFailed: 0\n'\n",
@@ -946,11 +947,38 @@ mod tests {
             timeout: Some(5),
             result_format: None,
         };
-        let private_copy = temp.path().join("private-copy");
+        let private_copy = temp_root.join("private-copy");
         std::fs::create_dir(&private_copy).unwrap();
-        assert!(copy_private_test_tree(&root, &private_copy).is_err());
+        // Copying preserves links without following them. The owning caller's
+        // complete preparation step rewrites internal links and rejects unsafe
+        // links before a process can start.
+        copy_private_test_tree(&root, &private_copy).unwrap();
+        assert!(crate::workload_sandbox::prepare_staging(&private_copy, &root).is_err());
+        assert!(!marker.exists());
         std::fs::remove_file(root.join("escape.sh")).unwrap();
         std::fs::remove_file(root.join("escape-dir")).unwrap();
+
+        std::fs::write(root.join("copied-input"), "published").unwrap();
+        std::os::unix::fs::symlink("copied-input", root.join("relative-link")).unwrap();
+        std::os::unix::fs::symlink(root.join("copied-input"), root.join("absolute-link")).unwrap();
+        let safe_copy = temp_root.join("safe-copy");
+        std::fs::create_dir(&safe_copy).unwrap();
+        copy_private_test_tree(&root, &safe_copy).unwrap();
+        crate::workload_sandbox::prepare_staging(&safe_copy, &root).unwrap();
+        assert!(safe_copy
+            .join("absolute-link")
+            .canonicalize()
+            .unwrap()
+            .starts_with(&safe_copy));
+        std::fs::write(safe_copy.join("absolute-link"), "private").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(safe_copy.join("relative-link")).unwrap(),
+            "private"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("copied-input")).unwrap(),
+            "published"
+        );
         let safe = executor
             .execute_test_suite(&root, "safe", &runner, None)
             .await;
