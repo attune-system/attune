@@ -13,6 +13,9 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: workload-kubernetes-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 jobs:
   provider:
     name: Native Pod boundary (${{ matrix.arch }})
@@ -72,6 +75,8 @@ jobs:
           "$RUNNER_TEMP/workload-zig/bin/pip" install ziglang==0.16.0
           echo "$RUNNER_TEMP/workload-zig/bin" >> "$GITHUB_PATH"
           cargo install --locked cargo-zigbuild --version 0.23.4
+      - name: Verify TLS client construction before image and cluster work
+        run: cargo test --locked -p attune-workload-backend --test kubernetes_tls_client -- --nocapture --test-threads=4
       - name: Build exact candidate Runner and native echo once
         shell: bash
         run: |
@@ -94,6 +99,8 @@ jobs:
           (root / 'workload-evidence' / 'build.json').write_text(json.dumps(evidence))
           with open(os.environ['GITHUB_ENV'], 'a') as stream:
               stream.write('CANDIDATE_TAG=docker.io/attune-owned/workload-ci:' + evidence['source'] + '\n')
+              stream.write('ATTUNE_ISOLATION_TEST_ECHO_PATH=' + str(context / 'echo') + '\n')
+              stream.write('ATTUNE_ISOLATION_TEST_RUNNER_PATH=' + str(context / 'attune-workload-runner') + '\n')
           PY
       - name: Package immutable candidate image from owned binaries
         shell: bash

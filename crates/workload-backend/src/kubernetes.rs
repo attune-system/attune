@@ -383,6 +383,28 @@ impl ProcessLauncher for KubernetesLauncher {
         spec: &ProcessSpec,
         create: ProcessCreateDisposition,
     ) -> Result<ResourceIdentity> {
+        if create == ProcessCreateDisposition::ReconcileOnly {
+            // Discovery recovers original public ownership even after image or
+            // helper policy changes. It grants no attach/start/stdin effect.
+            let pod = self
+                .pods()
+                .get_opt(&pod_name(spec))
+                .await
+                .map_err(|_| invalid())?
+                .ok_or_else(invalid)?;
+            let resource = ResourceIdentity::Kubernetes {
+                cluster: self.policy.cluster.clone(),
+                namespace: self.policy.namespace.clone(),
+                pod_name: pod_name(spec),
+                pod_uid: pod
+                    .metadata
+                    .uid
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(invalid)?,
+            };
+            self.cleanup_exact(spec, &resource).await?;
+            return Ok(resource);
+        }
         let expected = self.policy.pod(spec)?;
         match self
             .pods()
@@ -391,7 +413,6 @@ impl ProcessLauncher for KubernetesLauncher {
             .map_err(|_| invalid())?
         {
             Some(pod) => self.verify(spec, &pod, None),
-            None if create == ProcessCreateDisposition::ReconcileOnly => Err(invalid()),
             None => {
                 let pod = self
                     .pods()
@@ -403,6 +424,7 @@ impl ProcessLauncher for KubernetesLauncher {
         }
     }
     async fn start(&self, spec: &ProcessSpec, resource: &ResourceIdentity) -> Result<ProcessIo> {
+        self.policy.pod(spec)?; // Current operator image ceiling for new Run.
         crate::process_policy::validate_invocation(spec)?;
         self.ready(spec, resource).await?;
         self.seed(spec).await?;
