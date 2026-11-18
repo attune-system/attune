@@ -165,7 +165,7 @@ enum Node<'a> {
     File,
     Link(&'a str),
 }
-fn validate_entries<'a>(entries: &'a [ArchiveEntry], policy: &ArchivePolicy) -> Result<(u64, u64)> {
+fn validate_entries(entries: &[ArchiveEntry], policy: &ArchivePolicy) -> Result<(u64, u64)> {
     if policy.max_expanded_bytes == 0 || policy.max_files == 0 {
         return Err(quota());
     }
