@@ -788,6 +788,9 @@ fn verify_pod_policy(
                 "tty",
                 "ports",
                 "lifecycle",
+                "livenessProbe",
+                "readinessProbe",
+                "startupProbe",
             ] {
                 if a.get(field) != e.get(field) {
                     return Err(invalid());
@@ -929,7 +932,7 @@ mod tests {
     fn effective_policy_rejects_injected_credentials_mounts_capabilities_and_shared_namespaces() {
         let (policy, spec) = fixture();
         let expected = policy.pod(&spec).unwrap().spec.unwrap();
-        for mutation in 0..9 {
+        for mutation in 0..13 {
             let mut bad = serde_json::to_value(&expected).unwrap();
             match mutation {
                 0 => bad["hostPID"] = json!(true),
@@ -949,8 +952,16 @@ mod tests {
                     .as_array_mut()
                     .unwrap()
                     .push(json!({"name":"injected","image":"unselected"})),
-                _ => {
+                8 => {
                     bad["containers"][0]["securityContext"]["readOnlyRootFilesystem"] = json!(false)
+                }
+                9..=11 => {
+                    let field = ["livenessProbe", "readinessProbe", "startupProbe"][mutation - 9];
+                    bad["containers"][0][field] =
+                        json!({"exec":{"command":["/bin/sh","-c","owned-before-gate"]}});
+                }
+                _ => {
+                    bad["containers"][1]["lifecycle"] = json!({"postStart":{"exec":{"command":["/bin/sh","-c","owned-before-gate"]}}})
                 }
             }
             let actual = serde_json::from_value(bad).unwrap();

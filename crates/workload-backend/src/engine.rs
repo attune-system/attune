@@ -133,6 +133,7 @@ impl EnginePolicy {
                 attach_stdout: true,
                 attach_stderr: true,
                 tty: false,
+                healthcheck: DisabledHealthcheck::new(),
                 labels: public.labels.clone(),
                 host_config: public.host.clone(),
             },
@@ -339,6 +340,20 @@ struct HostPolicy {
     auto_remove: bool,
     init: bool,
 }
+// Docker otherwise inherits image HEALTHCHECK commands, which could execute
+// before the private gate opens. API v1.47 Test=["NONE"] disables inheritance.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+struct DisabledHealthcheck {
+    test: Vec<String>,
+}
+impl DisabledHealthcheck {
+    fn new() -> Self {
+        Self {
+            test: vec!["NONE".into()],
+        }
+    }
+}
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
 struct EngineCreateBody {
@@ -354,6 +369,7 @@ struct EngineCreateBody {
     attach_stdout: bool,
     attach_stderr: bool,
     tty: bool,
+    healthcheck: DisabledHealthcheck,
     labels: BTreeMap<String, String>,
     host_config: HostPolicy,
 }
@@ -875,6 +891,7 @@ impl DockerEngine {
             || value.config.image != plan.manifest.image.reference
             || value.config.user != "1000:1000"
             || value.config.tty
+            || value.config.healthcheck != DisabledHealthcheck::new()
             || value.host_config != plan.host
         {
             return Err(EngineError::OwnershipMismatch);
@@ -1239,6 +1256,7 @@ struct ObservedConfig {
     user: String,
     labels: BTreeMap<String, String>,
     tty: bool,
+    healthcheck: DisabledHealthcheck,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]

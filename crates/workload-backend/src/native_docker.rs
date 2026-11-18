@@ -132,6 +132,7 @@ impl DockerLauncher {
             attach_stdout: true,
             attach_stderr: true,
             tty: false,
+            healthcheck: DisabledHealthcheck::new(),
             labels: BTreeMap::from([
                 ("attune.io/process-intent".into(), spec.intent.to_string()),
                 ("attune.io/process-policy".into(), digest.as_str().into()),
@@ -199,6 +200,7 @@ impl DockerLauncher {
             || observed.config.image != spec.image.reference
             || observed.config.user != "1000:1000"
             || observed.config.tty
+            || observed.config.healthcheck != expected.healthcheck
             || observed.host_config != expected.host_config
             || expected
                 .labels
@@ -787,6 +789,7 @@ mod tests {
         assert_eq!(json["HostConfig"]["CapAdd"], serde_json::json!([]));
         assert_eq!(json["HostConfig"]["Init"], false);
         assert_eq!(json["User"], "1000:1000");
+        assert_eq!(json["Healthcheck"]["Test"], serde_json::json!(["NONE"]));
         let mounts = json["HostConfig"]["Mounts"].as_array().unwrap();
         assert!(mounts
             .iter()
@@ -878,6 +881,65 @@ mod tests {
                 .is_err(),
             "rejected cleanup must not contact Engine"
         );
+    }
+    #[tokio::test]
+    async fn inspection_rejects_inherited_or_executable_healthchecks_before_attach() {
+        for (health, accepted) in [
+            (Some(serde_json::json!({"Test":["NONE"]})), true),
+            (Some(serde_json::json!({"Test":[]})), false),
+            (
+                Some(serde_json::json!({"Test":["CMD-SHELL","owned-before-gate"]})),
+                false,
+            ),
+            (Some(serde_json::Value::Null), false),
+            (None, false),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let socket = root.path().join("owned-health-inspection.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let (launcher, spec, _cache) = fixture(&socket);
+            let body = serde_json::to_value(launcher.body(&spec, &[]).unwrap()).unwrap();
+            let mut config = body.clone();
+            if let Some(health) = health {
+                config["Healthcheck"] = health;
+            } else {
+                config.as_object_mut().unwrap().remove("Healthcheck");
+            }
+            let observed = serde_json::json!({"Id":"b".repeat(64),
+                "Name":format!("/{}",DockerLauncher::name(&spec)),
+                "Config":config,"HostConfig":body["HostConfig"],"State":{"Status":"created"}})
+            .to_string();
+            let server = tokio::spawn(async move {
+                for index in 0..2 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let mut buffer = [0; 1024];
+                    while !request.windows(4).any(|b| b == b"\r\n\r\n") {
+                        let count = stream.read(&mut buffer).await.unwrap();
+                        assert!(count > 0);
+                        request.extend_from_slice(&buffer[..count]);
+                        assert!(request.len() < 8192);
+                    }
+                    let request = String::from_utf8(request).unwrap();
+                    let first = request.lines().next().unwrap();
+                    assert!(first.starts_with("GET "));
+                    let response = if index == 0 {
+                        assert!(first.contains("/info "));
+                        r#"{"ID":"owned-daemon","OSType":"linux","Architecture":"amd64","SecurityOptions":["name=seccomp,profile=builtin"]}"#
+                    } else {
+                        assert!(first.contains("/containers/"));
+                        observed.as_str()
+                    };
+                    stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+                }
+            });
+            let result =
+                tokio::time::timeout(Duration::from_secs(5), launcher.inspect(&spec, None))
+                    .await
+                    .unwrap();
+            server.await.unwrap();
+            assert_eq!(result.is_ok(), accepted);
+        }
     }
     #[tokio::test]
     async fn reconciliation_recovers_public_ownership_after_policy_change_without_run_permission() {
