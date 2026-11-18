@@ -111,3 +111,4 @@ pub(crate) mod workload_launch_state;
 pub mod workload_pack_input;
 pub mod workload_sandbox;
 pub mod workload_session;
+pub mod workload_stdin;
