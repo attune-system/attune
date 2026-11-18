@@ -201,13 +201,20 @@ impl Fixture {
             .expect("custody tasks must settle after DB recovery");
         assert!(self.manager.spool.versions().await.unwrap().is_empty());
         assert_eq!(self.manager.slots.available_permits(), 1);
-        // The same running manager can admit another handoff after reclamation.
-        assert!(self.writer().seal(false, None).await.is_err());
+        drop(self.manager);
+        self.control_stop.cancel();
+        self.control_server.await.unwrap();
+        self.database.cleanup().await.unwrap();
+    }
+    async fn finish_retained(self) {
+        // No exact CP evidence exists for this deliberately invalid source.
+        // Deadline/rollback alone cannot authorize deleting encrypted custody.
+        self.manager.stop.cancel();
+        self.manager.tasks.close();
         tokio::time::timeout(Duration::from_secs(10), self.manager.tasks.wait())
             .await
             .unwrap();
-        assert!(self.manager.spool.versions().await.unwrap().is_empty());
-        assert_eq!(self.manager.slots.available_permits(), 1);
+        assert!(!self.manager.spool.versions().await.unwrap().is_empty());
         drop(self.manager);
         self.control_stop.cancel();
         self.control_server.await.unwrap();
@@ -291,11 +298,11 @@ impl Fixture {
 }
 
 #[tokio::test]
-async fn failed_preparation_reclaims_persisted_custody_without_restart() {
+async fn failed_preparation_without_retained_proof_preserves_custody() {
     let fixture = Fixture::new().await;
-    // The source deliberately does not exist: prepare rolls back definitively.
+    // Missing source proof cannot become an absence acknowledgement.
     assert!(fixture.writer().seal(false, None).await.is_err());
-    fixture.finish().await;
+    fixture.finish_retained().await;
 }
 
 #[tokio::test]
@@ -310,7 +317,7 @@ async fn cancelled_caller_cannot_abandon_persisted_preparation() {
     assert!(caller.await.unwrap_err().is_cancelled());
     drop(first);
     drop(second);
-    fixture.finish().await;
+    fixture.finish_retained().await;
 }
 
 #[tokio::test]

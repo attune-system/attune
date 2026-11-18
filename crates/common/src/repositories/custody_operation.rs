@@ -81,6 +81,39 @@ impl Operation {
 
 pub struct CustodyOperationRepository;
 impl CustodyOperationRepository {
+    /// Legacy control requests omit the reservation deadline. Only an exact
+    /// retained operation supplies that evidence; absence alone never permits
+    /// deletion. The exclusive graph lock also covers the lookup and tombstone,
+    /// including preparation requests that have not entered admission yet.
+    pub(crate) async fn cancel_retained_in(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        worker: i64,
+        current_instance: Uuid,
+        binding: &ControlRequest,
+    ) -> Result<bool> {
+        Graph::lock_reclamation(transaction).await?;
+        LogDeliveryRepository::require_instance(transaction, worker, current_instance).await?;
+        // Discovery only: do not acquire an operation lock before source locks.
+        // Exclusive graph admission excludes concurrent reserve/prepare/retention.
+        let deadline: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT finalize_by FROM log_custody_operation WHERE custody=$1")
+                .bind(binding.custody)
+                .fetch_optional(&mut **transaction)
+                .await?;
+        let Some(finalize_by) = deadline else {
+            return Ok(false);
+        };
+        Self::cancel_absent_in(
+            transaction,
+            worker,
+            current_instance,
+            &ReserveCustody {
+                binding: binding.clone(),
+                finalize_by,
+            },
+        )
+        .await
+    }
     /// Existing in-process preparation uses this SAME canonical protocol. Its
     /// transaction borrows stay owned by the caller; only remote preparation
     /// needs a separately acknowledged reservation before the request starts.

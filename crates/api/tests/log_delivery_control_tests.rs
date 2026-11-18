@@ -464,6 +464,15 @@ async fn delivery_issuance_is_scoped_and_revocation_cannot_be_restored() -> Resu
 
 #[tokio::test]
 async fn durable_custody_cancel_ack_fences_late_remote_and_local_preparation() -> Result<()> {
+    cancellation_fences_late_preparation(false).await
+}
+
+#[tokio::test]
+async fn legacy_settlement_cancels_reserved_remote_and_local_preparation() -> Result<()> {
+    cancellation_fences_late_preparation(true).await
+}
+
+async fn cancellation_fences_late_preparation(legacy: bool) -> Result<()> {
     use attune_common::{
         log_custody::{CustodyAbsence, CustodyOperationAck, CustodyOperationState},
         repositories::log_delivery::LogDeliveryRepository,
@@ -514,20 +523,78 @@ async fn durable_custody_cancel_ack_fences_late_remote_and_local_preparation() -
     });
     let mut joined = false;
     let exchange = async {
-        let cancellation = fixture
-            .ctx
-            .post(
-                cancel,
-                &prepare.reservation,
-                Some(host.session.token.as_str()),
-            )
-            .await?;
-        if cancellation.status() != StatusCode::OK {
-            return Err("custody cancellation did not ACK".into());
-        }
-        let ack = cancellation.json::<CustodyAbsence>().await?;
-        if !ack.absent {
-            return Err("custody cancellation did not prove absence".into());
+        if legacy {
+            let token = fixture.tokens.token()?;
+            for changed in [
+                ControlRequest {
+                    attempt: Uuid::new_v4(),
+                    ..fixture.binding.clone()
+                },
+                ControlRequest {
+                    stream: fixture.binding.stream + 1,
+                    ..fixture.binding.clone()
+                },
+                ControlRequest {
+                    execution: fixture.binding.execution + 1,
+                    ..fixture.binding.clone()
+                },
+            ] {
+                fixture
+                    .ctx
+                    .post(ROUTE, &changed, Some(&token))
+                    .await?
+                    .assert_status(StatusCode::FORBIDDEN);
+            }
+            let cross_worker = generate_worker_token_with_instance(
+                1,
+                &(fixture.worker + 1).to_string(),
+                fixture.tokens.instance_id(),
+                &fixture.ctx.state.jwt_config,
+                Some(60),
+            )?;
+            fixture
+                .ctx
+                .post(ROUTE, &fixture.binding, Some(&cross_worker))
+                .await?
+                .assert_status(StatusCode::FORBIDDEN);
+            // Missing retained operation evidence cannot acknowledge absence,
+            // even with a valid worker credential and otherwise exact target.
+            let missing = ControlRequest {
+                custody: Uuid::new_v4(),
+                ..fixture.binding.clone()
+            };
+            let response = fixture
+                .ctx
+                .post(ROUTE, &missing, Some(&token))
+                .await?
+                .assert_status(StatusCode::OK)
+                .json::<ControlResponse>()
+                .await?;
+            assert!(matches!(response, ControlResponse::Waiting));
+            let response = fixture
+                .ctx
+                .post(ROUTE, &fixture.binding, Some(&token))
+                .await?
+                .assert_status(StatusCode::OK)
+                .json::<ControlResponse>()
+                .await?;
+            assert!(matches!(response, ControlResponse::Settled));
+        } else {
+            let cancellation = fixture
+                .ctx
+                .post(
+                    cancel,
+                    &prepare.reservation,
+                    Some(host.session.token.as_str()),
+                )
+                .await?;
+            if cancellation.status() != StatusCode::OK {
+                return Err("custody cancellation did not ACK".into());
+            }
+            let ack = cancellation.json::<CustodyAbsence>().await?;
+            if !ack.absent {
+                return Err("custody cancellation did not prove absence".into());
+            }
         }
         release
             .send(())
@@ -562,6 +629,22 @@ async fn durable_custody_cancel_ack_fences_late_remote_and_local_preparation() -
     assert_eq!(state, "cancelled");
     assert_eq!(intents, 0);
     assert_eq!(secrets, baseline);
+    // Restoring source authority cannot restore a cancelled operation.
+    use attune_common::repositories::{
+        identity::{IdentityRepository, UpdateIdentityInput},
+        Update,
+    };
+    for frozen in [true, false] {
+        IdentityRepository::update(
+            &fixture.ctx.pool,
+            fixture.ctx.user.as_ref().unwrap().id,
+            UpdateIdentityInput {
+                frozen: Some(frozen),
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
     // A new HTTP request/router consumer sees the durable fence too.
     fixture
         .ctx
@@ -681,6 +764,15 @@ async fn custody_waiter(pool: &sqlx::PgPool, blocker: i32) -> Result<i32> {
 
 #[tokio::test]
 async fn durable_custody_absence_waits_for_admitted_preparation_commit() -> Result<()> {
+    cancellation_waits_for_admitted_preparation(false).await
+}
+
+#[tokio::test]
+async fn legacy_settlement_waits_for_admitted_remote_preparation_commit() -> Result<()> {
+    cancellation_waits_for_admitted_preparation(true).await
+}
+
+async fn cancellation_waits_for_admitted_preparation(legacy: bool) -> Result<()> {
     use attune_common::log_custody::CustodyAbsence;
     let fixture = LiveCustody::new().await?;
     let host = fixture.enroll_host().await?;
@@ -720,13 +812,23 @@ async fn durable_custody_absence_waits_for_admitted_preparation_commit() -> Resu
         // blocked inside source preparation, before the operation/intent effect.
         let preparing = custody_waiter(&fixture.ctx.pool, blocker).await?;
         let app = fixture.ctx.app.clone();
-        let request = Request::post("/api/v1/workload-hosts/custody/cancel-absent")
-            .header("content-type", "application/json")
-            .header(
-                "authorization",
-                format!("Bearer {}", host.session.token.as_str()),
+        let (path, credential, body) = if legacy {
+            (
+                ROUTE,
+                fixture.tokens.token()?,
+                serde_json::to_vec(&fixture.binding)?,
             )
-            .body(Body::from(serde_json::to_vec(&prepare.reservation)?))?;
+        } else {
+            (
+                "/api/v1/workload-hosts/custody/cancel-absent",
+                host.session.token.as_str().to_owned(),
+                serde_json::to_vec(&prepare.reservation)?,
+            )
+        };
+        let request = Request::post(path)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {credential}"))
+            .body(Body::from(body))?;
         tasks.spawn(async move {
             Ok::<_, std::convert::Infallible>((true, app.oneshot(request).await?))
         });
@@ -745,7 +847,18 @@ async fn durable_custody_absence_waits_for_admitted_preparation_commit() -> Resu
             }
             if cancel {
                 let body = axum::body::to_bytes(response.into_body(), 4096).await?;
-                absence = Some(serde_json::from_slice::<CustodyAbsence>(&body)?.absent);
+                absence = Some(if legacy {
+                    match serde_json::from_slice::<ControlResponse>(&body)? {
+                        ControlResponse::Waiting => false,
+                        _ => {
+                            return Err(
+                                "legacy control settled or delegated pending preparation".into()
+                            )
+                        }
+                    }
+                } else {
+                    serde_json::from_slice::<CustodyAbsence>(&body)?.absent
+                });
             } else {
                 prepared = true;
             }

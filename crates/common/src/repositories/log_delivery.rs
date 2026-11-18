@@ -116,15 +116,6 @@ struct AvailabilityRow {
 }
 pub struct LogDeliveryRepository;
 impl LogDeliveryRepository {
-    /// Reconcile a restart orphan against any producer COMMIT still settling.
-    /// Every prepare holds shared graph admission; exclusive admission therefore
-    /// waits for those transactions before absence becomes deletion evidence.
-    pub async fn custody_absent(conn: &mut PgConnection, version: i64) -> Result<bool> {
-        super::file_evidence_retention::FileEvidenceRetentionRepository::lock_reclamation(conn)
-            .await?;
-        Ok(Self::find(conn, version).await?.is_none())
-    }
-
     /// Caller has already authorized this execution's operational metadata.
     pub async fn availability(
         conn: &mut PgConnection,
@@ -447,8 +438,10 @@ impl LogDeliveryRepository {
         }
         let mut tx = pool.begin().await?;
         let Some(intent) = Self::find(&mut *tx, request.version).await? else {
-            let absent = Self::custody_absent(&mut tx, request.version).await?;
-            Self::require_instance(&mut tx, worker, instance).await?;
+            let absent = super::custody_operation::CustodyOperationRepository::cancel_retained_in(
+                &mut tx, worker, instance, request,
+            )
+            .await?;
             fresh()?;
             tx.commit().await?;
             fresh()?;

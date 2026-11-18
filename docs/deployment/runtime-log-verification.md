@@ -111,7 +111,15 @@ node-loss durability guarantee is implied. The action result remains unchanged.
 Settlement becomes manager-owned before spool persistence, so canceling its
 caller cannot abandon a persisted entry or an uncertain database commit.
 Database preparation has a ten-second bound. Failed preparation is reconciled
-under exclusive graph admission before absence permits orphan removal.
+under exclusive graph admission before absence permits orphan removal. Every
+absence acknowledgement must also durably cancel the exact custody operation:
+a graph lock alone cannot fence a delayed request that has not entered
+admission. The legacy control route uses the same cancellation gate as the
+host route. If it has no retained reservation proving the complete binding, it
+returns `Waiting`; missing source rows, rollback, deadline expiry and network
+failure do not themselves authorize local deletion. Such unproven custody stays
+encrypted on disk across shutdown rather than releasing its capacity slot.
+Terminal retained delivery intents are reconciled separately.
 After the upload deadline, the manager retains its bounded finalizer slot and
 retries terminal bookkeeping and custody cleanup when database access recovers;
 this does not permit late upload or extend the deadline. Shutdown can leave that
