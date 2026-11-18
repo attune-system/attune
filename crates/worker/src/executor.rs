@@ -703,7 +703,58 @@ impl ActionExecutor {
         execution: Execution,
         cancel_token: CancellationToken,
     ) -> Result<ExecutionOutcome> {
+        self.execute_started_with_effect(execution, cancel_token, None)
+            .await
+    }
+
+    /// The existing trusted loop retains preparation, capture, custody and
+    /// completion. Only native Pod/container effects are replaced. The plan is
+    /// supplied by trusted preparation, never a workload/API request.
+    pub async fn execute_started_isolated(
+        &self,
+        execution: Execution,
+        cancel_token: CancellationToken,
+        spec: attune_common::isolated_process::ProcessSpec,
+        launcher: Arc<dyn attune_common::isolated_process::ProcessLauncher>,
+    ) -> Result<ExecutionResult> {
+        self.execute_started_with_effect(execution, cancel_token, Some((spec, launcher)))
+            .await?
+            .result
+    }
+
+    async fn execute_started_with_effect(
+        &self,
+        execution: Execution,
+        cancel_token: CancellationToken,
+        isolated: Option<(
+            attune_common::isolated_process::ProcessSpec,
+            Arc<dyn attune_common::isolated_process::ProcessLauncher>,
+        )>,
+    ) -> Result<ExecutionOutcome> {
         let execution_id = execution.id;
+        let isolated_attempt = if let Some((spec, _)) = &isolated {
+            match &spec.target {
+                attune_common::workload_launch::LaunchTarget::Execution {
+                    execution,
+                    worker,
+                    worker_instance,
+                    attempt,
+                } if *execution == execution_id
+                    && *worker == self.worker_id.load(Ordering::Acquire)
+                    && *worker_instance == self.worker_instance
+                    && !attempt.is_nil() =>
+                {
+                    Some(*attempt)
+                }
+                _ => {
+                    return Err(Error::PermissionDenied(
+                        "Isolated action target unavailable".into(),
+                    ))
+                }
+            }
+        } else {
+            None
+        };
         info!("Starting execution: {}", execution_id);
 
         // Load action from database
@@ -744,7 +795,13 @@ impl ActionExecutor {
         };
         // The immutable contract is shared by validation, capture and redaction.
         let mut context = match self
-            .prepare_execution_context(&execution, &action, &mut preparation, true, None)
+            .prepare_execution_context(
+                &execution,
+                &action,
+                &mut preparation,
+                true,
+                isolated_attempt,
+            )
             .await
         {
             Ok(ctx) => ctx,
@@ -779,7 +836,13 @@ impl ActionExecutor {
         // Note: execute_action should rarely return Err - most failures should be
         // captured in ExecutionResult with non-zero exit codes
         let process_started = std::time::Instant::now();
-        let result = match self.execute_action(context).await {
+        let action_result = if let Some((spec, launcher)) = isolated {
+            self.execute_isolated_action(context, &preparation, spec, launcher)
+                .await
+        } else {
+            self.execute_action(context).await
+        };
+        let result = match action_result {
             Ok(result) => result,
             Err(e) => {
                 error!("Action execution failed catastrophically: {}", e);
@@ -2059,6 +2122,82 @@ impl ActionExecutor {
             advertised_version == &version.version
                 || matches_constraint(advertised_version, &version.version).unwrap_or(false)
         })
+    }
+
+    /// Execute the action using the runtime registry
+    async fn execute_isolated_action(
+        &self,
+        context: ExecutionContext,
+        preparation: &ExecutionPreparation,
+        spec: attune_common::isolated_process::ProcessSpec,
+        launcher: Arc<dyn attune_common::isolated_process::ProcessLauncher>,
+    ) -> Result<ExecutionResult> {
+        use attune_common::repositories::{
+            delegated_execution::DelegatedExecutionRepository,
+            execution_input::SelectedExecutionInput,
+            execution_process::ExecutionProcessRepository as Effects,
+        };
+        let master = self.secret_manager.encryption_key().ok_or_else(|| {
+            Error::PermissionDenied("Isolated action context encryption unavailable".into())
+        })?;
+        let selected = SelectedExecutionInput::new(
+            serde_json::to_value(&context.parameters)?,
+            preparation.input_snapshot.clone().ok_or_else(|| {
+                Error::PermissionDenied("Isolated action input unavailable".into())
+            })?,
+        )?;
+        let mut tx = self.pool.begin().await?;
+        let owner = DelegatedExecutionRepository::find(&mut tx, context.execution_id)
+            .await?
+            .owner
+            .ok_or_else(|| Error::PermissionDenied("Isolated action owner unavailable".into()))?;
+        tx.commit().await?;
+        Effects::reserve(&self.pool, &spec, owner, &selected, master).await?;
+        let resource = launcher.prepare(&spec).await?;
+        Effects::record_resource(&self.pool, spec.intent, &resource).await?;
+        let process = launcher.start(&spec, &resource).await?;
+        if process.resource != resource {
+            let _ = process
+                .control
+                .stop(attune_common::workload_launch::LaunchStopReason::LaunchFailure)
+                .await;
+            return Err(Error::PermissionDenied(
+                "Isolated action resource changed".into(),
+            ));
+        }
+        let payload = match Effects::consume_stdin(&self.pool, spec.intent, &resource, master).await
+        {
+            Ok(payload) => payload,
+            Err(error) => {
+                // No effect may open the gate on unknown COMMIT/expiry/revocation.
+                // Retain identity and stop evidence if provider cleanup is uncertain.
+                let recorded = Effects::request_stop(&self.pool, spec.intent).await;
+                let stopped = process
+                    .control
+                    .stop(attune_common::workload_launch::LaunchStopReason::SourceRevoked)
+                    .await;
+                recorded?;
+                stopped?;
+                return Err(error);
+            }
+        };
+        crate::runtime::process_executor::execute_isolated_cancellable(
+            process,
+            payload,
+            crate::runtime::process_executor::IsolatedCaptureOptions {
+                timeout_secs: context.timeout,
+                max_stdout_bytes: context.max_stdout_bytes,
+                max_stderr_bytes: context.max_stderr_bytes,
+                output_format: context.output_format,
+                output_policy: context.output_policy,
+                out_schema: context.out_schema.as_ref(),
+                cancel_token: context.cancel_token,
+                stdout_log_writer: context.stdout_log_writer,
+                stderr_log_writer: context.stderr_log_writer,
+            },
+        )
+        .await
+        .map_err(|_| Error::execution("Isolated action capture failed"))
     }
 
     /// Execute the action using the runtime registry

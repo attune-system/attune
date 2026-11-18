@@ -224,56 +224,6 @@ impl Fixture {
     async fn reserve(&self) -> Result<ReservedLaunch> {
         Ok(Ledger::freeze(&self.ctx.pool, self.image, self.spec.clone(), self.master()).await?)
     }
-    async fn enroll_manager(
-        &mut self,
-    ) -> Result<attune_common::workload_host::RegisteredWorkloadHost> {
-        use attune_common::{
-            repositories::workload_host::WorkloadHostRepository,
-            workload_host::{EnrollmentActor, RegisterWorkloadHost},
-        };
-        let token = self
-            .ctx
-            .create_test_user(&format!("manager_{}", Uuid::new_v4().simple()))
-            .await?;
-        let identity = validate_token(&token, &self.ctx.state.jwt_config)?
-            .sub
-            .parse::<i64>()?;
-        let worker = match self.spec.manifest.target {
-            LaunchTarget::Execution { worker, .. } => worker,
-            _ => return Err("execution required".into()),
-        };
-        let name: String = sqlx::query_scalar("SELECT name FROM worker WHERE id=$1")
-            .bind(worker)
-            .fetch_one(&self.ctx.pool)
-            .await?;
-        let profile:i64=sqlx::query_scalar("INSERT INTO workload_host_profile(image,role,capabilities,max_concurrent) VALUES($1,'action',$2,1) RETURNING id")
-            .bind(self.image).bind(json!({"api_origin":"https://owned-api.invalid/"})).fetch_one(&self.ctx.pool).await?;
-        let enrollment:i64=sqlx::query_scalar("INSERT INTO workload_host_enrollment(profile,identity,worker_name,worker,expires_at) VALUES($1,$2,$3,$4,clock_timestamp()+interval '1 hour') RETURNING id")
-            .bind(profile).bind(identity).bind(name).bind(worker).fetch_one(&self.ctx.pool).await?;
-        let host = WorkloadHostRepository::register(
-            &self.ctx.pool,
-            EnrollmentActor {
-                identity,
-                enrollment,
-                profile,
-                generation: 0,
-                expires_at: chrono::Utc::now().timestamp() + 1800,
-            },
-            &RegisterWorkloadHost {
-                instance: Uuid::new_v4(),
-                custody_instance: Uuid::new_v4(),
-            },
-            &self.ctx.state.jwt_config,
-        )
-        .await?;
-        if let LaunchTarget::Execution {
-            worker_instance, ..
-        } = &mut self.spec.manifest.target
-        {
-            *worker_instance = host.instance;
-        }
-        Ok(host)
-    }
     async fn selected_reserve(&self, value: Value) -> Result<ReservedLaunch> {
         use attune_common::repositories::execution_input::{
             ExecutionInputRepository, SelectedExecutionInput,
