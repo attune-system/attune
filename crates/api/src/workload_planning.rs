@@ -19,6 +19,8 @@ use attune_common::{
 use futures::{StreamExt, TryStreamExt};
 use std::{sync::Arc, time::Duration};
 use tokio::io::AsyncWriteExt;
+mod action;
+pub use action::freeze_action_launch;
 fn unavailable() -> ApiError {
     ApiError::InternalServerError("Pinned workload input preparation unavailable".into())
 }
