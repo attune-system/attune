@@ -632,10 +632,7 @@ dependencies = [
 name = "attune-launch-controller"
 version = "0.11.1"
 dependencies = [
- "async-trait",
  "attune-common",
- "axum",
- "bytes",
  "chrono",
  "futures",
  "libc",
@@ -646,9 +643,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
  "uuid",
  "zip",
 ]
