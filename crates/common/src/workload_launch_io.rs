@@ -24,6 +24,30 @@ pub enum LaunchIoError {
 }
 pub type LaunchIoResult<T> = std::result::Result<T, LaunchIoError>;
 
+/// Trusted CP/operator deployment policy, never deserialized from a pack or
+/// frontend request. Plain HTTP does not establish an isolated engine boundary.
+#[derive(Clone, Copy, Debug)]
+pub enum LaunchHttpPolicy {
+    TlsOrLoopback,
+    DevelopmentPlainHttp,
+}
+impl LaunchHttpPolicy {
+    pub fn allows_origin(self, url: &Url) -> bool {
+        let loopback = url.domain() == Some("localhost")
+            || url
+                .host_str()
+                .and_then(|host| {
+                    host.trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .parse::<std::net::IpAddr>()
+                        .ok()
+                })
+                .is_some_and(|address| address.is_loopback());
+        url.scheme() == "https"
+            || (url.scheme() == "http" && (matches!(self, Self::DevelopmentPlainHttp) || loopback))
+    }
+}
+
 pub struct LaunchIoChunk {
     pub bytes: Bytes,
     pub next_offset: u64,
@@ -58,6 +82,9 @@ pub trait LaunchIoHandle: Send + Sync {
     ) -> LaunchIoResult<LaunchIoChunk>;
     async fn wait(&self) -> LaunchIoResult<LaunchStatus>;
     async fn cancel(&self, reason: LaunchStopReason) -> LaunchIoResult<LaunchStatus>;
+    /// None means authenticated not-ready (Pending/Uploading/NotRequired), never
+    /// provider absence. Denial and transport failures remain errors. A receipt
+    /// exists only after CP durable publication, not merely local process exit.
     async fn stage_result(&self) -> LaunchIoResult<Option<LaunchStageResult>>;
 }
 
@@ -70,7 +97,10 @@ pub struct HttpLaunchTransport {
 }
 impl HttpLaunchTransport {
     pub fn new(base: Url) -> LaunchIoResult<Self> {
-        if !matches!(base.scheme(), "http" | "https")
+        Self::with_policy(base, LaunchHttpPolicy::TlsOrLoopback)
+    }
+    pub fn with_policy(base: Url, policy: LaunchHttpPolicy) -> LaunchIoResult<Self> {
+        if !policy.allows_origin(&base)
             || base.host_str().is_none()
             || !base.username().is_empty()
             || base.password().is_some()
@@ -378,6 +408,8 @@ mod tests {
             resource: None,
             stop_reason: None,
             publication: LaunchPublicationState::NotRequired,
+            capture: LaunchCaptureState::Pending,
+            capture_deadline: None,
         }
     }
     fn grant(launch: &ReservedLaunch, channel: LaunchIoChannel) -> LaunchIoGrant {
@@ -511,6 +543,7 @@ mod tests {
     #[test]
     fn credentials_and_raw_bytes_are_not_debug_values_or_url_authority() {
         for origin in [
+            "http://external-engine.example/",
             "http://user:password@localhost/",
             "http://localhost/?token=bad",
             "http://localhost/path",
@@ -518,6 +551,11 @@ mod tests {
         ] {
             assert!(HttpLaunchTransport::new(Url::parse(origin).unwrap()).is_err());
         }
+        assert!(HttpLaunchTransport::with_policy(
+            Url::parse("http://controller.dev/").unwrap(),
+            LaunchHttpPolicy::DevelopmentPlainHttp
+        )
+        .is_ok());
         let token = LaunchToken::new("owned-secret".into()).unwrap();
         assert!(secret(&token).unwrap().is_sensitive());
         assert!(!format!("{:?}", secret(&token).unwrap()).contains("owned-secret"));
@@ -528,5 +566,44 @@ mod tests {
             eof: true,
         };
         assert!(!format!("{chunk:?}").contains("private-output"));
+    }
+    #[tokio::test]
+    async fn stage_receipt_denial_or_transport_failure_is_not_not_ready() {
+        let launch = reserved();
+        let expected = launch.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            request(&mut socket).await;
+            json(&mut socket, &status(&expected)).await;
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let (head, _) = request(&mut socket).await;
+            assert!(head.starts_with("POST /v1/launches/71/stage-result "));
+            socket
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+            let (mut socket, _) = listener.accept().await.unwrap();
+            request(&mut socket).await;
+            socket.shutdown().await.unwrap();
+        });
+        let transport =
+            HttpLaunchTransport::new(Url::parse(&format!("http://{address}/")).unwrap()).unwrap();
+        let result = async {
+            let handle = transport.launch(&launch).await?;
+            assert!(matches!(
+                handle.stage_result().await,
+                Err(LaunchIoError::Rejected(403))
+            ));
+            assert!(handle.stage_result().await.is_err());
+            Ok::<_, LaunchIoError>(())
+        }
+        .await;
+        server.await.unwrap();
+        result.unwrap();
     }
 }
