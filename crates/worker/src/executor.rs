@@ -1150,6 +1150,13 @@ impl ActionExecutor {
         }
         tx.commit().await?;
         let action = self.load_action(&execution).await?;
+        if action.parameter_delivery != attune_common::models::ParameterDelivery::Stdin
+            || action.parameter_format != attune_common::models::ParameterFormat::Json
+        {
+            return Err(Error::validation(
+                "Control workloads require flat stdin JSON parameters",
+            ));
+        }
         let mut preparation = ExecutionPreparation {
             binding: self.schema_binding(execution_id).await?,
             parameter_secret_paths: None,
@@ -1350,18 +1357,21 @@ impl ActionExecutor {
             }
         }
 
-        // Add context data as environment variables from config
-        if let Some(config) = &restored_config {
-            if let Some(JsonValue::Object(map)) = config.get("context") {
-                for (key, value) in map {
-                    let env_key = format!("ATTUNE_CONTEXT_{}", key.to_uppercase());
-                    let env_value = match value {
-                        JsonValue::String(s) => s.clone(),
-                        JsonValue::Number(n) => n.to_string(),
-                        JsonValue::Bool(b) => b.to_string(),
-                        _ => serde_json::to_string(value)?,
-                    };
-                    env.insert(env_key, env_value);
+        // The execution-only protocol delivers ALL parameters through stdin.
+        // Keep the old local-worker context projection out of CP invocations.
+        if control_attempt.is_none() {
+            if let Some(config) = &restored_config {
+                if let Some(JsonValue::Object(map)) = config.get("context") {
+                    for (key, value) in map {
+                        let env_key = format!("ATTUNE_CONTEXT_{}", key.to_uppercase());
+                        let env_value = match value {
+                            JsonValue::String(s) => s.clone(),
+                            JsonValue::Number(n) => n.to_string(),
+                            JsonValue::Bool(b) => b.to_string(),
+                            _ => serde_json::to_string(value)?,
+                        };
+                        env.insert(env_key, env_value);
+                    }
                 }
             }
         }
