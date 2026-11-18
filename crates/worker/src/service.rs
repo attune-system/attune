@@ -252,13 +252,17 @@ impl WorkerService {
                     .map(|worker| worker.passthrough_env.as_slice())
                     .unwrap_or(&[]),
             )?
-            .with_workload_sandbox(
+            .with_workload_sandbox(if config.workload.is_some() {
+                // Native effects own execution. Any missed legacy hook
+                // must deny locally, without a Bubblewrap/trusted fallback.
+                attune_common::workload_sandbox::WorkloadSandbox::NativeEffectsRequired
+            } else {
                 attune_common::workload_sandbox::WorkloadSandbox::from_environment(
                     config.artifacts.transport
                         == attune_common::artifact_transport::TransportMode::Api,
                 )
-                .map_err(|error| Error::validation(error.to_string()))?,
-            );
+                .map_err(|error| Error::validation(error.to_string()))?
+            });
         config.validate_deployed_pack_transport()?;
         config.validate_deployed_artifact_transport()?;
         let configured_api_url = std::env::var("ATTUNE_API_URL").ok();
@@ -585,31 +589,38 @@ impl WorkerService {
             Arc::from(transport)
         };
 
-        let executor = Arc::new(
-            ActionExecutor::new(
-                pool.clone(),
-                runtime_registry,
-                artifact_manager,
-                secret_manager,
-                max_stdout_bytes,
-                max_stderr_bytes,
-                mirror_runtime_stdout_to_stdio,
-                mirror_runtime_stderr_to_stdio,
-                worker_name,
-                worker_token_provider.instance_id(),
-                config.artifacts.log_segment_writer_config(),
-                execution_log_retention_policy,
-                execution_log_retention_limit,
-                packs_base_dir.clone(),
-                artifacts_dir,
-                PathBuf::from(&config.runtime_envs_dir), // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- runtime_envs_dir is a trusted deployment configuration root, not request-derived input.
-                api_url,
-                jwt_config,
-                transport,
-            )
-            .with_worker_token_provider(worker_token_provider.clone())
-            .with_child_environment(child_environment.clone()),
-        );
+        let executor = ActionExecutor::new(
+            pool.clone(),
+            runtime_registry,
+            artifact_manager,
+            secret_manager,
+            max_stdout_bytes,
+            max_stderr_bytes,
+            mirror_runtime_stdout_to_stdio,
+            mirror_runtime_stderr_to_stdio,
+            worker_name,
+            worker_token_provider.instance_id(),
+            config.artifacts.log_segment_writer_config(),
+            execution_log_retention_policy,
+            execution_log_retention_limit,
+            packs_base_dir.clone(),
+            artifacts_dir,
+            PathBuf::from(&config.runtime_envs_dir), // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- runtime_envs_dir is a trusted deployment configuration root, not request-derived input.
+            api_url,
+            jwt_config,
+            transport,
+        )
+        .with_worker_token_provider(worker_token_provider.clone())
+        .with_child_environment(child_environment.clone());
+        let executor = if let Some(workload) = &config.workload {
+            executor.with_native_execution(
+                workload.clone(),
+                attune_workload_backend::configuration::configure(workload).await?,
+            )?
+        } else {
+            executor
+        };
+        let executor = Arc::new(executor);
 
         // Initialize heartbeat manager
         let heartbeat_interval = config
