@@ -260,11 +260,14 @@ pub fn validate_metadata(root: &std::path::Path) -> crate::Result<Vec<PackDiagno
             .map_err(|error| located(error, "pack.yaml", "/testing"))?;
         for (name, runner) in &config.runners {
             let base = format!("/testing/runners{}", pointer(name));
-            if !matches!(runner.r#type.as_str(), "script" | "unittest" | "pytest") {
+            if !matches!(
+                runner.r#type.as_str(),
+                "script" | "unittest" | "pytest" | "runtime"
+            ) {
                 return Err(metadata_error(
                     "pack.yaml",
                     &format!("{base}/type"),
-                    "Supported test runners are script, unittest, and pytest",
+                    "Supported test runners are script, unittest, pytest, and runtime",
                 ));
             }
             if runner
@@ -340,6 +343,45 @@ mod tests {
         )
         .unwrap();
         assert!(validate_metadata(root.path()).is_err());
+    }
+
+    #[test]
+    fn metadata_gate_accepts_runtime_tests_and_preserves_recipe_and_path_checks() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("tests")).unwrap();
+        std::fs::write(root.path().join("tests/check.py"), "print('fixture')\n").unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/runtime-services/fixture.json"
+        ))
+        .unwrap();
+        let manifest = serde_json::json!({
+            "ref": "demo", "version": "1.0.0",
+            "testing": {
+                "enabled": true, "discovery": {"method": "explicit"},
+                "runners": {"recipe": {
+                    "type": "runtime", "entry_point": "tests/check.py",
+                    "lifecycle": fixture["execution_config"]["lifecycle"]
+                }}
+            }
+        });
+        let write_manifest = |value: &serde_json::Value| {
+            std::fs::write(root.path().join("pack.yaml"), value.to_string()).unwrap();
+        };
+        write_manifest(&manifest);
+        validate_metadata(root.path()).unwrap();
+
+        for (field, value) in [
+            ("lifecycle", serde_json::Value::Null),
+            ("lifecycle", serde_json::json!({})),
+            ("type", serde_json::json!("unknown")),
+            ("entry_point", serde_json::json!("../outside.py")),
+            ("result_format", serde_json::json!("unknown")),
+        ] {
+            let mut invalid = manifest.clone();
+            invalid["testing"]["runners"]["recipe"][field] = value;
+            write_manifest(&invalid);
+            assert!(validate_metadata(root.path()).is_err(), "accepted {field}");
+        }
     }
 
     #[test]

@@ -90,8 +90,21 @@ def test_recipe_candidate_tests_use_an_admitted_worker_and_final_only_credential
     if admitted:
         pack = client.upload_pack(str(root), skip_tests=False)
         assert pack["ref"] == ref
+        response = client._request("GET", f"/api/v1/packs/{ref}/install/latest")
+        assert response.status_code == 200, response.text
+        install = response.json()["data"]
+        assert install["status"] == "succeeded", install
+        assert install["test_result"]["total_tests"] == 1, install
+        assert install["test_result"]["passed"] == 1, install
     else:
-        with pytest.raises(Exception) as error:
+        with pytest.raises(Exception, match="Candidate tests did not pass"):
             client.upload_pack(str(root), skip_tests=False)
-        assert "no active worker" in str(error.value).lower(), str(error.value)
+        response = client._request("GET", f"/api/v1/packs/{ref}/install/latest")
+        assert response.status_code == 200, response.text
+        install = response.json()["data"]
+        assert install["status"] == "failed", install
+        assert install["diagnostic_details"]["stage"] == "test_execution", install
+        assert install["diagnostic_details"]["outcome"] == "active_release_unchanged", install
+        assert install["test_result"] is None, install
+        assert install["test_execution_id"] is None, install
         assert client.get_pack_by_ref(ref) is None
