@@ -283,6 +283,37 @@ impl CacheStore {
         }
         Ok(record)
     }
+    /// Final factual cleanup only. The caller has already committed domain
+    /// completion and all selected-file/runtime publication receipts. Retain
+    /// the small immutable ownership/removal evidence for idempotent recovery.
+    pub(crate) fn cleanup_native_private(
+        &self,
+        spec: &attune_common::isolated_process::ProcessSpec,
+        resource: &attune_common::isolated_process::ResourceIdentity,
+    ) -> Result<()> {
+        let _lock = self.lock()?;
+        let parent = self.native_parent_locked(spec)?;
+        let record = self
+            .native_removal_locked(spec, &parent)?
+            .ok_or(CacheError::ArtifactPending)?;
+        if &record.resource != resource {
+            return Err(CacheError::AttemptConflict);
+        }
+        // Exact fixed children only; never follow a workload-created symlink
+        // or remove a published input/runtime cache, sibling intent or spool.
+        // An unreadable tree/uncertain deletion returns Err and stays retained.
+        for name in ["artifacts", "runtime", "pack", "publication.zip"] {
+            let path = parent.join(name);
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path)?,
+                Ok(_) => fs::remove_file(path)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    }
     pub(crate) fn record_native_removal(
         &self,
         spec: &attune_common::isolated_process::ProcessSpec,
@@ -1661,6 +1692,115 @@ mod tests {
         resource
     }
     #[test]
+    fn native_cleanup_requires_exact_removal_and_retains_only_historical_evidence() {
+        use attune_common::artifact_transport::ValidatedRelativePath;
+        let root = tempfile::tempdir().unwrap();
+        let limits = CacheLimits {
+            compressed_bytes: 65536,
+            expanded_bytes: 65536,
+            files: 32,
+        };
+        let store = CacheStore::open(root.path().into(), limits)
+            .unwrap()
+            .for_current_test_user();
+        let spec = native_setup();
+        store.prepare_native_private(&spec).unwrap();
+        let parent = root
+            .path()
+            .join(format!("private/{}", spec.intent.simple()));
+        fs::write(parent.join("runtime/tool"), b"owned runtime").unwrap();
+        fs::write(parent.join("artifacts/file"), b"owned artifact").unwrap();
+        let resource = attune_common::isolated_process::ResourceIdentity::Docker {
+            engine_id: 1,
+            daemon_id: "owned-daemon".into(),
+            container_id: "a".repeat(64),
+        };
+        assert!(matches!(
+            store.cleanup_native_private(&spec, &resource),
+            Err(CacheError::ArtifactPending)
+        ));
+        assert!(parent.join("runtime/tool").exists());
+        let resource = native_removed(&store, &spec);
+        // Archive validation/reads must keep the stage until the owning caller
+        // explicitly takes the final cleanup path after publication receipts.
+        drop(store.archive_native_stage(&spec).unwrap());
+        assert!(parent.join("runtime/tool").exists());
+        assert!(parent.join("publication.zip").exists());
+        let mut wrong = resource.clone();
+        if let attune_common::isolated_process::ResourceIdentity::Docker { container_id, .. } =
+            &mut wrong
+        {
+            *container_id = "b".repeat(64);
+        }
+        assert!(store.cleanup_native_private(&spec, &wrong).is_err());
+        assert!(parent.join("artifacts/file").exists());
+        store.cleanup_native_private(&spec, &resource).unwrap();
+        for name in ["runtime", "artifacts", "publication.zip"] {
+            assert!(!parent.join(name).exists());
+        }
+        assert!(parent.join("native-policy").is_file());
+        assert!(parent.join("native-removal.json").is_file());
+        drop(store);
+        let store = CacheStore::open(root.path().into(), limits)
+            .unwrap()
+            .for_current_test_user();
+        store.cleanup_native_private(&spec, &resource).unwrap();
+        assert!(store.native_removal(&spec, &resource).unwrap().is_some());
+        assert!(store.archive_native_stage(&spec).is_err());
+        let mut action = native_setup();
+        action.purpose = attune_common::workload_launch::LaunchPurpose::Action;
+        action.stage = None;
+        store.prepare_native_private(&action).unwrap();
+        let action_resource = native_removed(&store, &action);
+        store
+            .cleanup_native_private(&action, &action_resource)
+            .unwrap();
+        assert!(matches!(
+            store.read_native_artifact(&action, &ValidatedRelativePath::new("missing").unwrap(), 1),
+            Err(CacheError::LostArtifactStaging)
+        ));
+    }
+    #[test]
+    fn native_cleanup_does_not_follow_links_or_touch_sibling_and_published_trees() {
+        let root = tempfile::tempdir().unwrap();
+        let store = CacheStore::open(
+            root.path().into(),
+            CacheLimits {
+                compressed_bytes: 65536,
+                expanded_bytes: 65536,
+                files: 32,
+            },
+        )
+        .unwrap()
+        .for_current_test_user();
+        let spec = native_setup();
+        let sibling = native_setup();
+        store.prepare_native_private(&spec).unwrap();
+        store.prepare_native_private(&sibling).unwrap();
+        let parent = root
+            .path()
+            .join(format!("private/{}", spec.intent.simple()));
+        let sibling_parent = root
+            .path()
+            .join(format!("private/{}", sibling.intent.simple()));
+        fs::write(sibling_parent.join("artifacts/retained"), b"sibling").unwrap();
+        let published = root.path().join("inputs/owned-published");
+        fs::create_dir(&published).unwrap();
+        fs::write(published.join("retained"), b"published").unwrap();
+        std::os::unix::fs::symlink(&sibling_parent, parent.join("artifacts/escape")).unwrap();
+        fs::remove_dir(parent.join("runtime")).unwrap();
+        std::os::unix::fs::symlink(&published, parent.join("runtime")).unwrap();
+        let resource = native_removed(&store, &spec);
+        store.cleanup_native_private(&spec, &resource).unwrap();
+        assert_eq!(
+            fs::read(sibling_parent.join("artifacts/retained")).unwrap(),
+            b"sibling"
+        );
+        assert_eq!(fs::read(published.join("retained")).unwrap(), b"published");
+        assert!(fs::symlink_metadata(parent.join("runtime")).is_err());
+        assert!(fs::symlink_metadata(parent.join("artifacts")).is_err());
+    }
+    #[test]
     fn native_removal_receipt_is_owned_digest_bound_and_survives_restart_without_invented_absence()
     {
         let root = tempfile::tempdir().unwrap();
@@ -2105,6 +2245,48 @@ mod tests {
             attune_common::workload_launch::PACK_ROOT
         )
         .is_err());
+    }
+    #[test]
+    fn cached_zip_rejects_changed_pin_bounds_without_rewriting_the_original_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let limits = CacheLimits {
+            compressed_bytes: 4096,
+            expanded_bytes: 1024,
+            files: 32,
+        };
+        let cached = CacheStore::open(root.path().join("cached"), limits).unwrap();
+        let fresh = CacheStore::open(root.path().join("fresh"), limits).unwrap();
+        let mut body = zip_body(&[("safe", b"owned")], &[]);
+        let mut bytes = Vec::new();
+        body.read_to_end(&mut bytes).unwrap();
+        let loose = PinnedLaunchInput {
+            pin_id: 1,
+            object_id: 2,
+            object_version: "owned-bounds".into(),
+            kind: LaunchInputKind::Pack,
+            size_bytes: bytes.len() as u64,
+            sha256: Sha256Digest::of_bytes(&bytes),
+            max_expanded_bytes: 1024,
+            max_files: 32,
+        };
+        let destination = cached.install_input(&loose, &mut body).unwrap();
+        let receipt_path = destination.parent().unwrap().join("receipt");
+        let original = fs::read(&receipt_path).unwrap();
+        let tight = PinnedLaunchInput {
+            max_expanded_bytes: 5,
+            max_files: 1,
+            ..loose.clone()
+        };
+        assert!(matches!(
+            cached.install_input(&tight, &mut body),
+            Err(CacheError::PinMismatch)
+        ));
+        assert_eq!(fs::read(receipt_path).unwrap(), original);
+        assert_eq!(fs::read(destination.join("safe")).unwrap(), b"owned");
+        // This exact ZIP does satisfy the tight bounds. The failure above is
+        // the retained pin contract, not a corrupt archive or insufficient quota.
+        let exact = fresh.install_input(&tight, &mut body).unwrap();
+        assert_eq!(fs::read(exact.join("safe")).unwrap(), b"owned");
     }
     #[test]
     fn input_pin_is_verified_before_extraction_or_publication() {
