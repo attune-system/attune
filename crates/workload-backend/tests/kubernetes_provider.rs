@@ -216,7 +216,14 @@ impl Fixture {
         .await;
         // Test teardown joins exact provider removal even when an assertion or
         // effect fails. Never remove unrelated Pods/volumes by name prefix/age.
-        let cleanup = self.cleanup(&resource).await;
+        let cleanup = if matches!(&result, Ok(Ok(_))) {
+            self.launcher
+                .remove_stopped(spec, &resource)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        } else {
+            self.cleanup(&resource).await
+        };
         cleanup?;
         result?
     }
@@ -266,12 +273,99 @@ async fn reconcile_missing_intent_never_creates_and_changed_uid_never_starts() -
         .launcher
         .prepare(&spec, ProcessCreateDisposition::CreateOnce)
         .await?;
+    let mut revoked_policy = f.policy.clone();
+    revoked_policy.allowed_images.clear();
+    let cache = CacheStore::open(
+        f._root.path().join("revoked-cache"),
+        CacheLimits {
+            compressed_bytes: 1024,
+            expanded_bytes: 4096,
+            files: 32,
+        },
+    )?;
+    let revoked = KubernetesLauncher::new(f.client.clone(), revoked_policy, Arc::new(cache));
+    let recovered = revoked
+        .prepare(&spec, ProcessCreateDisposition::ReconcileOnly)
+        .await?;
+    assert_eq!(recovered, resource);
+    let denied_run = revoked.start(&spec, &resource).await.is_err();
     let mut changed = resource.clone();
     if let ResourceIdentity::Kubernetes { pod_uid, .. } = &mut changed {
         *pod_uid = Uuid::new_v4().to_string();
     }
     let rejected = f.launcher.start(&spec, &changed).await.is_err();
+    let rejected_cleanup = f.launcher.remove_stopped(&spec, &changed).await.is_err();
     f.cleanup(&resource).await?;
     assert!(rejected);
+    assert!(rejected_cleanup);
+    assert!(denied_run);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires explicitly owned disposable Kubernetes cluster, namespace-scoped config and exact candidate images; required provider CI includes this test"]
+async fn actual_owned_host_credential_process_files_and_signaling_are_hidden() -> TestResult {
+    let f = Fixture::new().await?;
+    let token = format!("owned-dummy-{}", Uuid::new_v4());
+    let secret_file = f._root.path().join("owned-host-only-credential");
+    std::fs::write(&secret_file, token.as_bytes())?;
+    let mut dummy = tokio::process::Command::new("/bin/sleep")
+        .arg("3600")
+        .env("OWNED_PROCESS_TOKEN", &token)
+        .kill_on_drop(true)
+        .spawn()?;
+    let pid = dummy.id().ok_or("owned dummy did not start")?;
+    let expected = Sha256Digest::of_bytes(token.as_bytes());
+    // Only a digest of a newly generated dummy credential enters this test
+    // invocation, not the credential itself or any real manager secret.
+    let script = r#"import os,pathlib,signal,sys,hashlib
+pid=int(sys.argv[1]); expected=sys.argv[2]; host_file=sys.argv[3]
+assert not pathlib.Path(host_file).exists()
+status=pathlib.Path('/proc/self/status').read_text()
+assert 'NoNewPrivs:\t1' in status and 'CapEff:\t0000000000000000' in status
+for path in pathlib.Path('/proc').glob('[0-9]*/environ'):
+    try: entries=path.read_bytes().split(b'\0')
+    except (PermissionError,FileNotFoundError,ProcessLookupError): continue
+    for entry in entries:
+        if entry.startswith(b'OWNED_PROCESS_TOKEN='):
+            assert hashlib.sha256(entry.split(b'=',1)[1]).hexdigest()!=expected
+# Namespace-local PID reuse is legitimate. If that ID exists it must have a
+# different credential; otherwise signaling the host ID must fail locally.
+if not pathlib.Path('/proc/'+str(pid)).exists():
+    try: os.kill(pid,signal.SIGSTOP)
+    except ProcessLookupError: pass
+    else: raise AssertionError('host process signal escaped PID namespace')
+try: pathlib.Path('/etc/attune-owned-write-probe').write_text('owned')
+except OSError: pass
+else: raise AssertionError('payload root is writable')
+assert not pathlib.Path('/var/run/secrets/kubernetes.io/serviceaccount/token').exists()
+assert not pathlib.Path('/var/run/docker.sock').exists()
+sys.stdout.write('owned-host-boundary-pass')
+"#;
+    let result = async {
+        let spec = f.spec(vec![
+            "/usr/bin/python3".into(),
+            "-c".into(),
+            script.into(),
+            pid.to_string(),
+            expected.as_str().into(),
+            secret_file.to_string_lossy().into_owned(),
+        ])?;
+        f.run(&spec, Vec::new()).await
+    }
+    .await;
+    // Always settle this owned child, including after a failed isolation probe.
+    let state = std::fs::read_to_string(format!("/proc/{pid}/status"));
+    let stopped = state.as_ref().is_ok_and(|s| {
+        s.lines()
+            .any(|line| line.starts_with("State:") && line.contains('T'))
+    });
+    let _kill_request = dummy.start_kill();
+    tokio::time::timeout(Duration::from_secs(10), dummy.wait()).await??;
+    let (exit, out, err) = result?;
+    assert!(!stopped, "owned host process was signaled from the payload");
+    assert_eq!(exit.exit_code, 0);
+    assert_eq!(out, b"owned-host-boundary-pass");
+    assert!(err.is_empty());
     Ok(())
 }

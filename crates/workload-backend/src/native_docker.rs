@@ -233,12 +233,127 @@ impl DockerLauncher {
         else {
             return Err(EngineError::OwnershipMismatch);
         };
-        if *engine_id != self.binding.engine_id || daemon_id != &self.binding.daemon_id {
+        if *engine_id != self.binding.engine_id
+            || daemon_id != &self.binding.daemon_id
+            || !resource_id(container_id)
+        {
             return Err(EngineError::OwnershipMismatch);
         }
         self.inspect(spec, Some(container_id))
             .await?
             .ok_or(EngineError::Transport)
+    }
+    async fn reconcile_owned(&self, spec: &ProcessSpec) -> Result<Option<(String, String)>> {
+        self.engine
+            .verify_engine_binding(&self.binding, &self.policy)
+            .await?;
+        let response = self
+            .engine
+            .control
+            .get(DockerEngine::url(&[
+                "containers",
+                &Self::name(spec),
+                "json",
+            ]))
+            .send()
+            .await
+            .map_err(|_| EngineError::Transport)?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let value: serde_json::Value = decode(response).await?;
+        let id = value["Id"]
+            .as_str()
+            .filter(|id| resource_id(id))
+            .ok_or(EngineError::InvalidResponse)?;
+        let identity = ResourceIdentity::Docker {
+            engine_id: self.binding.engine_id,
+            daemon_id: self.binding.daemon_id.clone(),
+            container_id: id.into(),
+        };
+        self.cleanup_exact(spec, &identity).await.map(Some)
+    }
+    async fn cleanup_exact(
+        &self,
+        spec: &ProcessSpec,
+        resource: &ResourceIdentity,
+    ) -> Result<(String, String)> {
+        let ResourceIdentity::Docker {
+            engine_id,
+            daemon_id,
+            container_id,
+        } = resource
+        else {
+            return Err(EngineError::OwnershipMismatch);
+        };
+        if *engine_id != self.binding.engine_id
+            || daemon_id != &self.binding.daemon_id
+            || !resource_id(container_id)
+        {
+            return Err(EngineError::OwnershipMismatch);
+        }
+        self.engine
+            .verify_engine_binding(&self.binding, &self.policy)
+            .await?;
+        let value: serde_json::Value = decode(
+            self.engine
+                .control
+                .get(DockerEngine::url(&["containers", container_id, "json"]))
+                .send()
+                .await
+                .map_err(|_| EngineError::Transport)?,
+        )
+        .await?;
+        let digest = crate::process_policy::public_digest(spec)
+            .map_err(|_| EngineError::OwnershipMismatch)?;
+        if value["Id"].as_str() != Some(container_id)
+            || value["Name"].as_str() != Some(&format!("/{}", Self::name(spec)))
+            || value["Config"]["Labels"]["attune.io/process-intent"].as_str()
+                != Some(&spec.intent.to_string())
+            || value["Config"]["Labels"]["attune.io/process-policy"].as_str()
+                != Some(digest.as_str())
+            || value["Config"]["Labels"]["attune.io/process-engine"].as_str() != Some(daemon_id)
+        {
+            return Err(EngineError::OwnershipMismatch);
+        }
+        Ok((
+            container_id.clone(),
+            value["State"]["Status"]
+                .as_str()
+                .ok_or(EngineError::InvalidResponse)?
+                .into(),
+        ))
+    }
+    /// Caller has committed terminal/custody state and an empty or published
+    /// ordinary-file inventory. This returns only positive Wait+Remove evidence;
+    /// private staging stays owned until its separate receipt-gated cleanup.
+    pub async fn remove_stopped(
+        &self,
+        spec: &ProcessSpec,
+        resource: &ResourceIdentity,
+    ) -> attune_common::Result<()> {
+        let (id, state) = self
+            .cleanup_exact(spec, resource)
+            .await
+            .map_err(common_error)?;
+        if !matches!(state.as_str(), "created" | "exited") {
+            return Err(common_error(EngineError::OwnershipMismatch));
+        }
+        self.wait_id(&id).await.map_err(common_error)?;
+        let response = self
+            .engine
+            .control
+            .delete(DockerEngine::url(&["containers", &id]))
+            .query(&[("force", "false"), ("v", "false")])
+            .send()
+            .await
+            .map_err(|_| common_error(EngineError::Transport))?;
+        if response.status() != StatusCode::NO_CONTENT {
+            return Err(common_error(EngineError::Rejected(
+                response.status().as_u16(),
+            )));
+        }
+        Ok(())
     }
     async fn wait_id(&self, id: &str) -> Result<LaunchExitOutcome> {
         let response = self
@@ -284,12 +399,21 @@ impl ProcessLauncher for DockerLauncher {
         spec: &ProcessSpec,
         create: ProcessCreateDisposition,
     ) -> attune_common::Result<ResourceIdentity> {
+        if create == ProcessCreateDisposition::ReconcileOnly {
+            let (id, _) = self
+                .reconcile_owned(spec)
+                .await
+                .map_err(common_error)?
+                .ok_or_else(|| common_error(EngineError::Transport))?;
+            return Ok(ResourceIdentity::Docker {
+                engine_id: self.binding.engine_id,
+                daemon_id: self.binding.daemon_id.clone(),
+                container_id: id,
+            });
+        }
         let id = if let Some((id, _)) = self.inspect(spec, None).await.map_err(common_error)? {
             id
         } else {
-            if create == ProcessCreateDisposition::ReconcileOnly {
-                return Err(common_error(EngineError::Transport));
-            }
             let image_env = self
                 .engine
                 .image_environment_for_binding(&self.binding, &self.policy, &spec.image)
@@ -481,7 +605,7 @@ impl ProcessControl for DockerControl {
     async fn wait(&self) -> attune_common::Result<LaunchExitOutcome> {
         let (id, _) = self
             .launcher
-            .exact(&self.spec, &self.resource)
+            .cleanup_exact(&self.spec, &self.resource)
             .await
             .map_err(common_error)?;
         self.launcher.wait_id(&id).await.map_err(common_error)
@@ -490,7 +614,7 @@ impl ProcessControl for DockerControl {
         self.writer.lock().await.take();
         let (id, _) = self
             .launcher
-            .exact(&self.spec, &self.resource)
+            .cleanup_exact(&self.spec, &self.resource)
             .await
             .map_err(common_error)?;
         let response = self
@@ -668,5 +792,96 @@ mod tests {
         let paths = server.await.unwrap();
         assert_eq!(paths.len(), 2);
         assert!(paths.iter().all(|p| !p.contains("/create")));
+    }
+    #[tokio::test]
+    async fn cleanup_rejects_cross_daemon_and_malformed_selectors_before_engine_io() {
+        let path = tempfile::tempdir().unwrap();
+        let socket = path.path().join("owned-cleanup.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (launcher, spec, _root) = fixture(&socket);
+        for (engine_id, daemon_id, container_id) in [
+            (6, "owned-daemon", "a".repeat(64)),
+            (5, "other-daemon", "a".repeat(64)),
+            (5, "owned-daemon", "../foreign-selector".into()),
+        ] {
+            let resource = ResourceIdentity::Docker {
+                engine_id,
+                daemon_id: daemon_id.into(),
+                container_id,
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                launcher.remove_stopped(&spec, &resource),
+            )
+            .await
+            .expect("rejection must precede transport");
+            assert!(result.is_err());
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), listener.accept())
+                .await
+                .is_err(),
+            "rejected cleanup must not contact Engine"
+        );
+    }
+    #[tokio::test]
+    async fn reconciliation_recovers_public_ownership_after_policy_change_without_run_permission() {
+        let path = tempfile::tempdir().unwrap();
+        let socket = path.path().join("owned-reconcile.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (mut launcher, mut spec, _root) = fixture(&socket);
+        let id = "b".repeat(64);
+        let expected_id = id.clone();
+        let digest = crate::process_policy::public_digest(&spec).unwrap();
+        let body=serde_json::json!({"Id":id,"Name":format!("/{}",DockerLauncher::name(&spec)),"Config":{"Labels":{
+            "attune.io/process-intent":spec.intent.to_string(),"attune.io/process-policy":digest.as_str(),"attune.io/process-engine":"owned-daemon"}},"State":{"Status":"exited"}}).to_string();
+        let original_invocation = spec.invocation.clone();
+        spec.invocation.argv.clear();
+        spec.invocation.env.clear();
+        launcher.policy.allowed_images.clear();
+        launcher.policy.memory_bytes *= 2;
+        launcher.bootstrap.sha256 = Sha256Digest::of_bytes(b"changed-public-helper");
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0; 1024];
+                while !request.windows(4).any(|b| b == b"\r\n\r\n") {
+                    let n = stream.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buf[..n]);
+                    assert!(request.len() < 8192);
+                }
+                let request = String::from_utf8(request).unwrap();
+                let first = request.lines().next().unwrap();
+                assert!(first.starts_with("GET "));
+                let response = if first.contains("/info ") {
+                    r#"{"ID":"owned-daemon","OSType":"linux","Architecture":"amd64","SecurityOptions":["name=seccomp,profile=builtin"]}"#
+                } else {
+                    assert!(first.contains("/containers/"));
+                    body.as_str()
+                };
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).as_bytes()).await.unwrap();
+            }
+            listener
+        });
+        let resource = launcher
+            .prepare(&spec, ProcessCreateDisposition::ReconcileOnly)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resource,ResourceIdentity::Docker{container_id,..} if container_id==&expected_id)
+        );
+        let listener = server.await.unwrap();
+        spec.invocation = original_invocation;
+        let denied = tokio::time::timeout(Duration::from_secs(1), launcher.start(&spec, &resource))
+            .await
+            .expect("new Run must deny before transport");
+        assert!(denied.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), listener.accept())
+                .await
+                .is_err()
+        );
     }
 }

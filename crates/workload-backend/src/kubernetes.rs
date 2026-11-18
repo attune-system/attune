@@ -19,7 +19,7 @@ use attune_common::{
 };
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
-    api::{AttachParams, PostParams},
+    api::{AttachParams, DeleteParams, PostParams, Preconditions},
     Api, Client,
 };
 use serde_json::json;
@@ -206,6 +206,99 @@ impl KubernetesLauncher {
         self.verify(spec, &pod, Some(pod_uid))?;
         Ok(pod)
     }
+    /// Original persisted ownership is enough for stop/removal after policy or
+    /// helper-image updates. It never permits attach, stdin or a new start.
+    async fn cleanup_exact(&self, spec: &ProcessSpec, resource: &ResourceIdentity) -> Result<Pod> {
+        let ResourceIdentity::Kubernetes {
+            cluster,
+            namespace,
+            pod_name: name,
+            pod_uid,
+        } = resource
+        else {
+            return Err(invalid());
+        };
+        if cluster != &self.policy.cluster
+            || namespace != &self.policy.namespace
+            || name != &pod_name(spec)
+        {
+            return Err(invalid());
+        }
+        let pod = self.pods().get(name).await.map_err(|_| invalid())?;
+        let digest = public_digest(spec)?;
+        if pod.metadata.uid.as_deref() != Some(pod_uid)
+            || pod.metadata.labels.as_ref().and_then(|v| v.get(OWNER))
+                != Some(&spec.intent.to_string())
+            || pod
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|v| v.get(PROOF))
+                .map(String::as_str)
+                != Some(digest.as_str())
+        {
+            return Err(invalid());
+        }
+        Ok(pod)
+    }
+    /// The trusted owning loop first commits terminal state/custody and proves
+    /// the ordinary-file inventory empty or durably published. This method is
+    /// only the exact provider effect, never a custody/publication ACK.
+    pub async fn remove_stopped(
+        &self,
+        spec: &ProcessSpec,
+        resource: &ResourceIdentity,
+    ) -> Result<()> {
+        let pod = self.cleanup_exact(spec, resource).await?;
+        if !pod
+            .status
+            .as_ref()
+            .and_then(|s| s.container_statuses.as_ref())
+            .is_some_and(|ss| {
+                ss.iter().any(|s| {
+                    s.name == PAYLOAD_CONTAINER
+                        && s.state.as_ref().is_some_and(|s| s.terminated.is_some())
+                })
+            })
+        {
+            return Err(invalid());
+        }
+        let ResourceIdentity::Kubernetes {
+            pod_name, pod_uid, ..
+        } = resource
+        else {
+            return Err(invalid());
+        };
+        // A positive UID-preconditioned Delete acknowledgement precedes all
+        // absence observations. Timeout/404 before ACK remains unknown.
+        self.pods()
+            .delete(
+                pod_name,
+                &DeleteParams {
+                    preconditions: Some(Preconditions {
+                        uid: Some(pod_uid.clone()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|_| invalid())?;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                match self.pods().get_opt(pod_name).await.map_err(|_| invalid())? {
+                    None => return Ok(()),
+                    Some(pod) if pod.metadata.uid.as_deref() != Some(pod_uid) => {
+                        return Err(invalid())
+                    }
+                    _ => {}
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| invalid())?
+    }
     async fn ready(&self, spec: &ProcessSpec, resource: &ResourceIdentity) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(120), async {
             loop {
@@ -290,6 +383,28 @@ impl ProcessLauncher for KubernetesLauncher {
         spec: &ProcessSpec,
         create: ProcessCreateDisposition,
     ) -> Result<ResourceIdentity> {
+        if create == ProcessCreateDisposition::ReconcileOnly {
+            // Discovery recovers original public ownership even after image or
+            // helper policy changes. It grants no attach/start/stdin effect.
+            let pod = self
+                .pods()
+                .get_opt(&pod_name(spec))
+                .await
+                .map_err(|_| invalid())?
+                .ok_or_else(invalid)?;
+            let resource = ResourceIdentity::Kubernetes {
+                cluster: self.policy.cluster.clone(),
+                namespace: self.policy.namespace.clone(),
+                pod_name: pod_name(spec),
+                pod_uid: pod
+                    .metadata
+                    .uid
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(invalid)?,
+            };
+            self.cleanup_exact(spec, &resource).await?;
+            return Ok(resource);
+        }
         let expected = self.policy.pod(spec)?;
         match self
             .pods()
@@ -298,7 +413,6 @@ impl ProcessLauncher for KubernetesLauncher {
             .map_err(|_| invalid())?
         {
             Some(pod) => self.verify(spec, &pod, None),
-            None if create == ProcessCreateDisposition::ReconcileOnly => Err(invalid()),
             None => {
                 let pod = self
                     .pods()
@@ -310,6 +424,7 @@ impl ProcessLauncher for KubernetesLauncher {
         }
     }
     async fn start(&self, spec: &ProcessSpec, resource: &ResourceIdentity) -> Result<ProcessIo> {
+        self.policy.pod(spec)?; // Current operator image ceiling for new Run.
         crate::process_policy::validate_invocation(spec)?;
         self.ready(spec, resource).await?;
         self.seed(spec).await?;
@@ -354,7 +469,10 @@ impl ProcessControl for PodControl {
     }
     async fn wait(&self) -> Result<LaunchExitOutcome> {
         loop {
-            let pod = self.launcher.exact(&self.spec, &self.resource).await?;
+            let pod = self
+                .launcher
+                .cleanup_exact(&self.spec, &self.resource)
+                .await?;
             if let Some(terminal) = pod
                 .status
                 .and_then(|s| s.container_statuses)
@@ -373,7 +491,9 @@ impl ProcessControl for PodControl {
         }
     }
     async fn stop(&self, _: LaunchStopReason) -> Result<LaunchExitOutcome> {
-        self.launcher.exact(&self.spec, &self.resource).await?;
+        self.launcher
+            .cleanup_exact(&self.spec, &self.resource)
+            .await?;
         self.stdin.lock().await.take();
         // The fixed helper kills only the payload PID namespace. Namespace
         // teardown may close exec before its reply; only the subsequent exact

@@ -143,7 +143,7 @@ jobs:
           cargo test --locked -p attune-common --lib workload_archive::tests:: -- --test-threads=4
       - name: Verify pure planner and actual helper refuses direct-host setup
         run: |
-          cargo test --locked -p attune-worker --lib runtime::launch_planning::tests:: -- --test-threads=4
+          cargo test --locked -p attune-workload-backend --lib planning::tests:: -- --test-threads=4
           cargo build --locked --profile test -p attune-workload-backend --bin attune-workload-runner
           python3 scripts/test-workload-runner.py --binary target/debug/attune-workload-runner
   docker-controller-publication:
