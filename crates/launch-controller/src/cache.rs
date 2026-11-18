@@ -46,6 +46,12 @@ pub struct CacheStore {
     root: PathBuf,
     limits: CacheLimits,
 }
+/// Public random binding sentinel; never an input pin or credential. Directory
+/// stays owned until the corresponding probe container removal is acknowledged.
+pub(crate) struct BindingSentinel {
+    pub nonce: uuid::Uuid,
+    pub payload: String,
+}
 struct Lock(File);
 impl Drop for Lock {
     fn drop(&mut self) {
@@ -86,6 +92,34 @@ impl CacheStore {
             }
         }
         Ok(Self { root, limits })
+    }
+    pub(crate) fn prepare_binding(&self) -> Result<BindingSentinel> {
+        let _lock = self.lock()?;
+        let nonce = uuid::Uuid::new_v4();
+        let parent = self.root.join("binding");
+        fs::create_dir_all(&parent)?;
+        let directory = parent.join(nonce.simple().to_string());
+        fs::create_dir(&directory)?;
+        let payload = uuid::Uuid::new_v4().to_string();
+        let path = directory.join("sentinel");
+        fs::write(&path, payload.as_bytes())?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o444))?;
+        Ok(BindingSentinel { nonce, payload })
+    }
+    /// Called only after definitive non-submission/rejection or actual removal.
+    pub(crate) fn cleanup_binding(&self, sentinel: &BindingSentinel) -> Result<()> {
+        let _lock = self.lock()?;
+        let path = self
+            .root
+            .join("binding")
+            .join(sentinel.nonce.simple().to_string());
+        if !fs::symlink_metadata(&path)?.is_dir()
+            || fs::read(path.join("sentinel"))? != sentinel.payload.as_bytes()
+        {
+            return Err(CacheError::PinMismatch);
+        }
+        fs::remove_dir_all(path)?;
+        Ok(())
     }
     fn lock(&self) -> Result<Lock> {
         let file = OpenOptions::new()

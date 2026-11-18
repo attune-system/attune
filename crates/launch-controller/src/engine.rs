@@ -293,6 +293,7 @@ struct VolumeMount {
     kind: String,
     source: String,
     target: String,
+    #[serde(default)]
     read_only: bool,
     volume_options: VolumeOptions,
 }
@@ -507,6 +508,207 @@ impl DockerEngine {
         }
         Ok(())
     }
+    /// Owned startup probe, using fixed commands and an operator-selected image.
+    /// It is not a launch-admission API. The random sentinel is written through
+    /// the controller's local mount and read through the Engine's exact named
+    /// volume/subpath. A remote/mismatched volume cannot pass by mere existence.
+    pub async fn verify_cache_binding(
+        &self,
+        policy: &EnginePolicy,
+        cache: &crate::cache::CacheStore,
+        image: &str,
+    ) -> Result<()> {
+        use attune_common::workload_launch::{
+            FrozenContextRef, LaunchInvocation, LaunchPurpose, LaunchRoot, LaunchTarget,
+            PinnedImage, RUNNER_ROOT,
+        };
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Volume {
+            name: String,
+            driver: String,
+            options: Option<BTreeMap<String, String>>,
+        }
+        policy.validate()?;
+        self.verify_daemon_policy().await?;
+        if !policy.allowed_images.contains(image) {
+            return Err(EngineError::Policy("probe image exceeds operator ceiling"));
+        }
+        let volume: Volume = decode(
+            self.control
+                .get(Self::url(&["volumes", &policy.cache_volume]))
+                .send()
+                .await
+                .map_err(|_| EngineError::Transport)?,
+        )
+        .await?;
+        if volume.name != policy.cache_volume
+            || volume.driver != "local"
+            || volume.options.is_some_and(|options| !options.is_empty())
+        {
+            return Err(EngineError::Policy(
+                "existing Docker-managed local named cache volume is required",
+            ));
+        }
+        let image_env = self.image_environment(image).await?;
+        let image_digest = image
+            .rsplit_once("sha256:")
+            .and_then(|(_, digest)| Sha256Digest::parse(digest).ok())
+            .ok_or(EngineError::Policy("probe image must be immutable"))?;
+        let sentinel = cache
+            .prepare_binding()
+            .map_err(|_| EngineError::Policy("cannot create owned binding sentinel"))?;
+        let manifest = LaunchManifest {
+            launch_id: i64::MAX,
+            purpose: LaunchPurpose::RuntimeProbe,
+            target: LaunchTarget::RuntimeProbe {
+                admission: i64::MAX,
+                attempt: sentinel.nonce,
+            },
+            owner_identity_id: i64::MAX,
+            engine_id: policy.engine_id,
+            engine_name_nonce: sentinel.nonce,
+            image: PinnedImage {
+                reference: image.into(),
+                sha256: image_digest,
+            },
+            context: FrozenContextRef {
+                id: i64::MAX,
+                version: 1,
+                ciphertext_sha256: Sha256Digest::of_bytes(sentinel.payload.as_bytes()),
+            },
+            inputs: vec![],
+            pack_access: PackAccess::ReadOnly,
+            stage: None,
+            timeout_ms: Some(15000),
+            lease_deadline: chrono::Utc::now() + chrono::Duration::seconds(30),
+        };
+        let spec = LaunchSpec {
+            manifest,
+            invocation: LaunchInvocation {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "test -e /proc/self/fd && cat /opt/attune/runner/sentinel".into(),
+                ],
+                env: BTreeMap::new(),
+                working_root: LaunchRoot::Scratch,
+            },
+        };
+        let mut prepared = match policy.prepare(&spec, &image_env) {
+            Ok(value) => value,
+            Err(error) => {
+                cache
+                    .cleanup_binding(&sentinel)
+                    .map_err(|_| EngineError::Policy("binding sentinel cleanup failed"))?;
+                return Err(error);
+            }
+        };
+        prepared.body.host_config.mounts = vec![VolumeMount::new(
+            &policy.cache_volume,
+            format!("binding/{}", sentinel.nonce.simple()),
+            RUNNER_ROOT,
+            true,
+        )];
+        prepared.body.labels.insert(
+            "io.attune.launch.binding-probe".into(),
+            sentinel.nonce.to_string(),
+        );
+        prepared.public.labels = prepared.body.labels.clone();
+        prepared.public.host = prepared.body.host_config.clone();
+        prepared.public.digest = Sha256Digest::of_bytes(
+            &serde_json::to_vec(&PublicEngineManifest {
+                image: image.into(),
+                user: prepared.body.user.clone(),
+                labels: prepared.public.labels.clone(),
+                host: prepared.public.host.clone(),
+            })
+            .map_err(|_| EngineError::InvalidResponse)?,
+        );
+        let container = match self.create_once(&prepared).await? {
+            CreateOutcome::Created(container) => container,
+            CreateOutcome::DefinitivelyRejected { status } => {
+                cache
+                    .cleanup_binding(&sentinel)
+                    .map_err(|_| EngineError::Policy("binding sentinel cleanup failed"))?;
+                return Err(EngineError::Rejected(status));
+            }
+            // Never treat absent inspect after an unknown create as settlement.
+            CreateOutcome::ReconcileRequired => self
+                .reconcile(&prepared.public)
+                .await?
+                .ok_or(EngineError::Transport)?,
+        };
+        let stdout = crate::capture::Capture::new(4096)?;
+        let stderr = crate::capture::Capture::new(4096)?;
+        let mut reader = None;
+        let run = tokio::time::timeout(Duration::from_secs(15), async {
+            let attached = self.attach(&container).await?;
+            let (read, mut stdin) = tokio::io::split(attached);
+            reader = Some(tokio::spawn(demultiplex(
+                read,
+                stdout.clone(),
+                stderr.clone(),
+            )));
+            self.start_once(&container).await?;
+            stdin.shutdown().await?;
+            let exit = self.wait(&container).await?;
+            if exit.exit_code != 0 || exit.oom_killed {
+                return Err(EngineError::Policy("cache binding probe command failed"));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| EngineError::Transport)
+        .and_then(|value| value);
+        // Even a failed start can leave an extant container holding the mount.
+        // Wait+Remove first; uncertain removal retains the owned sentinel.
+        let cleanup = async {
+            self.stop_and_wait(&container, 1).await?;
+            self.remove_stopped(&container).await?;
+            cache
+                .cleanup_binding(&sentinel)
+                .map_err(|_| EngineError::Policy("binding sentinel cleanup failed"))?;
+            Ok::<_, EngineError>(())
+        }
+        .await;
+        let mut reader_result = Ok(());
+        if let Some(mut task) = reader {
+            if cleanup.is_err() {
+                task.abort();
+                let _ = task.await;
+            } else {
+                reader_result = match tokio::time::timeout(Duration::from_secs(5), &mut task).await
+                {
+                    Ok(result) => result
+                        .map_err(|_| EngineError::InvalidResponse)
+                        .and_then(|result| result),
+                    Err(_) => {
+                        task.abort();
+                        let _ = task.await;
+                        Err(EngineError::Transport)
+                    }
+                };
+            }
+        }
+        cleanup?;
+        reader_result?;
+        run?;
+        let output = stdout.read(0, 4096)?;
+        let error = stderr.read(0, 4096)?;
+        if !output.eof
+            || !error.eof
+            || output.truncated_bytes != 0
+            || error.truncated_bytes != 0
+            || !error.bytes.is_empty()
+            || output.bytes != sentinel.payload.as_bytes()
+        {
+            return Err(EngineError::Policy(
+                "controller and Engine cache binding differs",
+            ));
+        }
+        Ok(())
+    }
     pub async fn create_once(&self, prepared: &PreparedContainer) -> Result<CreateOutcome> {
         let response = match self
             .control
@@ -685,10 +887,7 @@ impl DockerEngine {
             .await
             .map_err(|_| EngineError::Transport)?;
         let value: WaitResponse = decode(response).await?;
-        if value.error.is_some() {
-            return Err(EngineError::InvalidResponse);
-        }
-        let inspection: ContainerInspection = decode(
+        let inspection: StateInspection = decode(
             self.control
                 .get(Self::url(&[
                     "containers",
@@ -704,7 +903,15 @@ impl DockerEngine {
             return Err(EngineError::InvalidResponse);
         }
         Ok(ExitStatus {
-            exit_code: value.status_code,
+            // Docker can acknowledge Wait for a never-started container while
+            // reporting its launch error. That is failed execution, but still
+            // permits non-forced removal after inspection proves not running.
+            // Never allow an error-bearing zero status to become setup success.
+            exit_code: if value.error.is_some() && value.status_code == 0 {
+                -1
+            } else {
+                value.status_code
+            },
             oom_killed: inspection.state.oom_killed,
         })
     }
@@ -804,6 +1011,10 @@ struct ContainerInspection {
     name: String,
     config: ObservedConfig,
     host_config: HostPolicy,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct StateInspection {
     state: ObservedState,
 }
 #[derive(Deserialize)]

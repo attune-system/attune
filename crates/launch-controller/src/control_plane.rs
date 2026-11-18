@@ -31,7 +31,18 @@ pub struct ControlPlane {
 }
 impl ControlPlane {
     pub fn new(base: Url, credential: LaunchToken) -> Result<Self> {
-        if !matches!(base.scheme(), "https" | "http")
+        Self::with_policy(
+            base,
+            credential,
+            attune_common::workload_launch_io::LaunchHttpPolicy::TlsOrLoopback,
+        )
+    }
+    pub fn with_policy(
+        base: Url,
+        credential: LaunchToken,
+        policy: attune_common::workload_launch_io::LaunchHttpPolicy,
+    ) -> Result<Self> {
+        if !policy.allows_origin(&base)
             || base.host_str().is_none()
             || !base.username().is_empty()
             || base.password().is_some()
@@ -252,6 +263,28 @@ impl ControlPlane {
                     return Err(ControlError::Response);
                 }
             }
+            ClaimedLaunch::Capture {
+                manifest,
+                status,
+                lease,
+            } => {
+                validate_lease(lease, &launch.request)?;
+                validate_status(status, &launch.request)?;
+                if manifest.launch_id != launch.request.launch_id
+                    || manifest
+                        .admitted_digest()
+                        .map_err(|_| ControlError::Response)?
+                        != launch.request.admitted_digest
+                    || manifest.engine_id != lease.handle.engine_id
+                    || manifest.engine_name_nonce != lease.handle.engine_name_nonce
+                    || lease.purpose != LaunchLeasePurpose::Capture
+                    || status.state != LaunchState::Stopped
+                    || status.capture != LaunchCaptureState::Pending
+                    || status.capture_deadline.is_none()
+                {
+                    return Err(ControlError::Response);
+                }
+            }
         }
         Ok(claim)
     }
@@ -310,6 +343,7 @@ impl ControlPlane {
             .await?;
         validate_lease(&renewed, &request(&lease.handle))?;
         if renewed.handle.engine_id != lease.handle.engine_id
+            || renewed.purpose != lease.purpose
             || renewed.handle.engine_name_nonce != lease.handle.engine_name_nonce
             || renewed.handle.lease_id != lease.handle.lease_id
             || renewed.handle.lease_generation != lease.handle.lease_generation
