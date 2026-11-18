@@ -382,6 +382,95 @@ impl ExecutionProcessRepository {
         Ok(())
     }
 
+    /// CLI stdin is derived from the same restored input and bound argument
+    /// contract as argv. Original parameters stay in encrypted context; no new
+    /// plaintext fingerprint or independently supplied payload is authority.
+    async fn action_stdin(
+        connection: &mut sqlx::PgConnection,
+        context: &FrozenProcess,
+    ) -> Result<Vec<u8>> {
+        use super::{
+            execution::ExecutionRepository,
+            schema_contract::{BindingOwner, SchemaContractRepository},
+            FindById,
+        };
+        use crate::{
+            action_cli::{ArgumentLimits, ArgumentPlan, InputDelivery, SelectedProgram},
+            models::{ParameterDelivery, ParameterFormat},
+            workload_launch::RUNNER_ROOT,
+        };
+        let LaunchTarget::Execution {
+            execution,
+            worker,
+            attempt,
+            ..
+        } = context.target
+        else {
+            return Err(denied());
+        };
+        let execution = ExecutionRepository::find_by_id(&mut *connection, execution)
+            .await?
+            .ok_or_else(denied)?;
+        let snapshot = execution.executable_snapshot.as_ref().ok_or_else(denied)?;
+        let action = &snapshot.executable.action;
+        let Some(launch) = &action.launch else {
+            return Ok(context.stdin.as_bytes().to_vec());
+        };
+        if !matches!(
+            launch,
+            crate::pack_format::LaunchSpec::Native { .. }
+                | crate::pack_format::LaunchSpec::Command { .. }
+        ) || action.parameter_format != ParameterFormat::Json
+        {
+            return Err(denied());
+        }
+        let selected: Option<sqlx::types::Json<SelectedProgram>> = sqlx::query_scalar(
+            "SELECT selection FROM execution_program_selection WHERE execution=$1 AND attempt=$2 AND worker=$3 AND release=$4 FOR SHARE",
+        ).bind(execution.id).bind(attempt).bind(worker).bind(snapshot.release.id)
+            .fetch_optional(&mut *connection).await?;
+        let selected = selected.ok_or_else(denied)?.0;
+        let binding =
+            SchemaContractRepository::find(connection, BindingOwner::Execution, execution.id)
+                .await?
+                .ok_or_else(denied)?;
+        let schema = action
+            .param_schema
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let plan =
+            ArgumentPlan::from_bound_contract(&schema, launch.action_arguments()?, binding.input)
+                .map_err(|_| denied())?;
+        let delivery = match action.parameter_delivery {
+            ParameterDelivery::None => InputDelivery::None,
+            ParameterDelivery::Stdin => InputDelivery::Stdin,
+            _ => return Err(denied()),
+        };
+        let parameters: serde_json::Value =
+            serde_json::from_str(&context.stdin).map_err(|_| denied())?;
+        let materialized = plan
+            .materialize(
+                selected.argument_budget_program()?,
+                &parameters,
+                &[],
+                delivery,
+                ArgumentLimits::default(),
+            )
+            .map_err(|_| denied())?;
+        let mut expected = vec![
+            format!("{RUNNER_ROOT}/linux-{}", context.platform.native_arch()),
+            "exec".into(),
+            selected.sha256,
+            selected.path.to_str().ok_or_else(denied)?.to_owned(),
+            selected.invocation_name,
+        ];
+        expected.extend(materialized.argv().iter().cloned());
+        if context.invocation.argv != expected {
+            return Err(denied());
+        }
+        Ok(materialized.stdin_json().unwrap_or("").as_bytes().to_vec())
+    }
+
     /// Reserve BEFORE provider creation. A retry with changed private context
     /// is denied; randomized ciphertext has no public plaintext-secret digest.
     pub async fn reserve(
@@ -421,6 +510,7 @@ impl ExecutionProcessRepository {
         }
         input.ensure_fresh().await?;
         let (_, _, _, expiry) = input.into_parts();
+        Self::action_stdin(&mut tx, &context).await?;
         let epochs = workload_source::snapshot(&mut tx, proof.sources).await?;
         sqlx::query("INSERT INTO execution_process_effect(intent,target,encrypted_context,source_epochs) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
             .bind(spec.intent).bind(Json(&spec.target)).bind(encrypted).bind(Json(&epochs))
@@ -556,6 +646,7 @@ impl ExecutionProcessRepository {
         }
         input.ensure_fresh().await?;
         let (_, _, _, expiry) = input.into_parts();
+        let payload = Self::action_stdin(&mut tx, &context).await?;
         let epochs = workload_source::snapshot(&mut tx, proof.sources).await?;
         let record: Record = sqlx::query_as(&format!(
             "SELECT {COLUMNS} FROM execution_process_effect WHERE intent=$1 FOR UPDATE"
@@ -585,7 +676,7 @@ impl ExecutionProcessRepository {
         tx.commit().await?;
         expiry.ensure_fresh()?;
         fresh(proof.deadline)?;
-        LaunchStdinPayload::from_bytes(context.stdin.into_bytes())
+        LaunchStdinPayload::from_bytes(payload)
     }
 
     /// Record only the exact native resource's terminal outcome. It closes

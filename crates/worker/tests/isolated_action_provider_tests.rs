@@ -154,17 +154,29 @@ async fn remove_owned(client: Client, identity: &ResourceIdentity) -> Result<()>
 #[tokio::test]
 #[ignore = "requires explicit owned Kubernetes namespace, pinned binaries/images and disposable PostgreSQL"]
 async fn kubernetes_native_action_custody_completion_and_restart() -> Result<()> {
-    owning_case(true).await
+    let _provider = KUBERNETES_CASE.lock().await;
+    owning_case(true, false).await
 }
 
 // No provider effect is claimed: this catches actual preparer/custody/completion
 // regressions on PostgreSQL before the owning namespace job executes the Pod.
 #[tokio::test]
 async fn trusted_worker_completion_and_custody_repository_case() -> Result<()> {
-    owning_case(false).await
+    owning_case(false, false).await
 }
 
-async fn owning_case(real_provider: bool) -> Result<()> {
+// Each real case requires the owned node's fixed payload CPU budget. Retain
+// four database-test threads while serializing only these shared-provider cases.
+static KUBERNETES_CASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[tokio::test]
+#[ignore = "requires explicit owned Kubernetes namespace, pinned binaries/images and disposable PostgreSQL"]
+async fn kubernetes_native_cli_action_custody_completion_and_restart() -> Result<()> {
+    let _provider = KUBERNETES_CASE.lock().await;
+    owning_case(true, true).await
+}
+
+async fn owning_case(real_provider: bool, typed_cli: bool) -> Result<()> {
     attune_common::auth::install_crypto_provider();
     let root = tempfile::tempdir()?;
     let (platform, echo, runner, client, payload_image) = if real_provider {
@@ -256,6 +268,23 @@ async fn owning_case(real_provider: bool) -> Result<()> {
         .with_param_schema(json!({"message":{"type":"string","required":true}}))
         .create(&database)
         .await?;
+    let action = if typed_cli {
+        use attune_common::repositories::{
+            action::{ActionRepository, UpdateActionInput},
+            Patch,
+        };
+        ActionRepository::update(&database, action.id, UpdateActionInput {
+            entrypoint: Some(Patch::Clear),
+            launch: Some(Patch::Set(serde_json::from_value(json!({
+                "type":"native", "artifact":"echo", "arguments":[{"literal":"literal value; $(false)","order":0}]
+            }))?)),
+            parameter_delivery: Some("stdin".into()), parameter_format: Some("json".into()),
+            param_schema: Some(json!({"message":{"type":"string","required":true,"cli":{"kind":"positional","order":1}}})),
+            ..Default::default()
+        }).await?
+    } else {
+        action
+    };
     // Use the primary upload/initialization publication contract, including
     // its sidecar format_version:1 inventory. The offline CLI release format
     // is deliberately not an alternate producer/reader in this owning case.
@@ -276,6 +305,32 @@ async fn owning_case(real_provider: bool) -> Result<()> {
     std::fs::copy(&echo, &executable)?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))?;
+    if typed_cli {
+        let bytes = std::fs::read(&executable)?;
+        let path = format!("actions/{binary_relative}");
+        let metadata = json!({
+            "schema":"attune.pack.release/v1", "pack":{"ref":pack.r#ref,"version":pack.version},
+            "requires":{"attune":"*","platform_catalog":"v1","runtimes":["native"]},
+            "dependencies":{}, "evidence":{"sboms":[],"provenance":[]},
+            "files":[{"path":path,"size":bytes.len(),"sha256":Sha256Digest::of_bytes(&bytes).as_str(),"mode":"0755"}],
+            "artifacts":[{"kind":"native","id":"echo","component_refs":[action.r#ref],"variants":[{
+                "id":format!("linux-{}-static", platform.native_arch()),"path":path,
+                "target":{"os":"linux","arch":platform.native_arch(),"libc":"static"}
+            }]}]
+        });
+        std::fs::create_dir_all(source.join(".attune"))?;
+        std::fs::write(
+            source.join(pack_format::MANIFEST_PATH),
+            serde_json::to_vec(&metadata)?,
+        )?;
+        std::fs::write(
+            source.join("actions/echo.yaml"),
+            serde_json::to_vec(&json!({
+                "ref":action.r#ref,"runner_type":"native","launch":action.launch,"param_schema":action.param_schema,
+                "parameter_delivery":"stdin","parameter_format":"json"
+            }))?,
+        )?;
+    }
     let publication_root = root.path().join("publication");
     let publish_root = publication_root.clone();
     let pack_ref = pack.r#ref.clone();
@@ -574,6 +629,14 @@ async fn owning_case(real_provider: bool) -> Result<()> {
                 .await?
                 .context("trusted producer did not retain its native intent")?;
         intent = retained.intent;
+        if typed_cli {
+            ensure!(
+                retained.invocation.argv.len() == 7
+                    && retained.invocation.argv[5] == "literal value; $(false)"
+                    && retained.invocation.argv[6] == message,
+                "native CLI argv differs from admitted arguments"
+            );
+        }
         let retained_pack = retained
             .inputs
             .iter()

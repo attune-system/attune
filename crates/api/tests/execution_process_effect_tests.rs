@@ -24,7 +24,14 @@ async fn admitted(
 ) -> Result<(ProcessSpec, SelectedExecutionInput, ResourceIdentity)> {
     let owner = ctx.user.as_ref().unwrap().id;
     let token = helpers::delegated_source::token(ctx, owner, &["standard".into()]).await?;
-    let claims = attune_common::auth::jwt::validate_token(&token, &ctx.state.jwt_config)?;
+    admitted_token(ctx, &token).await
+}
+
+async fn admitted_token(
+    ctx: &TestContext,
+    token: &str,
+) -> Result<(ProcessSpec, SelectedExecutionInput, ResourceIdentity)> {
+    let claims = attune_common::auth::jwt::validate_token(token, &ctx.state.jwt_config)?;
     let execution = claims.metadata.unwrap()["execution_id"].as_i64().unwrap();
     let row = ExecutionRepository::find_by_id(&ctx.pool, execution)
         .await?
@@ -1013,4 +1020,164 @@ async fn runtime_file_allocation_cannot_attribute_a_different_execution() -> Res
     assert_eq!(count, 2);
     ctx.cleanup().await?;
     Ok(())
+}
+
+async fn admitted_cli(
+    ctx: &TestContext,
+    delivery: &str,
+) -> Result<(ProcessSpec, SelectedExecutionInput, ResourceIdentity)> {
+    use attune_common::repositories::{
+        action::{ActionRepository, UpdateActionInput},
+        component_lifecycle::PackProjectionIds,
+        runtime::{CreateRuntimeInput, RuntimeRepository},
+        Create, Patch,
+    };
+    let pack_ref = format!("native_cli_{}", Uuid::new_v4().simple());
+    let pack = helpers::create_test_pack(&ctx.pool, &pack_ref).await?;
+    let runtime = RuntimeRepository::create(
+        &ctx.pool,
+        CreateRuntimeInput {
+            r#ref: format!("{pack_ref}.native"),
+            pack: Some(pack.id),
+            pack_ref: Some(pack_ref.clone()),
+            description: None,
+            name: "native".into(),
+            aliases: Vec::new(),
+            distributions: json!({}),
+            installation: None,
+            execution_config: json!({}),
+            auto_detected: false,
+            detection_config: json!({}),
+        },
+    )
+    .await?;
+    let action_ref = format!("{pack_ref}.source");
+    let action = helpers::create_test_action(&ctx.pool, pack.id, &pack_ref, &action_ref).await?;
+    let action = ActionRepository::update(&ctx.pool, action.id, UpdateActionInput {
+        entrypoint: Some(Patch::Clear), runtime: Some(runtime.id),
+        launch: Some(Patch::Set(serde_json::from_value(json!({
+            "type":"native", "artifact":"owned", "arguments":[{"literal":"static literal; $(false)","order":0}]
+        }))?)),
+        parameter_delivery: Some(delivery.into()), parameter_format: Some("json".into()),
+        param_schema: Some(json!({"value":{"type":"string","required":true,"cli":{"kind":"positional","order":1}}})),
+        ..Default::default()
+    }).await?;
+    helpers::activate_test_pack_release_with_projections(
+        &ctx.pool,
+        &pack,
+        &PackProjectionIds {
+            actions: vec![action.id],
+            runtimes: vec![runtime.id],
+            ..Default::default()
+        },
+    )
+    .await?;
+    let execution = helpers::delegated_source::create(
+        &ctx.pool,
+        attune_common::repositories::execution::CreateExecutionInput {
+            action: Some(action.id),
+            action_ref,
+            executor: Some(ctx.user.as_ref().unwrap().id),
+            permission_set_refs: vec!["standard".into()],
+            ..Default::default()
+        },
+    )
+    .await?;
+    let token = helpers::delegated_source::execution_token(ctx, execution.id).await?;
+    admitted_token(ctx, &token).await
+}
+
+async fn cli_stdin_case(delivery: &str) -> Result<()> {
+    use attune_common::{
+        action_cli::SelectedProgram, repositories::execution_program::ExecutionProgramRepository,
+    };
+    attune_common::auth::install_crypto_provider();
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let (mut spec, selected, resource) = admitted_cli(&ctx, delivery).await?;
+    let owner = ctx.user.as_ref().unwrap().id;
+    let master = ctx.state.config.security.encryption_key.as_deref().unwrap();
+    let LaunchTarget::Execution {
+        execution, worker, ..
+    } = spec.target
+    else {
+        unreachable!()
+    };
+    let row = ExecutionRepository::find_by_id(&ctx.pool, execution)
+        .await?
+        .unwrap();
+    let release = row.pack_release.unwrap();
+    let program = SelectedProgram {
+        path: "/opt/attune/pack/bin/owned".into(),
+        sha256: Sha256Digest::of_bytes(b"owned-public-program")
+            .as_str()
+            .into(),
+        invocation_name: "/opt/attune/pack/bin/owned".into(),
+        artifact: Some("owned".into()),
+        variant: Some("linux-amd64-static".into()),
+    };
+    ExecutionProgramRepository::record(&ctx.pool, execution, worker, release, &program).await?;
+    spec.invocation.argv = vec![
+        "/opt/attune/runner/linux-amd64".into(),
+        "exec".into(),
+        program.sha256.clone(),
+        program.path.to_str().unwrap().into(),
+        program.invocation_name.clone(),
+        "static literal; $(false)".into(),
+        "owned-private-parameters".into(),
+    ];
+    let mut changed = spec.clone();
+    changed
+        .invocation
+        .argv
+        .last_mut()
+        .unwrap()
+        .replace_range(.., "owned-private-parametera");
+    assert!(
+        Effects::reserve(&ctx.pool, &changed, owner, &selected, master)
+            .await
+            .is_err()
+    );
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM execution_process_effect WHERE intent=$1")
+            .bind(spec.intent)
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(count, 0);
+    Effects::reserve(&ctx.pool, &spec, owner, &selected, master).await?;
+    Effects::begin_create(&ctx.pool, spec.intent, master).await?;
+    Effects::record_resource(&ctx.pool, spec.intent, &resource).await?;
+    let ciphertext: String = sqlx::query_scalar(
+        "SELECT encrypted_context FROM execution_process_effect WHERE intent=$1",
+    )
+    .bind(spec.intent)
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert!(!ciphertext.contains("owned-private-parameters"));
+    let payload = Effects::consume_stdin(&ctx.pool, spec.intent, &resource, master).await?;
+    if delivery == "none" {
+        assert!(payload.as_bytes().is_empty());
+    } else {
+        assert_eq!(
+            payload.as_bytes(),
+            br#"{"value":"owned-private-parameters"}"#
+        );
+    }
+    drop(payload); // Model losing the effect ACK; never authorize a second write.
+    assert!(
+        Effects::consume_stdin(&ctx.pool, spec.intent, &resource, master)
+            .await
+            .is_err()
+    );
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_cli_none_input_keeps_exact_argv_and_one_shot_empty_stdin() -> Result<()> {
+    cli_stdin_case("none").await
+}
+
+#[tokio::test]
+async fn native_cli_json_input_keeps_exact_argv_and_original_stdin() -> Result<()> {
+    cli_stdin_case("stdin").await
 }
