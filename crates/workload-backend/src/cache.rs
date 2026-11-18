@@ -157,6 +157,38 @@ impl CacheStore {
             files: self.limits.files.min(stage.quota_files).min(100_000),
         })
     }
+    /// The concrete Docker adapter has already observed exact payload exit.
+    /// This is selected-file I/O, not inventory/publication/cleanup authority.
+    pub(crate) fn read_native_artifact(
+        &self,
+        spec: &attune_common::isolated_process::ProcessSpec,
+        relative: &attune_common::artifact_transport::ValidatedRelativePath,
+        remaining: u64,
+    ) -> Result<Option<File>> {
+        let digest =
+            crate::process_policy::public_digest(spec).map_err(|_| CacheError::PinMismatch)?;
+        let _lock = self.lock()?;
+        let parent = self.root.join(format!("private/{}", spec.intent.simple()));
+        let metadata = fs::symlink_metadata(&parent).map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                CacheError::LostArtifactStaging
+            } else {
+                CacheError::Io(e)
+            }
+        })?;
+        if !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || fs::read(parent.join("native-policy"))? != digest.as_str().as_bytes()
+        {
+            return Err(CacheError::AttemptConflict);
+        }
+        crate::artifact_file::read_selected(
+            &parent.join("artifacts"),
+            relative,
+            remaining.min(self.artifact_limits.max_total_bytes),
+            self.artifact_limits,
+        )
+    }
     /// Only the Docker adapter calls this after exact successful container Wait.
     /// Retain one exact body across retry/restart; publication remains caller-owned.
     pub(crate) fn archive_native_stage(
@@ -686,39 +718,7 @@ impl CacheStore {
         )
     }
     fn validate_artifact_tree(&self, root: &Path, limits: ArtifactLimits) -> Result<()> {
-        let root_metadata = fs::symlink_metadata(root).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                CacheError::LostArtifactStaging
-            } else {
-                CacheError::Io(error)
-            }
-        })?;
-        if !root_metadata.is_dir() {
-            return Err(CacheError::UnsafeEntry);
-        }
-        let mut directories = vec![root.to_path_buf()];
-        let (mut files, mut bytes) = (0u64, 0u64);
-        while let Some(directory) = directories.pop() {
-            for entry in fs::read_dir(directory)? {
-                let entry = entry?;
-                let metadata = fs::symlink_metadata(entry.path())?;
-                files = files.checked_add(1).ok_or(CacheError::Quota)?;
-                if files > limits.max_entries {
-                    return Err(CacheError::Quota);
-                }
-                if metadata.is_dir() {
-                    directories.push(entry.path());
-                } else if metadata.is_file() && metadata.nlink() == 1 {
-                    bytes = bytes.checked_add(metadata.len()).ok_or(CacheError::Quota)?;
-                    if bytes > limits.max_total_bytes {
-                        return Err(CacheError::Quota);
-                    }
-                } else {
-                    return Err(CacheError::UnsafeEntry);
-                }
-            }
-        }
-        Ok(())
+        crate::artifact_file::validate_tree(root, limits)
     }
     /// Only pass a receipt decoded from the authenticated CP artifact protocol,
     /// never a frontend body or a locally synthesized terminal state. Persist
@@ -1460,6 +1460,57 @@ mod tests {
             timeout_ms: Some(1000),
             invocation: old.invocation,
         }
+    }
+    #[test]
+    fn native_selected_artifact_checks_retained_policy_and_does_not_infer_lost_root_absence() {
+        use attune_common::artifact_transport::ValidatedRelativePath;
+        let root = tempfile::tempdir().unwrap();
+        let store = CacheStore::open(
+            root.path().into(),
+            CacheLimits {
+                compressed_bytes: 65536,
+                expanded_bytes: 65536,
+                files: 32,
+            },
+        )
+        .unwrap()
+        .for_current_test_user();
+        let mut spec = native_setup();
+        spec.purpose = attune_common::workload_launch::LaunchPurpose::Action;
+        spec.stage = None;
+        let selected = ValidatedRelativePath::new("empty").unwrap();
+        assert!(matches!(
+            store.read_native_artifact(&spec, &selected, 0),
+            Err(CacheError::LostArtifactStaging)
+        ));
+        store.prepare_native_private(&spec).unwrap();
+        assert!(store
+            .read_native_artifact(&spec, &selected, 0)
+            .unwrap()
+            .is_none());
+        let artifacts = root
+            .path()
+            .join(format!("private/{}/artifacts", spec.intent.simple()));
+        fs::write(artifacts.join("empty"), b"").unwrap();
+        assert_eq!(
+            store
+                .read_native_artifact(&spec, &selected, 0)
+                .unwrap()
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .len(),
+            0
+        );
+        let mut changed = spec.clone();
+        changed.timeout_ms = Some(2000);
+        assert!(store.read_native_artifact(&changed, &selected, 0).is_err());
+        fs::remove_file(artifacts.join("empty")).unwrap();
+        fs::remove_dir(&artifacts).unwrap();
+        assert!(matches!(
+            store.read_native_artifact(&spec, &selected, 0),
+            Err(CacheError::LostArtifactStaging)
+        ));
     }
     #[test]
     fn native_stage_archive_keeps_exact_body_across_restart_and_checks_ownership() {

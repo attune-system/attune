@@ -47,6 +47,22 @@ fn main() {
                 }
             })
         }
+        Some("read-artifact") => {
+            let selected = arguments[1..]
+                .iter()
+                .map(|v| v.to_str().map(str::to_owned).ok_or_else(invalid))
+                .collect::<std::io::Result<Vec<_>>>();
+            match boundary_guard_basic()
+                .and(selected)
+                .and_then(|values| attune_workload_backend::transfer_runner::read_artifact(&values))
+            {
+                Ok(true) => Ok(()),
+                Ok(false) => std::process::exit(
+                    attune_workload_backend::transfer_runner::MISSING_ARTIFACT_EXIT_CODE,
+                ),
+                Err(error) => Err(error),
+            }
+        }
         #[cfg(target_os = "linux")]
         Some("terminate") if arguments.len() == 1 => boundary_guard_basic()
             .and_then(|_| attune_workload_backend::transfer_runner::terminate()),

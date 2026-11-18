@@ -131,6 +131,17 @@ Pod/container or stage. The real Python venv/pip console-script and absolute-lin
 Pod regression is part of the required external provider lane; compiling it does
 not establish that it passed.
 
+For action, sensor and candidate-test file outputs, the concrete
+`read_stopped_artifact` effect accepts only the owning loop's validated relative
+path, remaining byte bound and exact stopped resource. It checks the full
+retained artifact tree for aggregate byte/entry limits, links and special files
+before reading the selected file. An empty regular file returns a file; only
+selected-path ENOENT after a valid root/tree returns no file. Lost staging,
+invalid trees, denied provider calls and transport failures remain errors.
+Kubernetes uses a fixed bounded helper read; Docker opens only the attempt's
+owned private artifact subpath. The trusted owning workflow retains inventory,
+disclosure, publication and cleanup decisions; reading bytes is not a receipt.
+
 Archive/output bounds, free-space/admission/concurrency checks and owned cleanup
 are not a universal live filesystem byte/inode quota. Named-volume exhaustion
 remains a residual availability risk unless a tested filesystem quota
