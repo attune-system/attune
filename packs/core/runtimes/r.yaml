@@ -43,6 +43,6 @@ execution_config:
     install_command:
       - sh
       - "-c"
-      - 'cd {pack_dir} && R_LIBS_USER={env_dir}/library Rscript -e "if (file.exists(''renv.lock'')) renv::restore(library=''{env_dir}/library'', prompt=FALSE)" 2>/dev/null || true'
+      - 'cd {pack_dir} && R_LIBS_USER={env_dir}/library Rscript -e "if (file.exists(''renv.lock'')) renv::restore(library=''{env_dir}/library'', prompt=FALSE)"'
   env_vars:
     R_LIBS_USER: "{env_dir}/library"

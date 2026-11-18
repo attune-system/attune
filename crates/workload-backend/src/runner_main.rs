@@ -87,6 +87,7 @@ fn setup() -> std::io::Result<()> {
     }
     let plan: SetupPlan = serde_json::from_slice(&input).map_err(|_| invalid())?;
     plan.validate().map_err(|_| invalid())?;
+    attune_workload_backend::transfer_runner::prepare_setup_project()?;
     // Empty explicit baseline, not Default/capture of the helper's environment.
     let baseline = ChildProcessEnvironment::from_parent(
         std::iter::empty::<(std::ffi::OsString, std::ffi::OsString)>(),
@@ -95,7 +96,7 @@ fn setup() -> std::io::Result<()> {
     .map_err(|_| invalid())?;
     for step in plan.steps {
         if let Some(relative) = step.if_pack_file {
-            let path = Path::new(PACK_ROOT).join(relative);
+            let path = Path::new(attune_workload_backend::planning::PROJECT_ROOT).join(relative);
             match std::fs::metadata(path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Ok(metadata) if metadata.is_file() => {}
@@ -107,7 +108,7 @@ fn setup() -> std::io::Result<()> {
         child
             .args(&step.argv[1..])
             .envs(&plan.environment)
-            .current_dir(PACK_ROOT)
+            .current_dir(attune_workload_backend::planning::PROJECT_ROOT)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
@@ -209,8 +210,15 @@ fn boundary_guard(execution: bool) -> std::io::Result<()> {
         }
         readonly_path(Path::new(RUNTIME_ROOT), execution)?;
     }
-    if execution && std::env::current_dir()? != Path::new(PACK_ROOT).canonicalize()? {
-        return Err(invalid());
+    if execution {
+        let current = std::env::current_dir()?;
+        let pack = Path::new(PACK_ROOT).canonicalize()?;
+        let project = Path::new(attune_workload_backend::planning::PROJECT_ROOT)
+            .canonicalize()
+            .ok();
+        if current != pack && project.as_ref() != Some(&current) {
+            return Err(invalid());
+        }
     }
     Ok(())
 }

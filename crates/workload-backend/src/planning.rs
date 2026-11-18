@@ -4,13 +4,23 @@
 //! they must never be embedded in a public Runner archive or plaintext digest.
 use attune_common::{
     models::runtime::{RuntimeEnvVarConfig, RuntimeEnvVarOperation, RuntimeExecutionConfig},
-    workload_launch::{LaunchPlatform, PACK_ROOT, RUNNER_ROOT, RUNTIME_ROOT},
+    workload_launch::{LaunchPlatform, PackAccess, PACK_ROOT, RUNNER_ROOT, RUNTIME_ROOT},
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt};
 use thiserror::Error;
 
 pub const SETUP_STDIN_LIMIT: usize = 1024 * 1024;
+/// Setup-owned source/project output retained with the published runtime.
+pub const PROJECT_ROOT: &str = "/opt/attune/runtime/project";
+/// Runtime invocations use their frozen setup project. Candidate Pack working
+/// roots remain their private writable copy; mount roots do not change.
+pub fn working_directory(root: attune_common::workload_launch::LaunchRoot) -> &'static str {
+    match root {
+        attune_common::workload_launch::LaunchRoot::Runtime => PROJECT_ROOT,
+        _ => root.container_path(),
+    }
+}
 #[derive(Debug, Error)]
 pub enum PlanningError {
     #[error("invalid pack-relative launch path")]
@@ -35,7 +45,7 @@ pub struct SetupPlan {
 #[serde(deny_unknown_fields)]
 pub struct SetupStep {
     pub argv: Vec<String>,
-    /// Canonical relative path under the immutable Pack root, not a host path.
+    /// Canonical relative path under the private setup project, not a host path.
     /// Missing manifests skip only their dependency step, never environment creation.
     pub if_pack_file: Option<String>,
 }
@@ -165,7 +175,7 @@ pub fn setup_plan(
     selected: &BTreeMap<String, String>,
     hooks: &[Vec<String>],
 ) -> Result<SetupPlan> {
-    let vars = variables(config, None, true)?;
+    let vars = variables(config, None, true, PackAccess::ReadOnly)?;
     let mut environment = runtime_environment(config, selected, &vars)?;
     for (key, value) in [
         ("HOME", "/tmp"),
@@ -221,14 +231,18 @@ pub fn interpreted_argv(
     config: &RuntimeExecutionConfig,
     entry: &str,
     has_runtime: bool,
+    pack_access: PackAccess,
 ) -> Result<Vec<String>> {
     if config.interpreter.binary.is_empty() || (needs_runtime(config) && !has_runtime) {
         return Err(PlanningError::Configuration);
     }
-    let vars = variables(config, Some(entry), has_runtime)?;
+    let vars = variables(config, Some(entry), has_runtime, pack_access)?;
     let mut argv = vec![vars["interpreter"].clone()];
     argv.extend(render_command(&config.interpreter.args, &vars));
-    argv.push(pack_path(entry)?);
+    argv.push(action_path(
+        entry,
+        has_runtime && pack_access == PackAccess::ReadOnly,
+    )?);
     Ok(argv)
 }
 pub fn native_program(entry: &str, is_directory: bool, platform: LaunchPlatform) -> Result<String> {
@@ -244,13 +258,14 @@ pub fn action_environment(
     selected: &BTreeMap<String, String>,
     entry: &str,
     has_runtime: bool,
+    pack_access: PackAccess,
 ) -> Result<BTreeMap<String, String>> {
     if needs_runtime(config) && !has_runtime {
         return Err(PlanningError::Configuration);
     }
     // Action API opt-in and selected secret env are enforced by the owning CP
     // planner. This helper only renders runtime variables against fixed roots.
-    let vars = variables(config, Some(entry), has_runtime)?;
+    let vars = variables(config, Some(entry), has_runtime, pack_access)?;
     let mut output = BTreeMap::from([("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into())]);
     apply_runtime_environment(config, &mut output, &vars);
     output.extend(selected.clone());
@@ -260,16 +275,24 @@ fn variables(
     config: &RuntimeExecutionConfig,
     entry: Option<&str>,
     has_runtime: bool,
+    pack_access: PackAccess,
 ) -> Result<BTreeMap<&'static str, String>> {
+    let use_project = has_runtime && pack_access == PackAccess::ReadOnly;
     let mut vars = BTreeMap::from([
-        ("pack_dir", PACK_ROOT.into()),
+        (
+            "pack_dir",
+            if use_project { PROJECT_ROOT } else { PACK_ROOT }.into(),
+        ),
         ("env_dir", RUNTIME_ROOT.into()),
     ]);
     if let Some(dependency) = &config.dependencies {
-        vars.insert("manifest_path", pack_path(&dependency.manifest_file)?);
+        vars.insert(
+            "manifest_path",
+            action_path(&dependency.manifest_file, use_project)?,
+        );
     }
     if let Some(entry) = entry {
-        vars.insert("action_file", pack_path(entry)?);
+        vars.insert("action_file", action_path(entry, use_project)?);
     }
     let interpreter = if has_runtime {
         config
@@ -364,6 +387,14 @@ fn validate_environment(environment: &BTreeMap<String, String>) -> Result<()> {
     }
     Ok(())
 }
+fn action_path(relative: &str, has_runtime: bool) -> Result<String> {
+    let original = pack_path(relative)?;
+    Ok(if has_runtime {
+        format!("{PROJECT_ROOT}/{relative}")
+    } else {
+        original
+    })
+}
 fn pack_path(relative: &str) -> Result<String> {
     if relative.is_empty()
         || relative.contains(['\\', '\0'])
@@ -422,15 +453,84 @@ mod tests {
             Some("requirements.txt")
         );
         assert_eq!(plan.environment["HOME"], "/tmp");
-        assert!(interpreted_argv(&config, "actions/tool.py", false).is_err());
         assert_eq!(
-            interpreted_argv(&config, "actions/tool.py", true).unwrap(),
+            plan.steps[1].argv.last().unwrap(),
+            "/opt/attune/runtime/project/requirements.txt"
+        );
+        assert_eq!(
+            working_directory(attune_common::workload_launch::LaunchRoot::Runtime),
+            PROJECT_ROOT
+        );
+        assert_eq!(
+            working_directory(attune_common::workload_launch::LaunchRoot::Stage),
+            RUNTIME_ROOT
+        );
+        assert_eq!(
+            working_directory(attune_common::workload_launch::LaunchRoot::Pack),
+            PACK_ROOT
+        );
+        assert!(interpreted_argv(&config, "actions/tool.py", false, PackAccess::ReadOnly).is_err());
+        assert_eq!(
+            interpreted_argv(&config, "actions/tool.py", true, PackAccess::ReadOnly).unwrap(),
             [
                 "/opt/attune/runtime/bin/python3",
                 "-u",
-                "/opt/attune/pack/actions/tool.py"
+                "/opt/attune/runtime/project/actions/tool.py"
             ]
         );
+    }
+    #[test]
+    fn candidate_source_stays_in_writable_pack_while_interpreter_and_dependencies_use_runtime() {
+        let config = python();
+        assert_eq!(
+            interpreted_argv(&config, "actions/test.py", true, PackAccess::CandidateCopy).unwrap(),
+            [
+                "/opt/attune/runtime/bin/python3",
+                "-u",
+                "/opt/attune/pack/actions/test.py"
+            ]
+        );
+        let vars = variables(
+            &config,
+            Some("actions/test.py"),
+            true,
+            PackAccess::CandidateCopy,
+        )
+        .unwrap();
+        assert_eq!(vars["pack_dir"], PACK_ROOT);
+        assert_eq!(vars["manifest_path"], "/opt/attune/pack/requirements.txt");
+        assert_eq!(vars["interpreter"], "/opt/attune/runtime/bin/python3");
+        assert_eq!(
+            working_directory(attune_common::workload_launch::LaunchRoot::Pack),
+            PACK_ROOT
+        );
+    }
+    #[test]
+    fn canonical_dependency_plans_do_not_swallow_install_or_manifest_copy_errors() {
+        for source in [
+            include_str!("../../../packs/core/runtimes/ruby.yaml"),
+            include_str!("../../../packs/core/runtimes/go.yaml"),
+            include_str!("../../../packs/core/runtimes/r.yaml"),
+            include_str!("../../../packs/core/runtimes/perl.yaml"),
+            include_str!("../../../packs/core/runtimes/nodejs.yaml"),
+        ] {
+            let definition: serde_json::Value = serde_yaml_ng::from_str(source).unwrap();
+            let config: RuntimeExecutionConfig =
+                serde_json::from_value(definition["execution_config"].clone()).unwrap();
+            let plan = setup_plan(&config, &BTreeMap::new(), &[]).unwrap();
+            for step in &plan.steps {
+                assert!(!step
+                    .argv
+                    .iter()
+                    .any(|s| s.contains("|| true") || s.contains("2>/dev/null")));
+            }
+            assert!(plan.steps[1].if_pack_file.is_some());
+            assert!(plan
+                .steps
+                .iter()
+                .flat_map(|step| &step.argv)
+                .any(|s| s.contains(PROJECT_ROOT)));
+        }
     }
     #[test]
     fn native_selection_uses_admitted_platform_and_paths_cannot_escape() {
@@ -490,15 +590,16 @@ mod tests {
         assert!(!sentinel.exists());
         let entry = "actions/{env_dir}.py";
         assert_eq!(
-            interpreted_argv(&python(), entry, true)
+            interpreted_argv(&python(), entry, true, PackAccess::ReadOnly)
                 .unwrap()
                 .last()
                 .unwrap(),
-            "/opt/attune/pack/actions/{env_dir}.py"
+            "/opt/attune/runtime/project/actions/{env_dir}.py"
         );
         let selected = BTreeMap::from([("PYTHONPATH".into(), "selected-override".into())]);
         assert_eq!(
-            action_environment(&python(), &selected, entry, true).unwrap()["PYTHONPATH"],
+            action_environment(&python(), &selected, entry, true, PackAccess::ReadOnly).unwrap()
+                ["PYTHONPATH"],
             "selected-override"
         );
     }

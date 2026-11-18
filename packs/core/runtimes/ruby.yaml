@@ -42,7 +42,7 @@ execution_config:
     install_command:
       - sh
       - "-c"
-      - "cd {pack_dir} && GEM_HOME={env_dir}/gems GEM_PATH={env_dir}/gems bundle install --quiet 2>/dev/null || true"
+      - "cd {pack_dir} && GEM_HOME={env_dir}/gems GEM_PATH={env_dir}/gems bundle install --quiet"
   env_vars:
     GEM_HOME: "{env_dir}/gems"
     GEM_PATH: "{env_dir}/gems"

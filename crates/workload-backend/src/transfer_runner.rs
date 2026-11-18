@@ -147,6 +147,86 @@ pub fn seed(arguments: &[String]) -> io::Result<()> {
     File::open(STATE)?.sync_all()?;
     Ok(())
 }
+/// Fresh private copy only; no caller path and no mutable shared Pack mount.
+/// Final archive bounds still apply; these copy bounds are not a live quota.
+pub fn prepare_setup_project() -> io::Result<()> {
+    copy_project(
+        Path::new(attune_common::workload_launch::PACK_ROOT),
+        Path::new(crate::planning::PROJECT_ROOT),
+        4 * 1024 * 1024 * 1024,
+        100_000,
+    )
+}
+fn copy_project(
+    source: &Path,
+    destination: &Path,
+    max_bytes: u64,
+    max_entries: u64,
+) -> io::Result<()> {
+    if !fs::symlink_metadata(source)?.is_dir() {
+        return Err(invalid());
+    }
+    // No reuse/repair of a prior or attacker-created project. An interrupted
+    // Setup must settle its original attempt, not rerun against partial output.
+    fs::DirBuilder::new().mode(0o700).create(destination)?;
+    let mut pending = vec![(source.to_path_buf(), destination.to_path_buf())];
+    let (mut bytes, mut entries) = (0u64, 0u64);
+    while let Some((source, destination)) = pending.pop() {
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            let metadata = fs::symlink_metadata(entry.path())?;
+            entries = entries.checked_add(1).ok_or_else(invalid)?;
+            if entries > max_entries {
+                return Err(invalid());
+            }
+            let target = destination.join(entry.file_name());
+            if metadata.is_dir() {
+                fs::DirBuilder::new().mode(0o755).create(&target)?;
+                pending.push((entry.path(), target));
+            } else if metadata.is_file() && metadata.nlink() == 1 {
+                bytes = bytes.checked_add(metadata.len()).ok_or_else(invalid)?;
+                if bytes > max_bytes {
+                    return Err(invalid());
+                }
+                let input = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(entry.path())?;
+                let actual = input.metadata()?;
+                if !actual.is_file()
+                    || actual.nlink() != 1
+                    || actual.dev() != metadata.dev()
+                    || actual.ino() != metadata.ino()
+                    || actual.len() != metadata.len()
+                {
+                    return Err(invalid());
+                }
+                let mut output = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(if metadata.mode() & 0o111 != 0 {
+                        0o755
+                    } else {
+                        0o644
+                    })
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(target)?;
+                let count = io::copy(
+                    &mut input.take(metadata.len().checked_add(1).ok_or_else(invalid)?),
+                    &mut output,
+                )?;
+                if count != metadata.len() {
+                    return Err(invalid());
+                }
+            } else {
+                // Primary runtime-v1 release inputs have a regular-file
+                // inventory. Do not rewrite links into a different root.
+                return Err(invalid());
+            }
+        }
+    }
+    Ok(())
+}
 pub fn install() -> io::Result<()> {
     let executable = std::env::current_exe()?;
     let destination = Path::new("/opt/attune/bootstrap/runner");
@@ -292,6 +372,76 @@ pub fn terminate() -> io::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn setup_project_is_a_fresh_writable_copy_and_preserves_generated_outputs() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("pack");
+        let stage = root.path().join("runtime");
+        fs::create_dir_all(source.join("actions")).unwrap();
+        fs::create_dir(&stage).unwrap();
+        fs::write(source.join("Gemfile"), b"immutable source").unwrap();
+        fs::set_permissions(source.join("Gemfile"), fs::Permissions::from_mode(0o444)).unwrap();
+        fs::write(source.join("actions/tool"), b"owned executable").unwrap();
+        fs::set_permissions(
+            source.join("actions/tool"),
+            fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        let project = stage.join("project");
+        copy_project(&source, &project, 1024, 16).unwrap();
+        assert_ne!(
+            fs::metadata(source.join("Gemfile")).unwrap().ino(),
+            fs::metadata(project.join("Gemfile")).unwrap().ino()
+        );
+        assert_eq!(
+            fs::metadata(project.join("Gemfile")).unwrap().mode() & 0o200,
+            0o200
+        );
+        assert_ne!(
+            fs::metadata(project.join("actions/tool")).unwrap().mode() & 0o111,
+            0
+        );
+        fs::write(project.join("Gemfile"), b"private update").unwrap();
+        fs::write(project.join("Gemfile.lock"), b"generated lock").unwrap();
+        assert_eq!(
+            fs::read(source.join("Gemfile")).unwrap(),
+            b"immutable source"
+        );
+        assert!(!source.join("Gemfile.lock").exists());
+        assert!(copy_project(&source, &project, 1024, 16).is_err());
+        assert_eq!(
+            fs::read(project.join("Gemfile.lock")).unwrap(),
+            b"generated lock"
+        );
+    }
+    #[test]
+    fn setup_project_rejects_aliases_special_entries_and_copy_budget_overflow() {
+        for case in 0..5 {
+            let root = tempfile::tempdir().unwrap();
+            let source = root.path().join("pack");
+            fs::create_dir(&source).unwrap();
+            fs::write(source.join("file"), b"owned").unwrap();
+            let mut bound = (1024, 16);
+            match case {
+                0 => std::os::unix::fs::symlink("file", source.join("link")).unwrap(),
+                1 => fs::hard_link(source.join("file"), source.join("alias")).unwrap(),
+                2 => {
+                    let _socket =
+                        std::os::unix::net::UnixListener::bind(source.join("socket")).unwrap();
+                }
+                3 => bound.0 = 4,
+                4 => {
+                    fs::create_dir_all(source.join("a/b/c")).unwrap();
+                    bound.1 = 3;
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                copy_project(&source, &root.path().join("project"), bound.0, bound.1).is_err(),
+                "case {case}"
+            );
+        }
+    }
     #[test]
     fn kubernetes_volume_uses_an_owned_private_child_and_reopens_it() {
         let volume = tempfile::tempdir().unwrap();

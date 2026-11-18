@@ -123,7 +123,9 @@ pub fn run() -> io::Result<i32> {
             command
                 .args(&invocation.argv[1..])
                 .envs(&invocation.env)
-                .current_dir(invocation.working_root.container_path())
+                .current_dir(attune_workload_backend::planning::working_directory(
+                    invocation.working_root,
+                ))
                 .stdin(Stdio::inherit())
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit());

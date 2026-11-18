@@ -120,6 +120,19 @@ confined to the selected fixed root; image-external venv interpreter links need
 `--copies`. Setup must create, archive, publish and execute real console scripts
 and internal links successfully in the same admitted immutable image/platform.
 
+Setup's fixed Runner copies the primary release's regular-file project into
+`/opt/attune/runtime/project` before executing creation, dependency and hook
+steps. It rejects aliases, special entries, reuse and copy-budget overflow,
+rather than rewriting links. Steps run in this private writable copy; the
+admitted Pack remains read-only. Generated project/lock files are archived with
+the runtime. Interpreted actions and sensors use the published project and
+Runtime working-root convention, while candidate tests retain their own mutable
+Pack source and working directory. Stage working-root still means the runtime
+mount root. Native entrypoints remain selected from Pack. Ruby, Go, R and Perl
+install commands now propagate failure; Node skips only an absent manifest,
+not failed copying/installing. Real toolchain/bootstrap coverage remains part
+of activation acceptance; pure planner tests alone do not establish it.
+
 The concrete adapters' `archive_stopped_stage` effect accepts Setup only and
 requires exact resource ownership plus successful payload termination, including
 no OOM. Kubernetes reads a fixed retained ZIP from the credential-free transfer
