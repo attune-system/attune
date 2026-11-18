@@ -22,6 +22,68 @@ use sqlx::PgPool;
 use std::{path::Path, sync::Arc};
 use uuid::Uuid;
 
+/// Publish a selected, already-stopped private file through the existing
+/// attempt-fenced transport. The private snapshot stays alive through both
+/// acknowledgements; an uncertain upload or completion never authorizes the
+/// caller to remove the provider's retained stage.
+pub(crate) async fn publish_stopped_file(
+    transport: &dyn ArtifactFileTransport,
+    source: std::fs::File,
+    path: &str,
+    content_type: Option<&str>,
+    max_bytes: u64,
+) -> Result<u64> {
+    let (snapshot, size) = tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Seek};
+        let io_error = |_| Error::io("Stopped artifact snapshot I/O failed");
+        let mut source = source;
+        source.rewind().map_err(io_error)?;
+        let metadata = source.metadata().map_err(io_error)?;
+        if !metadata.is_file() {
+            return Err(Error::invalid_state(
+                "Stopped artifact is not a regular file",
+            ));
+        }
+        let expected = metadata.len();
+        if expected > max_bytes {
+            return Err(Error::validation(
+                "Stopped artifact exceeds publication bounds",
+            ));
+        }
+        let mut snapshot = tempfile::NamedTempFile::new().map_err(io_error)?;
+        let copied = std::io::copy(
+            &mut source.take(expected.saturating_add(1)),
+            snapshot.as_file_mut(),
+        )
+        .map_err(io_error)?;
+        if copied != expected {
+            return Err(Error::invalid_state(
+                "Stopped artifact changed before publication",
+            ));
+        }
+        snapshot.as_file().sync_all().map_err(io_error)?;
+        Ok::<_, Error>((snapshot, copied))
+    })
+    .await
+    .map_err(|_| Error::invalid_state("Stopped artifact snapshot did not complete"))??;
+    let uploaded = transport
+        .write_file_from_path(path, snapshot.path(), content_type)
+        .await
+        .map_err(|_| {
+            Error::retryable_transport("Native artifact upload acknowledgement pending")
+        })?;
+    if uploaded != size
+        || transport.complete_file(path).await.map_err(|_| {
+            Error::retryable_transport("Native artifact publication acknowledgement pending")
+        })? != Some(size)
+    {
+        return Err(Error::invalid_state(
+            "Artifact publication acknowledgement mismatch",
+        ));
+    }
+    Ok(size)
+}
+
 pub async fn register(
     pool: &PgPool,
     execution: &Execution,
@@ -451,5 +513,159 @@ impl ArtifactFileTransport for CompletionTransport {
     }
     async fn ensure_parent_dirs(&self, path: &str) -> Result<()> {
         self.underlying.ensure_parent_dirs(path).await
+    }
+}
+
+#[cfg(all(test, unix))]
+mod stopped_file_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
+
+    #[derive(Debug)]
+    struct ReceiptTransport {
+        bytes: Mutex<Option<Vec<u8>>>,
+        upload_unknown: bool,
+        receipt: Option<u64>,
+        completes: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl ArtifactFileTransport for ReceiptTransport {
+        async fn write_file(&self, _: &str, _: &[u8], _: Option<&str>) -> Result<()> {
+            panic!("stopped files must stream their private snapshot")
+        }
+        async fn write_file_from_path(&self, _: &str, path: &Path, _: Option<&str>) -> Result<u64> {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let bytes = std::fs::read(path).unwrap();
+            let size = bytes.len() as u64;
+            assert!(
+                self.bytes.lock().unwrap().replace(bytes).is_none(),
+                "upload was replayed"
+            );
+            if self.upload_unknown {
+                return Err(Error::io("upload acknowledgement lost"));
+            }
+            Ok(size)
+        }
+        async fn complete_file(&self, _: &str) -> Result<Option<u64>> {
+            self.completes.fetch_add(1, Ordering::SeqCst);
+            Ok(self.receipt)
+        }
+        async fn file_exists(&self, _: &str) -> Result<bool> {
+            panic!("no absence probes")
+        }
+        async fn file_size(&self, _: &str) -> Result<Option<u64>> {
+            panic!("no absence probes")
+        }
+        async fn delete_file(&self, _: &str) -> Result<()> {
+            panic!("no deletion authority")
+        }
+        async fn open_reader(&self, _: &str, _: u64) -> Result<BoxAsyncReader> {
+            panic!("no reads")
+        }
+        fn transport_mode(&self) -> &'static str {
+            "api"
+        }
+        fn base_dir(&self) -> &str {
+            "unused"
+        }
+        async fn ensure_parent_dirs(&self, _: &str) -> Result<()> {
+            panic!("no shared paths")
+        }
+    }
+    fn transport(receipt: Option<u64>, upload_unknown: bool) -> ReceiptTransport {
+        ReceiptTransport {
+            bytes: Mutex::new(None),
+            upload_unknown,
+            receipt,
+            completes: AtomicUsize::new(0),
+        }
+    }
+    fn source(bytes: &[u8]) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(bytes).unwrap();
+        file
+    }
+    #[tokio::test]
+    async fn zero_bytes_require_positive_zero_receipt() {
+        let file = source(b"");
+        let transport = transport(Some(0), false);
+        assert_eq!(
+            publish_stopped_file(&transport, file.reopen().unwrap(), "allocated/v1", None, 0)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(*transport.bytes.lock().unwrap(), Some(Vec::new()));
+        assert_eq!(transport.completes.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn exact_private_bytes_survive_source_cursor_and_require_durable_receipt() {
+        use std::io::Seek;
+        let file = source(b"private-output");
+        let mut reader = file.reopen().unwrap();
+        reader.seek(std::io::SeekFrom::End(0)).unwrap();
+        let transport = transport(Some(14), false);
+        assert_eq!(
+            publish_stopped_file(&transport, reader, "allocated/v1", None, 14)
+                .await
+                .unwrap(),
+            14
+        );
+        assert_eq!(
+            transport.bytes.lock().unwrap().as_deref(),
+            Some(b"private-output".as_slice())
+        );
+    }
+    #[tokio::test]
+    async fn missing_or_different_receipt_cannot_acknowledge_publication() {
+        for receipt in [None, Some(0), Some(2)] {
+            let file = source(b"x");
+            let transport = transport(receipt, false);
+            assert!(publish_stopped_file(
+                &transport,
+                file.reopen().unwrap(),
+                "allocated/v1",
+                None,
+                1
+            )
+            .await
+            .is_err());
+            assert_eq!(transport.completes.load(Ordering::SeqCst), 1);
+        }
+    }
+    #[tokio::test]
+    async fn lost_upload_ack_never_retries_or_completes() {
+        let file = source(b"x");
+        let transport = transport(Some(1), true);
+        assert!(
+            publish_stopped_file(&transport, file.reopen().unwrap(), "allocated/v1", None, 1)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            transport.bytes.lock().unwrap().as_deref(),
+            Some(b"x".as_slice())
+        );
+        assert_eq!(transport.completes.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn oversized_file_is_rejected_before_any_transport_effect() {
+        let file = source(b"xy");
+        let transport = transport(Some(2), false);
+        assert!(
+            publish_stopped_file(&transport, file.reopen().unwrap(), "allocated/v1", None, 1)
+                .await
+                .is_err()
+        );
+        assert!(transport.bytes.lock().unwrap().is_none());
+        assert_eq!(transport.completes.load(Ordering::SeqCst), 0);
     }
 }

@@ -155,6 +155,16 @@ Kubernetes uses a fixed bounded helper read; Docker opens only the attempt's
 owned private artifact subpath. The trusted owning workflow retains inventory,
 disclosure, publication and cleanup decisions; reading bytes is not a receipt.
 
+The staged action caller transfers these selected files through the existing
+authenticated artifact publication API, including for shared-volume managers.
+It holds a private bounded snapshot through upload and exact-size completion
+acknowledgements. The API retains attempt/origin checks and commits version
+metadata; the caller performs no unchecked metadata write afterward. Empty
+files require a positive zero-byte receipt. Missing files, invalid staging and
+uncertain publication currently retain the owning attempt and resource rather
+than permitting terminal completion or cleanup. Automatic recovery of these
+pending file cases and full provider/file acceptance remain activation work.
+
 Archive/output bounds, free-space/admission/concurrency checks and owned cleanup
 are not a universal live filesystem byte/inode quota. Named-volume exhaustion
 remains a residual availability risk unless a tested filesystem quota

@@ -99,6 +99,9 @@ pub struct ActionExecutor {
     recorded_readiness: crate::recorded_credentials::RecordedConsumerReadiness,
     /// Transport abstraction for artifact file content.
     transport: Arc<dyn ArtifactFileTransport>,
+    /// Concrete factual transfer/removal effects. Domain admission and
+    /// completion remain in this executor; this is never a workload service.
+    native_backend: Option<attune_workload_backend::configuration::NativeBackend>,
     action_cache_by_id: Arc<MetadataCache<String, Action>>,
     action_cache_by_ref: Arc<MetadataCache<String, Action>>,
     runtime_cache_by_id: Arc<MetadataCache<String, RuntimeModel>>,
@@ -374,6 +377,14 @@ struct LogAllocationSettings {
 }
 
 impl ActionExecutor {
+    pub fn with_native_backend(
+        mut self,
+        backend: attune_workload_backend::configuration::NativeBackend,
+    ) -> Self {
+        self.native_backend = Some(backend);
+        self
+    }
+
     /// Integration startup must prove all consumers are ready before enabling
     /// recorded issuance. No production caller enables this yet.
     pub fn with_recorded_readiness(
@@ -448,6 +459,7 @@ impl ActionExecutor {
             worker_tokens: None,
             recorded_readiness: Default::default(),
             transport,
+            native_backend: None,
             action_cache_by_id: Arc::new(MetadataCache::new(
                 ACTION_CACHE_TTL,
                 ACTION_CACHE_MAX_ENTRIES,
@@ -915,7 +927,13 @@ impl ActionExecutor {
         );
         let artifacts_started = std::time::Instant::now();
         // Finalize file-backed artifacts (stat files on disk and update size_bytes)
-        if let Err(e) = self.finalize_file_artifacts(execution_id).await {
+        if let Some(intent) = preparation.process_intent {
+            // Provider errors and uncertain publication retain private staging
+            // and the owning attempt. Never route isolated files through a
+            // manager-local path or acknowledge them as empty/missing.
+            self.finalize_isolated_file_artifacts(execution_id, intent)
+                .await?;
+        } else if let Err(e) = self.finalize_file_artifacts(execution_id).await {
             warn!(
                 "Failed to finalize file-backed artifacts for execution {}: {}",
                 execution_id, e
@@ -965,6 +983,21 @@ impl ActionExecutor {
             )
             .await?
         };
+
+        if let (Some(intent), Some(backend)) =
+            (preparation.process_intent, self.native_backend.as_ref())
+        {
+            let (spec, resource) = self.retained_process(intent).await?;
+            // The terminal transition and all selected file receipts committed
+            // first. Logs now belong to manager-only encrypted custody (or are
+            // explicitly incomplete), independently of the payload resource.
+            if backend.remove_stopped(&spec, &resource).await.is_err() {
+                warn!(
+                    execution_id,
+                    "Stopped native resource cleanup remains uncertain"
+                );
+            }
+        }
 
         debug!(
             phase = "terminal_persistence",
@@ -2722,6 +2755,101 @@ impl ActionExecutor {
         Ok(Some(
             resolve_checked_path(&self.artifacts_dir, &relative).await?,
         ))
+    }
+
+    async fn retained_process(
+        &self,
+        intent: uuid::Uuid,
+    ) -> Result<(
+        attune_common::isolated_process::ProcessSpec,
+        attune_common::isolated_process::ResourceIdentity,
+    )> {
+        use attune_common::repositories::execution_process::ExecutionProcessRepository as Effects;
+        let master = self.secret_manager.encryption_key().ok_or_else(|| {
+            Error::PermissionDenied("Process context encryption unavailable".into())
+        })?;
+        let spec = Effects::retained_spec(&self.pool, intent, master).await?;
+        let resource = Effects::retained_resource(&self.pool, intent)
+            .await?
+            .ok_or_else(|| Error::invalid_state("Native resource settlement unavailable"))?;
+        Ok((spec, resource))
+    }
+
+    async fn finalize_isolated_file_artifacts(
+        &self,
+        execution_id: i64,
+        intent: uuid::Uuid,
+    ) -> Result<()> {
+        let versions = ArtifactVersionRepository::find_ordinary_file_versions_by_execution(
+            &self.pool,
+            execution_id,
+        )
+        .await?;
+        if versions.is_empty() {
+            return Ok(());
+        }
+        let backend = self
+            .native_backend
+            .as_ref()
+            .ok_or_else(|| Error::invalid_state("Native artifact transfer effects unavailable"))?;
+        let (spec, resource) = self.retained_process(intent).await?;
+        if !matches!(spec.target, attune_common::workload_launch::LaunchTarget::Execution { execution, worker, .. }
+            if execution == execution_id && worker == self.worker_id.load(Ordering::Acquire))
+        {
+            return Err(Error::PermissionDenied(
+                "Native artifact owner mismatch".into(),
+            ));
+        }
+        // The provider validates the entire retained tree against its operator
+        // ceiling before returning any selected file, including ENOENT.
+        for version in versions {
+            let path = version.file_path.as_deref().ok_or_else(|| {
+                Error::invalid_state("Allocated native artifact path unavailable")
+            })?;
+            let relative = ValidatedRelativePath::new(path)?;
+            let source = backend
+                .read_stopped_artifact(&spec, &resource, &relative, i64::MAX as u64)
+                .await?
+                .ok_or_else(|| Error::invalid_state("Allocated native artifact was not written"))?;
+            let mut conn = self.pool.acquire().await?;
+            let recorded = attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(
+                &mut conn, execution_id,
+            ).await?;
+            drop(conn);
+            let transport = if recorded {
+                crate::completion::CompletionTransport::for_version(
+                    &self.pool,
+                    version.id,
+                    self.worker_id.load(Ordering::Acquire),
+                    self.worker_instance,
+                    self.transport.clone(),
+                    &self.api_url,
+                    &self.jwt_config,
+                )
+                .await?
+            } else {
+                // Even shared-volume managers transfer guest-private files
+                // through the existing authenticated publication endpoint.
+                // A local stat is not a receipt for this isolated stage.
+                let provider = self.worker_tokens.clone().ok_or_else(|| {
+                    Error::invalid_state("Native artifact delivery credential unavailable")
+                })?;
+                Arc::new(attune_common::artifact_transport::ApiTransport::new_with_worker_token_provider(
+                    &self.api_url, provider, self.transport.base_dir(),
+                )?)
+            };
+            crate::completion::publish_stopped_file(
+                transport.as_ref(),
+                source,
+                path,
+                version.content_type.as_deref(),
+                i64::MAX as u64,
+            )
+            .await?;
+            // The API commits exact-version metadata, output origins and
+            // publication together. No unchecked post-receipt DB mutation.
+        }
+        Ok(())
     }
 
     /// Finalize file-backed artifacts after execution completes.
