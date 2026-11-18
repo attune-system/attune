@@ -845,12 +845,51 @@ mod tests {
         let pack = root.path().join("candidate");
         std::fs::create_dir(&pack).unwrap();
         std::fs::write(pack.join("input"), "original").unwrap();
+        let hidden = root.path().join("manager-token");
+        std::fs::write(&hidden, "owned-dummy-host-token").unwrap();
+        let mut dummy = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .env_clear()
+            .env("OWNED_DUMMY_CREDENTIAL", "not-for-candidate")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = dummy.id();
         let executor = super::TestExecutor::new(root.path().to_path_buf())
-            .with_workload_sandbox(crate::workload_sandbox::WorkloadSandbox::Bubblewrap);
-        let result = executor.run_command("/bin/sh", &["-c".into(), "set -eu; echo modified > input; mkdir output; echo generated > output/result; echo test-ok".into()], &pack, None, std::time::Duration::from_secs(10)).await;
+            .with_workload_sandbox(crate::workload_sandbox::WorkloadSandbox::Bubblewrap)
+            .with_candidate_effects(CandidateTestEnvironment {
+                url: "https://api/candidate".into(),
+                token: "candidate-only".into(),
+            });
+        let script = format!("set -eu; test ! -e '{}'; test ! -e /proc/{pid}/environ; ! kill -TERM {pid} 2>/dev/null; test \"$ATTUNE_CANDIDATE_EFFECTS_TOKEN\" = candidate-only; test -z \"${{ATTUNE_API_TOKEN:-}}\"; echo modified > input; mkdir output; echo generated > output/result; echo test-ok", hidden.display());
+        let result = executor
+            .run_command(
+                "/bin/sh",
+                &["-c".into(), script],
+                &pack,
+                None,
+                std::time::Duration::from_secs(10),
+            )
+            .await;
         executor.process_owner().shutdown().await;
+        let survived = dummy.try_wait().unwrap().is_none();
+        if survived {
+            dummy.kill().unwrap();
+        }
+        dummy.wait().unwrap();
         let output = result.unwrap();
         assert_eq!(output.stdout.trim(), "test-ok");
+        assert_eq!(output.exit_code, 0);
+        assert!(
+            survived,
+            "candidate signaled the owned host credential process"
+        );
+        assert_eq!(
+            std::fs::read_to_string(hidden).unwrap(),
+            "owned-dummy-host-token"
+        );
         assert_eq!(
             std::fs::read_to_string(pack.join("input")).unwrap(),
             "original"
@@ -862,7 +901,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn runner_entrypoints_are_confined_before_execution() {
+    async fn runner_entrypoint_paths_and_candidate_tree_are_validated_before_execution() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("pack");
         std::fs::create_dir(&root).unwrap();
@@ -876,7 +915,10 @@ mod tests {
             "printf 'Total Tests: 1\nPassed: 1\nFailed: 0\n'\n",
         )
         .unwrap();
-        let executor = TestExecutor::new(root.clone());
+        // Path/tree validation and output parsing use an explicit process
+        // fixture. Real confinement is required in the isolated_* host lane.
+        let executor = TestExecutor::new(root.clone())
+            .with_workload_sandbox(crate::workload_sandbox::WorkloadSandbox::Disabled);
         for entry in [
             "../outside.sh",
             outside.to_str().unwrap(),
@@ -904,20 +946,16 @@ mod tests {
             timeout: Some(5),
             result_format: None,
         };
-        assert!(executor
-            .execute_test_suite(&root, "unsafe-input-tree", &runner, None)
-            .await
-            .is_err());
+        let private_copy = temp.path().join("private-copy");
+        std::fs::create_dir(&private_copy).unwrap();
+        assert!(copy_private_test_tree(&root, &private_copy).is_err());
         std::fs::remove_file(root.join("escape.sh")).unwrap();
         std::fs::remove_file(root.join("escape-dir")).unwrap();
-        assert_eq!(
-            executor
-                .execute_test_suite(&root, "safe", &runner, None)
-                .await
-                .unwrap()
-                .passed,
-            1
-        );
+        let safe = executor
+            .execute_test_suite(&root, "safe", &runner, None)
+            .await;
+        executor.process_owner().shutdown().await;
+        assert_eq!(safe.unwrap().passed, 1);
     }
 
     #[tokio::test]
@@ -936,24 +974,25 @@ mod tests {
                 result_format: None,
             },
         );
-        let plain = TestExecutor::new(root.path().to_path_buf());
+        let plain = TestExecutor::new(root.path().to_path_buf())
+            .with_workload_sandbox(crate::workload_sandbox::WorkloadSandbox::Disabled);
         assert!(plain
             .execute_pack_tests_at(root.path(), "candidate", "1.0.0", &config)
             .await
             .is_err());
-        let isolated = TestExecutor::new(root.path().to_path_buf()).with_candidate_effects(
-            CandidateTestEnvironment {
+        let selected = TestExecutor::new(root.path().to_path_buf())
+            .with_workload_sandbox(crate::workload_sandbox::WorkloadSandbox::Disabled)
+            .with_candidate_effects(CandidateTestEnvironment {
                 url: "https://api/candidate".into(),
                 token: "candidate-only".into(),
-            },
-        );
-        let result = isolated
+            });
+        let result = selected
             .execute_pack_tests_at(root.path(), "candidate", "1.0.0", &config)
-            .await
-            .unwrap();
-        assert_eq!(result.passed, 1);
+            .await;
+        selected.process_owner().shutdown().await;
+        assert_eq!(result.unwrap().passed, 1);
         config.candidate_api_effects = false;
-        assert!(isolated
+        assert!(selected
             .execute_pack_tests_at(root.path(), "candidate", "1.0.0", &config)
             .await
             .is_err());
@@ -1120,7 +1159,8 @@ mod tests {
     #[tokio::test]
     async fn test_commands_drain_and_bound_stdout_and_stderr() {
         let temp = tempfile::tempdir().unwrap();
-        let executor = TestExecutor::new(temp.path().to_path_buf());
+        let executor = TestExecutor::new(temp.path().to_path_buf())
+            .with_workload_sandbox(crate::workload_sandbox::WorkloadSandbox::Disabled);
         let output = executor
             .run_command(
                 "/bin/sh",
@@ -1129,9 +1169,9 @@ mod tests {
                 None,
                 Duration::from_secs(10),
             )
-            .await
-            .unwrap();
-
+            .await;
+        executor.process_owner().shutdown().await;
+        let output = output.unwrap();
         assert_eq!(output.stdout.len(), MAX_TEST_OUTPUT_BYTES);
         assert_eq!(output.stderr.len(), MAX_TEST_OUTPUT_BYTES);
     }
@@ -1139,7 +1179,8 @@ mod tests {
     #[tokio::test]
     async fn test_command_timeout_stops_process_group() {
         let temp = tempfile::tempdir().unwrap();
-        let executor = TestExecutor::new(temp.path().to_path_buf());
+        let executor = TestExecutor::new(temp.path().to_path_buf())
+            .with_workload_sandbox(crate::workload_sandbox::WorkloadSandbox::Disabled);
         let started = Instant::now();
         let result = executor
             .run_command(
@@ -1151,6 +1192,7 @@ mod tests {
             )
             .await;
 
+        executor.process_owner().shutdown().await;
         assert!(matches!(result, Err(Error::Timeout(_))));
         assert!(started.elapsed() < Duration::from_secs(5));
     }
@@ -1337,7 +1379,8 @@ mod tests {
     #[tokio::test]
     async fn test_normal_leader_exit_terminates_descendants_holding_pipes() {
         let root = tempfile::tempdir().unwrap();
-        let executor = TestExecutor::new(root.path().into());
+        let executor = TestExecutor::new(root.path().into())
+            .with_workload_sandbox(crate::workload_sandbox::WorkloadSandbox::Disabled);
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             executor.run_command(
@@ -1351,9 +1394,9 @@ mod tests {
                 Duration::from_secs(30),
             ),
         )
-        .await
-        .unwrap()
-        .unwrap();
+        .await;
+        executor.process_owner().shutdown().await;
+        let result = result.unwrap().unwrap();
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "done");
         assert_eq!(result.stderr, "error");
@@ -1362,25 +1405,47 @@ mod tests {
 
     #[tokio::test]
     async fn test_commands_do_not_inherit_service_secrets() {
+        const CHILD: &str = "ATTUNE_TESTEXEC_ENV_FIXTURE_CHILD";
+        const SECRET: &str = "ATTUNE_TEST_SECRET_SHOULD_NOT_LEAK";
+        if std::env::var(CHILD).as_deref() != Ok("owned-fixture") {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "test_executor::tests::test_commands_do_not_inherit_service_secrets",
+                    "--nocapture",
+                    "--test-threads=4",
+                ])
+                .env_clear()
+                .env(CHILD, "owned-fixture")
+                .env(SECRET, "owned-dummy-service-secret")
+                .output()
+                .await
+                .unwrap();
+            assert!(output.status.success(), "owned environment fixture failed");
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("owned-dummy-service-secret"));
+            return;
+        }
+        assert_eq!(
+            std::env::var(SECRET).as_deref(),
+            Ok("owned-dummy-service-secret")
+        );
         let temp = tempfile::tempdir().unwrap();
-        let secret_name = "ATTUNE_TEST_SECRET_SHOULD_NOT_LEAK";
-        std::env::set_var(secret_name, "secret-value");
-
-        let executor = TestExecutor::new(temp.path().to_path_buf());
+        let executor = TestExecutor::new(temp.path().to_path_buf())
+            .with_workload_sandbox(crate::workload_sandbox::WorkloadSandbox::Disabled);
         let result = executor
             .run_command(
                 "/bin/sh",
-                &[
-                    "-c".to_string(),
-                    format!("test -z \"${{{secret_name}:-}}\""),
-                ],
+                &["-c".into(), format!("test -z \"${{{SECRET}:-}}\"")],
                 temp.path(),
                 None,
                 Duration::from_secs(5),
             )
             .await;
-
-        std::env::remove_var(secret_name);
-        assert!(result.is_ok(), "pack test inherited a service secret");
+        executor.process_owner().shutdown().await;
+        assert_eq!(
+            result.unwrap().exit_code,
+            0,
+            "pack test inherited a service secret"
+        );
     }
 }
