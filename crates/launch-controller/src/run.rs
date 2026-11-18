@@ -518,13 +518,20 @@ mod tests {
         // transaction fences require owning API integration, not this mock.
         for outcome in [
             "authorized",
+            "empty-eof",
             "backpressure",
             "lost-ack",
             "wrong-count",
+            "wrong-handle",
+            "wrong-channel",
+            "expired",
             "denied",
         ] {
-            let bytes =
-                b"{\"selected\":\"owned-private-input\",\"escaped\":\"\\u0000\"}\n".to_vec();
+            let bytes = if outcome == "empty-eof" {
+                Vec::new()
+            } else {
+                b"{\"selected\":\"owned-private-input\",\"escaped\":\"\\u0000\"}\n".to_vec()
+            };
             let request = LaunchRequest {
                 launch_id: 1,
                 admitted_digest: Sha256Digest::of_bytes(b"manifest"),
@@ -593,14 +600,22 @@ mod tests {
                     let response = if outcome == "denied" {
                         serde_json::json!({})
                     } else {
-                        serde_json::to_value(LaunchIoAuthorization {
+                        let mut authorization = LaunchIoAuthorization {
                             handle: expected_handle,
                             channel: LaunchIoChannel::Stdin,
                             max_bytes: expected_bytes.len() as u64
                                 + u64::from(outcome == "wrong-count"),
                             expires_at: Utc::now() + chrono::Duration::seconds(30),
-                        })
-                        .unwrap()
+                        };
+                        match outcome {
+                            "wrong-handle" => authorization.handle.lease_generation += 1,
+                            "wrong-channel" => authorization.channel = LaunchIoChannel::Stdout,
+                            "expired" => {
+                                authorization.expires_at = Utc::now() - chrono::Duration::seconds(1)
+                            }
+                            _ => {}
+                        }
+                        serde_json::to_value(authorization).unwrap()
                     };
                     let body = serde_json::to_vec(&response).unwrap();
                     let status = if outcome == "denied" {
@@ -655,7 +670,7 @@ mod tests {
             let mut written = Vec::new();
             reader.read_to_end(&mut written).await.unwrap();
             let result = writing.await.unwrap();
-            let authorized = matches!(outcome, "authorized" | "backpressure");
+            let authorized = matches!(outcome, "authorized" | "empty-eof" | "backpressure");
             assert!(
                 lease_available,
                 "stdin backpressure blocked lease/cancel owner"
