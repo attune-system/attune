@@ -459,6 +459,8 @@ pub enum LaunchRuntimeState {
 pub enum LaunchLeasePurpose {
     Run,
     Cleanup,
+    /// Successful removed Setup only; no engine/invocation/input authority.
+    Publication,
 }
 
 /// Identity only. The secret lease credential travels in LAUNCH_LEASE_HEADER.
@@ -540,6 +542,11 @@ pub enum ClaimedLaunch {
     Cleanup {
         manifest: Box<LaunchManifest>,
         /// Recorded original evidence remains usable after source/image revocation.
+        status: LaunchStatus,
+        lease: LaunchLease,
+    },
+    Publication {
+        manifest: Box<LaunchManifest>,
         status: LaunchStatus,
         lease: LaunchLease,
     },
@@ -668,6 +675,15 @@ pub struct LaunchExitOutcome {
     pub oom_killed: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchPublicationState {
+    NotRequired,
+    Pending,
+    Uploading,
+    Published,
+    Rejected,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchStatus {
@@ -675,6 +691,7 @@ pub struct LaunchStatus {
     pub state: LaunchState,
     pub runtime_state: LaunchRuntimeState,
     pub exit_outcome: Option<LaunchExitOutcome>,
+    pub publication: LaunchPublicationState,
     pub resource: Option<EngineResourceEvidence>,
     pub stop_reason: Option<LaunchStopReason>,
 }
@@ -683,6 +700,12 @@ impl LaunchStatus {
     /// Historical success survives removal, without implying live authority.
     pub fn permits_stage_publication(&self) -> bool {
         self.validate_shape().is_ok()
+            && matches!(
+                self.publication,
+                LaunchPublicationState::Pending
+                    | LaunchPublicationState::Uploading
+                    | LaunchPublicationState::Published
+            )
             && self.state == LaunchState::Stopped
             && self.stop_reason.is_none()
             && self.exit_outcome
@@ -847,6 +870,7 @@ mod tests {
                 admitted_digest: resource.admitted_digest.clone(),
             },
             state: LaunchState::CleanupRequired,
+            publication: LaunchPublicationState::Pending,
             runtime_state: LaunchRuntimeState::Exited,
             exit_outcome: Some(LaunchExitOutcome {
                 exit_code: 0,
