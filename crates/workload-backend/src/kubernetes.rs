@@ -241,6 +241,86 @@ impl KubernetesLauncher {
         }
         Ok(pod)
     }
+    /// Read one owning-loop-selected artifact after exact payload termination.
+    /// Missing selected files are distinct from invalid/lost staging and provider
+    /// failures. This effect never acknowledges publication or removes the Pod.
+    pub async fn read_stopped_artifact(
+        &self,
+        spec: &ProcessSpec,
+        resource: &ResourceIdentity,
+        relative: &attune_common::artifact_transport::ValidatedRelativePath,
+        remaining_bytes: u64,
+    ) -> Result<Option<std::fs::File>> {
+        crate::artifact_file::permits_files(spec)?;
+        require_stopped_payload(&self.exact(spec, resource).await?)?;
+        let limits = self.cache.artifact_limits();
+        let remaining = remaining_bytes.min(limits.max_total_bytes);
+        let relative = relative
+            .as_path()
+            .to_str()
+            .filter(|p| p.len() <= 4096)
+            .ok_or_else(invalid)?;
+        let result = tokio::time::timeout(Duration::from_secs(120), async {
+            let mut streams = crate::kubernetes_io::exec(
+                &self.client,
+                &self.pods(),
+                &pod_name(spec),
+                TRANSFER_CONTAINER,
+                vec![
+                    BOOTSTRAP_RUNNER.into(),
+                    "read-artifact".into(),
+                    relative.into(),
+                    remaining.to_string(),
+                    limits.max_total_bytes.to_string(),
+                    limits.max_entries.to_string(),
+                ],
+            )
+            .await?;
+            let mut file = tokio::fs::File::from_std(tempfile::tempfile().map_err(|_| invalid())?);
+            let write = async { streams.stdin.shutdown().await.map_err(|_| invalid()) };
+            let read = async {
+                let count = tokio::io::copy(
+                    &mut (&mut streams.stdout).take(remaining.checked_add(1).ok_or_else(invalid)?),
+                    &mut file,
+                )
+                .await
+                .map_err(|_| invalid())?;
+                if count > remaining {
+                    return Err(invalid());
+                }
+                file.flush().await.map_err(|_| invalid())?;
+                Ok(count)
+            };
+            let errors = async {
+                let count = tokio::io::copy(
+                    &mut (&mut streams.stderr).take(16 * 1024 + 1),
+                    &mut tokio::io::sink(),
+                )
+                .await
+                .map_err(|_| invalid())?;
+                if count > 16 * 1024 {
+                    return Err(invalid());
+                }
+                Ok(count)
+            };
+            let (_, bytes, errors) = tokio::try_join!(write, read, errors)?;
+            match streams.exit_code().await? {
+                0 if errors == 0 => {
+                    use tokio::io::AsyncSeekExt;
+                    file.rewind().await.map_err(|_| invalid())?;
+                    Ok(Some(file.into_std().await))
+                }
+                crate::transfer_runner::MISSING_ARTIFACT_EXIT_CODE if bytes == 0 && errors == 0 => {
+                    Ok(None)
+                }
+                _ => Err(invalid()),
+            }
+        })
+        .await
+        .map_err(|_| invalid())??;
+        require_stopped_payload(&self.exact(spec, resource).await?)?;
+        Ok(result)
+    }
     /// Factual Setup transfer only. The caller validates/publishes the runtime
     /// and retains this Pod until its existing publication receipt is durable.
     /// No current invocation, stdin authority or Pod deletion is granted here.
@@ -454,6 +534,16 @@ impl KubernetesLauncher {
         }
         Ok(())
     }
+}
+fn require_stopped_payload(pod: &Pod) -> Result<()> {
+    pod.status
+        .as_ref()
+        .and_then(|s| s.container_statuses.as_ref())
+        .and_then(|s| s.iter().find(|s| s.name == PAYLOAD_CONTAINER))
+        .and_then(|s| s.state.as_ref())
+        .and_then(|s| s.terminated.as_ref())
+        .map(|_| ())
+        .ok_or_else(invalid)
 }
 fn require_successful_payload(pod: &Pod) -> Result<()> {
     let terminated = pod

@@ -12,6 +12,8 @@ use std::{
 };
 const STATE_VOLUME: &str = "/opt/attune/transfer";
 const STATE: &str = "/opt/attune/transfer/private";
+/// Only this fixed helper's selected-file absence, never a provider/API 404.
+pub const MISSING_ARTIFACT_EXIT_CODE: i32 = 3;
 fn invalid() -> io::Error {
     io::Error::other("invalid fixed workload transfer")
 }
@@ -222,6 +224,46 @@ pub fn archive(arguments: &[String]) -> io::Result<()> {
     .map_err(|_| invalid())?;
     io::copy(&mut file, &mut io::stdout())?;
     Ok(())
+}
+/// Fixed `/tmp/artifacts` read. False means selected ENOENT after the complete
+/// retained root passed validation; empty regular files return true.
+pub fn read_artifact(arguments: &[String]) -> io::Result<bool> {
+    use attune_common::{
+        artifact_transport::ValidatedRelativePath, workload_artifact::ArtifactLimits,
+    };
+    if arguments.len() != 4 || arguments[0].len() > 4096 {
+        return Err(invalid());
+    }
+    let relative = ValidatedRelativePath::new(&arguments[0]).map_err(|_| invalid())?;
+    let remaining = arguments[1].parse::<u64>().map_err(|_| invalid())?;
+    let limits = ArtifactLimits {
+        max_total_bytes: arguments[2].parse().map_err(|_| invalid())?,
+        max_entries: arguments[3].parse().map_err(|_| invalid())?,
+    };
+    if limits.max_total_bytes == 0 || limits.max_entries == 0 || remaining > limits.max_total_bytes
+    {
+        return Err(invalid());
+    }
+    let _lock = lock()?;
+    let Some(mut file) = crate::artifact_file::read_selected(
+        Path::new("/tmp/artifacts"),
+        &relative,
+        remaining,
+        limits,
+    )
+    .map_err(|_| invalid())?
+    else {
+        return Ok(false);
+    };
+    let expected = file.metadata()?.len();
+    let actual = io::copy(
+        &mut Read::by_ref(&mut file).take(remaining.saturating_add(1)),
+        &mut io::stdout(),
+    )?;
+    if actual != expected || actual > remaining {
+        return Err(invalid());
+    }
+    Ok(true)
 }
 #[cfg(target_os = "linux")]
 pub fn terminate() -> io::Result<()> {

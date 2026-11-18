@@ -384,6 +384,32 @@ impl DockerLauncher {
             .map_err(|_| common_error(EngineError::Transport))?
             .map_err(|_| common_error(EngineError::OwnershipMismatch))
     }
+    pub async fn read_stopped_artifact(
+        &self,
+        spec: &ProcessSpec,
+        resource: &ResourceIdentity,
+        relative: &attune_common::artifact_transport::ValidatedRelativePath,
+        remaining: u64,
+    ) -> attune_common::Result<Option<std::fs::File>> {
+        crate::artifact_file::permits_files(spec)?;
+        let (id, state) = self
+            .cleanup_exact(spec, resource)
+            .await
+            .map_err(common_error)?;
+        if state != "exited" {
+            return Err(common_error(EngineError::OwnershipMismatch));
+        }
+        self.wait_id(&id).await.map_err(common_error)?;
+        let store = self.cache.clone();
+        let selected = spec.clone();
+        let relative = relative.clone();
+        tokio::task::spawn_blocking(move || {
+            store.read_native_artifact(&selected, &relative, remaining)
+        })
+        .await
+        .map_err(|_| common_error(EngineError::Transport))?
+        .map_err(|_| common_error(EngineError::OwnershipMismatch))
+    }
     async fn wait_id(&self, id: &str) -> Result<LaunchExitOutcome> {
         let response = self
             .engine

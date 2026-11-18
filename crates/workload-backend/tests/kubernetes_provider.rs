@@ -372,12 +372,74 @@ else: raise AssertionError('published runtime writable')
 #[ignore = "requires explicitly owned disposable Kubernetes cluster, namespace-scoped config and exact candidate images; required provider CI includes this test"]
 async fn actual_bash_procfs_python_and_selected_environment() -> TestResult {
     let f = Fixture::new().await?;
-    let script = r#"test -e /proc/self/fd && test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token && test ! -e /var/run/docker.sock && test ! -e /opt/attune/transfer && test ! -e /cache && cat <(printf owned-procfs) && /usr/bin/python3 -c 'import os,sys,threading; assert os.environ["SELECTED"]=="owned-selected-value"; assert not any(k.startswith(("ATTUNE__","KUBERNETES_","DOCKER_")) for k in os.environ); t=threading.Thread(target=lambda:None);t.start();t.join(); sys.stderr.write("owned-separate-stderr")'"#;
+    let script = r#"test -e /proc/self/fd && test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token && test ! -e /var/run/docker.sock && test ! -e /opt/attune/transfer && test ! -e /cache && mkdir /tmp/artifacts/selected && printf owned-file > /tmp/artifacts/selected/content && : > /tmp/artifacts/empty && cat <(printf owned-procfs) && /usr/bin/python3 -c 'import os,sys,threading; assert os.environ["SELECTED"]=="owned-selected-value"; assert not any(k.startswith(("ATTUNE__","KUBERNETES_","DOCKER_")) for k in os.environ); t=threading.Thread(target=lambda:None);t.start();t.join(); sys.stderr.write("owned-separate-stderr")'"#;
     let spec = f.spec(vec!["/bin/bash".into(), "-c".into(), script.into()])?;
-    let (exit, out, err) = f.run(&spec, Vec::new()).await?;
-    assert_eq!(exit.exit_code, 0);
-    assert_eq!(out, b"owned-procfs");
-    assert_eq!(err, b"owned-separate-stderr");
+    let (resource, exit, out, err) = f.run_retained(&spec, Vec::new()).await?;
+    let result = async {
+        if exit.exit_code != 0 || out != b"owned-procfs" || err != b"owned-separate-stderr" {
+            return Err("procfs/environment/separate-stream regression".into());
+        }
+        use attune_common::artifact_transport::ValidatedRelativePath;
+        use std::io::Read;
+        let selected = ValidatedRelativePath::new("selected/content")?;
+        let mut file = f
+            .launcher
+            .read_stopped_artifact(&spec, &resource, &selected, 10)
+            .await?
+            .ok_or("selected artifact incorrectly missing")?;
+        let mut body = Vec::new();
+        file.read_to_end(&mut body)?;
+        if body != b"owned-file" {
+            return Err("selected artifact bytes changed".into());
+        }
+        let empty = ValidatedRelativePath::new("empty")?;
+        let file = f
+            .launcher
+            .read_stopped_artifact(&spec, &resource, &empty, 0)
+            .await?
+            .ok_or("empty artifact incorrectly missing")?;
+        if file.metadata()?.len() != 0 {
+            return Err("empty artifact gained bytes".into());
+        }
+        if f.launcher
+            .read_stopped_artifact(
+                &spec,
+                &resource,
+                &ValidatedRelativePath::new("selected/not-found")?,
+                10,
+            )
+            .await?
+            .is_some()
+        {
+            return Err("missing selected artifact unexpectedly present".into());
+        }
+        if f.launcher
+            .read_stopped_artifact(&spec, &resource, &selected, 9)
+            .await
+            .is_ok()
+        {
+            return Err("selected artifact exceeded remaining bound".into());
+        }
+        let mut changed = resource.clone();
+        if let ResourceIdentity::Kubernetes { pod_uid, .. } = &mut changed {
+            *pod_uid = Uuid::new_v4().to_string();
+        }
+        if f.launcher
+            .read_stopped_artifact(&spec, &changed, &selected, 10)
+            .await
+            .is_ok()
+        {
+            return Err("changed Pod UID read artifact".into());
+        }
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    }
+    .await;
+    if result.is_ok() {
+        f.launcher.remove_stopped(&spec, &resource).await?;
+    } else {
+        f.cleanup(&resource).await?;
+    }
+    result?;
     let secrets: Api<Secret> = Api::namespaced(f.client.clone(), &f.policy.namespace);
     match secrets.list(&ListParams::default()).await {
         Err(kube::Error::Api(e)) if e.code == 403 => {}

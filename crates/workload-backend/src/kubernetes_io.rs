@@ -28,20 +28,23 @@ pub(crate) struct Streams {
     pub stdin: Box<dyn AsyncWrite + Unpin + Send>,
     pub stdout: ProcessReader,
     pub stderr: ProcessReader,
-    terminal: Shared<BoxFuture<'static, Option<bool>>>,
+    terminal: Shared<BoxFuture<'static, Option<i32>>>,
 }
 impl Streams {
     pub async fn success(&mut self) -> Result<()> {
-        if self.terminal.clone().await == Some(true) {
+        if self.terminal.clone().await == Some(0) {
             Ok(())
         } else {
             Err(invalid())
         }
     }
+    pub async fn exit_code(&mut self) -> Result<i32> {
+        self.terminal.clone().await.ok_or_else(invalid)
+    }
 }
 struct CheckedReader {
     inner: DuplexStream,
-    terminal: Shared<BoxFuture<'static, Option<bool>>>,
+    terminal: Shared<BoxFuture<'static, Option<i32>>>,
     _owner: Arc<TaskOwner>,
 }
 impl AsyncRead for CheckedReader {
@@ -153,7 +156,7 @@ async fn connect(client: &Client, request: http::Request<Vec<u8>>) -> Result<Str
                                 1=>stdout.write_all(&bytes[1..]).await.ok()?,
                                 2=>stderr.write_all(&bytes[1..]).await.ok()?,
                                 3=>{let status:Status=serde_json::from_slice(&bytes[1..]).ok()?;
-                                    return match status.status.as_deref() {Some("Success")=>Some(true),Some("Failure")=>Some(false),_=>None};},
+                                    return exit_status(status);},
                                 _=>return None,
                             }
                         },
@@ -186,4 +189,52 @@ async fn connect(client: &Client, request: http::Request<Vec<u8>>) -> Result<Str
         }),
         terminal,
     })
+}
+
+fn exit_status(status: Status) -> Option<i32> {
+    match status.status.as_deref() {
+        Some("Success") => Some(0),
+        Some("Failure") if status.reason.as_deref() == Some("NonZeroExitCode") => {
+            let mut causes = status
+                .details?
+                .causes?
+                .into_iter()
+                .filter(|c| c.reason.as_deref() == Some("ExitCode"));
+            let cause = causes.next()?;
+            if causes.next().is_some() {
+                return None;
+            }
+            let code = cause.message?.parse::<i32>().ok()?;
+            (1..=255).contains(&code).then_some(code)
+        }
+        _ => None,
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn exit_status_keeps_selected_absence_distinct_from_denial_and_transport_loss() {
+        let status = |value| serde_json::from_value::<Status>(value).unwrap();
+        assert_eq!(exit_status(status(json!({"status":"Success"}))), Some(0));
+        for code in [1, 3, 137] {
+            assert_eq!(
+                exit_status(status(
+                    json!({"status":"Failure","reason":"NonZeroExitCode",
+                "details":{"causes":[{"reason":"ExitCode","message":code.to_string()}]}})
+                )),
+                Some(code)
+            );
+        }
+        for value in [
+            json!({"status":"Failure","reason":"Forbidden","code":403}),
+            json!({"status":"Failure","reason":"NotFound","code":404}),
+            json!({"status":"Failure"}),
+            json!({"status":"Failure","reason":"NonZeroExitCode","details":{"causes":[{"reason":"ExitCode","message":"not-an-exit"}]}}),
+            json!({"status":"Failure","reason":"NonZeroExitCode","details":{"causes":[{"reason":"ExitCode","message":"3"},{"reason":"ExitCode","message":"1"}]}}),
+        ] {
+            assert_eq!(exit_status(status(value)), None);
+        }
+    }
 }

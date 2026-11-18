@@ -44,6 +44,24 @@ impl NativeBackend {
             Self::Docker(v) => v.remove_stopped(spec, resource).await,
         }
     }
+    pub async fn read_stopped_artifact(
+        &self,
+        spec: &ProcessSpec,
+        resource: &ResourceIdentity,
+        relative: &attune_common::artifact_transport::ValidatedRelativePath,
+        remaining_bytes: u64,
+    ) -> Result<Option<std::fs::File>> {
+        match self {
+            Self::Kubernetes(v) => {
+                v.read_stopped_artifact(spec, resource, relative, remaining_bytes)
+                    .await
+            }
+            Self::Docker(v) => {
+                v.read_stopped_artifact(spec, resource, relative, remaining_bytes)
+                    .await
+            }
+        }
+    }
     pub async fn archive_stopped_stage(
         &self,
         spec: &ProcessSpec,
