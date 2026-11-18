@@ -1,0 +1,14 @@
+# Trusted controller only: never a workload runtime or general manager image.
+# Deployment supplies the fixed Engine socket, private state/cache and CP session
+# with read-only root, no-new-privileges, and CHOWN/DAC_OVERRIDE/FOWNER only.
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && install -d -m 0700 /var/lib/attune/launch /var/lib/attune/controller
+COPY dist/attune-service-binary /usr/local/bin/attune-service
+USER 0:0
+WORKDIR /
+HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
+    CMD curl --fail --silent http://127.0.0.1:8092/health || exit 1
+ENTRYPOINT ["/usr/bin/env", "-i", "PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/tmp", "TMPDIR=/tmp", "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt", "ATTUNE_LAUNCH_CONFIG=/run/secrets/attune-controller-config", "/usr/local/bin/attune-service"]

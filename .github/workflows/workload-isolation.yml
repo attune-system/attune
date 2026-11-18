@@ -33,6 +33,10 @@ on:
       - 'scripts/test-workload-runner.py'
       - 'scripts/test_native_http_action.py'
       - 'docker/Dockerfile.agent'
+      - 'docker/Dockerfile.agent-package'
+      - 'docker/Dockerfile.launch-controller-package'
+      - '.github/workflows/publish.yml'
+      - 'scripts/test_workload_release_packages.py'
       - 'docker/Dockerfile.optimized'
       - 'scripts/capture_build_diagnostics.py'
       - 'scripts/test_capture_build_diagnostics.py'
@@ -58,6 +62,7 @@ jobs:
           python3 scripts/test-workload-controller-compose.py
           python3 scripts/test_capture_build_diagnostics.py
           python3 scripts/test_docker_source_graph.py
+          python3 scripts/test_workload_release_packages.py
           python3 scripts/test_workload_proxy_diagnostics.py
           python3 scripts/test_workload_project_probes.py
   controller-project:

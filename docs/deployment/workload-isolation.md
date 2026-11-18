@@ -222,6 +222,18 @@ literal arguments, unchanged stdin and hash mismatch rejection. It is not the
 missing CP producer, and its real-container results remain required on both
 architectures before support can be claimed.
 
+The release build graph now includes the controller service binary/image and
+static Runner in the agent bundle/image. It assembles a public
+`attune-workload-runner-linux-{amd64,arm64}.zip` plus checksum file: exactly the
+matching `linux-amd64` or `linux-arm64` helper at ZIP root, without plans, context
+or credentials. Actual architecture and static-link checks apply to the helper;
+controller service builds retain the shared glibc floor. The dedicated controller
+package image has no general manager configuration or migrations, and clears its
+environment before reading the fixed controller config file. This is future
+release wiring, not evidence that those images/assets are published. Build and
+startup tests of the exact packaged candidate on both architectures remain
+required before supported deployment or image availability can be claimed.
+
 File artifacts are a separate unfinished integration boundary. The canonical
 `workload_artifact` protocol seals CP-selected file-version paths when Run closes,
 with a fixed deadline and independent publication grants/receipts. Filesystem

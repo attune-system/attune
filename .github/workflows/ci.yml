@@ -156,6 +156,7 @@ jobs:
           python3 scripts/test_docker_source_graph.py
           python3 scripts/test_check_core_component_versions.py
           python3 scripts/test_publish_image_provenance.py
+          python3 scripts/test_workload_release_packages.py
           python3 scripts/test_ci_rust_resources.py
           python3 scripts/test_ci_gate.py
 

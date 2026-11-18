@@ -10,6 +10,10 @@ tag=v1.2.3
 for file in \
     attune-binaries-amd64.tar.gz \
     attune-binaries-arm64.tar.gz \
+    attune-workload-runner-linux-amd64.zip \
+    attune-workload-runner-linux-amd64.zip.sha256 \
+    attune-workload-runner-linux-arm64.zip \
+    attune-workload-runner-linux-arm64.zip.sha256 \
     "attune_${version}_linux_amd64.tar.gz" \
     "attune_${version}_linux_amd64.tar.gz.sha256" \
     "attune_${version}_linux_arm64.tar.gz" \
@@ -106,7 +110,7 @@ fi
 rm "$test_root"/*.deb "$test_root"/*.rpm "$test_root"/*.pkg.tar.zst "$test_root"/*.pkg.tar.zst.sig
 bash "$repo_root/scripts/verify-release-assets.sh" "$test_root" "$version" "$tag" \
     --allow-missing-cli --allow-missing-linux-packages
-for required in attune-binaries-amd64.tar.gz "attune-docker-dist-${tag}.tar.gz" attune-openapi.json; do
+for required in attune-binaries-amd64.tar.gz attune-workload-runner-linux-amd64.zip attune-workload-runner-linux-arm64.zip.sha256 "attune-docker-dist-${tag}.tar.gz" attune-openapi.json; do
     rm "$test_root/$required"
     if bash "$repo_root/scripts/verify-release-assets.sh" "$test_root" "$version" "$tag" \
         --allow-missing-cli --allow-missing-linux-packages; then

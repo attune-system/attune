@@ -46,6 +46,8 @@ require_cli_archive() {
 
 for arch in amd64 arm64; do
     require_file "attune-binaries-${arch}.tar.gz"
+    require_file "attune-workload-runner-linux-${arch}.zip"
+    require_file "attune-workload-runner-linux-${arch}.zip.sha256"
     require_cli_archive "attune_${version}_linux_${arch}.tar.gz"
     require_cli_archive "attune_${version}_darwin_${arch}.tar.gz"
 done

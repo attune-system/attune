@@ -9,5 +9,6 @@ COPY dist/attune-agent /usr/local/bin/attune-agent
 COPY dist/attune-sensor-agent /usr/local/bin/attune-sensor-agent
 COPY dist/attune-mcp /usr/local/bin/attune-mcp
 COPY dist/attune /usr/local/bin/attune
+COPY dist/attune-workload-runner /usr/local/bin/attune-workload-runner
 
 ENTRYPOINT ["/usr/local/bin/attune-agent"]
