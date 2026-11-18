@@ -2334,6 +2334,219 @@ impl ActionExecutor {
         })
     }
 
+    async fn isolated_execution_owner(&self, execution: i64) -> Result<i64> {
+        use attune_common::repositories::{
+            delegated_execution::DelegatedExecutionRepository,
+            execution_runtime_admission::{
+                ExecutionAdmissionRepository, ExistingExecutionAuthority,
+            },
+        };
+        let mut tx = self.pool.begin().await?;
+        let owner =
+            match ExecutionAdmissionRepository::selected_authority(&mut tx, execution).await? {
+                ExistingExecutionAuthority::Delegated => {
+                    DelegatedExecutionRepository::validate(&mut tx, execution)
+                        .await?
+                        .owner
+                        .ok_or_else(|| {
+                            Error::PermissionDenied("Isolated action owner unavailable".into())
+                        })?
+                }
+                ExistingExecutionAuthority::Recorded => {
+                    let (record, fence) = ExecutionAdmissionRepository::require_with_fence(
+                        &mut tx,
+                        attune_common::repositories::runtime_authority::RuntimeOwner::Execution(
+                            execution,
+                        ),
+                    )
+                    .await?;
+                    fence.ensure_fresh_on(&mut tx).await?;
+                    record.authority.owner.sponsor_identity_id
+                }
+            };
+        tx.commit().await?;
+        Ok(owner)
+    }
+
+    /// A prerequisite effect owned by this action's existing lifecycle. It has
+    /// no action input/API credential, log custody or completion capability.
+    async fn inspect_isolated_command(
+        &self,
+        context: &ExecutionContext,
+        preparation: &ExecutionPreparation,
+        action: &attune_common::isolated_process::ProcessSpec,
+        program: &str,
+    ) -> Result<attune_common::action_cli::SelectedProgram> {
+        use attune_common::{
+            repositories::{
+                execution_input::SelectedExecutionInput,
+                execution_process::ExecutionProcessRepository as Effects,
+            },
+            workload_launch::{
+                LaunchPurpose, LaunchRoot, LaunchStopReason, LaunchTarget, RUNNER_ROOT,
+            },
+        };
+        let unavailable =
+            || Error::PermissionDenied("Isolated command inspection unavailable".into());
+        let master = self
+            .secret_manager
+            .encryption_key()
+            .ok_or_else(unavailable)?;
+        if let Some(selected) = Effects::inspected_program(&self.pool, action, master).await? {
+            let attune_common::workload_launch::LaunchTarget::Execution {
+                execution, attempt, ..
+            } = action.target
+            else {
+                return Err(unavailable());
+            };
+            let retained = Effects::retained_for_purpose(
+                &self.pool,
+                execution,
+                attempt,
+                LaunchPurpose::RuntimeProbe,
+                master,
+            )
+            .await?
+            .ok_or_else(unavailable)?;
+            let resource = Effects::retained_resource(&self.pool, retained.intent)
+                .await?
+                .ok_or_else(unavailable)?;
+            self.native_backend
+                .as_ref()
+                .ok_or_else(unavailable)?
+                .remove_stopped(&retained, &resource)
+                .await?;
+            return Ok(selected);
+        }
+        let LaunchTarget::Execution {
+            execution, attempt, ..
+        } = action.target
+        else {
+            return Err(unavailable());
+        };
+        let probe = if let Some(retained) = Effects::retained_for_purpose(
+            &self.pool,
+            execution,
+            attempt,
+            LaunchPurpose::RuntimeProbe,
+            master,
+        )
+        .await?
+        {
+            retained
+        } else {
+            let mut probe = action.clone();
+            probe.intent = uuid::Uuid::new_v4();
+            probe.purpose = LaunchPurpose::RuntimeProbe;
+            probe.invocation.argv = vec![
+                format!("{RUNNER_ROOT}/linux-{}", probe.platform.native_arch()),
+                "inspect-command-program".into(),
+                program.to_owned(),
+            ];
+            // Resolve only the captured native runtime's explicit guest PATH.
+            // No manager PATH, action credential, parameters or image/service
+            // environment enters the inspection process.
+            let config = context
+                .runtime_config_override
+                .as_ref()
+                .ok_or_else(unavailable)?;
+            let environment = crate::runtime::launch_planning::action_environment(
+                config,
+                &Default::default(),
+                program,
+                false,
+                probe.pack_access,
+            )
+            .map_err(|_| unavailable())?;
+            let path = environment.get("PATH").cloned().ok_or_else(unavailable)?;
+            probe.invocation.env = [("PATH".into(), path)].into();
+            probe.invocation.working_root = LaunchRoot::Pack;
+            probe
+        };
+        let selected = SelectedExecutionInput::new(
+            serde_json::to_value(&context.parameters)?,
+            preparation.input_snapshot.clone().ok_or_else(unavailable)?,
+        )?;
+        let owner = self.isolated_execution_owner(execution).await?;
+        Effects::reserve(&self.pool, &probe, owner, &selected, master).await?;
+        let backend = self.native_backend.as_ref().ok_or_else(unavailable)?;
+        let launcher = backend.launcher();
+        let create = Effects::begin_create(&self.pool, probe.intent, master).await?;
+        let resource = launcher.prepare(&probe, create).await?;
+        Effects::record_resource(&self.pool, probe.intent, &resource).await?;
+        let mut process = launcher.start(&probe, &resource).await?;
+        if process.resource != resource {
+            process
+                .control
+                .stop(LaunchStopReason::LaunchFailure)
+                .await?;
+            return Err(unavailable());
+        }
+        process.control = Arc::new(RecordingProcessControl {
+            inner: process.control,
+            pool: self.pool.clone(),
+            intent: probe.intent,
+            resource: resource.clone(),
+        });
+        let payload =
+            match Effects::consume_stdin(&self.pool, probe.intent, &resource, master).await {
+                Ok(payload) => payload,
+                Err(error) => {
+                    process
+                        .control
+                        .stop(LaunchStopReason::SourceRevoked)
+                        .await?;
+                    return Err(error);
+                }
+            };
+        let result = crate::runtime::process_executor::execute_isolated_cancellable(
+            process,
+            payload,
+            crate::runtime::process_executor::IsolatedCaptureOptions {
+                timeout_secs: context.timeout,
+                max_stdout_bytes: 16 * 1024,
+                max_stderr_bytes: 16 * 1024,
+                output_format: attune_common::models::OutputFormat::Text,
+                output_policy: Default::default(),
+                out_schema: None,
+                cancel_token: context.cancel_token.clone(),
+                stdout_log_writer: None,
+                stderr_log_writer: None,
+            },
+        )
+        .await
+        .map_err(|_| unavailable())?;
+        let capture = async {
+            if result.exit_code != 0
+                || result.error.is_some()
+                || result.timed_out
+                || result.logs_incomplete
+                || result.stdout_truncated
+                || result.stderr_truncated
+            {
+                return Err(unavailable());
+            }
+            let selected = serde_json::from_str(&result.stdout).map_err(|_| unavailable())?;
+            Effects::complete_command_inspection(
+                &self.pool,
+                probe.intent,
+                &resource,
+                &selected,
+                master,
+            )
+            .await?;
+            Ok(selected)
+        }
+        .await;
+        // This read-only probe has no file/custody obligations. Join factual
+        // cleanup even on rejected metadata/negative exit; uncertain removal
+        // never becomes authority to create or inspect again.
+        let cleanup = backend.remove_stopped(&probe, &resource).await;
+        let selected = capture?;
+        cleanup?;
+        Ok(selected)
+    }
+
     /// The existing trusted preparer selects the program and environment. A
     /// launcher supplies effects, never executable discovery or domain policy.
     /// Native file selection uses the immutable manifest + admitted platform;
@@ -2403,12 +2616,6 @@ impl ActionExecutor {
             return Err(unavailable());
         }
         let selected = if let Some(launch) = &action.launch {
-            if !matches!(
-                launch,
-                attune_common::pack_format::LaunchSpec::Native { .. }
-            ) {
-                return Err(unavailable());
-            }
             launch.validate_action_source(
                 action.entrypoint.as_deref(),
                 action.parameter_delivery,
@@ -2424,16 +2631,21 @@ impl ActionExecutor {
             let launch = launch.clone();
             let reference = action.r#ref.clone();
             let platform = spec.platform;
-            tokio::task::spawn_blocking(move || {
-                let body = cache.open_input_archive(&pin).map_err(|_| {
-                    Error::PermissionDenied("Native metadata archive unavailable".into())
-                })?;
-                attune_common::action_cli::select_released_native(
-                    &launch, &manifest, body, &reference, platform,
-                )
-            })
-            .await
-            .map_err(|_| unavailable())??
+            if let attune_common::pack_format::LaunchSpec::Command { program, .. } = &launch {
+                self.inspect_isolated_command(context, preparation, spec, program)
+                    .await?
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    let body = cache.open_input_archive(&pin).map_err(|_| {
+                        Error::PermissionDenied("Native metadata archive unavailable".into())
+                    })?;
+                    attune_common::action_cli::select_released_native(
+                        &launch, &manifest, body, &reference, platform,
+                    )
+                })
+                .await
+                .map_err(|_| unavailable())??
+            }
         } else {
             let relative = attune_common::artifact_transport::ValidatedRelativePath::new(
                 &context.entry_point,
@@ -2487,14 +2699,6 @@ impl ActionExecutor {
                     ArgumentLimits::default(),
                 )
                 .map_err(|_| unavailable())?;
-            attune_common::repositories::execution_program::ExecutionProgramRepository::record(
-                &self.pool,
-                execution.id,
-                self.worker_id.load(Ordering::Acquire),
-                snapshot.release.id,
-                &selected,
-            )
-            .await?;
             input.argv().to_vec()
         } else {
             Vec::new()
@@ -2502,7 +2706,12 @@ impl ActionExecutor {
         spec.invocation.argv =
             crate::runtime::launch_planning::cli_exec_argv(spec.platform, &selected, &arguments)
                 .map_err(|_| unavailable())?;
-        let file = if action.launch.is_some() {
+        let file = if matches!(
+            action.launch,
+            Some(attune_common::pack_format::LaunchSpec::Command { .. })
+        ) {
+            selected.path.to_str().ok_or_else(unavailable)?.to_owned()
+        } else if action.launch.is_some() {
             selected
                 .path
                 .strip_prefix(PACK_ROOT)
@@ -2538,14 +2747,19 @@ impl ActionExecutor {
             .timeout
             .map(|seconds| seconds.checked_mul(1000).ok_or_else(unavailable))
             .transpose()?;
-        attune_common::repositories::execution_program::ExecutionProgramRepository::record(
-            &self.pool,
-            execution.id,
-            self.worker_id.load(Ordering::Acquire),
-            snapshot.release.id,
-            &selected,
-        )
-        .await?;
+        if !matches!(
+            action.launch,
+            Some(attune_common::pack_format::LaunchSpec::Command { .. })
+        ) {
+            attune_common::repositories::execution_program::ExecutionProgramRepository::record(
+                &self.pool,
+                execution.id,
+                self.worker_id.load(Ordering::Acquire),
+                snapshot.release.id,
+                &selected,
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -2558,7 +2772,6 @@ impl ActionExecutor {
         launcher: Arc<dyn attune_common::isolated_process::ProcessLauncher>,
     ) -> Result<ExecutionResult> {
         use attune_common::repositories::{
-            delegated_execution::DelegatedExecutionRepository,
             execution_input::SelectedExecutionInput,
             execution_process::ExecutionProcessRepository as Effects,
         };
@@ -2592,35 +2805,7 @@ impl ActionExecutor {
                 Error::PermissionDenied("Isolated action input unavailable".into())
             })?,
         )?;
-        let mut tx = self.pool.begin().await?;
-        use attune_common::repositories::execution_runtime_admission::{
-            ExecutionAdmissionRepository, ExistingExecutionAuthority,
-        };
-        let owner =
-            match ExecutionAdmissionRepository::selected_authority(&mut tx, context.execution_id)
-                .await?
-            {
-                ExistingExecutionAuthority::Delegated => {
-                    DelegatedExecutionRepository::validate(&mut tx, context.execution_id)
-                        .await?
-                        .owner
-                        .ok_or_else(|| {
-                            Error::PermissionDenied("Isolated action owner unavailable".into())
-                        })?
-                }
-                ExistingExecutionAuthority::Recorded => {
-                    let (record, fence) = ExecutionAdmissionRepository::require_with_fence(
-                        &mut tx,
-                        attune_common::repositories::runtime_authority::RuntimeOwner::Execution(
-                            context.execution_id,
-                        ),
-                    )
-                    .await?;
-                    fence.ensure_fresh_on(&mut tx).await?;
-                    record.authority.owner.sponsor_identity_id
-                }
-            };
-        tx.commit().await?;
+        let owner = self.isolated_execution_owner(context.execution_id).await?;
         Effects::reserve(&self.pool, &spec, owner, &selected, master).await?;
         let create = Effects::begin_create(&self.pool, spec.intent, master).await?;
         let resource = launcher.prepare(&spec, create).await?;

@@ -292,6 +292,7 @@ impl LaunchManifest {
         let purpose_matches = matches!(
             (self.purpose, &self.target),
             (LaunchPurpose::Action, LaunchTarget::Execution { .. })
+                | (LaunchPurpose::RuntimeProbe, LaunchTarget::Execution { .. })
                 | (LaunchPurpose::Sensor, LaunchTarget::Sensor { .. })
                 | (LaunchPurpose::Setup, LaunchTarget::Setup { .. })
                 | (

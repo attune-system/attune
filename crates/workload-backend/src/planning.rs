@@ -266,7 +266,27 @@ pub fn action_environment(
     // The owning loop enforces API opt-in, origins and the current attempt.
     // Retain its explicit scoped token while rejecting manager/control context.
     validate_environment(selected, true)?;
-    let vars = variables(config, Some(entry), has_runtime, pack_access)?;
+    let vars = if entry.starts_with('/') {
+        // Installed native commands were selected in the admitted image. Keep
+        // their exact guest path; setup/project paths remain pack-relative.
+        if has_runtime
+            || pack_access != PackAccess::ReadOnly
+            || !matches!(config.interpreter.binary.as_str(), "" | "native" | "none")
+            || entry.contains(['\\', '\0'])
+            || entry.chars().any(char::is_control)
+            || entry
+                .split('/')
+                .skip(1)
+                .any(|part| part.is_empty() || matches!(part, "." | ".."))
+        {
+            return Err(PlanningError::Path);
+        }
+        let mut vars = variables(config, None, false, pack_access)?;
+        vars.insert("action_file", entry.to_owned());
+        vars
+    } else {
+        variables(config, Some(entry), has_runtime, pack_access)?
+    };
     let mut output = BTreeMap::from([("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into())]);
     apply_runtime_environment(config, &mut output, &vars);
     output.extend(selected.clone());
@@ -442,6 +462,70 @@ fn render(template: &str, vars: &BTreeMap<&str, String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selected_image_native_command_path_never_changes_project_path_rules() {
+        let mut native: RuntimeExecutionConfig =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        native.env_vars.insert(
+            "SELECTED_FILE".into(),
+            RuntimeEnvVarConfig::Value("{action_file}".into()),
+        );
+        let environment = action_environment(
+            &native,
+            &BTreeMap::new(),
+            "/echo",
+            false,
+            PackAccess::ReadOnly,
+        )
+        .unwrap();
+        assert_eq!(environment["SELECTED_FILE"], "/echo");
+        for path in [
+            "/",
+            "/a/../echo",
+            "/a/./echo",
+            "/a//echo",
+            "/echo/",
+            "/echo\n",
+            "/echo\0",
+            "/a\\echo",
+        ] {
+            assert!(action_environment(
+                &native,
+                &BTreeMap::new(),
+                path,
+                false,
+                PackAccess::ReadOnly
+            )
+            .is_err());
+        }
+        assert!(action_environment(
+            &native,
+            &BTreeMap::new(),
+            "/echo",
+            true,
+            PackAccess::ReadOnly
+        )
+        .is_err());
+        assert!(action_environment(
+            &native,
+            &BTreeMap::new(),
+            "/echo",
+            false,
+            PackAccess::CandidateCopy
+        )
+        .is_err());
+        assert!(action_environment(
+            &python(),
+            &BTreeMap::new(),
+            "/echo",
+            false,
+            PackAccess::ReadOnly
+        )
+        .is_err());
+        assert!(action_path("/echo", false).is_err());
+        assert!(action_path("/echo", true).is_err());
+    }
+
     fn python() -> RuntimeExecutionConfig {
         let pack: serde_json::Value =
             serde_yaml_ng::from_str(include_str!("../../../packs/core/runtimes/python.yaml"))
