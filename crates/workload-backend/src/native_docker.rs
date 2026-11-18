@@ -882,6 +882,18 @@ mod tests {
             "rejected cleanup must not contact Engine"
         );
     }
+    #[test]
+    fn local_candidate_image_uses_exact_config_id_without_tag_or_registry_alias() {
+        let path = tempfile::tempdir().unwrap();
+        let (mut launcher, mut spec, _root) = fixture(&path.path().join("not-connected.sock"));
+        spec.image.reference = format!("sha256:{}", spec.image.sha256.as_str());
+        launcher.policy.allowed_images =
+            std::collections::BTreeSet::from([spec.image.reference.clone()]);
+        let body = launcher.body(&spec, &[]).unwrap();
+        assert_eq!(body.image, spec.image.reference);
+        spec.image.reference = format!("sha256:{}", "b".repeat(64));
+        assert!(launcher.body(&spec, &[]).is_err());
+    }
     #[tokio::test]
     async fn inspection_rejects_inherited_or_executable_healthchecks_before_attach() {
         for (health, accepted) in [

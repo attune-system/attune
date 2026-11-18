@@ -2,7 +2,7 @@
 //! existing trusted worker. No Docker service, Job, operator or HTTP relay.
 use crate::{
     cache::CacheStore,
-    process_policy::{invalid, pinned_image, public_digest},
+    process_policy::{invalid, public_digest, registry_image},
     runner_protocol::encode_start,
 };
 use async_trait::async_trait;
@@ -53,7 +53,8 @@ impl KubernetesPolicy {
         let digest = public_digest(spec)?;
         if self.cluster.is_empty()
             || !dns_label(&self.namespace)
-            || !pinned_image(&self.helper_image)
+            || !registry_image(&spec.image)
+            || !registry_image(&self.helper_image)
             || (admission && !self.allowed_images.contains(&spec.image.reference))
             || self.memory_bytes < 32 * 1024 * 1024
             || self.scratch_bytes == 0
@@ -900,6 +901,15 @@ mod tests {
             arm.spec.unwrap().node_selector.unwrap()["kubernetes.io/arch"],
             "arm64"
         );
+    }
+    #[test]
+    fn kubernetes_does_not_treat_local_docker_config_ids_as_registry_manifest_references() {
+        let (policy, mut spec) = fixture();
+        spec.image.reference = format!("sha256:{}", spec.image.sha256.as_str());
+        assert!(policy.pod(&spec).is_err());
+        let (mut policy, spec) = fixture();
+        policy.helper_image.reference = format!("sha256:{}", policy.helper_image.sha256.as_str());
+        assert!(policy.pod(&spec).is_err());
     }
     #[test]
     fn stage_transfer_requires_positive_payload_success_not_sidecar_or_pod_phase() {

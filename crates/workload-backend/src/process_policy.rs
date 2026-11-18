@@ -60,12 +60,18 @@ pub(crate) fn public_digest(spec: &ProcessSpec) -> Result<Sha256Digest> {
     Ok(Sha256Digest::of_bytes(&bytes))
 }
 pub(crate) fn pinned_image(image: &attune_common::workload_launch::PinnedImage) -> bool {
+    image.reference == format!("sha256:{}", image.sha256.as_str()) || registry_image(image)
+}
+pub(crate) fn registry_image(image: &attune_common::workload_launch::PinnedImage) -> bool {
     image
         .reference
         .split_once("@sha256:")
         .is_some_and(|(name, digest)| {
             !name.is_empty()
-                && !name.bytes().any(|b| b.is_ascii_whitespace())
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"./:_-".contains(&b))
+                && !name.contains("://")
                 && digest == image.sha256.as_str()
         })
 }

@@ -100,6 +100,12 @@ that the manager and daemon see the same named volume/subpath. Daemon identity
 and immutable native platform are Docker-specific evidence, not Kubernetes
 fields.
 
+Docker also accepts the canonical exact local `sha256:<config-ID>` form for
+owned candidate images. The Engine must inspect that exact ID and platform on
+the configured daemon; an unavailable local ID fails without a tag or registry
+fallback. Kubernetes requires named manifest/index digest references and rejects
+local Docker IDs. No published image is inferred from a local build.
+
 Each workload has a private PID/IPC/mount namespace, normal private procfs,
 read-only root filesystem, all capabilities dropped and no-new-privileges.
 Only selected immutable input subpaths and the attempt's own stage/artifact
