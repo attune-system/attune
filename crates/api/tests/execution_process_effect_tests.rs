@@ -782,3 +782,235 @@ async fn native_file_publication_fences_worker_expiry_after_target_wait() -> Res
     ctx.cleanup().await?;
     result
 }
+
+async fn wait_for_database_blocker(pool: &sqlx::PgPool, blocker: i32) -> Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))",
+            )
+            .bind(blocker)
+            .fetch_one(pool)
+            .await?;
+            if waiting {
+                return Ok::<_, sqlx::Error>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_file_allocation_commits_before_exit_closes_run() -> Result<()> {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+    attune_common::auth::install_crypto_provider();
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let (spec, selected, resource) = admitted(&ctx).await?;
+    let master = ctx.state.config.security.encryption_key.as_deref().unwrap();
+    let owner = ctx.user.as_ref().unwrap().id;
+    let LaunchTarget::Execution { execution, .. } = spec.target else {
+        unreachable!()
+    };
+    Effects::reserve(&ctx.pool, &spec, owner, &selected, master).await?;
+    Effects::begin_create(&ctx.pool, spec.intent, master).await?;
+    Effects::record_resource(&ctx.pool, spec.intent, &resource).await?;
+    Effects::consume_stdin(&ctx.pool, spec.intent, &resource, master).await?;
+    let version = ordinary_file_version(&ctx, execution).await?;
+    let token = helpers::delegated_source::execution_token(&ctx, execution).await?;
+    // Block only target insertion. The request must retain its source Run
+    // while waiting here, so a concurrent exit cannot miss this allocation.
+    let mut blocker = ctx.pool.begin().await?;
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('artifact_version'),hashtext($1::text))")
+        .bind(version.artifact.to_string())
+        .execute(&mut *blocker)
+        .await?;
+    let app = ctx.app.clone();
+    let request = Request::post(format!(
+        "/api/v1/artifacts/{}/versions/file",
+        version.artifact
+    ))
+    .header("authorization", format!("Bearer {token}"))
+    .header("content-type", "application/json")
+    .body(Body::from("{}"))?;
+    let mut allocation = Some(tokio::spawn(async move { app.oneshot(request).await }));
+    let mut blocker = Some(blocker);
+    let mut exit = None;
+    let race = async {
+        wait_for_database_blocker(&ctx.pool, blocker_pid).await?;
+        // This exact operation row is held FOR SHARE by the admitted request.
+        let operation_waiter: i32 = sqlx::query_scalar(
+            "SELECT pid FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid))",
+        )
+        .bind(blocker_pid)
+        .fetch_one(&ctx.pool)
+        .await?;
+        let pool = ctx.pool.clone();
+        let intent = spec.intent;
+        let resource_copy = resource.clone();
+        exit = Some(tokio::spawn(async move {
+            Effects::record_exit(
+                &pool,
+                intent,
+                &resource_copy,
+                LaunchExitOutcome {
+                    exit_code: 0,
+                    oom_killed: false,
+                },
+            )
+            .await
+        }));
+        wait_for_database_blocker(&ctx.pool, operation_waiter).await?;
+        blocker.take().unwrap().commit().await?;
+        let response = allocation.take().unwrap().await??;
+        if response.status() != StatusCode::CREATED {
+            return Err("admitted allocation did not commit".into());
+        }
+        exit.take().unwrap().await??;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    }
+    .await;
+    // Failure teardown releases the owned blocker and joins both owners before
+    // the fixture pool/database can be disposed.
+    if let Some(blocker) = blocker.take() {
+        blocker.rollback().await?;
+    }
+    if race.is_err() {
+        if let Some(allocation) = allocation {
+            allocation.abort();
+            let _ = allocation.await;
+        }
+        if let Some(exit) = exit {
+            exit.abort();
+            let _ = exit.await;
+        }
+        ctx.cleanup().await?;
+        return race;
+    }
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM artifact_version WHERE artifact=$1 AND execution=$2",
+    )
+    .bind(version.artifact)
+    .bind(execution)
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(count, 2);
+    for path in [
+        format!("/api/v1/artifacts/{}/versions/file", version.artifact),
+        format!(
+            "/api/v1/artifacts/ref/{}.late-native/versions/file",
+            ExecutionRepository::find_by_id(&ctx.pool, execution)
+                .await?
+                .unwrap()
+                .action_ref
+        ),
+    ] {
+        let response = ctx
+            .app
+            .clone()
+            .oneshot(
+                Request::post(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))?,
+            )
+            .await?;
+        assert!(matches!(
+            response.status(),
+            StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED
+        ));
+    }
+    let after: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact_version WHERE execution=$1")
+        .bind(execution)
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(after, 2);
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_file_allocation_cannot_attribute_a_different_execution() -> Result<()> {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+    attune_common::auth::install_crypto_provider();
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let (spec, selected, resource) = admitted(&ctx).await?;
+    let master = ctx.state.config.security.encryption_key.as_deref().unwrap();
+    let owner = ctx.user.as_ref().unwrap().id;
+    let LaunchTarget::Execution { execution, .. } = spec.target else {
+        unreachable!()
+    };
+    Effects::reserve(&ctx.pool, &spec, owner, &selected, master).await?;
+    Effects::begin_create(&ctx.pool, spec.intent, master).await?;
+    Effects::record_resource(&ctx.pool, spec.intent, &resource).await?;
+    Effects::consume_stdin(&ctx.pool, spec.intent, &resource, master).await?;
+    let version = ordinary_file_version(&ctx, execution).await?;
+    let row = ExecutionRepository::find_by_id(&ctx.pool, execution)
+        .await?
+        .unwrap();
+    let token = helpers::delegated_source::execution_token(&ctx, execution).await?;
+    for path in [
+        format!("/api/v1/artifacts/{}/versions/file", version.artifact),
+        format!(
+            "/api/v1/artifacts/ref/{}.wrong-native/versions/file",
+            row.action_ref
+        ),
+    ] {
+        let response = ctx
+            .app
+            .clone()
+            .oneshot(
+                Request::post(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(
+                        &json!({"execution": execution + 1000000}),
+                    )?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact_version WHERE execution=$1")
+        .bind(execution)
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(count, 1);
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/v1/artifacts/ref/{}.positive-native/versions/file",
+                row.action_ref
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&json!({
+                "scope": attune_common::models::OwnerType::Action,
+                "owner": row.action_ref,
+                "visibility": attune_common::models::enums::ArtifactVisibility::Private,
+                "type": attune_common::models::enums::ArtifactType::FileBinary,
+            }))?))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact_version WHERE execution=$1")
+        .bind(execution)
+        .fetch_one(&ctx.pool)
+        .await?;
+    assert_eq!(count, 2);
+    ctx.cleanup().await?;
+    Ok(())
+}
