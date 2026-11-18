@@ -124,51 +124,58 @@ pub async fn output_body(
     file.rewind().await.map_err(|_| denied())?;
     let mut file = file.into_std().await;
     let policy = permit.policy;
-    let file = tokio::task::spawn_blocking(move || {
-        attune_common::workload_archive::validate_zip(&mut file, &policy).map_err(|_| denied())?;
-        Ok::<_, ApiError>(file)
-    })
-    .await
-    .map_err(|_| denied())??;
-    Ledger::output_body_permit(&state.db, actor, &request, output_id, &lease, &grant).await?;
     let state_task = state.clone();
     let key = ObjectKey::new(permit.key).map_err(|_| denied())?;
     let digest: [u8; 32] = hex::decode(permit.sha256.as_str())
         .map_err(|_| denied())?
         .try_into()
         .map_err(|_| denied())?;
-    let task = state.file_transfers.spawn(admission, async move {
-        let body = tokio_util::io::ReaderStream::new(tokio::fs::File::from_std(file))
-            .map_err(|error| BlobStoreError::Interrupted(error.to_string()))
-            .boxed();
-        let object = match state_task
-            .blob_store
-            .put_file_atomic(&key, body, permit.size, digest)
+    // Transfer ownership before starting non-cancelable blocking validation.
+    // Dropping the HTTP waiter or shutting down cannot release its admission
+    // while a ZIP parser or an uncertain provider publication remains active.
+    let task = state
+        .file_transfers
+        .finish_publication(admission, async move {
+            let file = tokio::task::spawn_blocking(move || {
+                attune_common::workload_archive::validate_zip(&mut file, &policy)
+                    .map_err(|_| denied())?;
+                Ok::<_, ApiError>(file)
+            })
             .await
-        {
-            Ok(object) => object,
-            Err(_) => state_task
+            .map_err(|_| denied())??;
+            Ledger::output_body_permit(&state_task.db, actor, &request, output_id, &lease, &grant)
+                .await?;
+            let body = tokio_util::io::ReaderStream::new(tokio::fs::File::from_std(file))
+                .map_err(|error| BlobStoreError::Interrupted(error.to_string()))
+                .boxed();
+            let object = match state_task
                 .blob_store
-                .head(&key)
+                .put_file_atomic(&key, body, permit.size, digest)
                 .await
-                .map_err(|_| denied())?
-                .ok_or_else(denied)?,
-        };
-        if object.size != permit.size || object.sha256 != digest {
-            return Err(denied());
-        }
-        Ledger::publish_output(
-            &state_task.db,
-            actor,
-            &request,
-            output_id,
-            &lease,
-            &grant,
-            &object,
-        )
-        .await
-        .map_err(ApiError::from)
-    });
-    let result = task.await.map_err(|_| denied())?.ok_or_else(denied)??;
+            {
+                Ok(object) => object,
+                Err(_) => state_task
+                    .blob_store
+                    .head(&key)
+                    .await
+                    .map_err(|_| denied())?
+                    .ok_or_else(denied)?,
+            };
+            if object.size != permit.size || object.sha256 != digest {
+                return Err(denied());
+            }
+            Ledger::publish_output(
+                &state_task.db,
+                actor,
+                &request,
+                output_id,
+                &lease,
+                &grant,
+                &object,
+            )
+            .await
+            .map_err(ApiError::from)
+        });
+    let result = task.await.map_err(|_| denied())??;
     response(actor, result)
 }

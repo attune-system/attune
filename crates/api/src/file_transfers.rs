@@ -166,7 +166,7 @@ impl FileTransfers {
         })
     }
 
-    /// A SQL COMMIT plus local publication must run to acknowledgement even if
+    /// Blocking validation and native/SQL publication must run to acknowledgement even if
     /// its HTTP waiter disconnects or shutdown cancellation begins. The admitted
     /// lease bounds outstanding work; drain joins this tracked critical section.
     pub(crate) fn finish_publication<F, T>(&self, lease: FileUploadLease, work: F) -> JoinHandle<T>
@@ -239,6 +239,35 @@ mod tests {
         assert!(!transfers.drain(Duration::ZERO).await);
         assert_eq!(transfers.tasks.len(), 0);
         assert!(transfers.upload(Some(1)).is_err());
+    }
+    #[tokio::test]
+    async fn detached_blocking_validation_retains_admission_and_shutdown_joins_it() {
+        let transfers = FileTransfers::new(128 * UNIT, 1);
+        let lease = transfers.upload(Some(1)).unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = transfers.finish_publication(lease, async move {
+            tokio::task::spawn_blocking(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+            .await
+            .unwrap();
+        });
+        entered_rx.await.unwrap();
+        drop(task);
+        assert!(transfers.upload(Some(1)).is_err());
+        let draining = transfers.clone();
+        let drain = tokio::spawn(async move { draining.drain(Duration::ZERO).await });
+        transfers.cancel.cancelled().await;
+        assert!(
+            !drain.is_finished(),
+            "shutdown must join non-cancelable parsing"
+        );
+        assert!(!transfers.tasks.is_empty());
+        release_tx.send(()).unwrap();
+        assert!(!drain.await.unwrap());
+        assert!(transfers.tasks.is_empty());
     }
     #[tokio::test]
     async fn memory_admission_precedes_buffers_and_successful_jobs_release_ownership() {
