@@ -397,3 +397,55 @@ async fn replacement_registration_cannot_reuse_an_existing_native_attempt() -> R
     ctx.cleanup().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn retired_controller_scope_cannot_fall_through_to_ambient_iam() -> Result<()> {
+    use attune_common::auth::jwt::{Claims, TokenType};
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+    attune_common::auth::install_crypto_provider();
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    // Even an active administrator subject cannot widen this retired machine
+    // purpose into ordinary API access after the relay route is removed.
+    let now = chrono::Utc::now().timestamp();
+    let claims = Claims {
+        sub: ctx.user.as_ref().unwrap().id.to_string(),
+        login: "retired-controller".into(),
+        iat: now,
+        exp: now + 60,
+        token_type: TokenType::Worker,
+        scope: Some("workload_controller".into()),
+        metadata: Some(json!({"controller":1,"engine":1,"incarnation":Uuid::new_v4()})),
+    };
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(ctx.state.jwt_config.secret.as_bytes()),
+    )?;
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/packs")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/workload-launches/1/resolve")
+                .header("authorization", format!("Bearer {}", ctx.token().unwrap()))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"launch_id":1,"admitted_digest":"retired"}"#))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    ctx.cleanup().await?;
+    Ok(())
+}

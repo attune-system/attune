@@ -440,25 +440,6 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::workload_hosts::custody::reserve,
         crate::routes::workload_hosts::custody::prepare,
         crate::routes::workload_hosts::custody::cancel_absent,
-        crate::routes::workload_launch::session,
-        crate::routes::workload_launch::engine_binding,
-        crate::routes::workload_launch::resolve,
-        crate::routes::workload_launch::output::reserve_output,
-        crate::routes::workload_launch::output::output_body,
-        crate::routes::workload_launch::output::stage_result,
-        crate::routes::workload_launch::io_grants,
-        crate::routes::workload_launch::authorize_io,
-        crate::routes::workload_launch::stdin::authorize,
-        crate::routes::workload_launch::reconcile,
-        crate::routes::workload_launch::claim,
-        crate::routes::workload_launch::status,
-        crate::routes::workload_launch::stop,
-        crate::routes::workload_launch::create_intent,
-        crate::routes::workload_launch::start,
-        crate::routes::workload_launch::renew,
-        crate::routes::workload_launch::observe,
-        crate::routes::workload_launch::stop_ack,
-        crate::routes::workload_launch::input_body,
 
         crate::routes::internal_files::download_file,
         crate::routes::internal_files::upload_file,
@@ -1077,12 +1058,12 @@ mod tests {
             .sum();
 
         assert_eq!(
-            path_count, 241,
+            path_count, 222,
             "Expected every mounted API path in the OpenAPI spec"
         );
 
         assert_eq!(
-            operation_count, 305,
+            operation_count, 286,
             "Expected every mounted API operation in the OpenAPI spec"
         );
 
@@ -1092,18 +1073,19 @@ mod tests {
             schemas["LaunchSpec"]["oneOf"].is_array(),
             "action launch union must remain distinct"
         );
-        assert!(schemas["WorkloadLaunchSpec"]["properties"]
-            .get("manifest")
-            .is_some());
-        assert!(schemas["WorkloadLaunchSpec"]["properties"]
-            .get("invocation")
-            .is_some());
+        assert!(
+            schemas.get("WorkloadLaunchSpec").is_none(),
+            "Retired relay schema must not be exposed"
+        );
+        assert!(
+            spec["paths"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .all(|path| !path.starts_with("/api/v1/workload-launches")),
+            "Retired relay routes must not be mounted"
+        );
         for (path, request, response) in [
-            (
-                "/api/v1/workload-launches/{id}/authorize-stdin",
-                "AuthorizeLaunchStdinRequest",
-                "LaunchIoAuthorization",
-            ),
             (
                 "/api/v1/workload-hosts/custody/reserve",
                 "ReserveCustody",
@@ -1124,16 +1106,6 @@ mod tests {
                 "ControlRequest",
                 "ControlResponse",
             ),
-            (
-                "/api/v1/workload-launches/{id}/claim",
-                "LaunchRequest",
-                "ClaimedLaunch",
-            ),
-            (
-                "/api/v1/workload-launches/reconcile",
-                "ReconcileLaunchesRequest",
-                "ReconcileLaunchesPage",
-            ),
         ] {
             let operation = &spec["paths"][path]["post"];
             assert!(
@@ -1148,34 +1120,6 @@ mod tests {
                 operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
                 format!("#/components/schemas/{response}")
             );
-        }
-        for (path, headers) in [
-            (
-                "/api/v1/workload-launches/{id}/claim",
-                &["x-attune-launch-dispatch"][..],
-            ),
-            (
-                "/api/v1/workload-launches/{id}/authorize-io",
-                &["x-attune-launch-lease", "x-attune-launch-io"][..],
-            ),
-            (
-                "/api/v1/workload-launches/{id}/outputs/{output_id}/body",
-                &["x-attune-launch-lease", "x-attune-launch-output"][..],
-            ),
-        ] {
-            let parameters = spec["paths"][path]["post"]["parameters"]
-                .as_array()
-                .expect("Control grant parameters");
-            for header in headers {
-                assert!(
-                    parameters
-                        .iter()
-                        .any(|parameter| parameter["in"] == "header"
-                            && parameter["name"] == *header
-                            && parameter["required"] == true),
-                    "Missing required grant header {header} on {path}"
-                );
-            }
         }
         let reveal = &spec["paths"]["/api/v1/triggers/{ref}/webhooks/reveal"]["post"];
         assert!(

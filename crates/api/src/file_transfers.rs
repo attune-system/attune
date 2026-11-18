@@ -28,9 +28,6 @@ pub(crate) struct FileMemoryLease {
     _memory: OwnedSemaphorePermit,
     _slot: OwnedSemaphorePermit,
 }
-pub(crate) struct ControlMemoryLease {
-    _memory: OwnedSemaphorePermit,
-}
 pub(crate) struct FileUploadLease {
     _memory: FileMemoryLease,
     _task: TaskTrackerToken,
@@ -108,54 +105,12 @@ impl FileTransfers {
             _task: self.tasks.token(),
         })
     }
-    /// ZIP central-directory/link metadata is bounded by both the compressed
-    /// body and admitted entry count. Reserve before parsing or allocating it.
-    pub(crate) fn archive_upload(
-        &self,
-        compressed: u64,
-        files: u64,
-    ) -> Result<FileUploadLease, String> {
-        let closed = self.closed.lock().expect("file admission lock poisoned");
-        if *closed {
-            return Err("Archive publication is shutting down".into());
-        }
-        let bytes = compressed
-            .checked_mul(16)
-            .and_then(|n| {
-                files
-                    .checked_mul(4096)
-                    .and_then(|entries| n.checked_add(entries))
-            })
-            .and_then(|n| n.checked_add(8 * UNIT))
-            .ok_or_else(|| "Archive admission accounting overflow".to_string())?;
-        Ok(FileUploadLease {
-            _memory: self.memory_lease_bytes(bytes)?,
-            _task: self.tasks.token(),
-        })
-    }
     pub(crate) fn reader(&self, plaintext: u64) -> Result<FileMemoryLease, String> {
         let closed = self.closed.lock().expect("file admission lock poisoned");
         if *closed {
             return Err("File delivery is shutting down".into());
         }
         self.memory_lease(Some(plaintext))
-    }
-    /// Admit before buffering private stdin JSON/Base64, decoded bytes and the
-    /// separately decrypted frozen context. No payload participates in errors.
-    pub(crate) fn private_stdin(&self) -> Result<ControlMemoryLease, String> {
-        let closed = self.closed.lock().expect("file admission lock poisoned");
-        if *closed {
-            return Err("Private input admission is shutting down".into());
-        }
-        // The memory budget itself bounds concurrent control decodes. Do not
-        // hold a native-transfer slot while CP planning needs a nested pinned
-        // archive transfer (including configured transfer concurrency of one).
-        let memory = self
-            .memory
-            .clone()
-            .try_acquire_many_owned(128)
-            .map_err(|_| "Private input memory budget unavailable".to_string())?;
-        Ok(ControlMemoryLease { _memory: memory })
     }
     pub(crate) fn spawn<F, T>(&self, lease: FileUploadLease, work: F) -> JoinHandle<Option<T>>
     where
@@ -298,19 +253,6 @@ mod tests {
             transfers.spawn(lease, async { 42 }).await.unwrap(),
             Some(42)
         );
-        assert!(transfers.drain(Duration::from_secs(1)).await);
-    }
-    #[tokio::test]
-    async fn private_control_memory_does_not_reserve_the_native_transfer_slot() {
-        let transfers = FileTransfers::new(256 * UNIT, 1);
-        let control = transfers.private_stdin().unwrap();
-        // Planning may need a pinned archive transfer while holding private
-        // context admission, even when native concurrency is exactly one.
-        let native = transfers.upload(Some(1)).unwrap();
-        assert!(transfers.private_stdin().is_err());
-        drop(native);
-        assert!(transfers.private_stdin().is_ok());
-        drop(control);
         assert!(transfers.drain(Duration::from_secs(1)).await);
     }
 }

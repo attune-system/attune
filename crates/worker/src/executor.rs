@@ -82,6 +82,8 @@ pub struct ActionExecutor {
     worker_id: AtomicI64,
     worker_name: String,
     worker_instance: uuid::Uuid,
+    /// Registration ownership is distinct from the log-delivery bearer instance.
+    process_incarnation: std::sync::OnceLock<uuid::Uuid>,
     log_segment_config: attune_common::log_stream::SegmentedLogConfig,
     execution_log_retention_policy: RetentionPolicyType,
     execution_log_retention_limit: i32,
@@ -423,6 +425,7 @@ impl ActionExecutor {
             worker_id: AtomicI64::new(0),
             worker_name,
             worker_instance,
+            process_incarnation: std::sync::OnceLock::new(),
             log_segment_config,
             execution_log_retention_policy: execution_log_retention_policy
                 .unwrap_or(DEFAULT_LOG_ARTIFACT_RETENTION_POLICY),
@@ -512,6 +515,30 @@ impl ActionExecutor {
         if let Some(manager) = self.log_delivery.get() {
             manager.drain().await;
         }
+    }
+    /// The caller must first join every attempt/capture producer. Retained
+    /// custody remains durable; a new manager may recover before its deadline.
+    pub async fn stop_log_delivery(&self) {
+        #[cfg(unix)]
+        if let Some(manager) = self.log_delivery.get() {
+            manager.stop_and_join().await;
+        }
+    }
+    /// Bind exactly once to this service's acknowledged worker registration.
+    /// A replacement incarnation requires a new owner/executor, never rebinding
+    /// an old process that may still retain attempts or private custody.
+    pub fn set_process_incarnation(&self, incarnation: uuid::Uuid) -> Result<()> {
+        if incarnation.is_nil() {
+            return Err(Error::validation("Missing worker process incarnation"));
+        }
+        if self.process_incarnation.set(incarnation).is_err()
+            && self.process_incarnation.get() != Some(&incarnation)
+        {
+            return Err(Error::PermissionDenied(
+                "Worker process incarnation already bound".into(),
+            ));
+        }
+        Ok(())
     }
     pub fn set_worker_id(&self, worker_id: i64) {
         self.worker_id.store(worker_id, Ordering::Release);
@@ -671,7 +698,7 @@ impl ActionExecutor {
                     attempt,
                 } if *execution == execution_id
                     && *worker == self.worker_id.load(Ordering::Acquire)
-                    && *worker_instance == self.worker_instance
+                    && self.process_incarnation.get() == Some(worker_instance)
                     && !attempt.is_nil() =>
                 {
                     Some(*attempt)
@@ -1970,12 +1997,136 @@ impl ActionExecutor {
         })
     }
 
+    /// The existing trusted preparer selects the program and environment. A
+    /// launcher supplies effects, never executable discovery or domain policy.
+    /// Native file selection uses the immutable manifest + admitted platform;
+    /// no control-plane PATH, architecture, unpacked tree or local probe enters it.
+    async fn prepare_isolated_native_invocation(
+        &self,
+        context: &ExecutionContext,
+        spec: &mut attune_common::isolated_process::ProcessSpec,
+    ) -> Result<()> {
+        use attune_common::{
+            pack_registry::storage::PackReleaseManifest,
+            repositories::pack_release::PackReleaseRepository,
+            workload_launch::{LaunchInputKind, LaunchRoot, PackAccess, PACK_ROOT},
+        };
+        let unavailable =
+            || Error::PermissionDenied("Isolated native program proof unavailable".into());
+        let execution = ExecutionRepository::find_by_id(&self.pool, context.execution_id)
+            .await?
+            .ok_or_else(unavailable)?;
+        let snapshot = execution
+            .executable_snapshot
+            .as_ref()
+            .ok_or_else(unavailable)?;
+        let action = &snapshot.executable.action;
+        // These paths remain explicitly unactivated until their actual pinned
+        // setup/image/native-CLI producer is integrated. No host fallback.
+        let config = context
+            .runtime_config_override
+            .as_ref()
+            .ok_or_else(unavailable)?;
+        if action.launch.is_some()
+            || spec.purpose != attune_common::workload_launch::LaunchPurpose::Action
+            || spec.inputs.len() != 2
+            || !matches!(config.interpreter.binary.as_str(), "" | "native" | "none")
+            || crate::runtime::launch_planning::needs_runtime(config)
+            || spec.stage.is_some()
+            || spec.pack_access != PackAccess::ReadOnly
+        {
+            return Err(unavailable());
+        }
+        let pack = spec
+            .inputs
+            .iter()
+            .find(|pin| pin.kind == LaunchInputKind::Pack)
+            .ok_or_else(unavailable)?;
+        if pack.object_id != snapshot.release.id
+            || pack.object_version != snapshot.release.digest
+            || !spec
+                .inputs
+                .iter()
+                .any(|pin| pin.kind == LaunchInputKind::Runner)
+        {
+            return Err(unavailable());
+        }
+        let release = PackReleaseRepository::find_by_id(&self.pool, snapshot.release.id)
+            .await?
+            .filter(|release| {
+                release.digest == snapshot.release.digest && release.pack_ref == action.pack_ref
+            })
+            .ok_or_else(unavailable)?;
+        let manifest: PackReleaseManifest =
+            serde_json::from_value(release.manifest).map_err(|_| unavailable())?;
+        if manifest.format_version != 1
+            || manifest.pack_ref != action.pack_ref
+            || manifest.version != release.version
+        {
+            return Err(unavailable());
+        }
+        let relative =
+            attune_common::artifact_transport::ValidatedRelativePath::new(&context.entry_point)?;
+        let file = format!("actions/{}", relative.as_str());
+        let variant = format!("{file}/linux-{}", spec.platform.native_arch());
+        let selected = manifest
+            .files
+            .iter()
+            .find(|entry| entry.path == file && entry.executable)
+            .or_else(|| {
+                manifest
+                    .files
+                    .iter()
+                    .find(|entry| entry.path == variant && entry.executable)
+            })
+            .ok_or_else(unavailable)?;
+        let program = format!("{PACK_ROOT}/{}", selected.path);
+        let selected = attune_common::action_cli::SelectedProgram {
+            path: PathBuf::from(&program),
+            sha256: selected.sha256.clone(),
+            invocation_name: program,
+            artifact: None,
+            variant: None,
+        };
+        spec.invocation.argv =
+            crate::runtime::launch_planning::cli_exec_argv(spec.platform, &selected, &[])
+                .map_err(|_| unavailable())?;
+        let mut environment = context
+            .env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        environment.extend(
+            context
+                .execution_env
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        spec.invocation.env =
+            crate::runtime::launch_planning::action_environment(config, &environment, &file, false)
+                .map_err(|_| unavailable())?;
+        spec.invocation.working_root = LaunchRoot::Pack;
+        spec.timeout_ms = context
+            .timeout
+            .map(|seconds| seconds.checked_mul(1000).ok_or_else(unavailable))
+            .transpose()?;
+        attune_common::repositories::execution_program::ExecutionProgramRepository::record(
+            &self.pool,
+            execution.id,
+            self.worker_id.load(Ordering::Acquire),
+            snapshot.release.id,
+            &selected,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Execute the action using the runtime registry
     async fn execute_isolated_action(
         &self,
         context: ExecutionContext,
         preparation: &ExecutionPreparation,
-        spec: attune_common::isolated_process::ProcessSpec,
+        mut spec: attune_common::isolated_process::ProcessSpec,
         launcher: Arc<dyn attune_common::isolated_process::ProcessLauncher>,
     ) -> Result<ExecutionResult> {
         use attune_common::repositories::{
@@ -1983,6 +2134,8 @@ impl ActionExecutor {
             execution_input::SelectedExecutionInput,
             execution_process::ExecutionProcessRepository as Effects,
         };
+        self.prepare_isolated_native_invocation(&context, &mut spec)
+            .await?;
         let master = self.secret_manager.encryption_key().ok_or_else(|| {
             Error::PermissionDenied("Isolated action context encryption unavailable".into())
         })?;
@@ -1993,10 +2146,33 @@ impl ActionExecutor {
             })?,
         )?;
         let mut tx = self.pool.begin().await?;
-        let owner = DelegatedExecutionRepository::find(&mut tx, context.execution_id)
-            .await?
-            .owner
-            .ok_or_else(|| Error::PermissionDenied("Isolated action owner unavailable".into()))?;
+        use attune_common::repositories::execution_runtime_admission::{
+            ExecutionAdmissionRepository, ExistingExecutionAuthority,
+        };
+        let owner =
+            match ExecutionAdmissionRepository::selected_authority(&mut tx, context.execution_id)
+                .await?
+            {
+                ExistingExecutionAuthority::Delegated => {
+                    DelegatedExecutionRepository::validate(&mut tx, context.execution_id)
+                        .await?
+                        .owner
+                        .ok_or_else(|| {
+                            Error::PermissionDenied("Isolated action owner unavailable".into())
+                        })?
+                }
+                ExistingExecutionAuthority::Recorded => {
+                    let (record, fence) = ExecutionAdmissionRepository::require_with_fence(
+                        &mut tx,
+                        attune_common::repositories::runtime_authority::RuntimeOwner::Execution(
+                            context.execution_id,
+                        ),
+                    )
+                    .await?;
+                    fence.ensure_fresh_on(&mut tx).await?;
+                    record.authority.owner.sponsor_identity_id
+                }
+            };
         tx.commit().await?;
         Effects::reserve(&self.pool, &spec, owner, &selected, master).await?;
         let create = Effects::begin_create(&self.pool, spec.intent, master).await?;
