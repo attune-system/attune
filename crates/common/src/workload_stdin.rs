@@ -8,6 +8,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use utoipa::ToSchema;
 
 pub const MAX_PRIVATE_STDIN_BYTES: usize = 8 * 1024 * 1024;
+/// Padded Base64 plus the fixed handle envelope; other control bodies retain
+/// their smaller limits. Admission must precede reading/decoding this body.
+pub const MAX_PRIVATE_STDIN_REQUEST_BYTES: usize = 12 * 1024 * 1024;
 const MAX_ENCODED_BYTES: usize = MAX_PRIVATE_STDIN_BYTES.div_ceil(3) * 4;
 fn invalid() -> Error {
     Error::validation("Invalid private launch stdin payload")
@@ -62,11 +65,26 @@ impl<'de> Deserialize<'de> for LaunchStdinPayload {
 /// authorization, then writes them once without re-reading a mutable file or
 /// changing chunks. Lost/uncertain ACK is fail-closed: no retry may create a
 /// second effect. LAUNCH_LEASE_HEADER and LAUNCH_IO_HEADER carry credentials.
-#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct AuthorizeLaunchStdinRequest {
     pub handle: LaunchHandle,
     pub payload: LaunchStdinPayload,
+}
+impl<'de> Deserialize<'de> for AuthorizeLaunchStdinRequest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            handle: LaunchHandle,
+            payload: LaunchStdinPayload,
+        }
+        let wire = Wire::deserialize(deserializer)
+            .map_err(|_| serde::de::Error::custom("Invalid private launch stdin request"))?;
+        Ok(Self {
+            handle: wire.handle,
+            payload: wire.payload,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -94,5 +112,13 @@ mod tests {
         assert!(LaunchStdinPayload::from_bytes(vec![0; MAX_PRIVATE_STDIN_BYTES + 1]).is_err());
         let oversized = format!("\"{}\"", "A".repeat(MAX_ENCODED_BYTES + 4));
         assert!(serde_json::from_str::<LaunchStdinPayload>(&oversized).is_err());
+    }
+    #[test]
+    fn request_shape_failures_do_not_echo_untrusted_private_fields() {
+        let error=serde_json::from_str::<AuthorizeLaunchStdinRequest>(
+            r#"{"owned-private-field-name":"owned-private-field-value","handle":{},"payload":"opaque"}"#,
+        ).unwrap_err().to_string();
+        assert!(error.contains("Invalid private launch stdin request"));
+        assert!(!error.contains("owned-private"));
     }
 }
