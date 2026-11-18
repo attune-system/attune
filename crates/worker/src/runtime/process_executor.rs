@@ -987,6 +987,7 @@ pub(crate) async fn run_command_output_owned(
     configure_child_process(&mut command)?;
     command
         .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let child = command.spawn()?;

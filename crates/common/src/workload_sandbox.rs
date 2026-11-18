@@ -1,5 +1,4 @@
-//! Optional Linux isolation for final workload processes. Setup commands remain
-//! outside this boundary; see docs/deployment/workload-isolation.md.
+//! Linux isolation for pack-controlled executable stages.
 use std::io;
 use std::path::Path;
 use std::process::Command;
@@ -12,16 +11,34 @@ pub enum WorkloadSandbox {
 }
 
 impl WorkloadSandbox {
-    /// Operator opt-in. Never silently downgrade an explicitly requested boundary.
+    /// Isolated by default; an explicit trusted-only deployment accepts host execution.
     pub fn from_environment(api_artifacts: bool) -> io::Result<Self> {
         match std::env::var("ATTUNE_WORKLOAD_SANDBOX") {
-            Err(std::env::VarError::NotPresent) => Ok(Self::Disabled),
-            Ok(value) if value == "disabled" => Ok(Self::Disabled),
-            Ok(value) if value == "bubblewrap" => {
+            Ok(value) if value == "trusted-only" => Ok(Self::Disabled),
+            value
+                if matches!(&value, Err(std::env::VarError::NotPresent))
+                    || matches!(&value, Ok(value) if value == "bubblewrap") =>
+            {
                 if !cfg!(target_os = "linux") || !api_artifacts {
                     return Err(io::Error::other(
                         "bubblewrap workloads require Linux and API artifact transport",
                     ));
+                }
+                let mut probe = Self::Bubblewrap.wrap_with_invocation_name(
+                    Command::new("/bin/true"),
+                    &[],
+                    Some("true".as_ref()),
+                )?;
+                let result = probe.output().map_err(|error| {
+                    io::Error::other(format!(
+                        "isolated workloads require usable /usr/bin/bwrap: {error}"
+                    ))
+                })?;
+                if !result.status.success() {
+                    return Err(io::Error::other(format!(
+                        "workload isolation prerequisite check failed: {}",
+                        String::from_utf8_lossy(&result.stderr)
+                    )));
                 }
                 Ok(Self::Bubblewrap)
             }
@@ -41,6 +58,53 @@ impl WorkloadSandbox {
         self,
         command: Command,
         read_paths: &[&Path],
+        invocation_name: Option<&std::ffi::OsStr>,
+    ) -> io::Result<Command> {
+        self.wrap_mounts(command, read_paths, &[], invocation_name)
+    }
+
+    /// Writable paths must be unique unpublished staging directories. Never
+    /// supply a shared parent or a published runtime here.
+    pub fn wrap_stage(
+        self,
+        command: Command,
+        read_paths: &[&Path],
+        write_paths: &[&Path],
+    ) -> io::Result<Command> {
+        let writes = write_paths
+            .iter()
+            .map(|path| (*path, *path))
+            .collect::<Vec<_>>();
+        self.wrap_mounts(command, read_paths, &writes, None)
+    }
+
+    /// Install at the final logical path while keeping the host destination
+    /// absent until publication. Only the owned stage is writable.
+    pub fn wrap_install(
+        self,
+        command: Command,
+        pack: &Path,
+        stage: &Path,
+        destination: &Path,
+    ) -> io::Result<Command> {
+        self.wrap_mounts(command, &[pack], &[(stage, destination)], None)
+    }
+
+    pub fn wrap_workspace(
+        self,
+        command: Command,
+        read_paths: &[&Path],
+        workspace: &Path,
+        logical_path: &Path,
+    ) -> io::Result<Command> {
+        self.wrap_mounts(command, read_paths, &[(workspace, logical_path)], None)
+    }
+
+    fn wrap_mounts(
+        self,
+        command: Command,
+        read_paths: &[&Path],
+        writes: &[(&Path, &Path)],
         invocation_name: Option<&std::ffi::OsStr>,
     ) -> io::Result<Command> {
         #[cfg(unix)]
@@ -107,7 +171,11 @@ impl WorkloadSandbox {
             "--dir",
             "/tmp/artifacts",
         ]);
-        for path in read_paths {
+        for path in read_paths
+            .iter()
+            .copied()
+            .chain(writes.iter().map(|(source, _)| *source))
+        {
             if !path.exists() {
                 return Err(io::Error::other("sandbox input path does not exist"));
             }
@@ -115,7 +183,7 @@ impl WorkloadSandbox {
             // credential-bearing tree through a selected pack/runtime alias.
             let canonical = path.canonicalize()?;
             if !path.is_absolute()
-                || canonical != *path
+                || canonical != path
                 || path.components().count() < 3
                 || ["/proc", "/dev", "/etc", "/usr", "/bin", "/lib", "/lib64"]
                     .iter()
@@ -123,14 +191,125 @@ impl WorkloadSandbox {
             {
                 return Err(io::Error::other("unsafe sandbox input path"));
             }
-            sandbox.arg("--ro-bind").arg(path).arg(path);
+            if read_paths.contains(&path) {
+                sandbox.arg("--ro-bind").arg(path).arg(path);
+            }
         }
+        for (source, destination) in writes {
+            let parent = destination
+                .parent()
+                .ok_or_else(|| io::Error::other("missing install parent"))?;
+            if !destination.is_absolute()
+                || parent.canonicalize()? != parent
+                || destination.components().count() < 3
+                || ["/proc", "/dev", "/etc", "/usr", "/bin", "/lib", "/lib64"]
+                    .iter()
+                    .any(|root| destination.starts_with(root))
+            {
+                return Err(io::Error::other("unsafe sandbox installation destination"));
+            }
+            sandbox.arg("--bind").arg(source).arg(destination);
+        }
+
         sandbox
             .arg("--chdir")
             .arg(command.get_current_dir().unwrap_or(Path::new("/tmp")));
         install_workload_environment(&mut sandbox, &command)?;
         Ok(sandbox)
     }
+}
+
+/// Convert logical installation-root links to relative links before the owned
+/// stage is renamed. This never follows a pack-created directory symlink.
+pub fn prepare_staging(root: &Path, destination: &Path) -> io::Result<()> {
+    if root.canonicalize()? != root || !std::fs::symlink_metadata(root)?.is_dir() {
+        return Err(io::Error::other("unsafe runtime staging root"));
+    }
+    fn visit(path: &Path, root: &Path, destination: &Path) -> io::Result<()> {
+        for entry in std::fs::read_dir(path)? {
+            let path = entry?.path();
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                let target = std::fs::read_link(&path)?;
+                if let Ok(relative) = target
+                    .strip_prefix(destination)
+                    .or_else(|_| target.strip_prefix(root))
+                {
+                    let mut new_target = std::path::PathBuf::new();
+                    for _ in path
+                        .parent()
+                        .unwrap()
+                        .strip_prefix(root)
+                        .unwrap()
+                        .components()
+                    {
+                        new_target.push("..");
+                    }
+                    new_target.push(relative);
+                    #[cfg(unix)]
+                    {
+                        std::fs::remove_file(&path)?;
+                        std::os::unix::fs::symlink(new_target, &path)?;
+                    }
+                    #[cfg(not(unix))]
+                    return Err(io::Error::other("runtime installation links require Unix"));
+                }
+            } else if metadata.is_dir() {
+                visit(&path, root, destination)?;
+            }
+        }
+        Ok(())
+    }
+    visit(root, root, destination)?;
+    validate_staging(root)
+}
+
+/// Inspect completed staging before any trusted marker write or publication.
+/// Setup descendants must have exited before this walk begins.
+pub fn validate_staging(root: &Path) -> io::Result<()> {
+    let canonical_root = root.canonicalize()?;
+    if canonical_root != root || !std::fs::symlink_metadata(root)?.is_dir() {
+        return Err(io::Error::other("unsafe runtime staging root"));
+    }
+    fn visit(path: &Path, root: &Path) -> io::Result<()> {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                let resolved = path.canonicalize()?;
+                // Interpreter links into the immutable system tree are needed
+                // by Python venvs. Never admit arbitrary host paths.
+                if !resolved.starts_with(root) && !resolved.starts_with("/usr") {
+                    return Err(io::Error::other(
+                        "runtime staging symlink escapes allowed trees",
+                    ));
+                }
+                if path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".attune"))
+                {
+                    return Err(io::Error::other("runtime marker must not be a symlink"));
+                }
+            } else if metadata.is_dir() {
+                visit(&path, root)?;
+            } else if metadata.is_file() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if metadata.nlink() != 1 {
+                        return Err(io::Error::other(
+                            "runtime staging hardlinks are unsupported",
+                        ));
+                    }
+                }
+            } else {
+                return Err(io::Error::other("runtime staging contains a special file"));
+            }
+        }
+        Ok(())
+    }
+    visit(root, root)
 }
 
 #[cfg(target_os = "linux")]
@@ -208,6 +387,125 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::process::Stdio;
 
+    #[cfg(unix)]
+    #[test]
+    fn publication_rejects_escape_links_and_special_files() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let staging = root.path().join("stage");
+        std::fs::create_dir(&staging).unwrap();
+        let outside = root.path().join("secret");
+        std::fs::write(&outside, "dummy").unwrap();
+        symlink(&outside, staging.join("escape")).unwrap();
+        assert!(validate_staging(&staging).is_err());
+        std::fs::remove_file(staging.join("escape")).unwrap();
+        std::fs::hard_link(&outside, staging.join("hardlink")).unwrap();
+        assert!(validate_staging(&staging).is_err());
+        std::fs::remove_file(staging.join("hardlink")).unwrap();
+        symlink("/usr/bin", staging.join("bin")).unwrap();
+        assert!(validate_staging(&staging).is_ok());
+        symlink("/usr/bin/true", staging.join(".attune-runtime-ready")).unwrap();
+        assert!(validate_staging(&staging).is_err());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "dummy");
+    }
+
+    #[test]
+    #[ignore = "requires Linux bubblewrap and unprivileged namespaces"]
+    fn bubblewrap_setup_exposes_only_owned_stage() {
+        let root = tempfile::tempdir().unwrap();
+        let pack = root.path().join("pack");
+        let stage = root.path().join("stage");
+        let sibling = root.path().join("sibling");
+        for path in [&pack, &stage, &sibling] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::write(pack.join("published"), "original").unwrap();
+        std::fs::write(sibling.join("token"), "dummy-sibling-token").unwrap();
+        let script = format!(
+            "set -eu; test ! -e '{}/token'; if echo poisoned > '{}/published'; then exit 41; fi; echo installed > '{}/result'; echo private > /tmp/artifacts/result",
+            sibling.display(), pack.display(), stage.display()
+        );
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", &script]).env_clear().current_dir(&pack);
+        let output = WorkloadSandbox::Bubblewrap
+            .wrap_stage(command, &[&pack], &[&stage])
+            .unwrap()
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(stage.join("result")).unwrap(),
+            "installed\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(pack.join("published")).unwrap(),
+            "original"
+        );
+        validate_staging(&stage).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires Linux bubblewrap and unprivileged namespaces"]
+    fn bubblewrap_install_publish_and_execute_preserves_console_and_links() {
+        let root = tempfile::tempdir().unwrap();
+        let pack = root.path().join("pack");
+        let stage = root.path().join("stage");
+        let destination = root.path().join("published");
+        std::fs::create_dir(&pack).unwrap();
+        std::fs::create_dir(&stage).unwrap();
+        let script = format!(
+            r#"set -eu
+mkdir -p '{destination}/bin'
+cp /bin/sh '{destination}/bin/sh'
+printf '#!{destination}/bin/sh\necho console-ok\n' > '{destination}/bin/console'
+chmod +x '{destination}/bin/console'
+ln -s '{destination}/bin/console' '{destination}/absolute-link'
+"#,
+            destination = destination.display()
+        );
+        let mut setup = Command::new("/bin/sh");
+        setup.args(["-c", &script]).env_clear().current_dir(&pack);
+        let output = WorkloadSandbox::Bubblewrap
+            .wrap_install(setup, &pack, &stage, &destination)
+            .unwrap()
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !destination.exists(),
+            "host destination must remain unpublished"
+        );
+        assert!(stage.join("bin/console").is_file());
+        prepare_staging(&stage, &destination).unwrap();
+        std::fs::rename(&stage, &destination).unwrap();
+        for executable in [
+            destination.join("bin/console"),
+            destination.join("absolute-link"),
+        ] {
+            let mut command = Command::new(executable);
+            command.env_clear();
+            let output = WorkloadSandbox::Bubblewrap
+                .wrap(command, &[&destination])
+                .unwrap()
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, b"console-ok\n");
+        }
+    }
+
     #[test]
     fn rejects_unsafe_mounts_without_running_workload() {
         for path in ["/", "/etc", "/proc", "/usr", "/dev", "/tmp/../etc"] {
@@ -243,6 +541,40 @@ mod tests {
         assert_eq!(
             &args[args.len() - 3..],
             &["/usr/bin/printf", "%s", "a b; $(false)"]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux Bubblewrap with --argv0 and unprivileged namespaces"]
+    fn bubblewrap_named_execution_preserves_static_argv0_and_selected_stdin() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "IFS= read -r input; printf '%s|%s' \"$0\" \"$input\""])
+            .env_clear();
+        let mut isolated = WorkloadSandbox::Bubblewrap
+            .wrap_with_invocation_name(command, &[], Some("owned-static-name".as_ref()))
+            .unwrap();
+        isolated
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = isolated.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"{\"selected\":\"owned input\"}\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "named Bubblewrap launch failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.stdout,
+            b"owned-static-name|{\"selected\":\"owned input\"}"
         );
     }
 
@@ -346,6 +678,7 @@ set -eu
 [ ! -e '{secret}' ]
 [ ! -e '/proc/{pid}/environ' ]
 [ ! -e '/proc/{pid}/root' ]
+if kill -0 {pid} 2>/dev/null; then exit 42; fi
 [ "$(cat '{runtime}/published')" = original ]
 if echo poisoned > '{runtime}/published' 2>/dev/null; then exit 41; fi
 [ "$ATTUNE_API_TOKEN" = scoped-dummy-token ]

@@ -13,7 +13,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 JOBS = ("publish-rust-images", "publish-web-images")
 RUST_IMAGES = (
-    "api", "executor", "notifier", "supervisor", "agent", "migrations",
+    "api", "executor", "notifier", "supervisor", "launch-controller", "agent", "migrations",
     "init-user", "init-packs",
 )
 LABELS = {

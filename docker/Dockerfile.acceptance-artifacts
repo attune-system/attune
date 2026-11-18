@@ -7,6 +7,8 @@ ARG BUSYBOX_IMAGE
 ARG POSTGRES_IMAGE=postgres@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395
 ARG NGINX_IMAGE
 
+FROM ${SERVICE_BASE} AS certificates
+
 FROM --platform=$BUILDPLATFORM ${TOOLCHAIN_IMAGE} AS compile
 ARG BUILDPLATFORM
 ARG TARGETPLATFORM
@@ -74,6 +76,7 @@ ENV ATTUNE_CONFIG=/opt/attune/config/config.yaml RUST_LOG=info
 CMD ["/usr/local/bin/attune-service"]
 
 FROM ${BUSYBOX_IMAGE} AS agent
+COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=compiled /agents/ /usr/local/bin/
 ENTRYPOINT ["/usr/local/bin/attune-agent"]
 

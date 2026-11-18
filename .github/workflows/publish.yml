@@ -145,6 +145,7 @@ jobs:
               {"name": "executor", "repository": "attune/executor", "source_path": "bin/attune-executor", "dockerfile": "docker/Dockerfile.runtime"},
               {"name": "notifier", "repository": "attune/notifier", "source_path": "bin/attune-notifier", "dockerfile": "docker/Dockerfile.runtime"},
               {"name": "supervisor", "repository": "attune/supervisor", "source_path": "bin/attune-supervisor", "dockerfile": "docker/Dockerfile.runtime"},
+              {"name": "launch-controller", "repository": "attune/launch-controller", "source_path": "bin/attune-launch-controller", "dockerfile": "docker/Dockerfile.launch-controller-package"},
               {"name": "agent", "repository": "attune/agent", "source_path": "agent/attune-agent", "dockerfile": "docker/Dockerfile.agent-package"},
               {"name": "migrations", "repository": "attune/migrations", "source_path": "", "dockerfile": "docker/Dockerfile.migrations-package"},
               {"name": "init-user", "repository": "attune/init-user", "source_path": "", "dockerfile": "docker/Dockerfile.init-user-package"},
@@ -354,7 +355,8 @@ jobs:
             --bin attune-notifier \
             --bin attune-supervisor \
             --bin attune-worker \
-            --bin attune-sensor
+            --bin attune-sensor \
+            --bin attune-launch-controller
 
       - name: Verify minimum glibc requirement
         shell: bash
@@ -375,7 +377,7 @@ jobs:
             [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ] && [ "$1" != "$2" ]
           }
 
-          for binary in attune-api attune-executor attune-notifier attune-supervisor attune-worker attune-sensor; do
+          for binary in attune-api attune-executor attune-notifier attune-supervisor attune-worker attune-sensor attune-launch-controller; do
             min_glibc="$(get_min_glibc "${output_dir}/${binary}")"
             if [ -z "${min_glibc}" ]; then
               echo "Failed to determine glibc requirement for ${binary}"
@@ -399,6 +401,7 @@ jobs:
             --bin attune-agent \
             --bin attune-sensor-agent \
             --bin attune-mcp \
+            --bin attune-workload-runner \
             --bin attune
 
       - name: Build static pack binaries
@@ -457,12 +460,13 @@ jobs:
           musl_output_dir="target/${{ matrix.musl_target }}/release"
           pack_binary="crates/core-timer-sensor/target/${{ matrix.musl_target }}/release/attune-core-timer-sensor"
 
-          for binary in attune-api attune-executor attune-notifier attune-supervisor attune-worker attune-sensor; do
+          for binary in attune-api attune-executor attune-notifier attune-supervisor attune-worker attune-sensor attune-launch-controller; do
             verify_arch "${service_output_dir}/${binary}"
           done
 
-          for binary in attune-agent attune-sensor-agent attune-mcp attune; do
+          for binary in attune-agent attune-sensor-agent attune-mcp attune attune-workload-runner; do
             verify_arch "${musl_output_dir}/${binary}"
+            verify_static "${musl_output_dir}/${binary}"
           done
 
           verify_arch "$pack_binary"
@@ -496,10 +500,12 @@ jobs:
           cp "${service_output_dir}/attune-supervisor" "$bundle_root/bin/"
           cp "${service_output_dir}/attune-worker" "$bundle_root/bin/"
           cp "${service_output_dir}/attune-sensor" "$bundle_root/bin/"
+          cp "${service_output_dir}/attune-launch-controller" "$bundle_root/bin/"
           cp "target/${MUSL_TARGET}/release/attune-agent" "$bundle_root/agent/"
           cp "target/${MUSL_TARGET}/release/attune-sensor-agent" "$bundle_root/agent/"
           cp "target/${MUSL_TARGET}/release/attune-mcp" "$bundle_root/agent/"
           cp "target/${MUSL_TARGET}/release/attune" "$bundle_root/agent/"
+          cp "target/${MUSL_TARGET}/release/attune-workload-runner" "$bundle_root/agent/"
           cp "${pack_binary_output_dir}/attune-core-timer-sensor" "$bundle_root/pack-binaries/"
           for action in echo sleep noop http_request; do
             cp "crates/core-actions/target/${MUSL_TARGET}/release/attune-core-$action" "$bundle_root/pack-binaries/"
@@ -515,6 +521,15 @@ jobs:
           EOF
 
           source_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          # Canonical Runner input: public static helper bytes only, fixed root
+          # filename selected by admitted Engine platform. Never a private plan.
+          runner_stage="$(mktemp -d)"
+          trap 'rm -rf "$runner_stage"' EXIT
+          install -m 0755 "target/${MUSL_TARGET}/release/attune-workload-runner" "$runner_stage/linux-${BUNDLE_ARCH}"
+          python3 scripts/package-cli-archive.py \
+            "dist/attune-workload-runner-linux-${BUNDLE_ARCH}.zip" \
+            "$source_date_epoch" "$runner_stage"
+          (cd dist && sha256sum "attune-workload-runner-linux-${BUNDLE_ARCH}.zip" > "attune-workload-runner-linux-${BUNDLE_ARCH}.zip.sha256")
           python3 scripts/package-cli-archive.py \
             "dist/attune-binaries-${BUNDLE_ARCH}.tar.gz" \
             "$source_date_epoch" "$bundle_root"
@@ -523,7 +538,10 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: attune-binaries-${{ matrix.arch }}
-          path: dist/attune-binaries-${{ matrix.arch }}.tar.gz
+          path: |
+            dist/attune-binaries-${{ matrix.arch }}.tar.gz
+            dist/attune-workload-runner-linux-${{ matrix.arch }}.zip
+            dist/attune-workload-runner-linux-${{ matrix.arch }}.zip.sha256
           if-no-files-found: error
           retention-days: 30
 
@@ -1672,7 +1690,7 @@ jobs:
           echo "  dockerfile: ${{ matrix.image.dockerfile }}"
 
           case "${{ matrix.image.name }}" in
-            api|executor|notifier|supervisor)
+            api|executor|notifier|supervisor|launch-controller)
               cp "dist/artifact/${{ matrix.image.source_path }}" dist/attune-service-binary
               ;;
             agent)
@@ -1680,6 +1698,7 @@ jobs:
               cp dist/artifact/agent/attune-sensor-agent dist/attune-sensor-agent
               cp dist/artifact/agent/attune-mcp dist/attune-mcp
               cp dist/artifact/agent/attune dist/attune
+              cp dist/artifact/agent/attune-workload-runner dist/attune-workload-runner
               ;;
             init-packs)
               for arch in amd64 arm64; do
@@ -1900,6 +1919,7 @@ jobs:
           - attune/executor
           - attune/notifier
           - attune/supervisor
+          - attune/launch-controller
           - attune/agent
           - attune/migrations
           - attune/init-user

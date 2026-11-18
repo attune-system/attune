@@ -24,8 +24,10 @@ COPY crates/worker/Cargo.toml ./crates/worker/Cargo.toml
 COPY crates/notifier/Cargo.toml ./crates/notifier/Cargo.toml
 COPY crates/supervisor/Cargo.toml ./crates/supervisor/Cargo.toml
 COPY crates/cli/Cargo.toml ./crates/cli/Cargo.toml
+COPY crates/launch-controller/Cargo.toml ./crates/launch-controller/Cargo.toml
 
-RUN mkdir -p crates/common/src && echo "" > crates/common/src/lib.rs && \
+RUN mkdir -p crates/launch-controller/src && echo "" > crates/launch-controller/src/lib.rs && echo "fn main(){}" > crates/launch-controller/src/main.rs && \
+    mkdir -p crates/common/src && echo "" > crates/common/src/lib.rs && \
     mkdir -p crates/api/src && echo "" > crates/api/src/lib.rs && echo "fn main(){}" > crates/api/src/main.rs && \
     mkdir -p crates/executor/src && echo "" > crates/executor/src/lib.rs && echo "fn main(){}" > crates/executor/src/main.rs && \
     mkdir -p crates/executor/benches && echo "fn main(){}" > crates/executor/benches/context_clone.rs && \
@@ -33,6 +35,7 @@ RUN mkdir -p crates/common/src && echo "" > crates/common/src/lib.rs && \
     echo "fn main(){}" > crates/sensor/src/agent_main.rs && \
     mkdir -p crates/worker/src && echo "fn main(){}" > crates/worker/src/main.rs && \
     echo "fn main(){}" > crates/worker/src/agent_main.rs && \
+    echo "fn main(){}" > crates/worker/src/workload_runner_main.rs && \
     mkdir -p crates/notifier/src && echo "fn main(){}" > crates/notifier/src/main.rs && \
     mkdir -p crates/supervisor/src && echo "fn main(){}" > crates/supervisor/src/main.rs && \
     mkdir -p crates/cli/src/bin && echo "" > crates/cli/src/lib.rs && \

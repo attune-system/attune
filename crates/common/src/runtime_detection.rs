@@ -288,14 +288,20 @@ impl RuntimeDetector {
         // Execute command
         let mut command = Command::new(binary);
         child_environment.apply(&mut command);
-        let output = match command.args(&args).output() {
-            Ok(output) => output,
-            Err(e) => {
-                if !optional {
-                    debug!("Failed to execute {}: {}", binary, e);
-                }
-                return false;
-            }
+        command.args(&args);
+        let Ok(command) = child_environment.sandbox_probe(command) else {
+            return false;
+        };
+        let mut command = tokio::process::Command::from(command);
+        command.kill_on_drop(true);
+        let output = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            command.output(),
+        )
+        .await
+        {
+            Ok(Ok(output)) => output,
+            _ => return false,
         };
 
         // Check exit code
@@ -349,6 +355,27 @@ impl RuntimeDetector {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    #[ignore = "requires Linux bubblewrap and unprivileged namespaces"]
+    async fn metadata_verification_cannot_read_host_or_modify_pack() {
+        let root = tempfile::tempdir().unwrap();
+        let hidden = root.path().join("manager-token");
+        std::fs::write(&hidden, "dummy-manager-token").unwrap();
+        let environment =
+            crate::child_process_environment::ChildProcessEnvironment::from_parent([], &[])
+                .unwrap()
+                .with_workload_sandbox(crate::workload_sandbox::WorkloadSandbox::Bubblewrap);
+        let command = serde_json::json!({"binary":"/bin/sh", "args":["-c", format!("test ! -e '{}' && echo verified", hidden.display())], "pattern":"verified"});
+        assert!(
+            super::RuntimeDetector::try_verification_command(&command, "hostile", &environment)
+                .await
+        );
+        assert_eq!(
+            std::fs::read_to_string(hidden).unwrap(),
+            "dummy-manager-token"
+        );
+    }
+
     use super::*;
 
     #[cfg(unix)]

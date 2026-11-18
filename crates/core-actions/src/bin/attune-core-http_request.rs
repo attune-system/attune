@@ -513,8 +513,15 @@ mod tests {
 
     #[test]
     fn existing_http_semantics_with_test_only_local_transport() {
-        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../scripts/test_native_http_action.py");
+        // The owned OCI ABI fixture pins this public script inside its RO Pack
+        // input. It must not mount the compile-time source checkout/host path.
+        // This override exists only in the test executable, never the action.
+        let script = std::env::var_os("ATTUNE_CORE_HTTP_TEST_SCRIPT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../scripts/test_native_http_action.py")
+            });
         assert!(std::process::Command::new("python3")
             .arg(script)
             .env("ATTUNE_CORE_HTTP_BINARY", std::env::current_exe().unwrap())

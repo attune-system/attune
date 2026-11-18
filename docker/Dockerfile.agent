@@ -136,12 +136,14 @@ COPY crates/worker/Cargo.toml ./crates/worker/Cargo.toml
 COPY crates/notifier/Cargo.toml ./crates/notifier/Cargo.toml
 COPY crates/supervisor/Cargo.toml ./crates/supervisor/Cargo.toml
 COPY crates/cli/Cargo.toml ./crates/cli/Cargo.toml
+COPY crates/launch-controller/Cargo.toml ./crates/launch-controller/Cargo.toml
 
 # Create minimal stub sources so cargo can resolve the workspace and fetch deps.
 # These are ONLY used for `cargo fetch` — never compiled.
 # NOTE: The worker crate has two binary targets, the sensor crate has two binary
 # targets, and the CLI crate has `attune` and `attune-mcp` binary targets.
-RUN mkdir -p crates/common/src && echo "" > crates/common/src/lib.rs && \
+RUN mkdir -p crates/launch-controller/src && echo "" > crates/launch-controller/src/lib.rs && echo "fn main(){}" > crates/launch-controller/src/main.rs && \
+    mkdir -p crates/common/src && echo "" > crates/common/src/lib.rs && \
     mkdir -p crates/api/src && echo "fn main(){}" > crates/api/src/main.rs && \
     mkdir -p crates/executor/src && echo "fn main(){}" > crates/executor/src/main.rs && \
     mkdir -p crates/executor/benches && echo "fn main(){}" > crates/executor/benches/context_clone.rs && \
@@ -149,6 +151,7 @@ RUN mkdir -p crates/common/src && echo "" > crates/common/src/lib.rs && \
     echo "fn main(){}" > crates/sensor/src/agent_main.rs && \
     mkdir -p crates/worker/src && echo "fn main(){}" > crates/worker/src/main.rs && \
     echo "fn main(){}" > crates/worker/src/agent_main.rs && \
+    echo "fn main(){}" > crates/worker/src/workload_runner_main.rs && \
     mkdir -p crates/notifier/src && echo "fn main(){}" > crates/notifier/src/main.rs && \
     mkdir -p crates/supervisor/src && echo "fn main(){}" > crates/supervisor/src/main.rs && \
     mkdir -p crates/cli/src/bin && echo "" > crates/cli/src/lib.rs && \
@@ -180,11 +183,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry
     --mount=type=cache,target=/usr/local/cargo/git,id=attune-cargo-git-v2,sharing=locked \
     --mount=type=cache,id=agent-target,target=/build/target,sharing=locked \
     TARGET="$(resolve-rust-target)" && \
-    cargo zigbuild --release -j "${CARGO_BUILD_JOBS}" --target "${TARGET}" --bin attune --bin attune-agent --bin attune-sensor-agent --bin attune-mcp && \
+    cargo zigbuild --release -j "${CARGO_BUILD_JOBS}" --target "${TARGET}" --bin attune --bin attune-agent --bin attune-sensor-agent --bin attune-mcp --bin attune-workload-runner && \
     cp "/build/target/${TARGET}/release/attune" /build/attune && \
     cp "/build/target/${TARGET}/release/attune-agent" /build/attune-agent && \
     cp "/build/target/${TARGET}/release/attune-sensor-agent" /build/attune-sensor-agent && \
-    cp "/build/target/${TARGET}/release/attune-mcp" /build/attune-mcp
+    cp "/build/target/${TARGET}/release/attune-mcp" /build/attune-mcp && \
+    cp "/build/target/${TARGET}/release/attune-workload-runner" /build/attune-workload-runner
 
 # Strip the binaries to minimize size.
 # When cross-compiling for a different architecture, the host strip may not
@@ -193,10 +197,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry
 RUN (strip /build/attune 2>/dev/null && echo "stripped attune" || echo "strip skipped for attune (cross-arch binary)") && \
     (strip /build/attune-agent 2>/dev/null && echo "stripped attune-agent" || echo "strip skipped for attune-agent (cross-arch binary)") && \
     (strip /build/attune-sensor-agent 2>/dev/null && echo "stripped attune-sensor-agent" || echo "strip skipped for attune-sensor-agent (cross-arch binary)") && \
-    (strip /build/attune-mcp 2>/dev/null && echo "stripped attune-mcp" || echo "strip skipped for attune-mcp (cross-arch binary)")
+    (strip /build/attune-mcp 2>/dev/null && echo "stripped attune-mcp" || echo "strip skipped for attune-mcp (cross-arch binary)") && \
+    (strip /build/attune-workload-runner 2>/dev/null && echo "stripped workload runner" || echo "strip skipped for workload runner (cross-arch binary)")
 
 # Verify the binaries exist and show their details
-RUN ls -lh /build/attune /build/attune-agent /build/attune-sensor-agent /build/attune-mcp && \
+RUN ls -lh /build/attune /build/attune-agent /build/attune-sensor-agent /build/attune-mcp /build/attune-workload-runner && \
     file /build/attune && \
     file /build/attune-agent && \
     file /build/attune-sensor-agent && \
@@ -213,10 +218,13 @@ RUN ls -lh /build/attune /build/attune-agent /build/attune-sensor-agent /build/a
 # Useful when you only need to extract the binary (e.g., via COPY --from).
 FROM scratch AS agent-binary
 
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
 COPY --from=builder /build/attune /usr/local/bin/attune
 COPY --from=builder /build/attune-agent /usr/local/bin/attune-agent
 COPY --from=builder /build/attune-sensor-agent /usr/local/bin/attune-sensor-agent
 COPY --from=builder /build/attune-mcp /usr/local/bin/attune-mcp
+COPY --from=builder /build/attune-workload-runner /usr/local/bin/attune-workload-runner
 
 ENTRYPOINT ["/usr/local/bin/attune-agent"]
 
@@ -243,9 +251,12 @@ ENTRYPOINT ["/usr/local/bin/attune-agent"]
 #         condition: service_completed_successfully
 FROM busybox:1.36 AS agent-init
 
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
 COPY --from=builder /build/attune /usr/local/bin/attune
 COPY --from=builder /build/attune-agent /usr/local/bin/attune-agent
 COPY --from=builder /build/attune-sensor-agent /usr/local/bin/attune-sensor-agent
 COPY --from=builder /build/attune-mcp /usr/local/bin/attune-mcp
+COPY --from=builder /build/attune-workload-runner /usr/local/bin/attune-workload-runner
 
 ENTRYPOINT ["/usr/local/bin/attune-agent"]

@@ -36,6 +36,7 @@ Attune is a pre-production, event-driven automation/orchestration platform built
 17. Bind delegated execution grants to an explicit active owner and secret disclosure to recorded origins. For registration, token consumers, key delivery, or signing changes, read `docs/permissions/delegation-and-secret-disclosure.md`.
 18. Select execution authority through `execution_authority_selection`, independently of managed/ad hoc ownership. Missing or revoked recorded admissions never authorize delegation. Delegated runtime Key reads retain attempt-fenced provenance. Output secrecy follows the admitted output schema/channel policy; input secrets and API authority do not classify outputs. Protected output fields retain recorded origins; see `docs/permissions/delegation-and-secret-disclosure.md`.
 19. Own transaction boundaries with SQLx transactions or an explicit cancellation-safe session owner. Session advisory locks spanning commits require cancellation-safe ownership (such as `SessionLease`) before acquisition through publication and acknowledged unlock; uncertain cleanup must dispose the session. Preserve the vendored SQLx clean-session pool checks. See `docs/testing/sqlx-session-regressions.md`.
+20. Workload launch frontends accept control-plane admitted IDs/digests, never caller commands, environment, images, host paths, Docker HostConfig or engine resource selectors. Engine sockets and reusable controller credentials stay outside pack containers. See `docs/deployment/workload-isolation.md` for the candidate backend's prerequisites and incomplete deployment status.
 
 ## Core Stack
 
@@ -61,7 +62,8 @@ attune/
 │   ├── sensor/      managed sensor runtime
 │   ├── notifier/    LISTEN/NOTIFY + WebSocket fanout
 │   ├── supervisor/  retention and corrective maintenance
-│   └── cli/         CLI + MCP binary
+│   ├── cli/         CLI + MCP binary
+│   └── launch-controller/ trusted Docker launch primitives (candidate backend)
 ├── migrations/
 ├── packs/
 ├── web/

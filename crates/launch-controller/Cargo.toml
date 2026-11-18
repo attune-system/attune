@@ -1,0 +1,27 @@
+[package]
+name = "attune-launch-controller"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "attune-launch-controller"
+path = "src/main.rs"
+
+[dependencies]
+attune-common = { path = "../common" }
+axum = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+libc = "0.2"
+reqwest = { workspace = true, features = ["query"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+tempfile = { workspace = true }
+zip = { workspace = true }

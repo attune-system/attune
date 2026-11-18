@@ -14,6 +14,10 @@ path = "src/main.rs"
 name = "attune-agent"
 path = "src/agent_main.rs"
 
+[[bin]]
+name = "attune-workload-runner"
+path = "src/workload_runner_main.rs"
+
 [dependencies]
 attune-common = { path = "../common" }
 tokio = { workspace = true }
