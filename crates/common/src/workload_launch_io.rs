@@ -189,7 +189,7 @@ impl LaunchIoHandle for HttpLaunchHandle {
     async fn write_stdin(&self, grant: &LaunchIoGrant, bytes: Bytes) -> LaunchIoResult<()> {
         let timeout = self.validate_grant(grant)?;
         if grant.channel != LaunchIoChannel::Stdin
-            || bytes.len() > 1024 * 1024
+            || bytes.len() > crate::workload_stdin::MAX_PRIVATE_STDIN_BYTES
             || bytes.len() as u64 > grant.max_bytes
         {
             return Err(LaunchIoError::Configuration);
@@ -525,6 +525,54 @@ mod tests {
         .await;
         server.await.unwrap();
         result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stdin_transport_uses_canonical_payload_bound_and_channel_grant() {
+        let launch = reserved();
+        let length = 1024 * 1024 + 1;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let (headers, body) = request(&mut socket).await;
+            assert!(headers.starts_with("PUT /v1/launches/71/stdin?admitted_digest="));
+            assert!(headers.contains("x-attune-launch-io: owned-channel-token"));
+            assert!(!headers.to_ascii_lowercase().contains("\nauthorization:"));
+            assert_eq!(body.len(), length);
+            assert!(body.iter().all(|byte| *byte == b'a'));
+            socket
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let handle = HttpLaunchHandle {
+            transport: HttpLaunchTransport::new(format!("http://{address}/").parse().unwrap())
+                .unwrap(),
+            launch: launch.clone(),
+        };
+        let mut input = grant(&launch, LaunchIoChannel::Stdin);
+        input.max_bytes = (crate::workload_stdin::MAX_PRIVATE_STDIN_BYTES + 1) as u64;
+        let oversized = handle
+            .write_stdin(
+                &input,
+                Bytes::from(vec![0; crate::workload_stdin::MAX_PRIVATE_STDIN_BYTES + 1]),
+            )
+            .await;
+        assert!(matches!(oversized, Err(LaunchIoError::Configuration)));
+        input.max_bytes = length as u64;
+        let result = handle
+            .write_stdin(&input, Bytes::from(vec![b'a'; length]))
+            .await;
+        if result.is_err() {
+            server.abort();
+            let _ = server.await;
+            panic!("valid bounded stdin did not reach the owned frontend");
+        }
+        server.await.unwrap();
     }
     #[tokio::test]
     async fn finite_reads_reject_missing_bytes_and_ambiguous_headers() {
