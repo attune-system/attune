@@ -118,6 +118,58 @@ impl Fixture {
             },
         })
     }
+    fn input(
+        &self,
+        kind: LaunchInputKind,
+        files: Vec<(&str, Vec<u8>, bool)>,
+    ) -> TestResult<PinnedLaunchInput> {
+        use sha2::{Digest, Sha256};
+        use std::io::{Read, Seek, Write};
+        let mut body = tempfile::tempfile()?;
+        {
+            let mut zip = zip::ZipWriter::new(&mut body);
+            for (name, bytes, executable) in files {
+                zip.start_file(
+                    name,
+                    zip::write::SimpleFileOptions::default().unix_permissions(if executable {
+                        0o755
+                    } else {
+                        0o644
+                    }),
+                )?;
+                zip.write_all(&bytes)?;
+            }
+            zip.finish()?;
+        }
+        body.rewind()?;
+        let mut hash = Sha256::new();
+        let mut buffer = [0; 65536];
+        loop {
+            let count = body.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&buffer[..count]);
+        }
+        body.rewind()?;
+        let pin = PinnedLaunchInput {
+            pin_id: 1,
+            object_id: 1,
+            object_version: Uuid::new_v4().to_string(),
+            kind,
+            size_bytes: body.metadata()?.len(),
+            sha256: Sha256Digest::parse(
+                hash.finalize()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
+            )?,
+            max_expanded_bytes: 128 * 1024 * 1024,
+            max_files: 4096,
+        };
+        self.cache.install_input(&pin, &mut body)?;
+        Ok(pin)
+    }
     async fn cleanup(&self, resource: &ResourceIdentity) -> TestResult {
         let ResourceIdentity::Kubernetes {
             namespace,
@@ -262,6 +314,11 @@ async fn python_setup_archive_reuse_preserves_console_script_and_absolute_link()
     // Local wheel, pip and ensurepip only; no network/package-index dependency.
     let program = r#"import os, subprocess, sys, zipfile
 root = '/opt/attune/runtime'
+assert os.getcwd() == root + '/project'
+assert open('/opt/attune/pack/source.txt').read() == 'immutable source'
+with open('source.txt', 'w') as f: f.write('private setup update')
+with open('generated.lock', 'w') as f: f.write('generated lock')
+assert open('/opt/attune/pack/source.txt').read() == 'immutable source'
 subprocess.run([sys.executable, '-m', 'venv', '--copies', root], check=True)
 files = {
  'ownedtool.py': 'def main():\n print("owned-console-ok")\n',
@@ -277,7 +334,42 @@ subprocess.run([root + '/bin/python', '-m', 'pip', 'install', '--no-index', '--n
 os.symlink(root + '/bin/python', root + '/bin/internal-python')
 assert open(root + '/bin/owned-console').readline().strip() == '#!' + root + '/bin/python'
 "#;
-    let mut setup = f.spec(vec!["/usr/bin/python3".into(), "-c".into(), program.into()])?;
+    let mut setup = f.spec(Vec::new())?;
+    let runner = {
+        use std::io::Read;
+        let file = std::fs::File::open(required("ATTUNE_ISOLATION_TEST_RUNNER_PATH")?)?;
+        if !file.metadata()?.is_file() || file.metadata()?.len() > 64 * 1024 * 1024 {
+            return Err("owned public Runner exceeds fixture input bound".into());
+        }
+        let mut bytes = Vec::new();
+        file.take(64 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.is_empty() || bytes.len() > 64 * 1024 * 1024 {
+            return Err("owned public Runner exceeds fixture input bound".into());
+        }
+        bytes
+    };
+    let runner_name = format!("linux-{}", setup.platform.native_arch());
+    setup
+        .inputs
+        .push(f.input(LaunchInputKind::Runner, vec![(&runner_name, runner, true)])?);
+    setup.inputs.push(f.input(
+        LaunchInputKind::Pack,
+        vec![("source.txt", b"immutable source".to_vec(), false)],
+    )?);
+    setup.invocation.argv = vec![
+        attune_workload_backend::planning::runner_program(setup.platform),
+        "setup".into(),
+    ];
+    setup.invocation.working_root = LaunchRoot::Stage;
+    let plan = attune_workload_backend::planning::SetupPlan {
+        version: 1,
+        environment: BTreeMap::from([("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into())]),
+        steps: vec![attune_workload_backend::planning::SetupStep {
+            argv: vec!["/usr/bin/python3".into(), "-c".into(), program.into()],
+            if_pack_file: None,
+        }],
+    };
+    plan.validate()?;
     setup.purpose = LaunchPurpose::Setup;
     setup.target = LaunchTarget::Setup {
         admission: 1,
@@ -289,7 +381,7 @@ assert open(root + '/bin/owned-console').readline().strip() == '#!' + root + '/b
         quota_files: 4096,
     });
     eprintln!("stage fixture phase=setup-run");
-    let (resource, exit, _, _) = f.run_retained(&setup, Vec::new()).await?;
+    let (resource, exit, _, _) = f.run_retained(&setup, serde_json::to_vec(&plan)?).await?;
     let result = async {
         if exit.exit_code != 0 || exit.oom_killed {
             return Err("owned Python setup did not succeed".into());
@@ -348,6 +440,10 @@ assert open(root + '/bin/owned-console').readline().strip() == '#!' + root + '/b
     eprintln!("stage fixture phase=setup-remove");
     f.launcher.remove_stopped(&setup, &resource).await?;
     let verify = r#"import os, subprocess
+assert os.getcwd() == '/opt/attune/runtime/project'
+assert open('generated.lock').read() == 'generated lock'
+assert open('source.txt').read() == 'private setup update'
+assert open('/opt/attune/pack/source.txt').read() == 'immutable source'
 subprocess.run(['/opt/attune/runtime/bin/owned-console'], check=True)
 subprocess.run(['/opt/attune/runtime/bin/internal-python', '-c', 'print("owned-link-ok")'], check=True)
 try: open('/opt/attune/runtime/poison', 'w')
@@ -357,6 +453,15 @@ else: raise AssertionError('published runtime writable')
 "#;
     let mut action = f.spec(vec!["/usr/bin/python3".into(), "-c".into(), verify.into()])?;
     action.inputs.push(pin);
+    action.inputs.push(
+        setup
+            .inputs
+            .iter()
+            .find(|p| p.kind == LaunchInputKind::Pack)
+            .unwrap()
+            .clone(),
+    );
+    action.invocation.working_root = LaunchRoot::Runtime;
     eprintln!("stage fixture phase=runtime-start-and-seed");
     let (exit, out, err) = f.run(&action, Vec::new()).await?;
     if exit.exit_code != 0
@@ -365,6 +470,42 @@ else: raise AssertionError('published runtime writable')
         || !err.is_empty()
     {
         return Err("published console script/link/readonly regression failed".into());
+    }
+    // A failed dependency/hook stops the same fixed helper immediately; no
+    // successful stage publication or following hook may be fabricated.
+    let mut failed = setup.clone();
+    failed.intent = Uuid::new_v4();
+    failed.target = LaunchTarget::Setup {
+        admission: 1,
+        attempt: Uuid::new_v4(),
+    };
+    let mut failed_plan = plan;
+    failed_plan.steps = vec![
+        attune_workload_backend::planning::SetupStep {
+            argv: vec!["/bin/sh".into(), "-c".into(), "exit 17".into()],
+            if_pack_file: None,
+        },
+        attune_workload_backend::planning::SetupStep {
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf owned-must-not-run".into(),
+            ],
+            if_pack_file: None,
+        },
+    ];
+    eprintln!("stage fixture phase=failed-step-stops-publication");
+    let (resource, exit, out, _) = f
+        .run_retained(&failed, serde_json::to_vec(&failed_plan)?)
+        .await?;
+    let denied = f
+        .launcher
+        .archive_stopped_stage(&failed, &resource)
+        .await
+        .is_err();
+    f.launcher.remove_stopped(&failed, &resource).await?;
+    if exit.exit_code == 0 || !out.is_empty() || !denied {
+        return Err("failed setup step continued or permitted publication".into());
     }
     Ok(())
 }

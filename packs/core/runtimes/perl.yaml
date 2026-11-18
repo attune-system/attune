@@ -41,7 +41,7 @@ execution_config:
     install_command:
       - sh
       - "-c"
-      - "cd {pack_dir} && PERL5LIB={env_dir}/lib/perl5 PERL_LOCAL_LIB_ROOT={env_dir} cpanm --local-lib {env_dir} --installdeps --quiet . 2>/dev/null || true"
+      - "cd {pack_dir} && PERL5LIB={env_dir}/lib/perl5 PERL_LOCAL_LIB_ROOT={env_dir} cpanm --local-lib {env_dir} --installdeps --quiet ."
   env_vars:
     PERL5LIB: "{env_dir}/lib/perl5"
     PERL_LOCAL_LIB_ROOT: "{env_dir}"

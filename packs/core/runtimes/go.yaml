@@ -42,7 +42,7 @@ execution_config:
     install_command:
       - sh
       - "-c"
-      - "cd {pack_dir} && GOPATH={env_dir} go mod download 2>/dev/null || true"
+      - "cd {pack_dir} && GOPATH={env_dir} go mod download"
   env_vars:
     GOPATH: "{env_dir}"
     GOMODCACHE: "{env_dir}/pkg/mod"

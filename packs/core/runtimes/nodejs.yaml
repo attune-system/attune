@@ -34,7 +34,7 @@ execution_config:
     create_command:
       - sh
       - "-c"
-      - "mkdir -p {env_dir} && cp {manifest_path} {env_dir}/ 2>/dev/null || true"
+      - "mkdir -p {env_dir} && if [ -e {manifest_path} ]; then cp {manifest_path} {env_dir}/; fi"
     interpreter_path: null
   dependencies:
     manifest_file: package.json
@@ -79,7 +79,7 @@ versions:
         create_command:
           - sh
           - "-c"
-          - "mkdir -p {env_dir} && cp {manifest_path} {env_dir}/ 2>/dev/null || true"
+          - "mkdir -p {env_dir} && if [ -e {manifest_path} ]; then cp {manifest_path} {env_dir}/; fi"
         interpreter_path: null
       dependencies:
         manifest_file: package.json
@@ -122,7 +122,7 @@ versions:
         create_command:
           - sh
           - "-c"
-          - "mkdir -p {env_dir} && cp {manifest_path} {env_dir}/ 2>/dev/null || true"
+          - "mkdir -p {env_dir} && if [ -e {manifest_path} ]; then cp {manifest_path} {env_dir}/; fi"
         interpreter_path: null
       dependencies:
         manifest_file: package.json
@@ -164,7 +164,7 @@ versions:
         create_command:
           - sh
           - "-c"
-          - "mkdir -p {env_dir} && cp {manifest_path} {env_dir}/ 2>/dev/null || true"
+          - "mkdir -p {env_dir} && if [ -e {manifest_path} ]; then cp {manifest_path} {env_dir}/; fi"
         interpreter_path: null
       dependencies:
         manifest_file: package.json
