@@ -85,10 +85,10 @@ struct OwnedSpool {
 #[derive(Clone)]
 pub struct LogDeliverySpool(Arc<OwnedSpool>);
 
-/// Own the private directory and custody key BEFORE making any registration
-/// request. No delivery can be read/written until the CP selects the worker ID.
-/// This owner is intentionally not Clone; binding consumes it without releasing
-/// the filesystem lease between enrollment and manager initialization.
+/// Own the private directory and custody key BEFORE activating registration.
+/// The logical slot supplies its stable ID/path without activating a new
+/// incarnation; acknowledged registration then binds it. This owner is not Clone:
+/// binding consumes it without releasing the lease during manager initialization.
 pub struct UnboundLogDeliverySpool(OwnedSpool);
 impl UnboundLogDeliverySpool {
     pub fn bind_worker(mut self, worker: i64) -> Result<LogDeliverySpool> {

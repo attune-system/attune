@@ -70,6 +70,9 @@ pub(crate) struct ExecutionOutcome {
 pub struct ActionExecutor {
     #[cfg(unix)]
     log_delivery: tokio::sync::OnceCell<Arc<crate::log_delivery::LogDeliveryManager>>,
+    #[cfg(unix)]
+    log_custody_owner:
+        tokio::sync::Mutex<Option<(i64, crate::log_delivery_spool::UnboundLogDeliverySpool)>>,
     pool: PgPool,
     child_environment: attune_common::child_process_environment::ChildProcessEnvironment,
     runtime_registry: RuntimeRegistry,
@@ -417,6 +420,8 @@ impl ActionExecutor {
         Self {
             #[cfg(unix)]
             log_delivery: tokio::sync::OnceCell::new(),
+            #[cfg(unix)]
+            log_custody_owner: tokio::sync::Mutex::new(None),
             pool,
             child_environment: Default::default(),
             runtime_registry,
@@ -474,16 +479,52 @@ impl ActionExecutor {
         self
     }
 
-    pub async fn start_log_delivery(
+    fn needs_log_custody(&self, config: &attune_common::config::LogDeliveryConfig) -> bool {
+        cfg!(unix) && config.enabled && self.transport.transport_mode() != "volume"
+    }
+
+    /// Existing trusted startup policy, with exclusive custody preceding the
+    /// only operation that can replace a live registered incarnation.
+    pub(crate) async fn register_worker_with_custody(
         &self,
-        config: attune_common::config::LogDeliveryConfig,
+        registration: &mut crate::registration::WorkerRegistration,
+        config: &attune_common::config::LogDeliveryConfig,
+    ) -> Result<i64> {
+        if self.needs_log_custody(config) {
+            let worker = registration.reserve_slot().await?;
+            self.acquire_log_custody(config, worker).await?;
+            let registered = registration.register_reserved(worker).await;
+            #[cfg(unix)]
+            if registered.is_err() {
+                // No capture/recovery task can exist before registration ACK.
+                // Release only ownership, retaining the synchronized key/files.
+                self.log_custody_owner.lock().await.take();
+            }
+            registered
+        } else {
+            registration.register().await
+        }
+    }
+
+    /// Prepare a stable ID's existing custody root without granting a worker
+    /// incarnation any authority. Kept for explicit owning integration fixtures
+    /// too; ordinary service startup uses register_worker_with_custody above.
+    pub async fn acquire_log_custody(
+        &self,
+        config: &attune_common::config::LogDeliveryConfig,
+        worker: i64,
     ) -> Result<()> {
         #[cfg(unix)]
-        if config.enabled && self.transport.transport_mode() != "volume" {
-            if config.max_finalizers == 0 || config.max_spool_bytes == 0 {
-                return Err(Error::validation("Log delivery budgets must be positive"));
+        if self.needs_log_custody(config) {
+            if worker <= 0 || config.max_finalizers == 0 || config.max_spool_bytes == 0 {
+                return Err(Error::validation(
+                    "Log delivery ownership and budgets must be valid",
+                ));
             }
-            let worker = self.worker_id.load(Ordering::Acquire);
+            let mut holder = self.log_custody_owner.lock().await;
+            if holder.is_some() || self.log_delivery.get().is_some() {
+                return Err(Error::invalid_state("Log custody already acquired"));
+            }
             let root = config
                 .spool_dir
                 .as_ref()
@@ -492,9 +533,45 @@ impl ActionExecutor {
                 .join(worker.to_string());
             let max_plain = self.max_stdout_bytes.max(self.max_stderr_bytes) as u64;
             let max_payload = attune_common::runtime_read_log::maximum_encoded_bytes(max_plain)?;
-            let manager = crate::log_delivery::LogDeliveryManager::open(
-                self.pool.clone(),
+            let entry_bytes = max_payload
+                .checked_mul(4)
+                .and_then(|v| v.checked_add(64 * 1024))
+                .ok_or_else(|| Error::validation("Log spool size overflow"))?;
+            let owner = crate::log_delivery_spool::LogDeliverySpool::acquire_owner(
                 root,
+                config.max_spool_bytes,
+                entry_bytes,
+                max_payload,
+            )
+            .await?;
+            *holder = Some((worker, owner));
+        }
+        #[cfg(not(unix))]
+        let _ = (config, worker);
+        Ok(())
+    }
+
+    pub async fn start_log_delivery(
+        &self,
+        config: attune_common::config::LogDeliveryConfig,
+    ) -> Result<()> {
+        #[cfg(unix)]
+        if self.needs_log_custody(&config) {
+            let worker = self.worker_id.load(Ordering::Acquire);
+            let (reserved, owner) =
+                self.log_custody_owner.lock().await.take().ok_or_else(|| {
+                    Error::invalid_state("Log custody must precede worker registration")
+                })?;
+            if reserved != worker {
+                return Err(Error::PermissionDenied(
+                    "Log custody registration changed".into(),
+                ));
+            }
+            let max_plain = self.max_stdout_bytes.max(self.max_stderr_bytes) as u64;
+            let max_payload = attune_common::runtime_read_log::maximum_encoded_bytes(max_plain)?;
+            let manager = crate::log_delivery::LogDeliveryManager::open_owned(
+                self.pool.clone(),
+                owner.bind_worker(worker)?,
                 worker,
                 self.worker_instance,
                 self.worker_tokens.clone().ok_or_else(|| {
@@ -2106,9 +2183,14 @@ impl ActionExecutor {
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone())),
         );
-        spec.invocation.env =
-            crate::runtime::launch_planning::action_environment(config, &environment, &file, false)
-                .map_err(|_| unavailable())?;
+        spec.invocation.env = crate::runtime::launch_planning::action_environment(
+            config,
+            &environment,
+            &file,
+            false,
+            spec.pack_access,
+        )
+        .map_err(|_| unavailable())?;
         spec.invocation.working_root = LaunchRoot::Pack;
         spec.timeout_ms = context
             .timeout
@@ -3300,6 +3382,251 @@ mod tests {
     use attune_common::repositories::Create;
     use attune_common::test_database::TestDatabase;
     use chrono::Utc;
+
+    #[cfg(unix)]
+    fn registration_executor(
+        database: &TestDatabase,
+        root: &Path,
+        name: &str,
+        tokens: Arc<attune_common::auth::WorkerTokenProvider>,
+    ) -> Result<ActionExecutor> {
+        let artifacts = root.join("artifacts");
+        let jwt = JwtConfig {
+            secret: "owned-registration-test-signing-key".into(),
+            ..Default::default()
+        };
+        Ok(ActionExecutor::new(
+            database.pool().clone(),
+            RuntimeRegistry::new(),
+            ArtifactManager::new(artifacts.clone()),
+            SecretManager::new(
+                database.pool().clone(),
+                Some("owned-registration-encryption-key".into()),
+            )?,
+            1024,
+            1024,
+            false,
+            false,
+            name.into(),
+            tokens.instance_id(),
+            attune_common::log_stream::SegmentedLogConfig {
+                initial_segment_bytes: 1024,
+                max_segment_bytes: 16384,
+                flush_interval_ms: 10,
+                retry_max_attempts: 1,
+                retry_attempt_timeout_ms: 500,
+                retry_initial_backoff_ms: 1,
+                retry_max_backoff_ms: 1,
+                finalization_timeout_ms: 5000,
+            },
+            None,
+            None,
+            root.join("packs"),
+            artifacts.clone(),
+            root.join("runtimes"),
+            "http://127.0.0.1:9".into(),
+            jwt,
+            Arc::new(
+                attune_common::artifact_transport::ApiTransport::new_with_worker_token_provider(
+                    "http://127.0.0.1:9",
+                    tokens.clone(),
+                    artifacts
+                        .to_str()
+                        .ok_or_else(|| Error::validation("fixture path"))?,
+                )?,
+            ),
+        )
+        .with_worker_token_provider(tokens))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registration_custody_overlap_cannot_replace_the_live_incarnation() -> anyhow::Result<()>
+    {
+        use crate::registration::WorkerRegistration;
+        use attune_common::{
+            auth::WorkerTokenProvider,
+            repositories::{runtime::WorkerRepository, FindById},
+        };
+        attune_common::auth::install_crypto_provider();
+        let mut config = Config::load_from_file(&format!(
+            "{}/../../config.test.yaml",
+            env!("CARGO_MANIFEST_DIR")
+        ))?;
+        let name = format!("custody-owner-{}", uuid::Uuid::new_v4());
+        config.worker = Some(serde_json::from_value(serde_json::json!({"name": name}))?);
+        let database = TestDatabase::create(&config.database)
+            .await?
+            .with_cleanup_on_drop();
+        let root = tempfile::tempdir()?;
+        let delivery = attune_common::config::LogDeliveryConfig {
+            spool_dir: Some(root.path().join("custody").to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let tokens = Arc::new(WorkerTokenProvider::new(1, "0", JwtConfig::default()));
+        let first = registration_executor(&database, root.path(), &name, tokens.clone())?;
+        let mut a = WorkerRegistration::new(database.pool().clone(), &config);
+        a.add_capability(
+            "log_delivery_instance".into(),
+            serde_json::json!(tokens.instance_id()),
+        );
+        let id = first
+            .register_worker_with_custody(&mut a, &delivery)
+            .await?;
+        let before = WorkerRepository::find_by_id(database.pool(), id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("registered worker"))?;
+        let key_path = PathBuf::from(delivery.spool_dir.as_ref().unwrap())
+            .join(id.to_string())
+            .join("custody.key");
+        let key = std::fs::read(&key_path)?;
+        let next_tokens = Arc::new(WorkerTokenProvider::new(1, "0", JwtConfig::default()));
+        let second = registration_executor(&database, root.path(), &name, next_tokens.clone())?;
+        let mut b = WorkerRegistration::new(database.pool().clone(), &config);
+        b.add_capability(
+            "log_delivery_instance".into(),
+            serde_json::json!(next_tokens.instance_id()),
+        );
+        anyhow::ensure!(
+            second
+                .register_worker_with_custody(&mut b, &delivery)
+                .await
+                .is_err(),
+            "overlapping custody was admitted"
+        );
+        anyhow::ensure!(
+            b.registered_incarnation().is_none(),
+            "failed overlap acknowledged registration"
+        );
+        let after = WorkerRepository::find_by_id(database.pool(), id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("live worker"))?;
+        anyhow::ensure!(
+            before.meta == after.meta
+                && before.capabilities == after.capabilities
+                && before.status == after.status,
+            "failed overlap mutated active registration"
+        );
+        drop(first);
+        let next = second
+            .register_worker_with_custody(&mut b, &delivery)
+            .await?;
+        anyhow::ensure!(
+            next == id && a.registered_incarnation() != b.registered_incarnation(),
+            "replacement identity not fenced"
+        );
+        anyhow::ensure!(
+            std::fs::read(&key_path)? == key,
+            "custody key rotated during replacement"
+        );
+        a.deregister().await?;
+        let current = WorkerRepository::find_by_id(database.pool(), id)
+            .await?
+            .unwrap();
+        anyhow::ensure!(
+            serde_json::to_value(current.status)? == serde_json::json!("active"),
+            "old deregistration closed replacement"
+        );
+        b.deregister().await?;
+        drop(second);
+        drop(a);
+        drop(b);
+        database.cleanup().await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registration_custody_failure_leaves_a_new_slot_inactive_and_unbound(
+    ) -> anyhow::Result<()> {
+        use crate::registration::WorkerRegistration;
+        use attune_common::{
+            auth::WorkerTokenProvider,
+            models::{WorkerRole, WorkerType},
+            repositories::{
+                runtime::{CreateWorkerInput, WorkerRepository},
+                FindById,
+            },
+        };
+        attune_common::auth::install_crypto_provider();
+        let mut config = Config::load_from_file(&format!(
+            "{}/../../config.test.yaml",
+            env!("CARGO_MANIFEST_DIR")
+        ))?;
+        let name = format!("custody-inactive-{}", uuid::Uuid::new_v4());
+        config.worker = Some(serde_json::from_value(serde_json::json!({"name": name}))?);
+        let database = TestDatabase::create(&config.database)
+            .await?
+            .with_cleanup_on_drop();
+        let root = tempfile::tempdir()?;
+        let delivery = attune_common::config::LogDeliveryConfig {
+            spool_dir: Some(root.path().join("custody").to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let mut registration = WorkerRegistration::new(database.pool().clone(), &config);
+        let id = registration.reserve_slot().await?;
+        let owned = PathBuf::from(delivery.spool_dir.as_ref().unwrap()).join(id.to_string());
+        std::fs::create_dir_all(&owned)?;
+        let sentinel = root.path().join("unrelated-owned-sentinel");
+        std::fs::write(&sentinel, b"unchanged")?;
+        std::os::unix::fs::symlink(&sentinel, owned.join("owner.lock"))?;
+        let tokens = Arc::new(WorkerTokenProvider::new(1, "0", JwtConfig::default()));
+        let executor = registration_executor(&database, root.path(), &name, tokens)?;
+        anyhow::ensure!(
+            executor
+                .register_worker_with_custody(&mut registration, &delivery)
+                .await
+                .is_err(),
+            "invalid ownership accepted"
+        );
+        anyhow::ensure!(
+            registration.registered_incarnation().is_none(),
+            "failed ownership registered worker"
+        );
+        let row = WorkerRepository::find_by_id(database.pool(), id)
+            .await?
+            .unwrap();
+        anyhow::ensure!(
+            serde_json::to_value(row.status)? == serde_json::json!("inactive")
+                && row.capabilities.is_none()
+                && row
+                    .meta
+                    .as_ref()
+                    .and_then(|v| v.get("registration_incarnation"))
+                    .is_none(),
+            "failed custody advertised authority"
+        );
+        anyhow::ensure!(
+            std::fs::read(&sentinel)? == b"unchanged",
+            "ownership failure changed unrelated file"
+        );
+        let wrong_name = CreateWorkerInput {
+            name: format!("different-{name}"),
+            worker_type: WorkerType::Local,
+            runtime: None,
+            host: None,
+            port: None,
+            status: None,
+            capabilities: None,
+            meta: None,
+        };
+        anyhow::ensure!(
+            WorkerRepository::register_reserved_incarnation(
+                database.pool(),
+                wrong_name,
+                WorkerRole::Action,
+                uuid::Uuid::new_v4(),
+                id
+            )
+            .await
+            .is_err(),
+            "reserved ID rebound to another name"
+        );
+        drop(executor);
+        drop(registration);
+        database.cleanup().await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn physical_stop_is_not_blocked_by_durable_stop_lock_wait() -> anyhow::Result<()> {

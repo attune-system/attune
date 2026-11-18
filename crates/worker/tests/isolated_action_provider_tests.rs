@@ -511,6 +511,7 @@ async fn owning_case(real_provider: bool) -> Result<()> {
         }
     });
     let result = async {
+        executor.acquire_log_custody(&delivery, worker.id).await?;
         executor.start_log_delivery(delivery.clone()).await?;
         let outcome = tokio::time::timeout(
             Duration::from_secs(240),

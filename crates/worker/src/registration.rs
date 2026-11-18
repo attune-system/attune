@@ -315,28 +315,60 @@ impl WorkerRegistration {
         Ok(())
     }
 
-    /// Register the worker in the database
-    pub async fn register(&mut self) -> Result<i64> {
-        info!("Registering worker: {}", self.worker_name);
+    fn registration_input(&self) -> Result<CreateWorkerInput> {
+        Ok(CreateWorkerInput {
+            name: self.worker_name.clone(),
+            worker_type: self.worker_type,
+            runtime: self.runtime_id,
+            host: self.host.clone(),
+            port: self.port,
+            status: None,
+            capabilities: Some(serde_json::to_value(&self.capabilities)?),
+            meta: None,
+        })
+    }
 
-        // Generate only at registration; heartbeat/capability refreshes retain it.
+    /// This does not advertise capabilities or replace a live incarnation.
+    pub(crate) async fn reserve_slot(&self) -> Result<i64> {
+        let mut input = self.registration_input()?;
+        input.capabilities = None;
+        WorkerRepository::reserve_registration_slot(&self.pool, input, self.worker_role).await
+    }
+
+    /// Ordinary callers without persistent custody retain their existing flow.
+    pub async fn register(&mut self) -> Result<i64> {
+        self.register_in_slot(None).await
+    }
+
+    pub(crate) async fn register_reserved(&mut self, worker: i64) -> Result<i64> {
+        self.register_in_slot(Some(worker)).await
+    }
+
+    async fn register_in_slot(&mut self, reserved: Option<i64>) -> Result<i64> {
+        info!("Registering worker: {}", self.worker_name);
         let incarnation = uuid::Uuid::new_v4();
-        let worker = WorkerRepository::register_incarnation(
-            &self.pool,
-            CreateWorkerInput {
-                name: self.worker_name.clone(),
-                worker_type: self.worker_type,
-                runtime: self.runtime_id,
-                host: self.host.clone(),
-                port: self.port,
-                status: None,
-                capabilities: Some(serde_json::to_value(&self.capabilities)?),
-                meta: None,
-            },
-            self.worker_role,
-            incarnation,
-        )
-        .await?;
+        let input = self.registration_input()?;
+        let worker = match reserved {
+            Some(worker) => {
+                WorkerRepository::register_reserved_incarnation(
+                    &self.pool,
+                    input,
+                    self.worker_role,
+                    incarnation,
+                    worker,
+                )
+                .await?
+            }
+            None => {
+                WorkerRepository::register_incarnation(
+                    &self.pool,
+                    input,
+                    self.worker_role,
+                    incarnation,
+                )
+                .await?
+            }
+        };
         self.incarnation = incarnation;
         let worker_id = worker.id;
 

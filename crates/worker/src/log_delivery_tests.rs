@@ -21,6 +21,7 @@ struct Fixture {
     directory: tempfile::TempDir,
     control_stop: CancellationToken,
     control_server: tokio::task::JoinHandle<()>,
+    control_requests: Arc<Notify>,
 }
 impl Fixture {
     async fn new() -> Self {
@@ -75,6 +76,8 @@ impl Fixture {
         let api = format!("http://{}", listener.local_addr().unwrap());
         // Transport fixture uses the canonical repository control decision;
         // authorization/rejection coverage belongs to the real API tests.
+        let control_requests = Arc::new(Notify::new());
+        let observed = control_requests.clone();
         let app = axum::Router::new().route(
             "/api/v1/internal/log-delivery/control",
             axum::routing::post(
@@ -84,6 +87,7 @@ impl Fixture {
                 >| {
                     let pool = pool.clone();
                     let expected = expected.clone();
+                    let observed = observed.clone();
                     async move {
                         use axum::response::IntoResponse;
                         if headers
@@ -93,6 +97,7 @@ impl Fixture {
                         {
                             return axum::http::StatusCode::UNAUTHORIZED.into_response();
                         }
+                        observed.notify_one();
                         use attune_common::repositories::log_delivery::ControlDecision;
                         match LogDeliveryRepository::reconcile_control(
                             &pool,
@@ -148,6 +153,7 @@ impl Fixture {
             directory,
             control_stop,
             control_server,
+            control_requests,
         }
     }
     fn writer(&self) -> SpoolingLogWriter {
@@ -390,4 +396,108 @@ async fn database_outage_across_expiry_does_not_strand_capacity() {
     assert_eq!(intent.state, "incomplete");
     assert_eq!(intent.failure.as_deref(), Some("deadline"));
     fixture.finish().await;
+}
+
+#[tokio::test]
+async fn cancelled_manager_initialization_retains_lease_until_custody_owners_stop(
+) -> anyhow::Result<()> {
+    let fixture = Fixture::new().await;
+    let mut first = fixture.entry().await;
+    first.finalize_by = chrono::Utc::now() + chrono::Duration::minutes(5);
+    let mut second = first.clone();
+    second.version += 1;
+    second.custody = Uuid::new_v4();
+    fixture.manager.spool.save(first.clone()).await?;
+    fixture.manager.spool.save(second.clone()).await?;
+    fixture.manager.stop_and_join().await;
+    let Fixture {
+        manager,
+        database,
+        directory,
+        control_stop,
+        control_server,
+        control_requests,
+    } = fixture;
+    let pool = database.pool().clone();
+    let worker = manager.worker;
+    let instance = manager.instance;
+    let tokens = manager.tokens.clone();
+    let api = manager.api.clone();
+    let root = directory.path().join("spool");
+    let key = std::fs::read(root.join("custody.key"))?;
+    drop(manager);
+    let recovering_root = root.clone();
+    let recovering = tokio::spawn(async move {
+        LogDeliveryManager::open(
+            pool,
+            recovering_root,
+            worker,
+            instance,
+            tokens,
+            api,
+            LogDeliveryConfig {
+                max_finalizers: 1,
+                max_spool_bytes: 100_000,
+                ..Default::default()
+            },
+            1024,
+            1024,
+        )
+        .await
+    });
+    let admitted = async {
+        // Actual first recovery transport, with one occupied slot. The second
+        // retained entry keeps open() pending; no fixed sleep models this state.
+        tokio::time::timeout(Duration::from_secs(10), control_requests.notified()).await?;
+        anyhow::ensure!(
+            !recovering.is_finished(),
+            "recovery was not held by its retained finalizer"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    recovering.abort();
+    let cancelled = recovering.await;
+    let checked = async {
+        admitted?;
+        anyhow::ensure!(
+            cancelled.is_err_and(|error| error.is_cancelled()),
+            "initialization was not cancelled"
+        );
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join("owner.lock"))?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if lease.try_lock().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        drop(lease);
+        let spool = LogDeliverySpool::open(root.clone(), worker, 100_000, 69_632, 1024).await?;
+        anyhow::ensure!(
+            spool.versions().await?.len() == 2,
+            "cancellation discarded retained custody"
+        );
+        anyhow::ensure!(
+            spool.load(first.version).await? == first
+                && spool.load(second.version).await? == second,
+            "cancellation changed retained bindings or payloads"
+        );
+        anyhow::ensure!(
+            std::fs::read(root.join("custody.key"))? == key,
+            "restart rotated custody key"
+        );
+        drop(spool);
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    control_stop.cancel();
+    control_server.await?;
+    database.cleanup().await?;
+    checked
 }
