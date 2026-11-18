@@ -102,6 +102,7 @@ mod tests {
 }
 
 pub mod workload_archive;
+pub mod workload_artifact;
 pub mod workload_controller;
 pub mod workload_host;
 pub mod workload_launch;
