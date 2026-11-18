@@ -41,7 +41,7 @@ def test_recipe_released_and_inline_actions_and_preparation_timeout(client, pack
 
 
 def test_recipe_sensor_emits_a_scoped_event_and_runs_its_rule(client, pack_ref):
-    client.create_rule(pack_ref=pack_ref, name="recipe_sensor_" + uuid.uuid4().hex[:8],
+    rule = client.create_rule(pack_ref=pack_ref, name="recipe_sensor_" + uuid.uuid4().hex[:8],
         trigger_ref="core.lifecycle_tick", action_ref="core.lifecycle_echo",
         action_params={"message": "sensor-contract"})
     base = "/api/v1/sensors/core.lifecycle_sensor"
@@ -49,14 +49,14 @@ def test_recipe_sensor_emits_a_scoped_event_and_runs_its_rule(client, pack_ref):
     assert response.status_code == 200, response.text
     try:
         wait_for_condition(lambda: any(event.get("payload", {}).get("message") == "sensor-contract"
-            for event in client.list_events(trigger_ref="core.lifecycle_tick")), timeout=90,
+            for event in client.list_events(trigger_ref="core.lifecycle_tick", rule_id=rule["id"])), timeout=90,
             error_message="Recipe sensor did not emit its admitted event")
         execution = None
 
         def received_execution():
             nonlocal execution
             execution = next((row for row in client.list_executions(action_ref="core.lifecycle_echo", limit=100)
-                if row.get("config", {}).get("message") == "sensor-contract"), None)
+                if row.get("rule_ref") == rule["ref"]), None)
             return execution is not None
 
         wait_for_condition(received_execution, timeout=90,
