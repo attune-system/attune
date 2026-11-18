@@ -67,12 +67,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry
     --mount=type=cache,target=/usr/local/cargo/git,id=attune-cargo-git-v2,sharing=locked \
     cargo fetch
 
-# Now copy only the source needed to build the service binaries.
+# Now copy the source needed to build the service binaries and their normal
+# local library dependencies. API preparation uses the worker's pure planner;
+# its fetch-only binary stubs are not a worker library implementation.
 # The other workspace members keep their stub sources from the fetch layer so
 # Cargo can still resolve the workspace without invalidating this layer when an
 # unrelated crate changes.
 COPY crates/common/ ./crates/common/
 COPY crates/api/ ./crates/api/
+COPY crates/worker/ ./crates/worker/
 COPY crates/executor/ ./crates/executor/
 COPY crates/notifier/ ./crates/notifier/
 COPY crates/supervisor/ ./crates/supervisor/
@@ -82,7 +85,8 @@ COPY migrations/ ./migrations/
 
 # Build only the Rust service binaries used by docker-compose.
 # Compiling this fixed set keeps the layer shared across api/executor/notifier/supervisor
-# builds without paying to compile worker, sensor, agent, timer, or CLI binaries.
+# builds without compiling worker/sensor/agent/timer/CLI binaries. The worker
+# library is compiled when it is a normal API dependency.
 # target cache uses sharing=locked so concurrent service builds serialize
 # writes to the shared compilation cache instead of corrupting it.
 #
