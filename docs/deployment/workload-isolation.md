@@ -73,6 +73,17 @@ stdin, including empty EOF, without adding a newline. Uncertain writes are not
 retried. Existing CLI executable verification and static invocation-name semantics
 remain part of selected invocation planning.
 
+Installed-command selection uses the fixed Runner `inspect-command-program`
+effect inside an admitted image/platform probe with the defining Pack and the
+same public Runner pin. It resolves only the selected guest/runtime PATH,
+hashes the selected read-only executable without launching it, and returns at
+most 16 KiB of `SelectedProgram` metadata. Probe invocations carry no action
+parameters or action API token. The trusted owning loop must bind this evidence
+to its source, attempt, image/platform, release, runtime configuration and
+helper before constructing the existing private exec envelope. Inspection
+output alone grants no launch authority; manager PATH/architecture discovery
+is not a substitute.
+
 ## Kubernetes effects
 
 The trusted worker uses a namespace-scoped Pod lifecycle/attach/exec identity in

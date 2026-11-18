@@ -17,9 +17,7 @@ use std::{
 fn main() {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     if arguments.len() == 1 && (arguments[0] == "--help" || arguments[0] == "-h") {
-        println!(
-            "attune-workload-runner setup|exec: private selected plan in an admitted OCI boundary"
-        );
+        println!("attune-workload-runner setup|exec|inspect-command-program: admitted OCI effects");
         return;
     }
     let result = match arguments.first().and_then(|value| value.to_str()) {
@@ -68,6 +66,7 @@ fn main() {
             .and_then(|_| attune_workload_backend::transfer_runner::terminate()),
         Some("setup") if arguments.len() == 1 => setup(),
         Some("exec") => execute(&arguments[1..]),
+        Some("inspect-command-program") => inspect_command_program(&arguments[1..]),
         _ => Err(invalid()),
     };
     if result.is_err() {
@@ -119,6 +118,53 @@ fn setup() -> std::io::Result<()> {
     Ok(())
 }
 
+const INSPECTION_OUTPUT_LIMIT: usize = 16 * 1024;
+/// Fixed helper effect in an admitted Probe. No subprocess or manager-side
+/// discovery; selected executable metadata alone grants no execution authority.
+#[cfg(unix)]
+fn inspect_command_program(arguments: &[std::ffi::OsString]) -> std::io::Result<()> {
+    boundary_guard(true)?;
+    if arguments.len() != 1 {
+        return Err(invalid());
+    }
+    let program = arguments[0].to_str().ok_or_else(invalid)?;
+    let environment =
+        ChildProcessEnvironment::from_parent(std::env::vars_os(), &[]).map_err(|_| invalid())?;
+    let (selected, body) = inspection_result(program, Path::new(PACK_ROOT), &environment)?;
+    readonly_path(&selected.path, true)?;
+    use std::io::Write;
+    std::io::stdout().lock().write_all(&body)
+}
+#[cfg(not(unix))]
+fn inspect_command_program(_: &[std::ffi::OsString]) -> std::io::Result<()> {
+    Err(invalid())
+}
+#[cfg(unix)]
+fn inspection_result(
+    program: &str,
+    release_root: &Path,
+    environment: &ChildProcessEnvironment,
+) -> std::io::Result<(attune_common::action_cli::SelectedProgram, Vec<u8>)> {
+    let launch = attune_common::pack_format::LaunchSpec::Command {
+        program: program.into(),
+        arguments: Vec::new(),
+    };
+    launch
+        .validate_action_source(
+            None,
+            attune_common::models::ParameterDelivery::None,
+            attune_common::models::ParameterFormat::Json,
+        )
+        .map_err(|_| invalid())?;
+    let selected =
+        attune_common::action_cli::select_program(&launch, release_root, None, "", environment)
+            .map_err(|_| invalid())?;
+    let body = serde_json::to_vec(&selected).map_err(|_| invalid())?;
+    if body.is_empty() || body.len() > INSPECTION_OUTPUT_LIMIT {
+        return Err(invalid());
+    }
+    Ok((selected, body))
+}
 #[cfg(unix)]
 fn execute(arguments: &[std::ffi::OsString]) -> std::io::Result<()> {
     use std::os::unix::process::CommandExt;
@@ -244,4 +290,65 @@ fn readonly_path(path: &Path, readonly: bool) -> std::io::Result<()> {
 #[cfg(all(unix, not(target_os = "linux")))]
 fn readonly_path(_: &Path, _: bool) -> std::io::Result<()> {
     Err(invalid())
+}
+
+#[cfg(all(test, unix))]
+mod inspection_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn inspection_preserves_static_alias_hashes_without_execution_and_uses_only_selected_path() {
+        let root = tempfile::tempdir().unwrap();
+        let pack = root.path().join("pack");
+        let image = root.path().join("image");
+        std::fs::create_dir(&pack).unwrap();
+        std::fs::create_dir(&image).unwrap();
+        let executable = image.join("canonical-program");
+        // Not a runnable ELF/script: successful inspection demonstrates that
+        // executable selection hashes bytes without attempting a child launch.
+        let bytes = b"owned inspection bytes, not an executable format";
+        std::fs::write(&executable, bytes).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::os::unix::fs::symlink(&executable, image.join("static-alias")).unwrap();
+        let env = ChildProcessEnvironment::from_parent(
+            [(
+                std::ffi::OsString::from("PATH"),
+                image.as_os_str().to_owned(),
+            )],
+            &[],
+        )
+        .unwrap();
+        let (selected, body) = inspection_result("static-alias", &pack, &env).unwrap();
+        assert_eq!(selected.path, executable);
+        assert_eq!(selected.invocation_name, "static-alias");
+        assert_eq!(
+            selected.sha256,
+            attune_common::workload_launch::Sha256Digest::of_bytes(bytes).as_str()
+        );
+        assert!(body.len() <= INSPECTION_OUTPUT_LIMIT);
+        assert_eq!(
+            serde_json::from_slice::<attune_common::action_cli::SelectedProgram>(&body).unwrap(),
+            selected
+        );
+        let empty = ChildProcessEnvironment::from_parent(std::iter::empty(), &[]).unwrap();
+        assert!(inspection_result("static-alias", &pack, &empty).is_err());
+        std::fs::write(pack.join("pack-program"), bytes).unwrap();
+        std::fs::set_permissions(
+            pack.join("pack-program"),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        assert!(
+            inspection_result(pack.join("pack-program").to_str().unwrap(), &pack, &env).is_err()
+        );
+        for program in [
+            "../program",
+            "relative/program",
+            "",
+            "owned-private\0program",
+        ] {
+            let error = inspection_result(program, &pack, &env).unwrap_err();
+            assert!(!error.to_string().contains("owned-private"));
+        }
+    }
 }

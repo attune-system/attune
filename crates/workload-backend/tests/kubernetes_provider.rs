@@ -581,11 +581,87 @@ async fn actual_bash_procfs_python_and_selected_environment() -> TestResult {
         f.cleanup(&resource).await?;
     }
     result?;
+    inspect_installed_command_without_manager_discovery(&f).await?;
     let secrets: Api<Secret> = Api::namespaced(f.client.clone(), &f.policy.namespace);
     match secrets.list(&ListParams::default()).await {
         Err(kube::Error::Api(e)) if e.code == 403 => {}
         _ => return Err("launcher credential unexpectedly permits Secret reads".into()),
     };
+    Ok(())
+}
+
+// These are fixed provider effects, not source admission or a cache proof. The
+// trusted caller must bind the result to the same image/platform/inputs before
+// using it. No action parameters or action API token enter the inspection Pod.
+async fn inspect_installed_command_without_manager_discovery(f: &Fixture) -> TestResult {
+    use std::io::Read;
+    let file = std::fs::File::open(required("ATTUNE_ISOLATION_TEST_RUNNER_PATH")?)?;
+    if !file.metadata()?.is_file() || file.metadata()?.len() > 64 * 1024 * 1024 {
+        return Err("owned public Runner exceeds fixture input bound".into());
+    }
+    let mut runner = Vec::new();
+    file.take(64 * 1024 * 1024 + 1).read_to_end(&mut runner)?;
+    if runner.is_empty() || runner.len() > 64 * 1024 * 1024 {
+        return Err("owned public Runner exceeds fixture input bound".into());
+    }
+    let mut probe = f.spec(Vec::new())?;
+    probe.purpose = LaunchPurpose::RuntimeProbe;
+    probe.target = LaunchTarget::RuntimeProbe {
+        admission: 1,
+        attempt: Uuid::new_v4(),
+    };
+    probe.inputs.push(f.input(
+        LaunchInputKind::Pack,
+        vec![(
+            "actions/installed.yaml",
+            b"ref: owned.installed\nrunner_type: native\nlaunch:\n  type: command\n  program: bash\nparameter_delivery: none\n".to_vec(),
+            false,
+        )],
+    )?);
+    let name = format!("linux-{}", probe.platform.native_arch());
+    probe
+        .inputs
+        .push(f.input(LaunchInputKind::Runner, vec![(&name, runner, true)])?);
+    probe.invocation.argv = vec![
+        attune_workload_backend::planning::runner_program(probe.platform),
+        "inspect-command-program".into(),
+        "bash".into(),
+    ];
+    probe.invocation.working_root = LaunchRoot::Pack;
+    probe.invocation.env = BTreeMap::from([("PATH".into(), "/bin:/usr/bin".into())]);
+    let (exit, body, err) = f.run(&probe, Vec::new()).await?;
+    if exit.exit_code != 0 || exit.oom_killed || !err.is_empty() || body.len() > 16 * 1024 {
+        return Err("installed program inspection failed or exceeded its bound".into());
+    }
+    let selected: attune_common::action_cli::SelectedProgram = serde_json::from_slice(&body)?;
+    if !selected.path.is_absolute()
+        || selected.path.starts_with(PACK_ROOT)
+        || selected.invocation_name != "bash"
+        || selected.artifact.is_some()
+        || selected.variant.is_some()
+    {
+        return Err("installed program selection changed its static contract".into());
+    }
+    Sha256Digest::parse(&selected.sha256)?;
+    // Reuse the exact admitted image and pins for execution. A source-side
+    // authority proof is deliberately not modeled in this provider fixture.
+    let mut execution = probe.clone();
+    execution.intent = Uuid::new_v4();
+    execution.purpose = LaunchPurpose::Action;
+    execution.target = f.spec(Vec::new())?.target;
+    execution.invocation.argv = attune_workload_backend::planning::cli_exec_argv(
+        execution.platform,
+        &selected,
+        &[
+            "-c".into(),
+            "test \"$0\" = bash && test -z \"${ATTUNE_API_TOKEN+x}\" && printf owned-static-argv0"
+                .into(),
+        ],
+    )?;
+    let (exit, out, err) = f.run(&execution, Vec::new()).await?;
+    if exit.exit_code != 0 || exit.oom_killed || out != b"owned-static-argv0" || !err.is_empty() {
+        return Err("inspected program did not preserve hash/static argv0 execution".into());
+    }
     Ok(())
 }
 #[tokio::test]
