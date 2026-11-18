@@ -43,7 +43,26 @@ def missing_sources(dockerfile, packages):
     return required - copied
 
 
+def missing_script_exemptions(dockerfile, rules):
+    # This repository excludes scripts/ from its build context and permits
+    # selected files explicitly. Check that policy, not a general ignore parser.
+    excluded_at = max(i for i, rule in enumerate(rules) if rule == 'scripts/')
+    included = set(rules[excluded_at + 1:])
+    scripts = set(re.findall(r'^COPY (scripts/[^\s]+) ', dockerfile, re.M))
+    return {source for source in scripts if '!' + source not in included}
+
+
 class DockerSourceGraphTests(unittest.TestCase):
+    def test_source_builder_scripts_are_explicitly_included_in_the_build_context(self):
+        rules = [line.strip() for line in (ROOT / '.dockerignore').read_text().splitlines()]
+        self.assertIn('scripts/', rules)  # Keep the broad exclusion intact.
+        source = (ROOT / 'docker/Dockerfile.agent').read_text()
+        self.assertEqual(missing_script_exemptions(source, rules), set())
+        self.assertEqual(
+            missing_script_exemptions(source, [rule for rule in rules if rule != '!scripts/package-cli-archive.py']),
+            {'scripts/package-cli-archive.py'},
+        )
+
     def test_selective_release_builders_copy_normal_local_dependency_closure(self):
         packages = manifests()
         for name in ["optimized", "agent", "mcp"]:
