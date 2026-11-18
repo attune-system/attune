@@ -21,14 +21,56 @@ import type { LaunchStatus } from "../models/LaunchStatus";
 import type { ObserveLaunchRequest } from "../models/ObserveLaunchRequest";
 import type { ReconcileLaunchesPage } from "../models/ReconcileLaunchesPage";
 import type { ReconcileLaunchesRequest } from "../models/ReconcileLaunchesRequest";
+import type { RegisteredWorkloadHost } from "../models/RegisteredWorkloadHost";
+import type { RegisterWorkloadHost } from "../models/RegisterWorkloadHost";
+import type { RenewWorkloadSession } from "../models/RenewWorkloadSession";
 import type { ReserveLaunchOutput } from "../models/ReserveLaunchOutput";
 import type { Sha256Digest } from "../models/Sha256Digest";
 import type { StopLaunchAcknowledgement } from "../models/StopLaunchAcknowledgement";
 import type { StopLaunchRequest } from "../models/StopLaunchRequest";
+import type { WorkloadSession } from "../models/WorkloadSession";
 import type { CancelablePromise } from "../core/CancelablePromise";
 import { OpenAPI } from "../core/OpenAPI";
 import { request as __request } from "../core/request";
 export class WorkloadControlService {
+  /**
+   * @returns RegisteredWorkloadHost
+   * @throws ApiError
+   */
+  public static workloadHostRegister({
+    requestBody,
+  }: {
+    requestBody: RegisterWorkloadHost;
+  }): CancelablePromise<RegisteredWorkloadHost> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/workload-hosts/register",
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        403: `Host enrollment unavailable`,
+      },
+    });
+  }
+  /**
+   * @returns WorkloadSession
+   * @throws ApiError
+   */
+  public static workloadHostSession({
+    requestBody,
+  }: {
+    requestBody: RenewWorkloadSession;
+  }): CancelablePromise<WorkloadSession> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/workload-hosts/session",
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        403: `Host session unavailable`,
+      },
+    });
+  }
   /**
    * @returns LaunchEngineBinding
    * @throws ApiError
@@ -58,6 +100,25 @@ export class WorkloadControlService {
       mediaType: "application/json",
       errors: {
         403: `Launch unavailable`,
+      },
+    });
+  }
+  /**
+   * @returns WorkloadSession
+   * @throws ApiError
+   */
+  public static workloadLaunchSession({
+    requestBody,
+  }: {
+    requestBody: RenewWorkloadSession;
+  }): CancelablePromise<WorkloadSession> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/workload-launches/session",
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        403: `Controller session unavailable`,
       },
     });
   }
