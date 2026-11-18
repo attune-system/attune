@@ -17,6 +17,8 @@ pub(crate) struct FileMutationProof {
     pub process_delivery: Option<DeliveryEffectFence>,
     pub worker: Option<(DeliveryContext, DeliveryPermit, DeliveryEffectFence)>,
     pub file_origin_budget: Option<crate::recorded_disclosure::OriginBudget>,
+    pub native_publication_expiry:
+        Option<attune_common::repositories::runtime_authority::ApprovalEffectFence>,
 }
 impl FileMutationProof {
     pub(crate) async fn commit(
@@ -42,6 +44,9 @@ impl FileMutationProof {
         if let Some(budget) = &self.file_origin_budget {
             budget.ensure_receipts_fresh()?;
         }
+        if let Some(expiry) = &self.native_publication_expiry {
+            expiry.ensure_fresh()?;
+        }
         require_credential_fresh(self.credential_deadline)
     }
     pub async fn ensure_fresh_on(&self, conn: &mut PgConnection) -> ApiResult<()> {
@@ -59,6 +64,9 @@ impl FileMutationProof {
         }
         if let Some(budget) = &self.file_origin_budget {
             budget.ensure_receipts_fresh_on(conn).await?;
+        }
+        if let Some(expiry) = &self.native_publication_expiry {
+            expiry.ensure_fresh_on(conn).await?;
         }
         self.ensure_fresh()
     }

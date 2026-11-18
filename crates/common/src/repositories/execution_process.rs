@@ -106,6 +106,43 @@ impl Record {
     }
 }
 
+/// Source protection for one existing API publication transaction. Prepare
+/// before input-origin locking; retain after all source locks and before
+/// target/provider-operation waits. This is not execution or upload authority.
+pub struct NativeFilePublication {
+    snapshot: RuntimeFence,
+    worker_deadline: DateTime<Utc>,
+}
+impl NativeFilePublication {
+    pub async fn retain(
+        self,
+        connection: &mut sqlx::PgConnection,
+    ) -> Result<super::runtime_authority::ApprovalEffectFence> {
+        let sources = self
+            .snapshot
+            .source_epochs
+            .iter()
+            .map(|epoch| (epoch.kind.as_str(), epoch.subject))
+            .collect();
+        let current = workload_source::snapshot(connection, sources).await?;
+        if current != self.snapshot.source_epochs.0 {
+            return Err(denied());
+        }
+        let admitted: Option<bool> = sqlx::query_scalar(
+            "SELECT stdin_consumed AND resource IS NOT NULL \
+             FROM execution_process_effect WHERE intent=$1 AND target=$2 AND source_epochs=$3 FOR SHARE"
+        ).bind(self.snapshot.intent).bind(&self.snapshot.target)
+            .bind(&self.snapshot.source_epochs).fetch_optional(&mut *connection).await?;
+        if admitted != Some(true) {
+            return Err(denied());
+        }
+        fresh_on(connection, Some(self.worker_deadline)).await?;
+        super::runtime_authority::ApprovalEffectFence::from_input_approval(Some(
+            self.worker_deadline,
+        ))
+    }
+}
+
 struct SourceProof {
     sources: Vec<(&'static str, i64)>,
     deadline: Option<DateTime<Utc>>,
@@ -223,13 +260,64 @@ impl ExecutionProcessRepository {
         worker: i64,
         instance: Uuid,
     ) -> Result<()> {
-        let current:Option<Uuid>=sqlx::query_scalar("SELECT (meta->>'registration_incarnation')::UUID FROM worker WHERE id=$1 AND status IN ('active','busy') AND last_heartbeat>clock_timestamp()-interval '90 seconds' FOR SHARE")
-            .bind(worker).fetch_optional(&mut **tx).await?;
-        if current != Some(instance) {
-            return Err(denied());
-        }
-        Ok(())
+        Self::worker_deadline(tx, worker, instance)
+            .await
+            .map(|_| ())
     }
+    /// Called by the existing file API among source locks. Runtime logs keep
+    /// their independent custody/handover contract.
+    pub async fn prepare_file_publication(
+        connection: &mut sqlx::PgConnection,
+        version: i64,
+        execution: i64,
+        attempt: Uuid,
+    ) -> Result<Option<NativeFilePublication>> {
+        let ordinary: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM artifact_version v JOIN artifact a ON a.id=v.artifact \
+         WHERE v.id=$1 AND v.execution=$2 AND v.file_path IS NOT NULL AND a.classification<>'runtime_log')"
+    ).bind(version).bind(execution).fetch_one(&mut *connection).await?;
+        if !ordinary {
+            return Ok(None);
+        }
+        let snapshot: Option<RuntimeFence> = sqlx::query_as(
+        "SELECT intent,target,source_epochs FROM execution_process_effect \
+         WHERE target->>'kind'='execution' AND (target->>'execution')::BIGINT=$1 AND target->>'attempt'=$2"
+    ).bind(execution).bind(attempt.to_string()).fetch_optional(&mut *connection).await?;
+        let Some(snapshot) = snapshot else {
+            return Ok(None);
+        };
+        let LaunchTarget::Execution {
+            worker,
+            worker_instance,
+            ..
+        } = snapshot.target.0
+        else {
+            return Err(denied());
+        };
+        let worker_deadline = Self::worker_deadline(connection, worker, worker_instance).await?;
+        Ok(Some(NativeFilePublication {
+            snapshot,
+            worker_deadline,
+        }))
+    }
+
+    async fn worker_deadline(
+        connection: &mut sqlx::PgConnection,
+        worker: i64,
+        instance: Uuid,
+    ) -> Result<DateTime<Utc>> {
+        sqlx::query_scalar(
+            "SELECT last_heartbeat+interval '90 seconds' FROM worker WHERE id=$1 \
+         AND (meta->>'registration_incarnation')::UUID=$2 AND status IN ('active','busy') \
+         AND last_heartbeat>clock_timestamp()-interval '90 seconds' FOR SHARE",
+        )
+        .bind(worker)
+        .bind(instance)
+        .fetch_optional(connection)
+        .await?
+        .ok_or_else(denied)
+    }
+
     /// Runtime token consumers retain this fence through their own effect
     /// transaction. Native exit/stop waits for admitted calls, then closes new
     /// allocation even while execution remains Running for log custody drain.
