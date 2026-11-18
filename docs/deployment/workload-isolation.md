@@ -31,10 +31,14 @@ requirement for the in-process path.
 
 `Config.workload` contains the operator-selected immutable runtime image,
 explicit platform, private cache root, memory/scratch limits and retained-tree
-bounds. Its closed `backend` selects Kubernetes (logical cluster, workload
+bounds. A shared public Runner ZIP pin and trusted package path are required for
+both providers. The factory installs it and returns that exact pin for the
+trusted producer's selected `/opt/attune/runner/linux-{platform}` input; it does
+not extract code from an image or invent object identities. Its closed `backend`
+selects Kubernetes (logical cluster, workload
 namespace and immutable public helper image) or Docker (fixed Unix socket,
-named volume/network, original daemon/platform binding, public helper ZIP pin
-and package path). The backend factory reads only the trusted manager's
+named volume/network, original daemon/platform binding and public probe image).
+The backend factory reads only the trusted manager's
 in-cluster Kubernetes identity; it never infers a developer context. Docker
 startup verifies the expected daemon and a positive owned named-volume sentinel
 probe. Its separate public helper image supplies that fixed probe, so a native
