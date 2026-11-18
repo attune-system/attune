@@ -24,6 +24,7 @@ import urllib.request
 import uuid
 from workload_startup_diagnostics import command as bounded_command
 from workload_proxy_diagnostics import classify as classify_proxy
+from workload_project_probes import caller_rejection, exception_category, tls_rejection
 
 ROOT = Path(__file__).resolve().parent.parent
 PROBE = "debian@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587"
@@ -258,6 +259,7 @@ def main():
         test_error = None
         cleanup_errors = []
         phase = "public-config-and-private-session"
+        subphase = "none"
         try:
             config = root / "config.json"
             run(["python3", str(ROOT / "scripts/generate-workload-controller-config.py"),
@@ -318,25 +320,17 @@ def main():
                 raise RuntimeError("actual controller/proxy startup prerequisites failed")
             phase = "tls-and-caller-denials"
             # A trust failure must happen before any HTTP/caller credential.
-            for trusted, hostname in [(False, "127.0.0.1"), (True, "wrong-owned-hostname.invalid")]:
+            for trusted, hostname, subphase in [(False, "127.0.0.1", "untrusted_ca"),
+                                               (True, "wrong-owned-hostname.invalid", "wrong_hostname")]:
                 tls = ssl.create_default_context(cafile=str(root / "ca.crt")) if trusted else ssl.create_default_context()
-                try:
-                    with socket.create_connection(("127.0.0.1", port), timeout=3) as transport:
-                        with tls.wrap_socket(transport, server_hostname=hostname):
-                            raise RuntimeError("untrusted CA/hostname unexpectedly accepted")
-                except ssl.SSLCertVerificationError:
-                    pass
+                tls_rejection(port, tls, hostname, subphase, proxy_report)
             request_body = json.dumps({"launch_id": 1, "admitted_digest": "a" * 64}).encode()
-            for headers in [{}, {"x-attune-launch-dispatch": "owned-wrong-grant"},
-                            {"Authorization": "Bearer " + PRIVATE_MARKER, "x-attune-launch-dispatch": "owned-wrong-grant"}]:
-                request = urllib.request.Request(origin + "/v1/launches/1/status", data=request_body,
-                    headers={"Content-Type": "application/json", **headers}, method="POST")
-                try:
-                    client.open(request, timeout=5)
-                    raise RuntimeError("missing/wrong caller grant was accepted")
-                except urllib.error.HTTPError as error:
-                    if error.code not in {401, 403}:
-                        raise RuntimeError("caller denial changed into an unrelated response") from error
+            for subphase, headers in [("missing_grant", {}),
+                                     ("wrong_grant", {"x-attune-launch-dispatch": "owned-wrong-grant"}),
+                                     ("broad_bearer", {"Authorization": "Bearer " + PRIVATE_MARKER, "x-attune-launch-dispatch": "owned-wrong-grant"})]:
+                caller_rejection(client, origin, request_body, headers, subphase, proxy_report)
+            phase = "authority-mounts-and-process-policy"
+            subphase = "none"
             mounts = {name: json.loads(docker("inspect", "--format", "{{json .Mounts}}", identifier, capture_output=True, text=True).stdout)
                       for name, identifier in ids.items()}
             if any(m["Destination"] in {"/var/run/docker.sock", "/var/lib/attune/launch", "/var/lib/attune/controller", "/run/secrets/attune-controller-session"}
@@ -377,7 +371,9 @@ def main():
             print("actual source controller/project TLS, confinement and caller-denial checks passed; CP effects/host loops not proved", flush=True)
         except BaseException as error:
             test_error = error
-            print(json.dumps({"phase": phase, "owned_project_diagnostics": diagnose(docker_command, owner)}), flush=True)
+            proxy_report({"phase": phase, "subphase": subphase,
+                          "exception_category": exception_category(error),
+                          "owned_project_diagnostics": diagnose(docker_command, owner)})
         finally:
             if started:
                 try:
