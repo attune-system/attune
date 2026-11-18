@@ -154,7 +154,8 @@ impl LaunchInputKind {
 }
 
 /// The body is fetched through the exact launch/pin endpoint, not a supplied
-/// URL or tar. Size/hash and expanded quotas are verified before publication.
+/// URL or tar. Body format is canonical ZIP (application/zip), with no fallback
+/// reader. Size/hash and expanded quotas are verified before publication.
 /// Runner input contains public immutable helper bytes, never credentials.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -439,6 +440,8 @@ pub enum LaunchState {
     CreateIntent,
     CreateUnknown,
     Created,
+    /// Exited normally; creation is settled but removal is still required.
+    CleanupRequired,
     StopRequired,
     Stopped,
 }
@@ -522,6 +525,8 @@ pub enum ClaimedLaunch {
     },
     Cleanup {
         manifest: Box<LaunchManifest>,
+        /// Recorded original evidence remains usable after source/image revocation.
+        status: LaunchStatus,
         lease: LaunchLease,
     },
     Stopped {
@@ -633,12 +638,14 @@ pub enum ProviderCreateSettlement {
 }
 /// DefinitiveAbsence requires settled provider ownership, not a timeout/404.
 /// Unknown creates remain StopRequired until owned resource settlement is proved.
+/// A created resource requires Wait and successful Remove before acknowledgement.
+/// Mere exit/stop is insufficient: an extant container could regain its RW stage.
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StopLaunchAcknowledgement {
     pub handle: LaunchHandle,
     pub create: ProviderCreateSettlement,
-    pub stopped_resource: Option<EngineResourceEvidence>,
+    pub removed_resource: Option<EngineResourceEvidence>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -659,10 +666,24 @@ pub struct LaunchStatus {
 }
 
 impl LaunchStatus {
+    /// Historical success survives removal, without implying live authority.
+    pub fn permits_stage_publication(&self) -> bool {
+        self.validate_shape().is_ok()
+            && self.state == LaunchState::Stopped
+            && self.stop_reason.is_none()
+            && self.exit_outcome
+                == Some(LaunchExitOutcome {
+                    exit_code: 0,
+                    oom_killed: false,
+                })
+    }
     pub fn validate_shape(&self) -> Result<()> {
         if self.request.launch_id <= 0
             || (self.runtime_state == LaunchRuntimeState::Exited) != self.exit_outcome.is_some()
             || (self.runtime_state == LaunchRuntimeState::Exited && self.resource.is_none())
+            || (self.state == LaunchState::CleanupRequired
+                && (self.runtime_state != LaunchRuntimeState::Exited || self.stop_reason.is_some()))
+            || (self.state == LaunchState::StopRequired && self.stop_reason.is_none())
             || self
                 .resource
                 .as_ref()
@@ -751,6 +772,8 @@ pub struct ReserveLaunchOutput {
     pub handle: LaunchHandle,
     pub kind: LaunchOutputKind,
     pub size_bytes: u64,
+    /// StageArchive requires successful Exited + Stopped (settled create/removal),
+    /// never CleanupRequired or StopRequired. Its body is canonical ZIP.
     /// For protected output this is the ciphertext body hash, not plaintext.
     pub sha256: Sha256Digest,
 }
@@ -793,6 +816,41 @@ mod tests {
         assert!(
             serde_json::from_value::<LaunchToken>(serde_json::json!("a".repeat(16385))).is_err()
         );
+    }
+    #[test]
+    fn stage_publication_requires_removed_success_and_preserves_cancellation() {
+        let manifest = manifest();
+        let resource = EngineResourceEvidence {
+            engine_id: manifest.engine_id,
+            resource_id: "owned-engine-resource".into(),
+            engine_name_nonce: manifest.engine_name_nonce,
+            admitted_digest: manifest.admitted_digest().unwrap(),
+            public_manifest_digest: Sha256Digest::of_bytes(b"owned-policy"),
+        };
+        let mut status = LaunchStatus {
+            request: LaunchRequest {
+                launch_id: manifest.launch_id,
+                admitted_digest: resource.admitted_digest.clone(),
+            },
+            state: LaunchState::CleanupRequired,
+            runtime_state: LaunchRuntimeState::Exited,
+            exit_outcome: Some(LaunchExitOutcome {
+                exit_code: 0,
+                oom_killed: false,
+            }),
+            resource: Some(resource),
+            stop_reason: None,
+        };
+        assert!(status.validate_shape().is_ok());
+        assert!(!status.permits_stage_publication());
+        status.state = LaunchState::Stopped;
+        assert!(status.permits_stage_publication());
+        status.stop_reason = Some(LaunchStopReason::Cancelled);
+        assert!(!status.permits_stage_publication());
+        status.state = LaunchState::StopRequired;
+        assert!(status.validate_shape().is_ok());
+        status.stop_reason = None;
+        assert!(status.validate_shape().is_err());
     }
     fn manifest() -> LaunchManifest {
         let hash = Sha256Digest::of_bytes(b"owned-public-fixture");
