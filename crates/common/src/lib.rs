@@ -36,6 +36,7 @@ pub mod inquiry_schema;
 pub mod key_access;
 pub mod key_ref;
 pub mod key_signing;
+pub mod log_custody;
 pub mod log_delivery;
 pub mod log_stream;
 pub mod metadata_cache;

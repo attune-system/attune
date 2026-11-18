@@ -437,6 +437,9 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::log_delivery_control::reconcile,
         crate::routes::workload_hosts::register,
         crate::routes::workload_hosts::session,
+        crate::routes::workload_hosts::custody::reserve,
+        crate::routes::workload_hosts::custody::prepare,
+        crate::routes::workload_hosts::custody::cancel_absent,
         crate::routes::workload_launch::session,
         crate::routes::workload_launch::engine_binding,
         crate::routes::workload_launch::resolve,
@@ -1073,17 +1076,32 @@ mod tests {
             .sum();
 
         assert_eq!(
-            path_count, 237,
+            path_count, 240,
             "Expected every mounted API path in the OpenAPI spec"
         );
 
         assert_eq!(
-            operation_count, 301,
+            operation_count, 304,
             "Expected every mounted API operation in the OpenAPI spec"
         );
 
         let spec = serde_json::to_value(&doc).unwrap();
         for (path, request, response) in [
+            (
+                "/api/v1/workload-hosts/custody/reserve",
+                "ReserveCustody",
+                "CustodyOperationAck",
+            ),
+            (
+                "/api/v1/workload-hosts/custody/prepare",
+                "PrepareCustody",
+                "CustodyOperationAck",
+            ),
+            (
+                "/api/v1/workload-hosts/custody/cancel-absent",
+                "ReserveCustody",
+                "CustodyAbsence",
+            ),
             (
                 "/api/v1/internal/log-delivery/control",
                 "ControlRequest",

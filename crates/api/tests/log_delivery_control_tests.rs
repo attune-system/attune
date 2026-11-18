@@ -194,6 +194,66 @@ struct LiveCustody {
 }
 
 impl LiveCustody {
+    async fn enroll_host(&self) -> Result<attune_common::workload_host::RegisteredWorkloadHost> {
+        use attune_common::{
+            repositories::workload_host::WorkloadHostRepository,
+            workload_host::{EnrollmentActor, RegisterWorkloadHost},
+        };
+        // A distinct manager identity remains available to prove negative
+        // settlement after the action owner's authority has been revoked.
+        let token = self
+            .ctx
+            .create_test_user(&format!("custodian-{}", Uuid::new_v4()))
+            .await?;
+        let identity =
+            attune_common::auth::jwt::validate_token(&token, &self.ctx.state.jwt_config)?
+                .sub
+                .parse::<i64>()?;
+        let engine:i64=sqlx::query_scalar("INSERT INTO workload_engine(pool,controller_url,daemon_id,platform) VALUES($1,'https://owned-controller.invalid','owned-daemon','linux/amd64') RETURNING id")
+            .bind(format!("custody-{}",Uuid::new_v4())).fetch_one(&self.ctx.pool).await?;
+        let digest = attune_common::workload_launch::Sha256Digest::of_bytes(b"owned-custody-image");
+        let image:i64=sqlx::query_scalar("INSERT INTO workload_execution_image(engine,reference,sha256,platform) VALUES($1,$2,$3,'linux/amd64') RETURNING id")
+            .bind(engine).bind(format!("sha256:{}",digest.as_str())).bind(digest.as_str()).fetch_one(&self.ctx.pool).await?;
+        let profile:i64=sqlx::query_scalar("INSERT INTO workload_host_profile(image,role,capabilities,max_concurrent) VALUES($1,'action','{}'::jsonb,1) RETURNING id")
+            .bind(image).fetch_one(&self.ctx.pool).await?;
+        let name: String = sqlx::query_scalar("SELECT name FROM worker WHERE id=$1")
+            .bind(self.worker)
+            .fetch_one(&self.ctx.pool)
+            .await?;
+        let enrollment:i64=sqlx::query_scalar("INSERT INTO workload_host_enrollment(profile,identity,worker_name,worker,expires_at) VALUES($1,$2,$3,$4,clock_timestamp()+interval '1 hour') RETURNING id")
+            .bind(profile).bind(identity).bind(name).bind(self.worker).fetch_one(&self.ctx.pool).await?;
+        Ok(WorkloadHostRepository::register(
+            &self.ctx.pool,
+            EnrollmentActor {
+                identity,
+                enrollment,
+                profile,
+                generation: 0,
+                expires_at: chrono::Utc::now().timestamp() + 1800,
+            },
+            &RegisterWorkloadHost {
+                instance: Uuid::new_v4(),
+                custody_instance: self.binding.source_instance,
+            },
+            &self.ctx.state.jwt_config,
+        )
+        .await?)
+    }
+
+    fn remote_preparation(&self) -> attune_common::log_custody::PrepareCustody {
+        attune_common::log_custody::PrepareCustody {
+            reservation: attune_common::log_custody::ReserveCustody {
+                binding: self.binding.clone(),
+                finalize_by: chrono::Utc::now() + chrono::Duration::seconds(60),
+            },
+            segments: self.preparation.segments.clone(),
+            total_bytes: self.preparation.total_bytes,
+            sha256: self.preparation.sha256.clone(),
+            truncated: self.preparation.truncated,
+            authenticated_manifest: self.preparation.authenticated_manifest.clone(),
+        }
+    }
+
     async fn new() -> Result<Self> {
         use attune_common::repositories::{
             delegated_execution::DelegatedExecutionRepository, execution::ExecutionRepository,
@@ -398,6 +458,405 @@ async fn delivery_issuance_is_scoped_and_revocation_cannot_be_restored() -> Resu
         .await?
         .unwrap();
     assert_eq!(intent.state, "revoked");
+    fixture.ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn durable_custody_cancel_ack_fences_late_remote_and_local_preparation() -> Result<()> {
+    use attune_common::{
+        log_custody::{CustodyAbsence, CustodyOperationAck, CustodyOperationState},
+        repositories::log_delivery::LogDeliveryRepository,
+    };
+    let fixture = LiveCustody::new().await?;
+    let host = fixture.enroll_host().await?;
+    let prepare = fixture.remote_preparation();
+    let reserve = "/api/v1/workload-hosts/custody/reserve";
+    let cancel = "/api/v1/workload-hosts/custody/cancel-absent";
+    fixture
+        .ctx
+        .post(reserve, &prepare.reservation, fixture.ctx.token())
+        .await?
+        .assert_status(StatusCode::FORBIDDEN);
+    let ack = fixture
+        .ctx
+        .post(
+            reserve,
+            &prepare.reservation,
+            Some(host.session.token.as_str()),
+        )
+        .await?
+        .assert_status(StatusCode::OK)
+        .json::<CustodyOperationAck>()
+        .await?;
+    assert_eq!(ack.state, CustodyOperationState::Reserved);
+    let baseline: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_secret_value")
+        .fetch_one(&fixture.ctx.pool)
+        .await?;
+    // Reserve is committed/ACKed. This actual HTTP consumer cannot enter graph
+    // admission until the cancellation's committed absence ACK is observed.
+    let (release, blocked) = tokio::sync::oneshot::channel();
+    let app = fixture.ctx.app.clone();
+    let request = Request::post("/api/v1/workload-hosts/custody/prepare")
+        .header("content-type", "application/json")
+        .header(
+            "authorization",
+            format!("Bearer {}", host.session.token.as_str()),
+        )
+        .body(Body::from(serde_json::to_vec(&prepare)?))?;
+    let mut delayed = tokio::spawn(async move {
+        blocked
+            .await
+            .map_err(|_| "delayed preparation gate closed")?;
+        app.oneshot(request)
+            .await
+            .map_err(|_| "delayed preparation transport failed")
+    });
+    let mut joined = false;
+    let exchange = async {
+        let cancellation = fixture
+            .ctx
+            .post(
+                cancel,
+                &prepare.reservation,
+                Some(host.session.token.as_str()),
+            )
+            .await?;
+        if cancellation.status() != StatusCode::OK {
+            return Err("custody cancellation did not ACK".into());
+        }
+        let ack = cancellation.json::<CustodyAbsence>().await?;
+        if !ack.absent {
+            return Err("custody cancellation did not prove absence".into());
+        }
+        release
+            .send(())
+            .map_err(|_| "delayed preparation disappeared")?;
+        let response = (&mut delayed).await;
+        joined = true;
+        if response??.status() != StatusCode::FORBIDDEN {
+            return Err("late preparation was admitted".into());
+        }
+        Ok::<_, Box<dyn std::error::Error>>(())
+    }
+    .await;
+    if !joined {
+        delayed.abort();
+        let _ = (&mut delayed).await;
+    }
+    if let Err(error) = exchange {
+        fixture.ctx.cleanup().await?;
+        return Err(error);
+    }
+    // The transitional in-process writer is gated by the same tombstone; it
+    // cannot provide a raw preparation bypass for the delayed effect.
+    let mut local = fixture.preparation.clone();
+    local.finalize_by = prepare.reservation.finalize_by;
+    let mut tx = fixture.ctx.pool.begin().await?;
+    assert!(LogDeliveryRepository::prepare(&mut tx, local)
+        .await
+        .is_err());
+    tx.rollback().await?;
+    let (state,intents,secrets):(String,i64,i64)=sqlx::query_as("SELECT state,(SELECT COUNT(*) FROM log_delivery_intent),(SELECT COUNT(*) FROM execution_secret_value) FROM log_custody_operation WHERE custody=$1")
+        .bind(fixture.binding.custody).fetch_one(&fixture.ctx.pool).await?;
+    assert_eq!(state, "cancelled");
+    assert_eq!(intents, 0);
+    assert_eq!(secrets, baseline);
+    // A new HTTP request/router consumer sees the durable fence too.
+    fixture
+        .ctx
+        .post(
+            "/api/v1/workload-hosts/custody/prepare",
+            &prepare,
+            Some(host.session.token.as_str()),
+        )
+        .await?
+        .assert_status(StatusCode::FORBIDDEN);
+    fixture.ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn durable_custody_reservation_does_not_revive_after_owner_restore() -> Result<()> {
+    use attune_common::log_custody::CustodyOperationAck;
+    let fixture = LiveCustody::new().await?;
+    let host = fixture.enroll_host().await?;
+    let prepare = fixture.remote_preparation();
+    fixture
+        .ctx
+        .post(
+            "/api/v1/workload-hosts/custody/reserve",
+            &prepare.reservation,
+            Some(host.session.token.as_str()),
+        )
+        .await?
+        .assert_status(StatusCode::OK)
+        .json::<CustodyOperationAck>()
+        .await?;
+    for frozen in [true, false] {
+        sqlx::query("UPDATE identity SET frozen=$2 WHERE id=$1")
+            .bind(fixture.ctx.user.as_ref().unwrap().id)
+            .bind(frozen)
+            .execute(&fixture.ctx.pool)
+            .await?;
+    }
+    for path in [
+        "/api/v1/workload-hosts/custody/reserve",
+        "/api/v1/workload-hosts/custody/prepare",
+    ] {
+        let body = if path.ends_with("reserve") {
+            serde_json::to_value(&prepare.reservation)?
+        } else {
+            serde_json::to_value(&prepare)?
+        };
+        fixture
+            .ctx
+            .post(path, &body, Some(host.session.token.as_str()))
+            .await?
+            .assert_status(StatusCode::FORBIDDEN);
+    }
+    let intents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM log_delivery_intent")
+        .fetch_one(&fixture.ctx.pool)
+        .await?;
+    assert_eq!(intents, 0);
+    // Restored authority can separately reserve a new exact version/custody.
+    let old = ArtifactVersionRepository::find_by_id(&fixture.ctx.pool, fixture.binding.version)
+        .await?
+        .unwrap();
+    let artifact = ArtifactRepository::find_by_id(&fixture.ctx.pool, old.artifact)
+        .await?
+        .unwrap();
+    let mut tx = fixture.ctx.pool.begin().await?;
+    let version = ArtifactVersionRepository::create_log_pending_with_conn(
+        &mut tx,
+        artifact.id,
+        &artifact.r#ref,
+        LogStreamBackend::ObjectSegments,
+        fixture.binding.execution,
+        json!({"stream":"stdout"}),
+    )
+    .await?;
+    let stream = LogStreamRepository::create_with_backend_with_conn(
+        &mut tx,
+        version.id,
+        LogStreamBackend::ObjectSegments,
+        1024,
+        100,
+    )
+    .await?;
+    ArtifactVersionRepository::protect_delegated_logs(
+        &mut tx,
+        fixture.binding.execution,
+        &[version.id],
+    )
+    .await?;
+    tx.commit().await?;
+    let mut new = prepare.reservation.clone();
+    new.binding.version = version.id;
+    new.binding.stream = stream.id;
+    new.binding.custody = Uuid::new_v4();
+    fixture
+        .ctx
+        .post(
+            "/api/v1/workload-hosts/custody/reserve",
+            &new,
+            Some(host.session.token.as_str()),
+        )
+        .await?
+        .assert_status(StatusCode::OK);
+    fixture.ctx.cleanup().await?;
+    Ok(())
+}
+
+async fn custody_waiter(pool: &sqlx::PgPool, blocker: i32) -> Result<i32> {
+    Ok(tokio::time::timeout(std::time::Duration::from_secs(10),async {
+        loop {
+            let waiter:Option<i32>=sqlx::query_scalar("SELECT pid FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)) AND pid<>pg_backend_pid() ORDER BY pid LIMIT 1")
+                .bind(blocker).fetch_optional(pool).await?;
+            if let Some(waiter)=waiter {return Ok::<_,sqlx::Error>(waiter);}
+            tokio::task::yield_now().await;
+        }
+    }).await??)
+}
+
+#[tokio::test]
+async fn durable_custody_absence_waits_for_admitted_preparation_commit() -> Result<()> {
+    use attune_common::log_custody::CustodyAbsence;
+    let fixture = LiveCustody::new().await?;
+    let host = fixture.enroll_host().await?;
+    let prepare = fixture.remote_preparation();
+    fixture
+        .ctx
+        .post(
+            "/api/v1/workload-hosts/custody/reserve",
+            &prepare.reservation,
+            Some(host.session.token.as_str()),
+        )
+        .await?
+        .assert_status(StatusCode::OK);
+    let mut barrier = fixture.ctx.pool.begin().await?;
+    let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *barrier)
+        .await?;
+    let _: i64 = sqlx::query_scalar("SELECT id FROM artifact_version WHERE id=$1 FOR UPDATE")
+        .bind(fixture.binding.version)
+        .fetch_one(&mut *barrier)
+        .await?;
+    let mut barrier = Some(barrier);
+    let mut tasks = tokio::task::JoinSet::new();
+    let app = fixture.ctx.app.clone();
+    let request = Request::post("/api/v1/workload-hosts/custody/prepare")
+        .header("content-type", "application/json")
+        .header(
+            "authorization",
+            format!("Bearer {}", host.session.token.as_str()),
+        )
+        .body(Body::from(serde_json::to_vec(&prepare)?))?;
+    tasks.spawn(
+        async move { Ok::<_, std::convert::Infallible>((false, app.oneshot(request).await?)) },
+    );
+    let exchange = async {
+        // This waiter has already acquired shared graph admission, and is
+        // blocked inside source preparation, before the operation/intent effect.
+        let preparing = custody_waiter(&fixture.ctx.pool, blocker).await?;
+        let app = fixture.ctx.app.clone();
+        let request = Request::post("/api/v1/workload-hosts/custody/cancel-absent")
+            .header("content-type", "application/json")
+            .header(
+                "authorization",
+                format!("Bearer {}", host.session.token.as_str()),
+            )
+            .body(Body::from(serde_json::to_vec(&prepare.reservation)?))?;
+        tasks.spawn(async move {
+            Ok::<_, std::convert::Infallible>((true, app.oneshot(request).await?))
+        });
+        let _cancelling = custody_waiter(&fixture.ctx.pool, preparing).await?;
+        barrier
+            .take()
+            .ok_or("source barrier lost")?
+            .commit()
+            .await?;
+        let mut prepared = false;
+        let mut absence = None;
+        while let Some(result) = tasks.join_next().await {
+            let (cancel, response) = result??;
+            if response.status() != StatusCode::OK {
+                return Err("custody race request rejected".into());
+            }
+            if cancel {
+                let body = axum::body::to_bytes(response.into_body(), 4096).await?;
+                absence = Some(serde_json::from_slice::<CustodyAbsence>(&body)?.absent);
+            } else {
+                prepared = true;
+            }
+        }
+        if !prepared || absence != Some(false) {
+            return Err("absence ACK did not retain committed custody".into());
+        }
+        Ok::<_, Box<dyn std::error::Error>>(())
+    }
+    .await;
+    // Every failure path releases its source barrier, then stops/joins request
+    // owners before closing the pool. No detached writer or timer survives.
+    if let Some(barrier) = barrier.take() {
+        barrier.rollback().await?;
+    }
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    if let Err(error) = exchange {
+        fixture.ctx.cleanup().await?;
+        return Err(error);
+    }
+    let (state,intents):(String,i64)=sqlx::query_as("SELECT state,(SELECT COUNT(*) FROM log_delivery_intent WHERE custody=$1) FROM log_custody_operation WHERE custody=$1")
+        .bind(fixture.binding.custody).fetch_one(&fixture.ctx.pool).await?;
+    assert_eq!(state, "prepared");
+    assert_eq!(intents, 1);
+    fixture.ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn custody_handover_can_cancel_retained_old_reservation_but_never_prepare_it() -> Result<()> {
+    use attune_common::{
+        log_custody::CustodyAbsence,
+        repositories::workload_host::WorkloadHostRepository,
+        workload_host::{self, EnrollmentActor, RegisterWorkloadHost},
+    };
+    let fixture = LiveCustody::new().await?;
+    let first = fixture.enroll_host().await?;
+    let request = fixture.remote_preparation();
+    fixture
+        .ctx
+        .post(
+            "/api/v1/workload-hosts/custody/reserve",
+            &request.reservation,
+            Some(first.session.token.as_str()),
+        )
+        .await?
+        .assert_status(StatusCode::OK);
+    let claims = attune_common::auth::jwt::validate_token(
+        first.session.token.as_str(),
+        &fixture.ctx.state.jwt_config,
+    )?;
+    let actor = workload_host::host_actor(&claims)?;
+    let second = WorkloadHostRepository::register(
+        &fixture.ctx.pool,
+        EnrollmentActor {
+            identity: actor.identity,
+            enrollment: actor.enrollment,
+            profile: actor.profile,
+            generation: actor.generation,
+            expires_at: chrono::Utc::now().timestamp() + 1800,
+        },
+        &RegisterWorkloadHost {
+            instance: Uuid::new_v4(),
+            custody_instance: Uuid::new_v4(),
+        },
+        &fixture.ctx.state.jwt_config,
+    )
+    .await?;
+    // An old registered manager and a replacement with the old entry cannot
+    // publish its delayed preparation. The replacement may close retained
+    // negative custody using its authenticated CURRENT delivery incarnation.
+    for token in [first.session.token.as_str(), second.session.token.as_str()] {
+        fixture
+            .ctx
+            .post(
+                "/api/v1/workload-hosts/custody/prepare",
+                &request,
+                Some(token),
+            )
+            .await?
+            .assert_status(StatusCode::FORBIDDEN);
+    }
+    let receipt = fixture
+        .ctx
+        .post(
+            "/api/v1/workload-hosts/custody/cancel-absent",
+            &request.reservation,
+            Some(second.session.token.as_str()),
+        )
+        .await?
+        .assert_status(StatusCode::OK)
+        .json::<CustodyAbsence>()
+        .await?;
+    assert!(receipt.absent);
+    let (state,intents):(String,i64)=sqlx::query_as("SELECT state,(SELECT COUNT(*) FROM log_delivery_intent WHERE custody=$1) FROM log_custody_operation WHERE custody=$1")
+        .bind(request.reservation.binding.custody).fetch_one(&fixture.ctx.pool).await?;
+    assert_eq!(state, "cancelled");
+    assert_eq!(intents, 0);
+    // A missing operation for another old incarnation does NOT prove absence.
+    let mut unreserved = request.reservation.clone();
+    unreserved.binding.custody = Uuid::new_v4();
+    fixture
+        .ctx
+        .post(
+            "/api/v1/workload-hosts/custody/cancel-absent",
+            &unreserved,
+            Some(second.session.token.as_str()),
+        )
+        .await?
+        .assert_status(StatusCode::FORBIDDEN);
     fixture.ctx.cleanup().await?;
     Ok(())
 }

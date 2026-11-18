@@ -8,7 +8,7 @@ use sqlx::{Executor, PgConnection, Postgres};
 use uuid::Uuid;
 
 const SELECT_COLUMNS:&str="id,execution,artifact_version,stream,worker,source_instance,delivery_instance,attempt,owner,custody,state,revision,segments,total_bytes,sha256,truncated,authenticated_manifest,finalize_by,failure,created,updated";
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize)]
 pub struct PrepareLogDelivery {
     pub execution: i64,
     pub version: i64,
@@ -222,6 +222,22 @@ impl LogDeliveryRepository {
     /// Call in an outer SQLx transaction after graph/source admission and before
     /// target locks. Byte custody must already be synchronized by the worker.
     pub async fn prepare(
+        transaction: &mut sqlx::Transaction<'_, Postgres>,
+        input: PrepareLogDelivery,
+    ) -> Result<LogDeliveryIntent> {
+        let version = input.version;
+        super::custody_operation::CustodyOperationRepository::reserve_and_prepare_local_in(
+            transaction,
+            input,
+        )
+        .await?;
+        Self::find(&mut **transaction, version)
+            .await?
+            .ok_or_else(denied)
+    }
+    /// Only the canonical operation repository calls this after source/epoch/
+    /// reservation validation. Never expose a second remote preparation path.
+    pub(crate) async fn prepare_reserved(
         conn: &mut PgConnection,
         mut input: PrepareLogDelivery,
     ) -> Result<LogDeliveryIntent> {

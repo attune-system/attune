@@ -40,6 +40,7 @@ pub mod cache;
 pub mod candidate_effect;
 pub mod component_configuration;
 pub mod component_lifecycle;
+pub mod custody_operation;
 pub mod dashboard;
 pub mod dashboard_iam;
 pub mod declared_input;

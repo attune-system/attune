@@ -3451,7 +3451,7 @@ pub mod log_availability {
 pub mod log_delivery {
     use super::*;
     use uuid::Uuid;
-    #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+    #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
     #[serde(deny_unknown_fields)]
     pub struct DeliverySegment {
         pub sequence: i64,

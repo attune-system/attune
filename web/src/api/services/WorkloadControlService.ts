@@ -5,6 +5,8 @@
 import type { AuthorizeLaunchIoRequest } from "../models/AuthorizeLaunchIoRequest";
 import type { CanonicalLaunchZip } from "../models/CanonicalLaunchZip";
 import type { ClaimedLaunch } from "../models/ClaimedLaunch";
+import type { CustodyAbsence } from "../models/CustodyAbsence";
+import type { CustodyOperationAck } from "../models/CustodyOperationAck";
 import type { LaunchCreateIntent } from "../models/LaunchCreateIntent";
 import type { LaunchEngineBinding } from "../models/LaunchEngineBinding";
 import type { LaunchIoAuthorization } from "../models/LaunchIoAuthorization";
@@ -19,11 +21,13 @@ import type { LaunchStageResult } from "../models/LaunchStageResult";
 import type { LaunchStartIntent } from "../models/LaunchStartIntent";
 import type { LaunchStatus } from "../models/LaunchStatus";
 import type { ObserveLaunchRequest } from "../models/ObserveLaunchRequest";
+import type { PrepareCustody } from "../models/PrepareCustody";
 import type { ReconcileLaunchesPage } from "../models/ReconcileLaunchesPage";
 import type { ReconcileLaunchesRequest } from "../models/ReconcileLaunchesRequest";
 import type { RegisteredWorkloadHost } from "../models/RegisteredWorkloadHost";
 import type { RegisterWorkloadHost } from "../models/RegisterWorkloadHost";
 import type { RenewWorkloadSession } from "../models/RenewWorkloadSession";
+import type { ReserveCustody } from "../models/ReserveCustody";
 import type { ReserveLaunchOutput } from "../models/ReserveLaunchOutput";
 import type { Sha256Digest } from "../models/Sha256Digest";
 import type { StopLaunchAcknowledgement } from "../models/StopLaunchAcknowledgement";
@@ -33,6 +37,63 @@ import type { CancelablePromise } from "../core/CancelablePromise";
 import { OpenAPI } from "../core/OpenAPI";
 import { request as __request } from "../core/request";
 export class WorkloadControlService {
+  /**
+   * @returns CustodyAbsence
+   * @throws ApiError
+   */
+  public static workloadHostCustodyCancelAbsent({
+    requestBody,
+  }: {
+    requestBody: ReserveCustody;
+  }): CancelablePromise<CustodyAbsence> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/workload-hosts/custody/cancel-absent",
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        403: `Custody unavailable`,
+      },
+    });
+  }
+  /**
+   * @returns CustodyOperationAck
+   * @throws ApiError
+   */
+  public static workloadHostCustodyPrepare({
+    requestBody,
+  }: {
+    requestBody: PrepareCustody;
+  }): CancelablePromise<CustodyOperationAck> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/workload-hosts/custody/prepare",
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        403: `Custody unavailable`,
+      },
+    });
+  }
+  /**
+   * @returns CustodyOperationAck
+   * @throws ApiError
+   */
+  public static workloadHostCustodyReserve({
+    requestBody,
+  }: {
+    requestBody: ReserveCustody;
+  }): CancelablePromise<CustodyOperationAck> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/workload-hosts/custody/reserve",
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        403: `Custody unavailable`,
+      },
+    });
+  }
   /**
    * @returns RegisteredWorkloadHost
    * @throws ApiError

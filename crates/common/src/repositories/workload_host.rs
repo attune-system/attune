@@ -232,6 +232,22 @@ impl WorkloadHostRepository {
         }
         Ok(deadline)
     }
+    pub(crate) async fn admit_custody(
+        tx: &mut Transaction<'_, Postgres>,
+        actor: HostActor,
+    ) -> Result<(DateTime<Utc>, uuid::Uuid)> {
+        let deadline = Self::admit(tx, actor).await?;
+        // admit retains this enrollment row and its registration generation.
+        // The requested spool entry may name an older source incarnation; it
+        // must never nominate the current authenticated delivery incarnation.
+        let current: Option<uuid::Uuid> =
+            sqlx::query_scalar("SELECT custody_instance FROM workload_host_enrollment WHERE id=$1")
+                .bind(actor.enrollment)
+                .fetch_one(&mut **tx)
+                .await?;
+        let current = current.filter(|value| !value.is_nil()).ok_or_else(denied)?;
+        Ok((deadline, current))
+    }
     pub async fn renew(
         pool: &PgPool,
         actor: HostActor,

@@ -17,6 +17,7 @@ use axum::{
     Extension, Json, Router,
 };
 use std::sync::Arc;
+pub mod custody;
 #[derive(Clone, Copy)]
 pub(crate) struct WorkloadHostConsumer;
 #[derive(Clone, Copy)]
@@ -53,6 +54,7 @@ pub async fn session(
 }
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
+        .merge(custody::routes())
         .route(
             "/workload-hosts/register",
             post(register).layer(Extension(WorkloadHostEnrollmentConsumer)),
