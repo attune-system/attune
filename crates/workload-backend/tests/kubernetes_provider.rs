@@ -307,6 +307,92 @@ async fn native_stdin_separate_capture_and_no_replay() -> TestResult {
     assert!(err.is_empty());
     Ok(())
 }
+
+async fn candidate_copy_and_artifact_reuse(f: &Fixture) -> TestResult {
+    let pack = f.input(
+        LaunchInputKind::Pack,
+        vec![("source.txt", b"immutable candidate source".to_vec(), false)],
+    )?;
+    let runtime = f.input(
+        LaunchInputKind::Runtime,
+        vec![(
+            "project/source.txt",
+            b"published runtime project".to_vec(),
+            false,
+        )],
+    )?;
+    // Reuse the same immutable inputs in distinct private attempts. Run these
+    // sequentially inside the existing case; do not add another concurrent Pod
+    // to the owned node's resource budget.
+    for _ in 0..2 {
+        let mut spec = f.spec(vec![
+            "/usr/bin/python3".into(),
+            "-c".into(),
+            include_str!("support/candidate_copy.py").into(),
+        ])?;
+        spec.purpose = LaunchPurpose::CandidateTest;
+        spec.target = LaunchTarget::CandidateTest {
+            install: 1,
+            test_job: 2,
+            attempt: Uuid::new_v4(),
+        };
+        spec.pack_access = PackAccess::CandidateCopy;
+        spec.inputs = vec![pack.clone(), runtime.clone()];
+        spec.invocation.working_root = LaunchRoot::Pack;
+        let (resource, exit, out, err) = f.run_retained(&spec, vec![]).await?;
+        let result: TestResult = async {
+            if exit.exit_code != 0
+                || exit.oom_killed
+                || out != b"owned-candidate-private-copy"
+                || !err.is_empty()
+            {
+                return Err("candidate private copy or published Runtime boundary failed".into());
+            }
+            let mut file = f
+                .launcher
+                .read_stopped_artifact(
+                    &spec,
+                    &resource,
+                    &attune_common::artifact_transport::ValidatedRelativePath::new(
+                        "candidate.txt",
+                    )?,
+                    64,
+                )
+                .await?
+                .ok_or("candidate selected artifact missing")?;
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut bytes)?;
+            if bytes != b"owned-candidate-artifact" {
+                return Err("candidate selected artifact changed".into());
+            }
+            Ok(())
+        }
+        .await;
+        // This effects fixture accepts the selected bytes; it does not model
+        // the owning worker's domain publication/completion receipt.
+        f.launcher.remove_stopped(&spec, &resource).await?;
+        result?;
+    }
+    for (pin, relative, expected) in [
+        (
+            &pack,
+            "source.txt",
+            b"immutable candidate source".as_slice(),
+        ),
+        (
+            &runtime,
+            "project/source.txt",
+            b"published runtime project".as_slice(),
+        ),
+    ] {
+        let mut archive = f.cache.open_input_archive(pin)?;
+        let root = f.cache.install_input(pin, &mut archive)?;
+        if std::fs::read(root.join(relative))? != expected {
+            return Err("candidate poisoned a retained immutable input".into());
+        }
+    }
+    Ok(())
+}
 #[tokio::test]
 #[ignore = "requires explicitly owned disposable Kubernetes cluster, namespace-scoped config and exact candidate images; required provider CI includes this test"]
 async fn python_setup_archive_reuse_preserves_console_script_and_absolute_link() -> TestResult {
@@ -507,6 +593,8 @@ else: raise AssertionError('published runtime writable')
     if exit.exit_code == 0 || !out.is_empty() || !denied {
         return Err("failed setup step continued or permitted publication".into());
     }
+    eprintln!("stage fixture phase=candidate-copy-and-artifact-reuse");
+    candidate_copy_and_artifact_reuse(&f).await?;
     Ok(())
 }
 #[tokio::test]

@@ -421,9 +421,109 @@ async fn native_docker_gate_procfs_capture_files_and_recovery() -> TestResult {
         return Err("empty stdin framing changed".into());
     }
     python_setup_removed_builder_and_readonly_reuse(&f).await?;
+    candidate_copy_and_artifact_reuse(&f).await?;
     node_threads_and_procfs_through_concrete_adapter().await?;
     // Keep the cache Arc in the fixture, never as a guest mount of its parent.
     drop(f.cache);
+    Ok(())
+}
+
+async fn candidate_copy_and_artifact_reuse(f: &Fixture) -> TestResult {
+    use std::io::Write;
+    let mut pins = Vec::new();
+    for (kind, path, bytes) in [
+        (
+            LaunchInputKind::Pack,
+            "source.txt",
+            b"immutable candidate source".as_slice(),
+        ),
+        (
+            LaunchInputKind::Runtime,
+            "project/source.txt",
+            b"published runtime project".as_slice(),
+        ),
+    ] {
+        let mut body = tempfile::tempfile()?;
+        {
+            let mut zip = zip::ZipWriter::new(&mut body);
+            zip.start_file(
+                path,
+                zip::write::SimpleFileOptions::default().unix_permissions(0o644),
+            )?;
+            zip.write_all(bytes)?;
+            zip.finish()?;
+        }
+        pins.push(f.input(kind, &mut body)?);
+    }
+    for _ in 0..2 {
+        let mut spec = f.spec(vec![
+            "/usr/bin/python3".into(),
+            "-c".into(),
+            include_str!("support/candidate_copy.py").into(),
+        ]);
+        spec.purpose = LaunchPurpose::CandidateTest;
+        spec.target = LaunchTarget::CandidateTest {
+            install: 1,
+            test_job: 2,
+            attempt: Uuid::new_v4(),
+        };
+        spec.pack_access = PackAccess::CandidateCopy;
+        spec.inputs = pins.clone();
+        spec.invocation.working_root = LaunchRoot::Pack;
+        let resource = f
+            .launcher
+            .prepare(&spec, ProcessCreateDisposition::CreateOnce)
+            .await?;
+        let result: TestResult = async {
+            let (exit, out, err) = run(f.launcher.start(&spec, &resource).await?, vec![]).await?;
+            if exit.exit_code != 0
+                || exit.oom_killed
+                || out != b"owned-candidate-private-copy"
+                || !err.is_empty()
+            {
+                return Err("candidate private copy or published Runtime boundary failed".into());
+            }
+            let mut file = f
+                .launcher
+                .read_stopped_artifact(
+                    &spec,
+                    &resource,
+                    &ValidatedRelativePath::new("candidate.txt")?,
+                    64,
+                )
+                .await?
+                .ok_or("candidate selected artifact missing")?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            if bytes != b"owned-candidate-artifact" {
+                return Err("candidate selected artifact changed".into());
+            }
+            Ok(())
+        }
+        .await;
+        // Byte acceptance in this effects fixture is not a domain receipt.
+        // Teardown is still awaited after any failed assertion/effect.
+        f.launcher.remove_stopped(&spec, &resource).await?;
+        result?;
+    }
+    for (pin, relative, expected) in [
+        (
+            &pins[0],
+            "source.txt",
+            b"immutable candidate source".as_slice(),
+        ),
+        (
+            &pins[1],
+            "project/source.txt",
+            b"published runtime project".as_slice(),
+        ),
+    ] {
+        let mut archive = f.cache.open_input_archive(pin)?;
+        let root = f.cache.install_input(pin, &mut archive)?;
+        if std::fs::read(root.join(relative))? != expected {
+            return Err("candidate poisoned a retained immutable input".into());
+        }
+    }
     Ok(())
 }
 
