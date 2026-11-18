@@ -422,13 +422,60 @@ async fn publication_fixture(
         quota_files: 20000,
     });
     setup.manifest.inputs = vec![pack_pin];
-    setup.invocation=LaunchInvocation { argv:vec!["/bin/sh".into(),"-ec".into(),"python3 -m venv --copies /opt/attune/runtime; /opt/attune/runtime/bin/python3 -m pip install --no-index --no-deps --no-compile /opt/attune/pack/owned_tool-1.0-py3-none-any.whl >/tmp/pip-install.log; ln -s /opt/attune/runtime/bin/owned-console /opt/attune/runtime/absolute-tool; ln -s bin/owned-console /opt/attune/runtime/relative-tool; test ! -e /var/run/docker.sock; test ! -d /opt/attune/private; ! touch /opt/attune/pack/poison 2>/dev/null".into()],env:BTreeMap::new(),working_root:LaunchRoot::Stage };
+    // Public Runner bytes only. This fixture is not CP pin/grant authority proof;
+    // it exercises the actual helper/Engine/cache/install/publication contracts.
+    let helper = std::fs::read(
+        std::env::var("ATTUNE_TEST_WORKLOAD_RUNNER_BIN").expect("actual candidate helper binary"),
+    )
+    .unwrap();
+    let platform = engine.observed_binding(policy.engine_id).await?.platform;
+    let helper_name = format!("linux-{}", platform.native_arch());
+    let mut helper_zip = tempfile::tempfile().unwrap();
+    {
+        let mut zip = zip::ZipWriter::new(&mut helper_zip);
+        zip.start_file(
+            &helper_name,
+            zip::write::SimpleFileOptions::default().unix_permissions(0o755),
+        )
+        .unwrap();
+        zip.write_all(&helper).unwrap();
+        zip.finish().unwrap();
+    }
+    helper_zip.seek(SeekFrom::Start(0)).unwrap();
+    let mut helper_body = Vec::new();
+    helper_zip.read_to_end(&mut helper_body).unwrap();
+    let helper_pin = PinnedLaunchInput {
+        pin_id: 20,
+        kind: LaunchInputKind::Runner,
+        object_id: 21,
+        object_version: "owned-public-helper".into(),
+        size_bytes: helper_body.len() as u64,
+        sha256: Sha256Digest::of_bytes(&helper_body),
+        max_expanded_bytes: helper.len() as u64,
+        max_files: 1,
+    };
+    helper_zip.seek(SeekFrom::Start(0)).unwrap();
+    cache.install_input(&helper_pin, &mut helper_zip).unwrap();
+    setup.manifest.inputs.push(helper_pin);
+    setup.manifest.timeout_ms = Some(90_000);
+    setup.invocation = LaunchInvocation {
+        argv: vec![format!("/opt/attune/runner/{helper_name}"), "setup".into()],
+        env: BTreeMap::new(),
+        working_root: LaunchRoot::Pack,
+    };
+    let private_plan = serde_json::to_vec(&serde_json::json!({"version":1,
+        "environment":{"PATH":"/usr/local/bin:/usr/bin:/bin","HOME":"/tmp","TMPDIR":"/tmp","PIP_CONFIG_FILE":"/dev/null"},
+        "steps":[
+            {"argv":["python3","-m","venv","--copies","/opt/attune/runtime"],"if_pack_file":null},
+            {"argv":["/opt/attune/runtime/bin/python3","-m","pip","install","--no-index","--no-deps","--no-compile","/opt/attune/pack/owned_tool-1.0-py3-none-any.whl"],"if_pack_file":"owned_tool-1.0-py3-none-any.whl"},
+            {"argv":["/bin/sh","-ec","ln -s /opt/attune/runtime/bin/owned-console /opt/attune/runtime/absolute-tool; ln -s bin/owned-console /opt/attune/runtime/relative-tool; test ! -e /var/run/docker.sock; test ! -d /opt/attune/private; ! touch /opt/attune/pack/poison 2>/dev/null"],"if_pack_file":null}
+        ]})).unwrap();
     cache
         .ensure_capacity(&setup.manifest, 128 * 1024 * 1024)
         .unwrap();
     cache.prepare_private(&setup.manifest).unwrap();
     assert_eq!(cache.stage_owner(&setup.manifest).unwrap(), (1000, 1000));
-    let (exit, resource, _, _) = run_captured(engine, policy, &setup).await?;
+    let (exit, resource, _, _) = run_captured(engine, policy, &setup, &private_plan).await?;
     assert_eq!(exit.exit_code, 0);
     assert!(!exit.oom_killed);
     cache.record_removal(&setup.manifest, &resource).unwrap();
@@ -471,7 +518,7 @@ async fn publication_fixture(
     let mut execute = spec(image);
     execute.manifest.inputs = vec![runtime_pin];
     execute.invocation=LaunchInvocation { argv:vec!["/bin/sh".into(),"-ec".into(),"/opt/attune/runtime/bin/owned-console; /opt/attune/runtime/absolute-tool; /opt/attune/runtime/relative-tool; ! touch /opt/attune/runtime/poison 2>/dev/null".into()],env:BTreeMap::new(),working_root:LaunchRoot::Runtime };
-    let (exit, _, out, err) = run_captured(engine, policy, &execute).await?;
+    let (exit, _, out, err) = run_captured(engine, policy, &execute, &[]).await?;
     assert_eq!(exit.exit_code, 0);
     assert!(!exit.oom_killed);
     assert!(err.is_empty());
@@ -491,6 +538,7 @@ async fn run_captured(
     engine: &DockerEngine,
     policy: &EnginePolicy,
     spec: &LaunchSpec,
+    input: &[u8],
 ) -> Result<(ExitStatus, EngineResourceEvidence, Vec<u8>, Vec<u8>)> {
     let image_env = engine
         .image_environment(&spec.manifest.image.reference)
@@ -518,6 +566,7 @@ async fn run_captured(
             stderr.clone(),
         )));
         engine.start_once(&container).await?;
+        stdin.write_all(input).await?;
         stdin.shutdown().await?;
         engine.wait(&container).await
     })

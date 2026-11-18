@@ -30,11 +30,14 @@ def docker(*args, capture=False, check=True):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--test-binary", required=True, type=Path)
+    parser.add_argument("--runner-binary", required=True, type=Path)
     args = parser.parse_args()
     binary = args.test_binary.resolve(strict=True)
-    dynamic = subprocess.run(["readelf", "-d", str(binary)], check=True, capture_output=True, text=True)
-    if "(NEEDED)" in dynamic.stdout:
-        raise SystemExit("test executable must be statically linked (build the musl test target)")
+    helper = args.runner_binary.resolve(strict=True)
+    for executable in (binary, helper):
+        dynamic = subprocess.run(["readelf", "-d", str(executable)], check=True, capture_output=True, text=True)
+        if "(NEEDED)" in dynamic.stdout:
+            raise SystemExit("controller test and public helper must be statically linked (musl)")
     owner = uuid.uuid4().hex
     volume = f"attune-controller-cache-test-{owner}"
     container = f"attune-controller-test-{owner}"
@@ -43,17 +46,21 @@ def main():
     volume_created = False
     image_created = False
     print(json.dumps({"owner": owner, "test_binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+                      "runner_binary_sha256": hashlib.sha256(helper.read_bytes()).hexdigest(),
                       "owned_volume": volume, "owned_container": container, "owned_image": image}), flush=True)
     try:
         docker("pull", PYTHON)
         with tempfile.TemporaryDirectory(prefix="attune-controller-boundary-") as directory:
             context = Path(directory)
             shutil.copyfile(binary, context / "boundary-tests")
+            shutil.copyfile(helper, context / "attune-workload-runner")
             (context / "boundary-tests").chmod(0o755)
+            (context / "attune-workload-runner").chmod(0o755)
             (context / "Dockerfile").write_text(
                 f"FROM {PYTHON} AS public-roots\nFROM {BASE}\n"
                 "COPY --from=public-roots /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt\n"
                 "COPY boundary-tests /usr/local/bin/boundary-tests\n"
+                "COPY attune-workload-runner /usr/local/bin/attune-workload-runner\n"
                 'ENTRYPOINT ["/usr/local/bin/boundary-tests"]\n'
             )
             docker("build", "--label", label, "-t", image, str(context))
@@ -72,6 +79,7 @@ def main():
             "-e", "ATTUNE_TEST_CACHE_ROOT=/var/lib/attune/launch",
             "-e", f"ATTUNE_TEST_CACHE_VOLUME={volume}",
             "-e", f"ATTUNE_TEST_PYTHON_IMAGE={PYTHON}",
+            "-e", "ATTUNE_TEST_WORKLOAD_RUNNER_BIN=/usr/local/bin/attune-workload-runner",
             image, "engine::tests::real_engine_cache_binding_and_python_publication",
             "--exact", "--ignored", "--nocapture", "--test-threads=4",
         )
