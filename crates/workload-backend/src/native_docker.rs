@@ -208,9 +208,12 @@ impl DockerLauncher {
                 .any(|(k, v)| observed.config.labels.get(k) != Some(v))
             || value["Config"]["Cmd"]
                 != serde_json::to_value(&expected.cmd).map_err(|_| EngineError::InvalidResponse)?
-            || value["Config"]["Entrypoint"]
-                != serde_json::to_value(&expected.entrypoint)
-                    .map_err(|_| EngineError::InvalidResponse)?
+            // Moby clears the request's [""] override to nil. Inspect must
+            // prove an explicitly empty entrypoint, never compare it literally
+            // to the request or accept a missing/executable entrypoint.
+            || !value["Config"].get("Entrypoint").is_some_and(|entrypoint| {
+                entrypoint.is_null() || entrypoint.as_array().is_some_and(Vec::is_empty)
+            })
         {
             return Err(EngineError::OwnershipMismatch);
         }
@@ -326,22 +329,61 @@ impl DockerLauncher {
                 .into(),
         ))
     }
-    /// Caller has committed terminal/custody state and an empty or published
-    /// ordinary-file inventory. This returns only positive Wait+Remove evidence;
-    /// private staging stays owned until its separate receipt-gated cleanup.
-    pub async fn remove_stopped(
+    async fn cached_removal(
         &self,
         spec: &ProcessSpec,
         resource: &ResourceIdentity,
-    ) -> attune_common::Result<()> {
+    ) -> attune_common::Result<Option<crate::cache::NativeRemoval>> {
+        let ResourceIdentity::Docker {
+            engine_id,
+            daemon_id,
+            container_id,
+        } = resource
+        else {
+            return Err(common_error(EngineError::OwnershipMismatch));
+        };
+        if *engine_id != self.binding.engine_id
+            || daemon_id != &self.binding.daemon_id
+            || !resource_id(container_id)
+        {
+            return Err(common_error(EngineError::OwnershipMismatch));
+        }
+        self.engine
+            .verify_engine_binding(&self.binding, &self.policy)
+            .await
+            .map_err(common_error)?;
+        let cache = self.cache.clone();
+        let spec = spec.clone();
+        let resource = resource.clone();
+        tokio::task::spawn_blocking(move || cache.native_removal(&spec, &resource))
+            .await
+            .map_err(|_| common_error(EngineError::Transport))?
+            .map_err(|_| common_error(EngineError::OwnershipMismatch))
+    }
+    /// Remove irrevocably before trusted bytes can be validated/published. An
+    /// exited Docker container alone can still be restarted by a stale Start.
+    /// Only an actually received Remove ACK is persisted; 404 is never proof.
+    async fn seal_removed(
+        &self,
+        spec: &ProcessSpec,
+        resource: &ResourceIdentity,
+        require_exited: bool,
+    ) -> attune_common::Result<crate::cache::NativeRemoval> {
+        if let Some(record) = self.cached_removal(spec, resource).await? {
+            if require_exited && !record.payload_exited {
+                return Err(common_error(EngineError::OwnershipMismatch));
+            }
+            return Ok(record);
+        }
         let (id, state) = self
             .cleanup_exact(spec, resource)
             .await
             .map_err(common_error)?;
-        if !matches!(state.as_str(), "created" | "exited") {
+        if !matches!(state.as_str(), "created" | "exited") || (require_exited && state != "exited")
+        {
             return Err(common_error(EngineError::OwnershipMismatch));
         }
-        self.wait_id(&id).await.map_err(common_error)?;
+        let outcome = self.wait_id(&id).await.map_err(common_error)?;
         let response = self
             .engine
             .control
@@ -351,13 +393,38 @@ impl DockerLauncher {
             .await
             .map_err(|_| common_error(EngineError::Transport))?;
         if response.status() != StatusCode::NO_CONTENT {
+            // Another concurrent owning read may already have persisted its
+            // positive ACK. Otherwise, including inspect/delete 404, retain.
+            if let Some(record) = self.cached_removal(spec, resource).await? {
+                if !require_exited || record.payload_exited {
+                    return Ok(record);
+                }
+            }
             return Err(common_error(EngineError::Rejected(
                 response.status().as_u16(),
             )));
         }
-        Ok(())
+        let cache = self.cache.clone();
+        let spec = spec.clone();
+        let resource = resource.clone();
+        tokio::task::spawn_blocking(move || {
+            cache.record_native_removal(&spec, &resource, outcome, state == "exited")
+        })
+        .await
+        .map_err(|_| common_error(EngineError::Transport))?
+        .map_err(|_| common_error(EngineError::OwnershipMismatch))
     }
-    /// Read the fixed private Setup stage only after exact successful Wait.
+    /// Idempotently returns durable exact Wait+Remove evidence. Private host
+    /// staging remains retained for the caller's existing publication receipts.
+    pub async fn remove_stopped(
+        &self,
+        spec: &ProcessSpec,
+        resource: &ResourceIdentity,
+    ) -> attune_common::Result<()> {
+        self.seal_removed(spec, resource, false).await.map(|_| ())
+    }
+    /// Read the retained private Setup stage only after exact successful Wait
+    /// and acknowledged removal, with durable original ownership evidence.
     /// No Engine archive API or caller pathname; existing runtime publication
     /// and its receipt remain the trusted owning loop's responsibility.
     pub async fn archive_stopped_stage(
@@ -368,15 +435,8 @@ impl DockerLauncher {
         self.cache
             .native_stage_limits(spec)
             .map_err(|_| common_error(EngineError::OwnershipMismatch))?;
-        let (id, state) = self
-            .cleanup_exact(spec, resource)
-            .await
-            .map_err(common_error)?;
-        if state != "exited" {
-            return Err(common_error(EngineError::OwnershipMismatch));
-        }
-        let outcome = self.wait_id(&id).await.map_err(common_error)?;
-        if outcome.exit_code != 0 || outcome.oom_killed {
+        let record = self.seal_removed(spec, resource, true).await?;
+        if record.outcome.exit_code != 0 || record.outcome.oom_killed {
             return Err(common_error(EngineError::OwnershipMismatch));
         }
         let cache = self.cache.clone();
@@ -394,14 +454,7 @@ impl DockerLauncher {
         remaining: u64,
     ) -> attune_common::Result<Option<std::fs::File>> {
         crate::artifact_file::permits_files(spec)?;
-        let (id, state) = self
-            .cleanup_exact(spec, resource)
-            .await
-            .map_err(common_error)?;
-        if state != "exited" {
-            return Err(common_error(EngineError::OwnershipMismatch));
-        }
-        self.wait_id(&id).await.map_err(common_error)?;
+        self.seal_removed(spec, resource, true).await?;
         let store = self.cache.clone();
         let selected = spec.clone();
         let relative = relative.clone();
@@ -660,6 +713,13 @@ impl ProcessControl for DockerControl {
             .map_err(|_| common_error(EngineError::Transport))
     }
     async fn wait(&self) -> attune_common::Result<LaunchExitOutcome> {
+        if let Ok(Some(record)) = self
+            .launcher
+            .cached_removal(&self.spec, &self.resource)
+            .await
+        {
+            return Ok(record.outcome);
+        }
         let (id, _) = self
             .launcher
             .cleanup_exact(&self.spec, &self.resource)
@@ -669,6 +729,13 @@ impl ProcessControl for DockerControl {
     }
     async fn stop(&self, _: LaunchStopReason) -> attune_common::Result<LaunchExitOutcome> {
         self.writer.lock().await.take();
+        if let Ok(Some(record)) = self
+            .launcher
+            .cached_removal(&self.spec, &self.resource)
+            .await
+        {
+            return Ok(record.outcome);
+        }
         let (id, _) = self
             .launcher
             .cleanup_exact(&self.spec, &self.resource)
@@ -729,7 +796,8 @@ mod tests {
                 files: 32,
             },
         )
-        .unwrap();
+        .unwrap()
+        .for_current_test_user();
         let bootstrap = PinnedLaunchInput {
             pin_id: 1,
             kind: LaunchInputKind::Runner,
@@ -895,16 +963,91 @@ mod tests {
         assert!(launcher.body(&spec, &[]).is_err());
     }
     #[tokio::test]
-    async fn inspection_rejects_inherited_or_executable_healthchecks_before_attach() {
-        for (health, accepted) in [
-            (Some(serde_json::json!({"Test":["NONE"]})), true),
-            (Some(serde_json::json!({"Test":[]})), false),
+    async fn provider_404_without_received_removal_ack_cannot_become_selected_file_absence() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("owned-unknown-removal.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (launcher, spec, _cache) = fixture(&socket);
+        launcher.cache.prepare_native_private(&spec).unwrap();
+        let resource = ResourceIdentity::Docker {
+            engine_id: 5,
+            daemon_id: "owned-daemon".into(),
+            container_id: "a".repeat(64),
+        };
+        let server = tokio::spawn(async move {
+            for index in 0..3 {
+                let (mut stream, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    assert!(request.len() < 8192);
+                }
+                let request = String::from_utf8(request).unwrap();
+                let first = request.lines().next().unwrap();
+                assert!(first.starts_with("GET "));
+                let (status, body) = if index < 2 {
+                    assert!(first.contains("/info "));
+                    (
+                        "200 OK",
+                        r#"{"ID":"owned-daemon","OSType":"linux","Architecture":"amd64","SecurityOptions":["name=seccomp,profile=builtin"]}"#,
+                    )
+                } else {
+                    assert!(first.contains("/containers/"));
+                    ("404 Not Found", r#"{"message":"not found"}"#)
+                };
+                stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let selected =
+            attune_common::artifact_transport::ValidatedRelativePath::new("selected/not-found")
+                .unwrap();
+        let result = launcher
+            .read_stopped_artifact(&spec, &resource, &selected, 10)
+            .await;
+        server.await.unwrap();
+        assert!(result.is_err());
+        assert!(launcher
+            .cache
+            .native_removal(&spec, &resource)
+            .unwrap()
+            .is_none());
+    }
+    #[tokio::test]
+    async fn inspection_requires_disabled_health_and_normalized_empty_entrypoint_before_attach() {
+        let disabled = Some(serde_json::json!({"Test":["NONE"]}));
+        for (health, entrypoint, accepted) in [
+            (disabled.clone(), Some(serde_json::Value::Null), true),
+            (disabled.clone(), Some(serde_json::json!([])), true),
             (
-                Some(serde_json::json!({"Test":["CMD-SHELL","owned-before-gate"]})),
+                Some(serde_json::json!({"Test":[]})),
+                Some(serde_json::Value::Null),
                 false,
             ),
-            (Some(serde_json::Value::Null), false),
-            (None, false),
+            (
+                Some(serde_json::json!({"Test":["CMD-SHELL","owned-before-gate"]})),
+                Some(serde_json::Value::Null),
+                false,
+            ),
+            (
+                Some(serde_json::Value::Null),
+                Some(serde_json::Value::Null),
+                false,
+            ),
+            (None, Some(serde_json::Value::Null), false),
+            (
+                disabled.clone(),
+                Some(serde_json::json!(["/bin/owned-image-entrypoint"])),
+                false,
+            ),
+            (disabled.clone(), Some(serde_json::json!([""])), false),
+            (disabled, None, false),
         ] {
             let root = tempfile::tempdir().unwrap();
             let socket = root.path().join("owned-health-inspection.sock");
@@ -916,6 +1059,11 @@ mod tests {
                 config["Healthcheck"] = health;
             } else {
                 config.as_object_mut().unwrap().remove("Healthcheck");
+            }
+            if let Some(entrypoint) = entrypoint {
+                config["Entrypoint"] = entrypoint;
+            } else {
+                config.as_object_mut().unwrap().remove("Entrypoint");
             }
             let observed = serde_json::json!({"Id":"b".repeat(64),
                 "Name":format!("/{}",DockerLauncher::name(&spec)),

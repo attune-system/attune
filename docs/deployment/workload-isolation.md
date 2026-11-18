@@ -50,6 +50,13 @@ to execute locally when configuration is missing. Service constructor/default
 activation and supported package/chart values remain incomplete. No published
 image pin or working default deployment is implied by this config/factory code.
 
+Configured native managers select `WorkloadSandbox::NativeEffectsRequired`
+through the existing child-environment interface. Residual guarded local
+workload/setup/install/probe calls fail before executable lookup or Bubblewrap
+startup. This is a migration deny guard, not proof that every caller migrated;
+raw unguarded command sinks still require inventory and removal before activation.
+Environment clearing and secret-bearing parent protection remain independent.
+
 A fixed Runner gate starts before pack code. Separate bounded stdout/stderr
 attach streams are established first. The trusted caller commits the existing
 input one-shot fence, then writes a bounded private invocation header and the
@@ -83,8 +90,8 @@ credential. Selected pack/runtime/Runner roots are per-Pod volumes mounted
 read-only in the payload; candidate tests receive their own writable pack copy.
 Setup alone receives a private writable runtime stage at the stable
 `/opt/attune/runtime` destination. Scratch and artifact staging are private to
-the attempt. The Pod/stage must be retained until publication receipts permit
-owned cleanup.
+the attempt. The Kubernetes Pod/stage must be retained until publication
+receipts permit owned cleanup.
 
 The attach transport requires Kubernetes stream protocol v5: stdin EOF must not
 close stdout/stderr. Missing terminal transport status is incomplete capture,
@@ -142,11 +149,16 @@ of activation acceptance; pure planner tests alone do not establish it.
 The concrete adapters' `archive_stopped_stage` effect accepts Setup only and
 requires exact resource ownership plus successful payload termination, including
 no OOM. Kubernetes reads a fixed retained ZIP from the credential-free transfer
-container; Docker reads only the owned private stage after successful Wait.
+container. Docker first observes exact Wait and a positive nonforced Remove
+acknowledgement, then persists a private, owned removal receipt binding the
+original public spec and exact daemon/container identity. Only then can it
+validate/read the retained host stage: an exited Docker container alone can be
+restarted. Receipt replay survives manager restart without inferring removal
+from 404 or timeout; invalid/missing evidence leaves publication incomplete.
 Both validate the bounded ZIP locally and preserve its exact bytes on retry.
 This file is transfer evidence, not a runtime-publication receipt. The owning
 runtime workflow must commit validation/publication before removing the retained
-Pod/container or stage. The real Python venv/pip console-script and absolute-link
+Kubernetes Pod or private host stage. The real Python venv/pip console-script and absolute-link
 Pod regression is part of the required external provider lane; compiling it does
 not establish that it passed.
 
@@ -157,8 +169,9 @@ retained artifact tree for aggregate byte/entry limits, links and special files
 before reading the selected file. An empty regular file returns a file; only
 selected-path ENOENT after a valid root/tree returns no file. Lost staging,
 invalid trees, denied provider calls and transport failures remain errors.
-Kubernetes uses a fixed bounded helper read; Docker opens only the attempt's
-owned private artifact subpath. The trusted owning workflow retains inventory,
+Kubernetes uses a fixed bounded helper read. Docker first requires its durable
+exact removal evidence, then opens only the attempt's owned private artifact
+subpath. The trusted owning workflow retains inventory,
 disclosure, publication and cleanup decisions; reading bytes is not a receipt.
 
 The staged action caller transfers these selected files through the existing
