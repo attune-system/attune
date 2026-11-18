@@ -1242,13 +1242,30 @@ pub async fn create_version_file(
     Json(request): Json<CreateFileVersionRequest>,
 ) -> ApiResult<impl IntoResponse> {
     crate::recorded_files::validate_file_descriptors(&user, &request.meta, &request.created_by)?;
+    let mut tx = state.db.begin().await?;
+    let retained = if user.claims.token_type == TokenType::Execution
+        && !crate::recorded_consumers::is_recorded(&user)?
+    {
+        Some(
+            crate::authz::AuthorizationService::retain_legacy_execution_snapshot_on(&mut tx, &user)
+                .await?,
+        )
+    } else {
+        None
+    };
     if !crate::recorded_consumers::is_recorded(&user)? {
-        let artifact = ArtifactRepository::find_by_id(&state.db, id)
+        let artifact = ArtifactRepository::find_by_id(&mut *tx, id)
             .await?
             .ok_or_else(|| ApiError::NotFound(format!("Artifact with ID {id} not found")))?;
-        authorize_artifact_action(&state, &user, Action::Update, &artifact).await?;
+        authorize_artifact_action_with_snapshot(
+            &state,
+            &user,
+            Action::Update,
+            &artifact,
+            retained.as_ref(),
+        )
+        .await?;
     }
-    let mut tx = state.db.begin().await?;
     let source = crate::recorded_files::authorize_body_mutation(
         &mut tx,
         &user,
@@ -1293,7 +1310,18 @@ pub async fn create_version_file(
         source.as_ref(),
     )
     .await?;
+    if retained.is_some() {
+        // All source locks are already retained; repeat the clock checks after
+        // target waits without releasing the admitted native Run fence.
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::retain_claims(
+            &mut tx, &user.claims,
+        ).await?;
+    }
+    if let Some(source) = &source {
+        source.ensure_fresh_on(&mut tx).await?;
+    }
     tx.commit().await?;
+    crate::recorded_files::require_credential_fresh(user.claims.exp)?;
     if let Some(source) = &source {
         source.ensure_fresh()?;
     }
@@ -1312,6 +1340,7 @@ pub async fn create_version_file(
     if let Some(source) = &source {
         source.ensure_fresh()?;
     }
+    crate::recorded_files::require_credential_fresh(user.claims.exp)?;
     let response = ArtifactVersionResponse::from(version);
 
     Ok((
@@ -3219,12 +3248,42 @@ pub async fn allocate_file_version_by_ref(
             )),
         ));
     }
-    let execution = request.execution.or_else(|| user.execution_id());
+    let execution = crate::recorded_files::execution_attribution(&user, request.execution)?;
+    let defaults = resolve_artifact_retention(
+        &state,
+        &user,
+        ArtifactRetentionDefaults {
+            artifact_ref: &artifact_ref,
+            scope: request.scope.unwrap_or(OwnerType::Action),
+            owner: request.owner.as_deref().unwrap_or_default(),
+            execution,
+            requested_policy: request.retention_policy,
+            requested_limit: request.retention_limit,
+            fallback_limit: 10,
+        },
+    )
+    .await;
+    let mut tx = state.db.begin().await?;
+    let retained = if user.claims.token_type == TokenType::Execution {
+        Some(
+            crate::authz::AuthorizationService::retain_legacy_execution_snapshot_on(&mut tx, &user)
+                .await?,
+        )
+    } else {
+        None
+    };
 
     // Upsert: find existing artifact or create a new one
-    let artifact = match ArtifactRepository::find_by_ref(&state.db, &artifact_ref).await? {
+    let artifact = match ArtifactRepository::find_by_ref(&mut *tx, &artifact_ref).await? {
         Some(existing) => {
-            authorize_artifact_action(&state, &user, Action::Update, &existing).await?;
+            authorize_artifact_action_with_snapshot(
+                &state,
+                &user,
+                Action::Update,
+                &existing,
+                retained.as_ref(),
+            )
+            .await?;
             existing
         }
         None => {
@@ -3247,28 +3306,16 @@ pub async fn allocate_file_version_by_ref(
                 .unwrap_or_else(|| default_visibility_for_artifact(a_type, classification));
             validate_runtime_log_visibility(classification, a_visibility)?;
             let owner_ref = request.owner.as_deref().unwrap_or_default();
-            let (a_retention_policy, a_retention_limit) = resolve_artifact_retention(
-                &state,
-                &user,
-                ArtifactRetentionDefaults {
-                    artifact_ref: &artifact_ref,
-                    scope: a_scope,
-                    owner: owner_ref,
-                    execution,
-                    requested_policy: request.retention_policy,
-                    requested_limit: request.retention_limit,
-                    fallback_limit: 10,
-                },
-            )
-            .await?;
+            let (a_retention_policy, a_retention_limit) = defaults?;
 
-            authorize_artifact_create(
+            authorize_artifact_create_with_snapshot(
                 &state,
                 &user,
                 &artifact_ref,
                 a_scope,
                 owner_ref,
                 a_visibility,
+                retained.as_ref(),
             )
             .await?;
 
@@ -3287,7 +3334,7 @@ pub async fn allocate_file_version_by_ref(
                 data: None,
             };
 
-            ArtifactRepository::create(&state.db, create_input).await?
+            ArtifactRepository::create(&mut *tx, create_input).await?
         }
     };
 
@@ -3303,8 +3350,8 @@ pub async fn allocate_file_version_by_ref(
         .content_type
         .unwrap_or_else(|| default_content_type_for_artifact(artifact.r#type));
 
-    let version = ArtifactVersionRepository::create_file_backed(
-        &state.db,
+    let version = ArtifactVersionRepository::create_file_backed_with_conn(
+        &mut tx,
         artifact.id,
         &artifact.r#ref,
         content_type.clone(),
@@ -3313,6 +3360,14 @@ pub async fn allocate_file_version_by_ref(
         request.created_by,
     )
     .await?;
+    if retained.is_some() {
+        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::retain_claims(
+            &mut tx, &user.claims,
+        ).await?;
+    }
+    crate::recorded_files::require_credential_fresh(user.claims.exp)?;
+    tx.commit().await?;
+    crate::recorded_files::require_credential_fresh(user.claims.exp)?;
     let file_path = version.file_path.clone().ok_or_else(|| {
         ApiError::InternalServerError(format!(
             "Allocated file-backed version {} is missing file_path",
@@ -3325,6 +3380,7 @@ pub async fn allocate_file_version_by_ref(
         .await
         .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
 
+    crate::recorded_files::require_credential_fresh(user.claims.exp)?;
     let response = ArtifactVersionResponse::from(version);
 
     Ok((
@@ -3619,6 +3675,19 @@ async fn authorize_artifact_action(
     action: Action,
     artifact: &attune_common::models::artifact::Artifact,
 ) -> Result<(), ApiError> {
+    authorize_artifact_action_with_snapshot(state, user, action, artifact, None).await
+}
+
+async fn authorize_artifact_action_with_snapshot(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    action: Action,
+    artifact: &attune_common::models::artifact::Artifact,
+    retained: Option<&(
+        crate::authz::AuthorizationSnapshot,
+        Vec<attune_common::rbac::Grant>,
+    )>,
+) -> Result<(), ApiError> {
     if crate::recorded_consumers::is_recorded(user)? {
         if action == Action::Read {
             return Box::pin(crate::recorded_consumers::artifact_read(
@@ -3668,21 +3737,27 @@ async fn authorize_artifact_action(
 
     // Public artifacts: any matching `artifacts:<action>` grant suffices.
     if artifact.visibility == ArtifactVisibility::Public {
-        return authz
-            .authorize(
-                user,
-                AuthorizationCheck {
-                    resource: Resource::Artifacts,
-                    action,
-                    context: ctx,
-                },
-            )
-            .await;
+        let check = AuthorizationCheck {
+            resource: Resource::Artifacts,
+            action,
+            context: ctx,
+        };
+        return if let Some((snapshot, _)) = retained {
+            authz.authorize_with_snapshot(user, Some(snapshot), check)
+        } else {
+            authz.authorize(user, check).await
+        };
     }
 
     // Private artifacts: load the caller's effective grants once and try the
     // permitted paths in order.
-    let grants = authz.effective_grants(user).await?;
+    let loaded;
+    let grants = if let Some((_, grants)) = retained {
+        grants.as_slice()
+    } else {
+        loaded = authz.effective_grants(user).await?;
+        loaded.as_slice()
+    };
 
     // (a) Constrained `artifacts:<action>` grant. Only grants with explicit
     //     `constraints` count — an unconstrained grant is treated as a
@@ -3735,6 +3810,30 @@ async fn authorize_artifact_create(
     scope: OwnerType,
     owner: &str,
     visibility: ArtifactVisibility,
+) -> Result<(), ApiError> {
+    authorize_artifact_create_with_snapshot(
+        state,
+        user,
+        artifact_ref,
+        scope,
+        owner,
+        visibility,
+        None,
+    )
+    .await
+}
+
+async fn authorize_artifact_create_with_snapshot(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    artifact_ref: &str,
+    scope: OwnerType,
+    owner: &str,
+    visibility: ArtifactVisibility,
+    retained: Option<&(
+        crate::authz::AuthorizationSnapshot,
+        Vec<attune_common::rbac::Grant>,
+    )>,
 ) -> Result<(), ApiError> {
     if !matches!(
         user.claims.token_type,
@@ -3802,20 +3901,26 @@ async fn authorize_artifact_create(
 
     // Public artifact creation: any matching `artifacts:create` grant suffices.
     if visibility == ArtifactVisibility::Public {
-        return authz
-            .authorize(
-                user,
-                AuthorizationCheck {
-                    resource: Resource::Artifacts,
-                    action: Action::Create,
-                    context: ctx,
-                },
-            )
-            .await;
+        let check = AuthorizationCheck {
+            resource: Resource::Artifacts,
+            action: Action::Create,
+            context: ctx,
+        };
+        return if let Some((snapshot, _)) = retained {
+            authz.authorize_with_snapshot(user, Some(snapshot), check)
+        } else {
+            authz.authorize(user, check).await
+        };
     }
 
     // Private artifact creation: same constrained-grant rule as reads.
-    let grants = authz.effective_grants(user).await?;
+    let loaded;
+    let grants = if let Some((_, grants)) = retained {
+        grants.as_slice()
+    } else {
+        loaded = authz.effective_grants(user).await?;
+        loaded.as_slice()
+    };
 
     let constrained_match = grants.iter().any(|g| {
         g.resource == Resource::Artifacts

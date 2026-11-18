@@ -115,7 +115,7 @@ pub(crate) async fn prepare_file_source(
     }))
 }
 
-fn require_credential_fresh(deadline: i64) -> ApiResult<()> {
+pub(crate) fn require_credential_fresh(deadline: i64) -> ApiResult<()> {
     if deadline <= chrono::Utc::now().timestamp() {
         return Err(ApiError::Forbidden(
             "File credential expired before effect or delivery".into(),
@@ -177,13 +177,13 @@ pub(crate) fn execution_attribution(
     user: &AuthenticatedUser,
     requested: Option<i64>,
 ) -> ApiResult<Option<i64>> {
-    if crate::recorded_consumers::is_recorded(user)? {
+    if user.claims.token_type == attune_common::auth::jwt::TokenType::Execution {
         let own = user
             .execution_id()
             .ok_or_else(|| ApiError::Forbidden("Execution attribution unavailable".into()))?;
         if requested.is_some_and(|id| id != own) {
             return Err(ApiError::Forbidden(
-                "Recorded file versions cannot impersonate another execution".into(),
+                "Runtime file versions cannot impersonate another execution".into(),
             ));
         }
         Ok(Some(own))
