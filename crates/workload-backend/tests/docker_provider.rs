@@ -41,6 +41,7 @@ struct Fixture {
     cache: Arc<CacheStore>,
     image: PinnedImage,
     platform: LaunchPlatform,
+    runner: PinnedLaunchInput,
 }
 impl Fixture {
     async fn new() -> TestResult<Self> {
@@ -140,7 +141,43 @@ impl Fixture {
             cache: configured.cache,
             image,
             platform,
+            runner: configured.runner,
         })
+    }
+    fn input(
+        &self,
+        kind: LaunchInputKind,
+        body: &mut std::fs::File,
+    ) -> TestResult<PinnedLaunchInput> {
+        use sha2::{Digest, Sha256};
+        body.rewind()?;
+        let mut hash = Sha256::new();
+        let mut bytes = [0; 65536];
+        loop {
+            let count = body.read(&mut bytes)?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&bytes[..count]);
+        }
+        body.rewind()?;
+        let pin = PinnedLaunchInput {
+            pin_id: 2,
+            object_id: 2,
+            object_version: Uuid::new_v4().to_string(),
+            kind,
+            size_bytes: body.metadata()?.len(),
+            sha256: Sha256Digest::parse(
+                hash.finalize()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
+            )?,
+            max_expanded_bytes: 64 * 1024 * 1024,
+            max_files: 4096,
+        };
+        self.cache.install_input(&pin, body)?;
+        Ok(pin)
     }
     fn spec(&self, argv: Vec<String>) -> ProcessSpec {
         ProcessSpec {
@@ -380,7 +417,127 @@ async fn native_docker_gate_procfs_capture_files_and_recovery() -> TestResult {
     if exit.exit_code != 0 || out != b"owned-empty-eof" || !err.is_empty() {
         return Err("empty stdin framing changed".into());
     }
+    python_setup_removed_builder_and_readonly_reuse(&f).await?;
     // Keep the cache Arc in the fixture, never as a guest mount of its parent.
     drop(f.cache);
+    Ok(())
+}
+
+async fn python_setup_removed_builder_and_readonly_reuse(f: &Fixture) -> TestResult {
+    use attune_workload_backend::planning::{runner_program, SetupPlan, SetupStep};
+    use std::io::Write;
+    let mut pack = tempfile::tempfile()?;
+    {
+        let mut zip = zip::ZipWriter::new(&mut pack);
+        zip.start_file(
+            "source.txt",
+            zip::write::SimpleFileOptions::default().unix_permissions(0o644),
+        )?;
+        zip.write_all(b"immutable source")?;
+        zip.finish()?;
+    }
+    let pack = f.input(LaunchInputKind::Pack, &mut pack)?;
+    let mut setup = f.spec(vec![runner_program(f.platform), "setup".into()]);
+    setup.inputs = vec![pack.clone(), f.runner.clone()];
+    setup.purpose = LaunchPurpose::Setup;
+    setup.target = LaunchTarget::Setup {
+        admission: 1,
+        attempt: Uuid::new_v4(),
+    };
+    setup.stage = Some(PrivateStage {
+        cache_key: "owned-docker-setup".into(),
+        quota_bytes: 64 * 1024 * 1024,
+        quota_files: 4096,
+    });
+    setup.invocation.working_root = LaunchRoot::Stage;
+    let program = r#"import os,subprocess,sys,zipfile
+root='/opt/attune/runtime'
+assert os.getcwd()==root+'/project'
+assert open('/opt/attune/pack/source.txt').read()=='immutable source'
+open('source.txt','w').write('private project')
+open('generated.lock','w').write('retained lock')
+assert open('/opt/attune/pack/source.txt').read()=='immutable source'
+subprocess.run([sys.executable,'-m','venv','--copies',root],check=True)
+files={
+ 'ownedtool.py':'def main():\n print("owned-docker-console")\n',
+ 'ownedtool-1.0.dist-info/METADATA':'Metadata-Version: 2.1\nName: ownedtool\nVersion: 1.0\n',
+ 'ownedtool-1.0.dist-info/WHEEL':'Wheel-Version: 1.0\nGenerator: owned-fixture\nRoot-Is-Purelib: true\nTag: py3-none-any\n',
+ 'ownedtool-1.0.dist-info/entry_points.txt':'[console_scripts]\nowned-console = ownedtool:main\n',
+}
+files['ownedtool-1.0.dist-info/RECORD']=''.join(k+',,\n' for k in files)+'ownedtool-1.0.dist-info/RECORD,,\n'
+wheel='/tmp/ownedtool-1.0-py3-none-any.whl'
+with zipfile.ZipFile(wheel,'w') as z:
+ for name,data in files.items(): z.writestr(name,data)
+subprocess.run([root+'/bin/python','-m','pip','install','--no-index','--no-deps','--disable-pip-version-check',wheel],check=True)
+os.symlink(root+'/bin/python',root+'/bin/internal-python')
+assert open(root+'/bin/owned-console').readline().strip()=='#!'+root+'/bin/python'
+"#;
+    let plan = SetupPlan {
+        version: 1,
+        environment: BTreeMap::from([("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into())]),
+        steps: vec![SetupStep {
+            argv: vec!["/usr/bin/python3".into(), "-c".into(), program.into()],
+            if_pack_file: None,
+        }],
+    };
+    let builder = f
+        .launcher
+        .prepare(&setup, ProcessCreateDisposition::CreateOnce)
+        .await?;
+    let result = async {
+        let (exit, _, _) = run(
+            f.launcher.start(&setup, &builder).await?,
+            serde_json::to_vec(&plan)?,
+        )
+        .await?;
+        if exit.exit_code != 0 || exit.oom_killed {
+            return Err("owned Docker venv/pip setup failed".into());
+        }
+        // This effect positively Waits+Removes before validation. A second
+        // exact body is replayed from retained staging, never a new build.
+        let mut archive = f.launcher.archive_stopped_stage(&setup, &builder).await?;
+        let runtime = f.input(LaunchInputKind::Runtime, &mut archive)?;
+        let mut replay = f.launcher.archive_stopped_stage(&setup, &builder).await?;
+        let repeated = f.input(LaunchInputKind::Runtime, &mut replay)?;
+        if runtime.sha256 != repeated.sha256 || runtime.size_bytes != repeated.size_bytes {
+            return Err("Docker setup archive changed on exact replay".into());
+        }
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(runtime)
+    }
+    .await;
+    // Fixture cache acceptance is not a domain runtime publication receipt.
+    // Remove is already acknowledged; final cleanup reclaims private bytes.
+    f.launcher.remove_stopped(&setup, &builder).await?;
+    let runtime = result?;
+    let mut reuse = f.spec(vec![
+        "/bin/bash".into(),
+        "-ec".into(),
+        r#"test "$PWD" = /opt/attune/runtime/project
+test "$(cat source.txt)" = 'private project'
+test "$(cat generated.lock)" = 'retained lock'
+test "$(cat /opt/attune/pack/source.txt)" = 'immutable source'
+/opt/attune/runtime/bin/owned-console
+/opt/attune/runtime/bin/internal-python -c 'import os; assert os.statvfs("/opt/attune/runtime").f_flag & os.ST_RDONLY; print("owned-docker-internal-link")'
+"#
+        .into(),
+    ]);
+    reuse.inputs = vec![pack, runtime, f.runner.clone()];
+    reuse.invocation.working_root = LaunchRoot::Runtime;
+    let resource = f
+        .launcher
+        .prepare(&reuse, ProcessCreateDisposition::CreateOnce)
+        .await?;
+    let result = async { run(f.launcher.start(&reuse, &resource).await?, vec![]).await }.await;
+    f.launcher.remove_stopped(&reuse, &resource).await?;
+    let (exit, out, err) = result?;
+    if exit.exit_code != 0
+        || exit.oom_killed
+        || out != b"owned-docker-console\nowned-docker-internal-link\n"
+        || !err.is_empty()
+    {
+        return Err(
+            "Docker runtime reuse lost console script/link/project or read-only mount".into(),
+        );
+    }
     Ok(())
 }
