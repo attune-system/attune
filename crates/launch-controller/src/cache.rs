@@ -382,14 +382,42 @@ impl CacheStore {
         }
         let _lock = self.lock()?;
         let path = self.root.join(crate::engine::stage_subpath(manifest));
+        let parent = path.parent().ok_or(CacheError::UnsafeEntry)?;
+        let destination = parent.join("publication.zip");
+        match fs::symlink_metadata(&destination) {
+            Ok(metadata) => {
+                if !metadata.is_file()
+                    || metadata.nlink() != 1
+                    || metadata.uid() != unsafe { libc::geteuid() }
+                {
+                    return Err(CacheError::UnsafeEntry);
+                }
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&destination)?;
+                let policy = archive_policy(
+                    attune_common::workload_launch::RUNTIME_ROOT,
+                    self.limits.compressed_bytes,
+                    stage.quota_bytes.min(self.limits.expanded_bytes),
+                    stage.quota_files.min(self.limits.files),
+                )?;
+                attune_common::workload_archive::validate_zip(&mut file, &policy)
+                    .map_err(|_| CacheError::UnsafeEntry)?;
+                return Ok(file);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         let entries = inspect_tree(
             &path,
             stage.quota_bytes.min(self.limits.expanded_bytes),
             stage.quota_files.min(self.limits.files),
             attune_common::workload_launch::RUNTIME_ROOT,
         )?;
+        let pending = tempfile::NamedTempFile::new_in(parent)?;
         let mut output = BoundedFile {
-            file: tempfile::tempfile_in(self.root.join("pending"))?,
+            file: pending.as_file().try_clone()?,
             limit: self.limits.compressed_bytes,
         };
         {
@@ -397,6 +425,7 @@ impl CacheStore {
             for entry in entries {
                 let name = entry.relative.to_str().ok_or(CacheError::UnsafeEntry)?;
                 let options = SimpleFileOptions::default()
+                    .last_modified_time(zip::DateTime::default())
                     .compression_method(zip::CompressionMethod::Deflated)
                     .unix_permissions(if entry.executable { 0o755 } else { 0o644 });
                 if let Some(target) = entry.link {
@@ -419,8 +448,15 @@ impl CacheStore {
             zip.finish()?;
         }
         use std::io::{Seek, SeekFrom};
+        output.file.sync_all()?;
         output.file.seek(SeekFrom::Start(0))?;
-        Ok(output.file)
+        // The exact body survives controller restart and a lost CP response.
+        // Never regenerate bytes after an output reservation was made.
+        let file = pending
+            .persist_noclobber(&destination)
+            .map_err(|error| CacheError::Io(error.error))?;
+        File::open(parent)?.sync_all()?;
+        Ok(file)
     }
 }
 struct BoundedFile {
@@ -896,5 +932,81 @@ mod tests {
             Path::new("../lib/tool")
         );
         assert_eq!(fs::read(root.path().join("bin/tool")).unwrap(), b"owned");
+    }
+    #[test]
+    fn exact_publication_body_survives_store_restart_and_pending_cannot_be_deleted() {
+        use attune_common::workload_launch::*;
+        let root = tempfile::tempdir().unwrap();
+        let limits = CacheLimits {
+            compressed_bytes: 65536,
+            expanded_bytes: 65536,
+            files: 32,
+        };
+        let store = CacheStore::open(root.path().to_path_buf(), limits).unwrap();
+        let mut spec = crate::test_support::spec(format!("sha256:{}", "a".repeat(64)));
+        spec.manifest.purpose = LaunchPurpose::Setup;
+        spec.manifest.target = LaunchTarget::Setup {
+            admission: 1,
+            attempt: uuid::Uuid::new_v4(),
+        };
+        spec.manifest.stage = Some(PrivateStage {
+            cache_key: "owned-frozen-binding".into(),
+            quota_bytes: 65536,
+            quota_files: 32,
+        });
+        store.prepare_private(&spec.manifest).unwrap();
+        let stage = root
+            .path()
+            .join(crate::engine::stage_subpath(&spec.manifest));
+        fs::write(stage.join("tool"), b"owned-runtime").unwrap();
+        let digest = spec.manifest.admitted_digest().unwrap();
+        let resource = EngineResourceEvidence {
+            engine_id: spec.manifest.engine_id,
+            resource_id: "a".repeat(64),
+            engine_name_nonce: spec.manifest.engine_name_nonce,
+            admitted_digest: digest.clone(),
+            public_manifest_digest: Sha256Digest::of_bytes(b"public-engine-policy"),
+        };
+        let mut status = LaunchStatus {
+            request: LaunchRequest {
+                launch_id: spec.manifest.launch_id,
+                admitted_digest: digest,
+            },
+            state: LaunchState::Stopped,
+            runtime_state: LaunchRuntimeState::Exited,
+            exit_outcome: Some(LaunchExitOutcome {
+                exit_code: 0,
+                oom_killed: false,
+            }),
+            publication: LaunchPublicationState::Pending,
+            capture: LaunchCaptureState::Complete,
+            capture_deadline: Some(chrono::Utc::now() + chrono::Duration::seconds(60)),
+            resource: Some(resource),
+            stop_reason: None,
+        };
+        let mut first = Vec::new();
+        store
+            .archive_settled_stage(&spec.manifest, &status)
+            .unwrap()
+            .read_to_end(&mut first)
+            .unwrap();
+        assert!(store
+            .cleanup_settled_private(&spec.manifest, &status)
+            .is_err());
+        drop(store);
+        let restarted = CacheStore::open(root.path().to_path_buf(), limits).unwrap();
+        let mut again = Vec::new();
+        restarted
+            .archive_settled_stage(&spec.manifest, &status)
+            .unwrap()
+            .read_to_end(&mut again)
+            .unwrap();
+        assert_eq!(first, again);
+        assert!(!first.is_empty());
+        status.publication = LaunchPublicationState::Published;
+        restarted
+            .cleanup_settled_private(&spec.manifest, &status)
+            .unwrap();
+        assert!(!stage.exists());
     }
 }

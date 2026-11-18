@@ -3,9 +3,9 @@
 use attune_common::workload_launch::*;
 use reqwest::{Client, Response, Url};
 use serde::{de::DeserializeOwned, Serialize};
-use std::{path::Path, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 const JSON_LIMIT: usize = 4 * 1024 * 1024;
 #[derive(Debug, Error)]
@@ -27,7 +27,7 @@ pub type Result<T> = std::result::Result<T, ControlError>;
 pub struct ControlPlane {
     client: Client,
     base: Url,
-    credential: LaunchToken,
+    credential: Arc<tokio::sync::RwLock<LaunchToken>>,
 }
 impl ControlPlane {
     pub fn new(base: Url, credential: LaunchToken) -> Result<Self> {
@@ -63,8 +63,17 @@ impl ControlPlane {
         Ok(Self {
             client,
             base,
-            credential,
+            credential: Arc::new(tokio::sync::RwLock::new(credential)),
         })
+    }
+    /// Replace only with a CP-issued, engine/pool-scoped session credential.
+    /// Clones observe the replacement; this client contains no signing key and
+    /// never invents a refresh or unlimited lifetime when renewal is unavailable.
+    pub async fn replace_credential(&self, credential: LaunchToken) {
+        *self.credential.write().await = credential;
+    }
+    async fn credential(&self) -> LaunchToken {
+        self.credential.read().await.clone()
     }
     fn url(&self, id: i64, suffix: &[&str]) -> Result<Url> {
         if id <= 0 {
@@ -77,6 +86,23 @@ impl ControlPlane {
             .extend(suffix);
         Ok(url)
     }
+    pub async fn engine_binding(&self) -> Result<LaunchEngineBinding> {
+        let mut url = self.base.clone();
+        url.set_path("/api/v1/workload-launches/engine");
+        let binding: LaunchEngineBinding = decode(
+            self.client
+                .get(url)
+                .bearer_auth(self.credential().await.as_str())
+                .send()
+                .await
+                .map_err(|_| ControlError::Transport)?,
+        )
+        .await?;
+        binding
+            .validate_shape()
+            .map_err(|_| ControlError::Response)?;
+        Ok(binding)
+    }
     async fn post<T: Serialize + ?Sized, O: DeserializeOwned>(
         &self,
         id: i64,
@@ -88,8 +114,8 @@ impl ControlPlane {
         let response = self
             .client
             .post(self.url(id, suffix)?)
-            .bearer_auth(self.credential.as_str())
-            .header(header, token.as_str())
+            .bearer_auth(self.credential().await.as_str())
+            .header(header, secret(token)?)
             .json(body)
             .send()
             .await
@@ -128,7 +154,7 @@ impl ControlPlane {
         let page: ReconcileLaunchesPage = decode(
             self.client
                 .post(url)
-                .bearer_auth(self.credential.as_str())
+                .bearer_auth(self.credential().await.as_str())
                 .json(query)
                 .send()
                 .await
@@ -168,9 +194,9 @@ impl ControlPlane {
         let authorization: LaunchIoAuthorization = decode(
             self.client
                 .post(self.url(lease.handle.launch_id, &["authorize-io"])?)
-                .bearer_auth(self.credential.as_str())
-                .header(LAUNCH_LEASE_HEADER, lease.token.as_str())
-                .header(LAUNCH_IO_HEADER, token.as_str())
+                .bearer_auth(self.credential().await.as_str())
+                .header(LAUNCH_LEASE_HEADER, secret(&lease.token)?)
+                .header(LAUNCH_IO_HEADER, secret(token)?)
                 .json(operation)
                 .send()
                 .await
@@ -181,6 +207,7 @@ impl ControlPlane {
             || authorization.channel != operation.channel
             || authorization.max_bytes < operation.bytes
             || authorization.expires_at <= chrono::Utc::now()
+            || authorization.expires_at > lease.handle.lease_deadline
         {
             return Err(ControlError::Response);
         }
@@ -420,6 +447,134 @@ impl ControlPlane {
         }
         Ok(status)
     }
+    pub async fn reserve_stage_output(
+        &self,
+        lease: &LaunchLease,
+        output: &ReserveLaunchOutput,
+    ) -> Result<LaunchOutputGrant> {
+        if lease.purpose != LaunchLeasePurpose::Publication
+            || output.handle != lease.handle
+            || output.kind != LaunchOutputKind::StageArchive
+            || output.size_bytes == 0
+        {
+            return Err(ControlError::Response);
+        }
+        let grant: LaunchOutputGrant = self.with_lease(lease, "outputs", output).await?;
+        if grant.output_id <= 0
+            || grant.expires_at <= chrono::Utc::now()
+            || grant.expires_at > lease.handle.lease_deadline
+        {
+            return Err(ControlError::Response);
+        }
+        Ok(grant)
+    }
+    /// File ownership is consumed; no pack process can modify this controller
+    /// spool body. CP validates the exact payload and repeats authority checks
+    /// after native provider I/O before returning its durable receipt.
+    pub async fn upload_stage_output(
+        &self,
+        lease: &LaunchLease,
+        output: &ReserveLaunchOutput,
+        grant: &LaunchOutputGrant,
+        body: std::fs::File,
+        compressed_ceiling: u64,
+    ) -> Result<LaunchStageResult> {
+        if lease.purpose != LaunchLeasePurpose::Publication
+            || output.handle != lease.handle
+            || output.kind != LaunchOutputKind::StageArchive
+            || grant.output_id <= 0
+            || output.size_bytes == 0
+            || output.size_bytes > compressed_ceiling
+            || body.metadata()?.len() != output.size_bytes
+        {
+            return Err(ControlError::Response);
+        }
+        let remaining = (grant.expires_at - chrono::Utc::now())
+            .to_std()
+            .map_err(|_| ControlError::Response)?;
+        if remaining.is_zero() || grant.expires_at > lease.handle.lease_deadline {
+            return Err(ControlError::Response);
+        }
+        let mut file = tokio::fs::File::from_std(body);
+        file.seek(std::io::SeekFrom::Start(0)).await?;
+        let deadline = grant.expires_at;
+        let stream = futures::stream::try_unfold(
+            (file, output.size_bytes),
+            move |(mut file, remaining)| async move {
+                if remaining == 0 {
+                    return Ok(None);
+                }
+                let mut bytes = vec![0u8; remaining.min(65536) as usize];
+                let count = file.read(&mut bytes).await?;
+                if chrono::Utc::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "publication grant expired",
+                    ));
+                }
+                if count == 0 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "publication body shortened",
+                    ))
+                } else {
+                    bytes.truncate(count);
+                    Ok(Some((bytes, (file, remaining - count as u64))))
+                }
+            },
+        );
+        let mut url = self.url(
+            lease.handle.launch_id,
+            &["outputs", &grant.output_id.to_string(), "body"],
+        )?;
+        url.query_pairs_mut()
+            .append_pair("admitted_digest", lease.handle.admitted_digest.as_str());
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(self.credential().await.as_str())
+            .header(LAUNCH_LEASE_HEADER, secret(&lease.token)?)
+            .header(LAUNCH_OUTPUT_HEADER, secret(&grant.token)?)
+            .header(reqwest::header::CONTENT_TYPE, LAUNCH_ARCHIVE_CONTENT_TYPE)
+            .header(reqwest::header::CONTENT_LENGTH, output.size_bytes)
+            .timeout(remaining.min(Duration::from_secs(30)))
+            .body(reqwest::Body::wrap_stream(stream))
+            .send()
+            .await
+            .map_err(|_| ControlError::Transport)?;
+        let receipt: LaunchStageResult = decode(response).await?;
+        if receipt.output_id != grant.output_id
+            || receipt.object_id <= 0
+            || receipt.validation_receipt <= 0
+            || receipt.object_version.is_empty()
+            || receipt.size_bytes != output.size_bytes
+            || receipt.sha256 != output.sha256
+        {
+            return Err(ControlError::Response);
+        }
+        Ok(receipt)
+    }
+    /// Historical receipt only. A CP denial/timeout is never absence/not-ready.
+    pub async fn stage_result(&self, launch: &ReservedLaunch) -> Result<LaunchStageResult> {
+        let receipt: LaunchStageResult = self
+            .post(
+                launch.request.launch_id,
+                &["stage-result"],
+                LAUNCH_DISPATCH_HEADER,
+                &launch.dispatch_token,
+                &launch.request,
+            )
+            .await?;
+        if receipt.output_id <= 0
+            || receipt.object_id <= 0
+            || receipt.validation_receipt <= 0
+            || receipt.object_version.is_empty()
+            || receipt.size_bytes == 0
+        {
+            return Err(ControlError::Response);
+        }
+        Ok(receipt)
+    }
     async fn with_lease<T: Serialize + ?Sized, O: DeserializeOwned>(
         &self,
         lease: &LaunchLease,
@@ -457,8 +612,8 @@ impl ControlPlane {
                 lease.handle.launch_id,
                 &["inputs", &input.pin_id.to_string(), "body"],
             )?)
-            .bearer_auth(self.credential.as_str())
-            .header(LAUNCH_LEASE_HEADER, lease.token.as_str())
+            .bearer_auth(self.credential().await.as_str())
+            .header(LAUNCH_LEASE_HEADER, secret(&lease.token)?)
             .json(&LaunchLeaseRequest {
                 handle: lease.handle.clone(),
             })
@@ -536,6 +691,12 @@ fn validate_status(status: &LaunchStatus, expected: &LaunchRequest) -> Result<()
     }
     Ok(())
 }
+fn secret(token: &LaunchToken) -> Result<reqwest::header::HeaderValue> {
+    let mut value = reqwest::header::HeaderValue::from_str(token.as_str())
+        .map_err(|_| ControlError::Configuration)?;
+    value.set_sensitive(true);
+    Ok(value)
+}
 async fn decode<T: DeserializeOwned>(mut response: Response) -> Result<T> {
     if !response.status().is_success() {
         return Err(ControlError::Rejected(response.status().as_u16()));
@@ -558,4 +719,60 @@ async fn decode<T: DeserializeOwned>(mut response: Response) -> Result<T> {
         bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes).map_err(|_| ControlError::Response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn cloned_clients_use_replaced_cp_credential_without_local_signing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for credential in ["owned-controller-first", "owned-controller-renewed"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0; 4096];
+                while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                    assert!(bytes.len() < 16384);
+                }
+                let headers = String::from_utf8(bytes).unwrap();
+                assert!(headers.starts_with("GET /api/v1/workload-launches/engine HTTP/1.1"));
+                assert!(headers
+                    .to_ascii_lowercase()
+                    .contains(&format!("authorization: bearer {credential}")));
+                assert!(!headers.contains("x-attune-launch-dispatch"));
+                assert!(!headers.contains("x-attune-launch-lease"));
+                let body = serde_json::to_vec(&LaunchEngineBinding {
+                    engine_id: 5,
+                    daemon_id: "owned-daemon".into(),
+                    platform: LaunchPlatform::LinuxAmd64,
+                })
+                .unwrap();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        let client = ControlPlane::new(
+            Url::parse(&format!("http://{address}/")).unwrap(),
+            LaunchToken::new("owned-controller-first".into()).unwrap(),
+        )
+        .unwrap();
+        let result = async {
+            assert_eq!(client.engine_binding().await?.engine_id, 5);
+            let other = client.clone();
+            other
+                .replace_credential(LaunchToken::new("owned-controller-renewed".into()).unwrap())
+                .await;
+            assert_eq!(client.engine_binding().await?.daemon_id, "owned-daemon");
+            Ok::<_, ControlError>(())
+        }
+        .await;
+        server.await.unwrap();
+        result.unwrap();
+    }
 }

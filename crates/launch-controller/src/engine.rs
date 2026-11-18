@@ -2,8 +2,8 @@
 //! Cache mounts are generated from fixed controller configuration + admitted
 //! immutable identifiers. No web request may deserialize an EngineCreateBody.
 use attune_common::workload_launch::{
-    EngineResourceEvidence, LaunchInputKind, LaunchManifest, LaunchSpec, PackAccess, Sha256Digest,
-    RUNTIME_ROOT, SCRATCH_ROOT,
+    EngineResourceEvidence, LaunchEngineBinding, LaunchInputKind, LaunchManifest, LaunchPlatform,
+    LaunchSpec, PackAccess, PinnedImage, Sha256Digest, RUNTIME_ROOT, SCRATCH_ROOT,
 };
 use reqwest::{header, Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
@@ -467,28 +467,15 @@ impl DockerEngine {
             .await
             .map_err(|_| EngineError::Transport)?;
         let value: ImageInspection = decode(response).await?;
-        if value
-            .config
-            .volumes
-            .is_some_and(|volumes| !volumes.is_empty())
-        {
-            return Err(EngineError::Policy(
-                "image-declared anonymous volumes are unsupported",
-            ));
-        }
-        Ok(value.config.env.unwrap_or_default())
+        image_environment(value)
     }
     /// Require the daemon's ordinary builtin seccomp boundary. The controller
     /// never installs an unconfined profile or relaxes parent proc masks.
     pub async fn verify_daemon_policy(&self) -> Result<()> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "PascalCase")]
-        struct Info {
-            security_options: Vec<String>,
-            #[serde(rename = "OSType")]
-            os_type: String,
-        }
-        let info: Info = decode(
+        self.daemon_info().await.map(|_| ())
+    }
+    async fn daemon_info(&self) -> Result<DaemonInformation> {
+        let info: DaemonInformation = decode(
             self.control
                 .get(Self::url(&["info"]))
                 .send()
@@ -505,6 +492,130 @@ impl DockerEngine {
             return Err(EngineError::Policy(
                 "Linux Engine with builtin seccomp is required",
             ));
+        }
+        Ok(info)
+    }
+    /// Public observation for trusted enrollment diagnostics. It conveys no
+    /// launch authority. Production startup compares the authenticated CP value.
+    pub async fn observed_binding(&self, engine_id: i64) -> Result<LaunchEngineBinding> {
+        let info = self.daemon_info().await?;
+        let binding = LaunchEngineBinding {
+            engine_id,
+            daemon_id: info.id,
+            platform: linux_platform(&info.os_type, &info.architecture)?,
+        };
+        binding
+            .validate_shape()
+            .map_err(|_| EngineError::InvalidResponse)?;
+        Ok(binding)
+    }
+    pub async fn verify_engine_binding(
+        &self,
+        expected: &LaunchEngineBinding,
+        policy: &EnginePolicy,
+    ) -> Result<()> {
+        expected
+            .validate_shape()
+            .map_err(|_| EngineError::Policy("invalid admitted engine binding"))?;
+        if expected.engine_id != policy.engine_id
+            || self.observed_binding(policy.engine_id).await? != *expected
+        {
+            return Err(EngineError::Policy(
+                "Docker daemon or native platform differs from admitted engine identity",
+            ));
+        }
+        Ok(())
+    }
+    /// Inspection is tied to the immutable registry binding, not the CP host's
+    /// architecture. Multiarch index equality alone never proves runtime reuse.
+    pub async fn image_environment_for_binding(
+        &self,
+        binding: &LaunchEngineBinding,
+        policy: &EnginePolicy,
+        image: &PinnedImage,
+    ) -> Result<Vec<String>> {
+        self.verify_engine_binding(binding, policy).await?;
+        let hash_ref = format!("sha256:{}", image.sha256.as_str());
+        if !policy.allowed_images.contains(&image.reference)
+            || (image.reference != hash_ref && !image.reference.ends_with(&format!("@{hash_ref}")))
+        {
+            return Err(EngineError::Policy(
+                "immutable image exceeds operator ceiling",
+            ));
+        }
+        let mut response = self
+            .control
+            .get(Self::url(&["images", &image.reference, "json"]))
+            .send()
+            .await
+            .map_err(|_| EngineError::Transport)?;
+        if response.status() == StatusCode::NOT_FOUND {
+            if image.reference.starts_with("sha256:") {
+                return Err(EngineError::Policy(
+                    "local immutable image ID is unavailable; no tag fallback",
+                ));
+            }
+            self.pull_immutable_image(binding, image).await?;
+            self.verify_engine_binding(binding, policy).await?;
+            response = self
+                .control
+                .get(Self::url(&["images", &image.reference, "json"]))
+                .send()
+                .await
+                .map_err(|_| EngineError::Transport)?;
+        }
+        let inspected: ImageInspection = decode(response).await?;
+        if linux_platform(&inspected.os, &inspected.architecture)? != binding.platform
+            || (image.reference.starts_with("sha256:") && inspected.id != image.reference)
+        {
+            return Err(EngineError::Policy(
+                "image does not match admitted native platform or immutable identity",
+            ));
+        }
+        image_environment(inspected)
+    }
+    async fn pull_immutable_image(
+        &self,
+        binding: &LaunchEngineBinding,
+        image: &PinnedImage,
+    ) -> Result<()> {
+        let mut url = Self::url(&["images", "create"]);
+        url.query_pairs_mut()
+            .append_pair("fromImage", &image.reference)
+            .append_pair("platform", binding.platform.as_str());
+        let mut response = self
+            .stream
+            .post(url)
+            .timeout(Duration::from_secs(300))
+            .send()
+            .await
+            .map_err(|_| EngineError::Transport)?;
+        if !response.status().is_success() {
+            return Err(EngineError::Rejected(response.status().as_u16()));
+        }
+        let mut pending = Vec::new();
+        let mut total = 0usize;
+        while let Some(chunk) = response.chunk().await.map_err(|_| EngineError::Transport)? {
+            total = total.saturating_add(chunk.len());
+            if total > 32 * 1024 * 1024 {
+                return Err(EngineError::InvalidResponse);
+            }
+            pending.extend_from_slice(&chunk);
+            while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+                if end > 65536 {
+                    return Err(EngineError::InvalidResponse);
+                }
+                if end > 0 {
+                    validate_pull_record(&pending[..end])?;
+                }
+                pending.drain(..=end);
+            }
+            if pending.len() > 65536 {
+                return Err(EngineError::InvalidResponse);
+            }
+        }
+        if !pending.is_empty() {
+            validate_pull_record(&pending)?;
         }
         Ok(())
     }
@@ -834,6 +945,71 @@ impl DockerEngine {
             name: manifest.engine_name(),
         }))
     }
+    /// Cleanup can settle an unrecorded late create without private invocation
+    /// or the current image allowlist. Selection is always the admitted nonce,
+    /// with exact ownership labels; never a caller-provided container selector.
+    /// None is deliberately not proof of absence after an unknown create.
+    pub async fn remove_admitted_resource(
+        &self,
+        manifest: &LaunchManifest,
+        original: Option<&EngineResourceEvidence>,
+    ) -> Result<Option<EngineResourceEvidence>> {
+        let container = if let Some(original) = original {
+            self.reconcile_cleanup(manifest, original).await?
+        } else {
+            let digest = manifest
+                .admitted_digest()
+                .map_err(|_| EngineError::OwnershipMismatch)?;
+            let response = self
+                .control
+                .get(Self::url(&["containers", &manifest.engine_name(), "json"]))
+                .send()
+                .await
+                .map_err(|_| EngineError::Transport)?;
+            if response.status() == StatusCode::NOT_FOUND {
+                return Ok(None);
+            }
+            let value: ContainerInspection = decode(response).await?;
+            let labels = BTreeMap::from([
+                (OWNER_LABEL.into(), manifest.engine_id.to_string()),
+                (LAUNCH_LABEL.into(), manifest.launch_id.to_string()),
+                (NONCE_LABEL.into(), manifest.engine_name_nonce.to_string()),
+                (DIGEST_LABEL.into(), digest.as_str().to_string()),
+            ]);
+            if !resource_id(&value.id)
+                || value.name != format!("/{}", manifest.engine_name())
+                || !labels
+                    .iter()
+                    .all(|(key, expected)| value.config.labels.get(key) == Some(expected))
+            {
+                return Err(EngineError::OwnershipMismatch);
+            }
+            let public = PublicEngineManifest {
+                image: value.config.image,
+                user: value.config.user,
+                labels,
+                host: value.host_config,
+            };
+            Some(OwnedContainer {
+                name: manifest.engine_name(),
+                evidence: EngineResourceEvidence {
+                    engine_id: manifest.engine_id,
+                    resource_id: value.id,
+                    engine_name_nonce: manifest.engine_name_nonce,
+                    admitted_digest: digest,
+                    public_manifest_digest: Sha256Digest::of_bytes(
+                        &serde_json::to_vec(&public).map_err(|_| EngineError::InvalidResponse)?,
+                    ),
+                },
+            })
+        };
+        let Some(container) = container else {
+            return Ok(None);
+        };
+        self.stop_and_wait(&container, 1).await?;
+        self.remove_stopped(&container).await?;
+        Ok(Some(container.evidence))
+    }
     pub async fn start_once(&self, container: &OwnedContainer) -> Result<()> {
         let response = self
             .control
@@ -991,7 +1167,53 @@ async fn decode<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct ImageInspection {
+    id: String,
+    os: String,
+    architecture: String,
     config: ImageConfig,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DaemonInformation {
+    #[serde(rename = "ID")]
+    id: String,
+    #[serde(rename = "OSType")]
+    os_type: String,
+    architecture: String,
+    security_options: Vec<String>,
+}
+fn linux_platform(os: &str, architecture: &str) -> Result<LaunchPlatform> {
+    match (os, architecture) {
+        ("linux", "amd64" | "x86_64") => Ok(LaunchPlatform::LinuxAmd64),
+        ("linux", "arm64" | "aarch64") => Ok(LaunchPlatform::LinuxArm64),
+        _ => Err(EngineError::Policy(
+            "unsupported native engine/image platform",
+        )),
+    }
+}
+fn image_environment(value: ImageInspection) -> Result<Vec<String>> {
+    if value
+        .config
+        .volumes
+        .is_some_and(|volumes| !volumes.is_empty())
+    {
+        return Err(EngineError::Policy(
+            "image-declared anonymous volumes are unsupported",
+        ));
+    }
+    Ok(value.config.env.unwrap_or_default())
+}
+fn validate_pull_record(bytes: &[u8]) -> Result<()> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| EngineError::InvalidResponse)?;
+    if value.get("error").is_some()
+        || value
+            .get("errorDetail")
+            .is_some_and(|value| !value.is_null())
+    {
+        return Err(EngineError::Policy("immutable platform image pull failed"));
+    }
+    Ok(())
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]

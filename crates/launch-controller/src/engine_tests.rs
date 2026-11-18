@@ -97,6 +97,66 @@ async fn bounded_demultiplexer_separates_channels_and_rejects_bad_frames() {
     .is_err());
 }
 
+#[tokio::test]
+async fn daemon_replacement_and_wrong_platform_image_are_rejected_before_create() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("owned-engine.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let image = format!("sha256:{}", "a".repeat(64));
+    let image_id = image.clone();
+    let server = tokio::spawn(async move {
+        for index in 0..3 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            while !request.windows(4).any(|value| value == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+                assert!(request.len() < 16384);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("GET "));
+            assert!(!request.contains("/containers/"));
+            let response = if index < 2 {
+                assert!(request.starts_with("GET /v1.47/info "));
+                serde_json::json!({"ID":if index==0 {"replacement-daemon"} else {"admitted-daemon"},"OSType":"linux","Architecture":"x86_64","SecurityOptions":["name=seccomp,profile=builtin"]})
+            } else {
+                assert!(request.contains("/images/"));
+                serde_json::json!({"Id":image_id,"Os":"linux","Architecture":"arm64","Config":{"Env":["LEAK=owned-image-secret"],"Volumes":null}})
+            };
+            let body = serde_json::to_vec(&response).unwrap();
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+    });
+    let engine = DockerEngine::connect(&socket).unwrap();
+    let policy = policy(image.clone(), "owned-network".into());
+    let binding = LaunchEngineBinding {
+        engine_id: 5,
+        daemon_id: "admitted-daemon".into(),
+        platform: LaunchPlatform::LinuxAmd64,
+    };
+    assert!(engine
+        .verify_engine_binding(&binding, &policy)
+        .await
+        .is_err());
+    let rejected = engine
+        .image_environment_for_binding(
+            &binding,
+            &policy,
+            &PinnedImage {
+                reference: image,
+                sha256: Sha256Digest::parse(&"a".repeat(64)).unwrap(),
+            },
+        )
+        .await;
+    server.await.unwrap();
+    assert!(rejected.is_err());
+    assert!(!format!("{:?}", rejected.err().unwrap()).contains("owned-image-secret"));
+}
+
 /// External Engine test, never silently skipped when explicitly selected. It
 /// creates/removes only its UUID network and CP-nonce-derived own container.
 #[tokio::test]
@@ -137,8 +197,25 @@ async fn real_engine_full_proc_and_readonly_policy() {
     );
     let policy = policy(image, network.clone());
     let result = async {
+        let binding = engine.observed_binding(policy.engine_id).await?;
+        engine.verify_engine_binding(&binding, &policy).await?;
+        let mut wrong_daemon = binding.clone();
+        wrong_daemon.daemon_id = uuid::Uuid::new_v4().to_string();
+        assert!(engine
+            .verify_engine_binding(&wrong_daemon, &policy)
+            .await
+            .is_err());
+        let mut wrong_platform = binding.clone();
+        wrong_platform.platform = match binding.platform {
+            LaunchPlatform::LinuxAmd64 => LaunchPlatform::LinuxArm64,
+            LaunchPlatform::LinuxArm64 => LaunchPlatform::LinuxAmd64,
+        };
+        assert!(engine
+            .verify_engine_binding(&wrong_platform, &policy)
+            .await
+            .is_err());
         let env = engine
-            .image_environment(&spec.manifest.image.reference)
+            .image_environment_for_binding(&binding, &policy, &spec.manifest.image)
             .await?;
         let prepared = policy.prepare(&spec, &env)?;
         let container = match engine.create_once(&prepared).await? {
