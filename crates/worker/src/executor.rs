@@ -2341,6 +2341,7 @@ impl ActionExecutor {
     async fn prepare_isolated_native_invocation(
         &self,
         context: &ExecutionContext,
+        preparation: &ExecutionPreparation,
         spec: &mut attune_common::isolated_process::ProcessSpec,
     ) -> Result<()> {
         use attune_common::{
@@ -2359,13 +2360,12 @@ impl ActionExecutor {
             .ok_or_else(unavailable)?;
         let action = &snapshot.executable.action;
         // These paths remain explicitly unactivated until their actual pinned
-        // setup/image/native-CLI producer is integrated. No host fallback.
+        // setup/image/command producer is integrated. No host fallback.
         let config = context
             .runtime_config_override
             .as_ref()
             .ok_or_else(unavailable)?;
-        if action.launch.is_some()
-            || spec.purpose != attune_common::workload_launch::LaunchPurpose::Action
+        if spec.purpose != attune_common::workload_launch::LaunchPurpose::Action
             || spec.inputs.len() != 2
             || !matches!(config.interpreter.binary.as_str(), "" | "native" | "none")
             || crate::runtime::launch_planning::needs_runtime(config)
@@ -2402,32 +2402,118 @@ impl ActionExecutor {
         {
             return Err(unavailable());
         }
-        let relative =
-            attune_common::artifact_transport::ValidatedRelativePath::new(&context.entry_point)?;
-        let file = format!("actions/{}", relative.as_str());
-        let variant = format!("{file}/linux-{}", spec.platform.native_arch());
-        let selected = manifest
-            .files
-            .iter()
-            .find(|entry| entry.path == file && entry.executable)
-            .or_else(|| {
-                manifest
-                    .files
-                    .iter()
-                    .find(|entry| entry.path == variant && entry.executable)
+        let selected = if let Some(launch) = &action.launch {
+            if !matches!(
+                launch,
+                attune_common::pack_format::LaunchSpec::Native { .. }
+            ) {
+                return Err(unavailable());
+            }
+            launch.validate_action_source(
+                action.entrypoint.as_deref(),
+                action.parameter_delivery,
+                action.parameter_format,
+            )?;
+            let cache = self
+                .native_preparation
+                .as_ref()
+                .ok_or_else(unavailable)?
+                .cache
+                .clone();
+            let pin = pack.clone();
+            let launch = launch.clone();
+            let reference = action.r#ref.clone();
+            let platform = spec.platform;
+            tokio::task::spawn_blocking(move || {
+                let body = cache.open_input_archive(&pin).map_err(|_| {
+                    Error::PermissionDenied("Native metadata archive unavailable".into())
+                })?;
+                attune_common::action_cli::select_released_native(
+                    &launch, &manifest, body, &reference, platform,
+                )
             })
-            .ok_or_else(unavailable)?;
-        let program = format!("{PACK_ROOT}/{}", selected.path);
-        let selected = attune_common::action_cli::SelectedProgram {
-            path: PathBuf::from(&program),
-            sha256: selected.sha256.clone(),
-            invocation_name: program,
-            artifact: None,
-            variant: None,
+            .await
+            .map_err(|_| unavailable())??
+        } else {
+            let relative = attune_common::artifact_transport::ValidatedRelativePath::new(
+                &context.entry_point,
+            )?;
+            let file = format!("actions/{}", relative.as_str());
+            let variant = format!("{file}/linux-{}", spec.platform.native_arch());
+            let selected = manifest
+                .files
+                .iter()
+                .find(|entry| entry.path == file && entry.executable)
+                .or_else(|| {
+                    manifest
+                        .files
+                        .iter()
+                        .find(|entry| entry.path == variant && entry.executable)
+                })
+                .ok_or_else(unavailable)?;
+            let program = format!("{PACK_ROOT}/{}", selected.path);
+            attune_common::action_cli::SelectedProgram {
+                path: PathBuf::from(&program),
+                sha256: selected.sha256.clone(),
+                invocation_name: program,
+                artifact: None,
+                variant: None,
+            }
+        };
+        let arguments = if let Some(launch) = &action.launch {
+            use attune_common::action_cli::{ArgumentLimits, ArgumentPlan, InputDelivery};
+            let schema = action
+                .param_schema
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let plan = ArgumentPlan::from_bound_contract(
+                &schema,
+                launch.action_arguments()?,
+                preparation.binding.input.clone(),
+            )
+            .map_err(|_| unavailable())?;
+            let delivery = match action.parameter_delivery {
+                attune_common::models::ParameterDelivery::None => InputDelivery::None,
+                attune_common::models::ParameterDelivery::Stdin => InputDelivery::Stdin,
+                _ => return Err(unavailable()),
+            };
+            let input = plan
+                .materialize(
+                    selected.argument_budget_program()?,
+                    &serde_json::to_value(&context.parameters)?,
+                    preparation.parameter_secret_paths.as_deref().unwrap_or(&[]),
+                    delivery,
+                    ArgumentLimits::default(),
+                )
+                .map_err(|_| unavailable())?;
+            attune_common::repositories::execution_program::ExecutionProgramRepository::record(
+                &self.pool,
+                execution.id,
+                self.worker_id.load(Ordering::Acquire),
+                snapshot.release.id,
+                &selected,
+            )
+            .await?;
+            input.argv().to_vec()
+        } else {
+            Vec::new()
         };
         spec.invocation.argv =
-            crate::runtime::launch_planning::cli_exec_argv(spec.platform, &selected, &[])
+            crate::runtime::launch_planning::cli_exec_argv(spec.platform, &selected, &arguments)
                 .map_err(|_| unavailable())?;
+        let file = if action.launch.is_some() {
+            selected
+                .path
+                .strip_prefix(PACK_ROOT)
+                .map_err(|_| unavailable())?
+                .to_str()
+                .ok_or_else(unavailable)?
+                .trim_start_matches('/')
+                .to_owned()
+        } else {
+            format!("actions/{}", context.entry_point)
+        };
         let mut environment = context
             .env
             .iter()
@@ -2497,7 +2583,7 @@ impl ActionExecutor {
             .as_ref()
             .is_none_or(|value| value.intent != spec.intent)
         {
-            self.prepare_isolated_native_invocation(&context, &mut spec)
+            self.prepare_isolated_native_invocation(&context, preparation, &mut spec)
                 .await?;
         }
         let selected = SelectedExecutionInput::new(
