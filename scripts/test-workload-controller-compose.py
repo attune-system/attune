@@ -19,6 +19,13 @@ def arguments(output):
 
 
 class ControllerConfigTests(unittest.TestCase):
+    def test_every_compiled_proxy_temp_module_uses_private_bounded_scratch(self):
+        source = (ROOT / "docker/workload-launch-proxy.conf").read_text()
+        for directive, path in [("client_body_temp_path", "client-body"), ("proxy_temp_path", "proxy"),
+                                ("fastcgi_temp_path", "fastcgi"), ("uwsgi_temp_path", "uwsgi"), ("scgi_temp_path", "scgi")]:
+            self.assertIn(f"{directive} /tmp/{path};", source)
+        self.assertNotIn("/var/cache/nginx", source)
+
     def test_public_config_has_fixed_roots_and_no_credential_or_raw_plan(self):
         with tempfile.TemporaryDirectory(prefix="attune-controller-config-") as directory:
             path = Path(directory) / "config.json"

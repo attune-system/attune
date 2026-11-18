@@ -122,10 +122,32 @@ def proxy_preflight(docker_command):
         for name, command in [
             ("key_readability", ["/bin/sh", "-c", "test -r /etc/attune/controller.key && test -r /etc/attune/controller.crt"]),
             ("nginx_config", ["/usr/sbin/nginx", "-t", "-c", "/etc/attune/launch-proxy.conf"]),
+            ("nginx_start", ["/usr/sbin/nginx", "-c", "/etc/attune/launch-proxy.conf", "-g", "daemon off;"]),
         ]:
             owner = "attune-proxy-prerequisite-" + uuid.uuid4().hex
-            logs, code, truncated = bounded_command([*base, "--name", owner, "--label", f"io.attune.test.owner={owner}",
+            detached = ["--detach"] if name == "nginx_start" else []
+            logs, code, truncated = bounded_command([*base, *detached, "--name", owner, "--label", f"io.attune.test.owner={owner}",
                 "--entrypoint=/usr/bin/env", PROXY, "-i", "PATH=/usr/sbin:/usr/bin:/bin", "HOME=/tmp", "TMPDIR=/tmp", *command])
+            if name == "nginx_start" and code == 0 and not truncated:
+                # nginx writes its private pid after configuration, listen and
+                # path initialization. An exec also requires the actual master
+                # to remain running. Join/remove it below before continuing.
+                deadline = time.monotonic() + 20
+                code = 1
+                while time.monotonic() < deadline:
+                    _, checked, overflow = bounded_command([*docker_command, "exec", owner,
+                        "/usr/bin/env", "-i", "PATH=/usr/sbin:/usr/bin:/bin", "/bin/sh", "-c", "test -s /tmp/nginx.pid"], 4096)
+                    if checked == 0 and not overflow:
+                        code = 0
+                        break
+                    state, inspected, overflow = bounded_command([*docker_command, "inspect", "--format", "{{.State.Status}}", owner], 4096)
+                    if inspected or overflow or state.strip() != "running":
+                        break
+                    time.sleep(0.1)
+                logs, collected, overflow = bounded_command([*docker_command, "logs", "--tail", "40", owner])
+                truncated = truncated or overflow
+                if collected:
+                    code = 1
             # The probe has no pack code or launch authority, but still owns
             # and settles its exact container. A failed lookup is not absence.
             label, inspected, overflow = bounded_command([*docker_command, "inspect", "--format", '{{index .Config.Labels "io.attune.test.owner"}}', owner], 4096)
@@ -136,10 +158,24 @@ def proxy_preflight(docker_command):
                     if status or overflow:
                         settled = False
                         break
-            print(json.dumps({"proxy_prerequisite": name, "exit": code, "truncated": truncated,
-                              "categories": classify_proxy(logs), "owned_container": owner, "cleanup_acknowledged": settled}), flush=True)
+            proxy_report({"proxy_prerequisite": name, "exit": code, "truncated": truncated,
+                          "categories": classify_proxy(logs), "owned_container": owner, "cleanup_acknowledged": settled})
             if code or truncated or not settled:
                 raise SystemExit("owned uid1000 proxy prerequisite failed before service build")
+
+
+def proxy_report(report):
+    # Persist only the already-sanitized fixed fields, including early failures
+    # before service build or stack start. Never spool the raw nginx output.
+    directory = ROOT / ".scratch/e2e-diagnostics"
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = directory / ("proxy-" + uuid.uuid4().hex + ".jsonl")
+    descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "w") as output:
+        output.write(json.dumps(report, sort_keys=True) + "\n")
+        output.flush()
+        os.fsync(output.fileno())
+    print(json.dumps(report, sort_keys=True), flush=True)
 
 
 class FixtureCp(http.server.BaseHTTPRequestHandler):
