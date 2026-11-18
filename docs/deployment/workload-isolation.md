@@ -45,6 +45,13 @@ probe. Its separate public helper image supplies that fixed probe, so a native
 payload image need not contain a shell. No HTTP enrollment, dispatch or session
 credential is configured between these in-process components.
 
+The action environment renderer preserves the owning loop's explicitly selected
+`ATTUNE_API_TOKEN`; runtime defaults cannot mint or replace reserved context.
+It rejects known manager database, broker, signing, encryption and control
+variable names. Setup plans and runtime probes reject action API tokens. These
+checks neither issue credentials nor establish secret origins: permission-set,
+owner, source and current-attempt admission remain with the trusted owning loop.
+
 New source-built agent exports and release-package images include the public
 archive at `/usr/local/share/attune/workload-runner.zip`. It contains only the
 once-built executable at `linux-amd64` or `linux-arm64`, selected from the

@@ -27,7 +27,7 @@ pub enum PlanningError {
     Path,
     #[error("runtime configuration requires an admitted setup/publication or is unsupported")]
     Configuration,
-    #[error("forbidden manager/action authority in setup environment")]
+    #[error("forbidden authority or control variable in workload environment")]
     Environment,
     #[error("private setup plan exceeds bounds")]
     Bounds,
@@ -70,7 +70,7 @@ impl SetupPlan {
         if self.version != 1 || self.steps.len() > 64 {
             return Err(PlanningError::Bounds);
         }
-        validate_environment(&self.environment)?;
+        validate_environment(&self.environment, false)?;
         let mut bytes = 0usize;
         for step in &self.steps {
             if step.argv.is_empty() || step.argv[0].is_empty() || step.argv.len() > 1024 {
@@ -263,12 +263,14 @@ pub fn action_environment(
     if needs_runtime(config) && !has_runtime {
         return Err(PlanningError::Configuration);
     }
-    // Action API opt-in and selected secret env are enforced by the owning CP
-    // planner. This helper only renders runtime variables against fixed roots.
+    // The owning loop enforces API opt-in, origins and the current attempt.
+    // Retain its explicit scoped token while rejecting manager/control context.
+    validate_environment(selected, true)?;
     let vars = variables(config, Some(entry), has_runtime, pack_access)?;
     let mut output = BTreeMap::from([("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into())]);
     apply_runtime_environment(config, &mut output, &vars);
     output.extend(selected.clone());
+    validate_environment(&output, true)?;
     Ok(output)
 }
 fn variables(
@@ -313,13 +315,13 @@ fn runtime_environment(
     selected: &BTreeMap<String, String>,
     vars: &BTreeMap<&str, String>,
 ) -> Result<BTreeMap<String, String>> {
-    validate_environment(selected)?;
+    validate_environment(selected, false)?;
     let mut output = selected.clone();
     output
         .entry("PATH".into())
         .or_insert_with(|| "/usr/local/bin:/usr/bin:/bin".into());
     apply_runtime_environment(config, &mut output, vars);
-    validate_environment(&output)?;
+    validate_environment(&output, false)?;
     Ok(output)
 }
 fn apply_runtime_environment(
@@ -351,7 +353,10 @@ fn apply_runtime_environment(
         output.insert(name.clone(), value);
     }
 }
-fn validate_environment(environment: &BTreeMap<String, String>) -> Result<()> {
+fn validate_environment(
+    environment: &BTreeMap<String, String>,
+    selected_action_token: bool,
+) -> Result<()> {
     let mut bytes = 0usize;
     for (name, value) in environment {
         let upper = name.to_ascii_uppercase();
@@ -365,14 +370,18 @@ fn validate_environment(environment: &BTreeMap<String, String>) -> Result<()> {
             || upper.starts_with("ATTUNE_RUNTIME_LOG_")
             || upper.starts_with("DOCKER_")
             || upper.starts_with("KUBERNETES_")
+            || (upper == "ATTUNE_API_TOKEN"
+                && (!selected_action_token || name != "ATTUNE_API_TOKEN"))
             || matches!(
                 upper.as_str(),
-                "ATTUNE_API_TOKEN"
-                    | "DATABASE_URL"
+                "DATABASE_URL"
                     | "MQ_URL"
+                    | "ATTUNE_MQ_URL"
+                    | "ATTUNE_MQ_EXCHANGE"
                     | "JWT_SECRET"
                     | "ENCRYPTION_KEY"
                     | "KUBECONFIG"
+                    | "ATTUNE_CONFIG"
                     | "ATTUNE_AGENT_BOOTSTRAP_TOKEN"
             )
         {
@@ -576,6 +585,78 @@ mod tests {
         let mut invalid = plan;
         invalid.version = 2;
         assert!(invalid.validate().is_err());
+    }
+    #[test]
+    fn action_environment_retains_selected_api_token_without_runtime_default_authority() {
+        let mut config = python();
+        config.env_vars.insert(
+            "ATTUNE_API_TOKEN".into(),
+            RuntimeEnvVarConfig::Value("runtime-must-not-mint-or-replace-token".into()),
+        );
+        let selected = BTreeMap::from([
+            (
+                "ATTUNE_API_TOKEN".into(),
+                "owned-selected-scoped-token".into(),
+            ),
+            ("ATTUNE_ACTION".into(), "owned.action".into()),
+        ]);
+        let result = action_environment(
+            &config,
+            &selected,
+            "actions/tool.py",
+            true,
+            PackAccess::ReadOnly,
+        )
+        .unwrap();
+        assert_eq!(result["ATTUNE_API_TOKEN"], "owned-selected-scoped-token");
+        assert_eq!(result["ATTUNE_ACTION"], "owned.action");
+        assert!(!action_environment(
+            &config,
+            &BTreeMap::new(),
+            "actions/tool.py",
+            true,
+            PackAccess::ReadOnly,
+        )
+        .unwrap()
+        .contains_key("ATTUNE_API_TOKEN"));
+        assert!(setup_plan(&config, &selected, &[]).is_err());
+        for key in [
+            "ATTUNE__DATABASE__URL",
+            "DATABASE_URL",
+            "MQ_URL",
+            "ATTUNE_MQ_URL",
+            "ATTUNE_MQ_EXCHANGE",
+            "JWT_SECRET",
+            "ENCRYPTION_KEY",
+            "ATTUNE_CONFIG",
+            "ATTUNE_LAUNCH_SESSION",
+            "ATTUNE_RUNTIME_LOG_CUSTODY_KEY",
+            "DOCKER_HOST",
+            "KUBECONFIG",
+            "attune_api_token",
+        ] {
+            let error = action_environment(
+                &config,
+                &BTreeMap::from([(key.into(), "owned-private-manager-value".into())]),
+                "actions/tool.py",
+                true,
+                PackAccess::ReadOnly,
+            )
+            .unwrap_err();
+            assert!(!error.to_string().contains("owned-private-manager-value"));
+        }
+        config.env_vars.insert(
+            "JWT_SECRET".into(),
+            RuntimeEnvVarConfig::Value("owned-private-runtime-value".into()),
+        );
+        assert!(action_environment(
+            &config,
+            &BTreeMap::new(),
+            "actions/tool.py",
+            true,
+            PackAccess::ReadOnly,
+        )
+        .is_err());
     }
     #[test]
     fn rendering_never_executes_hooks_or_reinterprets_replacement_values() {
