@@ -94,7 +94,7 @@ impl CacheStore {
         {
             return Err(CacheError::UnsafeEntry);
         }
-        for child in ["inputs", "private", "pending"] {
+        for child in ["inputs", "private", "pending", "manifests"] {
             let path = root.join(child);
             if !path.exists() {
                 fs::create_dir(&path)?;
@@ -236,6 +236,9 @@ impl CacheStore {
     /// not reuse or reset a writable stage. No recursive delete by caller path.
     pub fn prepare_private(&self, manifest: &LaunchManifest) -> Result<()> {
         let _lock = self.lock()?;
+        // Durable public recovery evidence precedes every Engine create. A
+        // Stopped/artifact-only claim intentionally carries no private context.
+        self.record_manifest_locked(manifest)?;
         let path = self
             .root
             .join(format!("private/{}", manifest.engine_name_nonce.simple()));
@@ -264,6 +267,104 @@ impl CacheStore {
             copy_private(&source, &output, self.workload_owner)?;
         }
         Ok(())
+    }
+    fn manifest_path(
+        &self,
+        request: &attune_common::workload_launch::LaunchRequest,
+    ) -> Result<PathBuf> {
+        if request.launch_id <= 0 {
+            return Err(CacheError::PinMismatch);
+        }
+        Ok(self.root.join("manifests").join(format!(
+            "{}-{}.json",
+            request.launch_id,
+            request.admitted_digest.as_str()
+        )))
+    }
+    fn record_manifest_locked(&self, manifest: &LaunchManifest) -> Result<()> {
+        manifest
+            .validate_shape()
+            .map_err(|_| CacheError::PinMismatch)?;
+        let request = attune_common::workload_launch::LaunchRequest {
+            launch_id: manifest.launch_id,
+            admitted_digest: manifest
+                .admitted_digest()
+                .map_err(|_| CacheError::PinMismatch)?,
+        };
+        let destination = self.manifest_path(&request)?;
+        let bytes = serde_json::to_vec(manifest).map_err(|_| CacheError::PinMismatch)?;
+        if bytes.len() > 4 * 1024 * 1024 {
+            return Err(CacheError::Quota);
+        }
+        match self.read_manifest_locked(&request) {
+            Ok(previous) => {
+                if serde_json::to_vec(&previous).map_err(|_| CacheError::PinMismatch)? != bytes {
+                    return Err(CacheError::PinMismatch);
+                }
+            }
+            Err(CacheError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                let mut pending = tempfile::NamedTempFile::new_in(self.root.join("manifests"))?;
+                use std::io::Write;
+                pending.write_all(&bytes)?;
+                pending.as_file().sync_all()?;
+                pending
+                    .persist_noclobber(destination)
+                    .map_err(|error| error.error)?;
+                File::open(self.root.join("manifests"))?.sync_all()?;
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+    /// Local evidence only. The caller first authenticates the exact CP request
+    /// and Stopped/artifact claim; this index never authorizes Run or upload.
+    /// Missing/corrupt evidence remains an incomplete recovery obligation.
+    pub fn retained_manifest(
+        &self,
+        request: &attune_common::workload_launch::LaunchRequest,
+    ) -> Result<LaunchManifest> {
+        let _lock = self.lock()?;
+        self.read_manifest_locked(request)
+    }
+    fn read_manifest_locked(
+        &self,
+        request: &attune_common::workload_launch::LaunchRequest,
+    ) -> Result<LaunchManifest> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(self.manifest_path(request)?)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o077 != 0
+            || metadata.len() > 4 * 1024 * 1024
+        {
+            return Err(CacheError::UnsafeEntry);
+        }
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(4 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > 4 * 1024 * 1024 {
+            return Err(CacheError::Quota);
+        }
+        let manifest: LaunchManifest =
+            serde_json::from_slice(&bytes).map_err(|_| CacheError::PinMismatch)?;
+        manifest
+            .validate_shape()
+            .map_err(|_| CacheError::PinMismatch)?;
+        if manifest.launch_id != request.launch_id
+            || manifest
+                .admitted_digest()
+                .map_err(|_| CacheError::PinMismatch)?
+                != request.admitted_digest
+            || serde_json::to_vec(&manifest).map_err(|_| CacheError::PinMismatch)? != bytes
+        {
+            return Err(CacheError::PinMismatch);
+        }
+        Ok(manifest)
     }
     /// File-backed artifact transport is separate from runtime publication.
     /// The fixed private subpath is not activated by the Engine builder until
@@ -1033,6 +1134,66 @@ fn ensure_parents(root: &Path, relative: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_manifest_restart_evidence_is_digest_bound_private_and_never_an_invocation() {
+        use attune_common::workload_launch::LaunchRequest;
+        let root = tempfile::tempdir().unwrap();
+        let limits = CacheLimits {
+            compressed_bytes: 65536,
+            expanded_bytes: 65536,
+            files: 32,
+        };
+        let store = CacheStore::open(root.path().into(), limits)
+            .unwrap()
+            .for_current_test_user();
+        let mut spec = crate::test_support::spec(format!("sha256:{}", "a".repeat(64)));
+        spec.invocation
+            .env
+            .insert("SELECTED_SECRET".into(), "owned-private-input".into());
+        spec.invocation.argv.push("owned-private-argument".into());
+        let request = LaunchRequest {
+            launch_id: spec.manifest.launch_id,
+            admitted_digest: spec.manifest.admitted_digest().unwrap(),
+        };
+        store.prepare_private(&spec.manifest).unwrap();
+        let path = store.manifest_path(&request).unwrap();
+        let saved = fs::read(&path).unwrap();
+        assert!(!String::from_utf8_lossy(&saved).contains("owned-private"));
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        drop(store);
+        let restarted = CacheStore::open(root.path().into(), limits)
+            .unwrap()
+            .for_current_test_user();
+        assert_eq!(
+            restarted
+                .retained_manifest(&request)
+                .unwrap()
+                .engine_name_nonce,
+            spec.manifest.engine_name_nonce
+        );
+        let sibling = LaunchRequest {
+            launch_id: request.launch_id + 1,
+            ..request.clone()
+        };
+        assert!(restarted.retained_manifest(&sibling).is_err());
+        let alias = root.path().join("linked-manifest");
+        fs::hard_link(&path, &alias).unwrap();
+        assert!(restarted.retained_manifest(&request).is_err());
+        fs::remove_file(&alias).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::write(&alias, &saved).unwrap();
+        std::os::unix::fs::symlink(&alias, &path).unwrap();
+        assert!(restarted.retained_manifest(&request).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, &saved).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut poisoned = spec.manifest.clone();
+        poisoned.engine_name_nonce = uuid::Uuid::new_v4();
+        fs::write(&path, serde_json::to_vec(&poisoned).unwrap()).unwrap();
+        assert!(restarted.retained_manifest(&request).is_err());
+        assert_eq!(fs::read(alias).unwrap(), saved);
+    }
     use attune_common::workload_launch::{LaunchInputKind, PinnedLaunchInput};
     use std::io::{Seek, SeekFrom, Write};
 
