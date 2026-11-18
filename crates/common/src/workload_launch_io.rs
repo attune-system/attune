@@ -33,16 +33,15 @@ pub enum LaunchHttpPolicy {
 }
 impl LaunchHttpPolicy {
     pub fn allows_origin(self, url: &Url) -> bool {
-        let loopback = url.domain() == Some("localhost")
-            || url
-                .host_str()
-                .and_then(|host| {
-                    host.trim_start_matches('[')
-                        .trim_end_matches(']')
-                        .parse::<std::net::IpAddr>()
-                        .ok()
-                })
-                .is_some_and(|address| address.is_loopback());
+        let loopback = url
+            .host_str()
+            .and_then(|host| {
+                host.trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                    .ok()
+            })
+            .is_some_and(|address| address.is_loopback());
         url.scheme() == "https"
             || (url.scheme() == "http" && (matches!(self, Self::DevelopmentPlainHttp) || loopback))
     }
@@ -562,12 +561,17 @@ mod tests {
     fn credentials_and_raw_bytes_are_not_debug_values_or_url_authority() {
         for origin in [
             "http://external-engine.example/",
+            "http://localhost/",
+            "http://loopback.example/",
             "http://user:password@localhost/",
             "http://localhost/?token=bad",
             "http://localhost/path",
             "file:///tmp/host",
         ] {
             assert!(HttpLaunchTransport::new(Url::parse(origin).unwrap()).is_err());
+        }
+        for origin in ["http://127.0.0.1/", "http://[::1]/"] {
+            assert!(HttpLaunchTransport::new(Url::parse(origin).unwrap()).is_ok());
         }
         assert!(HttpLaunchTransport::with_policy(
             Url::parse("http://controller.dev/").unwrap(),
