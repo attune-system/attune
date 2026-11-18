@@ -383,7 +383,13 @@ impl DockerLauncher {
         {
             return Err(common_error(EngineError::OwnershipMismatch));
         }
-        let outcome = self.wait_id(&id).await.map_err(common_error)?;
+        // A stale in-flight Start may have raced the prior exited snapshot.
+        // Bound settlement and retain on uncertainty instead of hanging file
+        // finalization or treating an unobserved exit as publication proof.
+        let outcome = tokio::time::timeout(Duration::from_secs(20), self.wait_id(&id))
+            .await
+            .map_err(|_| common_error(EngineError::Transport))?
+            .map_err(common_error)?;
         let response = self
             .engine
             .control
