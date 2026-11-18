@@ -111,9 +111,10 @@ pub fn validate_api_pack_transport(api_url: Option<&str>, has_worker_token: bool
     Ok(())
 }
 
-/// Build the configured pack transport with a refreshable worker token provider.
+/// Build the configured pack transport with separate writable candidate storage.
 pub fn build_pack_transport_with_worker_token_provider(
     packs_base_dir: &str,
+    candidate_base_dir: &str,
     api_url: Option<&str>,
     token_provider: Option<Arc<WorkerTokenProvider>>,
     configured_mode: &TransportMode,
@@ -143,7 +144,8 @@ pub fn build_pack_transport_with_worker_token_provider(
                         url,
                         provider,
                         packs_base_dir,
-                    )?,
+                    )?
+                    .with_candidate_base_dir(candidate_base_dir),
                 );
             }
             Ok(Box::new(transport))
@@ -156,11 +158,10 @@ pub fn build_pack_transport_with_worker_token_provider(
                     "packs.transport is 'api' but worker token configuration is missing",
                 )
             })?;
-            Ok(Box::new(ApiPackTransport::new_with_worker_token_provider(
-                url,
-                provider,
-                packs_base_dir,
-            )?))
+            Ok(Box::new(
+                ApiPackTransport::new_with_worker_token_provider(url, provider, packs_base_dir)?
+                    .with_candidate_base_dir(candidate_base_dir),
+            ))
         }
         TransportMode::Auto => unreachable!("auto mode is resolved before transport construction"),
     }
@@ -201,6 +202,7 @@ mod tests {
         std::fs::write(temp.path().join(PACKS_SENTINEL_FILE), "sentinel").unwrap();
         let error = build_pack_transport_with_worker_token_provider(
             temp.path().to_str().unwrap(),
+            temp.path().to_str().unwrap(),
             None,
             Some(token_provider()),
             &TransportMode::Api,
@@ -214,6 +216,7 @@ mod tests {
     fn api_mode_requires_worker_token_provider_without_falling_back() {
         let temp = tempfile::tempdir().unwrap();
         let error = build_pack_transport_with_worker_token_provider(
+            temp.path().to_str().unwrap(),
             temp.path().to_str().unwrap(),
             Some("http://api:8080"),
             None,
@@ -230,6 +233,7 @@ mod tests {
         std::fs::write(temp.path().join(PACKS_SENTINEL_FILE), "sentinel").unwrap();
 
         let transport = build_pack_transport_with_worker_token_provider(
+            temp.path().to_str().unwrap(),
             temp.path().to_str().unwrap(),
             None,
             None,

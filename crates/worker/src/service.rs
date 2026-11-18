@@ -365,7 +365,6 @@ impl WorkerService {
         let packs_base_dir = std::path::PathBuf::from(&config.packs_base_dir);
         // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- Pack/runtime roots are trusted deployment configuration values.
         let runtime_envs_dir = std::path::PathBuf::from(&config.runtime_envs_dir);
-        cleanup_stale_pack_test_attempts(&packs_base_dir.join(".pack-test-attempts"));
         cleanup_stale_pack_test_attempts(&runtime_envs_dir.join(".pack-test-attempts"));
 
         // Determine which runtimes to register based on configuration
@@ -583,6 +582,7 @@ impl WorkerService {
             let transport =
                 attune_common::pack_transport::build_pack_transport_with_worker_token_provider(
                     &config.packs_base_dir,
+                    &config.runtime_envs_dir,
                     configured_api_url.as_deref(),
                     Some(worker_token_provider.clone()),
                     &config.packs.transport,
@@ -2156,8 +2156,7 @@ async fn handle_metadata_invalidation(
 }
 
 struct PackTestCandidateCleanup {
-    files: Option<PathBuf>,
-    runtime: PathBuf,
+    root: PathBuf,
 }
 
 fn cleanup_stale_pack_test_attempts(root: &std::path::Path) {
@@ -2193,11 +2192,9 @@ fn pack_candidate_token_matches(expected_hash: &str, candidate_token: &str) -> b
 
 impl Drop for PackTestCandidateCleanup {
     fn drop(&mut self) {
-        for path in self.files.iter().chain(std::iter::once(&self.runtime)) {
-            if let Err(error) = std::fs::remove_dir_all(path) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(path = %path.display(), %error, "Failed to remove pack test attempt data");
-                }
+        if let Err(error) = std::fs::remove_dir_all(&self.root) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %self.root.display(), %error, "Failed to remove pack test attempt data");
             }
         }
     }
@@ -2247,11 +2244,6 @@ async fn handle_pack_test(
             && pack_transport.transport_mode() != "volume"
             && payload.candidate_path.is_some()
         {
-            let _ = std::fs::remove_dir_all(
-                packs_base_dir
-                    .join(".pack-test-attempts")
-                    .join(payload.pack_install_id.to_string()),
-            );
             let _ = std::fs::remove_dir_all(
                 runtime_envs_dir
                     .join(".pack-test-attempts")
@@ -2309,12 +2301,7 @@ async fn handle_pack_test(
         .candidate_path
         .as_ref()
         .map(|_| PackTestCandidateCleanup {
-            files: Some(
-                packs_base_dir
-                    .join(".pack-test-attempts")
-                    .join(payload.pack_install_id.to_string()),
-            ),
-            runtime: runtime_envs_dir
+            root: runtime_envs_dir
                 .join(".pack-test-attempts")
                 .join(payload.pack_install_id.to_string()),
         });

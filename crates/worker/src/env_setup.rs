@@ -482,6 +482,7 @@ pub async fn prepare_python_candidate_test_runtime(
     let env_dir = runtime_envs_dir
         .join(".pack-test-attempts")
         .join(attempt_id.to_string())
+        .join("envs")
         .join(&runtime_name);
     let process_runtime = ProcessRuntime::new(
         runtime_name,

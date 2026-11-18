@@ -68,6 +68,7 @@ pub struct ApiPackTransport {
     api_url: String,
     auth_token_source: AuthTokenSource,
     packs_base_dir: String,
+    candidate_base_dir: String,
     client: Client,
 }
 
@@ -84,6 +85,7 @@ impl ApiPackTransport {
             api_url: api_url.trim_end_matches('/').to_string(),
             auth_token_source: AuthTokenSource::Static(auth_token.to_string()),
             packs_base_dir: packs_base_dir.to_string(),
+            candidate_base_dir: packs_base_dir.to_string(),
             client,
         })
     }
@@ -104,8 +106,15 @@ impl ApiPackTransport {
             api_url: api_url.trim_end_matches('/').to_string(),
             auth_token_source: AuthTokenSource::WorkerProvider(token_provider),
             packs_base_dir: packs_base_dir.to_string(),
+            candidate_base_dir: packs_base_dir.to_string(),
             client,
         })
+    }
+
+    /// Candidate inputs need writable storage even when installed releases are read-only.
+    pub fn with_candidate_base_dir(mut self, candidate_base_dir: &str) -> Self {
+        self.candidate_base_dir = candidate_base_dir.to_string();
+        self
     }
 
     /// Update the auth token (e.g., after token refresh).
@@ -197,7 +206,12 @@ impl ApiPackTransport {
             None
         };
 
-        let download_dir = Path::new(&self.packs_base_dir).join(".pack-downloads");
+        let download_root = if candidate_access_token.is_some() {
+            &self.candidate_base_dir
+        } else {
+            &self.packs_base_dir
+        };
+        let download_dir = Path::new(download_root).join(".pack-downloads");
         tokio::fs::create_dir_all(&download_dir)
             .await
             .map_err(|e| {
@@ -336,11 +350,12 @@ impl PackFileTransport for ApiPackTransport {
                 Some(candidate_access_token),
             )
             .await?;
-        let attempt_dir = Path::new(&self.packs_base_dir)
+        let attempt_dir = Path::new(&self.candidate_base_dir)
             .join(".pack-test-attempts")
-            .join(pack_install_id.to_string());
+            .join(pack_install_id.to_string())
+            .join("files");
         let pack_dir = attempt_dir.join(pack_ref);
-        let packs_dir = self.packs_base_dir.clone();
+        let candidate_base_dir = self.candidate_base_dir.clone();
         let pack_ref = pack_ref.to_string();
         let extraction_dir = attempt_dir.clone();
         let extraction = tokio::task::spawn_blocking(move || {
@@ -356,7 +371,7 @@ impl PackFileTransport for ApiPackTransport {
                 "Failed to extract candidate pack: {error}"
             )));
         }
-        debug!(packs_base_dir = %packs_dir, pack_install_id, "Candidate pack synced for testing");
+        debug!(%candidate_base_dir, pack_install_id, "Candidate pack synced for testing");
         Ok(pack_dir)
     }
 
@@ -702,6 +717,82 @@ mod tests {
         (format!("http://{address}"), handle)
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn candidate_storage_is_separate_from_readonly_releases_and_test_environments() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().unwrap();
+        let packs = root.path().join("packs");
+        let candidates = root.path().join("runtime");
+        std::fs::create_dir(&packs).unwrap();
+        std::fs::write(packs.join("unchanged"), "installed release").unwrap();
+        let environment = candidates.join(".pack-test-attempts/42/envs/python");
+        std::fs::create_dir_all(&environment).unwrap();
+        std::fs::write(environment.join("unchanged"), "test environment").unwrap();
+
+        for volume in [false, true] {
+            let archive = archive_with_entry(
+                "python/pack.yaml",
+                b"ref: python\n",
+                tar::EntryType::Regular,
+            );
+            let digest: String = Sha256::digest(&archive)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            let (url, server) = spawn_download_server(
+                archive,
+                "/api/v1/internal/pack-installs/42/archive",
+                Some(digest),
+            )
+            .await;
+            let api = ApiPackTransport::new(&url, "token", packs.to_str().unwrap())
+                .unwrap()
+                .with_candidate_base_dir(candidates.to_str().unwrap());
+            let transport: Box<dyn PackFileTransport> = if volume {
+                Box::new(
+                    super::super::VolumePackTransport::new(packs.to_str().unwrap())
+                        .with_candidate_transport(api),
+                )
+            } else {
+                Box::new(api)
+            };
+            std::fs::set_permissions(&packs, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let result = transport
+                .sync_pack_test_candidate("python", 42, Some("attempt-token"))
+                .await;
+            let served = server.await;
+            std::fs::set_permissions(&packs, std::fs::Permissions::from_mode(0o700)).unwrap();
+            served.unwrap();
+            let candidate = result.unwrap();
+            assert_eq!(
+                candidate,
+                candidates.join(".pack-test-attempts/42/files/python")
+            );
+            assert_eq!(
+                std::fs::read_to_string(candidate.join("pack.yaml")).unwrap(),
+                "ref: python\n"
+            );
+            assert_eq!(std::fs::read_dir(&packs).unwrap().count(), 1);
+            assert_eq!(
+                std::fs::read_to_string(packs.join("unchanged")).unwrap(),
+                "installed release"
+            );
+            assert_eq!(
+                std::fs::read_to_string(environment.join("unchanged")).unwrap(),
+                "test environment"
+            );
+            assert_eq!(
+                std::fs::read_dir(candidates.join(".pack-downloads"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+        root.close().unwrap();
+    }
+
     #[tokio::test]
     async fn candidate_download_rejects_missing_or_mismatched_digest_before_extraction() {
         for digest in [None, Some("0".repeat(64))] {
@@ -718,7 +809,10 @@ mod tests {
                 .await;
             server.await.unwrap();
             assert!(result.unwrap_err().to_string().contains("digest"));
-            assert!(!temp.path().join(".pack-test-attempts/42/demo").exists());
+            assert!(!temp
+                .path()
+                .join(".pack-test-attempts/42/files/demo")
+                .exists());
             if temp.path().join(".pack-downloads").exists() {
                 assert_eq!(
                     std::fs::read_dir(temp.path().join(".pack-downloads"))
