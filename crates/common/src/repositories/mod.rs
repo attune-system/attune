@@ -530,5 +530,5 @@ pub mod iam_ownership;
 
 pub mod work_queue_output;
 
-pub(crate) mod workload_source;
 pub mod workload_launch;
+pub(crate) mod workload_source;
