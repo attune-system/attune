@@ -24,6 +24,7 @@ use crate::{
 };
 
 mod artifact;
+mod host;
 mod materialization;
 mod output;
 mod stdin;

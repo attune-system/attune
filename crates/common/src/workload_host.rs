@@ -224,6 +224,19 @@ pub struct AssignedAction {
     pub max_stdout_bytes: u64,
     pub max_stderr_bytes: u64,
 }
+/// A manager reports only its already-owned work; scheduling and all launch
+/// selections remain trusted control-plane decisions.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NextActionRequest {
+    pub known_executions: Vec<i64>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum NextActionResponse {
+    Idle,
+    Assigned { assignment: Box<AssignedAction> },
+}
 impl std::fmt::Debug for AssignedAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AssignedAction")

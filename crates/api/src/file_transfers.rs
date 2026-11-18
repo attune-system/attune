@@ -28,6 +28,9 @@ pub(crate) struct FileMemoryLease {
     _memory: OwnedSemaphorePermit,
     _slot: OwnedSemaphorePermit,
 }
+pub(crate) struct ControlMemoryLease {
+    _memory: OwnedSemaphorePermit,
+}
 pub(crate) struct FileUploadLease {
     _memory: FileMemoryLease,
     _task: TaskTrackerToken,
@@ -139,12 +142,20 @@ impl FileTransfers {
     }
     /// Admit before buffering private stdin JSON/Base64, decoded bytes and the
     /// separately decrypted frozen context. No payload participates in errors.
-    pub(crate) fn private_stdin(&self) -> Result<FileMemoryLease, String> {
+    pub(crate) fn private_stdin(&self) -> Result<ControlMemoryLease, String> {
         let closed = self.closed.lock().expect("file admission lock poisoned");
         if *closed {
             return Err("Private input admission is shutting down".into());
         }
-        self.memory_lease_bytes(128 * UNIT)
+        // The memory budget itself bounds concurrent control decodes. Do not
+        // hold a native-transfer slot while CP planning needs a nested pinned
+        // archive transfer (including configured transfer concurrency of one).
+        let memory = self
+            .memory
+            .clone()
+            .try_acquire_many_owned(128)
+            .map_err(|_| "Private input memory budget unavailable".to_string())?;
+        Ok(ControlMemoryLease { _memory: memory })
     }
     pub(crate) fn spawn<F, T>(&self, lease: FileUploadLease, work: F) -> JoinHandle<Option<T>>
     where
@@ -287,6 +298,19 @@ mod tests {
             transfers.spawn(lease, async { 42 }).await.unwrap(),
             Some(42)
         );
+        assert!(transfers.drain(Duration::from_secs(1)).await);
+    }
+    #[tokio::test]
+    async fn private_control_memory_does_not_reserve_the_native_transfer_slot() {
+        let transfers = FileTransfers::new(256 * UNIT, 1);
+        let control = transfers.private_stdin().unwrap();
+        // Planning may need a pinned archive transfer while holding private
+        // context admission, even when native concurrency is exactly one.
+        let native = transfers.upload(Some(1)).unwrap();
+        assert!(transfers.private_stdin().is_err());
+        drop(native);
+        assert!(transfers.private_stdin().is_ok());
+        drop(control);
         assert!(transfers.drain(Duration::from_secs(1)).await);
     }
 }

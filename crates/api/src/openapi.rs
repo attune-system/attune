@@ -437,6 +437,8 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::log_delivery_control::reconcile,
         crate::routes::workload_hosts::register,
         crate::routes::workload_hosts::session,
+        crate::routes::workload_hosts::actions::next,
+        crate::routes::workload_hosts::actions::io_grant,
         crate::routes::workload_hosts::custody::reserve,
         crate::routes::workload_hosts::custody::prepare,
         crate::routes::workload_hosts::custody::cancel_absent,
@@ -1077,12 +1079,12 @@ mod tests {
             .sum();
 
         assert_eq!(
-            path_count, 241,
+            path_count, 243,
             "Expected every mounted API path in the OpenAPI spec"
         );
 
         assert_eq!(
-            operation_count, 305,
+            operation_count, 307,
             "Expected every mounted API operation in the OpenAPI spec"
         );
 
@@ -1099,6 +1101,16 @@ mod tests {
             .get("invocation")
             .is_some());
         for (path, request, response) in [
+            (
+                "/api/v1/workload-hosts/actions/next",
+                "NextActionRequest",
+                "NextActionResponse",
+            ),
+            (
+                "/api/v1/workload-hosts/actions/io-grants",
+                "LaunchIoGrantRequest",
+                "LaunchIoGrant",
+            ),
             (
                 "/api/v1/workload-launches/{id}/authorize-stdin",
                 "AuthorizeLaunchStdinRequest",

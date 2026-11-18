@@ -21,6 +21,8 @@ import type { LaunchRequest } from "../models/LaunchRequest";
 import type { LaunchStageResult } from "../models/LaunchStageResult";
 import type { LaunchStartIntent } from "../models/LaunchStartIntent";
 import type { LaunchStatus } from "../models/LaunchStatus";
+import type { NextActionRequest } from "../models/NextActionRequest";
+import type { NextActionResponse } from "../models/NextActionResponse";
 import type { ObserveLaunchRequest } from "../models/ObserveLaunchRequest";
 import type { PrepareCustody } from "../models/PrepareCustody";
 import type { ReconcileLaunchesPage } from "../models/ReconcileLaunchesPage";
@@ -38,6 +40,44 @@ import type { CancelablePromise } from "../core/CancelablePromise";
 import { OpenAPI } from "../core/OpenAPI";
 import { request as __request } from "../core/request";
 export class WorkloadControlService {
+  /**
+   * @returns LaunchIoGrant
+   * @throws ApiError
+   */
+  public static workloadHostIoGrant({
+    requestBody,
+  }: {
+    requestBody: LaunchIoGrantRequest;
+  }): CancelablePromise<LaunchIoGrant> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/workload-hosts/actions/io-grants",
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        403: `Channel unavailable`,
+      },
+    });
+  }
+  /**
+   * @returns NextActionResponse
+   * @throws ApiError
+   */
+  public static workloadHostNextAction({
+    requestBody,
+  }: {
+    requestBody: NextActionRequest;
+  }): CancelablePromise<NextActionResponse> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/workload-hosts/actions/next",
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        403: `Action unavailable`,
+      },
+    });
+  }
   /**
    * @returns CustodyAbsence
    * @throws ApiError

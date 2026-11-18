@@ -26,6 +26,8 @@ pub struct ClaimedActionSource {
     pub admission: i64,
     pub image: i64,
     pub profile: HostExecutionProfile,
+    pub api_origin: reqwest::Url,
+    pub http_policy: crate::workload_launch_io::LaunchHttpPolicy,
 }
 impl WorkloadHostRepository {
     pub async fn claim_action(
@@ -125,6 +127,38 @@ impl WorkloadHostRepository {
             )
         };
         let description = Self::profile(&mut tx, &profile).await?;
+        // This immutable CP profile, never a request Host/X-Forwarded header or
+        // a caller-supplied origin, selects where action API credentials go.
+        let http_policy = match profile.capabilities.get("development_plain_http") {
+            None | Some(serde_json::Value::Bool(false)) => {
+                crate::workload_launch_io::LaunchHttpPolicy::TlsOrLoopback
+            }
+            Some(serde_json::Value::Bool(true)) => {
+                crate::workload_launch_io::LaunchHttpPolicy::DevelopmentPlainHttp
+            }
+            _ => return Err(denied()),
+        };
+        let api_origin = profile
+            .capabilities
+            .get("api_origin")
+            .and_then(|value| value.as_str())
+            .and_then(|value| reqwest::Url::parse(value).ok())
+            .ok_or_else(denied)?;
+        if !http_policy.allows_origin(&api_origin)
+            || !(api_origin.scheme() == "https"
+                || matches!(
+                    http_policy,
+                    crate::workload_launch_io::LaunchHttpPolicy::DevelopmentPlainHttp
+                ))
+            || api_origin.host_str().is_none()
+            || api_origin.path() != "/"
+            || !api_origin.username().is_empty()
+            || api_origin.password().is_some()
+            || api_origin.query().is_some()
+            || api_origin.fragment().is_some()
+        {
+            return Err(denied());
+        }
         let artifact_limits: crate::workload_artifact::ArtifactLimits = profile
             .capabilities
             .get("artifact_limits")
@@ -149,6 +183,8 @@ impl WorkloadHostRepository {
             admission,
             image: profile.image,
             profile: description,
+            api_origin,
+            http_policy,
         };
         tx.commit().await?;
         if actor.expires_at <= Utc::now().timestamp() {
