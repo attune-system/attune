@@ -17,9 +17,13 @@ use attune_common::{
         Create, FindById,
     },
 };
-use axum::http::StatusCode;
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+};
 use helpers::{Result, TestContext};
 use serde_json::json;
+use tower::ServiceExt;
 use uuid::Uuid;
 
 const ROUTE: &str = "/api/v1/internal/log-delivery/control";
@@ -99,9 +103,18 @@ async fn control_requires_current_worker_binding_and_exact_custody() -> Result<(
         .bind(request.source_instance).bind(request.attempt).bind(request.custody)
         .bind(json!([{"sequence":0,"size_bytes":1,"sha256":"0".repeat(64)}]))
         .bind("0".repeat(64)).execute(&ctx.pool).await?;
-    ctx.post(ROUTE, &request, None)
-        .await?
-        .assert_status(StatusCode::UNAUTHORIZED);
+    // TestContext::post(None) deliberately uses its stored admin token.
+    // A raw request is required to exercise the unauthenticated boundary.
+    let unauthenticated = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::post(ROUTE)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&request)?))?,
+        )
+        .await?;
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
     ctx.post(ROUTE, &request, ctx.token())
         .await?
         .assert_status(StatusCode::FORBIDDEN);

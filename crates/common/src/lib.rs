@@ -101,4 +101,6 @@ mod tests {
 }
 
 pub mod workload_launch;
+pub mod workload_controller;
+pub(crate) mod workload_launch_state;
 pub mod workload_sandbox;

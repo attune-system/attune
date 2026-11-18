@@ -435,6 +435,18 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
 
         // Internal service endpoints
         crate::routes::log_delivery_control::reconcile,
+        crate::routes::workload_launch::resolve,
+        crate::routes::workload_launch::reconcile,
+        crate::routes::workload_launch::claim,
+        crate::routes::workload_launch::status,
+        crate::routes::workload_launch::stop,
+        crate::routes::workload_launch::create_intent,
+        crate::routes::workload_launch::start,
+        crate::routes::workload_launch::renew,
+        crate::routes::workload_launch::observe,
+        crate::routes::workload_launch::stop_ack,
+        crate::routes::workload_launch::input_body,
+
         crate::routes::internal_files::download_file,
         crate::routes::internal_files::upload_file,
         crate::routes::internal_files::check_file,
@@ -1052,16 +1064,47 @@ mod tests {
             .sum();
 
         assert_eq!(
-            path_count, 216,
+            path_count, 228,
             "Expected every mounted API path in the OpenAPI spec"
         );
 
         assert_eq!(
-            operation_count, 280,
+            operation_count, 292,
             "Expected every mounted API operation in the OpenAPI spec"
         );
 
         let spec = serde_json::to_value(&doc).unwrap();
+        for (path, request, response) in [
+            (
+                "/api/v1/internal/log-delivery/control",
+                "ControlRequest",
+                "ControlResponse",
+            ),
+            (
+                "/api/v1/workload-launches/{id}/claim",
+                "LaunchRequest",
+                "ClaimedLaunch",
+            ),
+            (
+                "/api/v1/workload-launches/reconcile",
+                "ReconcileLaunchesRequest",
+                "ReconcileLaunchesPage",
+            ),
+        ] {
+            let operation = &spec["paths"][path]["post"];
+            assert!(
+                operation.is_object(),
+                "Missing protected control route {path}"
+            );
+            assert_eq!(
+                operation["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+                format!("#/components/schemas/{request}")
+            );
+            assert_eq!(
+                operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+                format!("#/components/schemas/{response}")
+            );
+        }
         let reveal = &spec["paths"]["/api/v1/triggers/{ref}/webhooks/reveal"]["post"];
         assert!(
             reveal.is_object(),
