@@ -137,8 +137,7 @@ async fn setup_runtime_fixture() -> (
 async fn coordinated_environment_claims_single_owner_and_retrys_after_failure() {
     let (pool, temp_dir, pack, runtime, runtime_version, worker_a, worker_b) =
         setup_runtime_fixture().await;
-    let manager =
-        PackEnvironmentManager::with_base_path(pool.clone(), temp_dir.path().to_path_buf());
+    let manager = PackEnvironmentManager::new(pool.clone());
     let env_path = temp_dir.path().join("runtime_envs").join("python-3.12");
 
     let target = manager
@@ -189,8 +188,7 @@ async fn coordinated_environment_claims_single_owner_and_retrys_after_failure() 
 async fn coordinated_environment_becomes_outdated_when_manifest_checksum_changes() {
     let (pool, temp_dir, pack, runtime, runtime_version, worker_a, _worker_b) =
         setup_runtime_fixture().await;
-    let manager =
-        PackEnvironmentManager::with_base_path(pool.clone(), temp_dir.path().to_path_buf());
+    let manager = PackEnvironmentManager::new(pool.clone());
     let env_path = temp_dir.path().join("runtime_envs").join("python-3.12");
 
     let target = manager

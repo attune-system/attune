@@ -439,8 +439,7 @@ pub async fn prepare_python_test_runtime(
         runtime_envs_dir.to_path_buf(),
     )
     .with_child_environment(child_environment.clone());
-    let env_manager =
-        PackEnvironmentManager::with_base_path(db_pool.clone(), runtime_envs_dir.to_path_buf());
+    let env_manager = PackEnvironmentManager::new(db_pool.clone());
 
     coordinate_environment_setup(
         &env_manager,
@@ -550,8 +549,7 @@ async fn setup_environments_for_pack(
 
     let runtime_requirements = collect_runtime_requirements(db_pool, &actions).await;
     let seen_runtime_ids: HashSet<i64> = runtime_requirements.keys().copied().collect();
-    let env_manager =
-        PackEnvironmentManager::with_base_path(db_pool.clone(), runtime_envs_dir.to_path_buf());
+    let env_manager = PackEnvironmentManager::new(db_pool.clone());
 
     if seen_runtime_ids.is_empty() {
         debug!("Pack '{}' has no actions with runtimes, skipping", pack_ref);
