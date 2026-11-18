@@ -34,6 +34,8 @@ on:
       - 'scripts/capture_build_diagnostics.py'
       - 'scripts/test_capture_build_diagnostics.py'
       - 'scripts/test_docker_source_graph.py'
+      - 'scripts/workload_proxy_diagnostics.py'
+      - 'scripts/test_workload_proxy_diagnostics.py'
   workflow_dispatch:
 permissions:
   contents: read
@@ -51,6 +53,7 @@ jobs:
           python3 scripts/test-workload-controller-compose.py
           python3 scripts/test_capture_build_diagnostics.py
           python3 scripts/test_docker_source_graph.py
+          python3 scripts/test_workload_proxy_diagnostics.py
   controller-project:
     name: Actual external controller project (${{ matrix.arch }})
     strategy:

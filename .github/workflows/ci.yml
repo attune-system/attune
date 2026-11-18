@@ -151,6 +151,7 @@ jobs:
           python3 scripts/test_core_bootstrap_failure.py
           python3 scripts/test_workload_startup_diagnostics.py
           python3 scripts/test_capture_build_diagnostics.py
+          python3 scripts/test_workload_proxy_diagnostics.py
           python3 scripts/test_docker_source_graph.py
           python3 scripts/test_check_core_component_versions.py
           python3 scripts/test_publish_image_provenance.py

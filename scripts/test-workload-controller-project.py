@@ -23,6 +23,7 @@ import urllib.error
 import urllib.request
 import uuid
 from workload_startup_diagnostics import command as bounded_command
+from workload_proxy_diagnostics import classify as classify_proxy
 
 ROOT = Path(__file__).resolve().parent.parent
 PROBE = "debian@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587"
@@ -61,9 +62,12 @@ def diagnose(docker_command, owner):
         if info.get("owner") != owner or info.get("service") not in {"launch-controller", "launch-proxy"}:
             continue
         logs, code, truncated = bounded_command([*docker_command, "logs", "--tail", "80", identifier])
+        categories = {key: logs.count(value) for key, value in signatures.items() if value in logs}
+        if info["service"] == "launch-proxy":
+            categories.update(classify_proxy(logs))
         reports.append({"service": info["service"], "state": info.get("state"),
             "exit": info.get("exit"), "oom": info.get("oom"),
-            "categories": {key: logs.count(value) for key, value in signatures.items() if value in logs},
+            "categories": categories,
             "log_bytes_examined": len(logs.encode()), "log_failed": code != 0, "log_truncated": truncated,
             "private_marker_present": any(value in logs for value in [DUMMY_SESSION, PRIVATE_MARKER, "owned-wrong-grant"])})
     return reports
@@ -99,6 +103,43 @@ def change_owner(path, uid):
         # These are only the fresh fixture's explicit files. No host policy,
         # socket ownership, unrelated files or security setting is changed.
         run(["sudo", "-n", "chown", f"{uid}:{uid}", str(path)])
+
+
+def proxy_preflight(docker_command):
+    """Actual pinned nginx/UID/key/config prerequisite before a cold build."""
+    with tempfile.TemporaryDirectory(prefix="attune-proxy-prerequisite-") as directory:
+        root = Path(directory)
+        certificates(root)
+        change_owner(root / "proxy.key", 1000)
+        base = [*docker_command, "run", "--network=none", "--user=1000:1000",
+                "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges:true",
+                "--tmpfs", "/tmp:rw,nosuid,nodev,size=16777216,uid=1000,gid=1000,mode=0700",
+                "--mount", f"type=bind,source={ROOT / 'docker/workload-launch-proxy.conf'},target=/etc/attune/launch-proxy.conf,readonly",
+                "--mount", f"type=bind,source={root / 'proxy.crt'},target=/etc/attune/controller.crt,readonly",
+                "--mount", f"type=bind,source={root / 'proxy.key'},target=/etc/attune/controller.key,readonly"]
+        # Distinguish bound-key fixture metadata from nginx configuration. The
+        # private bytes never pass through stdout, arguments or diagnostics.
+        for name, command in [
+            ("key_readability", ["/bin/sh", "-c", "test -r /etc/attune/controller.key && test -r /etc/attune/controller.crt"]),
+            ("nginx_config", ["/usr/sbin/nginx", "-t", "-c", "/etc/attune/launch-proxy.conf"]),
+        ]:
+            owner = "attune-proxy-prerequisite-" + uuid.uuid4().hex
+            logs, code, truncated = bounded_command([*base, "--name", owner, "--label", f"io.attune.test.owner={owner}",
+                "--entrypoint=/usr/bin/env", PROXY, "-i", "PATH=/usr/sbin:/usr/bin:/bin", "HOME=/tmp", "TMPDIR=/tmp", *command])
+            # The probe has no pack code or launch authority, but still owns
+            # and settles its exact container. A failed lookup is not absence.
+            label, inspected, overflow = bounded_command([*docker_command, "inspect", "--format", '{{index .Config.Labels "io.attune.test.owner"}}', owner], 4096)
+            settled = inspected == 0 and not overflow and label.strip() == owner
+            if settled:
+                for operation in [["stop", "--time", "2", owner], ["wait", owner], ["rm", owner]]:
+                    _, status, overflow = bounded_command([*docker_command, *operation], 4096)
+                    if status or overflow:
+                        settled = False
+                        break
+            print(json.dumps({"proxy_prerequisite": name, "exit": code, "truncated": truncated,
+                              "categories": classify_proxy(logs), "owned_container": owner, "cleanup_acknowledged": settled}), flush=True)
+            if code or truncated or not settled:
+                raise SystemExit("owned uid1000 proxy prerequisite failed before service build")
 
 
 class FixtureCp(http.server.BaseHTTPRequestHandler):
@@ -149,6 +190,8 @@ def main():
         return run([*docker_command, *values], **kwargs)
     print(json.dumps({"owner": owner, "engine_id": engine_id, "image": image,
                       "cache_volume": cache_name, "state_volume": state_name}), flush=True)
+    docker("pull", PROXY)
+    proxy_preflight(docker_command)
     diagnostics = ROOT / ".scratch/e2e-diagnostics"
     diagnostics.mkdir(parents=True, exist_ok=True)
     run(["python3", str(ROOT / "scripts/capture_build_diagnostics.py"),
