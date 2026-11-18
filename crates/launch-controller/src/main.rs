@@ -41,6 +41,10 @@ struct ControllerConfig {
     compressed_bytes: u64,
     expanded_bytes: u64,
     archive_files: u64,
+    #[serde(default = "artifact_max_total_bytes")]
+    artifact_max_total_bytes: u64,
+    #[serde(default = "artifact_max_entries")]
+    artifact_max_entries: u64,
     minimum_free_bytes: u64,
     max_active: usize,
     max_retained: usize,
@@ -50,6 +54,12 @@ struct ControllerConfig {
     development_plain_http: bool,
 }
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+fn artifact_max_total_bytes() -> u64 {
+    attune_common::workload_artifact::ArtifactLimits::default().max_total_bytes
+}
+fn artifact_max_entries() -> u64 {
+    attune_common::workload_artifact::ArtifactLimits::default().max_entries
+}
 
 fn read_owned<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let file = OpenOptions::new()
@@ -76,6 +86,9 @@ fn read_owned<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if unsafe { libc::geteuid() } != 0 || unsafe { libc::getegid() } != 0 {
+        return Err("trusted controller requires root ownership with only its documented custodian capabilities".into());
+    }
     attune_common::parent_process_protection::protect_service_parent()
         .map_err(|_| "could not protect controller parent")?;
     let path =
@@ -135,14 +148,17 @@ async fn main() -> Result<()> {
         pids_limit: config.pids_limit,
         scratch_bytes: config.scratch_bytes,
     };
-    let cache = Arc::new(CacheStore::open(
-        "/var/lib/attune/launch".into(),
-        CacheLimits {
-            compressed_bytes: config.compressed_bytes,
-            expanded_bytes: config.expanded_bytes,
-            files: config.archive_files,
-        },
-    )?);
+    let cache = Arc::new(
+        CacheStore::open(
+            "/var/lib/attune/launch".into(),
+            CacheLimits {
+                compressed_bytes: config.compressed_bytes,
+                expanded_bytes: config.expanded_bytes,
+                files: config.archive_files,
+            },
+        )?
+        .with_artifact_limits(config.artifact_max_total_bytes, config.artifact_max_entries)?,
+    );
     let actuator = Arc::new(
         Actuator::initialize(
             cp.clone(),

@@ -2,6 +2,7 @@
 //! paths are accepted. Bodies are canonical ZIP and extraction never follows
 //! links. All publication is serialized across controller processes sharing the
 //! volume; workload containers see only a selected `body` subdirectory.
+use attune_common::workload_artifact::ArtifactLimits;
 use attune_common::workload_launch::{LaunchManifest, PinnedLaunchInput, Sha256Digest};
 use sha2::{Digest, Sha256};
 use std::{
@@ -30,6 +31,8 @@ pub enum CacheError {
     Zip(#[from] zip::result::ZipError),
     #[error("private attempt directory already exists or is not owned")]
     AttemptConflict,
+    #[error("file artifact publication remains unacknowledged; private staging retained")]
+    ArtifactPending,
 }
 pub type Result<T> = std::result::Result<T, CacheError>;
 
@@ -46,6 +49,7 @@ pub struct CacheStore {
     root: PathBuf,
     limits: CacheLimits,
     workload_owner: WorkloadOwner,
+    artifact_limits: ArtifactLimits,
 }
 #[derive(Clone, Copy)]
 struct WorkloadOwner {
@@ -69,6 +73,12 @@ impl Drop for Lock {
 }
 impl CacheStore {
     pub fn open(root: PathBuf, limits: CacheLimits) -> Result<Self> {
+        // Published inputs must remain custodian-owned, independently of any
+        // workload uid. Only filesystem unit fixtures run under a test owner;
+        // production cannot silently become a same-uid cache custodian.
+        if !cfg!(test) && unsafe { libc::geteuid() } != 0 {
+            return Err(CacheError::UnsafeEntry);
+        }
         if !root.is_absolute()
             || limits.compressed_bytes == 0
             || limits.expanded_bytes == 0
@@ -104,7 +114,21 @@ impl CacheStore {
                 uid: 1000,
                 gid: 1000,
             },
+            artifact_limits: ArtifactLimits::default(),
         })
+    }
+    pub fn with_artifact_limits(mut self, max_total_bytes: u64, max_entries: u64) -> Result<Self> {
+        let limits = ArtifactLimits {
+            max_total_bytes,
+            max_entries,
+        };
+        attune_common::workload_artifact::validate_inventory(&[], limits)
+            .map_err(|_| CacheError::Quota)?;
+        self.artifact_limits = limits;
+        Ok(self)
+    }
+    pub fn artifact_limits(&self) -> ArtifactLimits {
+        self.artifact_limits
     }
     /// Filesystem logic tests run as the CI runner, which need not be uid 1000.
     /// This internal test seam is absent from production and request DTOs; the
@@ -239,6 +263,206 @@ impl CacheStore {
             let output = path.join("pack");
             copy_private(&source, &output, self.workload_owner)?;
         }
+        Ok(())
+    }
+    /// File-backed artifact transport is separate from runtime publication.
+    /// The fixed private subpath is not activated by the Engine builder until
+    /// the CP artifact grant/state contract is integrated; never discard it as
+    /// ordinary scratch or infer a publication ACK from process exit.
+    pub fn prepare_artifact_staging(&self, manifest: &LaunchManifest) -> Result<()> {
+        use attune_common::workload_launch::LaunchPurpose;
+        if !matches!(
+            manifest.purpose,
+            LaunchPurpose::Action | LaunchPurpose::Sensor | LaunchPurpose::CandidateTest
+        ) {
+            return Err(CacheError::PinMismatch);
+        }
+        let _lock = self.lock()?;
+        let parent = self
+            .root
+            .join(format!("private/{}", manifest.engine_name_nonce.simple()));
+        let metadata = fs::symlink_metadata(&parent)?;
+        if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(CacheError::UnsafeEntry);
+        }
+        let directory = parent.join("artifacts");
+        fs::create_dir(&directory)?;
+        make_workload_owned(&directory, self.workload_owner)?;
+        let marker = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(parent.join("artifact.pending"))?;
+        marker.sync_all()?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+    /// The relative path must come from an exact CP-issued file-version grant,
+    /// never a frontend path/selector. Caller must hold retained artifact
+    /// publication authority; Stopped alone is not file-upload authorization.
+    pub fn open_settled_artifact(
+        &self,
+        manifest: &LaunchManifest,
+        status: &attune_common::workload_launch::LaunchStatus,
+        relative: &str,
+    ) -> Result<File> {
+        use attune_common::artifact_transport::ValidatedRelativePath;
+        use attune_common::workload_launch::{LaunchPurpose, LaunchState};
+        if !matches!(
+            manifest.purpose,
+            LaunchPurpose::Action | LaunchPurpose::Sensor | LaunchPurpose::CandidateTest
+        ) || status.validate_shape().is_err()
+            || status.state != LaunchState::Stopped
+            || status.request.launch_id != manifest.launch_id
+            || status.request.admitted_digest
+                != manifest
+                    .admitted_digest()
+                    .map_err(|_| CacheError::PinMismatch)?
+        {
+            return Err(CacheError::PinMismatch);
+        }
+        ValidatedRelativePath::new(relative).map_err(|_| CacheError::UnsafeEntry)?;
+        let _lock = self.lock()?;
+        let root = self.root.join(format!(
+            "private/{}/artifacts",
+            manifest.engine_name_nonce.simple()
+        ));
+        self.validate_artifact_tree(&root)?;
+        let mut path = root;
+        let components = Path::new(relative).components().collect::<Vec<_>>();
+        for (index, component) in components.iter().enumerate() {
+            if !matches!(component, std::path::Component::Normal(_)) {
+                return Err(CacheError::UnsafeEntry);
+            }
+            path.push(component.as_os_str());
+            let metadata = fs::symlink_metadata(&path)?;
+            if index + 1 < components.len() && !metadata.is_dir() {
+                return Err(CacheError::UnsafeEntry);
+            }
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.len() > self.artifact_limits.max_total_bytes
+        {
+            return Err(CacheError::UnsafeEntry);
+        }
+        Ok(file)
+    }
+    fn validate_artifact_tree(&self, root: &Path) -> Result<()> {
+        let root_metadata = fs::symlink_metadata(root)?;
+        if !root_metadata.is_dir() {
+            return Err(CacheError::UnsafeEntry);
+        }
+        let mut directories = vec![root.to_path_buf()];
+        let (mut files, mut bytes) = (0u64, 0u64);
+        while let Some(directory) = directories.pop() {
+            for entry in fs::read_dir(directory)? {
+                let entry = entry?;
+                let metadata = fs::symlink_metadata(entry.path())?;
+                files = files.checked_add(1).ok_or(CacheError::Quota)?;
+                if files > self.artifact_limits.max_entries {
+                    return Err(CacheError::Quota);
+                }
+                if metadata.is_dir() {
+                    directories.push(entry.path());
+                } else if metadata.is_file() && metadata.nlink() == 1 {
+                    bytes = bytes.checked_add(metadata.len()).ok_or(CacheError::Quota)?;
+                    if bytes > self.artifact_limits.max_total_bytes {
+                        return Err(CacheError::Quota);
+                    }
+                } else {
+                    return Err(CacheError::UnsafeEntry);
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Only pass a receipt decoded from the authenticated CP artifact protocol,
+    /// never a frontend body or a locally synthesized terminal state. Persist
+    /// settlement before deleting the owned stage so crash/lost-ACK recovery
+    /// cannot recreate publication authority or infer an unknown PUT absent.
+    pub fn cleanup_artifact_staging(
+        &self,
+        manifest: &LaunchManifest,
+        status: &attune_common::workload_launch::LaunchStatus,
+        receipt: &attune_common::workload_artifact::ArtifactPublicationReceipt,
+    ) -> Result<()> {
+        use attune_common::workload_artifact::ArtifactPublicationState;
+        use attune_common::workload_launch::{LaunchPurpose, LaunchState};
+        if !matches!(
+            manifest.purpose,
+            LaunchPurpose::Action | LaunchPurpose::Sensor | LaunchPurpose::CandidateTest
+        ) || status.validate_shape().is_err()
+            || status.state != LaunchState::Stopped
+            || status.request.launch_id != manifest.launch_id
+            || status.request.admitted_digest
+                != manifest
+                    .admitted_digest()
+                    .map_err(|_| CacheError::PinMismatch)?
+            || receipt.request != status.request
+            || receipt.publication_id <= 0
+            || receipt.cleanup_receipt_id <= 0
+            || !matches!(
+                receipt.state,
+                ArtifactPublicationState::Complete | ArtifactPublicationState::Incomplete
+            )
+        {
+            return Err(CacheError::PinMismatch);
+        }
+        let _lock = self.lock()?;
+        let evidence = self.root.join("artifacts-settled");
+        fs::create_dir_all(&evidence)?;
+        let name = manifest.engine_name_nonce.simple().to_string();
+        let destination = evidence.join(&name);
+        let bytes = serde_json::to_vec(receipt).map_err(|_| CacheError::PinMismatch)?;
+        match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&destination)
+        {
+            Ok(mut file) => {
+                let metadata = file.metadata()?;
+                if !metadata.is_file()
+                    || metadata.nlink() != 1
+                    || metadata.uid() != unsafe { libc::geteuid() }
+                    || metadata.len() > 8192
+                {
+                    return Err(CacheError::UnsafeEntry);
+                }
+                let mut previous = Vec::new();
+                file.read_to_end(&mut previous)?;
+                if previous != bytes {
+                    return Err(CacheError::PinMismatch);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let mut pending = tempfile::NamedTempFile::new_in(&evidence)?;
+                use std::io::Write;
+                pending.write_all(&bytes)?;
+                pending.as_file().sync_all()?;
+                pending
+                    .persist_noclobber(&destination)
+                    .map_err(|error| error.error)?;
+                File::open(&evidence)?.sync_all()?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let directory = self.root.join("private").join(name);
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.is_dir() && metadata.uid() == unsafe { libc::geteuid() } => {
+                fs::remove_dir_all(&directory)?
+            }
+            Ok(_) => return Err(CacheError::UnsafeEntry),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        File::open(self.root.join("private"))?.sync_all()?;
         Ok(())
     }
     /// Admission budget, not a live filesystem quota. Concurrent/stale writers
@@ -385,6 +609,11 @@ impl CacheStore {
         let path = self
             .root
             .join(format!("private/{}", manifest.engine_name_nonce.simple()));
+        match fs::symlink_metadata(path.join("artifact.pending")) {
+            Ok(_) => return Err(CacheError::ArtifactPending),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path)?,
             Ok(_) => return Err(CacheError::AttemptConflict),
@@ -1046,5 +1275,120 @@ mod tests {
             .cleanup_settled_private(&spec.manifest, &status)
             .unwrap();
         assert!(!stage.exists());
+    }
+    #[test]
+    fn private_artifacts_require_settlement_and_reject_escape_aliases_and_unacked_cleanup() {
+        use attune_common::workload_launch::*;
+        let root = tempfile::tempdir().unwrap();
+        let store = CacheStore::open(
+            root.path().into(),
+            CacheLimits {
+                compressed_bytes: 1024,
+                expanded_bytes: 32,
+                files: 4,
+            },
+        )
+        .unwrap()
+        .with_artifact_limits(32, 4)
+        .unwrap()
+        .for_current_test_user();
+        let spec = crate::test_support::spec(format!("sha256:{}", "a".repeat(64)));
+        store.prepare_private(&spec.manifest).unwrap();
+        store.prepare_artifact_staging(&spec.manifest).unwrap();
+        let directory = root.path().join(format!(
+            "private/{}/artifacts",
+            spec.manifest.engine_name_nonce.simple()
+        ));
+        fs::write(directory.join("result"), b"owned-file").unwrap();
+        // A filesystem fixture, not a CP authorization/removal proof.
+        let digest = spec.manifest.admitted_digest().unwrap();
+        let mut status = LaunchStatus {
+            request: LaunchRequest {
+                launch_id: spec.manifest.launch_id,
+                admitted_digest: digest.clone(),
+            },
+            state: LaunchState::Stopped,
+            runtime_state: LaunchRuntimeState::Exited,
+            exit_outcome: Some(LaunchExitOutcome {
+                exit_code: 0,
+                oom_killed: false,
+            }),
+            publication: LaunchPublicationState::NotRequired,
+            capture: LaunchCaptureState::Complete,
+            capture_deadline: None,
+            resource: Some(EngineResourceEvidence {
+                engine_id: spec.manifest.engine_id,
+                resource_id: "b".repeat(64),
+                engine_name_nonce: spec.manifest.engine_name_nonce,
+                admitted_digest: digest,
+                public_manifest_digest: Sha256Digest::of_bytes(b"fixture"),
+            }),
+            stop_reason: None,
+        };
+        let mut bytes = Vec::new();
+        store
+            .open_settled_artifact(&spec.manifest, &status, "result")
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"owned-file");
+        fs::write(directory.join("empty"), []).unwrap();
+        assert_eq!(
+            store
+                .open_settled_artifact(&spec.manifest, &status, "empty")
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(matches!(
+            store.cleanup_settled_private(&spec.manifest, &status),
+            Err(CacheError::ArtifactPending)
+        ));
+        assert!(directory.join("result").exists());
+        assert!(store
+            .open_settled_artifact(&spec.manifest, &status, "../other-attempt")
+            .is_err());
+        status.state = LaunchState::Created;
+        assert!(store
+            .open_settled_artifact(&spec.manifest, &status, "result")
+            .is_err());
+        status.state = LaunchState::Stopped;
+        std::os::unix::fs::symlink("result", directory.join("alias")).unwrap();
+        assert!(store
+            .open_settled_artifact(&spec.manifest, &status, "result")
+            .is_err());
+        fs::remove_file(directory.join("alias")).unwrap();
+        fs::hard_link(directory.join("result"), directory.join("alias")).unwrap();
+        assert!(store
+            .open_settled_artifact(&spec.manifest, &status, "result")
+            .is_err());
+        fs::remove_file(directory.join("alias")).unwrap();
+        fs::write(directory.join("large"), [0; 33]).unwrap();
+        assert!(matches!(
+            store.open_settled_artifact(&spec.manifest, &status, "result"),
+            Err(CacheError::Quota)
+        ));
+        let mut receipt = attune_common::workload_artifact::ArtifactPublicationReceipt {
+            request: status.request.clone(),
+            publication_id: 1,
+            state: attune_common::workload_artifact::ArtifactPublicationState::Incomplete,
+            cleanup_receipt_id: 0,
+        };
+        assert!(store
+            .cleanup_artifact_staging(&spec.manifest, &status, &receipt)
+            .is_err());
+        assert!(directory.exists());
+        receipt.cleanup_receipt_id = 2;
+        store
+            .cleanup_artifact_staging(&spec.manifest, &status, &receipt)
+            .unwrap();
+        assert!(!directory.exists());
+        // Same authenticated historical receipt can finish local cleanup again;
+        // it grants no upload, allocation or new container creation authority.
+        store
+            .cleanup_artifact_staging(&spec.manifest, &status, &receipt)
+            .unwrap();
     }
 }
