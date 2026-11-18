@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+pub(crate) use compiler::compile_action_input;
 pub use compiler::{check_local_graph, compile, compile_inline, inspect_definition};
 pub use runtime::{AuthoringReport, CompiledContract};
 

@@ -7,6 +7,7 @@ use super::{
     check_json, digest, error, pointer, Contract, ErrorCode, Limits, Result, COMPILER_CONTRACT,
 };
 
+mod action_cli;
 mod authoring;
 pub use authoring::AuthoringReport;
 

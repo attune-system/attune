@@ -18,6 +18,7 @@ const ANNOTATIONS: &[&str] = &[
     "examples",
     "position",
     "secret",
+    "cli",
 ];
 const ASSERTIONS: &[&str] = &[
     "type",
@@ -64,6 +65,7 @@ struct Compiler<'a> {
     schema_nodes: usize,
     source_ref: String,
     allow_candidates: bool,
+    action_cli_paths: BTreeSet<String>,
 }
 
 /// Check a current inline definition without claiming an executable-release pin.
@@ -107,6 +109,7 @@ pub fn inspect_definition(
         schema_nodes: 0,
         source_ref: "authored".into(),
         allow_candidates: true,
+        action_cli_paths: BTreeSet::new(),
     };
     compiler.add_document("authored", authored.clone(), context)?;
     let document = &compiler.documents["authored"];
@@ -195,6 +198,7 @@ pub fn check_local_graph(definitions: &BTreeMap<String, Value>, limits: Limits) 
         schema_nodes: 0,
         source_ref: "authored".into(),
         allow_candidates: true,
+        action_cli_paths: BTreeSet::new(),
     };
     for (type_ref, schema) in definitions {
         inspect_definition(SchemaContext::SingleValue, schema, limits)?;
@@ -320,7 +324,35 @@ pub fn compile(
     limits: Limits,
 ) -> Result<Contract> {
     let source_ref = source.component_ref().to_owned();
-    compile_inner(source, context, authored, registry, limits).map_err(|mut failure| {
+    compile_inner(source, context, authored, registry, limits, BTreeSet::new()).map_err(
+        |mut failure| {
+            if failure.source_ref.is_none() {
+                failure.source_ref = Some(source_ref);
+            }
+            failure
+        },
+    )
+}
+
+/// Only the action argument planner supplies explicitly authored binding paths.
+/// Ordinary schema consumers and reusable type documents cannot opt in.
+pub(crate) fn compile_action_input(
+    source: SourceIdentity,
+    authored: &Value,
+    registry: &RegistryView,
+    limits: Limits,
+    action_cli_paths: BTreeSet<String>,
+) -> Result<Contract> {
+    let source_ref = source.component_ref().to_owned();
+    compile_inner(
+        source,
+        SchemaContext::FlatDocument,
+        authored,
+        registry,
+        limits,
+        action_cli_paths,
+    )
+    .map_err(|mut failure| {
         if failure.source_ref.is_none() {
             failure.source_ref = Some(source_ref);
         }
@@ -334,6 +366,7 @@ fn compile_inner(
     authored: &Value,
     registry: &RegistryView,
     limits: Limits,
+    action_cli_paths: BTreeSet<String>,
 ) -> Result<Contract> {
     check_json(authored, limits, limits.max_source_bytes)?;
     let mut compiler = Compiler {
@@ -348,6 +381,7 @@ fn compile_inner(
         schema_nodes: 0,
         source_ref: source.component_ref().to_owned(),
         allow_candidates: matches!(source, SourceIdentity::Authoring { .. }),
+        action_cli_paths,
     };
     // A distinct document key prevents a type from sharing the author's local scope.
     let document = "authored".to_string();
@@ -471,7 +505,7 @@ impl Compiler<'_> {
         }
         let mut positions = BTreeSet::new();
         match context {
-            SchemaContext::SingleValue => self.index(&schema, "", &mut positions, 0)?,
+            SchemaContext::SingleValue => self.index(&schema, "", &mut positions, 0, key)?,
             SchemaContext::FlatDocument => {
                 let fields = schema
                     .as_object_mut()
@@ -486,7 +520,7 @@ impl Compiler<'_> {
                     if field.get("required").is_some_and(Value::is_boolean) {
                         field.remove("required");
                     }
-                    self.index(&Value::Object(field.clone()), &path, &mut positions, 1)?;
+                    self.index(&Value::Object(field.clone()), &path, &mut positions, 1, key)?;
                 }
             }
         }
@@ -501,6 +535,7 @@ impl Compiler<'_> {
         path: &str,
         positions: &mut BTreeSet<String>,
         depth: usize,
+        document_key: &str,
     ) -> Result<()> {
         self.schema_nodes += 1;
         if depth > self.limits.max_depth || self.schema_nodes > self.limits.max_schema_nodes {
@@ -515,12 +550,23 @@ impl Compiler<'_> {
             .ok_or_else(|| error(ErrorCode::InvalidDefinition, path))?;
         for (keyword, value) in map {
             let child_path = pointer(path, keyword);
+            if keyword == "cli"
+                && (document_key != "authored" || !self.action_cli_paths.contains(path))
+            {
+                return Err(error(ErrorCode::UnsupportedKeyword, child_path));
+            }
             if MAP_SCHEMAS.contains(&keyword.as_str()) {
                 let children = value
                     .as_object()
                     .ok_or_else(|| error(ErrorCode::InvalidDefinition, &child_path))?;
                 for (name, child) in children {
-                    self.index(child, &pointer(&child_path, name), positions, depth + 1)?;
+                    self.index(
+                        child,
+                        &pointer(&child_path, name),
+                        positions,
+                        depth + 1,
+                        document_key,
+                    )?;
                 }
             } else if ARRAY_SCHEMAS.contains(&keyword.as_str()) {
                 let children = value
@@ -532,10 +578,11 @@ impl Compiler<'_> {
                         &pointer(&child_path, &index.to_string()),
                         positions,
                         depth + 1,
+                        document_key,
                     )?;
                 }
             } else if SINGLE_SCHEMAS.contains(&keyword.as_str()) {
-                self.index(value, &child_path, positions, depth + 1)?;
+                self.index(value, &child_path, positions, depth + 1, document_key)?;
             } else if !ANNOTATIONS.contains(&keyword.as_str())
                 && !ASSERTIONS.contains(&keyword.as_str())
                 && !matches!(keyword.as_str(), "$ref" | "$schema" | "format")
@@ -865,6 +912,13 @@ fn check_overrides(map: &Map<String, Value>, reference_keyword: &str, path: &str
 
 fn node_id(location: &Location) -> Result<String> {
     digest(&(&location.document, &location.path))
+}
+
+pub(super) fn authored_node_id(path: &str) -> Result<String> {
+    node_id(&Location {
+        document: "authored".into(),
+        path: path.into(),
+    })
 }
 
 fn reference(location: &Location) -> Result<Value> {
