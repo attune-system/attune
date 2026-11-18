@@ -42,6 +42,9 @@ async fn create_pack_with_action(
     let action = ActionRepository::create(
         &ctx.pool,
         CreateActionInput {
+            launch: None,
+            parameter_delivery: None,
+            parameter_format: None,
             output_policy: Default::default(),
             output_format: Default::default(),
             r#ref: action_ref.to_string(),
@@ -49,7 +52,7 @@ async fn create_pack_with_action(
             pack_ref: pack.r#ref.clone(),
             label: format!("Action {}", action_ref),
             description: Some("Queue dispatch action".to_string()),
-            entrypoint: "main.py".to_string(),
+            entrypoint: Some("main.py".to_string()),
             runtime: None,
             enabled: true,
             runtime_version_constraint: None,

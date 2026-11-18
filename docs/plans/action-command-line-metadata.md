@@ -2,23 +2,36 @@
 
 ## Status and scope
 
-Status: implementation in progress; not available for execution. This document
-records the agreed metadata shape and the complete target contract. Examples
-using these fields are not descriptions of current production support.
+Status: integrated in PR #83; validation and review are tracked in the PR.
 
-The first implementation slice lives in `crates/common/src/action_cli/`. Its
-opt-in `ArgumentPlan::compile` validates parameter annotations and fixed literal
-entries against a captured type view. It retains CLI metadata in the shared
-compiled contract and derives bounded, secret-aware argv and stdin JSON through
-`ArgumentPlan::materialize`. Defaults remain an admission concern; materialization
-does not reapply them. Tests live in `crates/common/tests/action_cli_tests.rs`.
+The shared `crates/common/src/action_cli/` module validates CLI annotations,
+retains them in immutable schema contracts, derives definition-only previews,
+and materializes bounded argv after authorized input restoration. Action
+repositories, registration, archive checks, API DTOs, CLI/MCP and web authoring
+preserve the metadata. Schema binding uses admitted named-type revisions;
+defaults remain an admission concern and are not reapplied by the worker.
 
-Production schema entry points still reject `cli`; no action/launch storage,
-registration, API, scheduler capability, worker, or agent path enables this
-format yet. Installed-program resolution and real process integration remain
-unimplemented. Neither the helper nor a compiler preview establishes execution
-authority. The incorporation and acceptance sections below remain outstanding
-for end-to-end delivery.
+The worker and injected agent share native execution with a cleared child
+environment, pinned release working directory, explicit stdin policy, and
+existing output/cancellation/log handling. Supporting Linux workers advertise
+`action_cli_arguments_v1`. Executable path, digest, native artifact and variant
+are recorded separately in `execution_program_selection`, keyed by the existing
+worker attempt; no argv or input values are stored there. The table is removed
+with its execution and does not change execution history or authority.
+
+Installed tools resolve from the selected startup baseline PATH, excluding
+empty/relative entries, then are canonicalized and hashed. Packaged binaries
+are selected from the pinned release manifest and checked for consumer,
+platform, executable intent, confinement and content digest. Both paths are
+verified again immediately before launching. Deployments must protect tool
+files/directories and release materialization against concurrent replacement;
+these checks do not remove that operating-system boundary.
+
+Storage uses the forward migration
+`migrations/20261118000001_action_command_launch.sql`. Applied migration bytes
+and stored snapshots are preserved; this feature requires no database reset.
+All typed native/command sources use the worker capability gate, including
+argument-free native artifacts, because older workers lack this source handler.
 
 The current scalar/flag/array domain checks conservatively require an explicit
 resolved `type` at the selected schema node (and scalar item nodes when expanding
@@ -151,7 +164,10 @@ absolute Linux path. Relative paths such as `./tool` and `bin/tool` MUST be
 rejected. A bare name MUST resolve using the worker's selected baseline `PATH`,
 excluding empty and relative search entries; caller-controlled environment
 values and the working directory MUST NOT participate in that search. Resolution
-MUST produce an absolute executable regular-file target before spawning.
+MUST produce an absolute executable regular-file target before spawning. Preserve
+the static invocation spelling as `argv[0]` for installed multicall tools; this
+is derived from `program` and is never an execution input. Budgets cover the
+longer of that spelling and the canonical executable path.
 The worker MUST NOT fall back to a shell, download a missing program, or use
 another executable when resolution fails.
 
@@ -650,9 +666,9 @@ applicable; they need not be recoded when they fail before argument planning.
 
 ## Incorporation and rollout requirements
 
-Current code has part of the typed launch format in archive validation, while
-action registration and worker execution still primarily use entry points. This
-feature requires end-to-end launch plumbing, not only a new schema annotation.
+The integration extends typed archive launches through action registration and
+worker execution. It requires end-to-end launch plumbing, including the schema
+annotation and every immutable admission path.
 
 Implementation MUST update:
 

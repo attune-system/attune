@@ -72,3 +72,97 @@ describe("action output policy editing", () => {
     );
   });
 });
+
+describe("binary launch editing", () => {
+  const parameters = {
+    output: {
+      type: "string",
+      default: "out file",
+      cli: { kind: "positional", order: 20 },
+    },
+  };
+  const launch = {
+    type: "command",
+    program: "tool",
+    arguments: [{ literal: "generate", order: 0 }],
+  };
+  const binary = {
+    ...action,
+    entrypoint: null,
+    launch,
+    parameter_delivery: "none",
+    parameter_format: "json",
+    param_schema: parameters,
+  } as ActionResponse;
+
+  it("preserves launch, static tokens and CLI bindings through unrelated edits", async () => {
+    render(<ConfigureActionModal action={binary} onClose={() => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: "Save Defaults" }));
+    await waitFor(() => expect(api.save).toHaveBeenCalled());
+    expect(api.save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          entrypoint: null,
+          launch,
+          param_schema: parameters,
+          parameter_delivery: "none",
+          parameter_format: "json",
+        }),
+      }),
+    );
+  });
+
+  it("clears the binary source explicitly when selecting an entry point", async () => {
+    render(<ConfigureActionModal action={binary} onClose={() => {}} />);
+    fireEvent.click(screen.getByLabelText("Use a binary launch"));
+    fireEvent.change(screen.getByLabelText("Entry Point"), {
+      target: { value: "run" },
+    });
+    fireEvent.change(screen.getByLabelText("Input parameter schema (JSON)"), {
+      target: { value: "{}" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save Defaults" }));
+    await waitFor(() => expect(api.save).toHaveBeenCalled());
+    expect(api.save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          entrypoint: "run",
+          launch: null,
+          param_schema: {},
+          parameter_delivery: "stdin",
+        }),
+      }),
+    );
+  });
+
+  it("preserves non-CLI native file delivery and format", async () => {
+    const fileNative = {
+      ...binary,
+      launch: { type: "native", artifact: "tool", arguments: [] },
+      param_schema: {},
+      parameter_delivery: "file",
+      parameter_format: "yaml",
+    } as ActionResponse;
+    render(<ConfigureActionModal action={fileNative} onClose={() => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: "Save Defaults" }));
+    await waitFor(() => expect(api.save).toHaveBeenCalled());
+    expect(api.save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          parameter_delivery: "file",
+          parameter_format: "yaml",
+        }),
+      }),
+    );
+  });
+
+  it("rejects unsupported source fields without saving a partial replacement", async () => {
+    render(<ConfigureActionModal action={binary} onClose={() => {}} />);
+    fireEvent.change(screen.getByLabelText("Binary launch (JSON)"), {
+      target: { value: JSON.stringify({ ...launch, extra_args: [] }) },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save Defaults" }));
+    await screen.findByText("Launch contains unsupported fields");
+    expect(api.save).not.toHaveBeenCalled();
+  });
+});

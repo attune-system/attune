@@ -69,6 +69,9 @@ impl Fixture {
         let action = ActionRepository::create(
             db.pool(),
             CreateActionInput {
+                launch: None,
+                parameter_delivery: None,
+                parameter_format: None,
                 output_policy: Default::default(),
                 output_format: Default::default(),
                 r#ref: format!("{}.run", pack.r#ref),
@@ -76,7 +79,7 @@ impl Fixture {
                 pack_ref: pack.r#ref.clone(),
                 label: "Run".into(),
                 description: None,
-                entrypoint: "run.py".into(),
+                entrypoint: Some("run.py".into()),
                 runtime: None,
                 enabled: true,
                 runtime_version_constraint: None,

@@ -90,7 +90,14 @@ pub enum RuntimeError {
 }
 
 /// Action execution context
+pub struct NativeInvocation {
+    pub selected: attune_common::action_cli::SelectedProgram,
+    pub input: Option<attune_common::action_cli::PreparedArguments>,
+}
+
 pub struct ExecutionContext {
+    /// Prepared only from the immutable admitted launch/schema and protected origins.
+    pub native_invocation: Option<NativeInvocation>,
     /// Execution ID
     pub execution_id: i64,
 
@@ -210,6 +217,7 @@ impl ExecutionContext {
     pub fn test_context(action_ref: String, code: Option<String>) -> Self {
         use std::collections::HashMap;
         Self {
+            native_invocation: None,
             execution_id: 1,
             action_ref,
             parameters: HashMap::new(),

@@ -914,7 +914,7 @@ fn node_id(location: &Location) -> Result<String> {
     digest(&(&location.document, &location.path))
 }
 
-pub(super) fn authored_node_id(path: &str) -> Result<String> {
+pub(crate) fn authored_node_id(path: &str) -> Result<String> {
     node_id(&Location {
         document: "authored".into(),
         path: path.into(),

@@ -73,6 +73,7 @@ pub struct ActionExecutor {
     #[cfg(unix)]
     log_delivery: tokio::sync::OnceCell<Arc<crate::log_delivery::LogDeliveryManager>>,
     pool: PgPool,
+    child_environment: attune_common::child_process_environment::ChildProcessEnvironment,
     runtime_registry: RuntimeRegistry,
     artifact_manager: ArtifactManager,
     secret_manager: SecretManager,
@@ -330,6 +331,14 @@ impl ActionExecutor {
         Ok(self)
     }
 
+    pub fn with_child_environment(
+        mut self,
+        environment: attune_common::child_process_environment::ChildProcessEnvironment,
+    ) -> Self {
+        self.child_environment = environment;
+        self
+    }
+
     /// Create a new action executor
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -358,6 +367,7 @@ impl ActionExecutor {
             #[cfg(unix)]
             log_delivery: tokio::sync::OnceCell::new(),
             pool,
+            child_environment: Default::default(),
             runtime_registry,
             artifact_manager,
             secret_manager,
@@ -1197,7 +1207,7 @@ impl ActionExecutor {
         let secrets = HashMap::new();
 
         // Determine entry point from action
-        let entry_point = action.entrypoint.clone();
+        let entry_point = action.entrypoint.clone().unwrap_or_default();
 
         // Effective execution timeout resolved from execution.timeout_seconds
         // (snapshotted at creation) with defensive fallbacks for legacy rows.
@@ -1234,7 +1244,14 @@ impl ActionExecutor {
             None
         };
 
-        let runtime_name = runtime_record.as_ref().map(|r| r.name.to_lowercase());
+        let runtime_name = runtime_record.as_ref().map(|runtime| {
+            if action.launch.is_some() {
+                normalize_runtime_name(&runtime.name)
+            } else {
+                // File runtimes are registered under their lowercased DB labels.
+                runtime.name.to_lowercase()
+            }
+        });
 
         // --- Runtime Version Resolution ---
         // If the action declares a runtime_version_constraint (e.g., ">=3.12"),
@@ -1269,7 +1286,9 @@ impl ActionExecutor {
 
         // Construct code_path for pack actions
         // Pack actions have their script files in packs/{pack_ref}/actions/{entrypoint}
-        let code_path = if action.pack_ref.starts_with("core") || !action.is_adhoc {
+        let code_path = if action.launch.is_some() {
+            None
+        } else if action.pack_ref.starts_with("core") || !action.is_adhoc {
             // This is a pack action, construct the file path
             let action_file_path = pack_dir.join("actions").join(&entry_point);
 
@@ -1329,7 +1348,130 @@ impl ActionExecutor {
         // The ProcessRuntime also does this internally, but setting it in the
         // context allows the executor to override if needed.
         let working_dir: Option<StdPathBuf> = if pack_dir.exists() {
-            Some(pack_dir)
+            Some(if action.launch.is_some() {
+                tokio::fs::canonicalize(pack_dir).await.map_err(|_| {
+                    Error::Validation("action.launch.program_unavailable: Pinned release directory is unavailable".into())
+                })?
+            } else {
+                pack_dir
+            })
+        } else {
+            None
+        };
+        let native_invocation = if let Some(launch) = &action.launch {
+            let snapshot = execution.executable_snapshot.as_ref().ok_or_else(|| {
+                Error::Validation("Command launch requires an admitted executable snapshot".into())
+            })?;
+            launch.validate_action_source(
+                action.entrypoint.as_deref(),
+                action.parameter_delivery,
+                action.parameter_format,
+            )?;
+            if runtime_name.as_deref() != Some("native") {
+                return Err(Error::Validation(
+                    "Command launch requires a native runtime".into(),
+                ));
+            }
+            let root = working_dir.clone().ok_or_else(|| {
+                Error::Validation(
+                    "action.launch.program_unavailable: Pinned release directory is unavailable"
+                        .into(),
+                )
+            })?;
+            let release =
+                attune_common::repositories::pack_release::PackReleaseRepository::find_by_id(
+                    &self.pool,
+                    snapshot.release.id,
+                )
+                .await?
+                .filter(|release| {
+                    release.digest == snapshot.release.digest && release.pack_ref == action.pack_ref
+                })
+                .ok_or_else(|| {
+                    Error::Validation(
+                        "action.launch.program_unavailable: Pinned command release is unavailable"
+                            .into(),
+                    )
+                })?;
+            let manifest = if matches!(
+                launch,
+                attune_common::pack_format::LaunchSpec::Native { .. }
+            ) {
+                Some(
+                    serde_json::from_value::<attune_common::pack_format::Manifest>(
+                        release.manifest,
+                    )
+                    .map_err(|_| Error::Validation("Invalid pinned release manifest".into()))?,
+                )
+            } else {
+                None
+            };
+            let launch_copy = launch.clone();
+            let reference = action.r#ref.clone();
+            let environment = self.child_environment.clone();
+            let selected = tokio::task::spawn_blocking(move || {
+                attune_common::action_cli::select_program(
+                    &launch_copy,
+                    &root,
+                    manifest.as_ref(),
+                    &reference,
+                    &environment,
+                )
+            })
+            .await
+            .map_err(|_| Error::Validation("Program selection task failed".into()))??;
+            let empty = serde_json::json!({});
+            let plan = attune_common::action_cli::ArgumentPlan::from_bound_contract(
+                action.param_schema.as_ref().unwrap_or(&empty),
+                launch.action_arguments()?,
+                binding.input.clone(),
+            )
+            .map_err(|error| Error::Validation(error.to_string()))?;
+            let schema = action.param_schema.as_ref().unwrap_or(&empty);
+            let cli_enabled = matches!(
+                launch,
+                attune_common::pack_format::LaunchSpec::Command { .. }
+            ) || !launch.action_arguments()?.is_empty()
+                || attune_common::action_cli::schema_for_binding(schema)
+                    .map_err(|error| Error::Validation(error.to_string()))?
+                    != *schema
+                || action.parameter_delivery == attune_common::models::ParameterDelivery::None;
+            let input = if cli_enabled {
+                let delivery = match action.parameter_delivery {
+                    attune_common::models::ParameterDelivery::None => {
+                        attune_common::action_cli::InputDelivery::None
+                    }
+                    attune_common::models::ParameterDelivery::Stdin => {
+                        attune_common::action_cli::InputDelivery::Stdin
+                    }
+                    _ => {
+                        return Err(Error::Validation(
+                            "Unsupported command input delivery".into(),
+                        ))
+                    }
+                };
+                let input = plan
+                    .materialize(
+                        selected.argument_budget_program()?,
+                        &serde_json::to_value(&parameters)?,
+                        preparation.parameter_secret_paths.as_deref().unwrap_or(&[]),
+                        delivery,
+                        attune_common::action_cli::ArgumentLimits::default(),
+                    )
+                    .map_err(|error| Error::Validation(error.to_string()))?;
+                Some(input)
+            } else {
+                None
+            };
+            attune_common::repositories::execution_program::ExecutionProgramRepository::record(
+                &self.pool,
+                execution.id,
+                self.worker_id.load(Ordering::Acquire),
+                snapshot.release.id,
+                &selected,
+            )
+            .await?;
+            Some(crate::runtime::NativeInvocation { selected, input })
         } else {
             None
         };
@@ -1338,6 +1480,7 @@ impl ActionExecutor {
             .await?;
 
         let context = ExecutionContext {
+            native_invocation,
             execution_id: execution.id,
             action_ref: execution.action_ref.clone(),
             parameters,

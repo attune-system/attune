@@ -114,6 +114,19 @@ impl ChildProcessEnvironment {
         self.workload_sandbox.wrap(command, read_paths)
     }
 
+    pub fn sandbox_workload_with_invocation_name(
+        &self,
+        command: Command,
+        read_paths: &[&std::path::Path],
+        invocation_name: Option<&str>,
+    ) -> std::io::Result<Command> {
+        self.workload_sandbox.wrap_with_invocation_name(
+            command,
+            read_paths,
+            invocation_name.map(std::ffi::OsStr::new),
+        )
+    }
+
     pub fn get(&self, name: &str) -> Option<&OsStr> {
         #[cfg(windows)]
         {

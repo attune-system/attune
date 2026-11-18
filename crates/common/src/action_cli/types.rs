@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// One immutable token, ordered together with the parameter bindings.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LiteralArgument {
     pub literal: String,
@@ -9,7 +9,7 @@ pub struct LiteralArgument {
 }
 
 /// Action-input annotation; values and their paths are never duplicated here.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CliBinding {
     Positional {
@@ -91,7 +91,7 @@ impl CliBinding {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Encoding {
     #[default]
@@ -99,7 +99,7 @@ pub enum Encoding {
     Json,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OptionStyle {
     #[default]
@@ -108,7 +108,7 @@ pub enum OptionStyle {
     Attached,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MissingPolicy {
     #[default]
@@ -116,8 +116,8 @@ pub enum MissingPolicy {
     Error,
 }
 
-/// Future process integration must explicitly select the admitted input route.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// The admitted source explicitly selects the input-document route.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum InputDelivery {
     None,
@@ -142,7 +142,7 @@ impl Default for ArgumentLimits {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, utoipa::ToSchema)]
 pub enum ErrorCode {
     InvalidBinding,
     DuplicateOrder,
@@ -184,3 +184,12 @@ pub(super) fn failure(code: ErrorCode, path: impl Into<String>) -> Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Definition-only preview. Contains no execution input or resolved secret value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct ArgumentPreview {
+    pub order: i64,
+    pub literal: Option<String>,
+    pub parameter: Option<String>,
+    pub cli: Option<CliBinding>,
+}

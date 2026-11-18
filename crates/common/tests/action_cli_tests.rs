@@ -669,3 +669,21 @@ fn source_depth_definition_count_and_expansion_have_bounded_work() {
         .unwrap_err();
     assert_eq!(code(error), ErrorCode::LimitExceeded);
 }
+
+#[test]
+fn definition_preview_orders_literals_and_dot_paths_without_input_values() {
+    let schema = json!({"report":{"type":"object","properties":{"output":{"type":"string","cli":{"kind":"option","name":"--output","order":20}}}}});
+    let preview = attune_common::action_cli::describe_arguments(
+        &schema,
+        &[LiteralArgument {
+            literal: "generate".into(),
+            order: 0,
+        }],
+    )
+    .unwrap();
+    assert_eq!(preview.len(), 2);
+    assert_eq!(preview[0].literal.as_deref(), Some("generate"));
+    assert_eq!(preview[1].parameter.as_deref(), Some("report.output"));
+    assert_eq!(preview[1].order, 20);
+    assert!(preview[1].literal.is_none());
+}

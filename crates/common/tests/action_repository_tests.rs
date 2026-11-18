@@ -107,7 +107,7 @@ async fn test_create_action_with_optional_fields() {
         action.description,
         Some("Action with all optional fields".to_string())
     );
-    assert_eq!(action.entrypoint, "custom.py");
+    assert_eq!(action.entrypoint.as_deref(), Some("custom.py"));
     assert!(action.param_schema.is_some());
     assert!(action.out_schema.is_some());
 }
@@ -358,6 +358,9 @@ async fn test_action_foreign_key_constraint() {
 
     // Try to create action with non-existent pack
     let input = CreateActionInput {
+        launch: None,
+        parameter_delivery: None,
+        parameter_format: None,
         output_policy: Default::default(),
         output_format: Default::default(),
         r#ref: "test.action".to_string(),
@@ -365,7 +368,7 @@ async fn test_action_foreign_key_constraint() {
         pack_ref: "nonexistent.pack".to_string(),
         label: "Test Action".to_string(),
         description: Some("Test".to_string()),
-        entrypoint: "main.py".to_string(),
+        entrypoint: Some("main.py".to_string()),
         runtime: None,
         enabled: true,
         runtime_version_constraint: None,

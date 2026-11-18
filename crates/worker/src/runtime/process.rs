@@ -1985,6 +1985,7 @@ mod tests {
         );
 
         let context = ExecutionContext {
+            native_invocation: None,
             execution_id: 1,
             action_ref: "mypack.hello".to_string(),
             parameters: HashMap::new(),
@@ -2027,6 +2028,7 @@ mod tests {
         );
 
         let context = ExecutionContext {
+            native_invocation: None,
             execution_id: 1,
             action_ref: "mypack.hello".to_string(),
             parameters: HashMap::new(),
@@ -2069,6 +2071,7 @@ mod tests {
         );
 
         let context = ExecutionContext {
+            native_invocation: None,
             execution_id: 1,
             action_ref: "mypack.hello".to_string(),
             parameters: HashMap::new(),
@@ -2167,6 +2170,7 @@ mod tests {
         );
 
         let context = ExecutionContext {
+            native_invocation: None,
             execution_id: 1,
             action_ref: "testpack.hello".to_string(),
             parameters: HashMap::new(),
@@ -2233,6 +2237,7 @@ mod tests {
         );
 
         let context = ExecutionContext {
+            native_invocation: None,
             execution_id: 2,
             action_ref: "testpack.hello".to_string(),
             parameters: HashMap::new(),
@@ -2320,6 +2325,7 @@ mod tests {
         );
 
         let context = ExecutionContext {
+            native_invocation: None,
             execution_id: 22,
             action_ref: "testpack.hello".to_string(),
             parameters: HashMap::new(),
@@ -2406,6 +2412,7 @@ mod tests {
         env.insert("PYTHONPATH".to_string(), "/existing/pythonpath".to_string());
 
         let context = ExecutionContext {
+            native_invocation: None,
             execution_id: 3,
             action_ref: "testpack.hello".to_string(),
             parameters: HashMap::new(),
@@ -2455,6 +2462,7 @@ mod tests {
         );
 
         let context = ExecutionContext {
+            native_invocation: None,
             execution_id: 3,
             action_ref: "adhoc.test".to_string(),
             parameters: HashMap::new(),
@@ -2501,6 +2509,7 @@ mod tests {
         );
 
         let context = ExecutionContext {
+            native_invocation: None,
             execution_id: 30,
             action_ref: "adhoc.test_inputs".to_string(),
             parameters: {
@@ -2576,6 +2585,7 @@ mod tests {
 
         // No code_path, no code — should resolve via entry_point
         let context = ExecutionContext {
+            native_invocation: None,
             execution_id: 4,
             action_ref: "testpack.greet".to_string(),
             parameters: HashMap::new(),
@@ -2792,6 +2802,7 @@ mod tests {
             .with_inline_actions_dir(inline_actions_dir.clone()),
         );
         let context = |code: &str| ExecutionContext {
+            native_invocation: None,
             execution_id: 42,
             action_ref: "adhoc.equal_id".to_string(),
             parameters: HashMap::new(),
@@ -2851,6 +2862,7 @@ mod tests {
         );
 
         let context = ExecutionContext {
+            native_invocation: None,
             execution_id: 5,
             action_ref: "testpack.pwd".to_string(),
             parameters: HashMap::new(),

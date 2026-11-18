@@ -146,6 +146,9 @@ async fn ad_hoc_action_snapshots_current_definition_against_active_release() {
     let action = ActionRepository::create(
         &pool,
         CreateActionInput {
+            launch: None,
+            parameter_delivery: None,
+            parameter_format: None,
             output_policy: Default::default(),
             output_format: Default::default(),
             r#ref: action_ref,
@@ -153,7 +156,7 @@ async fn ad_hoc_action_snapshots_current_definition_against_active_release() {
             pack_ref: pack.r#ref.clone(),
             label: "Ad hoc".to_string(),
             description: None,
-            entrypoint: "printf first".to_string(),
+            entrypoint: Some("printf first".to_string()),
             runtime: None,
             enabled: true,
             runtime_version_constraint: None,
@@ -185,7 +188,9 @@ async fn ad_hoc_action_snapshots_current_definition_against_active_release() {
         &pool,
         action.id,
         UpdateActionInput {
-            entrypoint: Some("printf second".to_string()),
+            entrypoint: Some(attune_common::repositories::Patch::Set(
+                "printf second".to_string(),
+            )),
             ..Default::default()
         },
     )
@@ -196,9 +201,15 @@ async fn ad_hoc_action_snapshots_current_definition_against_active_release() {
         .expect("second ad hoc snapshot");
 
     assert_eq!(first.release.id, release.id);
-    assert_eq!(first.executable.action.entrypoint, "printf first");
+    assert_eq!(
+        first.executable.action.entrypoint.as_deref(),
+        Some("printf first")
+    );
     assert_eq!(second.release.id, release.id);
-    assert_eq!(second.executable.action.entrypoint, "printf second");
+    assert_eq!(
+        second.executable.action.entrypoint.as_deref(),
+        Some("printf second")
+    );
 }
 
 #[tokio::test]
@@ -573,7 +584,10 @@ async fn workflow_snapshot_pins_each_action_to_its_defining_release() {
 
     assert_eq!(snapshot.release.id, release_b.id);
     assert_eq!(child_snapshot.release.id, release_a.id);
-    assert_eq!(child_snapshot.executable.action.entrypoint, "child-a.py");
+    assert_eq!(
+        child_snapshot.executable.action.entrypoint.as_deref(),
+        Some("child-a.py")
+    );
 }
 
 #[tokio::test]

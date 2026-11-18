@@ -1,3 +1,5 @@
+import { checkCliOrderPrecision, parseActionLaunch } from "@/lib/action-launch";
+import { ParameterDelivery, ParameterFormat } from "@/api";
 import OutputPolicyEditor from "@/components/common/OutputPolicyEditor";
 import SchemaBuilder from "@/components/common/SchemaBuilder";
 import { isFlatSchema, type FlatSchema } from "@/lib/flat-schema";
@@ -615,7 +617,8 @@ function ActionDetail({ actionRef }: { actionRef: string }) {
                   Entry Point
                 </dt>
                 <dd className="mt-1 text-sm text-gray-900 font-mono">
-                  {action.data?.entrypoint}
+                  {action.data?.entrypoint ??
+                    JSON.stringify(action.data?.launch)}
                 </dd>
               </div>
               <div className="sm:col-span-2">
@@ -1158,7 +1161,25 @@ export function ConfigureActionModal({
 
   const [label, setLabel] = useState(action.label);
   const [description, setDescription] = useState(action.description ?? "");
-  const [entrypoint, setEntrypoint] = useState(action.entrypoint);
+  const [entrypoint, setEntrypoint] = useState(action.entrypoint ?? "");
+  const [runtimeRef, setRuntimeRef] = useState(action.runtime_ref ?? "");
+  const [useLaunch, setUseLaunch] = useState(!!action.launch);
+  const [launchText, setLaunchText] = useState(
+    JSON.stringify(
+      action.launch ?? { type: "command", program: "", arguments: [] },
+      null,
+      2,
+    ),
+  );
+  const [inputSchemaText, setInputSchemaText] = useState(
+    JSON.stringify(action.param_schema ?? {}, null, 2),
+  );
+  const [parameterDelivery, setParameterDelivery] = useState(
+    action.parameter_delivery ?? ParameterDelivery.STDIN,
+  );
+  const [parameterFormat, setParameterFormat] = useState(
+    action.parameter_format ?? ParameterFormat.JSON,
+  );
   const [outputPolicy, setOutputPolicy] = useState<OutputPolicy>(
     action.output_policy ?? {},
   );
@@ -1243,6 +1264,13 @@ export function ConfigureActionModal({
       (affinity.anti_affinity?.length ?? 0) > 0;
 
     try {
+      const parameters: unknown = JSON.parse(inputSchemaText);
+      if (!isFlatSchema(parameters))
+        throw new Error(
+          "Input parameters must use the flat field schema format",
+        );
+      checkCliOrderPrecision(parameters);
+      const launch = useLaunch ? parseActionLaunch(launchText) : null;
       const referenceAllowedPackRefs =
         referenceVisibility === "restricted"
           ? allowedPackRefsText
@@ -1256,7 +1284,10 @@ export function ConfigureActionModal({
         data: {
           label,
           description: description || null,
-          entrypoint,
+          entrypoint: useLaunch ? null : entrypoint,
+          launch,
+          parameter_delivery: parameterDelivery,
+          parameter_format: parameterFormat,
           accesses_mcp: accessesMcp,
           reference_visibility: referenceVisibility,
           reference_allowed_pack_refs: referenceAllowedPackRefs,
@@ -1292,9 +1323,11 @@ export function ConfigureActionModal({
           output_policy: outputPolicy,
           output_format: outputFormat,
           // Preserve fields we don't edit in this modal
-          runtime: action.runtime ?? null,
+          ...(runtimeRef && runtimeRef !== action.runtime_ref
+            ? { runtime_ref: runtimeRef }
+            : { runtime: action.runtime ?? null }),
           required_worker_runtimes: action.required_worker_runtimes ?? {},
-          param_schema: action.param_schema ?? null,
+          param_schema: parameters,
           out_schema: outSchema,
         },
       });
@@ -1347,18 +1380,113 @@ export function ConfigureActionModal({
             />
           </div>
 
-          {/* Entrypoint */}
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              Entry Point
+          {!action.workflow_def && (
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={useLaunch}
+                onChange={(e) => {
+                  setUseLaunch(e.target.checked);
+                  if (!e.target.checked)
+                    setParameterDelivery(ParameterDelivery.STDIN);
+                }}
+              />
+              Use a binary launch
             </label>
-            <input
-              type="text"
-              value={entrypoint}
-              onChange={(e) => setEntrypoint(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm font-mono focus:ring-blue-500 focus:border-blue-500"
+          )}
+          {useLaunch ? (
+            <>
+              <label className="block text-sm font-medium text-gray-700">
+                Native runtime reference
+                <input
+                  aria-label="Native runtime reference"
+                  value={runtimeRef}
+                  onChange={(e) => setRuntimeRef(e.target.value)}
+                  placeholder="core.native"
+                  className="block w-full border rounded-md p-2"
+                />
+              </label>
+              <label className="block text-sm font-medium text-gray-700">
+                Binary launch (JSON)
+                <textarea
+                  aria-label="Binary launch (JSON)"
+                  value={launchText}
+                  onChange={(e) => setLaunchText(e.target.value)}
+                  rows={7}
+                  className="w-full px-3 py-2 border rounded-md font-mono text-sm"
+                />
+              </label>
+              <label className="block text-sm font-medium text-gray-700">
+                Parameter delivery
+                <select
+                  value={parameterDelivery}
+                  onChange={(e) =>
+                    setParameterDelivery(e.target.value as ParameterDelivery)
+                  }
+                  className="block border rounded-md p-2"
+                >
+                  <option value={ParameterDelivery.NONE}>No stdin input</option>
+                  <option value={ParameterDelivery.STDIN}>
+                    Input on stdin
+                  </option>
+                  <option value={ParameterDelivery.FILE}>
+                    Input file (native without CLI bindings)
+                  </option>
+                </select>
+              </label>
+              <label className="block text-sm font-medium text-gray-700">
+                Parameter format
+                <select
+                  value={parameterFormat}
+                  onChange={(e) =>
+                    setParameterFormat(e.target.value as ParameterFormat)
+                  }
+                  className="block border rounded-md p-2"
+                >
+                  <option value={ParameterFormat.JSON}>JSON</option>
+                  <option value={ParameterFormat.YAML}>
+                    YAML (without CLI bindings)
+                  </option>
+                  <option value={ParameterFormat.DOTENV}>
+                    Dotenv (without CLI bindings)
+                  </option>
+                </select>
+              </label>
+            </>
+          ) : (
+            <label className="block text-sm font-medium text-gray-700">
+              Entry Point
+              <input
+                type="text"
+                value={entrypoint}
+                onChange={(e) => setEntrypoint(e.target.value)}
+                className="w-full px-3 py-2 border rounded-md text-sm font-mono"
+              />
+            </label>
+          )}
+          <label className="block text-sm font-medium text-gray-700">
+            Input parameter schema (JSON)
+            <textarea
+              aria-label="Input parameter schema (JSON)"
+              value={inputSchemaText}
+              onChange={(e) => setInputSchemaText(e.target.value)}
+              rows={8}
+              className="w-full px-3 py-2 border rounded-md font-mono text-sm"
             />
-          </div>
+            <span className="text-xs text-gray-500">
+              For binary launches, add cli bindings to nonsecret parameter
+              fields.
+            </span>
+          </label>
+
+          {action.argument_preview && (
+            <details className="text-sm">
+              <summary>Argument bindings (saved definition preview)</summary>
+              <pre className="overflow-auto text-xs">
+                {JSON.stringify(action.argument_preview, null, 2)}
+              </pre>
+            </details>
+          )}
 
           {/* Reference Visibility */}
           <div>

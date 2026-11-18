@@ -249,13 +249,48 @@ impl SchemaContractRepository {
                 }
             }
         }
-        let input = Self::materialize(
-            transaction,
-            source.clone(),
-            SchemaContext::FlatDocument,
-            inputs.into_iter().flatten().next().unwrap_or(&empty),
-        )
-        .await?;
+        let parameters = inputs.into_iter().flatten().next().unwrap_or(&empty);
+        let input = if let Some(launch) = &action.launch {
+            launch.validate_action_source(
+                action.entrypoint.as_deref(),
+                action.parameter_delivery,
+                action.parameter_format,
+            )?;
+            let runtime = snapshot
+                .executable
+                .runtime
+                .as_ref()
+                .ok_or_else(|| Error::validation("Missing admitted native runtime"))?;
+            crate::action_cli::validate_native_runtime(
+                runtime,
+                &snapshot.executable.runtime_versions,
+            )?;
+            let clean = crate::action_cli::schema_for_binding(parameters)
+                .map_err(|error| Error::validation(error.to_string()))?;
+            let contract = Self::materialize(
+                transaction,
+                source.clone(),
+                SchemaContext::FlatDocument,
+                &clean,
+            )
+            .await?;
+            crate::action_cli::ArgumentPlan::from_bound_contract(
+                parameters,
+                launch.action_arguments()?,
+                contract,
+            )
+            .map_err(|error| Error::validation(error.to_string()))?
+            .contract()
+            .clone()
+        } else {
+            Self::materialize(
+                transaction,
+                source.clone(),
+                SchemaContext::FlatDocument,
+                parameters,
+            )
+            .await?
+        };
         let output = if let Some(schema) = outputs.into_iter().flatten().next() {
             Some(Self::materialize(transaction, source, SchemaContext::FlatDocument, schema).await?)
         } else {

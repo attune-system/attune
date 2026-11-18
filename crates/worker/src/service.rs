@@ -585,27 +585,30 @@ impl WorkerService {
             Arc::from(transport)
         };
 
-        let executor = Arc::new(ActionExecutor::new(
-            pool.clone(),
-            runtime_registry,
-            artifact_manager,
-            secret_manager,
-            max_stdout_bytes,
-            max_stderr_bytes,
-            mirror_runtime_stdout_to_stdio,
-            mirror_runtime_stderr_to_stdio,
-            worker_name,
-            worker_token_provider.instance_id(),
-            config.artifacts.log_segment_writer_config(),
-            execution_log_retention_policy,
-            execution_log_retention_limit,
-            packs_base_dir.clone(),
-            artifacts_dir,
-            PathBuf::from(&config.runtime_envs_dir), // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- runtime_envs_dir is a trusted deployment configuration root, not request-derived input.
-            api_url,
-            jwt_config,
-            transport,
-        ));
+        let executor = Arc::new(
+            ActionExecutor::new(
+                pool.clone(),
+                runtime_registry,
+                artifact_manager,
+                secret_manager,
+                max_stdout_bytes,
+                max_stderr_bytes,
+                mirror_runtime_stdout_to_stdio,
+                mirror_runtime_stderr_to_stdio,
+                worker_name,
+                worker_token_provider.instance_id(),
+                config.artifacts.log_segment_writer_config(),
+                execution_log_retention_policy,
+                execution_log_retention_limit,
+                packs_base_dir.clone(),
+                artifacts_dir,
+                PathBuf::from(&config.runtime_envs_dir), // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- runtime_envs_dir is a trusted deployment configuration root, not request-derived input.
+                api_url,
+                jwt_config,
+                transport,
+            )
+            .with_child_environment(child_environment.clone()),
+        );
 
         // Initialize heartbeat manager
         let heartbeat_interval = config
@@ -691,6 +694,10 @@ impl WorkerService {
         let worker_id = {
             let mut reg = self.registration.write().await;
             reg.detect_capabilities(&self.config).await?;
+            reg.add_capability(
+                attune_common::action_cli::WORKER_CAPABILITY.into(),
+                serde_json::json!(cfg!(target_os = "linux")),
+            );
 
             // If running as an agent, store the detected interpreter metadata
             // and set the agent_mode flag before registering.

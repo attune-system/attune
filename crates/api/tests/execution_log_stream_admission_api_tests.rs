@@ -178,6 +178,9 @@ async fn bound_stream_fixture_with_policy(
     let action = ActionRepository::create(
         &ctx.pool,
         CreateActionInput {
+            launch: None,
+            parameter_delivery: None,
+            parameter_format: None,
             output_policy,
             output_format: Default::default(),
             r#ref: format!("{}.tail", pack.r#ref),
@@ -185,7 +188,7 @@ async fn bound_stream_fixture_with_policy(
             pack_ref: pack.r#ref.clone(),
             label: "Ad-hoc log caller".into(),
             description: None,
-            entrypoint: "main.py".into(),
+            entrypoint: Some("main.py".into()),
             runtime: None,
             enabled: true,
             runtime_version_constraint: None,

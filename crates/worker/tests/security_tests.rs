@@ -89,6 +89,7 @@ print(json.dumps(result))
 "#;
 
     let context = ExecutionContext {
+        native_invocation: None,
         execution_id: 1,
         action_ref: "security.test_environ".to_string(),
         parameters: HashMap::new(),
@@ -156,6 +157,7 @@ async fn test_shell_secrets_not_in_environ() {
     let runtime = make_shell_process_runtime(tmp.path().to_path_buf());
 
     let context = ExecutionContext {
+        native_invocation: None,
         execution_id: 2,
         action_ref: "security.test_shell_environ".to_string(),
         parameters: HashMap::new(),
@@ -267,6 +269,7 @@ print(json.dumps({'secret_a': secrets.get('secret_a')}))
 "#;
 
     let context1 = ExecutionContext {
+        native_invocation: None,
         execution_id: 3,
         action_ref: "security.action1".to_string(),
         parameters: HashMap::new(),
@@ -320,6 +323,7 @@ print(json.dumps({
 "#;
 
     let context2 = ExecutionContext {
+        native_invocation: None,
         execution_id: 4,
         action_ref: "security.action2".to_string(),
         parameters: HashMap::new(),
@@ -386,6 +390,7 @@ print("ok")
 "#;
 
     let context = ExecutionContext {
+        native_invocation: None,
         execution_id: 5,
         action_ref: "security.no_secrets".to_string(),
         parameters: HashMap::new(),
@@ -434,6 +439,7 @@ async fn test_shell_empty_secrets() {
     let runtime = make_shell_process_runtime(tmp.path().to_path_buf());
 
     let context = ExecutionContext {
+        native_invocation: None,
         execution_id: 6,
         action_ref: "security.no_secrets".to_string(),
         parameters: HashMap::new(),
@@ -527,6 +533,7 @@ echo "PASS: No secrets in environment"
     );
 
     let context = ExecutionContext {
+        native_invocation: None,
         execution_id: 7,
         action_ref: "testpack.check_env".to_string(),
         parameters: HashMap::new(),
@@ -615,6 +622,7 @@ print(json.dumps({"leaked": leaked}))
     );
 
     let context = ExecutionContext {
+        native_invocation: None,
         execution_id: 8,
         action_ref: "testpack.check_env".to_string(),
         parameters: HashMap::new(),

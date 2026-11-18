@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-pub(crate) use compiler::compile_action_input;
+pub(crate) use compiler::{authored_node_id, compile_action_input};
 pub use compiler::{check_local_graph, compile, compile_inline, inspect_definition};
 pub use runtime::{AuthoringReport, CompiledContract};
 
@@ -290,6 +290,42 @@ pub(super) fn check_json(value: &Value, limits: Limits, byte_limit: usize) -> Re
         return Err(error(ErrorCode::ResourceLimit, ""));
     }
     Ok(size)
+}
+
+/// Retain action-only metadata after the repository has selected an immutable
+/// named-type view using its annotation-free reference-discovery projection.
+pub(crate) fn annotate_action_input(
+    mut contract: Contract,
+    authored: &Value,
+    paths: &std::collections::BTreeSet<String>,
+) -> Result<Contract> {
+    for path in paths {
+        let id = authored_node_id(path)?;
+        let annotation = authored
+            .pointer(path)
+            .and_then(|node| node.get("cli"))
+            .ok_or_else(|| error(ErrorCode::InvalidDefinition, path))?;
+        let node = contract
+            .annotated_schema
+            .get_mut("$defs")
+            .and_then(|defs| defs.get_mut(&id))
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| error(ErrorCode::InvalidDefinition, path))?;
+        node.insert("cli".into(), annotation.clone());
+    }
+    contract.authored_digest = digest(authored)?;
+    contract.binding_digest.clear();
+    if serde_json::to_vec(&contract)
+        .map_err(|_| error(ErrorCode::InvalidDefinition, ""))?
+        .len()
+        .saturating_add(64)
+        > contract.limits.max_compiled_bytes
+    {
+        return Err(error(ErrorCode::ResourceLimit, ""));
+    }
+    contract.binding_digest = digest(&contract)?;
+    CompiledContract::new(&contract)?;
+    Ok(contract)
 }
 
 #[cfg(test)]

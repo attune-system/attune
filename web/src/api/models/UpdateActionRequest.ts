@@ -3,10 +3,13 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { ActionReferenceVisibility } from "./ActionReferenceVisibility";
+import type { LaunchSpec } from "./LaunchSpec";
 import type { LogRetentionLimitPatch } from "./LogRetentionLimitPatch";
 import type { LogRetentionPolicyPatch } from "./LogRetentionPolicyPatch";
 import type { OutputFormat } from "./OutputFormat";
 import type { OutputPolicy } from "./OutputPolicy";
+import type { ParameterDelivery } from "./ParameterDelivery";
+import type { ParameterFormat } from "./ParameterFormat";
 import type { RuntimeVersionConstraintPatch } from "./RuntimeVersionConstraintPatch";
 import type { TimeoutSecondsPatch } from "./TimeoutSecondsPatch";
 import type { WorkerAffinity } from "./WorkerAffinity";
@@ -41,6 +44,7 @@ export type UpdateActionRequest = {
    * Human-readable label
    */
   label?: string | null;
+  launch?: null | LaunchSpec;
   log_retention_limit?: null | LogRetentionLimitPatch;
   log_retention_policy?: null | LogRetentionPolicyPatch;
   /**
@@ -53,6 +57,8 @@ export type UpdateActionRequest = {
    * Parameter schema (StackStorm-style with inline required/secret)
    */
   param_schema?: Record<string, any> | null;
+  parameter_delivery?: null | ParameterDelivery;
+  parameter_format?: null | ParameterFormat;
   /**
    * Replace the restricted visibility allow-list.
    */

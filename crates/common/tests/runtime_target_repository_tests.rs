@@ -384,6 +384,9 @@ async fn ad_hoc_components_do_not_inherit_pack_authority_from_namespace_associat
     let action = ActionRepository::create(
         &db,
         CreateActionInput {
+            launch: None,
+            parameter_delivery: None,
+            parameter_format: None,
             output_policy: Default::default(),
             output_format: Default::default(),
             r#ref: format!("{}.adhoc", pack.r#ref),
@@ -391,7 +394,7 @@ async fn ad_hoc_components_do_not_inherit_pack_authority_from_namespace_associat
             pack_ref: pack.r#ref.clone(),
             label: "Ad hoc".into(),
             description: None,
-            entrypoint: "run.sh".into(),
+            entrypoint: Some("run.sh".into()),
             runtime: None,
             enabled: true,
             runtime_version_constraint: None,

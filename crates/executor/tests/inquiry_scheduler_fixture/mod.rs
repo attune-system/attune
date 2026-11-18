@@ -160,7 +160,7 @@ async fn create_admitted_inquiry_fixture_executions(
     let mut invocations = Vec::new();
     for action in actions {
         let mut selected = invocation(InvocationBinding::Action {
-            action_ref: action.r#ref.clone(),
+action_ref: action.r#ref.clone(),
         });
         if action.id == workflow_action.id {
             selected
@@ -410,7 +410,7 @@ async fn accept_inquiry_fixture_action(
         }
     };
     let invocation = InvocationBinding::Action {
-        action_ref: action_ref.into(),
+action_ref: action_ref.into(),
     };
     let snapshot = Admission::resolve_current_snapshot(
         &mut acceptance,
@@ -700,7 +700,7 @@ async fn inquiry_scheduler_wait_targets_keep_action_admission_and_parent_ownersh
         assert_eq!(
             admission.authority.binding,
             InvocationBinding::Action {
-                action_ref: fixture.request.action_ref.clone(),
+action_ref: fixture.request.action_ref.clone(),
             }
         );
         if target.id == owned.id {

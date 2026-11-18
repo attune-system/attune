@@ -152,6 +152,12 @@ impl SchemaTypeRepository {
         sqlx::query("DELETE FROM schema_type_reference WHERE source_pack = $1 AND source_kind <> 'schema_type'")
             .bind(pack).execute(&mut *connection).await?;
         for (kind, reference, field, schema) in sources {
+            let schema = if kind == "action" && field == "param_schema" {
+                crate::action_cli::schema_for_binding(&schema)
+                    .map_err(|error| Error::validation(error.to_string()))?
+            } else {
+                schema
+            };
             let targets = crate::value_schema::inspect_definition(
                 SchemaContext::FlatDocument,
                 &schema,

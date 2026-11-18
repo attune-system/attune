@@ -1416,12 +1416,15 @@ async fn create_companion_action(
     workflow_def_id: i64,
 ) -> Result<(), ApiError> {
     let action_input = CreateActionInput {
+        launch: None,
+        parameter_delivery: None,
+        parameter_format: None,
         r#ref: workflow_ref.to_string(),
         pack: pack_id,
         pack_ref: pack_ref.to_string(),
         label: label.to_string(),
         description: description.map(|s| s.to_string()),
-        entrypoint: entrypoint.to_string(),
+        entrypoint: Some(entrypoint.to_string()),
         runtime: None,
         enabled: true,
         runtime_version_constraint: None,
@@ -1541,6 +1544,7 @@ async fn update_companion_action(
 
     if let Some(action) = existing_action {
         let update_input = UpdateActionInput {
+            launch: None,
             label: update.label.map(|s| s.to_string()),
             description: update.description.map(|s| Patch::Set(s.to_string())),
             entrypoint: None,

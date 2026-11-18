@@ -3,6 +3,9 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { ActionReferenceVisibility } from "./ActionReferenceVisibility";
+import type { LaunchSpec } from "./LaunchSpec";
+import type { ParameterDelivery } from "./ParameterDelivery";
+import type { ParameterFormat } from "./ParameterFormat";
 import type { RetentionPolicyType } from "./RetentionPolicyType";
 import type { WorkerAffinity } from "./WorkerAffinity";
 import type { WorkerToleration } from "./WorkerToleration";
@@ -38,7 +41,7 @@ export type ActionSummary = {
   /**
    * Entry point
    */
-  entrypoint: string;
+  entrypoint?: string | null;
   /**
    * Action ID
    */
@@ -47,6 +50,7 @@ export type ActionSummary = {
    * Human-readable label
    */
   label: string;
+  launch?: null | LaunchSpec;
   /**
    * Per-action retention limit override for stdout/stderr execution log artifacts.
    */
@@ -56,6 +60,8 @@ export type ActionSummary = {
    * Pack reference
    */
   pack_ref: string;
+  parameter_delivery: ParameterDelivery;
+  parameter_format: ParameterFormat;
   /**
    * Unique reference identifier
    */

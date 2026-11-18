@@ -357,6 +357,24 @@ pub async fn preflight(
                 error,
             )
         })?;
+        let contract = if let Some((authored, launch)) = &consumer.action_input {
+            crate::action_cli::ArgumentPlan::from_bound_contract(
+                authored,
+                launch.action_arguments()?,
+                contract,
+            )
+            .map_err(|error| {
+                super::diagnostics::action_cli_error(
+                    &consumer.source_file,
+                    &super::diagnostics::pointer(&consumer.schema_field),
+                    error,
+                )
+            })?
+            .contract()
+            .clone()
+        } else {
+            contract
+        };
         contracts.insert(
             format!("{}#{}", consumer.source_ref, consumer.schema_field),
             contract,
@@ -391,6 +409,7 @@ struct ConsumerSchemaSource {
     source_ref: String,
     schema_field: String,
     schema: serde_json::Value,
+    action_input: Option<(serde_json::Value, crate::pack_format::LaunchSpec)>,
 }
 
 fn read_consumer_schemas(pack_dir: &Path, pack_ref: &str) -> Result<Vec<ConsumerSchemaSource>> {
@@ -473,7 +492,25 @@ fn read_consumer_schemas(pack_dir: &Path, pack_ref: &str) -> Result<Vec<Consumer
                     )
                 })?
             {
+                let action_input =
+                    if parent == "actions" && *fields == crate::schema_type::PARAM_SCHEMA_FIELDS {
+                        data.get("launch")
+                            .cloned()
+                            .map(serde_yaml_ng::from_value::<crate::pack_format::LaunchSpec>)
+                            .transpose()
+                            .map_err(|_| Error::validation("Invalid action launch"))?
+                            .map(|launch| (schema.clone(), launch))
+                    } else {
+                        None
+                    };
+                let schema = if action_input.is_some() {
+                    crate::action_cli::schema_for_binding(&schema)
+                        .map_err(|error| Error::validation(error.to_string()))?
+                } else {
+                    schema
+                };
                 consumers.push(ConsumerSchemaSource {
+                    action_input,
                     source_file: relative.to_string_lossy().into_owned(),
                     source_ref: source_ref.clone(),
                     schema_field: fields

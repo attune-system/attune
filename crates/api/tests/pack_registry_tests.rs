@@ -1263,7 +1263,10 @@ async fn managed_action_api_edit_readmits_metadata_over_the_same_immutable_relea
     assert_eq!(before.policy.release_id, after.policy.release_id);
     let edited =
         ManagedExecutableRepository::resolve_invocation(&mut tx, &after.policy, &binding).await?;
-    assert_eq!(edited.executable.action.entrypoint, "actions/edited.sh");
+    assert_eq!(
+        edited.executable.action.entrypoint.as_deref(),
+        Some("actions/edited.sh")
+    );
     let old =
         ManagedExecutableRepository::resolve_invocation(&mut tx, &before.policy, &binding).await?;
     assert_eq!(

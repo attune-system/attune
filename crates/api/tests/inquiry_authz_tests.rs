@@ -127,6 +127,9 @@ async fn setup_pack_action(pool: &PgPool, suffix: &str) -> TResult<(Pack, Action
     let action = ActionRepository::create(
         pool,
         CreateActionInput {
+            launch: None,
+            parameter_delivery: None,
+            parameter_format: None,
             output_policy: Default::default(),
             output_format: Default::default(),
             r#ref: format!("{}.ask", pack.r#ref),
@@ -134,7 +137,7 @@ async fn setup_pack_action(pool: &PgPool, suffix: &str) -> TResult<(Pack, Action
             pack_ref: pack.r#ref.clone(),
             label: "Ask".to_string(),
             description: None,
-            entrypoint: "ask.sh".to_string(),
+            entrypoint: Some("ask.sh".to_string()),
             runtime: None,
             enabled: true,
             runtime_version_constraint: None,
