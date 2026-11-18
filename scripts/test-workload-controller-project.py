@@ -11,6 +11,8 @@ from datetime import datetime, timedelta, timezone
 import http.server
 import json
 import os
+import re
+import shutil
 from pathlib import Path
 import socket
 import ssl
@@ -50,6 +52,8 @@ def diagnose(docker_command, owner):
         "engine_policy_failed": "Policy(",
         "parent_protection_failed": "could not protect controller parent",
         "root_owner_required": "trusted controller requires root ownership",
+        "runtime_loader_failed": "error while loading shared libraries",
+        "runtime_executable_unusable": "cannot execute binary file",
     }
     for identifier in raw.splitlines()[:8]:
         data, code, truncated = bounded_command([*docker_command, "inspect", "--format",
@@ -211,6 +215,79 @@ class FixtureCp(http.server.BaseHTTPRequestHandler):
         self.reply(403, {})
 
 
+
+def package_controller_image(docker, docker_command, owner, source_image, diagnostics):
+    """Use the exact built public binary in the release Dockerfile, no rebuild.
+
+    Fixed read-only export container; no archive API, host mount, engine socket,
+    cache/session, CP credential or workload input. Cleanup requires real owned
+    Stop/Wait/Remove acknowledgements before the package build may proceed.
+    """
+    evidence = json.loads(docker("image", "inspect", "--format",
+        '{"id":{{json .Id}},"labels":{{json .Config.Labels}}}', source_image,
+        capture_output=True, text=True, timeout=30).stdout)
+    if evidence.get("labels", {}).get("io.attune.test.owner") != owner or not re.fullmatch(r"sha256:[0-9a-f]{64}", evidence.get("id", "")):
+        raise RuntimeError("package source image ownership invalid")
+    image = source_image + "-package"
+    with tempfile.TemporaryDirectory(prefix=owner + "-package-") as directory:
+        context = Path(directory)
+        (context / "dist").mkdir()
+        binary = context / "dist/attune-service-binary"
+        identifier = None
+        owned = False
+        failure = None
+        cleanup_errors = []
+        try:
+            # Bound export before cat: immutable read-only image bytes cannot
+            # grow between stat and read. This is a fixed trusted build command.
+            identifier = docker("create", "--pull=never", "--name", owner + "-package-export",
+                "--label", "io.attune.test.owner=" + owner, "--network", "none", "--user", "1000:1000",
+                "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges:true", "--entrypoint", "/bin/sh", evidence["id"],
+                "-ec", 'test "$(stat -c%s /usr/local/bin/attune-service)" -le 536870912; exec cat /usr/local/bin/attune-service',
+                capture_output=True, text=True, timeout=30).stdout.strip()
+            if not re.fullmatch(r"[0-9a-f]{64}", identifier):
+                raise RuntimeError("package export create remains uncertain")
+            labels = json.loads(docker("inspect", "--format", "{{json .Config.Labels}}", identifier,
+                capture_output=True, text=True, timeout=30).stdout)
+            owned = labels.get("io.attune.test.owner") == owner
+            if not owned:
+                raise RuntimeError("package export ownership changed")
+            with binary.open("wb") as output:
+                docker("start", "-a", identifier, stdout=output, stderr=subprocess.DEVNULL, timeout=60)
+            if not 4 <= binary.stat().st_size <= 536870912:
+                raise RuntimeError("package binary exceeds bound")
+            with binary.open("rb") as body:
+                if body.read(4) != b"\x7fELF":
+                    raise RuntimeError("package binary is not ELF")
+            binary.chmod(0o755)
+        except BaseException as error:
+            failure = error
+        finally:
+            if owned:
+                for operation in [("stop", "-t", "5", identifier), ("wait", identifier), ("rm", identifier)]:
+                    try:
+                        if operation[0] == "wait":
+                            exited = docker(*operation, capture_output=True, text=True, timeout=30).stdout.strip()
+                            if not re.fullmatch(r"[0-9]+", exited):
+                                raise RuntimeError("package export wait not acknowledged")
+                            if exited != "0" and failure is None:
+                                failure = RuntimeError("package export did not exit successfully")
+                        else:
+                            docker(*operation, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+                    except BaseException as error:
+                        cleanup_errors.append(type(error).__name__)
+            proxy_report({"phase": "controller-package-export", "cleanup_ack": owned and not cleanup_errors,
+                          "outcome": "failed" if failure or cleanup_errors else "complete"})
+        if failure or cleanup_errors:
+            raise RuntimeError("owned package binary export failed or cleanup uncertain") from None
+        shutil.copyfile(ROOT / "docker/Dockerfile.launch-controller-package", context / "Dockerfile")
+        run(["python3", str(ROOT / "scripts/capture_build_diagnostics.py"),
+             "--output", str(diagnostics / (owner + ".package-build.jsonl")), "--group", "controller-package", "--",
+             *docker_command, "build", "--progress=plain", "--label", "io.attune.test.owner=" + owner,
+             "-f", str(context / "Dockerfile"), "-t", image, str(context)])
+    return image
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--owned-engine-socket", required=True, type=Path)
@@ -236,6 +313,8 @@ def main():
            *docker_command, "build", "--progress=plain", "--label", f"io.attune.test.owner={owner}",
            "--build-arg", "SERVICE=launch-controller", "--build-arg", "SERVICE_USER=root",
            "--build-arg", "CARGO_BUILD_JOBS=2", "-f", str(ROOT / "docker/Dockerfile.optimized"), "-t", image, str(ROOT)])
+    source_image = image
+    image = package_controller_image(docker, docker_command, owner, source_image, diagnostics)
     for selected in [PROBE, PEER, PROXY]:
         docker("pull", selected)
     info = json.loads(docker("info", "--format", "{{json .}}", capture_output=True, text=True).stdout)
@@ -370,7 +449,7 @@ def main():
                     raise RuntimeError("private log absence cannot be established from incomplete diagnostics")
                 if any(value in logs for value in [DUMMY_SESSION, PRIVATE_MARKER, "owned-wrong-grant"]):
                     raise RuntimeError("private marker appeared in project logs")
-            print("actual source controller/project TLS, confinement and caller-denial checks passed; CP effects/host loops not proved", flush=True)
+            print("actual release-package controller/project TLS, confinement and caller-denial checks passed; CP effects/host loops not proved", flush=True)
         except BaseException as error:
             test_error = error
             proxy_report({"phase": phase, "subphase": subphase,
@@ -400,13 +479,14 @@ def main():
             cp.server_close()
             if cp_thread.is_alive():
                 cleanup_errors.append("CP fixture did not join")
-            try:
-                labels = json.loads(docker("image", "inspect", "--format", "{{json .Config.Labels}}", image, capture_output=True, text=True).stdout)
-                if labels.get("io.attune.test.owner") != owner:
-                    raise RuntimeError("owned image labels changed")
-                docker("image", "rm", image)
-            except BaseException as error:
-                cleanup_errors.append(type(error).__name__)
+            for owned_image in [image, source_image]:
+                try:
+                    labels = json.loads(docker("image", "inspect", "--format", "{{json .Config.Labels}}", owned_image, capture_output=True, text=True).stdout)
+                    if labels.get("io.attune.test.owner") != owner:
+                        raise RuntimeError("owned image labels changed")
+                    docker("image", "rm", owned_image)
+                except BaseException as error:
+                    cleanup_errors.append(type(error).__name__)
         if test_error is not None or cleanup_errors:
             # No raw logs, environment, request bodies, token values or TLS key.
             raise SystemExit(f"owned project validation failed ({type(test_error).__name__}); cleanup={cleanup_errors}; owner={owner}; retained volumes={not ready}")

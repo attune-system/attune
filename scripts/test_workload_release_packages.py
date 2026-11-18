@@ -5,6 +5,7 @@ This checks release graph/ZIP contents, not ELF ABI or real-image startup. Those
 need the real multiarch build and owned packaged-container execution lanes.
 """
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,8 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
 import zipfile
 
 import yaml
@@ -46,6 +49,61 @@ class WorkloadReleasePackages(unittest.TestCase):
             self.assertIn(['--bin', 'attune-launch-controller'], [service[i:i+2] for i in range(len(service)-1)])
             self.assertIn(['--bin', 'attune-workload-runner'], [agent[i:i+2] for i in range(len(agent)-1)])
             self.assertEqual(agent[agent.index('--target') + 1], 'musl-fixture')
+
+
+    def test_package_export_requires_owned_wait_remove_before_build_and_retains_failure(self):
+        # Actual local filesystem plus Engine CLI fault simulation only. The
+        # workflow still runs this export/package/project on both real Engines.
+        spec = importlib.util.spec_from_file_location('owned_controller_project', ROOT / 'scripts/test-workload-controller-project.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        owner = 'attune-owned-package-fixture'
+        for outcome in ('success', 'start_failure', 'foreign_container', 'uncertain_remove', 'nonzero_exit'):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                events, builds, reports = [], [], []
+                def docker(*arguments, **keywords):
+                    events.append(arguments[0])
+                    if arguments[:2] == ('image', 'inspect'):
+                        return SimpleNamespace(stdout=json.dumps({'id': 'sha256:' + 'a' * 64, 'labels': {'io.attune.test.owner': owner}}))
+                    if arguments[0] == 'create':
+                        self.assertNotIn('--mount', arguments)
+                        self.assertIn('--read-only', arguments)
+                        self.assertIn('--cap-drop=ALL', arguments)
+                        return SimpleNamespace(stdout='b' * 64 + '\n')
+                    if arguments[0] == 'inspect':
+                        return SimpleNamespace(stdout=json.dumps({'io.attune.test.owner': 'foreign' if outcome == 'foreign_container' else owner}))
+                    if arguments[0] == 'start':
+                        keywords['stdout'].write(b'\x7fELF-owned-public-binary')
+                        if outcome == 'start_failure':
+                            raise subprocess.CalledProcessError(1, 'owned-export', stderr=b'owned-private-not-for-report')
+                    if arguments[0] == 'wait':
+                        return SimpleNamespace(stdout='17\n' if outcome == 'nonzero_exit' else '0\n')
+                    if arguments[0] == 'rm' and outcome == 'uncertain_remove':
+                        raise subprocess.TimeoutExpired('owned-remove', 1)
+                    return SimpleNamespace(stdout='')
+                def build(command):
+                    self.assertEqual(events[-3:], ['stop', 'wait', 'rm'])
+                    context = Path(command[-1])
+                    self.assertEqual((context / 'dist/attune-service-binary').read_bytes(), b'\x7fELF-owned-public-binary')
+                    self.assertEqual((context / 'Dockerfile').read_bytes(), (ROOT / 'docker/Dockerfile.launch-controller-package').read_bytes())
+                    builds.append(command)
+                with patch.object(module, 'run', build), patch.object(module, 'proxy_report', reports.append):
+                    if outcome == 'success':
+                        image = module.package_controller_image(docker, ['docker'], owner, 'attune-owned:source', Path(directory))
+                        self.assertEqual(image, 'attune-owned:source-package')
+                        self.assertEqual(len(builds), 1)
+                        self.assertTrue(reports[-1]['cleanup_ack'])
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            module.package_controller_image(docker, ['docker'], owner, 'attune-owned:source', Path(directory))
+                        self.assertEqual(builds, [])
+                        self.assertEqual(reports[-1]['outcome'], 'failed')
+                        if outcome == 'foreign_container':
+                            self.assertEqual(events, ['image', 'create', 'inspect'])
+                        else:
+                            self.assertEqual(events[-3:], ['stop', 'wait', 'rm'])
+                        self.assertEqual(reports[-1]['cleanup_ack'], outcome in {'start_failure', 'nonzero_exit'})
+                    self.assertNotIn('owned-private', json.dumps(reports))
 
     def test_both_actual_assembly_scripts_produce_public_platform_zip_and_complete_bundle(self):
         for arch in ('amd64', 'arm64'):

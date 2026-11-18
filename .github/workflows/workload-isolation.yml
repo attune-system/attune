@@ -81,7 +81,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
-      - name: Build actual source image and validate owned HTTPS project
+      - name: Build source and release-package images and validate owned HTTPS project
         run: python3 scripts/test-workload-controller-project.py --owned-engine-socket /var/run/docker.sock
       - name: Retain sanitized first-attempt build diagnostics
         if: ${{ always() }}
