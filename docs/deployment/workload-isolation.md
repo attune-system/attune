@@ -45,6 +45,22 @@ probe. Its separate public helper image supplies that fixed probe, so a native
 payload image need not contain a shell. No HTTP enrollment, dispatch or session
 credential is configured between these in-process components.
 
+The action environment renderer preserves the owning loop's explicitly selected
+`ATTUNE_API_TOKEN`; runtime defaults cannot mint or replace reserved context.
+It rejects known manager database, broker, signing, encryption and control
+variable names. Setup plans and runtime probes reject action API tokens. These
+checks neither issue credentials nor establish secret origins: permission-set,
+owner, source and current-attempt admission remain with the trusted owning loop.
+
+New source-built agent exports and release-package images include the public
+archive at `/usr/local/share/attune/workload-runner.zip`. It contains only the
+once-built executable at `linux-amd64` or `linux-arm64`, selected from the
+compiler target. Release bundles include the same ZIP as the corresponding
+published archive asset. The operator still supplies its exact digest, size
+and bounds in `helper`; the package file alone grants no launch authority.
+This is a source packaging contract, not a claim that older published image
+pins contain the archive or implement native execution.
+
 The optional field is migration staging, not permission for activated managers
 to execute locally when configuration is missing. An explicitly configured
 worker constructs the adapter and routes its existing action loop through the
@@ -214,6 +230,12 @@ files require a positive zero-byte receipt. Missing files, invalid staging and
 uncertain publication currently retain the owning attempt and resource rather
 than permitting terminal completion or cleanup. Automatic recovery of these
 pending file cases and full provider/file acceptance remain activation work.
+
+Before extracting a new cached input or allocating a new Docker private tree,
+the cache checks available filesystem space under its publication lock using
+the admitted input/stage/artifact bounds. Reuse does not create a new disk
+reservation, and other writers can consume space after this observation. The
+trusted owning loops remain responsible for admission and concurrency.
 
 Archive/output bounds, free-space/admission/concurrency checks and owned cleanup
 are not a universal live filesystem byte/inode quota. Named-volume exhaustion

@@ -23,7 +23,7 @@ pub enum CacheError {
     Io(#[from] io::Error),
     #[error("invalid, escaping or unsupported ZIP/tree entry")]
     UnsafeEntry,
-    #[error("input or stage exceeds controller/admitted quota")]
+    #[error("input or stage exceeds configured bounds or available cache space")]
     Quota,
     #[error("input body does not match admitted immutable pin")]
     PinMismatch,
@@ -535,6 +535,13 @@ impl CacheStore {
             // The parent is custodian-owned and never mounted in a workload.
             return Ok(destination);
         }
+        // Check before extraction or copying a second archive body. This is
+        // best-effort admission, not a disk reservation or live write quota.
+        self.require_available(
+            pin.size_bytes
+                .checked_add(pin.max_expanded_bytes)
+                .ok_or(CacheError::Quota)?,
+        )?;
         let pending = tempfile::Builder::new()
             .prefix("input-")
             .tempdir_in(self.root.join("pending"))?;
@@ -609,6 +616,30 @@ impl CacheStore {
             }
             return Ok(());
         }
+        let mut required = self
+            .limits
+            .compressed_bytes
+            .checked_add(self.artifact_limits.max_total_bytes)
+            .ok_or(CacheError::Quota)?;
+        if spec.stage.is_some() {
+            required = required
+                .checked_add(self.native_stage_limits(spec)?.expanded_bytes)
+                .ok_or(CacheError::Quota)?;
+        }
+        if spec.pack_access == attune_common::workload_launch::PackAccess::CandidateCopy {
+            required = required
+                .checked_add(
+                    spec.inputs
+                        .iter()
+                        .find(|pin| {
+                            pin.kind == attune_common::workload_launch::LaunchInputKind::Pack
+                        })
+                        .ok_or(CacheError::PinMismatch)?
+                        .max_expanded_bytes,
+                )
+                .ok_or(CacheError::Quota)?;
+        }
+        self.require_available(required)?;
         fs::create_dir(&path)?;
         for name in ["artifacts"]
             .into_iter()
@@ -1016,7 +1047,6 @@ impl CacheStore {
         manifest: &LaunchManifest,
         minimum_free_bytes: u64,
     ) -> Result<()> {
-        use std::os::unix::ffi::OsStrExt;
         let _lock = self.lock()?;
         let mut required = self.limits.compressed_bytes;
         for input in &manifest.inputs {
@@ -1044,6 +1074,17 @@ impl CacheStore {
                 )
                 .ok_or(CacheError::Quota)?;
         }
+        self.require_available(
+            required
+                .checked_add(minimum_free_bytes)
+                .ok_or(CacheError::Quota)?,
+        )
+    }
+    /// Caller holds the cache lock. Concurrent workloads/other writers can
+    /// still exhaust disk after this observation; owning loops cap concurrency
+    /// and retain failed effects for acknowledged cleanup, never assume quota.
+    fn require_available(&self, required: u64) -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
         let name = std::ffi::CString::new(self.root.as_os_str().as_bytes())
             .map_err(|_| CacheError::UnsafeEntry)?;
         let mut status = std::mem::MaybeUninit::<libc::statvfs>::uninit();
@@ -1052,7 +1093,7 @@ impl CacheStore {
         }
         let status = unsafe { status.assume_init() };
         let available = (status.f_bavail as u128) * (status.f_frsize as u128);
-        if available < required as u128 + minimum_free_bytes as u128 {
+        if available < required as u128 {
             return Err(CacheError::Quota);
         }
         Ok(())
@@ -2245,6 +2286,60 @@ mod tests {
             attune_common::workload_launch::PACK_ROOT
         )
         .is_err());
+    }
+    #[test]
+    fn cache_space_admission_precedes_new_input_and_native_private_allocation() {
+        let root = tempfile::tempdir().unwrap();
+        // An impossible declared budget exercises actual statvfs admission
+        // without filling a disk, changing mounts or relying on free-space races.
+        let impossible = u64::MAX / 4;
+        let store = CacheStore::open(
+            root.path().into(),
+            CacheLimits {
+                compressed_bytes: impossible,
+                expanded_bytes: impossible,
+                files: 32,
+            },
+        )
+        .unwrap()
+        .for_current_test_user();
+        let mut body = zip_body(&[("safe", b"owned")], &[]);
+        let mut bytes = Vec::new();
+        body.read_to_end(&mut bytes).unwrap();
+        let mut pin = PinnedLaunchInput {
+            pin_id: 1,
+            object_id: 2,
+            object_version: "owned-space-admission".into(),
+            kind: LaunchInputKind::Pack,
+            size_bytes: bytes.len() as u64,
+            sha256: Sha256Digest::of_bytes(&bytes),
+            max_expanded_bytes: impossible,
+            max_files: 32,
+        };
+        assert!(matches!(
+            store.install_input(&pin, &mut body),
+            Err(CacheError::Quota)
+        ));
+        assert_eq!(fs::read_dir(root.path().join("inputs")).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_dir(root.path().join("pending")).unwrap().count(),
+            0
+        );
+        pin.max_expanded_bytes = 1024;
+        assert!(store
+            .install_input(&pin, &mut body)
+            .unwrap()
+            .join("safe")
+            .is_file());
+        let spec = native_setup();
+        assert!(matches!(
+            store.prepare_native_private(&spec),
+            Err(CacheError::Quota)
+        ));
+        assert_eq!(
+            fs::read_dir(root.path().join("private")).unwrap().count(),
+            0
+        );
     }
     #[test]
     fn cached_zip_rejects_changed_pin_bounds_without_rewriting_the_original_receipt() {

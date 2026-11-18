@@ -527,6 +527,7 @@ jobs:
             "dist/attune-workload-runner-linux-${BUNDLE_ARCH}.zip" \
             "$source_date_epoch" "$runner_stage"
           (cd dist && sha256sum "attune-workload-runner-linux-${BUNDLE_ARCH}.zip" > "attune-workload-runner-linux-${BUNDLE_ARCH}.zip.sha256")
+          cp "dist/attune-workload-runner-linux-${BUNDLE_ARCH}.zip" "$bundle_root/agent/attune-workload-runner.zip"
           python3 scripts/package-cli-archive.py \
             "dist/attune-binaries-${BUNDLE_ARCH}.tar.gz" \
             "$source_date_epoch" "$bundle_root"
@@ -1696,6 +1697,7 @@ jobs:
               cp dist/artifact/agent/attune-mcp dist/attune-mcp
               cp dist/artifact/agent/attune dist/attune
               cp dist/artifact/agent/attune-workload-runner dist/attune-workload-runner
+              cp dist/artifact/agent/attune-workload-runner.zip dist/attune-workload-runner.zip
               ;;
             init-packs)
               for arch in amd64 arm64; do
