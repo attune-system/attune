@@ -509,6 +509,20 @@ pub struct ReservedLaunch {
     pub request: LaunchRequest,
     pub dispatch_token: LaunchToken,
 }
+/// Controller restart discovery is engine-scoped by authentication. Complete a
+/// bounded cursor round, then begin a new round; unfinished rows are not consumed.
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReconcileLaunchesRequest {
+    pub after: Option<i64>,
+    pub limit: u32,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReconcileLaunchesPage {
+    pub items: Vec<ReservedLaunch>,
+    pub next_cursor: Option<i64>,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchLease {
