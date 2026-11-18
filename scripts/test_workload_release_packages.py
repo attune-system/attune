@@ -29,6 +29,36 @@ def step(name):
 
 
 class WorkloadReleasePackages(unittest.TestCase):
+    def test_source_agent_zip_assembly_uses_only_the_once_built_platform_helper(self):
+        source = (ROOT / 'docker/Dockerfile.agent').read_text()
+        command = source.split('ARG SOURCE_DATE_EPOCH=0\nRUN ', 1)[1].split('\n\n', 1)[0]
+        self.assertEqual(source.count('/build/workload-runner.zip /usr/local/share/attune/workload-runner.zip'), 2)
+        self.assertIn('dist/attune-workload-runner.zip /usr/local/share/attune/workload-runner.zip',
+                      (ROOT / 'docker/Dockerfile.agent-package').read_text())
+        for arch, target in [('amd64', 'x86_64-unknown-linux-musl'), ('arm64', 'aarch64-unknown-linux-musl')]:
+            with self.subTest(arch=arch), tempfile.TemporaryDirectory(prefix='attune-agent-zip-') as directory:
+                root = Path(directory)
+                (root / 'scripts').mkdir()
+                shutil.copyfile(ROOT / 'scripts/package-cli-archive.py', root / 'scripts/package-cli-archive.py')
+                tools = root / 'tools'
+                tools.mkdir()
+                resolve = tools / 'resolve-rust-target'
+                resolve.write_text('#!/bin/sh\nprintf "%s\\n" "$RUST_TARGET"\n')
+                resolve.chmod(0o755)
+                helper = root / 'attune-workload-runner'
+                helper.write_bytes(('owned-public-helper-' + arch).encode())
+                (root / 'private-plan.json').write_text('owned-private-not-for-runner')
+                subprocess.run(['sh', '-ec', command.replace('/build/', './')], cwd=root, check=True,
+                               timeout=10, env={'PATH': str(tools) + os.pathsep + os.defpath,
+                                                'RUST_TARGET': target, 'SOURCE_DATE_EPOCH': '1700000000'})
+                output = root / 'workload-runner.zip'
+                self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o444)
+                with zipfile.ZipFile(output) as archive:
+                    self.assertEqual(archive.namelist(), [f'linux-{arch}'])
+                    self.assertEqual(archive.read(f'linux-{arch}'), helper.read_bytes())
+                    self.assertEqual(stat.S_IMODE(archive.getinfo(f'linux-{arch}').external_attr >> 16), 0o755)
+                self.assertNotIn(b'owned-private', output.read_bytes())
+
     def test_actual_build_commands_select_services_and_static_runner(self):
         with tempfile.TemporaryDirectory(prefix='attune-build-command-') as directory:
             root = Path(directory)
@@ -105,6 +135,7 @@ class WorkloadReleasePackages(unittest.TestCase):
                 with tarfile.open(root / f'dist/attune-binaries-{arch}.tar.gz') as bundle:
                     self.assertNotIn('bin/attune-launch-controller', bundle.getnames())
                     self.assertIn('agent/attune-workload-runner', bundle.getnames())
+                    self.assertEqual(bundle.extractfile('agent/attune-workload-runner.zip').read(), output.read_bytes())
                     self.assertNotIn('agent/private-plan.json', bundle.getnames())
 
 

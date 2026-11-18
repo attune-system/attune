@@ -10,5 +10,6 @@ COPY dist/attune-sensor-agent /usr/local/bin/attune-sensor-agent
 COPY dist/attune-mcp /usr/local/bin/attune-mcp
 COPY dist/attune /usr/local/bin/attune
 COPY dist/attune-workload-runner /usr/local/bin/attune-workload-runner
+COPY --chmod=0444 dist/attune-workload-runner.zip /usr/local/share/attune/workload-runner.zip
 
 ENTRYPOINT ["/usr/local/bin/attune-agent"]
