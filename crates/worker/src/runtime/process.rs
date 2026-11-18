@@ -1334,7 +1334,9 @@ impl Runtime for ProcessRuntime {
         // Verify the interpreter is available on the system
         let mut command = Command::new(binary);
         self.child_environment.apply(command.as_std_mut());
-        let result = command.arg("--version").output().await;
+        command.arg("--version");
+        let command = self.child_environment.sandbox_probe(command.into_std())?;
+        let result = Command::from(command).output().await;
 
         match result {
             Ok(output) => {
@@ -1387,7 +1389,9 @@ impl Runtime for ProcessRuntime {
         // Check if interpreter is available
         let mut command = Command::new(binary);
         self.child_environment.apply(command.as_std_mut());
-        let output = command.arg("--version").output().await;
+        command.arg("--version");
+        let command = self.child_environment.sandbox_probe(command.into_std())?;
+        let output = Command::from(command).output().await;
 
         match output {
             Ok(output) if output.status.success() => Ok(()),
@@ -1439,6 +1443,40 @@ mod tests {
             environment: None,
             dependencies: None,
             env_vars: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn native_effects_policy_denies_residual_process_setup_and_validation_before_lookup() {
+        use attune_common::{
+            child_process_environment::ChildProcessEnvironment, workload_sandbox::WorkloadSandbox,
+        };
+        let root = TempDir::new().unwrap();
+        let mut config = make_shell_config();
+        config.interpreter.binary = root
+            .path()
+            .join("owned-private-missing-interpreter")
+            .to_str()
+            .unwrap()
+            .into();
+        let environment = ChildProcessEnvironment::from_parent([], &[])
+            .unwrap()
+            .with_workload_sandbox(WorkloadSandbox::NativeEffectsRequired);
+        let runtime = ProcessRuntime::new(
+            "owned-native-effects".into(),
+            config,
+            root.path().into(),
+            root.path().join("runtime"),
+        )
+        .with_child_environment(environment);
+        for result in [runtime.setup().await, runtime.validate().await] {
+            match result {
+                Err(RuntimeError::IoError(error)) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                    assert!(!error.to_string().contains("owned-private-missing"));
+                }
+                _ => panic!("residual local version probe bypassed native effects policy"),
+            }
         }
     }
 

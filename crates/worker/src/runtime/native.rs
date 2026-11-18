@@ -284,7 +284,9 @@ impl Runtime for NativeRuntime {
             use std::process::Command;
             let mut command = Command::new("uname");
             self.child_environment.apply(&mut command);
-            let output = command.arg("-s").output().map_err(|e| {
+            command.arg("-s");
+            let mut command = self.child_environment.sandbox_probe(command)?;
+            let output = command.output().map_err(|e| {
                 RuntimeError::SetupError(format!("Failed to verify native runtime: {}", e))
             })?;
 
@@ -315,7 +317,9 @@ impl Runtime for NativeRuntime {
             use std::process::Command;
             let mut command = Command::new("echo");
             self.child_environment.apply(&mut command);
-            command.arg("test").output().map_err(|e| {
+            command.arg("test");
+            let mut command = self.child_environment.sandbox_probe(command)?;
+            command.output().map_err(|e| {
                 RuntimeError::SetupError(format!("Native runtime validation failed: {}", e))
             })?;
         }
@@ -327,6 +331,26 @@ impl Runtime for NativeRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_effects_policy_denies_residual_native_setup_and_validation_before_lookup() {
+        let environment =
+            attune_common::child_process_environment::ChildProcessEnvironment::from_parent([], &[])
+                .unwrap()
+                .with_workload_sandbox(
+                    attune_common::workload_sandbox::WorkloadSandbox::NativeEffectsRequired,
+                );
+        let runtime = NativeRuntime::new().with_child_environment(environment);
+        for result in [runtime.setup().await, runtime.validate().await] {
+            match result {
+                Err(RuntimeError::IoError(error)) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                }
+                _ => panic!("residual native host probe bypassed native effects policy"),
+            }
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
