@@ -904,6 +904,12 @@ mod tests {
             timeout: Some(5),
             result_format: None,
         };
+        assert!(executor
+            .execute_test_suite(&root, "unsafe-input-tree", &runner, None)
+            .await
+            .is_err());
+        std::fs::remove_file(root.join("escape.sh")).unwrap();
+        std::fs::remove_file(root.join("escape-dir")).unwrap();
         assert_eq!(
             executor
                 .execute_test_suite(&root, "safe", &runner, None)
@@ -1150,9 +1156,32 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Linux bubblewrap and unprivileged namespaces"]
+    async fn isolated_missing_executable_exits_nonzero_and_drains_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let executor = TestExecutor::new(root.path().into())
+            .with_workload_sandbox(crate::workload_sandbox::WorkloadSandbox::Bubblewrap);
+        let owner = executor.process_owner();
+        let result = executor
+            .run_command(
+                &root.path().join("missing").to_string_lossy(),
+                &[],
+                root.path(),
+                None,
+                Duration::from_secs(5),
+            )
+            .await;
+        owner.shutdown().await;
+        assert_ne!(result.unwrap().exit_code, 0);
+        assert!(owner.tasks.is_empty());
+        root.close().unwrap();
+    }
+
+    #[tokio::test]
     async fn test_spawn_failure_leaves_no_owned_process() {
         let root = tempfile::tempdir().unwrap();
-        let executor = TestExecutor::new(root.path().into());
+        let executor = TestExecutor::new(root.path().into())
+            .with_workload_sandbox(crate::workload_sandbox::WorkloadSandbox::Disabled);
         let owner = executor.process_owner();
         assert!(executor
             .run_command(
@@ -1214,7 +1243,8 @@ mod tests {
     async fn test_aborted_consumer_awaits_process_and_readers_before_root_cleanup() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().to_path_buf();
-        let executor = TestExecutor::new(path.clone());
+        let executor = TestExecutor::new(path.clone())
+            .with_workload_sandbox(crate::workload_sandbox::WorkloadSandbox::Disabled);
         let processes = executor.process_owner();
         let consumer = tokio::spawn(async move {
             executor
@@ -1252,7 +1282,9 @@ mod tests {
         let handler_path = path.clone();
         let handler = tasks.spawn(async move {
             let path = handler_path;
-            let executor = TestExecutor::new(path.clone()).with_cancellation(cancellation);
+            let executor = TestExecutor::new(path.clone())
+                .with_workload_sandbox(crate::workload_sandbox::WorkloadSandbox::Disabled)
+                .with_cancellation(cancellation);
             let config = TestConfig {
                 enabled: true,
                 candidate_api_effects: false,
