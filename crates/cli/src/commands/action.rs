@@ -528,13 +528,7 @@ async fn handle_show(
                 ),
                 (
                     "Entry Point",
-                    action.entrypoint.clone().unwrap_or_else(|| {
-                        action
-                            .launch
-                            .as_ref()
-                            .map(|launch| serde_json::to_string(launch).unwrap_or_default())
-                            .unwrap_or_default()
-                    }),
+                    format_action_source(action.entrypoint.as_deref(), action.launch.as_ref()),
                 ),
                 (
                     "Runtime",
@@ -656,13 +650,7 @@ async fn handle_update(
                 ),
                 (
                     "Entrypoint",
-                    action.entrypoint.clone().unwrap_or_else(|| {
-                        action
-                            .launch
-                            .as_ref()
-                            .map(|launch| serde_json::to_string(launch).unwrap_or_default())
-                            .unwrap_or_default()
-                    }),
+                    format_action_source(action.entrypoint.as_deref(), action.launch.as_ref()),
                 ),
                 (
                     "Runtime",
@@ -880,6 +868,16 @@ async fn handle_execute(
     }
 
     Ok(())
+}
+
+fn format_action_source(
+    entrypoint: Option<&str>,
+    launch: Option<&attune_common::pack_format::LaunchSpec>,
+) -> String {
+    entrypoint
+        .map(str::to_owned)
+        .or_else(|| launch.and_then(|launch| serde_json::to_string(launch).ok()))
+        .unwrap_or_default()
 }
 
 fn read_metadata<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T> {

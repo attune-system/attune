@@ -4,6 +4,20 @@ use crate::{Error, Result};
 
 pub const WORKER_CAPABILITY: &str = "action_cli_arguments_v1";
 
+/// CLI-enabled definitions support only no input or stdin JSON.
+pub fn validate_cli_input_delivery(
+    cli_enabled: bool,
+    delivery: ParameterDelivery,
+    format: ParameterFormat,
+) -> Result<()> {
+    if cli_enabled && (delivery == ParameterDelivery::File || format != ParameterFormat::Json) {
+        return Err(Error::validation(
+            "action.launch.invalid: CLI parameters require no input or stdin JSON",
+        ));
+    }
+    Ok(())
+}
+
 impl LaunchSpec {
     pub fn action_arguments(&self) -> Result<&[super::LiteralArgument]> {
         match self {
@@ -62,17 +76,13 @@ impl LaunchSpec {
             }
             _ => unreachable!("action_arguments checked the launch kind"),
         }
-        if matches!(self, Self::Command { .. })
-            || !self.action_arguments()?.is_empty()
-            || delivery == ParameterDelivery::None
-        {
-            if delivery == ParameterDelivery::File || format != ParameterFormat::Json {
-                return Err(Error::validation(
-                    "action.launch.invalid: Command arguments support only no input or stdin JSON",
-                ));
-            }
-        }
-        Ok(())
+        validate_cli_input_delivery(
+            matches!(self, Self::Command { .. })
+                || !self.action_arguments()?.is_empty()
+                || delivery == ParameterDelivery::None,
+            delivery,
+            format,
+        )
     }
 }
 

@@ -864,14 +864,7 @@ impl PackChecker {
                 let clean = crate::action_cli::schema_for_binding(&schema).map_err(|error| {
                     crate::pack_registry::diagnostics::action_cli_error(rel, &schema_path, error)
                 })?;
-                if clean != schema
-                    && (delivery == crate::models::ParameterDelivery::File
-                        || format != crate::models::ParameterFormat::Json)
-                {
-                    return Err(crate::Error::validation(
-                        "CLI parameters require no input or stdin JSON",
-                    ));
-                }
+                crate::action_cli::validate_cli_input_delivery(clean != schema, delivery, format)?;
                 crate::action_cli::ArgumentPlan::compile(
                     crate::value_schema::SourceIdentity::Authoring {
                         component_ref: rel.into(),

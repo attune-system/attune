@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value;
 
 use crate::value_schema::{self, CompiledContract, Contract, Limits, RegistryView, SourceIdentity};
-pub use launch::{validate_native_runtime, WORKER_CAPABILITY};
+pub use launch::{validate_cli_input_delivery, validate_native_runtime, WORKER_CAPABILITY};
 pub use materialize::PreparedArguments;
 pub use program::{select_program, verify_selected_program, SelectedProgram};
 use types::failure;

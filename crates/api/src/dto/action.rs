@@ -840,6 +840,14 @@ impl From<attune_common::repositories::queue_stats::QueueStats> for QueueStatsRe
     }
 }
 
+fn nullable_field<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -964,12 +972,4 @@ mod tests {
         let clear: TimeoutSecondsPatch = serde_json::from_str(r#"{"op":"clear"}"#).unwrap();
         assert!(matches!(clear, TimeoutSecondsPatch::Clear));
     }
-}
-
-fn nullable_field<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: serde::Deserialize<'de>,
-{
-    Option::<T>::deserialize(deserializer).map(Some)
 }

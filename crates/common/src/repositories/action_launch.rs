@@ -284,13 +284,7 @@ async fn validate(
     let parameters = parameters.unwrap_or(&empty);
     let clean =
         schema_for_binding(parameters).map_err(|error| Error::validation(error.to_string()))?;
-    if &clean != parameters
-        && (delivery == ParameterDelivery::File || format != ParameterFormat::Json)
-    {
-        return Err(Error::validation(
-            "action.launch.invalid: CLI parameters require no input or stdin JSON",
-        ));
-    }
+    crate::action_cli::validate_cli_input_delivery(&clean != parameters, delivery, format)?;
     let source = SourceIdentity::Authoring {
         component_ref: reference.into(),
     };
