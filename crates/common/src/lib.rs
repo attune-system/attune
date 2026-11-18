@@ -27,7 +27,6 @@ pub mod event_schema;
 mod execution_attribution;
 pub mod execution_authority;
 pub mod execution_env;
-pub mod execution_host_config;
 pub mod file_legacy_controller;
 mod http_client;
 pub mod inquiry_callback_adapter;

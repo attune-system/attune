@@ -59,6 +59,7 @@ pub mod execution_event_emitter;
 pub mod execution_input;
 pub mod execution_key_read;
 pub mod execution_log_stream_lease;
+pub mod execution_process;
 pub mod execution_program;
 pub mod execution_runtime_admission;
 mod execution_runtime_control;

@@ -185,9 +185,9 @@ struct PrerequisiteSource {
     image: i64,
     expires_at: DateTime<Utc>,
 }
-struct SourceProof {
-    sources: Vec<(&'static str, i64)>,
-    deadline: Option<DateTime<Utc>>,
+pub(crate) struct SourceProof {
+    pub(crate) sources: Vec<(&'static str, i64)>,
+    pub(crate) deadline: Option<DateTime<Utc>>,
     retained: Option<Vec<SourceEpoch>>,
     image: Option<i64>,
 }
@@ -311,7 +311,7 @@ impl WorkloadLaunchRepository {
     }
     /// Live authority is selected through the recorded mode, never inferred from
     /// ownership or borrowed from a missing/revoked managed admission.
-    async fn source(
+    pub(crate) async fn source(
         tx: &mut Transaction<'_, Postgres>,
         target: &LaunchTarget,
         expected_owner: i64,
@@ -319,7 +319,7 @@ impl WorkloadLaunchRepository {
         super::schema_type::SchemaTypeRepository::lock_selection(tx).await?;
         Self::source_for(tx, target, expected_owner, false).await
     }
-    async fn source_for(
+    pub(crate) async fn source_for(
         tx: &mut Transaction<'_, Postgres>,
         target: &LaunchTarget,
         expected_owner: i64,
@@ -364,7 +364,7 @@ impl WorkloadLaunchRepository {
                             return Err(denied());
                         }
                         if !allow_canceling {
-                            RuntimeAuthorityRepository::validate_execution_credential(
+                            RuntimeAuthorityRepository::validate_execution_source(
                                 tx,
                                 &RuntimeCredentialBinding {
                                     execution_id: *execution,
