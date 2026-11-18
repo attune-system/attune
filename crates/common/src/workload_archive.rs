@@ -64,6 +64,12 @@ pub fn validate_zip<R: Read + Seek>(
         if archive.len() as u64 > policy.max_files {
             return Err(quota());
         }
+        // ZipArchive indexes by name and can otherwise hide duplicate central
+        // entries. Require one consistent local/central representation before
+        // accepting its metadata or expanding payloads.
+        archive
+            .validate_header_consistency()
+            .map_err(|_| invalid())?;
         let mut entries = Vec::with_capacity(archive.len());
         let mut expanded = 0u64;
         for index in 0..archive.len() {
@@ -409,5 +415,36 @@ mod tests {
             .unwrap();
         buffer.get_mut()[position] ^= 1;
         assert!(validate_zip(&mut buffer, &policy).is_err());
+    }
+    #[test]
+    fn rejects_duplicate_and_mismatched_local_central_names() {
+        let mut buffer = Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut buffer);
+            for name in ["a", "b"] {
+                zip.start_file(name, SimpleFileOptions::default()).unwrap();
+                zip.write_all(b"x").unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let original = buffer.into_inner();
+        for central_too in [false, true] {
+            let mut bytes = original.clone();
+            for index in 0..bytes.len().saturating_sub(46) {
+                let name_offset = if bytes[index..].starts_with(b"PK\x03\x04") {
+                    Some(30)
+                } else if central_too && bytes[index..].starts_with(b"PK\x01\x02") {
+                    Some(46)
+                } else {
+                    None
+                };
+                if let Some(offset) = name_offset {
+                    if bytes.get(index + offset) == Some(&b'b') {
+                        bytes[index + offset] = b'a';
+                    }
+                }
+            }
+            assert!(validate_zip(&mut Cursor::new(bytes), &policy()).is_err());
+        }
     }
 }
