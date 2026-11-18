@@ -184,6 +184,7 @@ mod tests {
 
     fn action(visibility: ActionReferenceVisibility, allowed: Vec<&str>) -> Action {
         Action {
+            launch: None,
             output_policy: Default::default(),
             id: 1,
             r#ref: "owner.do_it".to_string(),
@@ -191,7 +192,7 @@ mod tests {
             pack_ref: "owner".to_string(),
             label: "Do it".to_string(),
             description: None,
-            entrypoint: "do.sh".to_string(),
+            entrypoint: Some("do.sh".to_string()),
             runtime: None,
             enabled: true,
             enabled_override: None,

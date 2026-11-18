@@ -98,6 +98,7 @@ fn make_shell_config() -> RuntimeExecutionConfig {
 
 fn make_context(action_ref: &str, entry_point: &str, runtime_name: &str) -> ExecutionContext {
     ExecutionContext {
+        native_invocation: None,
         execution_id: 1,
         action_ref: action_ref.to_string(),
         parameters: HashMap::new(),

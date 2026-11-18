@@ -446,16 +446,21 @@ to these filesystem modes.
 
 ### Shared schema
 
-Actions and sensors share process launch variants. Only actions may use
-`Intrinsic`:
+Actions and sensors share process launch variants. `Command` and CLI arguments
+are action-only extensions defined by [Action command-line metadata](../plans/action-command-line-metadata.md). Only actions may use `Intrinsic`:
 
 ```rust
 enum LaunchSpec {
+    Command {
+        program: String,
+        arguments: Vec<LiteralArgument>,
+    },
     File {
         path: PackPath,
     },
     Native {
         artifact: ArtifactId,
+        arguments: Vec<LiteralArgument>, // action-only, defaults to empty
     },
     JavaJar {
         artifact: ArtifactId,

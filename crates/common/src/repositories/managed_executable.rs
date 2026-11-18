@@ -80,7 +80,8 @@ impl ManagedExecutableRepository {
     }
 
     pub fn changes_admitted_metadata(input: &super::action::UpdateActionInput) -> bool {
-        input.entrypoint.is_some()
+        input.launch.is_some()
+            || input.entrypoint.is_some()
             || input.runtime.is_some()
             || input.runtime_version_constraint.is_some()
             || input.required_worker_runtimes.is_some()

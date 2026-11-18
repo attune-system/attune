@@ -50,6 +50,9 @@ impl NativeRuntime {
     async fn execute_binary(
         &self,
         binary_path: PathBuf,
+        arguments: &[String],
+        invocation_name: Option<&str>,
+        working_dir: Option<&Path>,
         _secrets: &std::collections::HashMap<String, serde_json::Value>,
         env: &std::collections::HashMap<String, String>,
         parameters_stdin: Option<&str>,
@@ -65,13 +68,6 @@ impl NativeRuntime {
         stderr_log_writer: Option<BoundedLogFileWriter>,
         cancel_token: Option<CancellationToken>,
     ) -> RuntimeResult<ExecutionResult> {
-        let binary_path = attune_common::native_entrypoint::resolve(
-            &binary_path,
-            std::env::consts::OS,
-            std::env::consts::ARCH,
-        )
-        .map_err(RuntimeError::InvalidAction)?;
-
         // Check if binary exists and is executable
         if !binary_path.exists() {
             return Err(RuntimeError::ExecutionFailed(format!(
@@ -97,17 +93,33 @@ impl NativeRuntime {
 
         // Build command
         let mut cmd = Command::new(&binary_path);
+        cmd.args(arguments);
 
         // Set working directory
-        if let Some(ref work_dir) = self.work_dir {
+        if let Some(work_dir) = working_dir.or(self.work_dir.as_deref()) {
             cmd.current_dir(work_dir);
         }
 
         parameter_passing::apply_runtime_environment(&mut cmd, env, &self.child_environment);
 
+        let mut read_paths = Vec::new();
+        if let Some(directory) = working_dir {
+            read_paths.push(directory);
+        }
+        if !["/usr", "/bin", "/lib", "/lib64", "/sbin"]
+            .iter()
+            .any(|root| binary_path.starts_with(root))
+            && !working_dir.is_some_and(|directory| binary_path.starts_with(directory))
+        {
+            read_paths.push(binary_path.as_path());
+        }
         let cmd = Command::from(
             self.child_environment
-                .sandbox_workload(cmd.into_std(), &[binary_path.as_path()])?,
+                .sandbox_workload_with_invocation_name(
+                    cmd.into_std(),
+                    &read_paths,
+                    invocation_name,
+                )?,
         );
 
         super::process_executor::execute_streaming_cancellable(
@@ -145,7 +157,8 @@ impl Runtime for NativeRuntime {
     fn can_execute(&self, context: &ExecutionContext) -> bool {
         // Check if runtime_name is explicitly set to "native"
         if let Some(ref runtime_name) = context.runtime_name {
-            return runtime_name.to_lowercase() == "native";
+            return attune_common::runtime_detection::normalize_runtime_name(runtime_name)
+                == "native";
         }
 
         // Otherwise, check if code_path points to an executable binary
@@ -191,15 +204,59 @@ impl Runtime for NativeRuntime {
         parameter_passing::merge_execution_environment(&mut env, &context.execution_env)?;
 
         // Get stdin content if parameters are delivered via stdin
-        let parameters_stdin = prepared_params.stdin_content();
+        let prepared_cli = context
+            .native_invocation
+            .as_ref()
+            .and_then(|invocation| invocation.input.as_ref());
+        let parameters_stdin = match prepared_cli {
+            Some(input) => input.stdin_json(),
+            None => prepared_params.stdin_content(),
+        };
 
         // Get the binary path
-        let binary_path = context.code_path.ok_or_else(|| {
-            RuntimeError::InvalidAction("Native runtime requires code_path to be set".to_string())
-        })?;
+        if let Some(invocation) = &context.native_invocation {
+            let selected = invocation.selected.clone();
+            tokio::task::spawn_blocking(move || {
+                attune_common::action_cli::verify_selected_program(&selected)
+            })
+            .await
+            .map_err(|_| RuntimeError::InvalidAction("Program verification task failed".into()))?
+            .map_err(|error| RuntimeError::InvalidAction(error.to_string()))?;
+        }
+        let binary_path = context
+            .native_invocation
+            .as_ref()
+            .map(|invocation| invocation.selected.path.clone())
+            .or(context.code_path.clone())
+            .ok_or_else(|| {
+                RuntimeError::InvalidAction(
+                    "Native runtime requires code_path to be set".to_string(),
+                )
+            })?;
 
+        let binary_path = if context.native_invocation.is_some() {
+            binary_path
+        } else {
+            attune_common::native_entrypoint::resolve(
+                &binary_path,
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+            )
+            .map_err(RuntimeError::InvalidAction)?
+        };
         self.execute_binary(
             binary_path,
+            prepared_cli.map(|input| input.argv()).unwrap_or(&[]),
+            context
+                .native_invocation
+                .as_ref()
+                .map(|invocation| invocation.selected.invocation_name.as_str()),
+            // Typed launches require the pinned release root. Ordinary file
+            // entrypoints retain the runtime's existing work_dir behavior.
+            context
+                .native_invocation
+                .as_ref()
+                .and(context.working_dir.as_deref()),
             &std::collections::HashMap::new(),
             &env,
             parameters_stdin,
@@ -446,6 +503,89 @@ mod tests {
         context.cancel_token = cancel_token;
         context.stdout_log_writer = Some(stdout_log_writer);
         context
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cli_invocation_preserves_tokens_and_explicit_eof() {
+        use attune_common::action_cli::{
+            select_program, ArgumentLimits, ArgumentPlan, InputDelivery,
+        };
+        use attune_common::value_schema::{Limits, RegistryView, SourceIdentity};
+        use serde_json::json;
+        let root = tempfile::tempdir().unwrap();
+        let launch: attune_common::pack_format::LaunchSpec = serde_json::from_value(
+            json!({"type":"command","program":"printf","arguments":[{"literal":"<%s>","order":0}]}),
+        )
+        .unwrap();
+        let selected =
+            select_program(&launch, root.path(), None, "test.cli", &Default::default()).unwrap();
+        let schema = json!({"value":{"type":"string","cli":{"kind":"positional","order":10}}});
+        let plan = ArgumentPlan::compile(
+            SourceIdentity::Authoring {
+                component_ref: "test.cli".into(),
+            },
+            &schema,
+            launch.action_arguments().unwrap(),
+            &RegistryView::new(),
+            Limits::default(),
+        )
+        .unwrap();
+        let value = "a b; $(false) \" 世界";
+        let input = plan
+            .materialize(
+                selected.path.to_str().unwrap(),
+                &json!({"value":value}),
+                &[],
+                InputDelivery::None,
+                ArgumentLimits::default(),
+            )
+            .unwrap();
+        let mut context = ExecutionContext::test_context("test.cli".into(), None);
+        context.native_invocation = Some(super::super::NativeInvocation {
+            selected,
+            input: Some(input),
+        });
+        context.code_path = Some("/unavailable/fallback".into());
+        context.working_dir = Some(root.path().into());
+        context.parameter_delivery = attune_common::models::ParameterDelivery::None;
+        let result = NativeRuntime::new().execute(context).await.unwrap();
+        assert_eq!(result.stdout, format!("<{value}>"));
+        assert_eq!(result.exit_code, 0);
+        // cat must receive EOF even with no stdin payload; inherited stdin would hang.
+        let launch = serde_json::from_value(json!({"type":"command","program":"cat"})).unwrap();
+        let selected =
+            select_program(&launch, root.path(), None, "test.cli", &Default::default()).unwrap();
+        let plan = ArgumentPlan::compile(
+            SourceIdentity::Authoring {
+                component_ref: "test.cli".into(),
+            },
+            &json!({}),
+            &[],
+            &RegistryView::new(),
+            Limits::default(),
+        )
+        .unwrap();
+        let input = plan
+            .materialize(
+                selected.path.to_str().unwrap(),
+                &json!({}),
+                &[],
+                InputDelivery::None,
+                ArgumentLimits::default(),
+            )
+            .unwrap();
+        let mut context = ExecutionContext::test_context("test.cli".into(), None);
+        context.native_invocation = Some(super::super::NativeInvocation {
+            selected,
+            input: Some(input),
+        });
+        context.parameter_delivery = attune_common::models::ParameterDelivery::None;
+        context.timeout = Some(2);
+        let result = NativeRuntime::new().execute(context).await.unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert!(result.stdout.is_empty());
+        assert!(!result.timed_out);
     }
 
     #[tokio::test]

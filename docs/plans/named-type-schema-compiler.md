@@ -216,6 +216,17 @@ monotonic: true marking is inherited through aliases, and explicit false cannot
 remove an inherited root marking. Structural overrides cannot remove nested
 secret marking either.
 
+Action input schemas for typed native/command launches may additionally attach
+`cli` at explicit authored field occurrences, including named/local reference
+use sites. This is an opt-in annotation: reusable type definitions, output
+schemas, ordinary file/workflow actions, and other consumers reject it. Binding
+extraction follows authored occurrences; a reference does not inherit another
+occurrence's CLI binding. The validator graph strips `cli`, while the admitted
+annotated contract retains it and its original authored digest. Worker planning
+uses that immutable contract and conservative resolved secrecy, not a fresh
+registry lookup. See [Action command-line metadata](action-command-line-metadata.md)
+for placement, conversion, ordering, and concrete provenance checks.
+
 Every effective default must validate without further default insertion.
 Defaults and examples containing values classified as secret are rejected,
 including an inherited default made secret by use-site marking. Examples are

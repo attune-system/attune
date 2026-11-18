@@ -92,6 +92,9 @@ async fn create_test_runtime(pool: &PgPool, suffix: &str) -> i64 {
 /// Test helper to create a test action
 async fn create_test_action(pool: &PgPool, pack_id: i64, suffix: &str) -> i64 {
     let action_input = CreateActionInput {
+        launch: None,
+        parameter_delivery: None,
+        parameter_format: None,
         output_policy: Default::default(),
         output_format: Default::default(),
         r#ref: format!("test_pack_{}.action", suffix),
@@ -99,7 +102,7 @@ async fn create_test_action(pool: &PgPool, pack_id: i64, suffix: &str) -> i64 {
         pack_ref: format!("test_pack_{}", suffix),
         label: format!("Test Action {}", suffix),
         description: Some(format!("Test action {}", suffix)),
-        entrypoint: "echo test".to_string(),
+        entrypoint: Some("echo test".to_string()),
         runtime: None,
         enabled: true,
         runtime_version_constraint: None,

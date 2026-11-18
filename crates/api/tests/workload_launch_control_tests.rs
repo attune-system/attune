@@ -224,8 +224,51 @@ impl Fixture {
     async fn reserve(&self) -> Result<ReservedLaunch> {
         Ok(Ledger::freeze(&self.ctx.pool, self.image, self.spec.clone(), self.master()).await?)
     }
+    async fn selected_reserve(&self, value: Value) -> Result<ReservedLaunch> {
+        use attune_common::repositories::execution_input::{
+            ExecutionInputRepository, SelectedExecutionInput,
+        };
+        let execution = match self.spec.manifest.target {
+            LaunchTarget::Execution { execution, .. } => execution,
+            _ => return Err("execution target required".into()),
+        };
+        sqlx::query("UPDATE execution SET config=$2 WHERE id=$1")
+            .bind(execution)
+            .bind(&value)
+            .execute(&self.ctx.pool)
+            .await?;
+        let mut tx = self.ctx.pool.begin().await?;
+        let input =
+            ExecutionInputRepository::restore(&mut tx, execution, Some(self.master()), None)
+                .await?;
+        let (selected, _, snapshot, expiry) = input.into_parts();
+        tx.commit().await?;
+        expiry.ensure_fresh()?;
+        let root = Ledger::reserve_action_admission(
+            &self.ctx.pool,
+            &self.spec.manifest.target,
+            self.spec.manifest.owner_identity_id,
+            self.image,
+        )
+        .await?;
+        Ok(Ledger::freeze_selected_execution(
+            &self.ctx.pool,
+            root,
+            self.image,
+            self.spec.clone(),
+            self.master(),
+            None,
+            SelectedExecutionInput::new(selected, snapshot)?,
+        )
+        .await?)
+    }
     async fn running(&self) -> Result<(ReservedLaunch, LaunchLease)> {
-        let reserved = self.reserve().await?;
+        self.run_reserved(self.reserve().await?).await
+    }
+    async fn run_reserved(
+        &self,
+        reserved: ReservedLaunch,
+    ) -> Result<(ReservedLaunch, LaunchLease)> {
         let claim: ClaimedLaunch = self
             .ok(
                 &reserved,
@@ -1880,4 +1923,169 @@ async fn artifact_discovery_survives_stopped_complete_capture_without_setup_publ
         .any(|item| item.request == reserved.request));
     fixture.ctx.cleanup().await?;
     Ok(())
+}
+
+#[tokio::test]
+async fn exact_private_stdin_rejects_substitution_and_consumes_once_before_ack() -> Result<()> {
+    use attune_common::workload_stdin::{AuthorizeLaunchStdinRequest, LaunchStdinPayload};
+    let fixture = Fixture::new().await?;
+    let reserved = fixture.selected_reserve(json!({"value":"one"})).await?;
+    let (reserved, lease) = fixture.run_reserved(reserved).await?;
+    let grant: LaunchIoGrant = fixture
+        .ok(
+            &reserved,
+            "io-grants",
+            &LaunchIoGrantRequest {
+                request: reserved.request.clone(),
+                channel: LaunchIoChannel::Stdin,
+            },
+            LAUNCH_DISPATCH_HEADER,
+            &reserved.dispatch_token,
+        )
+        .await?;
+    let endpoint = format!(
+        "/api/v1/workload-launches/{}/authorize-stdin",
+        reserved.request.launch_id
+    );
+    for (payload, expected) in [
+        (br#"{"value":"two"}"#.as_slice(), StatusCode::FORBIDDEN),
+        (br#"{"value":"one"} "#.as_slice(), StatusCode::FORBIDDEN),
+        (br#"{"value":"one"}"#.as_slice(), StatusCode::OK),
+        (br#"{"value":"one"}"#.as_slice(), StatusCode::FORBIDDEN),
+    ] {
+        let request = AuthorizeLaunchStdinRequest {
+            handle: lease.handle.clone(),
+            payload: LaunchStdinPayload::from_bytes(payload.to_vec())?,
+        };
+        let response = fixture
+            .ctx
+            .app
+            .clone()
+            .oneshot(
+                Request::post(&endpoint)
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {}", fixture.credential))
+                    .header(LAUNCH_LEASE_HEADER, lease.token.as_str())
+                    .header(LAUNCH_IO_HEADER, grant.token.as_str())
+                    .body(Body::from(serde_json::to_vec(&request)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), expected);
+        let bytes = to_bytes(response.into_body(), 4096).await?;
+        assert!(!String::from_utf8_lossy(&bytes).contains("value"));
+        if expected == StatusCode::OK {
+            let auth: LaunchIoAuthorization = serde_json::from_slice(&bytes)?;
+            assert_eq!(auth.max_bytes, payload.len() as u64);
+            let consumed: bool = sqlx::query_scalar(
+                "SELECT (operation->>'stdin_authorized')::boolean FROM workload_launch WHERE id=$1",
+            )
+            .bind(reserved.request.launch_id)
+            .fetch_one(&fixture.ctx.pool)
+            .await?;
+            assert!(consumed, "ACK must follow persisted one-shot effect");
+        }
+    }
+    // Refreshing a count-only grant cannot clear consumption or authorize stdin.
+    let count = AuthorizeLaunchIoRequest {
+        request: reserved.request.clone(),
+        channel: LaunchIoChannel::Stdin,
+        offset: 0,
+        bytes: 15,
+    };
+    let response = fixture
+        .ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/v1/workload-launches/{}/authorize-io",
+                reserved.request.launch_id
+            ))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", fixture.credential))
+            .header(LAUNCH_LEASE_HEADER, lease.token.as_str())
+            .header(LAUNCH_IO_HEADER, grant.token.as_str())
+            .body(Body::from(serde_json::to_vec(&count)?))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    fixture.ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn private_stdin_expiry_after_grant_wait_cannot_consume_or_ack() -> Result<()> {
+    use attune_common::workload_stdin::{AuthorizeLaunchStdinRequest, LaunchStdinPayload};
+    let fixture = Fixture::new().await?;
+    let reserved = fixture.selected_reserve(json!({"value":"one"})).await?;
+    let (reserved, lease) = fixture.run_reserved(reserved).await?;
+    let grant: LaunchIoGrant = fixture
+        .ok(
+            &reserved,
+            "io-grants",
+            &LaunchIoGrantRequest {
+                request: reserved.request.clone(),
+                channel: LaunchIoChannel::Stdin,
+            },
+            LAUNCH_DISPATCH_HEADER,
+            &reserved.dispatch_token,
+        )
+        .await?;
+    let mut barrier = fixture.ctx.pool.begin().await?;
+    let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *barrier)
+        .await?;
+    let _: i64 = sqlx::query_scalar("SELECT launch FROM workload_launch_io_grant WHERE launch=$1 AND channel='stdin' FOR UPDATE")
+        .bind(reserved.request.launch_id).fetch_one(&mut *barrier).await?;
+    let body = AuthorizeLaunchStdinRequest {
+        handle: lease.handle.clone(),
+        payload: LaunchStdinPayload::from_bytes(br#"{"value":"one"}"#.to_vec())?,
+    };
+    let request = Request::post(format!(
+        "/api/v1/workload-launches/{}/authorize-stdin",
+        reserved.request.launch_id
+    ))
+    .header("content-type", "application/json")
+    .header("authorization", format!("Bearer {}", fixture.credential))
+    .header(LAUNCH_LEASE_HEADER, lease.token.as_str())
+    .header(LAUNCH_IO_HEADER, grant.token.as_str())
+    .body(Body::from(serde_json::to_vec(&body)?))?;
+    let app = fixture.ctx.app.clone();
+    let mut owner = tokio::spawn(async move { app.oneshot(request).await });
+    let mut joined = false;
+    let exchange = async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))")
+                    .bind(blocker).fetch_one(&fixture.ctx.pool).await?;
+                if waiting { return Ok::<_,sqlx::Error>(()); }
+                tokio::task::yield_now().await;
+            }
+        }).await??;
+        // The request passed initial auth and is waiting inside its owning
+        // transaction. Change the exact grant while holding its observed lock.
+        sqlx::query("UPDATE workload_launch_io_grant SET expires_at=clock_timestamp()-interval '1 second' WHERE launch=$1 AND channel='stdin'")
+            .bind(reserved.request.launch_id).execute(&mut *barrier).await?;
+        Ok::<_,Box<dyn std::error::Error>>(())
+    }.await;
+    // Release on every path, then join/abort the request before pool cleanup.
+    barrier.commit().await?;
+    if exchange.is_ok() {
+        let response = (&mut owner).await;
+        joined = true;
+        assert_eq!(response??.status(), StatusCode::FORBIDDEN);
+        let consumed: bool = sqlx::query_scalar(
+            "SELECT (operation->>'stdin_authorized')::boolean FROM workload_launch WHERE id=$1",
+        )
+        .bind(reserved.request.launch_id)
+        .fetch_one(&fixture.ctx.pool)
+        .await?;
+        assert!(!consumed);
+    }
+    if !joined {
+        owner.abort();
+        let _ = owner.await;
+    }
+    fixture.ctx.cleanup().await?;
+    exchange
 }

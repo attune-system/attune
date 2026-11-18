@@ -26,7 +26,7 @@ Attune is a pre-production, event-driven automation/orchestration platform built
 8. Keep schema definitions flat: `param_schema`, `out_schema`, and `conf_schema` use Attune's flat per-field format, not raw JSON Schema.
    For value-schema validation, defaults, secret traversal, or template handling, use `crates/common/src/value_schema/` and read `docs/plans/named-type-schema-compiler.md`. Authoring previews are not runtime release bindings.
 9. Keep `execution.config` flat: the object itself is the parameters map. Do not wrap parameters under `{"parameters": ...}`.
-10. Deliver action parameters via **stdin JSON**, not environment variables.
+10. Deliver action parameters via **stdin JSON**, with declared nonsecret CLI bindings for native/command action launches as the explicit exception. Use `crates/common/src/action_cli/` and read `docs/plans/action-command-line-metadata.md` for ordering, secrecy, and executable selection.
 11. Keep execution API access opt-in via `permission_set_refs`. The reserved ref `standard` grants only scoped key/artifact access for the executing action/pack (and containing workflow action/pack for workflow child executions).
 12. Store workflow actions using the [two-file representation](#storage-and-authoring).
 13. Compare runtime names case-insensitively via `normalize_runtime_name()` (for example, `node`, `nodejs`, and `Node.js` should resolve equivalently).

@@ -26,6 +26,7 @@ use crate::{
 mod artifact;
 mod materialization;
 mod output;
+mod stdin;
 pub use artifact::ArtifactAllocation;
 pub use materialization::{PackInputReservation, PublicInputCleanup};
 pub use output::{LaunchOutputCleanup, OutputBodyPermit};
@@ -733,7 +734,7 @@ impl WorkloadLaunchRepository {
         }
         Ok(())
     }
-    fn invocation(record: &Record, master: &str) -> Result<LaunchInvocation> {
+    fn private_context(record: &Record, master: &str) -> Result<FrozenContext> {
         if record.manifest.context.id != record.id
             || record.manifest.context.version != 1
             || record.manifest.context.ciphertext_sha256
@@ -750,7 +751,10 @@ impl WorkloadLaunchRepository {
         {
             return Err(denied());
         }
-        Ok(context.invocation)
+        Ok(context)
+    }
+    fn invocation(record: &Record, master: &str) -> Result<LaunchInvocation> {
+        Ok(Self::private_context(record, master)?.invocation)
     }
     /// Reserve an execution/worker-incarnation admission before any asynchronous
     /// preparation. A retry may recover this exact record, never rebind it after

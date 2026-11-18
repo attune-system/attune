@@ -4,13 +4,13 @@
 /* eslint-disable */
 import type { LaunchLease } from "./LaunchLease";
 import type { LaunchManifest } from "./LaunchManifest";
-import type { LaunchSpec } from "./LaunchSpec";
 import type { LaunchStatus } from "./LaunchStatus";
+import type { WorkloadLaunchSpec } from "./WorkloadLaunchSpec";
 export type ClaimedLaunch =
   | {
       lease: LaunchLease;
       mode: "active";
-      spec: LaunchSpec;
+      spec: WorkloadLaunchSpec;
     }
   | {
       lease: LaunchLease;

@@ -16,6 +16,7 @@ use axum::{
     Extension, Json, Router,
 };
 pub mod output;
+pub mod stdin;
 pub use output::{output_body, reserve_output, stage_result};
 use std::sync::Arc;
 
@@ -390,6 +391,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/workload-launches/{id}/stage-result", post(stage_result))
         .route("/workload-launches/{id}/io-grants", post(io_grants))
         .route("/workload-launches/{id}/authorize-io", post(authorize_io))
+        .route(
+            "/workload-launches/{id}/authorize-stdin",
+            post(stdin::authorize),
+        )
         .route("/workload-launches/reconcile", post(reconcile))
         .route("/workload-launches/{id}/resolve", post(resolve))
         .route("/workload-launches/{id}/claim", post(claim))

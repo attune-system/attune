@@ -10260,6 +10260,7 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
         let workers: Vec<_> = WorkerRepository::find_action_workers(pool)
             .await?
             .into_iter()
+            .filter(|worker| Self::worker_supports_launch(worker, action.launch.as_ref()))
             .filter(|worker| {
                 !require_delegated
                     || worker
@@ -10274,6 +10275,9 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
                         == Some(true)
             })
             .collect();
+        if action.launch.is_some() && workers.is_empty() {
+            return Err(anyhow::anyhow!("No compatible workers advertise action_cli_arguments_v1 and the required execution authority"));
+        }
         if require_delegated && workers.is_empty() {
             return Err(anyhow::anyhow!(
                 "No compatible workers found with delegated execution authority v1 completion readiness"
@@ -10563,6 +10567,21 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
 
     /// Check if a worker supports a given runtime
     ///
+    fn worker_supports_launch(
+        worker: &attune_common::models::Worker,
+        launch: Option<&attune_common::pack_format::LaunchSpec>,
+    ) -> bool {
+        launch.is_none()
+            || worker
+                .capabilities
+                .as_ref()
+                .and_then(|capabilities| {
+                    capabilities.get(attune_common::action_cli::WORKER_CAPABILITY)
+                })
+                .and_then(JsonValue::as_bool)
+                == Some(true)
+    }
+
     /// This checks the worker's capabilities.runtimes array against the runtime's aliases.
     /// If aliases are missing, fall back to the runtime's canonical name.
     fn worker_supports_runtime(worker: &attune_common::models::Worker, runtime: &Runtime) -> bool {
@@ -11623,6 +11642,9 @@ tasks:
                 ActionRepository::create(
                     pool,
                     CreateActionInput {
+                        launch: None,
+                        parameter_delivery: None,
+                        parameter_format: None,
                         output_policy: Default::default(),
                         output_format: Default::default(),
                         r#ref: format!("scheduler_inquiry_it.{name}"),
@@ -11630,7 +11652,7 @@ tasks:
                         pack_ref: "scheduler_inquiry_it".to_string(),
                         label: name.to_string(),
                         description: None,
-                        entrypoint: format!("{name}.sh"),
+                        entrypoint: Some(format!("{name}.sh")),
                         runtime: None,
                         enabled: true,
                         runtime_version_constraint: None,
@@ -13397,6 +13419,28 @@ true,
             created: Utc::now(),
             updated: Utc::now(),
         }
+    }
+
+    #[test]
+    fn command_launch_requires_explicit_worker_capability() {
+        let mut worker = create_test_worker("command-worker", 0);
+        let launch =
+            serde_json::from_value(serde_json::json!({"type":"command","program":"tool"})).unwrap();
+        assert!(ExecutionScheduler::worker_supports_launch(&worker, None));
+        assert!(!ExecutionScheduler::worker_supports_launch(
+            &worker,
+            Some(&launch)
+        ));
+        worker.capabilities = Some(serde_json::json!({"action_cli_arguments_v1":"true"}));
+        assert!(!ExecutionScheduler::worker_supports_launch(
+            &worker,
+            Some(&launch)
+        ));
+        worker.capabilities = Some(serde_json::json!({"action_cli_arguments_v1":true}));
+        assert!(ExecutionScheduler::worker_supports_launch(
+            &worker,
+            Some(&launch)
+        ));
     }
 
     #[test]

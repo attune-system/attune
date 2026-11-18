@@ -80,6 +80,25 @@ pub fn schema_error(
     }
 }
 
+/// Preserve stable CLI/schema codes and authored source locations.
+pub fn action_cli_error(file: &str, field: &str, error: crate::action_cli::Error) -> crate::Error {
+    match error {
+        crate::action_cli::Error::Schema(error) => schema_error(file, field, error),
+        crate::action_cli::Error::Argument { code, path } => {
+            let message = format!("{code} at {path}");
+            let mut diagnostic = PackDiagnostic::at(file, field, &message);
+            diagnostic.code = code.to_string();
+            crate::Error::Deployment {
+                details: Box::new(DeploymentDetails::new(
+                    "metadata_validation",
+                    vec![diagnostic],
+                )),
+                source: Box::new(crate::Error::Validation(message)),
+            }
+        }
+    }
+}
+
 pub fn located(error: crate::Error, file: &str, field: &str) -> crate::Error {
     if matches!(error, crate::Error::Deployment { .. }) {
         return error;

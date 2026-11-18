@@ -32,6 +32,26 @@ impl WorkloadSandbox {
     /// Call before configuring stdio, process groups or pre_exec hooks. Only
     /// trusted selected pack/runtime paths may be supplied, never a shared root.
     pub fn wrap(self, command: Command, read_paths: &[&Path]) -> io::Result<Command> {
+        self.wrap_with_invocation_name(command, read_paths, None)
+    }
+
+    /// Preserve a static executable invocation name through optional isolation.
+    /// The name is metadata, never an execution parameter.
+    pub fn wrap_with_invocation_name(
+        self,
+        command: Command,
+        read_paths: &[&Path],
+        invocation_name: Option<&std::ffi::OsStr>,
+    ) -> io::Result<Command> {
+        #[cfg(unix)]
+        let command = {
+            use std::os::unix::process::CommandExt;
+            let mut command = command;
+            if let Some(name) = invocation_name {
+                command.arg0(name);
+            }
+            command
+        };
         if matches!(self, Self::Disabled) {
             return Ok(command);
         }
@@ -39,6 +59,9 @@ impl WorkloadSandbox {
             return Err(io::Error::other("bubblewrap workloads require Linux"));
         }
         let mut sandbox = Command::new("/usr/bin/bwrap");
+        if let Some(name) = invocation_name {
+            sandbox.arg("--argv0").arg(name);
+        }
         sandbox.args([
             "--unshare-user",
             "--unshare-pid",
@@ -205,6 +228,22 @@ mod tests {
         let command = WorkloadSandbox::Disabled.wrap(command, &[]).unwrap();
         assert_eq!(command.get_program(), "/bin/sh");
         assert_eq!(command.get_envs().count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn named_wrapper_preserves_program_identity_without_reordering_arguments() {
+        let mut command = Command::new("/usr/bin/printf");
+        command.arg("%s").arg("a b; $(false)");
+        let command = WorkloadSandbox::Bubblewrap
+            .wrap_with_invocation_name(command, &[], Some("printf".as_ref()))
+            .unwrap();
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(&args[..2], &["--argv0", "printf"]);
+        assert_eq!(
+            &args[args.len() - 3..],
+            &["/usr/bin/printf", "%s", "a b; $(false)"]
+        );
     }
 
     #[cfg(target_os = "linux")]

@@ -439,6 +439,7 @@ impl fmt::Debug for LaunchInvocation {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
+#[schema(as = WorkloadLaunchSpec)]
 pub struct LaunchSpec {
     pub manifest: LaunchManifest,
     pub invocation: LaunchInvocation,

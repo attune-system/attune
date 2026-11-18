@@ -46,6 +46,22 @@ pub(crate) struct FrozenInputSnapshot {
     config: Value,
     secrets: Vec<FrozenSecret>,
 }
+impl FrozenInputSnapshot {
+    /// The origin dependency frontier must be captured before remote delivery
+    /// of inherited/ordinary secrets is enabled. Until then, the executable
+    /// consumer admits only the source-complete public-input case.
+    pub(crate) fn public_snapshot(&self) -> Result<ExecutionInputSnapshot> {
+        if !self.secrets.is_empty() {
+            return Err(denied());
+        }
+        Ok(ExecutionInputSnapshot {
+            execution: self.execution,
+            executor: self.executor,
+            config: self.config.clone(),
+            secrets: Vec::new(),
+        })
+    }
+}
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FrozenSecret {

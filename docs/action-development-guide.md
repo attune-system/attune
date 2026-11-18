@@ -1172,3 +1172,67 @@ env | grep ATTUNE >&2  # Print all ATTUNE_* variables to stderr
 - **JSON**: Last line parsed into `execution.result`
 - **YAML**: Full output parsed into `execution.result`
 - **JSONL**: Each line parsed, collected into array in `execution.result`
+
+## Calling an installed binary with arguments
+
+A native action can call a worker-installed program directly. Define fixed
+arguments under `launch.arguments`, and dynamic bindings on their parameter
+schema fields. One global `order` determines the sequence.
+
+```yaml
+ref: tools.print_message
+label: Print message
+runner_type: native
+launch:
+  type: command
+  program: printf
+  arguments:
+    - literal: "%s\n"
+      order: 0
+parameter_delivery: none
+output_format: text
+parameters:
+  message:
+    type: string
+    default: hello
+    cli:
+      kind: positional
+      order: 10
+```
+
+`attune action execute tools.print_message --param 'message=hello world'` passes
+`hello world` as one argument. Use `cli: {kind: option, name: --output, order: 20}`
+for an option/value pair, or `kind: flag` for a Boolean switch. Nested bindings
+belong on explicit `properties` definitions; author-facing paths use dot/bracket
+notation. Static subcommands, flags and `--` separators are literal entries.
+
+For a binary distributed in the pack, use `launch: {type: native, artifact: tool}`
+and publish the verified native artifact with the pack builder. Both launch
+forms require a direct native runtime. Existing `entry_point` actions continue
+working without `launch`.
+
+Commands default to no input document. Use `parameter_delivery: stdin` to send
+the complete flat JSON map as well as declared arguments. Secrets cannot bind to
+argv. With `none`, any concrete protected input fails before launch, including
+unbound fields. Optional secrets can use stdin JSON. CLI invocations support
+JSON input only and never expand shell expressions. Constrain values that the
+target program interprets as paths, code or response files. Deployments must
+protect installed programs and search directories against untrusted writes.
+
+Action detail responses include a definition-only `argument_preview` in derived
+order. The web configuration dialog exposes launch/input schema JSON and this
+saved preview. CLI JSON/YAML output preserves the same metadata. Replace sources
+atomically with:
+
+```bash
+attune action update tools.print_message --clear-entrypoint \
+  --launch-file launch.yaml --parameters-file parameters.yaml \
+  --parameter-delivery none --parameter-format json
+```
+
+Use `--clear-launch --entrypoint run` with a compatible schema and explicit
+`--parameter-delivery stdin` when switching back. Omitted patch fields preserve
+stored settings. Supporting Linux workers advertise `action_cli_arguments_v1`;
+use placement constraints for tools installed only on selected workers.
+See the [full metadata specification](plans/action-command-line-metadata.md)
+for conversion rules, limits, diagnostics and security responsibilities.

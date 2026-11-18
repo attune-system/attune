@@ -483,14 +483,12 @@ impl PackChecker {
         self.check_environment_metadata(component, &value, &rel);
         self.check_flat_schema_alias(
             map,
-            &[
-                "param_schema",
-                "out_schema",
-                "conf_schema",
-                "event_config_schema",
-            ],
+            &["out_schema", "conf_schema", "event_config_schema"],
             &rel,
         );
+        if component != "actions" || yaml_get(map, "launch").is_none() {
+            self.check_flat_schema(map, "param_schema", &rel);
+        }
         match component {
             "types" => {
                 self.check_owned_ref(map, component, "schema_type", &rel, false);
@@ -728,7 +726,7 @@ impl PackChecker {
     fn check_action(&mut self, map: &Mapping, rel: &str) {
         self.check_action_output_policy(map, rel);
         for (field, allowed) in [
-            ("parameter_delivery", &["stdin", "file"][..]),
+            ("parameter_delivery", &["stdin", "file", "none"][..]),
             ("parameter_format", &["json", "yaml", "dotenv"][..]),
             ("output_format", &["text", "json", "yaml", "jsonl"][..]),
             (
@@ -770,13 +768,149 @@ impl PackChecker {
             }
         }
         self.check_owned_ref(map, "actions", "action", rel, false);
-        self.check_flat_schema(map, "parameters", rel);
+        let has_launch = yaml_get(map, "launch").is_some();
+        if !has_launch {
+            self.check_flat_schema(map, "parameters", rel);
+        }
         self.check_flat_schema_alias(map, &["output", "output_schema"], rel);
         self.optional_type(map, "enabled", "boolean", rel);
         self.optional_type(map, "runner_type", "string", rel);
         self.check_string_array(map, "default_execution_permission_set_refs", rel);
         self.check_string_array(map, "reference_allowed_pack_refs", rel);
 
+        if has_launch {
+            if matches!(
+                yaml_get(map, "launch")
+                    .and_then(|value| value.get("type"))
+                    .and_then(YamlValue::as_str),
+                Some("file" | "java_jar" | "java_class" | "intrinsic")
+            ) {
+                self.check_flat_schema(map, "parameters", rel);
+                self.check_flat_schema(map, "param_schema", rel);
+                if yaml_get(map, "entry_point").is_some()
+                    || yaml_get(map, "workflow_file").is_some()
+                    || yaml_get(map, "parameter_delivery").and_then(YamlValue::as_str)
+                        == Some("none")
+                {
+                    self.error_at(
+                        rel,
+                        "launch",
+                        "action.launch.invalid",
+                        "Invalid execution source or parameter delivery",
+                    );
+                }
+                return;
+            }
+            let result: crate::Result<()> = (|| {
+                if yaml_get(map, "workflow_file").is_some()
+                    || yaml_get(map, "entry_point").is_some()
+                {
+                    return Err(crate::Error::validation(
+                        "Workflow and process sources are exclusive",
+                    ));
+                }
+                let launch: crate::pack_format::LaunchSpec =
+                    serde_yaml_ng::from_value(yaml_get(map, "launch").unwrap().clone())
+                        .map_err(|_| crate::Error::validation("Invalid action launch"))?;
+                let runtime = yaml_get(map, "runner_type")
+                    .and_then(YamlValue::as_str)
+                    .unwrap_or("");
+                let named_runtime = runtime.contains('.')
+                    && crate::schema::RefValidator::validate_component_ref(runtime).is_ok();
+                if crate::runtime_detection::normalize_runtime_name(
+                    runtime.strip_prefix("core.").unwrap_or(runtime),
+                ) != "native"
+                    && !named_runtime
+                {
+                    return Err(crate::Error::validation(
+                        "Command launches require a native runtime",
+                    ));
+                }
+                if named_runtime && runtime != "core.native" {
+                    self.warning(
+                        Some(rel),
+                        "action.runtime_unverified",
+                        "The server must resolve this runtime reference to a direct native runtime",
+                    );
+                }
+                let delivery = yaml_get(map, "parameter_delivery")
+                    .and_then(YamlValue::as_str)
+                    .map(str::parse)
+                    .transpose()
+                    .map_err(crate::Error::validation)?
+                    .unwrap_or_else(|| launch.default_parameter_delivery());
+                let format = yaml_get(map, "parameter_format")
+                    .and_then(YamlValue::as_str)
+                    .unwrap_or("json")
+                    .parse()
+                    .map_err(crate::Error::validation)?;
+                launch.validate_action_source(
+                    yaml_get(map, "entry_point").and_then(YamlValue::as_str),
+                    delivery,
+                    format,
+                )?;
+                let value = YamlValue::Mapping(map.clone());
+                let schema = crate::schema_type::read_schema_field(
+                    &value,
+                    crate::schema_type::PARAM_SCHEMA_FIELDS,
+                )?
+                .unwrap_or_else(|| serde_json::json!({}));
+                let schema_field = crate::schema_type::PARAM_SCHEMA_FIELDS
+                    .iter()
+                    .find(|field| yaml_get(map, field).is_some())
+                    .copied()
+                    .unwrap_or("parameters");
+                let schema_path = crate::pack_registry::diagnostics::pointer(schema_field);
+                let clean = crate::action_cli::schema_for_binding(&schema).map_err(|error| {
+                    crate::pack_registry::diagnostics::action_cli_error(rel, &schema_path, error)
+                })?;
+                crate::action_cli::validate_cli_input_delivery(clean != schema, delivery, format)?;
+                crate::action_cli::ArgumentPlan::compile(
+                    crate::value_schema::SourceIdentity::Authoring {
+                        component_ref: rel.into(),
+                    },
+                    &schema,
+                    launch.action_arguments()?,
+                    &self.type_registry,
+                    crate::value_schema::Limits::default(),
+                )
+                .map_err(|error| {
+                    crate::pack_registry::diagnostics::action_cli_error(rel, &schema_path, error)
+                })?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                match error {
+                    crate::Error::Deployment { details, .. } => {
+                        for diagnostic in details.diagnostics {
+                            if diagnostic.code
+                                == crate::value_schema::ErrorCode::MissingReference.as_str()
+                            {
+                                self.warning(
+                                    Some(rel),
+                                    "schema.external_reference_unverified",
+                                    "Command parameter types require server-side validation",
+                                );
+                            } else {
+                                self.push_diagnostic(diagnostic);
+                            }
+                        }
+                    }
+                    error => {
+                        self.error_at(rel, "launch", "action.launch.invalid", error.to_string())
+                    }
+                }
+            }
+            return;
+        }
+        if yaml_get(map, "parameter_delivery").and_then(YamlValue::as_str) == Some("none") {
+            self.error_at(
+                rel,
+                "parameter_delivery",
+                "action.launch.invalid",
+                "No-input delivery requires a typed native launch",
+            );
+        }
         if let Some(workflow_file) = self.optional_string(map, "workflow_file", rel) {
             self.check_referenced_workflow(&workflow_file, rel);
             return;

@@ -6079,6 +6079,9 @@ mod tests {
         let action = ActionRepository::create(
             &mut *tx,
             CreateActionInput {
+                launch: None,
+                parameter_delivery: None,
+                parameter_format: None,
                 output_policy: Default::default(),
                 output_format: Default::default(),
                 r#ref: "log_binding.echo".into(),
@@ -6086,7 +6089,7 @@ mod tests {
                 pack_ref: pack.r#ref.clone(),
                 label: "Echo".into(),
                 description: None,
-                entrypoint: "echo".into(),
+                entrypoint: Some("echo".into()),
                 runtime: None,
                 enabled: true,
                 runtime_version_constraint: None,

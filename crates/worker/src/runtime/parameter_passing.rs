@@ -238,6 +238,7 @@ pub fn merge_parameters_and_secrets(
 /// Prepared parameters ready for execution
 #[derive(Debug)]
 pub enum PreparedParameters {
+    NoInput,
     /// Parameters are in environment variables
     Environment,
     /// Parameters will be passed via stdin
@@ -275,6 +276,10 @@ pub fn prepare_parameters(
     config: ParameterDeliveryConfig,
 ) -> Result<PreparedParameters, RuntimeError> {
     match config.delivery {
+        ParameterDelivery::None => {
+            env.insert("ATTUNE_PARAMETER_DELIVERY".into(), "none".into());
+            Ok(PreparedParameters::NoInput)
+        }
         ParameterDelivery::Stdin => {
             // Format parameters for stdin
             let formatted = format_parameters(parameters, config.format)?;

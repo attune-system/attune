@@ -167,14 +167,21 @@ pub struct EvidenceFile {
     pub sha256: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LaunchSpec {
+    Command {
+        program: String,
+        #[serde(default)]
+        arguments: Vec<crate::action_cli::LiteralArgument>,
+    },
     File {
         path: String,
     },
     Native {
         artifact: String,
+        #[serde(default)]
+        arguments: Vec<crate::action_cli::LiteralArgument>,
     },
     JavaJar {
         artifact: String,
@@ -192,13 +199,15 @@ pub enum LaunchSpec {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 pub enum IntrinsicHandler {
     #[serde(rename = "attune.inquiry/v1")]
     InquiryV1,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, utoipa::ToSchema,
+)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum ClasspathEntry {
     Artifact { artifact: String },

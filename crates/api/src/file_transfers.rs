@@ -137,6 +137,15 @@ impl FileTransfers {
         }
         self.memory_lease(Some(plaintext))
     }
+    /// Admit before buffering private stdin JSON/Base64, decoded bytes and the
+    /// separately decrypted frozen context. No payload participates in errors.
+    pub(crate) fn private_stdin(&self) -> Result<FileMemoryLease, String> {
+        let closed = self.closed.lock().expect("file admission lock poisoned");
+        if *closed {
+            return Err("Private input admission is shutting down".into());
+        }
+        self.memory_lease_bytes(128 * UNIT)
+    }
     pub(crate) fn spawn<F, T>(&self, lease: FileUploadLease, work: F) -> JoinHandle<Option<T>>
     where
         F: Future<Output = T> + Send + 'static,

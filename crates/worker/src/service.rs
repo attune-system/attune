@@ -607,7 +607,8 @@ impl WorkerService {
                 jwt_config,
                 transport,
             )
-            .with_worker_token_provider(worker_token_provider.clone()),
+            .with_worker_token_provider(worker_token_provider.clone())
+            .with_child_environment(child_environment.clone()),
         );
 
         // Initialize heartbeat manager
@@ -694,6 +695,10 @@ impl WorkerService {
         let worker_id = {
             let mut reg = self.registration.write().await;
             reg.detect_capabilities(&self.config).await?;
+            reg.add_capability(
+                attune_common::action_cli::WORKER_CAPABILITY.into(),
+                serde_json::json!(cfg!(target_os = "linux")),
+            );
 
             // If running as an agent, store the detected interpreter metadata
             // and set the agent_mode flag before registering.

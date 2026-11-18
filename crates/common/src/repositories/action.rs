@@ -17,7 +17,7 @@ use super::{
 };
 
 /// Columns selected in all Action queries. Must match the `Action` model's `FromRow` fields.
-pub const ACTION_COLUMNS: &str = "id, ref, pack, pack_ref, label, description, entrypoint, \
+pub const ACTION_COLUMNS: &str = "id, ref, pack, pack_ref, label, description, entrypoint, launch, \
     runtime, effective_enabled AS enabled, enabled_override, runtime_version_constraint, required_worker_runtimes, \
     worker_selector, worker_tolerations, worker_affinity, \
     param_schema, out_schema, output_policy, workflow_def, is_adhoc, accesses_mcp, \
@@ -168,7 +168,10 @@ pub struct CreateActionInput {
     pub pack_ref: String,
     pub label: String,
     pub description: Option<String>,
-    pub entrypoint: String,
+    pub entrypoint: Option<String>,
+    pub launch: Option<crate::pack_format::LaunchSpec>,
+    pub parameter_delivery: Option<String>,
+    pub parameter_format: Option<String>,
     pub runtime: Option<Id>,
     pub enabled: bool,
     pub runtime_version_constraint: Option<String>,
@@ -198,7 +201,8 @@ pub struct CreateActionInput {
 pub struct UpdateActionInput {
     pub label: Option<String>,
     pub description: Option<Patch<String>>,
-    pub entrypoint: Option<String>,
+    pub entrypoint: Option<Patch<String>>,
+    pub launch: Option<Patch<crate::pack_format::LaunchSpec>>,
     pub runtime: Option<Id>,
     pub enabled: Option<bool>,
     pub runtime_version_constraint: Option<Patch<String>>,
@@ -276,18 +280,8 @@ impl List for ActionRepository {
     }
 }
 
-super::schema_consumer::schema_consumer_repository!(
-    ActionRepository,
-    CreateActionInput,
-    UpdateActionInput,
-    "action",
-    value_patch,
-    [param_schema, out_schema],
-    output_policy output_policy
-);
-
 impl ActionRepository {
-    async fn create_row<'e, E>(executor: E, input: CreateActionInput) -> Result<Action>
+    pub(super) async fn create_row<'e, E>(executor: E, input: CreateActionInput) -> Result<Action>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
@@ -333,8 +327,8 @@ impl ActionRepository {
                                   default_execution_permission_set_refs,
                                   reference_visibility, reference_allowed_pack_refs,
                                   log_retention_policy, log_retention_limit,
-                                  artifact_retention_policy, artifact_retention_limit, timeout_seconds, output_policy, output_format)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+                                  artifact_retention_policy, artifact_retention_limit, timeout_seconds, output_policy, output_format, launch, parameter_delivery, parameter_format)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
             RETURNING {}
             "#,
             ACTION_COLUMNS
@@ -366,6 +360,9 @@ impl ActionRepository {
         .bind(input.timeout_seconds)
         .bind(sqlx::types::Json(&input.output_policy))
         .bind(input.output_format.to_string())
+        .bind(input.launch.as_ref().map(sqlx::types::Json))
+        .bind(&input.parameter_delivery)
+        .bind(&input.parameter_format)
         .fetch_one(executor)
         .await
         .map_err(|e| {
@@ -383,7 +380,11 @@ impl ActionRepository {
 }
 
 impl ActionRepository {
-    async fn update_row<'e, E>(executor: E, id: i64, input: UpdateActionInput) -> Result<Action>
+    pub(super) async fn update_row<'e, E>(
+        executor: E,
+        id: i64,
+        input: UpdateActionInput,
+    ) -> Result<Action>
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
@@ -458,7 +459,23 @@ impl ActionRepository {
                 query.push(", ");
             }
             query.push("entrypoint = ");
-            query.push_bind(entrypoint);
+            match entrypoint {
+                Patch::Set(value) => query.push_bind(value),
+                Patch::Clear => query.push_bind(Option::<String>::None),
+            };
+            has_updates = true;
+        }
+
+        if let Some(launch) = &input.launch {
+            if has_updates {
+                query.push(", ");
+            }
+            query.push("launch = ");
+            match launch {
+                Patch::Set(value) => query.push_bind(Some(sqlx::types::Json(value))),
+                Patch::Clear => query
+                    .push_bind(Option::<sqlx::types::Json<&crate::pack_format::LaunchSpec>>::None),
+            };
             has_updates = true;
         }
 

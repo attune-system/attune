@@ -448,6 +448,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
         crate::routes::workload_launch::output::stage_result,
         crate::routes::workload_launch::io_grants,
         crate::routes::workload_launch::authorize_io,
+        crate::routes::workload_launch::stdin::authorize,
         crate::routes::workload_launch::reconcile,
         crate::routes::workload_launch::claim,
         crate::routes::workload_launch::status,
@@ -1076,17 +1077,33 @@ mod tests {
             .sum();
 
         assert_eq!(
-            path_count, 240,
+            path_count, 241,
             "Expected every mounted API path in the OpenAPI spec"
         );
 
         assert_eq!(
-            operation_count, 304,
+            operation_count, 305,
             "Expected every mounted API operation in the OpenAPI spec"
         );
 
         let spec = serde_json::to_value(&doc).unwrap();
+        let schemas = &spec["components"]["schemas"];
+        assert!(
+            schemas["LaunchSpec"]["oneOf"].is_array(),
+            "action launch union must remain distinct"
+        );
+        assert!(schemas["WorkloadLaunchSpec"]["properties"]
+            .get("manifest")
+            .is_some());
+        assert!(schemas["WorkloadLaunchSpec"]["properties"]
+            .get("invocation")
+            .is_some());
         for (path, request, response) in [
+            (
+                "/api/v1/workload-launches/{id}/authorize-stdin",
+                "AuthorizeLaunchStdinRequest",
+                "LaunchIoAuthorization",
+            ),
             (
                 "/api/v1/workload-hosts/custody/reserve",
                 "ReserveCustody",

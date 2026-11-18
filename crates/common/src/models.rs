@@ -120,6 +120,8 @@ pub mod enums {
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
     #[serde(rename_all = "lowercase")]
     pub enum ParameterDelivery {
+        /// Do not deliver an input document; argv still uses explicit public bindings.
+        None,
         /// Pass parameters via stdin (secure, recommended for most cases)
         #[default]
         Stdin,
@@ -130,6 +132,7 @@ pub mod enums {
     impl fmt::Display for ParameterDelivery {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
+                Self::None => write!(f, "none"),
                 Self::Stdin => write!(f, "stdin"),
                 Self::File => write!(f, "file"),
             }
@@ -141,6 +144,7 @@ pub mod enums {
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
             match s.to_lowercase().as_str() {
+                "none" => Ok(Self::None),
                 "stdin" => Ok(Self::Stdin),
                 "file" => Ok(Self::File),
                 _ => Err(format!("Invalid parameter delivery method: {}", s)),
@@ -1550,7 +1554,10 @@ pub mod action {
         pub pack_ref: String,
         pub label: String,
         pub description: Option<String>,
-        pub entrypoint: String,
+        pub entrypoint: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[sqlx(json(nullable))]
+        pub launch: Option<crate::pack_format::LaunchSpec>,
         pub runtime: Option<Id>,
         pub enabled: bool,
         #[serde(default)]

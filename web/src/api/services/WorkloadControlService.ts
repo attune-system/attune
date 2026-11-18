@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { AuthorizeLaunchIoRequest } from "../models/AuthorizeLaunchIoRequest";
+import type { AuthorizeLaunchStdinRequest } from "../models/AuthorizeLaunchStdinRequest";
 import type { CanonicalLaunchZip } from "../models/CanonicalLaunchZip";
 import type { ClaimedLaunch } from "../models/ClaimedLaunch";
 import type { CustodyAbsence } from "../models/CustodyAbsence";
@@ -218,6 +219,44 @@ export class WorkloadControlService {
       mediaType: "application/json",
       errors: {
         403: `Launch unavailable`,
+      },
+    });
+  }
+  /**
+   * @returns LaunchIoAuthorization
+   * @throws ApiError
+   */
+  public static workloadLaunchAuthorizeStdin({
+    id,
+    xAttuneLaunchLease,
+    xAttuneLaunchIo,
+    requestBody,
+  }: {
+    id: number;
+    /**
+     * Exact target-scoped grant
+     */
+    xAttuneLaunchLease: string;
+    /**
+     * Exact stdin grant
+     */
+    xAttuneLaunchIo: string;
+    requestBody: AuthorizeLaunchStdinRequest;
+  }): CancelablePromise<LaunchIoAuthorization> {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/api/v1/workload-launches/{id}/authorize-stdin",
+      path: {
+        id: id,
+      },
+      headers: {
+        "x-attune-launch-lease": xAttuneLaunchLease,
+        "x-attune-launch-io": xAttuneLaunchIo,
+      },
+      body: requestBody,
+      mediaType: "application/json",
+      errors: {
+        403: `Private input unavailable`,
       },
     });
   }

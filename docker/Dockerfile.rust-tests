@@ -98,7 +98,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry
     cargo metadata --format-version=1 --no-deps > /tmp/cargo-metadata.json && \
     cargo test --workspace --all-features --no-run --message-format=json-render-diagnostics > /tmp/cargo-artifacts.jsonl && \
     python3 docker/extract-rust-test-artifacts.py \
-      /tmp/cargo-metadata.json /tmp/cargo-artifacts.jsonl /build/test-artifacts
+      /tmp/cargo-metadata.json /tmp/cargo-artifacts.jsonl /build/test-artifacts && \
+    mkdir -p /build/test-artifacts/fixtures && \
+    rustc --edition=2021 crates/api/tests/support/action_cli_probe.rs \
+      -o /build/test-artifacts/fixtures/action_cli_probe
 
 # These files are runtime fixtures, but changes to them do not require a Rust
 # rebuild unless they were copied explicitly above.

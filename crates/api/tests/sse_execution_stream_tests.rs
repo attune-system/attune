@@ -66,6 +66,9 @@ async fn setup_test_pack_and_action(pool: &PgPool) -> Result<(Pack, Action)> {
     let pack = PackRepository::create(pool, pack_input).await?;
 
     let action_input = CreateActionInput {
+        launch: None,
+        parameter_delivery: None,
+        parameter_format: None,
         output_policy: Default::default(),
         output_format: Default::default(),
         r#ref: format!("{}.test_action", pack.r#ref),
@@ -73,7 +76,7 @@ async fn setup_test_pack_and_action(pool: &PgPool) -> Result<(Pack, Action)> {
         pack_ref: pack.r#ref.clone(),
         label: "Test Action".to_string(),
         description: Some("Test action for SSE tests".to_string()),
-        entrypoint: "test.sh".to_string(),
+        entrypoint: Some("test.sh".to_string()),
         runtime: None,
         enabled: true,
         runtime_version_constraint: None,

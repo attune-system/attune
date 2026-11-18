@@ -1481,6 +1481,9 @@ async fn execution_action(
     let action = attune_common::repositories::action::ActionRepository::create(
         &ctx.pool,
         attune_common::repositories::action::CreateActionInput {
+            launch: None,
+            parameter_delivery: None,
+            parameter_format: None,
             output_policy,
             output_format: Default::default(),
             r#ref: format!("{pack_ref}.login"),
@@ -1488,7 +1491,7 @@ async fn execution_action(
             pack_ref: pack_ref.into(),
             label: "Ad-hoc signing caller".into(),
             description: None,
-            entrypoint: "main.py".into(),
+            entrypoint: Some("main.py".into()),
             runtime: None,
             enabled: true,
             runtime_version_constraint: None,
