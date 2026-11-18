@@ -94,7 +94,7 @@ def test_recipe_candidate_tests_use_an_admitted_worker_and_final_only_credential
         assert response.status_code == 200, response.text
         install = response.json()["data"]
         assert install["status"] == "succeeded", install
-        assert install["test_result"]["total_tests"] == 1, install
+        assert install["test_result"]["totalTests"] == 1, install
         assert install["test_result"]["passed"] == 1, install
     else:
         with pytest.raises(Exception, match="Candidate tests did not pass"):
