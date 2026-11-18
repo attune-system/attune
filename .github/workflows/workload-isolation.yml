@@ -3,6 +3,11 @@ on:
   pull_request:
     paths:
       - 'crates/common/src/workload_sandbox.rs'
+      - 'crates/common/src/workload_config.rs'
+      - 'crates/common/src/config.rs'
+      - 'crates/common/src/execution_env.rs'
+      - 'crates/common/src/parent_process_protection.rs'
+      - 'crates/common/src/artifact_transport.rs'
       - 'crates/common/src/child_process_environment.rs'
       - 'crates/common/src/test_executor.rs'
       - 'crates/common/src/action_cli/**'
@@ -41,6 +46,9 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: workload-isolation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 jobs:
   package-contracts:
     name: Workload helper packaging contracts
@@ -165,6 +173,7 @@ jobs:
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_TEST_DEBUG: '0'
       ATTUNE_TEST_RUN_ID: ctl-pub-${{ matrix.arch }}
+      TEST_ARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
@@ -184,14 +193,16 @@ jobs:
         run: cargo zigbuild --locked --profile test --target ${{ matrix.target }} -p attune-workload-backend --bin attune-workload-runner --message-format=json > "$RUNNER_TEMP/runner-artifacts.jsonl"
       - name: Build actual native HTTP action and owned local-transport tests
         run: cargo zigbuild --locked --profile test --manifest-path crates/core-actions/Cargo.toml --target ${{ matrix.target }} --tests --message-format=json > "$RUNNER_TEMP/native-http-artifacts.jsonl"
-      - name: Run owned controller container and actual Engine publication test
+      - name: Run owned UID1000 manager and concrete Docker adapter effects
         run: |
           python3 - <<'PY'
           import json, os, subprocess
           from pathlib import Path
           artifacts = [json.loads(line) for line in (Path(os.environ['RUNNER_TEMP']) / 'controller-artifacts.jsonl').read_text().splitlines() if line.startswith('{')]
           tests = [item['executable'] for item in artifacts if item.get('reason') == 'compiler-artifact' and item['target']['name'] == 'attune_workload_backend' and item['profile'].get('test') and item.get('executable')]
-          assert len(tests) == 1, 'missing/ambiguous actual controller test executable'
+          assert len(tests) == 1, 'missing/ambiguous actual backend library test executable'
+          providers = [item['executable'] for item in artifacts if item.get('reason') == 'compiler-artifact' and item['target']['name'] == 'docker_provider' and item['profile'].get('test') and item.get('executable')]
+          assert len(providers) == 1, 'missing/ambiguous concrete Docker adapter test executable'
           artifacts = [json.loads(line) for line in (Path(os.environ['RUNNER_TEMP']) / 'runner-artifacts.jsonl').read_text().splitlines() if line.startswith('{')]
           helpers = [item['executable'] for item in artifacts if item.get('reason') == 'compiler-artifact' and item['target']['name'] == 'attune-workload-runner' and not item['profile'].get('test') and item.get('executable')]
           assert len(helpers) == 1, 'missing/ambiguous actual public helper executable'
@@ -199,5 +210,7 @@ jobs:
           native = [item['executable'] for item in artifacts if item.get('reason') == 'compiler-artifact' and item['target']['name'] == 'attune-core-http_request' and not item['profile'].get('test') and item.get('executable')]
           native_tests = [item['executable'] for item in artifacts if item.get('reason') == 'compiler-artifact' and item['target']['name'] == 'attune-core-http_request' and item['profile'].get('test') and item.get('executable')]
           assert len(native) == len(native_tests) == 1, 'missing/ambiguous actual native HTTP executables'
-          subprocess.run(['python3', 'scripts/test-launch-controller-container.py', '--test-binary', tests[0], '--runner-binary', helpers[0], '--native-http-binary', native[0], '--native-http-tests', native_tests[0]], check=True)
+          echo = [item['executable'] for item in artifacts if item.get('reason') == 'compiler-artifact' and item['target']['name'] == 'attune-core-echo' and not item['profile'].get('test') and item.get('executable')]
+          assert len(echo) == 1, 'missing/ambiguous once-built native echo executable'
+          subprocess.run(['python3', 'scripts/test-launch-controller-container.py', '--test-binary', tests[0], '--runner-binary', helpers[0], '--native-http-binary', native[0], '--native-http-tests', native_tests[0], '--provider-tests', providers[0], '--native-echo-binary', echo[0]], check=True)
           PY
