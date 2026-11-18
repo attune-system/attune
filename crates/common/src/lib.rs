@@ -105,3 +105,4 @@ pub mod workload_archive;
 pub mod workload_launch;
 pub mod workload_launch_io;
 pub mod workload_sandbox;
+pub mod workload_session;
