@@ -703,8 +703,8 @@ async fn run_captured(
             .await?
             .ok_or(EngineError::Transport)?,
     };
-    let stdout = crate::capture::Capture::new(65536)?;
-    let stderr = crate::capture::Capture::new(65536)?;
+    let stdout = crate::probe_capture::ProbeCapture::new(65536)?;
+    let stderr = crate::probe_capture::ProbeCapture::new(65536)?;
     let mut reader = None;
     let run = tokio::time::timeout(std::time::Duration::from_secs(90), async {
         let attached = engine.attach(&container).await?;
@@ -744,10 +744,10 @@ async fn run_captured(
     }
     cleanup?;
     let exit = run?;
-    let out = stdout.read(0, 65536)?;
-    let err = stderr.read(0, 65536)?;
-    if !out.eof || !err.eof || out.truncated_bytes != 0 || err.truncated_bytes != 0 {
-        return Err(EngineError::InvalidResponse);
-    }
-    Ok((exit, container.evidence().clone(), out.bytes, err.bytes))
+    Ok((
+        exit,
+        container.evidence().clone(),
+        stdout.bytes()?,
+        stderr.bytes()?,
+    ))
 }

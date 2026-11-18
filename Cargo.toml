@@ -9,7 +9,7 @@ members = [
     "crates/notifier",
     "crates/supervisor",
     "crates/cli",
-    "crates/launch-controller",
+    "crates/workload-backend",
 ]
 # Pack-binary crates are intentionally excluded from the workspace. Local
 # Compose builds them with docker/Dockerfile.pack-binaries; release CI builds

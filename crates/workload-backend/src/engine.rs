@@ -57,7 +57,6 @@ impl EnginePolicy {
             || !engine_name(&self.cache_volume)
             || !engine_name(&self.network)
             || matches!(self.network.as_str(), "host" | "none")
-            || self.allowed_images.is_empty()
             || self.memory_bytes < 32 * 1024 * 1024
             || self.memory_bytes > i64::MAX as u64
             || self.pids_limit < 16
@@ -750,8 +749,8 @@ impl DockerEngine {
                 .await?
                 .ok_or(EngineError::Transport)?,
         };
-        let stdout = crate::capture::Capture::new(4096)?;
-        let stderr = crate::capture::Capture::new(4096)?;
+        let stdout = crate::probe_capture::ProbeCapture::new(4096)?;
+        let stderr = crate::probe_capture::ProbeCapture::new(4096)?;
         let mut reader = None;
         let run = tokio::time::timeout(Duration::from_secs(15), async {
             let attached = self.attach(&container).await?;
@@ -805,17 +804,11 @@ impl DockerEngine {
         cleanup?;
         reader_result?;
         run?;
-        let output = stdout.read(0, 4096)?;
-        let error = stderr.read(0, 4096)?;
-        if !output.eof
-            || !error.eof
-            || output.truncated_bytes != 0
-            || error.truncated_bytes != 0
-            || !error.bytes.is_empty()
-            || output.bytes != sentinel.payload.as_bytes()
-        {
+        let output = stdout.bytes()?;
+        let error = stderr.bytes()?;
+        if !error.is_empty() || output != sentinel.payload.as_bytes() {
             return Err(EngineError::Policy(
-                "controller and Engine cache binding differs",
+                "manager and Engine cache binding differs",
             ));
         }
         Ok(())
@@ -1302,3 +1295,7 @@ pub async fn demultiplex<R: AsyncRead + Unpin, W: AsyncWrite + Unpin, E: AsyncWr
 #[cfg(test)]
 #[path = "engine_tests.rs"]
 mod tests;
+
+#[path = "native_docker.rs"]
+mod native_docker;
+pub use native_docker::DockerLauncher;

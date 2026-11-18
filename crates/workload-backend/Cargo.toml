@@ -1,5 +1,5 @@
 [package]
-name = "attune-launch-controller"
+name = "attune-workload-backend"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,13 +7,17 @@ license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "attune-launch-controller"
-path = "src/main.rs"
+name = "attune-workload-runner"
+path = "src/runner_main.rs"
 
 [dependencies]
 attune-common = { path = "../common" }
-axum = { workspace = true }
+kube = { version = "=5.1.0", default-features = false, features = ["client", "config", "rustls-tls", "ring", "ws"] }
+k8s-openapi = { version = "=0.29.0", features = ["earliest"] }
 chrono = { workspace = true }
+async-trait = { workspace = true }
+http = "1"
+tungstenite = "=0.30.0"
 futures = { workspace = true }
 libc = "0.2"
 reqwest = { workspace = true, features = ["query"] }
@@ -25,3 +29,6 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 tempfile = { workspace = true }
 zip = { workspace = true }
+
+[dev-dependencies]
+serde_yaml_ng = { workspace = true }
