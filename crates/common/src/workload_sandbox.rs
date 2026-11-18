@@ -8,9 +8,21 @@ pub enum WorkloadSandbox {
     #[default]
     Disabled,
     Bubblewrap,
+    /// Configured native managers must route every workload through their
+    /// in-process container effects. This is a deny guard, not isolation proof.
+    NativeEffectsRequired,
 }
 
 impl WorkloadSandbox {
+    pub(crate) fn require_local_execution(self) -> io::Result<()> {
+        if matches!(self, Self::NativeEffectsRequired) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "local workload execution denied; native process effects are required",
+            ));
+        }
+        Ok(())
+    }
     /// Isolated by default; an explicit trusted-only deployment accepts host execution.
     pub fn from_environment(api_artifacts: bool) -> io::Result<Self> {
         match std::env::var("ATTUNE_WORKLOAD_SANDBOX") {
@@ -107,6 +119,7 @@ impl WorkloadSandbox {
         writes: &[(&Path, &Path)],
         invocation_name: Option<&std::ffi::OsStr>,
     ) -> io::Result<Command> {
+        self.require_local_execution()?;
         #[cfg(unix)]
         let command = {
             use std::os::unix::process::CommandExt;

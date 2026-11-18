@@ -130,6 +130,7 @@ impl ChildProcessEnvironment {
     /// Verification may expose only its selected executable, never its parent
     /// directory (which can contain sibling credentials or writable runtimes).
     pub fn sandbox_probe(&self, command: Command) -> std::io::Result<Command> {
+        self.workload_sandbox.require_local_execution()?;
         let program = std::path::Path::new(command.get_program());
         let selected = if program.is_absolute() {
             program.to_path_buf()
@@ -173,11 +174,11 @@ impl ChildProcessEnvironment {
     ) -> &'a std::path::Path {
         if matches!(
             self.workload_sandbox,
-            crate::workload_sandbox::WorkloadSandbox::Disabled
+            crate::workload_sandbox::WorkloadSandbox::Bubblewrap
         ) {
-            stage
-        } else {
             destination
+        } else {
+            stage
         }
     }
 
@@ -341,5 +342,64 @@ mod tests {
                 .and_then(|(_, value)| value),
             Some(value.as_os_str())
         );
+    }
+}
+
+#[cfg(test)]
+mod native_workload_guard_tests {
+    use super::*;
+    use crate::workload_sandbox::WorkloadSandbox;
+    #[test]
+    fn native_effects_required_denies_every_local_adapter_before_lookup_or_launch() {
+        let environment = ChildProcessEnvironment::from_parent(std::iter::empty(), &[])
+            .unwrap()
+            .with_workload_sandbox(WorkloadSandbox::NativeEffectsRequired);
+        let missing = std::path::Path::new("/owned-native-guard-not-a-real-pack");
+        fn selected_command() -> Command {
+            let mut command = Command::new("owned-private-unavailable-program");
+            command
+                .arg("owned-private-argument")
+                .env("OWNED_SELECTED", "owned-private-value");
+            command
+        }
+        for result in [
+            environment.sandbox_workload(selected_command(), &[missing]),
+            environment.sandbox_workload_with_invocation_name(
+                selected_command(),
+                &[missing],
+                Some("owned-static-alias"),
+            ),
+            environment.sandbox_probe(selected_command()),
+            environment.sandbox_setup(selected_command(), missing, missing),
+            environment.sandbox_install(selected_command(), missing, missing, missing),
+            WorkloadSandbox::NativeEffectsRequired.wrap_stage(
+                selected_command(),
+                &[missing],
+                &[missing],
+            ),
+            WorkloadSandbox::NativeEffectsRequired.wrap_workspace(
+                selected_command(),
+                &[missing],
+                missing,
+                missing,
+            ),
+        ] {
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("local workload unexpectedly permitted"),
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                error.to_string(),
+                "local workload execution denied; native process effects are required"
+            );
+        }
+        let stage = std::path::Path::new("/owned-private-unpublished-stage");
+        let destination = std::path::Path::new("/owned-published-runtime");
+        assert_eq!(environment.setup_path(stage, destination), stage);
+        // The guard does not replace or weaken the independent env clearing.
+        let mut command = selected_command();
+        environment.apply(&mut command);
+        assert_eq!(command.get_envs().count(), 0);
     }
 }
