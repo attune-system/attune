@@ -187,3 +187,28 @@ binding probe and Python archive/publication fixture exercise actual ownership
 and writable-stage behavior in this configuration. Filesystem-only host tests use
 an internal test owner matching the CI runner; that seam is absent in production.
 These focused fixtures do not certify the unfinished complete service stack.
+
+
+The public `attune-workload-runner` helper is packaged with the agent binaries.
+Its `setup` mode accepts a bounded private v1 plan once on stdin, inside the
+admitted Setup container. The immutable Runner ZIP contains executable helper
+bytes only. Runtime create/dependency/hook children clear their environment and
+receive only the CP-selected plan environment; the helper never logs the plan
+or accepts host mounts, controller credentials or an action API token. Fixed
+read-only Pack/Runner roots and the writable stable Runtime stage are required;
+direct-host use fails before executing a plan. This guard is a packaging check,
+not an independent attestation of OCI policy. The actual packaged Python/pip
+console-script and internal-link fixture must pass on each supported architecture.
+
+File artifacts are a separate unfinished integration boundary. The canonical
+`workload_artifact` protocol seals CP-selected file-version paths when Run closes,
+with a fixed deadline and independent publication grants/receipts. Filesystem
+primitives now retain a private per-attempt tree for Action, Sensor and
+CandidateTest, reject artifact links/hardlinks/special files, and enforce shared
+retained-tree defaults of 256MiB and 4096 directory/file entries. Zero-byte regular
+files are valid. Deleting retained staging requires an authenticated settled
+cleanup receipt, never process exit, timeout or a 404. These primitives are not
+yet activated in the Engine mount builder or connected to actual CP upload
+operations; the current tmpfs artifact mount remains a known gap until that
+integration and restart/lost-acknowledgement tests pass. Setup and RuntimeProbe
+have no action file-publication authority.
