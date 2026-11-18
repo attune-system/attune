@@ -20,9 +20,16 @@ use sqlx::{types::Json, PgPool};
 use uuid::Uuid;
 
 const COLUMNS: &str =
-    "intent,target,encrypted_context,source_epochs,resource,stdin_consumed,stop_requested,create_submitted,exit_outcome";
+    "intent,target,purpose,encrypted_context,source_epochs,resource,stdin_consumed,stop_requested,create_submitted,exit_outcome";
 fn denied() -> Error {
     Error::PermissionDenied("Execution process effect unavailable".into())
+}
+fn purpose_name(purpose: LaunchPurpose) -> Result<&'static str> {
+    match purpose {
+        LaunchPurpose::Action => Ok("action"),
+        LaunchPurpose::RuntimeProbe => Ok("runtime_probe"),
+        _ => Err(denied()),
+    }
 }
 
 /// Private encrypted storage projection; never an API/audit/tracing DTO.
@@ -80,6 +87,7 @@ impl FrozenProcess {
 struct Record {
     intent: Uuid,
     target: Json<LaunchTarget>,
+    purpose: String,
     encrypted_context: String,
     source_epochs: Json<Vec<SourceEpoch>>,
     resource: Option<Json<ResourceIdentity>>,
@@ -99,7 +107,10 @@ impl Record {
     fn context(&self, master: &str) -> Result<FrozenProcess> {
         let plaintext = crypto::decrypt(&self.encrypted_context, master).map_err(|_| denied())?;
         let context: FrozenProcess = serde_json::from_str(&plaintext).map_err(|_| denied())?;
-        if context.intent != self.intent || context.target != self.target.0 {
+        if context.intent != self.intent
+            || context.target != self.target.0
+            || purpose_name(context.purpose)? != self.purpose
+        {
             return Err(denied());
         }
         Ok(context)
@@ -241,7 +252,10 @@ impl ExecutionProcessRepository {
                     }));
                     fresh_on(tx, Some(execution_deadline)).await?;
                 }
-                Self::worker(tx, *worker, *worker_instance).await?;
+                let worker_deadline = Self::worker_deadline(tx, *worker, *worker_instance).await?;
+                deadline = Some(
+                    deadline.map_or(worker_deadline, |deadline| deadline.min(worker_deadline)),
+                );
                 let mut sources = vec![
                     ("owner", expected_owner),
                     ("execution", *execution),
@@ -254,15 +268,6 @@ impl ExecutionProcessRepository {
             }
             _ => Err(denied()),
         }
-    }
-    async fn worker(
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        worker: i64,
-        instance: Uuid,
-    ) -> Result<()> {
-        Self::worker_deadline(tx, worker, instance)
-            .await
-            .map(|_| ())
     }
     /// Called by the existing file API among source locks. Runtime logs keep
     /// their independent custody/handover contract.
@@ -281,9 +286,10 @@ impl ExecutionProcessRepository {
         }
         let snapshot: Option<RuntimeFence> = sqlx::query_as(
         "SELECT intent,target,source_epochs FROM execution_process_effect \
-         WHERE target->>'kind'='execution' AND (target->>'execution')::BIGINT=$1 AND target->>'attempt'=$2"
+         WHERE purpose='action' AND target->>'kind'='execution' AND (target->>'execution')::BIGINT=$1 AND target->>'attempt'=$2"
     ).bind(execution).bind(attempt.to_string()).fetch_optional(&mut *connection).await?;
         let Some(snapshot) = snapshot else {
+            Self::deny_inspection_only(connection, execution, attempt).await?;
             return Ok(None);
         };
         let LaunchTarget::Execution {
@@ -299,6 +305,21 @@ impl ExecutionProcessRepository {
             snapshot,
             worker_deadline,
         }))
+    }
+
+    async fn deny_inspection_only(
+        connection: &mut sqlx::PgConnection,
+        execution: i64,
+        attempt: Uuid,
+    ) -> Result<()> {
+        let probe: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM execution_process_effect WHERE purpose='runtime_probe' \
+             AND target->>'kind'='execution' AND (target->>'execution')::BIGINT=$1 AND target->>'attempt'=$2)"
+        ).bind(execution).bind(attempt.to_string()).fetch_one(connection).await?;
+        if probe {
+            return Err(denied());
+        }
+        Ok(())
     }
 
     async fn worker_deadline(
@@ -328,7 +349,7 @@ impl ExecutionProcessRepository {
     ) -> Result<()> {
         let snapshot: Option<RuntimeFence> = sqlx::query_as(
             "SELECT intent,target,source_epochs FROM execution_process_effect \
-             WHERE target->>'kind'='execution' AND (target->>'execution')::BIGINT=$1 \
+             WHERE purpose='action' AND target->>'kind'='execution' AND (target->>'execution')::BIGINT=$1 \
              AND target->>'attempt'=$2",
         )
         .bind(execution)
@@ -336,6 +357,7 @@ impl ExecutionProcessRepository {
         .fetch_optional(&mut *connection)
         .await?;
         let Some(snapshot) = snapshot else {
+            Self::deny_inspection_only(connection, execution, attempt).await?;
             // Non-process producers retain their existing admission contracts.
             // Isolated process evidence cannot disappear: its deletion guard
             // retains the original attempt's closure/tombstone independently.
@@ -385,9 +407,260 @@ impl ExecutionProcessRepository {
     /// CLI stdin is derived from the same restored input and bound argument
     /// contract as argv. Original parameters stay in encrypted context; no new
     /// plaintext fingerprint or independently supplied payload is authority.
+    /// Program metadata is useful only with a positive, exact, current native
+    /// inspection receipt. It never confers action completion or file authority.
+    async fn prove_inspection(
+        connection: &mut sqlx::PgConnection,
+        action: &FrozenProcess,
+        intent: Uuid,
+        master: &str,
+    ) -> Result<()> {
+        let snapshot: Record = sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM execution_process_effect WHERE intent=$1"
+        ))
+        .bind(intent)
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(denied)?;
+        let probe = snapshot.context(master)?;
+        if probe.purpose != LaunchPurpose::RuntimeProbe
+            || action.purpose != LaunchPurpose::Action
+            || probe.target != action.target
+            || probe.owner != action.owner
+            || probe.image != action.image
+            || probe.platform != action.platform
+            || probe.inputs != action.inputs
+            || probe.pack_access != action.pack_access
+            || probe.stage.is_some()
+            || action.stage.is_some()
+            || probe.stdin != action.stdin
+            || probe.input != action.input
+        {
+            return Err(denied());
+        }
+        if probe.invocation.argv.len() != 3
+            || probe.invocation.argv[0]
+                != format!(
+                    "{}/linux-{}",
+                    crate::workload_launch::RUNNER_ROOT,
+                    probe.platform.native_arch()
+                )
+            || probe.invocation.argv[1] != "inspect-command-program"
+            || probe.invocation.env.contains_key("ATTUNE_API_TOKEN")
+        {
+            return Err(denied());
+        }
+        let sources = snapshot
+            .source_epochs
+            .iter()
+            .map(|epoch| (epoch.kind.as_str(), epoch.subject))
+            .collect();
+        let current = workload_source::snapshot(connection, sources).await?;
+        let record: Record = sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM execution_process_effect WHERE intent=$1 FOR SHARE"
+        ))
+        .bind(intent)
+        .fetch_one(&mut *connection)
+        .await?;
+        if record.encrypted_context != snapshot.encrypted_context
+            || record.source_epochs.0 != current
+            || record.stop_requested
+            || !record.create_submitted
+            || !record.stdin_consumed
+            || record.resource.is_none()
+            || record.exit_outcome.as_ref().map(|exit| exit.0)
+                != Some(LaunchExitOutcome {
+                    exit_code: 0,
+                    oom_killed: false,
+                })
+        {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
+    /// Capture the fixed helper's bounded metadata on the transaction that owns
+    /// its fresh source/input/epoch/effect proof. No nested pooled transaction.
+    pub async fn complete_command_inspection(
+        pool: &PgPool,
+        intent: Uuid,
+        resource: &ResourceIdentity,
+        selected: &crate::action_cli::SelectedProgram,
+        master: &str,
+    ) -> Result<()> {
+        use super::{execution::ExecutionRepository, FindById};
+        let mut tx = pool.begin().await?;
+        let snapshot: Record = sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM execution_process_effect WHERE intent=$1"
+        ))
+        .bind(intent)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(denied)?;
+        let context = snapshot.context(master)?;
+        if context.purpose != LaunchPurpose::RuntimeProbe {
+            return Err(denied());
+        }
+        let LaunchTarget::Execution {
+            execution,
+            worker,
+            attempt,
+            ..
+        } = context.target
+        else {
+            return Err(denied());
+        };
+        let proof = Self::source(&mut tx, &context.target, context.owner).await?;
+        let expected = context.input.public_snapshot()?;
+        let mut input =
+            ExecutionInputRepository::restore(&mut tx, execution, Some(master), Some(&expected))
+                .await?;
+        let value: serde_json::Value =
+            serde_json::from_str(&context.stdin).map_err(|_| denied())?;
+        if &value != input.value() {
+            return Err(denied());
+        }
+        input.ensure_fresh().await?;
+        let (_, _, _, expiry) = input.into_parts();
+        Self::action_stdin(&mut tx, &context, master).await?;
+        let execution_record = ExecutionRepository::find_by_id(&mut *tx, execution)
+            .await?
+            .ok_or_else(denied)?;
+        let snapshot_action = execution_record
+            .executable_snapshot
+            .as_ref()
+            .ok_or_else(denied)?;
+        let Some(crate::pack_format::LaunchSpec::Command { program, .. }) =
+            &snapshot_action.executable.action.launch
+        else {
+            return Err(denied());
+        };
+        let path = selected.path.to_str().ok_or_else(denied)?;
+        if selected.invocation_name != *program
+            || selected.artifact.is_some()
+            || selected.variant.is_some()
+            || !path.starts_with('/')
+            || path.len() > 4096
+            || path.chars().any(char::is_control)
+            || path
+                .split('/')
+                .skip(1)
+                .any(|part| part.is_empty() || matches!(part, "." | ".."))
+            || selected.path.starts_with(crate::workload_launch::PACK_ROOT)
+            || selected.sha256.len() != 64
+            || !selected
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(denied());
+        }
+        let epochs = workload_source::snapshot(&mut tx, proof.sources).await?;
+        let record: Record = sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM execution_process_effect WHERE intent=$1 FOR UPDATE"
+        ))
+        .bind(intent)
+        .fetch_one(&mut *tx)
+        .await?;
+        if record.encrypted_context != snapshot.encrypted_context
+            || record.source_epochs.0 != epochs
+            || record.stop_requested
+            || !record.create_submitted
+            || !record.stdin_consumed
+            || record.resource.as_ref().map(|resource| &resource.0) != Some(resource)
+            || record.exit_outcome.as_ref().map(|exit| exit.0)
+                != Some(LaunchExitOutcome {
+                    exit_code: 0,
+                    oom_killed: false,
+                })
+        {
+            return Err(denied());
+        }
+        super::execution_program::ExecutionProgramRepository::record_inspected_on(
+            &mut tx,
+            execution,
+            worker,
+            attempt,
+            snapshot_action.release.id,
+            serde_json::to_value(selected).map_err(|_| denied())?,
+            Some(intent),
+        )
+        .await?;
+        expiry.ensure_fresh_on(&mut tx).await?;
+        fresh_on(&mut tx, proof.deadline).await?;
+        tx.commit().await?;
+        expiry.ensure_fresh()?;
+        fresh(proof.deadline)
+    }
+
+    /// Recovery reuses captured metadata only after the original inspection's
+    /// source/attempt proof is current. Consumed-but-uncaptured input is denied
+    /// by the ordinary one-shot gate; it is never inspected a second time.
+    pub async fn inspected_program(
+        pool: &PgPool,
+        action: &ProcessSpec,
+        master: &str,
+    ) -> Result<Option<crate::action_cli::SelectedProgram>> {
+        let LaunchTarget::Execution {
+            execution,
+            worker,
+            attempt,
+            ..
+        } = action.target
+        else {
+            return Err(denied());
+        };
+        let mut tx = pool.begin().await?;
+        let row: Option<(Json<crate::action_cli::SelectedProgram>, Option<Uuid>)> = sqlx::query_as(
+            "SELECT selection,native_probe FROM execution_program_selection WHERE execution=$1 AND attempt=$2 AND worker=$3"
+        ).bind(execution).bind(attempt).bind(worker).fetch_optional(&mut *tx).await?;
+        let Some((Json(selected), Some(intent))) = row else {
+            return Ok(None);
+        };
+        let record: Record = sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM execution_process_effect WHERE intent=$1"
+        ))
+        .bind(intent)
+        .fetch_one(&mut *tx)
+        .await?;
+        let probe = record.context(master)?;
+        let proof = Self::source(&mut tx, &probe.target, probe.owner).await?;
+        let expected = probe.input.public_snapshot()?;
+        let mut input =
+            ExecutionInputRepository::restore(&mut tx, execution, Some(master), Some(&expected))
+                .await?;
+        let value: serde_json::Value = serde_json::from_str(&probe.stdin).map_err(|_| denied())?;
+        if input.value() != &value {
+            return Err(denied());
+        }
+        input.ensure_fresh().await?;
+        let (_, _, _, expiry) = input.into_parts();
+        let action_context = FrozenProcess {
+            purpose: LaunchPurpose::Action,
+            intent: action.intent,
+            target: action.target.clone(),
+            image: action.image.clone(),
+            platform: action.platform,
+            inputs: action.inputs.clone(),
+            pack_access: action.pack_access,
+            stage: action.stage.clone(),
+            timeout_ms: action.timeout_ms,
+            invocation: action.invocation.clone(),
+            ..probe
+        };
+        Self::prove_inspection(&mut tx, &action_context, intent, master).await?;
+        expiry.ensure_fresh_on(&mut tx).await?;
+        fresh_on(&mut tx, proof.deadline).await?;
+        tx.commit().await?;
+        expiry.ensure_fresh()?;
+        fresh(proof.deadline)?;
+        Ok(Some(selected))
+    }
+
     async fn action_stdin(
         connection: &mut sqlx::PgConnection,
         context: &FrozenProcess,
+        master: &str,
     ) -> Result<Vec<u8>> {
         use super::{
             execution::ExecutionRepository,
@@ -413,6 +686,25 @@ impl ExecutionProcessRepository {
             .ok_or_else(denied)?;
         let snapshot = execution.executable_snapshot.as_ref().ok_or_else(denied)?;
         let action = &snapshot.executable.action;
+        if context.purpose == LaunchPurpose::RuntimeProbe {
+            let Some(crate::pack_format::LaunchSpec::Command { program, .. }) = &action.launch
+            else {
+                return Err(denied());
+            };
+            let expected = vec![
+                format!("{RUNNER_ROOT}/linux-{}", context.platform.native_arch()),
+                "inspect-command-program".into(),
+                program.clone(),
+            ];
+            if context.invocation.argv != expected
+                || context.stage.is_some()
+                || context.pack_access != PackAccess::ReadOnly
+                || context.invocation.env.contains_key("ATTUNE_API_TOKEN")
+            {
+                return Err(denied());
+            }
+            return Ok(Vec::new());
+        }
         let Some(launch) = &action.launch else {
             return Ok(context.stdin.as_bytes().to_vec());
         };
@@ -424,11 +716,19 @@ impl ExecutionProcessRepository {
         {
             return Err(denied());
         }
-        let selected: Option<sqlx::types::Json<SelectedProgram>> = sqlx::query_scalar(
-            "SELECT selection FROM execution_program_selection WHERE execution=$1 AND attempt=$2 AND worker=$3 AND release=$4 FOR SHARE",
+        let selected: Option<(sqlx::types::Json<SelectedProgram>, Option<Uuid>)> = sqlx::query_as(
+            // Metadata is immutable under the retained execution source. Taking
+            // its row lock before probe epochs/operation would invert the
+            // inspection publisher's operation -> metadata order.
+            "SELECT selection,native_probe FROM execution_program_selection WHERE execution=$1 AND attempt=$2 AND worker=$3 AND release=$4",
         ).bind(execution.id).bind(attempt).bind(worker).bind(snapshot.release.id)
             .fetch_optional(&mut *connection).await?;
-        let selected = selected.ok_or_else(denied)?.0;
+        let (Json(selected), probe) = selected.ok_or_else(denied)?;
+        if matches!(launch, crate::pack_format::LaunchSpec::Command { .. }) {
+            Self::prove_inspection(connection, context, probe.ok_or_else(denied)?, master).await?;
+        } else if probe.is_some() {
+            return Err(denied());
+        }
         let binding =
             SchemaContractRepository::find(connection, BindingOwner::Execution, execution.id)
                 .await?
@@ -481,7 +781,10 @@ impl ExecutionProcessRepository {
         master: &str,
     ) -> Result<()> {
         if spec.intent.is_nil()
-            || spec.purpose != LaunchPurpose::Action
+            || !matches!(
+                spec.purpose,
+                LaunchPurpose::Action | LaunchPurpose::RuntimeProbe
+            )
             || !matches!(spec.target, LaunchTarget::Execution { execution, .. }
                 if execution==selected.snapshot.execution())
         {
@@ -510,10 +813,10 @@ impl ExecutionProcessRepository {
         }
         input.ensure_fresh().await?;
         let (_, _, _, expiry) = input.into_parts();
-        Self::action_stdin(&mut tx, &context).await?;
+        Self::action_stdin(&mut tx, &context, master).await?;
         let epochs = workload_source::snapshot(&mut tx, proof.sources).await?;
-        sqlx::query("INSERT INTO execution_process_effect(intent,target,encrypted_context,source_epochs) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
-            .bind(spec.intent).bind(Json(&spec.target)).bind(encrypted).bind(Json(&epochs))
+        sqlx::query("INSERT INTO execution_process_effect(intent,target,purpose,encrypted_context,source_epochs) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING")
+            .bind(spec.intent).bind(Json(&spec.target)).bind(purpose_name(spec.purpose)?).bind(encrypted).bind(Json(&epochs))
             .execute(&mut *tx).await?;
         let record: Record = sqlx::query_as(&format!(
             "SELECT {COLUMNS} FROM execution_process_effect WHERE intent=$1 FOR UPDATE"
@@ -646,7 +949,7 @@ impl ExecutionProcessRepository {
         }
         input.ensure_fresh().await?;
         let (_, _, _, expiry) = input.into_parts();
-        let payload = Self::action_stdin(&mut tx, &context).await?;
+        let payload = Self::action_stdin(&mut tx, &context, master).await?;
         let epochs = workload_source::snapshot(&mut tx, proof.sources).await?;
         let record: Record = sqlx::query_as(&format!(
             "SELECT {COLUMNS} FROM execution_process_effect WHERE intent=$1 FOR UPDATE"
@@ -731,6 +1034,9 @@ impl ExecutionProcessRepository {
         .await?
         .ok_or_else(denied)?;
         let context = snapshot.context(master)?;
+        if context.purpose != LaunchPurpose::Action {
+            return Err(denied());
+        }
         let LaunchTarget::Execution {
             execution,
             worker,
@@ -821,6 +1127,7 @@ impl ExecutionProcessRepository {
         {
             return Err(denied());
         }
+        fresh_on(tx, proof.deadline).await?;
         Ok(None)
     }
 
@@ -832,12 +1139,23 @@ impl ExecutionProcessRepository {
         attempt: Uuid,
         master: &str,
     ) -> Result<Option<ProcessSpec>> {
+        Self::retained_for_purpose(pool, execution, attempt, LaunchPurpose::Action, master).await
+    }
+
+    pub async fn retained_for_purpose(
+        pool: &PgPool,
+        execution: i64,
+        attempt: Uuid,
+        purpose: LaunchPurpose,
+        master: &str,
+    ) -> Result<Option<ProcessSpec>> {
         let record: Option<Record> = sqlx::query_as(&format!(
             "SELECT {COLUMNS} FROM execution_process_effect WHERE target->>'kind'='execution' \
-             AND (target->>'execution')::BIGINT=$1 AND target->>'attempt'=$2"
+             AND (target->>'execution')::BIGINT=$1 AND target->>'attempt'=$2 AND purpose=$3"
         ))
         .bind(execution)
         .bind(attempt.to_string())
+        .bind(purpose_name(purpose)?)
         .fetch_optional(pool)
         .await?;
         record

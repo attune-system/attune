@@ -1026,6 +1026,14 @@ async fn admitted_cli(
     ctx: &TestContext,
     delivery: &str,
 ) -> Result<(ProcessSpec, SelectedExecutionInput, ResourceIdentity)> {
+    admitted_typed(ctx, delivery, false).await
+}
+
+async fn admitted_typed(
+    ctx: &TestContext,
+    delivery: &str,
+    command: bool,
+) -> Result<(ProcessSpec, SelectedExecutionInput, ResourceIdentity)> {
     use attune_common::repositories::{
         action::{ActionRepository, UpdateActionInput},
         component_lifecycle::PackProjectionIds,
@@ -1053,11 +1061,14 @@ async fn admitted_cli(
     .await?;
     let action_ref = format!("{pack_ref}.source");
     let action = helpers::create_test_action(&ctx.pool, pack.id, &pack_ref, &action_ref).await?;
+    let launch = if command {
+        json!({"type":"command","program":"/echo","arguments":[{"literal":"static literal; $(false)","order":0}]})
+    } else {
+        json!({"type":"native","artifact":"owned","arguments":[{"literal":"static literal; $(false)","order":0}]})
+    };
     let action = ActionRepository::update(&ctx.pool, action.id, UpdateActionInput {
         entrypoint: Some(Patch::Clear), runtime: Some(runtime.id),
-        launch: Some(Patch::Set(serde_json::from_value(json!({
-            "type":"native", "artifact":"owned", "arguments":[{"literal":"static literal; $(false)","order":0}]
-        }))?)),
+        launch: Some(Patch::Set(serde_json::from_value(launch)?)),
         parameter_delivery: Some(delivery.into()), parameter_format: Some("json".into()),
         param_schema: Some(json!({"value":{"type":"string","required":true,"cli":{"kind":"positional","order":1}}})),
         ..Default::default()
@@ -1180,4 +1191,402 @@ async fn native_cli_none_input_keeps_exact_argv_and_one_shot_empty_stdin() -> Re
 #[tokio::test]
 async fn native_cli_json_input_keeps_exact_argv_and_original_stdin() -> Result<()> {
     cli_stdin_case("stdin").await
+}
+
+#[tokio::test]
+async fn command_inspection_is_not_action_authority_and_selection_is_exact() -> Result<()> {
+    use attune_common::action_cli::SelectedProgram;
+    attune_common::auth::install_crypto_provider();
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let (mut action, input, resource) = admitted_typed(&ctx, "stdin", true).await?;
+    let owner = ctx.user.as_ref().unwrap().id;
+    let master = ctx.state.config.security.encryption_key.as_deref().unwrap();
+    let mut probe = action.clone();
+    probe.intent = Uuid::new_v4();
+    probe.purpose = LaunchPurpose::RuntimeProbe;
+    probe.invocation.argv = vec![
+        "/opt/attune/runner/linux-amd64".into(),
+        "inspect-command-program".into(),
+        "/echo".into(),
+    ];
+    probe.invocation.env.remove("ATTUNE_API_TOKEN");
+    let mut token_probe = probe.clone();
+    token_probe
+        .invocation
+        .env
+        .insert("ATTUNE_API_TOKEN".into(), "must-not-be-accepted".into());
+    assert!(
+        Effects::reserve(&ctx.pool, &token_probe, owner, &input, master)
+            .await
+            .is_err()
+    );
+    Effects::reserve(&ctx.pool, &probe, owner, &input, master).await?;
+    Effects::begin_create(&ctx.pool, probe.intent, master).await?;
+    Effects::record_resource(&ctx.pool, probe.intent, &resource).await?;
+    let empty = Effects::consume_stdin(&ctx.pool, probe.intent, &resource, master).await?;
+    assert!(empty.as_bytes().is_empty());
+    drop(empty); // A lost acknowledgement is not a second inspection.
+    assert!(
+        Effects::consume_stdin(&ctx.pool, probe.intent, &resource, master)
+            .await
+            .is_err()
+    );
+    let program = SelectedProgram {
+        path: "/echo".into(),
+        sha256: Sha256Digest::of_bytes(b"same-image-echo").as_str().into(),
+        invocation_name: "/echo".into(),
+        artifact: None,
+        variant: None,
+    };
+    // No selection before positive exit, even with otherwise correct metadata.
+    assert!(Effects::complete_command_inspection(
+        &ctx.pool,
+        probe.intent,
+        &resource,
+        &program,
+        master
+    )
+    .await
+    .is_err());
+    Effects::record_exit(
+        &ctx.pool,
+        probe.intent,
+        &resource,
+        LaunchExitOutcome {
+            exit_code: 0,
+            oom_killed: false,
+        },
+    )
+    .await?;
+    let mut tx = ctx.pool.begin().await?;
+    assert!(Effects::lock_completion(&mut tx, probe.intent, master)
+        .await
+        .is_err());
+    tx.rollback().await?;
+    let LaunchTarget::Execution {
+        execution, attempt, ..
+    } = probe.target
+    else {
+        unreachable!()
+    };
+    let token = helpers::delegated_source::execution_token(&ctx, execution).await?;
+    let claims = attune_common::auth::jwt::validate_token(&token, &ctx.state.jwt_config)?;
+    let mut tx = ctx.pool.begin().await?;
+    assert!(
+        DelegatedExecutionRepository::validate_claims(&mut tx, &claims)
+            .await
+            .is_err()
+    );
+    tx.rollback().await?;
+    let version = ordinary_file_version(&ctx, execution).await?;
+    let mut tx = ctx.pool.begin().await?;
+    assert!(
+        Effects::prepare_file_publication(&mut tx, version.id, execution, attempt)
+            .await
+            .is_err()
+    );
+    tx.rollback().await?;
+    let mut wrong_program = program.clone();
+    wrong_program.invocation_name = "/else".into();
+    assert!(Effects::complete_command_inspection(
+        &ctx.pool,
+        probe.intent,
+        &resource,
+        &wrong_program,
+        master
+    )
+    .await
+    .is_err());
+    Effects::complete_command_inspection(&ctx.pool, probe.intent, &resource, &program, master)
+        .await?;
+    assert_eq!(
+        Effects::inspected_program(&ctx.pool, &action, master).await?,
+        Some(program.clone())
+    );
+    action.invocation.argv = vec![
+        "/opt/attune/runner/linux-amd64".into(),
+        "exec".into(),
+        program.sha256.clone(),
+        "/echo".into(),
+        "/echo".into(),
+        "static literal; $(false)".into(),
+        "owned-private-parameters".into(),
+    ];
+    let mut changed_image = action.clone();
+    changed_image.image.sha256 = Sha256Digest::of_bytes(b"different image");
+    changed_image.image.reference = format!("sha256:{}", changed_image.image.sha256.as_str());
+    assert!(
+        Effects::reserve(&ctx.pool, &changed_image, owner, &input, master)
+            .await
+            .is_err()
+    );
+    let mut changed_platform = action.clone();
+    changed_platform.platform = LaunchPlatform::LinuxArm64;
+    changed_platform.invocation.argv[0] = "/opt/attune/runner/linux-arm64".into();
+    assert!(
+        Effects::reserve(&ctx.pool, &changed_platform, owner, &input, master)
+            .await
+            .is_err()
+    );
+    // An idempotent metadata publisher owns probe -> program rows. Observe
+    // the action waiting on that probe, then prove its metadata read did not
+    // take the inverse program -> probe lock order.
+    let mut barrier = ctx.pool.begin().await?;
+    let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *barrier)
+        .await?;
+    let _: Uuid = sqlx::query_scalar(
+        "SELECT intent FROM execution_process_effect WHERE intent=$1 FOR UPDATE",
+    )
+    .bind(probe.intent)
+    .fetch_one(&mut *barrier)
+    .await?;
+    let pool = ctx.pool.clone();
+    let action_copy = action.clone();
+    let master_copy = master.to_owned();
+    let mut reserve = tokio::spawn(async move {
+        Effects::reserve(&pool, &action_copy, owner, &input, &master_copy).await
+    });
+    let mut barrier = Some(barrier);
+    let ordered = async {
+        wait_for_database_blocker(&ctx.pool, blocker).await?;
+        assert!(!reserve.is_finished());
+        sqlx::query(
+            "UPDATE execution_program_selection SET selection=selection WHERE execution=$1",
+        )
+        .bind(execution)
+        .execute(&mut **barrier.as_mut().unwrap())
+        .await?;
+        barrier.take().unwrap().commit().await?;
+        (&mut reserve).await??;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    }
+    .await;
+    if let Some(barrier) = barrier {
+        barrier.rollback().await?;
+    }
+    if !reserve.is_finished() {
+        reserve.abort();
+        let _ = reserve.await;
+    }
+    if let Err(error) = ordered {
+        ctx.cleanup().await?;
+        return Err(error);
+    }
+    // Same attempt has two receipts; only the Action may consume action input.
+    Effects::begin_create(&ctx.pool, action.intent, master).await?;
+    Effects::record_resource(&ctx.pool, action.intent, &resource).await?;
+    let original = Effects::consume_stdin(&ctx.pool, action.intent, &resource, master).await?;
+    assert_eq!(
+        original.as_bytes(),
+        br#"{"value":"owned-private-parameters"}"#
+    );
+    let mut tx = ctx.pool.begin().await?;
+    assert!(
+        DelegatedExecutionRepository::validate_claims(&mut tx, &claims)
+            .await?
+            .is_some()
+    );
+    tx.commit().await?;
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn command_inspection_rejects_failed_and_revoked_proofs_after_restoration() -> Result<()> {
+    use attune_common::action_cli::SelectedProgram;
+    attune_common::auth::install_crypto_provider();
+    for exit_code in [1, 0] {
+        let ctx = TestContext::new().await?.with_admin_auth().await?;
+        let (action, input, resource) = admitted_typed(&ctx, "none", true).await?;
+        let owner = ctx.user.as_ref().unwrap().id;
+        let master = ctx.state.config.security.encryption_key.as_deref().unwrap();
+        let mut probe = action.clone();
+        probe.intent = Uuid::new_v4();
+        probe.purpose = LaunchPurpose::RuntimeProbe;
+        probe.invocation.argv = vec![
+            "/opt/attune/runner/linux-amd64".into(),
+            "inspect-command-program".into(),
+            "/echo".into(),
+        ];
+        probe.invocation.env.remove("ATTUNE_API_TOKEN");
+        Effects::reserve(&ctx.pool, &probe, owner, &input, master).await?;
+        Effects::begin_create(&ctx.pool, probe.intent, master).await?;
+        Effects::record_resource(&ctx.pool, probe.intent, &resource).await?;
+        Effects::consume_stdin(&ctx.pool, probe.intent, &resource, master).await?;
+        Effects::record_exit(
+            &ctx.pool,
+            probe.intent,
+            &resource,
+            LaunchExitOutcome {
+                exit_code,
+                oom_killed: false,
+            },
+        )
+        .await?;
+        let program = SelectedProgram {
+            path: "/echo".into(),
+            sha256: Sha256Digest::of_bytes(b"same-image-echo").as_str().into(),
+            invocation_name: "/echo".into(),
+            artifact: None,
+            variant: None,
+        };
+        if exit_code != 0 {
+            assert!(Effects::complete_command_inspection(
+                &ctx.pool,
+                probe.intent,
+                &resource,
+                &program,
+                master
+            )
+            .await
+            .is_err());
+            assert!(Effects::inspected_program(&ctx.pool, &action, master)
+                .await?
+                .is_none());
+        } else {
+            Effects::complete_command_inspection(
+                &ctx.pool,
+                probe.intent,
+                &resource,
+                &program,
+                master,
+            )
+            .await?;
+            sqlx::query("UPDATE identity SET frozen=TRUE WHERE id=$1")
+                .bind(owner)
+                .execute(&ctx.pool)
+                .await?;
+            sqlx::query("UPDATE identity SET frozen=FALSE WHERE id=$1")
+                .bind(owner)
+                .execute(&ctx.pool)
+                .await?;
+            // Restoration cannot restore either captured selection or a late
+            // positive output acknowledgement from the old inspection.
+            assert!(Effects::inspected_program(&ctx.pool, &action, master)
+                .await
+                .is_err());
+            assert!(Effects::complete_command_inspection(
+                &ctx.pool,
+                probe.intent,
+                &resource,
+                &program,
+                master
+            )
+            .await
+            .is_err());
+        }
+        ctx.cleanup().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn command_inspection_worker_expiry_during_receipt_wait_cannot_publish() -> Result<()> {
+    use attune_common::action_cli::SelectedProgram;
+    attune_common::auth::install_crypto_provider();
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let (mut probe, input, resource) = admitted_typed(&ctx, "none", true).await?;
+    let owner = ctx.user.as_ref().unwrap().id;
+    let master = ctx
+        .state
+        .config
+        .security
+        .encryption_key
+        .as_deref()
+        .unwrap()
+        .to_owned();
+    probe.purpose = LaunchPurpose::RuntimeProbe;
+    probe.invocation.argv = vec![
+        "/opt/attune/runner/linux-amd64".into(),
+        "inspect-command-program".into(),
+        "/echo".into(),
+    ];
+    probe.invocation.env.remove("ATTUNE_API_TOKEN");
+    Effects::reserve(&ctx.pool, &probe, owner, &input, &master).await?;
+    Effects::begin_create(&ctx.pool, probe.intent, &master).await?;
+    Effects::record_resource(&ctx.pool, probe.intent, &resource).await?;
+    Effects::consume_stdin(&ctx.pool, probe.intent, &resource, &master).await?;
+    Effects::record_exit(
+        &ctx.pool,
+        probe.intent,
+        &resource,
+        LaunchExitOutcome {
+            exit_code: 0,
+            oom_killed: false,
+        },
+    )
+    .await?;
+    let LaunchTarget::Execution {
+        worker, execution, ..
+    } = probe.target
+    else {
+        unreachable!()
+    };
+    let mut barrier = ctx.pool.begin().await?;
+    let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *barrier)
+        .await?;
+    let _: Uuid = sqlx::query_scalar(
+        "SELECT intent FROM execution_process_effect WHERE intent=$1 FOR UPDATE",
+    )
+    .bind(probe.intent)
+    .fetch_one(&mut *barrier)
+    .await?;
+    let deadline: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "UPDATE worker SET last_heartbeat=clock_timestamp()-interval '86 seconds' WHERE id=$1 RETURNING last_heartbeat+interval '90 seconds'"
+    ).bind(worker).fetch_one(&ctx.pool).await?;
+    let pool = ctx.pool.clone();
+    let mut call = tokio::spawn(async move {
+        let program = SelectedProgram {
+            path: "/echo".into(),
+            sha256: Sha256Digest::of_bytes(b"same-image-echo").as_str().into(),
+            invocation_name: "/echo".into(),
+            artifact: None,
+            variant: None,
+        };
+        Effects::complete_command_inspection(&pool, probe.intent, &resource, &program, &master)
+            .await
+    });
+    let mut barrier = Some(barrier);
+    let result = async {
+        wait_for_database_blocker(&ctx.pool, blocker).await?;
+        assert!(!call.is_finished());
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let expired: bool = sqlx::query_scalar("SELECT clock_timestamp()>=$1")
+                    .bind(deadline)
+                    .fetch_one(&ctx.pool)
+                    .await?;
+                if expired {
+                    return Ok::<_, sqlx::Error>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        barrier.take().unwrap().commit().await?;
+        assert!(
+            (&mut call).await?.is_err(),
+            "expired worker cannot publish inspected metadata"
+        );
+        let captured: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM execution_program_selection WHERE execution=$1",
+        )
+        .bind(execution)
+        .fetch_one(&ctx.pool)
+        .await?;
+        assert_eq!(captured, 0);
+        Ok::<_, Box<dyn std::error::Error>>(())
+    }
+    .await;
+    if let Some(barrier) = barrier {
+        barrier.rollback().await?;
+    }
+    if !call.is_finished() {
+        call.abort();
+        let _ = call.await;
+    }
+    ctx.cleanup().await?;
+    result
 }

@@ -155,14 +155,14 @@ async fn remove_owned(client: Client, identity: &ResourceIdentity) -> Result<()>
 #[ignore = "requires explicit owned Kubernetes namespace, pinned binaries/images and disposable PostgreSQL"]
 async fn kubernetes_native_action_custody_completion_and_restart() -> Result<()> {
     let _provider = KUBERNETES_CASE.lock().await;
-    owning_case(true, false).await
+    owning_case(true, false, false).await
 }
 
 // No provider effect is claimed: this catches actual preparer/custody/completion
 // regressions on PostgreSQL before the owning namespace job executes the Pod.
 #[tokio::test]
 async fn trusted_worker_completion_and_custody_repository_case() -> Result<()> {
-    owning_case(false, false).await
+    owning_case(false, false, false).await
 }
 
 // Each real case requires the owned node's fixed payload CPU budget. Retain
@@ -173,10 +173,17 @@ static KUBERNETES_CASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 #[ignore = "requires explicit owned Kubernetes namespace, pinned binaries/images and disposable PostgreSQL"]
 async fn kubernetes_native_cli_action_custody_completion_and_restart() -> Result<()> {
     let _provider = KUBERNETES_CASE.lock().await;
-    owning_case(true, true).await
+    owning_case(true, true, false).await
 }
 
-async fn owning_case(real_provider: bool, typed_cli: bool) -> Result<()> {
+#[tokio::test]
+#[ignore = "requires explicit owned Kubernetes namespace, pinned binaries/images and disposable PostgreSQL"]
+async fn kubernetes_command_action_custody_completion_and_restart() -> Result<()> {
+    let _provider = KUBERNETES_CASE.lock().await;
+    owning_case(true, true, true).await
+}
+
+async fn owning_case(real_provider: bool, typed_cli: bool, command: bool) -> Result<()> {
     attune_common::auth::install_crypto_provider();
     let root = tempfile::tempdir()?;
     let (platform, echo, runner, client, payload_image) = if real_provider {
@@ -273,11 +280,14 @@ async fn owning_case(real_provider: bool, typed_cli: bool) -> Result<()> {
             action::{ActionRepository, UpdateActionInput},
             Patch,
         };
+        let launch = if command {
+            json!({"type":"command","program":"/usr/local/libexec/attune/echo","arguments":[{"literal":"literal value; $(false)","order":0}]})
+        } else {
+            json!({"type":"native","artifact":"echo","arguments":[{"literal":"literal value; $(false)","order":0}]})
+        };
         ActionRepository::update(&database, action.id, UpdateActionInput {
             entrypoint: Some(Patch::Clear),
-            launch: Some(Patch::Set(serde_json::from_value(json!({
-                "type":"native", "artifact":"echo", "arguments":[{"literal":"literal value; $(false)","order":0}]
-            }))?)),
+            launch: Some(Patch::Set(serde_json::from_value(launch)?)),
             parameter_delivery: Some("stdin".into()), parameter_format: Some("json".into()),
             param_schema: Some(json!({"message":{"type":"string","required":true,"cli":{"kind":"positional","order":1}}})),
             ..Default::default()
@@ -636,6 +646,33 @@ async fn owning_case(real_provider: bool, typed_cli: bool) -> Result<()> {
                     && retained.invocation.argv[6] == message,
                 "native CLI argv differs from admitted arguments"
             );
+        }
+        if command {
+            let probe = Effects::retained_for_purpose(
+                database.pool(),
+                execution.id,
+                attempt,
+                LaunchPurpose::RuntimeProbe,
+                MASTER,
+            )
+            .await?
+            .context("command probe receipt missing")?;
+            ensure!(
+                probe.image == retained.image
+                    && probe.platform == retained.platform
+                    && probe.inputs == retained.inputs
+                    && probe.invocation.argv[1] == "inspect-command-program"
+                    && !probe.invocation.env.contains_key("ATTUNE_API_TOKEN"),
+                "command inspection binding differs"
+            );
+            let mut tx = database.begin().await?;
+            ensure!(
+                Effects::lock_completion(&mut tx, probe.intent, MASTER)
+                    .await
+                    .is_err(),
+                "probe must never complete the action"
+            );
+            tx.rollback().await?;
         }
         let retained_pack = retained
             .inputs
