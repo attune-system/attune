@@ -2247,6 +2247,48 @@ mod tests {
         .is_err());
     }
     #[test]
+    fn cached_zip_rejects_changed_pin_bounds_without_rewriting_the_original_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let limits = CacheLimits {
+            compressed_bytes: 4096,
+            expanded_bytes: 1024,
+            files: 32,
+        };
+        let cached = CacheStore::open(root.path().join("cached"), limits).unwrap();
+        let fresh = CacheStore::open(root.path().join("fresh"), limits).unwrap();
+        let mut body = zip_body(&[("safe", b"owned")], &[]);
+        let mut bytes = Vec::new();
+        body.read_to_end(&mut bytes).unwrap();
+        let loose = PinnedLaunchInput {
+            pin_id: 1,
+            object_id: 2,
+            object_version: "owned-bounds".into(),
+            kind: LaunchInputKind::Pack,
+            size_bytes: bytes.len() as u64,
+            sha256: Sha256Digest::of_bytes(&bytes),
+            max_expanded_bytes: 1024,
+            max_files: 32,
+        };
+        let destination = cached.install_input(&loose, &mut body).unwrap();
+        let receipt_path = destination.parent().unwrap().join("receipt");
+        let original = fs::read(&receipt_path).unwrap();
+        let tight = PinnedLaunchInput {
+            max_expanded_bytes: 5,
+            max_files: 1,
+            ..loose.clone()
+        };
+        assert!(matches!(
+            cached.install_input(&tight, &mut body),
+            Err(CacheError::PinMismatch)
+        ));
+        assert_eq!(fs::read(receipt_path).unwrap(), original);
+        assert_eq!(fs::read(destination.join("safe")).unwrap(), b"owned");
+        // This exact ZIP does satisfy the tight bounds. The failure above is
+        // the retained pin contract, not a corrupt archive or insufficient quota.
+        let exact = fresh.install_input(&tight, &mut body).unwrap();
+        assert_eq!(fs::read(exact.join("safe")).unwrap(), b"owned");
+    }
+    #[test]
     fn input_pin_is_verified_before_extraction_or_publication() {
         let root = tempfile::tempdir().unwrap();
         let store = CacheStore::open(
