@@ -54,7 +54,7 @@ impl Fixture {
         let controller_identity = validate_token(&controller_access, &ctx.state.jwt_config)?
             .sub
             .parse::<i64>()?;
-        let engine:i64=sqlx::query_scalar("INSERT INTO workload_engine(pool,controller_url) VALUES($1,'https://owned-controller.invalid') RETURNING id")
+        let engine:i64=sqlx::query_scalar("INSERT INTO workload_engine(pool,controller_url,daemon_id,platform) VALUES($1,'https://owned-controller.invalid','owned-daemon','linux/amd64') RETURNING id")
             .bind(format!("owned-{}",Uuid::new_v4())).fetch_one(&ctx.pool).await?;
         let actor_incarnation = Uuid::new_v4();
         let controller:i64=sqlx::query_scalar("INSERT INTO workload_controller(engine,identity,incarnation) VALUES($1,$2,$3) RETURNING id")
@@ -483,6 +483,79 @@ async fn reserve_revoke_restore_claim_never_revives_old_launch_but_new_admission
     Ok(())
 }
 
+#[tokio::test]
+async fn engine_identity_is_immutable_and_disable_restore_permanently_closes_old_launch(
+) -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let reserved = fixture.reserve().await?;
+    for (credential, expected) in [
+        (None, StatusCode::UNAUTHORIZED),
+        (fixture.ctx.token(), StatusCode::FORBIDDEN),
+        (Some(fixture.credential.as_str()), StatusCode::OK),
+    ] {
+        let mut request = Request::get("/api/v1/workload-launches/engine");
+        if let Some(credential) = credential {
+            request = request.header("authorization", format!("Bearer {credential}"));
+        }
+        let response = fixture
+            .ctx
+            .app
+            .clone()
+            .oneshot(request.body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), expected);
+        if expected == StatusCode::OK {
+            let body = to_bytes(response.into_body(), 4096).await?;
+            let binding: LaunchEngineBinding = serde_json::from_slice(&body)?;
+            assert_eq!(binding.engine_id, fixture.actor().engine);
+            assert_eq!(binding.daemon_id, "owned-daemon");
+            assert_eq!(binding.platform, LaunchPlatform::LinuxAmd64);
+        }
+    }
+    for sql in [
+        "UPDATE workload_engine SET daemon_id='replacement-daemon' WHERE id=$1",
+        "UPDATE workload_engine SET platform='linux/arm64' WHERE id=$1",
+        "DELETE FROM workload_engine WHERE id=$1",
+    ] {
+        assert!(sqlx::query(sql)
+            .bind(fixture.actor().engine)
+            .execute(&fixture.ctx.pool)
+            .await
+            .is_err());
+    }
+    for disabled in [true, false] {
+        sqlx::query("UPDATE workload_engine SET disabled=$2 WHERE id=$1")
+            .bind(fixture.actor().engine)
+            .bind(disabled)
+            .execute(&fixture.ctx.pool)
+            .await?;
+    }
+    let claimed: ClaimedLaunch = fixture
+        .ok(
+            &reserved,
+            "claim",
+            &reserved.request,
+            LAUNCH_DISPATCH_HEADER,
+            &reserved.dispatch_token,
+        )
+        .await?;
+    assert!(matches!(
+        claimed,
+        ClaimedLaunch::Cleanup {
+            status: LaunchStatus {
+                stop_reason: Some(LaunchStopReason::SourceRevoked),
+                ..
+            },
+            ..
+        }
+    ));
+    // Engine admission revocation does not erase the cleanup identity.
+    let binding = Ledger::engine_binding(&fixture.ctx.pool, fixture.actor()).await?;
+    assert_eq!(binding.daemon_id, "owned-daemon");
+    fixture.ctx.cleanup().await?;
+    Ok(())
+}
+
 fn archive(name: &str, contents: &[u8]) -> Vec<u8> {
     use std::io::Write;
     let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
@@ -540,6 +613,8 @@ impl Fixture {
         };
         action.manifest.inputs = vec![pin.clone()];
         let binding = RuntimeStageBinding {
+            engine_id: action.manifest.engine_id,
+            platform: LaunchPlatform::LinuxAmd64,
             image_sha256: action.manifest.image.sha256.clone(),
             pack_sha256: digest,
             configuration_ciphertext_sha256: Sha256Digest::of_bytes(
@@ -780,6 +855,26 @@ async fn removed_setup_publication_replays_exact_receipt_and_requires_real_build
         Some(&binding),
     )
     .await?;
+    for (engine_id, platform) in [
+        (binding.engine_id + 1, binding.platform),
+        (binding.engine_id, LaunchPlatform::LinuxArm64),
+    ] {
+        let mut wrong = binding.clone();
+        wrong.engine_id = engine_id;
+        wrong.platform = platform;
+        assert!(
+            Ledger::freeze_with_runtime_binding(
+                &fixture.ctx.pool,
+                fixture.image,
+                action.clone(),
+                fixture.master(),
+                Some(&wrong)
+            )
+            .await
+            .is_err(),
+            "an index digest alone is not engine/platform build proof"
+        );
+    }
     let mut wrong = binding.clone();
     wrong.runtime_definition_sha256 = Sha256Digest::of_bytes(b"different-runtime-definition");
     assert!(Ledger::freeze_with_runtime_binding(

@@ -87,6 +87,8 @@ pub struct LaunchInputBody {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeStageBinding {
+    pub engine_id: i64,
+    pub platform: LaunchPlatform,
     pub image_sha256: Sha256Digest,
     pub pack_sha256: Sha256Digest,
     pub configuration_ciphertext_sha256: Sha256Digest,
@@ -101,6 +103,29 @@ struct SourceProof {
 
 pub struct WorkloadLaunchRepository;
 impl WorkloadLaunchRepository {
+    /// Immutable engine/platform proof. Cleanup may read a disabled engine's
+    /// identity; disabling admission must never make owned resources unremovable.
+    pub async fn engine_binding(
+        pool: &PgPool,
+        actor: ControllerActor,
+    ) -> Result<LaunchEngineBinding> {
+        let mut tx = pool.begin().await?;
+        Self::actor(&mut tx, actor).await?;
+        let (daemon_id, platform): (String, String) =
+            sqlx::query_as("SELECT daemon_id,platform FROM workload_engine WHERE id=$1 FOR SHARE")
+                .bind(actor.engine)
+                .fetch_one(&mut *tx)
+                .await?;
+        let result = LaunchEngineBinding {
+            engine_id: actor.engine,
+            daemon_id,
+            platform: serde_json::from_value(serde_json::Value::String(platform))?,
+        };
+        result.validate_shape()?;
+        Self::actor(&mut tx, actor).await?;
+        tx.commit().await?;
+        Ok(result)
+    }
     async fn now(tx: &mut Transaction<'_, Postgres>) -> Result<DateTime<Utc>> {
         Ok(sqlx::query_scalar("SELECT clock_timestamp()")
             .fetch_one(&mut **tx)
@@ -407,7 +432,9 @@ impl WorkloadLaunchRepository {
             || proof.retained.as_ref().is_some_and(|retained| {
                 retained
                     .iter()
-                    .filter(|expected| !capture || expected.kind != "image")
+                    .filter(|expected| {
+                        !capture || !matches!(expected.kind.as_str(), "image" | "engine")
+                    })
                     .any(|expected| !current.contains(expected))
             })
         {
@@ -429,13 +456,14 @@ impl WorkloadLaunchRepository {
         let mut sources =
             Self::source_for(tx, &record.manifest.target, record.owner, capture).await?;
         if !capture {
-            let image:Option<i64>=sqlx::query_scalar("SELECT i.id FROM workload_execution_image i JOIN workload_engine e ON e.id=i.engine WHERE i.id=$1 AND i.engine=$2 AND i.sha256=$3 AND i.reference=$4 AND i.revoked_at IS NULL AND NOT e.disabled FOR SHARE OF i,e")
+            let image:Option<i64>=sqlx::query_scalar("SELECT i.id FROM workload_execution_image i JOIN workload_engine e ON e.id=i.engine WHERE i.id=$1 AND i.engine=$2 AND i.sha256=$3 AND i.reference=$4 AND i.revoked_at IS NULL AND NOT e.disabled AND i.platform=e.platform FOR SHARE OF i,e")
             .bind(record.image).bind(record.engine).bind(record.manifest.image.sha256.as_str()).bind(&record.manifest.image.reference).fetch_optional(&mut **tx).await?;
             if image.is_none() {
                 return Err(denied());
             }
         }
         sources.sources.push(("image", record.image));
+        sources.sources.push(("engine", record.engine));
         let epochs = workload_source::snapshot(tx, sources.sources.clone()).await?;
         Self::retained_epochs(&sources, &epochs, record.image, capture)?;
         Ok((epochs, sources.deadline))
@@ -443,10 +471,10 @@ impl WorkloadLaunchRepository {
     fn same_epochs(current: &[SourceEpoch], expected: &[SourceEpoch], capture: bool) -> bool {
         current
             .iter()
-            .filter(|entry| !capture || entry.kind != "image")
+            .filter(|entry| !capture || !matches!(entry.kind.as_str(), "image" | "engine"))
             .eq(expected
                 .iter()
-                .filter(|entry| !capture || entry.kind != "image"))
+                .filter(|entry| !capture || !matches!(entry.kind.as_str(), "image" | "engine")))
     }
     /// Acquire sources and epochs before locking the operation. Permission loss
     /// closes the operation durably; cleanup may proceed without private context.
@@ -571,10 +599,13 @@ impl WorkloadLaunchRepository {
         }
         let mut tx = pool.begin().await?;
         let mut proof = Self::source(&mut tx, target, owner).await?;
-        let image_digest:String=sqlx::query_scalar("SELECT i.sha256 FROM workload_execution_image i JOIN workload_engine e ON e.id=i.engine WHERE i.id=$1 AND i.revoked_at IS NULL AND NOT e.disabled FOR SHARE OF i,e").bind(image).fetch_optional(&mut *tx).await?.ok_or_else(denied)?;
+        let (image_digest, engine_id, platform):(String,i64,String)=sqlx::query_as("SELECT i.sha256,i.engine,e.platform FROM workload_execution_image i JOIN workload_engine e ON e.id=i.engine WHERE i.id=$1 AND i.revoked_at IS NULL AND NOT e.disabled AND i.platform=e.platform FOR SHARE OF i,e").bind(image).fetch_optional(&mut *tx).await?.ok_or_else(denied)?;
         if purpose == LaunchPurpose::Setup {
             let binding = binding.as_ref().ok_or_else(denied)?;
-            if binding.image_sha256.as_str() != image_digest {
+            if binding.image_sha256.as_str() != image_digest
+                || binding.engine_id != engine_id
+                || binding.platform.as_str() != platform
+            {
                 return Err(denied());
             }
             let pack:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workload_launch_object WHERE source_target=$1 AND kind='pack' AND sha256=$2 AND retired_at IS NULL)").bind(Json(target)).bind(binding.pack_sha256.as_str()).fetch_one(&mut *tx).await?;
@@ -583,6 +614,7 @@ impl WorkloadLaunchRepository {
             }
         }
         proof.sources.push(("image", image));
+        proof.sources.push(("engine", engine_id));
         let epochs = workload_source::snapshot(&mut tx, proof.sources).await?;
         let now = Self::now(&mut tx).await?;
         if expires_at <= now || expires_at > now + chrono::Duration::hours(1) {
@@ -634,7 +666,7 @@ impl WorkloadLaunchRepository {
             spec.manifest.owner_identity_id,
         )
         .await?;
-        let image: Option<i64>=sqlx::query_scalar("SELECT i.id FROM workload_execution_image i JOIN workload_engine e ON e.id=i.engine WHERE i.id=$1 AND i.engine=$2 AND i.reference=$3 AND i.sha256=$4 AND i.revoked_at IS NULL AND NOT e.disabled FOR SHARE OF i,e")
+        let image: Option<i64>=sqlx::query_scalar("SELECT i.id FROM workload_execution_image i JOIN workload_engine e ON e.id=i.engine WHERE i.id=$1 AND i.engine=$2 AND i.reference=$3 AND i.sha256=$4 AND i.revoked_at IS NULL AND NOT e.disabled AND i.platform=e.platform FOR SHARE OF i,e")
             .bind(image_id).bind(spec.manifest.engine_id).bind(&spec.manifest.image.reference).bind(spec.manifest.image.sha256.as_str()).fetch_optional(&mut *tx).await?;
         if image.is_none() {
             return Err(denied());
@@ -661,8 +693,14 @@ impl WorkloadLaunchRepository {
                 return Err(denied());
             }
         }
+        let platform: String =
+            sqlx::query_scalar("SELECT platform FROM workload_engine WHERE id=$1 FOR SHARE")
+                .bind(spec.manifest.engine_id)
+                .fetch_one(&mut *tx)
+                .await?;
         let mut sources = sources;
         sources.sources.push(("image", image_id));
+        sources.sources.push(("engine", spec.manifest.engine_id));
         let epochs = workload_source::snapshot(&mut tx, sources.sources.clone()).await?;
         Self::retained_epochs(&sources, &epochs, image_id, false)?;
         for input in spec
@@ -672,15 +710,17 @@ impl WorkloadLaunchRepository {
             .filter(|input| input.kind == LaunchInputKind::Runtime)
         {
             let expected = expected_runtime.ok_or_else(denied)?;
-            if expected.image_sha256 != spec.manifest.image.sha256
+            if expected.platform.as_str() != platform
+                || expected.engine_id != spec.manifest.engine_id
+                || expected.image_sha256 != spec.manifest.image.sha256
                 || !spec.manifest.inputs.iter().any(|pin| {
                     pin.kind == LaunchInputKind::Pack && pin.sha256 == expected.pack_sha256
                 })
             {
                 return Err(denied());
             }
-            let build:Option<(Json<RuntimeStageBinding>,Json<Vec<SourceEpoch>>)>=sqlx::query_as("SELECT o.stage_binding,b.source_epochs FROM workload_launch_object o JOIN workload_launch b ON b.id=o.build_launch WHERE o.id=$1 AND o.kind='runtime' AND o.retired_at IS NULL AND o.built_image_sha256=$2 AND o.built_image_sha256=b.manifest#>>'{image,sha256}' AND b.manifest->>'purpose'='setup' AND b.operation#>>'{status,state}'='stopped' AND b.operation#>>'{status,runtime_state}'='exited' AND b.operation#>>'{status,publication}'='published' AND b.operation#>'{status,stop_reason}'='null'::jsonb AND b.operation#>>'{status,exit_outcome,exit_code}'='0' AND b.operation#>>'{status,exit_outcome,oom_killed}'='false'")
-                .bind(input.object_id).bind(expected.image_sha256.as_str()).fetch_optional(&mut *tx).await?;
+            let build:Option<(Json<RuntimeStageBinding>,Json<Vec<SourceEpoch>>)>=sqlx::query_as("SELECT o.stage_binding,b.source_epochs FROM workload_launch_object o JOIN workload_launch b ON b.id=o.build_launch WHERE o.id=$1 AND o.kind='runtime' AND o.retired_at IS NULL AND o.built_image_sha256=$2 AND b.engine=$3 AND o.stage_binding->>'platform'=$4 AND o.built_image_sha256=b.manifest#>>'{image,sha256}' AND b.manifest->>'purpose'='setup' AND b.operation#>>'{status,state}'='stopped' AND b.operation#>>'{status,runtime_state}'='exited' AND b.operation#>>'{status,publication}'='published' AND b.operation#>'{status,stop_reason}'='null'::jsonb AND b.operation#>>'{status,exit_outcome,exit_code}'='0' AND b.operation#>>'{status,exit_outcome,oom_killed}'='false'")
+                .bind(input.object_id).bind(expected.image_sha256.as_str()).bind(expected.engine_id).bind(expected.platform.as_str()).fetch_optional(&mut *tx).await?;
             let (binding, build_epochs) = build.ok_or_else(denied)?;
             if binding.0 != *expected
                 || build_epochs
@@ -719,7 +759,9 @@ impl WorkloadLaunchRepository {
                 .iter()
                 .find(|input| input.kind == LaunchInputKind::Pack)
                 .ok_or_else(denied)?;
-            if binding.image_sha256 != spec.manifest.image.sha256
+            if binding.platform.as_str() != platform
+                || binding.engine_id != spec.manifest.engine_id
+                || binding.image_sha256 != spec.manifest.image.sha256
                 || binding.pack_sha256 != pack.sha256
             {
                 return Err(denied());

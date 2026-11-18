@@ -435,6 +435,7 @@ use attune_common::audit::{AuditCategory, AuditOutcome};
 
         // Internal service endpoints
         crate::routes::log_delivery_control::reconcile,
+        crate::routes::workload_launch::engine_binding,
         crate::routes::workload_launch::resolve,
         crate::routes::workload_launch::output::reserve_output,
         crate::routes::workload_launch::output::output_body,
@@ -1069,12 +1070,12 @@ mod tests {
             .sum();
 
         assert_eq!(
-            path_count, 233,
+            path_count, 234,
             "Expected every mounted API path in the OpenAPI spec"
         );
 
         assert_eq!(
-            operation_count, 297,
+            operation_count, 298,
             "Expected every mounted API operation in the OpenAPI spec"
         );
 

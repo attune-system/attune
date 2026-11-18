@@ -1,7 +1,7 @@
 -- Monotonic revocation evidence deliberately has no FK to retained sources.
 CREATE TABLE workload_source_epoch (
     id BIGSERIAL PRIMARY KEY,
-    kind TEXT NOT NULL CHECK (kind IN ('owner','execution','worker','workload','sensor','admission','install','image')),
+    kind TEXT NOT NULL CHECK (kind IN ('owner','execution','worker','workload','sensor','admission','install','image','engine')),
     subject BIGINT NOT NULL CHECK (subject > 0),
     epoch BIGINT NOT NULL DEFAULT 0 CHECK (epoch >= 0),
     UNIQUE(kind, subject)
@@ -152,8 +152,21 @@ CREATE TABLE workload_engine (
     id BIGSERIAL PRIMARY KEY,
     pool TEXT NOT NULL UNIQUE CHECK (length(pool) BETWEEN 1 AND 128),
     controller_url TEXT NOT NULL,
+    daemon_id TEXT NOT NULL CHECK (length(daemon_id) BETWEEN 1 AND 256 AND daemon_id ~ '^[!-~]+$'),
+    platform TEXT NOT NULL CHECK (platform IN ('linux/amd64','linux/arm64')),
     disabled BOOLEAN NOT NULL DEFAULT FALSE
 );
+CREATE FUNCTION guard_workload_engine_identity() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP='DELETE' OR ROW(NEW.id,NEW.pool,NEW.daemon_id,NEW.platform)
+      IS DISTINCT FROM ROW(OLD.id,OLD.pool,OLD.daemon_id,OLD.platform)
+    THEN RAISE EXCEPTION 'Workload engine identity and native platform are immutable'; END IF;
+    IF ROW(NEW.disabled,NEW.controller_url) IS DISTINCT FROM ROW(OLD.disabled,OLD.controller_url) THEN
+        PERFORM bump_workload_source_epoch('engine',OLD.id);
+    END IF;
+    RETURN NEW;
+END $$;
+CREATE TRIGGER workload_engine_identity BEFORE UPDATE OR DELETE ON workload_engine FOR EACH ROW EXECUTE FUNCTION guard_workload_engine_identity();
 CREATE TABLE workload_controller (
     id BIGSERIAL PRIMARY KEY,
     engine BIGINT NOT NULL REFERENCES workload_engine(id),

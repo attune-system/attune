@@ -12,7 +12,7 @@ use attune_common::{
 use axum::{
     extract::{Path, State},
     http::HeaderMap,
-    routing::post,
+    routing::{get, post},
     Extension, Json, Router,
 };
 pub mod output;
@@ -69,6 +69,15 @@ fn response<T>(actor: ControllerActor, value: T) -> ApiResult<Json<T>> {
         ));
     }
     Ok(Json(value))
+}
+
+#[utoipa::path(operation_id="workload_launch_engine_binding",get,path="/api/v1/workload-launches/engine",responses((status=200,body=LaunchEngineBinding),(status=403,description="Engine unavailable")),tag="workload-control")]
+pub async fn engine_binding(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+) -> ApiResult<Json<LaunchEngineBinding>> {
+    let actor = actor(&user)?;
+    response(actor, Ledger::engine_binding(&state.db, actor).await?)
 }
 
 #[utoipa::path(operation_id="workload_launch_resolve",post,path="/api/v1/workload-launches/{id}/resolve",params(("id"=i64,Path),("x-attune-launch-dispatch"=String,Header,description="Exact target-scoped grant")),request_body=LaunchRequest,responses((status=200,body=LaunchManifest),(status=403,description="Launch unavailable")),tag="workload-control")]
@@ -350,6 +359,7 @@ pub async fn authorize_io(
 }
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/workload-launches/engine", get(engine_binding))
         .route("/workload-launches/{id}/outputs", post(reserve_output))
         .route(
             "/workload-launches/{id}/outputs/{output_id}/body",
