@@ -1,0 +1,207 @@
+name: Kubernetes Workload Isolation
+on:
+  pull_request:
+    paths:
+      - 'crates/common/**'
+      - 'crates/worker/**'
+      - 'crates/workload-backend/**'
+      - 'crates/core-actions/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'docker/Dockerfile.workload-provider-test'
+      - '.github/workflows/workload-kubernetes.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  provider:
+    name: Native Pod boundary (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            kind_sha: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+            kubectl_sha: 6129359f4e1f3848a5572ccb0b26cf28b8ca08cef38c95a765b2f64a2c961a2f
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            kind_sha: 20022bee6cfcd5086cb7234d218e3454e6090022f2a8f55d1fa7fcf42c3867a2
+            kubectl_sha: 922df28df248cc00a9e025f947704f1d1482de64ece54cfe57e61f19eaf1eef3
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      SQLX_OFFLINE: 'true'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      ATTUNE_TEST_RUN_ID: k8s-${{ matrix.arch }}
+      ATTUNE_ISOLATION_TEST_PLATFORM: linux/${{ matrix.arch }}
+      TEST_ARCH: ${{ matrix.arch }}
+      RUST_TARGET: ${{ matrix.target }}
+      KIND_SHA256: ${{ matrix.kind_sha }}
+      KUBECTL_SHA256: ${{ matrix.kubectl_sha }}
+      # Fixture versions, not a declaration of the product's supported range.
+      KIND_NODE_IMAGE: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: '1.100.0'
+          targets: ${{ matrix.target }}
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      - name: Install checksum-pinned test tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/attune-k8s-bin" "$RUNNER_TEMP/workload-evidence"
+          for tool in kind kubectl; do
+            case "$tool" in
+              kind) url="https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-$TEST_ARCH"; checksum="$KIND_SHA256" ;;
+              kubectl) url="https://dl.k8s.io/release/v1.37.0/bin/linux/$TEST_ARCH/kubectl"; checksum="$KUBECTL_SHA256" ;;
+            esac
+            curl --fail --silent --show-error --location "$url" -o "$RUNNER_TEMP/attune-k8s-bin/$tool"
+            printf '%s  %s\n' "$checksum" "$RUNNER_TEMP/attune-k8s-bin/$tool" | sha256sum --check --strict
+            chmod 0755 "$RUNNER_TEMP/attune-k8s-bin/$tool"
+          done
+          echo "$RUNNER_TEMP/attune-k8s-bin" >> "$GITHUB_PATH"
+          python3 -m venv "$RUNNER_TEMP/workload-zig"
+          "$RUNNER_TEMP/workload-zig/bin/pip" install ziglang==0.16.0
+          echo "$RUNNER_TEMP/workload-zig/bin" >> "$GITHUB_PATH"
+          cargo install --locked cargo-zigbuild --version 0.23.4
+      - name: Build exact candidate Runner and native echo once
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo zigbuild --locked --profile test --target "$RUST_TARGET" -p attune-workload-backend --bin attune-workload-runner --message-format=json > "$RUNNER_TEMP/runner-artifacts.jsonl"
+          cargo zigbuild --locked --profile test --target "$RUST_TARGET" --manifest-path crates/core-actions/Cargo.toml --bin attune-core-echo --message-format=json > "$RUNNER_TEMP/echo-artifacts.jsonl"
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, shutil, subprocess
+          root = pathlib.Path(os.environ['RUNNER_TEMP'])
+          context = root / 'workload-image'
+          context.mkdir()
+          evidence = {'source': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'binaries': {}}
+          for source, target, destination in [('runner', 'attune-workload-runner', 'attune-workload-runner'), ('echo', 'attune-core-echo', 'echo')]:
+              artifacts = [json.loads(line) for line in (root / (source + '-artifacts.jsonl')).read_text().splitlines() if line.startswith('{')]
+              paths = [item['executable'] for item in artifacts if item.get('reason') == 'compiler-artifact' and item['target']['name'] == target and not item['profile'].get('test') and item.get('executable')]
+              assert len(paths) == 1, 'missing/ambiguous actual candidate binary'
+              shutil.copyfile(paths[0], context / destination)
+              (context / destination).chmod(0o555)
+              evidence['binaries'][destination] = hashlib.sha256((context / destination).read_bytes()).hexdigest()
+          (root / 'workload-evidence' / 'build.json').write_text(json.dumps(evidence))
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write('CANDIDATE_TAG=docker.io/attune-owned/workload-ci:' + evidence['source'] + '\n')
+          PY
+      - name: Package immutable candidate image from owned binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build --platform "$ATTUNE_ISOLATION_TEST_PLATFORM" --provenance=false --sbom=false --tag "$CANDIDATE_TAG" --output "type=oci,dest=$RUNNER_TEMP/candidate.oci.tar" --file docker/Dockerfile.workload-provider-test "$RUNNER_TEMP/workload-image"
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, tarfile
+          root = pathlib.Path(os.environ['RUNNER_TEMP'])
+          with tarfile.open(root / 'candidate.oci.tar') as archive:
+              index = json.load(archive.extractfile('index.json'))
+              assert len(index['manifests']) == 1, 'candidate must contain exactly one platform manifest'
+              descriptor = index['manifests'][0]
+              assert descriptor['mediaType'] == 'application/vnd.oci.image.manifest.v1+json', 'unexpected candidate manifest type'
+              digest = descriptor['digest']
+              assert re.fullmatch(r'sha256:[0-9a-f]{64}', digest), 'invalid manifest digest'
+              body = archive.extractfile('blobs/sha256/' + digest.split(':')[1]).read()
+              assert 'sha256:' + hashlib.sha256(body).hexdigest() == digest, 'manifest digest mismatch'
+              manifest = json.loads(body)
+              config_digest = manifest['config']['digest']
+              config_body = archive.extractfile('blobs/sha256/' + config_digest.split(':')[1]).read()
+              assert 'sha256:' + hashlib.sha256(config_body).hexdigest() == config_digest, 'image config digest mismatch'
+              config = json.loads(config_body)
+              assert config['os'] + '/' + config['architecture'] == os.environ['ATTUNE_ISOLATION_TEST_PLATFORM'], 'candidate platform mismatch'
+          image = 'docker.io/attune-owned/workload-ci@' + digest
+          (root / 'workload-evidence' / 'image.json').write_text(json.dumps({'image': image, 'platform': os.environ['ATTUNE_ISOLATION_TEST_PLATFORM']}))
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              for key in ['ATTUNE_ISOLATION_TEST_PAYLOAD_IMAGE', 'ATTUNE_ISOLATION_TEST_HELPER_IMAGE']:
+                  stream.write(key + '=' + image + '\n')
+          PY
+      - name: Create owned cluster and namespace-scoped launcher context
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          cluster="attune-wl-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          namespace="$cluster"
+          admin="$RUNNER_TEMP/attune-kind-admin.json"
+          context="kind-$cluster"
+          if kind get clusters | grep -Fxq "$cluster"; then
+            echo 'Refusing pre-existing cluster name' >&2
+            exit 1
+          fi
+          printf '%s\n' "$cluster" > "$RUNNER_TEMP/attune-kind-owner"
+          kind create cluster --name "$cluster" --image "$KIND_NODE_IMAGE" --kubeconfig "$admin" --wait 180s
+          kind load image-archive --name "$cluster" "$RUNNER_TEMP/candidate.oci.tar"
+          node="$cluster-control-plane"
+          docker exec "$node" ctr --namespace=k8s.io images tag --force "$CANDIDATE_TAG" "$ATTUNE_ISOLATION_TEST_PAYLOAD_IMAGE"
+          docker exec "$node" ctr --namespace=k8s.io images list > "$RUNNER_TEMP/loaded-images.txt"
+          python3 - <<'PY'
+          import os, pathlib
+          reference = os.environ['ATTUNE_ISOLATION_TEST_PAYLOAD_IMAGE']
+          lines = (pathlib.Path(os.environ['RUNNER_TEMP']) / 'loaded-images.txt').read_text().splitlines()
+          rows = [line.split() for line in lines if line.split() and line.split()[0] == reference]
+          assert len(rows) == 1 and rows[0][2] == reference.split('@')[1], 'loaded candidate digest was not established'
+          PY
+          kubectl --kubeconfig "$admin" --context "$context" create namespace "$namespace"
+          kubectl --kubeconfig "$admin" --context "$context" label namespace "$namespace" io.attune.test.owner="$cluster" pod-security.kubernetes.io/enforce=restricted pod-security.kubernetes.io/enforce-version=v1.37
+          kubectl --kubeconfig "$admin" --context "$context" --namespace "$namespace" create serviceaccount attune-test-launcher
+          kubectl --kubeconfig "$admin" --context "$context" --namespace "$namespace" create role attune-test-launcher --verb=get,list,watch,create,delete,patch --resource=pods
+          kubectl --kubeconfig "$admin" --context "$context" --namespace "$namespace" create role attune-test-streams --verb=get,create --resource=pods/attach,pods/exec
+          for role in attune-test-launcher attune-test-streams; do
+            kubectl --kubeconfig "$admin" --context "$context" --namespace "$namespace" create rolebinding "$role" --role "$role" --serviceaccount "$namespace:attune-test-launcher"
+          done
+          export ATTUNE_ISOLATION_TEST_NAMESPACE="$namespace" ATTUNE_ISOLATION_TEST_CONTEXT=attune-owned-fixture ATTUNE_ISOLATION_TEST_CLUSTER="$cluster"
+          export ATTUNE_ISOLATION_TEST_KUBECONFIG="$RUNNER_TEMP/attune-launcher.json"
+          export ATTUNE_KIND_ADMIN_CONFIG="$admin" ATTUNE_KIND_ADMIN_CONTEXT="$context"
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          command = ['kubectl', '--kubeconfig', os.environ['ATTUNE_KIND_ADMIN_CONFIG'], '--context', os.environ['ATTUNE_KIND_ADMIN_CONTEXT']]
+          admin = json.loads(subprocess.check_output(command + ['config', 'view', '--raw', '--minify', '-o', 'json']))
+          token = subprocess.check_output(command + ['--namespace', os.environ['ATTUNE_ISOLATION_TEST_NAMESPACE'], 'create', 'token', 'attune-test-launcher', '--duration=2h'], text=True).strip()
+          context = os.environ['ATTUNE_ISOLATION_TEST_CONTEXT']
+          config = {'apiVersion': 'v1', 'kind': 'Config', 'current-context': context,
+                    'clusters': [{'name': 'owned', 'cluster': admin['clusters'][0]['cluster']}],
+                    'users': [{'name': 'launcher', 'user': {'token': token}}],
+                    'contexts': [{'name': context, 'context': {'cluster': 'owned', 'user': 'launcher', 'namespace': os.environ['ATTUNE_ISOLATION_TEST_NAMESPACE']}}]}
+          path = pathlib.Path(os.environ['ATTUNE_ISOLATION_TEST_KUBECONFIG'])
+          path.write_text(json.dumps(config))
+          path.chmod(0o600)
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              for key in ['ATTUNE_ISOLATION_TEST_NAMESPACE', 'ATTUNE_ISOLATION_TEST_CONTEXT', 'ATTUNE_ISOLATION_TEST_CLUSTER', 'ATTUNE_ISOLATION_TEST_KUBECONFIG']:
+                  stream.write(key + '=' + os.environ[key] + '\n')
+          PY
+          denied_status=0
+          denied_answer=$(kubectl --kubeconfig "$ATTUNE_ISOLATION_TEST_KUBECONFIG" --context "$ATTUNE_ISOLATION_TEST_CONTEXT" --namespace "$namespace" auth can-i get secrets) || denied_status=$?
+          test "$denied_status" -eq 1
+          test "$denied_answer" = no
+      - name: Run actual Pod effects and boundary assertions
+        run: cargo test --locked -p attune-workload-backend --test kubernetes_provider -- --include-ignored --nocapture --test-threads=4
+      - name: Remove and acknowledge only this run's cluster
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner="$RUNNER_TEMP/attune-kind-owner"
+          if [ -f "$owner" ]; then
+            cluster=$(cat "$owner")
+            test "$cluster" = "attune-wl-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            kind delete cluster --name "$cluster"
+            test -z "$(docker ps --all --quiet --filter "label=io.x-k8s.kind.cluster=$cluster")"
+            printf '{"owned_cluster_removed":true}\n' > "$RUNNER_TEMP/workload-evidence/cleanup.json"
+          fi
+          rm -f "$RUNNER_TEMP/attune-kind-admin.json" "$RUNNER_TEMP/attune-launcher.json"
+      - name: Preserve public source, image and cleanup evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: kubernetes-provider-${{ matrix.arch }}
+          path: ${{ runner.temp }}/workload-evidence/*.json
+          if-no-files-found: warn

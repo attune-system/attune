@@ -1,0 +1,10 @@
+# Disposable CI fixture. Both inputs are built once from the exact candidate
+# source using the repository's static multi-arch toolchain, not downloaded.
+ARG BASE_IMAGE=python@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df
+FROM ${BASE_IMAGE}
+COPY --chmod=0555 attune-workload-runner /usr/local/bin/attune-workload-runner
+COPY --chmod=0555 echo /usr/local/libexec/attune/echo
+RUN test -x /bin/bash && /usr/local/bin/python3 --version \
+    && ln -sf /usr/local/bin/python3 /usr/bin/python3 && /usr/bin/python3 --version
+USER 1000:1000
+ENTRYPOINT ["/usr/local/bin/attune-workload-runner"]

@@ -46,10 +46,10 @@ COPY crates/worker/Cargo.toml ./crates/worker/Cargo.toml
 COPY crates/notifier/Cargo.toml ./crates/notifier/Cargo.toml
 COPY crates/supervisor/Cargo.toml ./crates/supervisor/Cargo.toml
 COPY crates/cli/Cargo.toml ./crates/cli/Cargo.toml
-COPY crates/launch-controller/Cargo.toml ./crates/launch-controller/Cargo.toml
+COPY crates/workload-backend/Cargo.toml ./crates/workload-backend/Cargo.toml
 
 # Create minimal stub sources for dep resolution and fetch
-RUN mkdir -p crates/launch-controller/src && echo "" > crates/launch-controller/src/lib.rs && echo "fn main(){}" > crates/launch-controller/src/main.rs && \
+RUN mkdir -p crates/workload-backend/src && echo "" > crates/workload-backend/src/lib.rs && \
     mkdir -p crates/common/src && echo "" > crates/common/src/lib.rs && \
     mkdir -p crates/api/src && echo "fn main(){}" > crates/api/src/main.rs && \
     mkdir -p crates/executor/src && echo "fn main(){}" > crates/executor/src/main.rs && \
@@ -57,7 +57,7 @@ RUN mkdir -p crates/launch-controller/src && echo "" > crates/launch-controller/
     mkdir -p crates/sensor/src && echo "fn main(){}" > crates/sensor/src/main.rs && \
     mkdir -p crates/worker/src && echo "fn main(){}" > crates/worker/src/main.rs && \
     echo "fn main(){}" > crates/worker/src/agent_main.rs && \
-    echo "fn main(){}" > crates/worker/src/workload_runner_main.rs && \
+    echo "fn main(){}" > crates/workload-backend/src/runner_main.rs && \
     mkdir -p crates/notifier/src && echo "fn main(){}" > crates/notifier/src/main.rs && \
     mkdir -p crates/supervisor/src && echo "fn main(){}" > crates/supervisor/src/main.rs && \
     mkdir -p crates/cli/src && echo "fn main(){}" > crates/cli/src/main.rs

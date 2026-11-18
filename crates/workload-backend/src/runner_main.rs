@@ -1,12 +1,13 @@
-//! Public helper bytes only. Private rendered plan arrives once on stdin inside
-//! a CP-admitted OCI container; this binary is not a host isolation backend.
+#[cfg(target_os = "linux")]
+mod gated_runner;
+// Public helper bytes only; no control-plane authority/configuration.
 use attune_common::child_process_environment::ChildProcessEnvironment;
 use attune_common::workload_launch::PACK_ROOT;
 #[cfg(target_os = "linux")]
 use attune_common::workload_launch::{RUNNER_ROOT, RUNTIME_ROOT};
 #[cfg(unix)]
-use attune_worker::runtime::launch_planning::validate_cli_exec;
-use attune_worker::runtime::launch_planning::{SetupPlan, SETUP_STDIN_LIMIT};
+use attune_workload_backend::planning::validate_cli_exec;
+use attune_workload_backend::planning::{SetupPlan, SETUP_STDIN_LIMIT};
 use std::{
     io::Read,
     path::Path,
@@ -22,6 +23,33 @@ fn main() {
         return;
     }
     let result = match arguments.first().and_then(|value| value.to_str()) {
+        #[cfg(target_os = "linux")]
+        Some("gated") if arguments.len() == 1 => match gated_runner::run() {
+            Ok(code) => std::process::exit(code),
+            Err(error) => Err(error),
+        },
+        Some("install") if arguments.len() == 1 => {
+            attune_workload_backend::transfer_runner::install()
+        }
+        Some("transfer") if arguments.len() == 1 => boundary_guard_basic().and_then(|_| loop {
+            std::thread::park();
+        }),
+        Some("seed") | Some("archive") => {
+            let selected = arguments[1..]
+                .iter()
+                .map(|v| v.to_str().map(str::to_owned).ok_or_else(invalid))
+                .collect::<std::io::Result<Vec<_>>>();
+            boundary_guard_basic().and(selected).and_then(|values| {
+                if arguments[0] == "seed" {
+                    attune_workload_backend::transfer_runner::seed(&values)
+                } else {
+                    attune_workload_backend::transfer_runner::archive(&values)
+                }
+            })
+        }
+        #[cfg(target_os = "linux")]
+        Some("terminate") if arguments.len() == 1 => boundary_guard_basic()
+            .and_then(|_| attune_workload_backend::transfer_runner::terminate()),
         Some("setup") if arguments.len() == 1 => setup(),
         Some("exec") => execute(&arguments[1..]),
         _ => Err(invalid()),
@@ -119,6 +147,23 @@ fn invalid() -> std::io::Error {
 /// Fail closed on obvious direct-host/mispackaging use. These checks are not an
 /// attestation of isolation: CP/controller immutable policy and real Engine
 /// boundary tests establish that contract, not a pack-selected environment flag.
+#[cfg(target_os = "linux")]
+fn boundary_guard_basic() -> std::io::Result<()> {
+    if unsafe { libc::geteuid() } != 1000 || unsafe { libc::getegid() } != 1000 {
+        return Err(invalid());
+    }
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    if !status.lines().any(|line| line == "NoNewPrivs:\t1")
+        || !status
+            .lines()
+            .any(|line| line == "CapEff:\t0000000000000000")
+    {
+        return Err(invalid());
+    }
+    readonly_path(Path::new("/"), true)?;
+    readonly_path(&std::env::current_exe()?, true)
+}
+
 #[cfg(target_os = "linux")]
 fn boundary_guard(execution: bool) -> std::io::Result<()> {
     if unsafe { libc::geteuid() } != 1000 || unsafe { libc::getegid() } != 1000 {

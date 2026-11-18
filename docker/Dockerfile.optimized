@@ -44,11 +44,11 @@ COPY crates/worker/Cargo.toml ./crates/worker/Cargo.toml
 COPY crates/notifier/Cargo.toml ./crates/notifier/Cargo.toml
 COPY crates/supervisor/Cargo.toml ./crates/supervisor/Cargo.toml
 COPY crates/cli/Cargo.toml ./crates/cli/Cargo.toml
-COPY crates/launch-controller/Cargo.toml ./crates/launch-controller/Cargo.toml
+COPY crates/workload-backend/Cargo.toml ./crates/workload-backend/Cargo.toml
 
 # Create minimal stub sources so cargo can resolve the workspace and fetch deps.
 # These are ONLY used for `cargo fetch` — never compiled.
-RUN mkdir -p crates/launch-controller/src && echo "" > crates/launch-controller/src/lib.rs && echo "fn main(){}" > crates/launch-controller/src/main.rs && \
+RUN mkdir -p crates/workload-backend/src && echo "" > crates/workload-backend/src/lib.rs && \
     mkdir -p crates/common/src && echo "" > crates/common/src/lib.rs && \
     mkdir -p crates/api/src && echo "fn main(){}" > crates/api/src/main.rs && \
     mkdir -p crates/executor/src && echo "fn main(){}" > crates/executor/src/main.rs && \
@@ -56,7 +56,7 @@ RUN mkdir -p crates/launch-controller/src && echo "" > crates/launch-controller/
     mkdir -p crates/sensor/src && echo "fn main(){}" > crates/sensor/src/main.rs && \
     mkdir -p crates/worker/src && echo "fn main(){}" > crates/worker/src/main.rs && \
     echo "fn main(){}" > crates/worker/src/agent_main.rs && \
-    echo "fn main(){}" > crates/worker/src/workload_runner_main.rs && \
+    echo "fn main(){}" > crates/workload-backend/src/runner_main.rs && \
     mkdir -p crates/notifier/src && echo "fn main(){}" > crates/notifier/src/main.rs && \
     mkdir -p crates/supervisor/src && echo "fn main(){}" > crates/supervisor/src/main.rs && \
     mkdir -p crates/cli/src && echo "fn main(){}" > crates/cli/src/main.rs
@@ -79,7 +79,7 @@ COPY crates/worker/ ./crates/worker/
 COPY crates/executor/ ./crates/executor/
 COPY crates/notifier/ ./crates/notifier/
 COPY crates/supervisor/ ./crates/supervisor/
-COPY crates/launch-controller/ ./crates/launch-controller/
+COPY crates/workload-backend/ ./crates/workload-backend/
 # `sqlx::migrate!` resolves this directory while compiling attune-common.
 COPY migrations/ ./migrations/
 
@@ -101,7 +101,7 @@ ARG ATTUNE_BUILD_GIT_SHA
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry-v2,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,id=attune-cargo-git-v2,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
-    for service in api executor notifier supervisor launch-controller; do \
+    for service in api executor notifier supervisor; do \
         binary="/build/target/release/attune-${service}"; \
         if [ -f "$binary" ] && [ ! -s "$binary" ]; then rm "$binary"; fi; \
     done && \
@@ -111,17 +111,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry
     --bin attune-executor \
     --bin attune-notifier \
     --bin attune-supervisor \
-    --bin attune-launch-controller \
     -j "${CARGO_BUILD_JOBS}" && \
-    for service in api executor notifier supervisor launch-controller; do \
+    for service in api executor notifier supervisor; do \
         test -s "/build/target/release/attune-${service}" || exit 1; \
     done && \
     mkdir -p /build/service-binaries && \
     cp /build/target/release/attune-api /build/service-binaries/api && \
     cp /build/target/release/attune-executor /build/service-binaries/executor && \
     cp /build/target/release/attune-notifier /build/service-binaries/notifier && \
-    cp /build/target/release/attune-supervisor /build/service-binaries/supervisor && \
-    cp /build/target/release/attune-launch-controller /build/service-binaries/launch-controller
+    cp /build/target/release/attune-supervisor /build/service-binaries/supervisor
 
 # Extract the requested service binary from the architecture-specific builder layer.
 # This is the only layer that varies per SERVICE value.

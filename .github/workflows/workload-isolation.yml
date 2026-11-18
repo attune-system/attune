@@ -13,10 +13,12 @@ on:
       - 'crates/common/src/workload_session.rs'
       - 'crates/common/src/workload_artifact.rs'
       - 'crates/worker/src/runtime/launch_planning.rs'
-      - 'crates/worker/src/workload_runner_main.rs'
+      - 'crates/workload-backend/src/runner_main.rs'
       - 'crates/worker/Cargo.toml'
       - 'crates/core-actions/**'
-      - 'crates/launch-controller/**'
+      - 'crates/workload-backend/**'
+      - 'crates/common/src/isolated_process.rs'
+      - 'docker/Dockerfile.workload-provider-test'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'tests/workload-sandbox-harness/**'
@@ -24,73 +26,35 @@ on:
       - 'scripts/ci-workload-isolation-prerequisites.sh'
       - 'docker/Dockerfile.workload-runtime'
       - 'docker-compose.yaml'
-      - 'docker-compose.workload-host.yaml'
-      - 'docker/workload-launch-proxy.conf'
-      - 'scripts/generate-workload-controller-config.py'
-      - 'scripts/test-workload-controller-compose.py'
-      - 'scripts/test-workload-controller-project.py'
       - 'scripts/test-workload-runtime-images.py'
       - 'scripts/test-launch-controller-container.py'
       - 'scripts/test-workload-runner.py'
       - 'scripts/test_native_http_action.py'
       - 'docker/Dockerfile.agent'
       - 'docker/Dockerfile.agent-package'
-      - 'docker/Dockerfile.launch-controller-package'
       - '.github/workflows/publish.yml'
       - 'scripts/test_workload_release_packages.py'
       - 'docker/Dockerfile.optimized'
       - 'scripts/capture_build_diagnostics.py'
       - 'scripts/test_capture_build_diagnostics.py'
       - 'scripts/test_docker_source_graph.py'
-      - 'scripts/workload_proxy_diagnostics.py'
-      - 'scripts/test_workload_proxy_diagnostics.py'
-      - 'scripts/workload_project_probes.py'
-      - 'scripts/test_workload_project_probes.py'
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  controller-config:
-    name: External controller configuration contracts
+  package-contracts:
+    name: Workload helper packaging contracts
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
-      - name: Verify public config and separate controller/proxy authority
+      - name: Verify source graph and public helper packages
         run: |
-          python3 scripts/test-workload-controller-compose.py
           python3 scripts/test_capture_build_diagnostics.py
           python3 scripts/test_docker_source_graph.py
           python3 scripts/test_workload_release_packages.py
-          python3 scripts/test_workload_proxy_diagnostics.py
-          python3 scripts/test_workload_project_probes.py
-  controller-project:
-    name: Actual external controller project (${{ matrix.arch }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-24.04
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-        with:
-          persist-credentials: false
-      - name: Build source and release-package images and validate owned HTTPS project
-        run: python3 scripts/test-workload-controller-project.py --owned-engine-socket /var/run/docker.sock
-      - name: Retain sanitized first-attempt build diagnostics
-        if: ${{ always() }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: controller-project-build-${{ matrix.arch }}
-          path: .scratch/e2e-diagnostics/*.jsonl
-          if-no-files-found: warn
   host-boundary:
     name: Linux host workload boundary
     runs-on: ubuntu-24.04
@@ -121,7 +85,7 @@ jobs:
       - name: Real candidate adapter confinement (missing prerequisites fail)
         if: ${{ always() }}
         env:
-          ATTUNE_TEST_RUN_ID: candidate-${{ github.run_id }}
+          ATTUNE_TEST_RUN_ID: cand-${{ github.run_id }}
         run: cargo test --locked -p attune-common --lib test_executor::tests::isolated_ -- --include-ignored --nocapture --test-threads=4
 
       - name: Preserve kernel and prerequisite evidence
@@ -144,7 +108,7 @@ jobs:
       - name: Build and verify shell, Python, Node, full and sensor images
         run: python3 scripts/test-workload-runtime-images.py
   docker-controller-boundary:
-    name: Docker controller boundary (${{ matrix.arch }})
+    name: Docker backend boundary (${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
@@ -172,18 +136,18 @@ jobs:
           docker version
           docker info --format '{{json .SecurityOptions}}'
           docker pull "$ATTUNE_TEST_LAUNCH_IMAGE"
-      - name: Run actual controller modules and real Engine test (no skips)
+      - name: Run reusable backend modules and real Engine test (no skips)
         run: |
-          cargo test --locked -p attune-launch-controller --lib -- --nocapture --test-threads=4
-          cargo test --locked -p attune-launch-controller --lib real_engine_full_proc_and_readonly_policy -- --ignored --nocapture --test-threads=4
+          cargo test --locked -p attune-workload-backend --lib -- --nocapture --test-threads=4
+          cargo test --locked -p attune-workload-backend --lib real_engine_full_proc_and_readonly_policy -- --ignored --nocapture --test-threads=4
           cargo test --locked -p attune-common --lib workload_archive::tests:: -- --test-threads=4
       - name: Verify pure planner and actual helper refuses direct-host setup
         run: |
           cargo test --locked -p attune-worker --lib runtime::launch_planning::tests:: -- --test-threads=4
-          cargo build --locked --profile test -p attune-worker --bin attune-workload-runner
+          cargo build --locked --profile test -p attune-workload-backend --bin attune-workload-runner
           python3 scripts/test-workload-runner.py --binary target/debug/attune-workload-runner
   docker-controller-publication:
-    name: Colocated controller and Python publication (${{ matrix.arch }})
+    name: Docker cache and Python publication (${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
@@ -214,10 +178,10 @@ jobs:
           "$RUNNER_TEMP/workload-zig/bin/pip" install ziglang==0.16.0
           echo "$RUNNER_TEMP/workload-zig/bin" >> "$GITHUB_PATH"
           cargo install --locked cargo-zigbuild --version 0.23.4
-      - name: Build actual controller test executable from candidate source
-        run: cargo zigbuild --locked --target ${{ matrix.target }} -p attune-launch-controller --tests --message-format=json > "$RUNNER_TEMP/controller-artifacts.jsonl"
+      - name: Build actual backend test executable from candidate source
+        run: cargo zigbuild --locked --target ${{ matrix.target }} -p attune-workload-backend --tests --message-format=json > "$RUNNER_TEMP/controller-artifacts.jsonl"
       - name: Build actual public helper from same candidate source
-        run: cargo zigbuild --locked --profile test --target ${{ matrix.target }} -p attune-worker --bin attune-workload-runner --message-format=json > "$RUNNER_TEMP/runner-artifacts.jsonl"
+        run: cargo zigbuild --locked --profile test --target ${{ matrix.target }} -p attune-workload-backend --bin attune-workload-runner --message-format=json > "$RUNNER_TEMP/runner-artifacts.jsonl"
       - name: Build actual native HTTP action and owned local-transport tests
         run: cargo zigbuild --locked --profile test --manifest-path crates/core-actions/Cargo.toml --target ${{ matrix.target }} --tests --message-format=json > "$RUNNER_TEMP/native-http-artifacts.jsonl"
       - name: Run owned controller container and actual Engine publication test
@@ -226,7 +190,7 @@ jobs:
           import json, os, subprocess
           from pathlib import Path
           artifacts = [json.loads(line) for line in (Path(os.environ['RUNNER_TEMP']) / 'controller-artifacts.jsonl').read_text().splitlines() if line.startswith('{')]
-          tests = [item['executable'] for item in artifacts if item.get('reason') == 'compiler-artifact' and item['target']['name'] == 'attune_launch_controller' and item['profile'].get('test') and item.get('executable')]
+          tests = [item['executable'] for item in artifacts if item.get('reason') == 'compiler-artifact' and item['target']['name'] == 'attune_workload_backend' and item['profile'].get('test') and item.get('executable')]
           assert len(tests) == 1, 'missing/ambiguous actual controller test executable'
           artifacts = [json.loads(line) for line in (Path(os.environ['RUNNER_TEMP']) / 'runner-artifacts.jsonl').read_text().splitlines() if line.startswith('{')]
           helpers = [item['executable'] for item in artifacts if item.get('reason') == 'compiler-artifact' and item['target']['name'] == 'attune-workload-runner' and not item['profile'].get('test') and item.get('executable')]

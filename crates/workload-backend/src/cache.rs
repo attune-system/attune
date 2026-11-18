@@ -37,18 +37,6 @@ pub enum CacheError {
     LostArtifactStaging,
 }
 pub type Result<T> = std::result::Result<T, CacheError>;
-const ARTIFACT_QUEUE_LIMIT: usize = 256;
-const ARTIFACT_EVIDENCE_LIMIT: u64 = 4 * 1024 * 1024;
-
-/// Historical public removal evidence, never invocation or authority. Fresh CP
-/// receipt authentication is independently required before local deletion.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ArtifactCleanupEvidence {
-    pub manifest: LaunchManifest,
-    pub status: attune_common::workload_launch::LaunchStatus,
-}
-
 #[derive(Clone, Copy)]
 pub struct CacheLimits {
     pub compressed_bytes: u64,
@@ -57,7 +45,8 @@ pub struct CacheLimits {
 }
 
 /// The root is configured once by the operator, never selected by a request.
-/// Production runs this custodian as root; pack processes run as uid 1000.
+/// The trusted manager owns this private root. Workloads receive only selected
+/// subdirectories through read-only mounts, never the root or sibling stages.
 pub struct CacheStore {
     root: PathBuf,
     limits: CacheLimits,
@@ -86,12 +75,10 @@ impl Drop for Lock {
 }
 impl CacheStore {
     pub fn open(root: PathBuf, limits: CacheLimits) -> Result<Self> {
-        // Published inputs must remain custodian-owned, independently of any
-        // workload uid. Only filesystem unit fixtures run under a test owner;
-        // production cannot silently become a same-uid cache custodian.
-        if !cfg!(test) && unsafe { libc::geteuid() } != 0 {
-            return Err(CacheError::UnsafeEntry);
-        }
+        // This is a trusted manager's private cache, not a shared-host UID
+        // boundary. Kubernetes transfer does not require the manager's UID to
+        // equal the guest's UID. Ownership and non-following checks remain
+        // mandatory; Docker stage chown still fails if its owner cannot do it.
         if !root.is_absolute()
             || limits.compressed_bytes == 0
             || limits.expanded_bytes == 0
@@ -107,13 +94,8 @@ impl CacheStore {
         {
             return Err(CacheError::UnsafeEntry);
         }
-        for child in [
-            "inputs",
-            "private",
-            "pending",
-            "manifests",
-            "artifact-cleanup",
-        ] {
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        for child in ["inputs", "private", "pending", "manifests"] {
             let path = root.join(child);
             if !path.exists() {
                 fs::create_dir(&path)?;
@@ -244,12 +226,101 @@ impl CacheStore {
             pin.kind.container_root(),
         )?;
         seal_tree(&output, pin.kind.container_root())?;
+        // Keep the exact authenticated ZIP for native Pod transfer; the payload
+        // receives only the extracted body, never this manager-owned parent.
+        use std::io::{Seek, SeekFrom};
+        body.seek(SeekFrom::Start(0))?;
+        let mut archive = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o400)
+            .open(pending.path().join("input.zip"))?;
+        io::copy(body, &mut archive)?;
+        archive.sync_all()?;
         fs::write(pending.path().join("receipt"), receipt(pin)?)?;
         fs::create_dir_all(parent.parent().ok_or(CacheError::UnsafeEntry)?)?;
         // Global cache lock owns validation through publication. No workload
         // sees this temporary directory or the cache parent.
         fs::rename(pending.path(), parent)?;
         Ok(destination)
+    }
+    /// Exact, bounded, digest-verified ZIP, not a caller-selected host path.
+    pub fn open_input_archive(&self, pin: &PinnedLaunchInput) -> Result<File> {
+        let _lock = self.lock()?;
+        let path = self
+            .root
+            .join(crate::engine::input_subpath(pin.kind, &pin.sha256));
+        let parent = path.parent().ok_or(CacheError::UnsafeEntry)?;
+        if fs::read(parent.join("receipt"))? != receipt(pin)? {
+            return Err(CacheError::PinMismatch);
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(parent.join("input.zip"))?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return Err(CacheError::UnsafeEntry);
+        }
+        verify_body(&mut file, pin)?;
+        Ok(file)
+    }
+    /// Idempotent local directory initialization for one persisted native intent.
+    /// The DB owns create authority; this receipt only detects directory reuse.
+    pub fn prepare_native_private(
+        &self,
+        spec: &attune_common::isolated_process::ProcessSpec,
+    ) -> Result<()> {
+        let digest =
+            crate::process_policy::public_digest(spec).map_err(|_| CacheError::PinMismatch)?;
+        let _lock = self.lock()?;
+        let path = self.root.join(format!("private/{}", spec.intent.simple()));
+        let marker = path.join("native-policy");
+        if path.exists() {
+            if !fs::symlink_metadata(&path)?.is_dir()
+                || fs::read(marker)? != digest.as_str().as_bytes()
+            {
+                return Err(CacheError::AttemptConflict);
+            }
+            return Ok(());
+        }
+        fs::create_dir(&path)?;
+        for name in ["artifacts"]
+            .into_iter()
+            .chain(spec.stage.as_ref().map(|_| "runtime"))
+        {
+            let directory = path.join(name);
+            fs::create_dir(&directory)?;
+            make_workload_owned(&directory, self.workload_owner)?;
+        }
+        if spec.pack_access == attune_common::workload_launch::PackAccess::CandidateCopy {
+            let pin = spec
+                .inputs
+                .iter()
+                .find(|p| p.kind == attune_common::workload_launch::LaunchInputKind::Pack)
+                .ok_or(CacheError::PinMismatch)?;
+            copy_private(
+                &self
+                    .root
+                    .join(crate::engine::input_subpath(pin.kind, &pin.sha256)),
+                &path.join("pack"),
+                self.workload_owner,
+            )?;
+        }
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(marker)?;
+        use io::Write;
+        file.write_all(digest.as_str().as_bytes())?;
+        file.sync_all()?;
+        File::open(&path)?.sync_all()?;
+        File::open(self.root.join("private"))?.sync_all()?;
+        Ok(())
     }
     /// Each nonce is single-use. Restarts must reconcile the existing launch,
     /// not reuse or reset a writable stage. No recursive delete by caller path.
@@ -384,195 +455,6 @@ impl CacheStore {
             return Err(CacheError::PinMismatch);
         }
         Ok(manifest)
-    }
-    /// Fsync public removal evidence BEFORE the first artifact claim, which
-    /// may immediately return a terminal receipt and end CP discovery.
-    pub(crate) fn begin_artifact_cleanup(
-        &self,
-        request: &attune_common::workload_launch::LaunchRequest,
-        status: &attune_common::workload_launch::LaunchStatus,
-    ) -> Result<LaunchManifest> {
-        let _lock = self.lock()?;
-        let manifest = self.read_manifest_locked(request)?;
-        validate_artifact_status(&manifest, status)?;
-        let path = self.artifact_cleanup_path(request);
-        match self.read_artifact_cleanup_locked(request) {
-            Ok(previous) => {
-                if serde_json::to_vec(&previous.manifest).map_err(|_| CacheError::PinMismatch)?
-                    != serde_json::to_vec(&manifest).map_err(|_| CacheError::PinMismatch)?
-                    || previous.status.runtime_state != status.runtime_state
-                    || previous.status.resource != status.resource
-                    || previous.status.exit_outcome != status.exit_outcome
-                    || previous.status.stop_reason != status.stop_reason
-                {
-                    return Err(CacheError::PinMismatch);
-                }
-                return Ok(manifest);
-            }
-            Err(CacheError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        let directory = self.root.join("artifact-cleanup");
-        if fs::read_dir(&directory)?.take(ARTIFACT_QUEUE_LIMIT).count() >= ARTIFACT_QUEUE_LIMIT {
-            return Err(CacheError::Quota);
-        }
-        let evidence = ArtifactCleanupEvidence {
-            manifest: manifest.clone(),
-            status: status.clone(),
-        };
-        let bytes = serde_json::to_vec(&evidence).map_err(|_| CacheError::PinMismatch)?;
-        if bytes.len() as u64 > ARTIFACT_EVIDENCE_LIMIT {
-            return Err(CacheError::Quota);
-        }
-        let mut pending = tempfile::NamedTempFile::new_in(&directory)?;
-        use std::io::Write;
-        pending.write_all(&bytes)?;
-        pending.as_file().sync_all()?;
-        pending
-            .persist_noclobber(path)
-            .map_err(|error| CacheError::Io(error.error))?;
-        File::open(directory)?.sync_all()?;
-        Ok(manifest)
-    }
-    fn artifact_cleanup_path(
-        &self,
-        request: &attune_common::workload_launch::LaunchRequest,
-    ) -> PathBuf {
-        self.root.join("artifact-cleanup").join(format!(
-            "{}-{}.json",
-            request.launch_id,
-            request.admitted_digest.as_str()
-        ))
-    }
-    fn read_artifact_cleanup_locked(
-        &self,
-        request: &attune_common::workload_launch::LaunchRequest,
-    ) -> Result<ArtifactCleanupEvidence> {
-        if request.launch_id <= 0 {
-            return Err(CacheError::PinMismatch);
-        }
-        let mut file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(self.artifact_cleanup_path(request))?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.nlink() != 1
-            || metadata.mode() & 0o077 != 0
-            || metadata.len() > ARTIFACT_EVIDENCE_LIMIT
-        {
-            return Err(CacheError::UnsafeEntry);
-        }
-        let mut bytes = Vec::new();
-        (&mut file)
-            .take(ARTIFACT_EVIDENCE_LIMIT + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > ARTIFACT_EVIDENCE_LIMIT {
-            return Err(CacheError::Quota);
-        }
-        let evidence: ArtifactCleanupEvidence =
-            serde_json::from_slice(&bytes).map_err(|_| CacheError::PinMismatch)?;
-        evidence
-            .manifest
-            .validate_shape()
-            .map_err(|_| CacheError::PinMismatch)?;
-        validate_artifact_status(&evidence.manifest, &evidence.status)?;
-        if &evidence.status.request != request
-            || serde_json::to_vec(&evidence).map_err(|_| CacheError::PinMismatch)? != bytes
-        {
-            return Err(CacheError::PinMismatch);
-        }
-        Ok(evidence)
-    }
-    pub(crate) fn artifact_cleanup_evidence(
-        &self,
-        request: &attune_common::workload_launch::LaunchRequest,
-    ) -> Result<ArtifactCleanupEvidence> {
-        let _lock = self.lock()?;
-        self.read_artifact_cleanup_locked(request)
-    }
-    /// Bounded owned local recovery, including receipt ACKs lost after CP
-    /// discovery ended. Corrupt/unowned evidence fails rather than vanishing.
-    pub fn pending_artifact_cleanups(
-        &self,
-    ) -> Result<Vec<attune_common::workload_launch::LaunchRequest>> {
-        let _lock = self.lock()?;
-        let mut pending = Vec::new();
-        for entry in fs::read_dir(self.root.join("artifact-cleanup"))? {
-            if pending.len() >= ARTIFACT_QUEUE_LIMIT {
-                return Err(CacheError::Quota);
-            }
-            let entry = entry?;
-            let name = entry.file_name();
-            let name = name.to_str().ok_or(CacheError::UnsafeEntry)?;
-            let (id, digest) = name
-                .strip_suffix(".json")
-                .and_then(|name| name.split_once('-'))
-                .ok_or(CacheError::UnsafeEntry)?;
-            let request = attune_common::workload_launch::LaunchRequest {
-                launch_id: id.parse().map_err(|_| CacheError::UnsafeEntry)?,
-                admitted_digest: Sha256Digest::parse(digest)
-                    .map_err(|_| CacheError::UnsafeEntry)?,
-            };
-            if self.artifact_cleanup_path(&request).file_name()
-                != Some(entry.file_name().as_os_str())
-            {
-                return Err(CacheError::UnsafeEntry);
-            }
-            self.read_artifact_cleanup_locked(&request)?;
-            pending.push(request);
-        }
-        pending.sort_by_key(|request| request.launch_id);
-        Ok(pending)
-    }
-    pub(crate) fn finish_artifact_cleanup(
-        &self,
-        request: &attune_common::workload_launch::LaunchRequest,
-        receipt: &attune_common::workload_artifact::ArtifactPublicationReceipt,
-    ) -> Result<()> {
-        let _lock = self.lock()?;
-        let evidence = self.read_artifact_cleanup_locked(request)?;
-        use attune_common::workload_artifact::ArtifactPublicationState;
-        if &receipt.request != request
-            || receipt.publication_id <= 0
-            || receipt.cleanup_receipt_id <= 0
-            || !matches!(
-                receipt.state,
-                ArtifactPublicationState::Complete | ArtifactPublicationState::Incomplete
-            )
-        {
-            return Err(CacheError::PinMismatch);
-        }
-        let nonce = evidence.manifest.engine_name_nonce.simple().to_string();
-        match fs::symlink_metadata(self.root.join("private").join(&nonce)) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-            Ok(_) => return Err(CacheError::ArtifactPending),
-        }
-        let mut persisted = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(self.root.join("artifacts-settled").join(nonce))?;
-        let metadata = persisted.metadata()?;
-        if !metadata.is_file()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.nlink() != 1
-            || metadata.mode() & 0o077 != 0
-            || metadata.len() > 8192
-        {
-            return Err(CacheError::UnsafeEntry);
-        }
-        let mut bytes = Vec::new();
-        (&mut persisted).take(8193).read_to_end(&mut bytes)?;
-        if bytes != serde_json::to_vec(receipt).map_err(|_| CacheError::PinMismatch)? {
-            return Err(CacheError::PinMismatch);
-        }
-        // Caller must first persist authenticated settlement and fsync owned
-        // nonce deletion. This removes only the exact validated queue record.
-        fs::remove_file(self.artifact_cleanup_path(request))?;
-        File::open(self.root.join("artifact-cleanup"))?.sync_all()?;
-        Ok(())
     }
     /// File-backed artifact transport is separate from runtime publication.
     /// The fixed private subpath is not activated by the Engine builder until
@@ -1089,6 +971,72 @@ impl CacheStore {
         Ok(file)
     }
 }
+/// Fixed-container transfer helper only. The adapter has already selected the
+/// exact stopped resource/root. No caller host path reaches this function.
+pub(crate) fn seed_fixed_root(pin: &PinnedLaunchInput, body: &mut File, root: &Path) -> Result<()> {
+    verify_body(body, pin)?;
+    if !fs::symlink_metadata(root)?.is_dir() || fs::read_dir(root)?.next().is_some() {
+        return Err(CacheError::AttemptConflict);
+    }
+    extract_zip(
+        body,
+        root,
+        pin.max_expanded_bytes,
+        pin.max_files,
+        pin.kind.container_root(),
+    )
+}
+pub(crate) fn archive_fixed_root(root: &Path, output: File, limits: CacheLimits) -> Result<File> {
+    let entries = inspect_tree(
+        root,
+        limits.expanded_bytes,
+        limits.files,
+        attune_common::workload_launch::RUNTIME_ROOT,
+    )?;
+    let mut output = BoundedFile {
+        file: output,
+        limit: limits.compressed_bytes,
+    };
+    {
+        let mut zip = ZipWriter::new(&mut output);
+        for entry in entries {
+            let name = entry.relative.to_str().ok_or(CacheError::UnsafeEntry)?;
+            let options = SimpleFileOptions::default()
+                .last_modified_time(zip::DateTime::default())
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(if entry.executable { 0o755 } else { 0o644 });
+            if let Some(target) = entry.link {
+                zip.add_symlink(
+                    name,
+                    target.to_str().ok_or(CacheError::UnsafeEntry)?,
+                    options,
+                )?;
+            } else if entry.directory {
+                zip.add_directory(format!("{name}/"), options)?;
+            } else {
+                zip.start_file(name, options)?;
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(root.join(&entry.relative))?;
+                io::copy(&mut file, &mut zip)?;
+            }
+        }
+        zip.finish()?;
+    }
+    use io::{Seek, SeekFrom};
+    output.file.sync_all()?;
+    output.file.seek(SeekFrom::Start(0))?;
+    let policy = archive_policy(
+        attune_common::workload_launch::RUNTIME_ROOT,
+        limits.compressed_bytes,
+        limits.expanded_bytes,
+        limits.files,
+    )?;
+    attune_common::workload_archive::validate_zip(&mut output.file, &policy)
+        .map_err(|_| CacheError::UnsafeEntry)?;
+    Ok(output.file)
+}
 struct BoundedFile {
     file: File,
     limit: u64,
@@ -1344,31 +1292,6 @@ fn seal_tree(root: &Path, container_root: &str) -> Result<()> {
         }
     }
     fs::set_permissions(root, fs::Permissions::from_mode(0o555))?;
-    Ok(())
-}
-fn validate_artifact_status(
-    manifest: &LaunchManifest,
-    status: &attune_common::workload_launch::LaunchStatus,
-) -> Result<()> {
-    use attune_common::workload_launch::{LaunchPurpose, LaunchState};
-    if !matches!(
-        manifest.purpose,
-        LaunchPurpose::Action | LaunchPurpose::Sensor | LaunchPurpose::CandidateTest
-    ) || status.validate_shape().is_err()
-        || status.state != LaunchState::Stopped
-        || status.request.launch_id != manifest.launch_id
-        || status.request.admitted_digest
-            != manifest
-                .admitted_digest()
-                .map_err(|_| CacheError::PinMismatch)?
-        || status.resource.as_ref().is_some_and(|resource| {
-            resource.engine_id != manifest.engine_id
-                || resource.engine_name_nonce != manifest.engine_name_nonce
-                || resource.admitted_digest != status.request.admitted_digest
-        })
-    {
-        return Err(CacheError::PinMismatch);
-    }
     Ok(())
 }
 fn make_workload_owned(path: &Path, owner: WorkloadOwner) -> Result<()> {

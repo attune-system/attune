@@ -59,6 +59,7 @@ attune/
 │   ├── api/         REST API
 │   ├── executor/    scheduling, workflow orchestration, queue dispatch
 │   ├── worker/      action execution + universal agent binary
+│   ├── workload-backend/ in-process Kubernetes/Docker effects + public Runner
 │   ├── sensor/      managed sensor runtime
 │   ├── notifier/    LISTEN/NOTIFY + WebSocket fanout
 │   ├── supervisor/  retention and corrective maintenance
@@ -107,7 +108,7 @@ attune/
 
 ## Docker / Deployment Reality
 
-- Attune runs primarily via **Docker Compose** (`docker-compose.yaml`).
+- Current local deployment uses **Docker Compose** (`docker-compose.yaml`). Native workload isolation targets Kubernetes as primary and also requires Compose; both remain readiness-gated until all pack executable paths migrate. See `docs/deployment/workload-isolation.md`.
 - Main named volumes:
   - `packs_data` for packs
   - `pack_binaries` for local compiled core inputs, mounted read-only only by bootstrap
@@ -213,6 +214,8 @@ Workflow details live in:
 - `docs/examples/*.yaml`
 
 ## Runtime / Execution Rules
+
+- Trusted worker/sensor loops retain admission, preparation, credentials, custody and completion. Pack-controlled effects use the narrow in-process `common::isolated_process` adapters; no standalone launch-controller or execution-host relay is required. Native adapters are not activated until all existing executable paths and packaged deployments validate; reachable legacy paths remain fail-closed.
 
 - Core ships only native `echo`, `sleep`, `noop`, and `http_request` actions. Native directory entrypoints contain regular executable `linux-amd64`/`linux-arm64` variants selected directly by the worker; see `packs/core/README.md` and `docs/packs/native-core-rollout.md`.
 - Worker runtimes come from DB-backed runtime definitions; native runtimes are represented by empty interpreter config.
