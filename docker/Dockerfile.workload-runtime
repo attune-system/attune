@@ -1,10 +1,24 @@
-# Runtime prerequisites for injected worker and sensor agents. Building this
-# image does not establish kernel/seccomp/procfs compatibility: service startup
-# performs a real sandbox probe and fails closed on incompatible hosts.
-ARG RUNTIME_IMAGE=python:3.12-slim-bookworm
-FROM ${RUNTIME_IMAGE}
+# Tested Debian 12 runtime/package matrix for injected agents. A successful
+# image build is not proof that the host permits nested workload namespaces.
+ARG RUNTIME_IMAGE=python@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df
+ARG NODE_IMAGE=node@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee
+FROM ${NODE_IMAGE} AS node
+FROM ${RUNTIME_IMAGE} AS runtime
+USER 0
 ARG BUBBLEWRAP_PACKAGE_VERSION=0.8.0-2+deb12u1
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN . /etc/os-release && test "$ID" = debian && test "$VERSION_CODENAME" = bookworm \
+    && apt-get update && apt-get install -y --no-install-recommends \
     bubblewrap=${BUBBLEWRAP_PACKAGE_VERSION} ca-certificates curl git util-linux \
     && /usr/bin/bwrap --help | grep -- --disable-userns \
     && rm -rf /var/lib/apt/lists/*
+
+# Full and sensor pools use the same verified Python+Node Bookworm composition,
+# rather than applying Debian 12 package pins to an arbitrary third-party base.
+FROM runtime AS full
+RUN apt-get update && apt-get install -y --no-install-recommends libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+    && python3 --version && node --version && npm --version
