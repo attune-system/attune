@@ -29,6 +29,23 @@ and public `attune-workload-runner`. The former standalone controller service,
 frontend, session store and TLS proxy are retired. Their HTTP protocol is not a
 requirement for the in-process path.
 
+`Config.workload` contains the operator-selected immutable runtime image,
+explicit platform, private cache root, memory/scratch limits and retained-tree
+bounds. Its closed `backend` selects Kubernetes (logical cluster, workload
+namespace and immutable public helper image) or Docker (fixed Unix socket,
+named volume/network, original daemon/platform binding, public helper ZIP pin
+and package path). The backend factory reads only the trusted manager's
+in-cluster Kubernetes identity; it never infers a developer context. Docker
+startup verifies the expected daemon and a positive owned named-volume sentinel
+probe. Its separate public helper image supplies that fixed probe, so a native
+payload image need not contain a shell. No HTTP enrollment, dispatch or session
+credential is configured between these in-process components.
+
+The optional field is migration staging, not permission for activated managers
+to execute locally when configuration is missing. Service constructor/default
+activation and supported package/chart values remain incomplete. No published
+image pin or working default deployment is implied by this config/factory code.
+
 A fixed Runner gate starts before pack code. Separate bounded stdout/stderr
 attach streams are established first. The trusted caller commits the existing
 input one-shot fence, then writes a bounded private invocation header and the

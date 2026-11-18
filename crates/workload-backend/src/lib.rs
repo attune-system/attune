@@ -2,6 +2,7 @@
 //! Admission, retries, origins, encryption, custody and completion stay there.
 //! This library is not a controller service or an HTTP control plane.
 pub mod cache;
+pub mod configuration;
 pub mod engine;
 pub mod kubernetes;
 mod kubernetes_io;

@@ -2041,6 +2041,12 @@ pub struct Config {
     /// Sensor configuration (optional, for sensor services)
     pub sensor: Option<SensorConfig>,
 
+    /// Operator-owned native process boundary. Optional only while callsites
+    /// migrate; an activated worker/sensor must require it, never run locally
+    /// when it is absent. No engine/cluster credential enters a workload.
+    #[serde(default)]
+    pub workload: Option<crate::workload_config::WorkloadConfig>,
+
     /// Packs base directory (where pack directories are located)
     #[serde(default = "default_packs_base_dir")]
     pub packs_base_dir: String,
@@ -2464,6 +2470,9 @@ impl Config {
     /// Validate configuration
     pub fn validate(&self) -> crate::Result<()> {
         self.packs.republish.validate()?;
+        if let Some(workload) = &self.workload {
+            workload.validate()?;
+        }
         self.artifacts.validate_file_memory()?;
         if let Some(worker) = &self.worker {
             crate::child_process_environment::validate_passthrough_env(&worker.passthrough_env)?;
@@ -2960,6 +2969,7 @@ mod tests {
             security: SecurityConfig::default(),
             worker: None,
             sensor: None,
+            workload: None,
             packs_base_dir: default_packs_base_dir(),
             packs: PacksConfig::default(),
             runtime_envs_dir: default_runtime_envs_dir(),
@@ -3514,6 +3524,7 @@ mod tests {
             },
             worker: None,
             sensor: None,
+            workload: None,
             packs_base_dir: default_packs_base_dir(),
             packs: PacksConfig::default(),
             runtime_envs_dir: default_runtime_envs_dir(),
@@ -3577,6 +3588,7 @@ mod tests {
             },
             worker: None,
             sensor: None,
+            workload: None,
             packs_base_dir: default_packs_base_dir(),
             packs: PacksConfig::default(),
             runtime_envs_dir: default_runtime_envs_dir(),

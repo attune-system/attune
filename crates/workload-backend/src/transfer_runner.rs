@@ -6,22 +6,39 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     os::{
         fd::AsRawFd,
-        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::Path,
 };
-const STATE: &str = "/opt/attune/transfer";
+const STATE_VOLUME: &str = "/opt/attune/transfer";
+const STATE: &str = "/opt/attune/transfer/private";
 fn invalid() -> io::Error {
     io::Error::other("invalid fixed workload transfer")
 }
-fn lock() -> io::Result<File> {
-    let meta = fs::symlink_metadata(STATE)?;
+fn prepare_private_state(volume: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(volume)?;
     if !meta.is_dir()
         || !(meta.uid() == unsafe { libc::geteuid() } || (meta.uid() == 0 && meta.gid() == 1000))
-        || meta.mode() & 0o002 != 0
     {
         return Err(invalid());
     }
+    // Kubernetes emptyDir roots are 0777 (and fsGroup may add setgid). The
+    // volume is mounted only in the trusted helper. Put locks, receipts and
+    // archive bodies in an owned private child, never in that volume root.
+    let state = volume.join("private");
+    match fs::DirBuilder::new().mode(0o700).create(&state) {
+        Ok(()) => File::open(volume)?.sync_all()?,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let meta = fs::symlink_metadata(state)?;
+    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o777 != 0o700 {
+        return Err(invalid());
+    }
+    Ok(())
+}
+fn lock() -> io::Result<File> {
+    prepare_private_state(Path::new(STATE_VOLUME))?;
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -227,4 +244,49 @@ pub fn terminate() -> io::Result<()> {
         return Err(invalid());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kubernetes_volume_uses_an_owned_private_child_and_reopens_it() {
+        let volume = tempfile::tempdir().unwrap();
+        fs::set_permissions(volume.path(), fs::Permissions::from_mode(0o2777)).unwrap();
+        prepare_private_state(volume.path()).unwrap();
+        let state = volume.path().join("private");
+        let before = fs::symlink_metadata(&state).unwrap();
+        assert_eq!(before.uid(), unsafe { libc::geteuid() });
+        assert_eq!(before.mode() & 0o777, 0o700);
+        fs::write(state.join("receipt"), b"owned receipt").unwrap();
+        prepare_private_state(volume.path()).unwrap();
+        assert_eq!(fs::read(state.join("receipt")).unwrap(), b"owned receipt");
+        assert_eq!(fs::symlink_metadata(state).unwrap().ino(), before.ino());
+    }
+
+    #[test]
+    fn unsafe_existing_state_is_rejected_without_repair() {
+        let volume = tempfile::tempdir().unwrap();
+        let state = volume.path().join("private");
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(prepare_private_state(volume.path()).is_err());
+        assert_eq!(fs::symlink_metadata(state).unwrap().mode() & 0o777, 0o777);
+    }
+
+    #[test]
+    fn symlink_state_or_volume_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let volume = root.path().join("volume");
+        let other = root.path().join("other");
+        fs::create_dir(&volume).unwrap();
+        fs::create_dir(&other).unwrap();
+        std::os::unix::fs::symlink(&other, volume.join("private")).unwrap();
+        assert!(prepare_private_state(&volume).is_err());
+        let linked_volume = root.path().join("linked-volume");
+        std::os::unix::fs::symlink(&volume, &linked_volume).unwrap();
+        assert!(prepare_private_state(&linked_volume).is_err());
+        assert!(fs::read_dir(other).unwrap().next().is_none());
+    }
 }
