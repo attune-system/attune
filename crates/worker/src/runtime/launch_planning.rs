@@ -92,6 +92,64 @@ impl SetupPlan {
 pub fn runner_program(platform: LaunchPlatform) -> String {
     format!("{RUNNER_ROOT}/linux-{}", platform.native_arch())
 }
+/// Private CP-selected envelope, never a public Runner body or caller plan.
+/// Selection/provenance must already be bound to the admitted immutable image
+/// or native input. This function never probes the CP host filesystem/PATH.
+pub fn cli_exec_argv(
+    platform: LaunchPlatform,
+    selected: &attune_common::action_cli::SelectedProgram,
+    arguments: &[String],
+) -> Result<Vec<String>> {
+    validate_cli_exec(selected, arguments)?;
+    let mut argv = vec![
+        runner_program(platform),
+        "exec".into(),
+        selected.sha256.clone(),
+        selected.path.to_str().ok_or(PlanningError::Path)?.into(),
+        selected.invocation_name.clone(),
+    ];
+    argv.extend_from_slice(arguments);
+    Ok(argv)
+}
+
+pub fn validate_cli_exec(
+    selected: &attune_common::action_cli::SelectedProgram,
+    arguments: &[String],
+) -> Result<()> {
+    let path = selected.path.to_str().ok_or(PlanningError::Path)?;
+    if !selected.path.is_absolute()
+        || selected
+            .path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+        || path.contains('\0')
+        || selected.invocation_name.is_empty()
+        || selected.invocation_name.contains('\0')
+    {
+        return Err(PlanningError::Path);
+    }
+    attune_common::workload_launch::Sha256Digest::parse(&selected.sha256)
+        .map_err(|_| PlanningError::Configuration)?;
+    let limits = attune_common::action_cli::ArgumentLimits::default();
+    let program_bytes = path.len().max(selected.invocation_name.len());
+    if arguments.len() > limits.max_arguments || program_bytes > limits.max_argument_bytes {
+        return Err(PlanningError::Bounds);
+    }
+    let mut total = program_bytes.checked_add(1).ok_or(PlanningError::Bounds)?;
+    for argument in arguments {
+        if argument.contains('\0') || argument.len() > limits.max_argument_bytes {
+            return Err(PlanningError::Bounds);
+        }
+        total = total
+            .checked_add(argument.len())
+            .and_then(|sum| sum.checked_add(1))
+            .ok_or(PlanningError::Bounds)?;
+    }
+    if total > limits.max_total_bytes {
+        return Err(PlanningError::Bounds);
+    }
+    Ok(())
+}
 pub fn needs_runtime(config: &RuntimeExecutionConfig) -> bool {
     config
         .environment
@@ -443,5 +501,59 @@ mod tests {
             action_environment(&python(), &selected, entry, true).unwrap()["PYTHONPATH"],
             "selected-override"
         );
+    }
+    #[test]
+    fn private_cli_envelope_preserves_named_image_program_and_literal_arguments_without_host_lookup(
+    ) {
+        let selected = attune_common::action_cli::SelectedProgram {
+            path: "/opt/owned-image-only/program-not-on-cp-host".into(),
+            sha256: "a".repeat(64),
+            invocation_name: "static-multicall-name".into(),
+            artifact: None,
+            variant: None,
+        };
+        let arguments = vec![
+            "".into(),
+            "spaces and quotes '\"; $(false)".into(),
+            "--".into(),
+        ];
+        let argv = cli_exec_argv(LaunchPlatform::LinuxArm64, &selected, &arguments).unwrap();
+        assert_eq!(
+            &argv[..5],
+            &[
+                "/opt/attune/runner/linux-arm64",
+                "exec",
+                &"a".repeat(64),
+                "/opt/owned-image-only/program-not-on-cp-host",
+                "static-multicall-name"
+            ]
+        );
+        assert_eq!(&argv[5..], &arguments);
+    }
+
+    #[test]
+    fn private_cli_envelope_rejects_unbound_program_shape_and_shared_argument_budget_overflow() {
+        let mut selected = attune_common::action_cli::SelectedProgram {
+            path: "/usr/bin/owned-tool".into(),
+            sha256: "a".repeat(64),
+            invocation_name: "tool".into(),
+            artifact: None,
+            variant: None,
+        };
+        selected.sha256 = "A".repeat(64);
+        assert!(cli_exec_argv(LaunchPlatform::LinuxAmd64, &selected, &[]).is_err());
+        selected.sha256 = "a".repeat(64);
+        selected.path = "relative/tool".into();
+        assert!(cli_exec_argv(LaunchPlatform::LinuxAmd64, &selected, &[]).is_err());
+        selected.path = "/usr/bin/owned-tool".into();
+        assert!(cli_exec_argv(LaunchPlatform::LinuxAmd64, &selected, &["\0".into()]).is_err());
+        assert!(cli_exec_argv(
+            LaunchPlatform::LinuxAmd64,
+            &selected,
+            &vec!["x".repeat(16384); 4]
+        )
+        .is_err());
+        selected.invocation_name.clear();
+        assert!(cli_exec_argv(LaunchPlatform::LinuxAmd64, &selected, &[]).is_err());
     }
 }

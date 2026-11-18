@@ -1,7 +1,11 @@
 //! Public helper bytes only. Private rendered plan arrives once on stdin inside
 //! a CP-admitted OCI container; this binary is not a host isolation backend.
 use attune_common::child_process_environment::ChildProcessEnvironment;
-use attune_common::workload_launch::{PACK_ROOT, RUNNER_ROOT, RUNTIME_ROOT};
+use attune_common::workload_launch::PACK_ROOT;
+#[cfg(target_os = "linux")]
+use attune_common::workload_launch::{RUNNER_ROOT, RUNTIME_ROOT};
+#[cfg(unix)]
+use attune_worker::runtime::launch_planning::validate_cli_exec;
 use attune_worker::runtime::launch_planning::{SetupPlan, SETUP_STDIN_LIMIT};
 use std::{
     io::Read,
@@ -13,18 +17,23 @@ fn main() {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     if arguments.len() == 1 && (arguments[0] == "--help" || arguments[0] == "-h") {
         println!(
-            "attune-workload-runner setup: private stdin plan in an admitted OCI Setup container"
+            "attune-workload-runner setup|exec: private selected plan in an admitted OCI boundary"
         );
         return;
     }
-    if arguments.len() != 1 || arguments[0] != "setup" || setup().is_err() {
+    let result = match arguments.first().and_then(|value| value.to_str()) {
+        Some("setup") if arguments.len() == 1 => setup(),
+        Some("exec") => execute(&arguments[1..]),
+        _ => Err(invalid()),
+    };
+    if result.is_err() {
         // Never log argv/environment/stdin or the selected program's error.
-        eprintln!("workload setup failed or requires an admitted OCI Setup boundary");
+        eprintln!("workload helper failed or requires an admitted OCI boundary");
         std::process::exit(1);
     }
 }
 fn setup() -> std::io::Result<()> {
-    boundary_guard()?;
+    boundary_guard(false)?;
     let mut input = Vec::new();
     std::io::stdin()
         .take(SETUP_STDIN_LIMIT as u64 + 1)
@@ -64,16 +73,54 @@ fn setup() -> std::io::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(unix)]
+fn execute(arguments: &[std::ffi::OsString]) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    boundary_guard(true)?;
+    if arguments.len() < 3 {
+        return Err(invalid());
+    }
+    let selected = attune_common::action_cli::SelectedProgram {
+        sha256: arguments[0].to_str().ok_or_else(invalid)?.into(),
+        path: arguments[1].clone().into(),
+        invocation_name: arguments[2].to_str().ok_or_else(invalid)?.into(),
+        artifact: None,
+        variant: None,
+    };
+    let argv = arguments[3..]
+        .iter()
+        .map(|argument| argument.to_str().map(str::to_owned).ok_or_else(invalid))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    validate_cli_exec(&selected, &argv).map_err(|_| invalid())?;
+    readonly_path(&selected.path, true)?;
+    attune_common::action_cli::verify_selected_program(&selected).map_err(|_| invalid())?;
+    let mut command = Command::new(&selected.path);
+    // The only inherited environment is the controller's cleared, explicitly
+    // selected Engine context. Do not capture a manager/default configuration.
+    command
+        .env_clear()
+        .envs(std::env::vars_os())
+        .arg0(&selected.invocation_name)
+        .args(&argv)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    Err(command.exec()) // Replaces the helper; selected stdin is never consumed.
+}
+#[cfg(not(unix))]
+fn execute(_: &[std::ffi::OsString]) -> std::io::Result<()> {
+    Err(invalid())
+}
 fn invalid() -> std::io::Error {
-    std::io::Error::other("invalid workload setup boundary or private plan")
+    std::io::Error::other("invalid workload boundary or private invocation")
 }
 
 /// Fail closed on obvious direct-host/mispackaging use. These checks are not an
 /// attestation of isolation: CP/controller immutable policy and real Engine
 /// boundary tests establish that contract, not a pack-selected environment flag.
 #[cfg(target_os = "linux")]
-fn boundary_guard() -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
+fn boundary_guard(execution: bool) -> std::io::Result<()> {
     if unsafe { libc::geteuid() } != 1000 || unsafe { libc::getegid() } != 1000 {
         return Err(invalid());
     }
@@ -89,29 +136,43 @@ fn boundary_guard() -> std::io::Result<()> {
     {
         return Err(invalid());
     }
-    for (path, readonly) in [
-        ("/", true),
-        (PACK_ROOT, true),
-        (RUNNER_ROOT, true),
-        (RUNTIME_ROOT, false),
-    ] {
+    for (path, readonly) in [("/", true), (PACK_ROOT, true), (RUNNER_ROOT, true)] {
         if !Path::new(path).is_dir() {
             return Err(invalid());
         }
-        let path = std::ffi::CString::new(Path::new(path).as_os_str().as_bytes())
-            .map_err(|_| invalid())?;
-        let mut info = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-        if unsafe { libc::statvfs(path.as_ptr(), info.as_mut_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let info = unsafe { info.assume_init() };
-        if (info.f_flag & libc::ST_RDONLY != 0) != readonly {
+        readonly_path(Path::new(path), readonly)?;
+    }
+    if !execution || Path::new(RUNTIME_ROOT).exists() {
+        if !Path::new(RUNTIME_ROOT).is_dir() {
             return Err(invalid());
         }
+        readonly_path(Path::new(RUNTIME_ROOT), execution)?;
+    }
+    if execution && std::env::current_dir()? != Path::new(PACK_ROOT).canonicalize()? {
+        return Err(invalid());
     }
     Ok(())
 }
 #[cfg(not(target_os = "linux"))]
-fn boundary_guard() -> std::io::Result<()> {
+fn boundary_guard(_: bool) -> std::io::Result<()> {
+    Err(invalid())
+}
+
+#[cfg(target_os = "linux")]
+fn readonly_path(path: &Path, readonly: bool) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| invalid())?;
+    let mut info = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(path.as_ptr(), info.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let info = unsafe { info.assume_init() };
+    if (info.f_flag & libc::ST_RDONLY != 0) != readonly {
+        return Err(invalid());
+    }
+    Ok(())
+}
+#[cfg(all(unix, not(target_os = "linux")))]
+fn readonly_path(_: &Path, _: bool) -> std::io::Result<()> {
     Err(invalid())
 }

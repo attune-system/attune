@@ -3,6 +3,9 @@ on:
   pull_request:
     paths:
       - 'crates/common/src/workload_sandbox.rs'
+      - 'crates/common/src/child_process_environment.rs'
+      - 'crates/common/src/action_cli/**'
+      - 'crates/common/src/workload_stdin.rs'
       - 'crates/common/src/workload_archive.rs'
       - 'crates/common/src/workload_launch.rs'
       - 'crates/common/src/workload_launch_io.rs'
@@ -96,6 +99,7 @@ jobs:
           sudo apt-get install -y bubblewrap gcc strace apparmor-utils
           bwrap --version
           bwrap --help | grep -- --disable-userns
+          bwrap --help | grep -- --argv0
           uname -a
       - name: Diagnose and load only the distro Bubblewrap userns policy
         run: bash scripts/ci-workload-isolation-prerequisites.sh

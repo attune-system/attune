@@ -471,7 +471,7 @@ async fn publication_fixture(
     };
     helper_zip.seek(SeekFrom::Start(0)).unwrap();
     cache.install_input(&helper_pin, &mut helper_zip).unwrap();
-    setup.manifest.inputs.push(helper_pin);
+    setup.manifest.inputs.push(helper_pin.clone());
     setup.manifest.timeout_ms = Some(90_000);
     setup.invocation = LaunchInvocation {
         argv: vec![format!("/opt/attune/runner/{helper_name}"), "setup".into()],
@@ -550,6 +550,66 @@ async fn publication_fixture(
     assert_eq!(exit.exit_code, 0);
     assert_eq!(out, b"python-thread-ok\n");
     assert!(err.is_empty());
+
+    // Selected image-program bytes are measured in this same immutable image,
+    // never using controller/CP host PATH or architecture. This fixture is not
+    // the still-required authoritative CP probe/inventory producer.
+    let mut image_probe = spec(image.clone());
+    image_probe.manifest.purpose = LaunchPurpose::RuntimeProbe;
+    image_probe.manifest.target = LaunchTarget::RuntimeProbe {
+        admission: 12,
+        attempt: uuid::Uuid::new_v4(),
+    };
+    image_probe.invocation.argv = vec![
+        "/usr/bin/sha256sum".into(),
+        "/usr/bin/dash".into(),
+        "/usr/bin/printf".into(),
+    ];
+    let (exit, _, hashes, err) = run_captured(engine, policy, &image_probe, &[]).await?;
+    assert_eq!(exit.exit_code, 0);
+    assert!(err.is_empty());
+    let hashes = String::from_utf8(hashes).unwrap();
+    let selected_hashes: Vec<_> = hashes
+        .lines()
+        .map(|line| Sha256Digest::parse(line.split_whitespace().next().unwrap()).unwrap())
+        .collect();
+    assert_eq!(selected_hashes.len(), 2);
+    let mut named = spec(image.clone());
+    named.manifest.inputs = vec![pack_pin.clone(), helper_pin];
+    named.invocation = LaunchInvocation {
+        argv: vec![format!("/opt/attune/runner/{helper_name}"), "exec".into(), selected_hashes[0].as_str().into(),
+            "/usr/bin/dash".into(), "owned-static-name".into(), "-c".into(),
+            "printf '%s|' \"$0\"; IFS= read -r input; printf '%s' \"$input\"; test \"$SELECTED_ONLY\" = owned-env".into()],
+        env: BTreeMap::from([("SELECTED_ONLY".into(), "owned-env".into())]), working_root: LaunchRoot::Pack,
+    };
+    let (exit, _, out, err) =
+        run_captured(engine, policy, &named, b"{\"selected\":\"owned input\"}\n").await?;
+    assert_eq!(exit.exit_code, 0);
+    assert_eq!(out, b"owned-static-name|{\"selected\":\"owned input\"}");
+    assert!(err.is_empty());
+    let mut literal = named.clone();
+    literal.manifest.engine_name_nonce = uuid::Uuid::new_v4();
+    literal.invocation.argv = vec![
+        format!("/opt/attune/runner/{helper_name}"),
+        "exec".into(),
+        selected_hashes[1].as_str().into(),
+        "/usr/bin/printf".into(),
+        "printf".into(),
+        "%s|%s".into(),
+        "value with spaces".into(),
+        "literal '\"; $(false)".into(),
+    ];
+    let (exit, _, out, err) = run_captured(engine, policy, &literal, &[]).await?;
+    assert_eq!(exit.exit_code, 0);
+    assert_eq!(out, b"value with spaces|literal '\"; $(false)");
+    assert!(err.is_empty());
+    let mut mismatched = named.clone();
+    mismatched.manifest.engine_name_nonce = uuid::Uuid::new_v4();
+    mismatched.invocation.argv[2] = "0".repeat(64);
+    let (exit, _, out, err) = run_captured(engine, policy, &mismatched, &[]).await?;
+    assert_eq!(exit.exit_code, 1);
+    assert!(out.is_empty());
+    assert!(String::from_utf8_lossy(&err).contains("workload helper failed"));
 
     let mut native = spec(image);
     native.manifest.inputs = vec![pack_pin];

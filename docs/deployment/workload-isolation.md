@@ -86,13 +86,18 @@ and allowance invariants with `python3 scripts/test-workload-seccomp.py`.
 It deliberately grants neither network/cgroup namespace creation nor arbitrary
 `setns`. It is not enabled automatically in Compose.
 
-The exact Debian `bubblewrap 0.8.0-2+deb12u1` package supports the required flags:
-its owned host trace completed procfs/mount setup and enforced
-`--disable-userns` (a further user namespace creation returned `ENOSPC`).
-That host result does not establish compatibility with a container's parent
-proc restrictions. `Dockerfile.workload-runtime` builds the injected runtime
-prerequisites instead of relying on startup package installation in stock
-images. Startup continues to reject incompatible container policy.
+The earlier exact Debian `bubblewrap 0.8.0-2+deb12u1` host trace completed
+procfs/mount setup and enforced `--disable-userns` (a further user namespace
+creation returned `ENOSPC`). It does **not** support `--argv0`, required by the
+current declared CLI invocation contract. The host boundary now requires both
+`--disable-userns` and `--argv0` (upstream Bubblewrap 0.9.0 or newer), and startup
+probes the actual named launch. The pinned 0.8.0 runtime images are therefore
+insufficient for that contract, in addition to the parent-proc incompatibility.
+`Dockerfile.workload-runtime` remains a reproducible diagnostic legacy image
+build, not evidence of supported isolated deployment. The candidate Docker
+Engine backend supplies ordinary private procfs and executes the immutable
+Runner directly; it does not depend on nested Bubblewrap in workload images.
+Startup continues to reject incompatible policy without an unisolated fallback.
 
 For background, see [Docker seccomp](https://docs.docker.com/engine/security/seccomp/),
 [Linux procfs](https://docs.kernel.org/filesystems/proc.html), and
@@ -199,6 +204,23 @@ read-only Pack/Runner roots and the writable stable Runtime stage are required;
 direct-host use fails before executing a plan. This guard is a packaging check,
 not an independent attestation of OCI policy. The actual packaged Python/pip
 console-script and internal-link fixture must pass on each supported architecture.
+
+The helper's `exec` mode preserves declared CLI semantics through the private
+envelope `[runner(platform), exec, expected_sha256, canonical_program,
+static_invocation_name, ...application_args]`. It verifies the regular executable,
+canonical path, read-only filesystem and admitted byte hash immediately before
+`exec`, preserves the static name as OS argv0, and forwards selected stdin without
+reading it. Argument limits match the shared CLI materializer; no shell or PATH
+selection occurs in this adapter. The Runner pin contains helper bytes only;
+argv, environment and stdin stay in the encrypted frozen context. The CP producer
+must bind the selected executable to the admitted immutable image/platform or
+pinned native input and selected Pack working root. Installed-command selection
+still requires an authoritative image probe/inventory producer; the CP must not
+substitute its own host filesystem, PATH or architecture. The owned packaged
+fixture measures image executable bytes in that same image and tests argv0,
+literal arguments, unchanged stdin and hash mismatch rejection. It is not the
+missing CP producer, and its real-container results remain required on both
+architectures before support can be claimed.
 
 File artifacts are a separate unfinished integration boundary. The canonical
 `workload_artifact` protocol seals CP-selected file-version paths when Run closes,

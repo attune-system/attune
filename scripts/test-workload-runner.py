@@ -26,6 +26,7 @@ def main():
             (["--help"], b"", True),
             (["unsupported"], b"", False),
             (["setup"], json.dumps(plan).encode(), False),
+            (["exec", "a" * 64, "/usr/bin/touch", "touch", str(sentinel)], b"", False),
         ]:
             result = subprocess.run([str(binary), *arguments], input=body, env=environment,
                                     cwd=root, capture_output=True, timeout=10, check=False)

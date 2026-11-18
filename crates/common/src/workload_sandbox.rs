@@ -24,7 +24,11 @@ impl WorkloadSandbox {
                         "bubblewrap workloads require Linux and API artifact transport",
                     ));
                 }
-                let mut probe = Self::Bubblewrap.wrap(Command::new("/bin/true"), &[])?;
+                let mut probe = Self::Bubblewrap.wrap_with_invocation_name(
+                    Command::new("/bin/true"),
+                    &[],
+                    Some("true".as_ref()),
+                )?;
                 let result = probe.output().map_err(|error| {
                     io::Error::other(format!(
                         "isolated workloads require usable /usr/bin/bwrap: {error}"
@@ -537,6 +541,40 @@ ln -s '{destination}/bin/console' '{destination}/absolute-link'
         assert_eq!(
             &args[args.len() - 3..],
             &["/usr/bin/printf", "%s", "a b; $(false)"]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux Bubblewrap with --argv0 and unprivileged namespaces"]
+    fn bubblewrap_named_execution_preserves_static_argv0_and_selected_stdin() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "IFS= read -r input; printf '%s|%s' \"$0\" \"$input\""])
+            .env_clear();
+        let mut isolated = WorkloadSandbox::Bubblewrap
+            .wrap_with_invocation_name(command, &[], Some("owned-static-name".as_ref()))
+            .unwrap();
+        isolated
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = isolated.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"{\"selected\":\"owned input\"}\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "named Bubblewrap launch failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.stdout,
+            b"owned-static-name|{\"selected\":\"owned input\"}"
         );
     }
 
