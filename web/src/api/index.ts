@@ -90,7 +90,6 @@ export type { ArtifactVersionByRefUploadForm } from "./models/ArtifactVersionByR
 export type { ArtifactVersionSummary } from "./models/ArtifactVersionSummary";
 export type { ArtifactVersionUploadForm } from "./models/ArtifactVersionUploadForm";
 export { ArtifactVisibility } from "./models/ArtifactVisibility";
-export type { AssignedAction } from "./models/AssignedAction";
 export { AuditCategory } from "./models/AuditCategory";
 export type { AuditEventResponse } from "./models/AuditEventResponse";
 export type { AuditEventSummary } from "./models/AuditEventSummary";
@@ -313,8 +312,6 @@ export { ManagementOriginKind } from "./models/ManagementOriginKind";
 export { MissingPolicy } from "./models/MissingPolicy";
 export type { NativeMaintenanceConfig } from "./models/NativeMaintenanceConfig";
 export type { NativeMaintenanceStatus } from "./models/NativeMaintenanceStatus";
-export type { NextActionRequest } from "./models/NextActionRequest";
-export type { NextActionResponse } from "./models/NextActionResponse";
 export type { NodeJsEnvironment } from "./models/NodeJsEnvironment";
 export type { NodeJsRequirements } from "./models/NodeJsRequirements";
 export type { NullableJsonPatch } from "./models/NullableJsonPatch";

@@ -2140,122 +2140,14 @@ async fn private_stdin_expiry_after_grant_wait_cannot_consume_or_ack() -> Result
     exchange
 }
 
-#[tokio::test]
-async fn host_assignment_is_private_target_bound_and_fenced_by_registration_handover() -> Result<()>
-{
-    use attune_common::{
-        repositories::workload_host::WorkloadHostRepository,
-        workload_host::{self, NextActionRequest, NextActionResponse, RegisterWorkloadHost},
-    };
-    let mut fixture = Fixture::new().await?;
-    let host = fixture.enroll_manager().await?;
-    let reserved = fixture.selected_reserve(json!({"value":"one"})).await?;
-    let route = "/api/v1/workload-hosts/actions/next";
-    let request = NextActionRequest::default();
-    for credential in [fixture.ctx.token().unwrap(), fixture.credential.as_str()] {
-        fixture
-            .ctx
-            .post(route, &request, Some(credential))
-            .await?
-            .assert_status(StatusCode::FORBIDDEN);
-    }
-    let claims = validate_token(host.session.token.as_str(), &fixture.ctx.state.jwt_config)?;
-    let actor = workload_host::host_actor(&claims)?;
-    for changed in [
-        workload_host::HostActor {
-            worker: actor.worker + 1,
-            ..actor
-        },
-        workload_host::HostActor {
-            instance: Uuid::new_v4(),
-            ..actor
-        },
-        workload_host::HostActor {
-            registration_generation: actor.registration_generation + 1,
-            ..actor
-        },
+#[test]
+fn superseded_execution_host_assignment_routes_are_absent_from_the_contract() {
+    use utoipa::OpenApi;
+    let document = attune_api::openapi::ApiDoc::openapi();
+    for path in [
+        "/api/v1/workload-hosts/actions/next",
+        "/api/v1/workload-hosts/actions/io-grants",
     ] {
-        let token = workload_host::mint_host(changed, &fixture.ctx.state.jwt_config)?;
-        fixture
-            .ctx
-            .post(route, &request, Some(token.as_str()))
-            .await?
-            .assert_status(StatusCode::FORBIDDEN);
+        assert!(!document.paths.paths.contains_key(path));
     }
-    let response = fixture
-        .ctx
-        .post(route, &request, Some(host.session.token.as_str()))
-        .await?
-        .assert_status(StatusCode::OK)
-        .json::<Value>()
-        .await?;
-    assert!(
-        !response.to_string().contains("owned-private-context"),
-        "host never receives private invocation/environment"
-    );
-    let NextActionResponse::Assigned { assignment } = serde_json::from_value(response)? else {
-        return Err("assignment missing".into());
-    };
-    assert_eq!(assignment.launch.request, reserved.request);
-    assert_eq!(assignment.stdin_json, r#"{"value":"one"}"#);
-    assert_eq!(
-        assignment.execution,
-        match fixture.spec.manifest.target {
-            LaunchTarget::Execution { execution, .. } => execution,
-            _ => unreachable!(),
-        }
-    );
-    let grant_request = LaunchIoGrantRequest {
-        request: reserved.request.clone(),
-        channel: LaunchIoChannel::Stdin,
-    };
-    let grant: LaunchIoGrant = fixture
-        .ctx
-        .post(
-            "/api/v1/workload-hosts/actions/io-grants",
-            &grant_request,
-            Some(host.session.token.as_str()),
-        )
-        .await?
-        .assert_status(StatusCode::OK)
-        .json()
-        .await?;
-    assert_eq!(grant.request, reserved.request);
-    let replacement = WorkloadHostRepository::register(
-        &fixture.ctx.pool,
-        workload_host::EnrollmentActor {
-            identity: actor.identity,
-            enrollment: actor.enrollment,
-            profile: actor.profile,
-            generation: actor.generation,
-            expires_at: chrono::Utc::now().timestamp() + 1800,
-        },
-        &RegisterWorkloadHost {
-            instance: Uuid::new_v4(),
-            custody_instance: Uuid::new_v4(),
-        },
-        &fixture.ctx.state.jwt_config,
-    )
-    .await?;
-    for token in [
-        host.session.token.as_str(),
-        replacement.session.token.as_str(),
-    ] {
-        fixture
-            .ctx
-            .post(
-                "/api/v1/workload-hosts/actions/io-grants",
-                &grant_request,
-                Some(token),
-            )
-            .await?
-            .assert_status(StatusCode::FORBIDDEN);
-    }
-    fixture
-        .ctx
-        .post(route, &request, Some(host.session.token.as_str()))
-        .await?
-        .assert_status(StatusCode::FORBIDDEN);
-    fixture.ctx.cleanup().await?;
-    Ok(())
 }
