@@ -2183,9 +2183,14 @@ impl ActionExecutor {
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone())),
         );
-        spec.invocation.env =
-            crate::runtime::launch_planning::action_environment(config, &environment, &file, false)
-                .map_err(|_| unavailable())?;
+        spec.invocation.env = crate::runtime::launch_planning::action_environment(
+            config,
+            &environment,
+            &file,
+            false,
+            spec.pack_access,
+        )
+        .map_err(|_| unavailable())?;
         spec.invocation.working_root = LaunchRoot::Pack;
         spec.timeout_ms = context
             .timeout
