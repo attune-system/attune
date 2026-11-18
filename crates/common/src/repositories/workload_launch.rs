@@ -178,13 +178,12 @@ impl WorkloadLaunchRepository {
     async fn save(tx: &mut Transaction<'_, Postgres>, record: &Record) -> Result<()> {
         record.operation.status.validate_shape()?;
         let now = Self::now(tx).await?;
-        if !record.operation.cleanup_only() || record.operation.publication_pending() {
-            if record
+        if (!record.operation.cleanup_only() || record.operation.publication_pending())
+            && record
                 .effect_deadline
                 .is_some_and(|deadline| deadline <= now)
-            {
-                return Err(denied());
-            }
+        {
+            return Err(denied());
         }
         sqlx::query(
             "UPDATE workload_launch SET operation=$2,lease_hash=$3,controller=$4 WHERE id=$1",
@@ -1356,16 +1355,15 @@ impl WorkloadLaunchRepository {
         {
             return Err(denied());
         }
-        if request.channel != LaunchIoChannel::Stdin {
-            if !record.operation.capture_pending()
+        if request.channel != LaunchIoChannel::Stdin
+            && (!record.operation.capture_pending()
                 || record
                     .operation
                     .status
                     .capture_deadline
-                    .is_some_and(|deadline| deadline <= now)
-            {
-                return Err(denied());
-            }
+                    .is_some_and(|deadline| deadline <= now))
+        {
+            return Err(denied());
         }
         if request.channel == LaunchIoChannel::Stdin {
             if request.offset != 0
