@@ -98,12 +98,24 @@ pub trait ProcessControl: Send + Sync {
     async fn stop(&self, reason: LaunchStopReason) -> Result<LaunchExitOutcome>;
 }
 
+/// Durable native-effect decision committed before a provider request. A
+/// resource lookup returning 404 never changes ReconcileOnly back to CreateOnce.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessCreateDisposition {
+    CreateOnce,
+    ReconcileOnly,
+}
+
 #[async_trait]
 pub trait ProcessLauncher: Send + Sync {
     /// Create/recover only the recorded intent, with pack execution held at a
     /// credential-free fixed gate. Unknown create settlement is reconciled;
     /// absence after a timed-out create is not authority for a duplicate.
-    async fn prepare(&self, spec: &ProcessSpec) -> Result<ResourceIdentity>;
+    async fn prepare(
+        &self,
+        spec: &ProcessSpec,
+        create: ProcessCreateDisposition,
+    ) -> Result<ResourceIdentity>;
 
     /// Caller has durably recorded this exact resource. Attach separate streams
     /// before returning; this MUST NOT release pack execution. An already-exited
