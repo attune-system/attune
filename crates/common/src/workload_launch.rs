@@ -18,6 +18,11 @@ use crate::{Error, Result};
 
 pub const LAUNCH_DISPATCH_HEADER: &str = "x-attune-launch-dispatch";
 pub const LAUNCH_LEASE_HEADER: &str = "x-attune-launch-lease";
+pub const LAUNCH_IO_HEADER: &str = "x-attune-launch-io";
+pub const LAUNCH_ARCHIVE_CONTENT_TYPE: &str = "application/zip";
+pub const LAUNCH_IO_NEXT_OFFSET_HEADER: &str = "x-attune-launch-next-offset";
+pub const LAUNCH_IO_EOF_HEADER: &str = "x-attune-launch-eof";
+pub const LAUNCH_IO_TRUNCATED_HEADER: &str = "x-attune-launch-truncated-bytes";
 pub const PACK_ROOT: &str = "/opt/attune/pack";
 pub const RUNTIME_ROOT: &str = "/opt/attune/runtime";
 pub const RUNNER_ROOT: &str = "/opt/attune/runner";
@@ -467,7 +472,7 @@ pub struct LaunchHandle {
     pub engine_name_nonce: Uuid,
 }
 
-#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, ToSchema)]
 #[serde(transparent)]
 #[schema(value_type = String)]
 pub struct LaunchToken(String);
@@ -483,6 +488,11 @@ impl LaunchToken {
     }
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+impl<'de> Deserialize<'de> for LaunchToken {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
     }
 }
 impl fmt::Debug for LaunchToken {
@@ -630,14 +640,100 @@ pub struct StopLaunchAcknowledgement {
     pub create: ProviderCreateSettlement,
     pub stopped_resource: Option<EngineResourceEvidence>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchExitOutcome {
+    pub exit_code: i32,
+    pub oom_killed: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchStatus {
     pub request: LaunchRequest,
     pub state: LaunchState,
     pub runtime_state: LaunchRuntimeState,
+    pub exit_outcome: Option<LaunchExitOutcome>,
     pub resource: Option<EngineResourceEvidence>,
     pub stop_reason: Option<LaunchStopReason>,
+}
+
+impl LaunchStatus {
+    pub fn validate_shape(&self) -> Result<()> {
+        if self.request.launch_id <= 0
+            || (self.runtime_state == LaunchRuntimeState::Exited) != self.exit_outcome.is_some()
+            || (self.runtime_state == LaunchRuntimeState::Exited && self.resource.is_none())
+            || self
+                .resource
+                .as_ref()
+                .is_some_and(|resource| resource.admitted_digest != self.request.admitted_digest)
+        {
+            return Err(Error::validation("Invalid launch status"));
+        }
+        Ok(())
+    }
+}
+
+/// Raw stdin/stdout/stderr are distinct from encoded/published log artifacts.
+/// These credentials stay in non-pack managers/custodians, not invocation envs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchIoChannel {
+    Stdin,
+    Stdout,
+    Stderr,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchIoGrantRequest {
+    pub request: LaunchRequest,
+    pub channel: LaunchIoChannel,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchIoGrant {
+    pub request: LaunchRequest,
+    pub channel: LaunchIoChannel,
+    pub token: LaunchToken,
+    pub max_bytes: u64,
+    pub expires_at: DateTime<Utc>,
+}
+/// Controller authenticates with its CP credential and current lease, forwarding
+/// the manager's exact channel credential in LAUNCH_IO_HEADER before byte effects.
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizeLaunchIoRequest {
+    pub request: LaunchRequest,
+    pub channel: LaunchIoChannel,
+    pub offset: u64,
+    pub bytes: u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchIoAuthorization {
+    pub handle: LaunchHandle,
+    pub channel: LaunchIoChannel,
+    pub max_bytes: u64,
+    pub expires_at: DateTime<Utc>,
+}
+/// A finite raw-byte read permits credential refresh between reads for sensors.
+/// Tokens are headers, never query parameters. Missing bytes are capture failure.
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchIoReadQuery {
+    pub admitted_digest: Sha256Digest,
+    pub offset: u64,
+    pub max_bytes: u32,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchStageResult {
+    pub output_id: i64,
+    pub object_id: i64,
+    pub object_version: String,
+    pub size_bytes: u64,
+    pub sha256: Sha256Digest,
+    pub validation_receipt: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -688,6 +784,15 @@ mod tests {
             LaunchToken::new("owned-secret-token".into()).unwrap()
         )
         .contains("owned-secret"));
+    }
+    #[test]
+    fn credential_deserialization_cannot_bypass_validation() {
+        for value in ["", "with space", "with\ncontrol"] {
+            assert!(serde_json::from_value::<LaunchToken>(serde_json::json!(value)).is_err());
+        }
+        assert!(
+            serde_json::from_value::<LaunchToken>(serde_json::json!("a".repeat(16385))).is_err()
+        );
     }
     fn manifest() -> LaunchManifest {
         let hash = Sha256Digest::of_bytes(b"owned-public-fixture");
