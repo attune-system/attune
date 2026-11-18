@@ -444,6 +444,12 @@ if [[ "$DO_STARTUP" == true ]]; then
     log_success "${service} healthy (${elapsed}s)"
   done
 
+  # Exercise actual packaged client construction against the public build-info
+  # endpoint. Offline --info --local does not load system trust roots. Reuse the
+  # freshly built init-agent image; no extra build, credentials or API mutation.
+  python3 "$PROJECT_ROOT/scripts/probe_packaged_client_roots.py" -- \
+    docker compose --project-name "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILES[@]}"
+
   # Configure the ephemeral stack's short cache lifecycle windows through the
   # public API before starting the supervisor. This keeps production defaults
   # intact while allowing cursor-expiry and bounded-cleanup scenarios to poll
