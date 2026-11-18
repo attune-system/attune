@@ -394,6 +394,21 @@ async fn publication_fixture(
         )
         .unwrap();
         zip.write_all(wheel.get_ref()).unwrap();
+        for (name, variable) in [
+            ("native-http", "ATTUNE_TEST_NATIVE_HTTP_BIN"),
+            ("native-http-tests", "ATTUNE_TEST_NATIVE_HTTP_TESTS"),
+            ("http-semantics.py", "ATTUNE_TEST_NATIVE_HTTP_SCRIPT"),
+        ] {
+            let bytes =
+                std::fs::read(std::env::var(variable).expect("actual candidate native binary"))
+                    .unwrap();
+            zip.start_file(
+                name,
+                zip::write::SimpleFileOptions::default().unix_permissions(0o755),
+            )
+            .unwrap();
+            zip.write_all(&bytes).unwrap();
+        }
         zip.finish().unwrap();
     }
     pack.seek(SeekFrom::Start(0)).unwrap();
@@ -406,7 +421,7 @@ async fn publication_fixture(
         object_version: "owned-pack".into(),
         size_bytes: bytes.len() as u64,
         sha256: Sha256Digest::of_bytes(&bytes),
-        max_expanded_bytes: 1024 * 1024,
+        max_expanded_bytes: 256 * 1024 * 1024,
         max_files: 32,
     };
     cache.install_input(&pack_pin, &mut pack).unwrap();
@@ -421,7 +436,7 @@ async fn publication_fixture(
         quota_bytes: 256 * 1024 * 1024,
         quota_files: 20000,
     });
-    setup.manifest.inputs = vec![pack_pin];
+    setup.manifest.inputs = vec![pack_pin.clone()];
     // Public Runner bytes only. This fixture is not CP pin/grant authority proof;
     // it exercises the actual helper/Engine/cache/install/publication contracts.
     let helper = std::fs::read(
@@ -515,8 +530,8 @@ async fn publication_fixture(
         max_files: 20000,
     };
     cache.install_input(&runtime_pin, &mut archive).unwrap();
-    let mut execute = spec(image);
-    execute.manifest.inputs = vec![runtime_pin];
+    let mut execute = spec(image.clone());
+    execute.manifest.inputs = vec![runtime_pin.clone()];
     execute.invocation=LaunchInvocation { argv:vec!["/bin/sh".into(),"-ec".into(),"/opt/attune/runtime/bin/owned-console; /opt/attune/runtime/absolute-tool; /opt/attune/runtime/relative-tool; ! touch /opt/attune/runtime/poison 2>/dev/null".into()],env:BTreeMap::new(),working_root:LaunchRoot::Runtime };
     let (exit, _, out, err) = run_captured(engine, policy, &execute, &[]).await?;
     assert_eq!(exit.exit_code, 0);
@@ -526,6 +541,79 @@ async fn publication_fixture(
         out,
         b"published-console-ok\npublished-console-ok\npublished-console-ok\n"
     );
+    // Full procfs and ordinary thread creation in the published Python runtime.
+    let mut python = spec(image.clone());
+    python.manifest.inputs = vec![runtime_pin];
+    python.invocation.argv = vec!["/opt/attune/runtime/bin/python3".into(), "-c".into(),
+        "import os,threading; result=[]; t=threading.Thread(target=lambda:result.append(42)); t.start(); t.join(); assert result==[42]; assert os.path.isdir('/proc/self/fd'); print('python-thread-ok')".into()];
+    let (exit, _, out, err) = run_captured(engine, policy, &python, &[]).await?;
+    assert_eq!(exit.exit_code, 0);
+    assert_eq!(out, b"python-thread-ok\n");
+    assert!(err.is_empty());
+
+    let mut native = spec(image);
+    native.manifest.inputs = vec![pack_pin];
+    native.invocation.argv = vec!["/opt/attune/pack/native-http".into()];
+    let (exit, _, out, err) = run_captured(
+        engine,
+        policy,
+        &native,
+        br#"{"url":"http://127.0.0.1:1","timeout":1}"#,
+    )
+    .await?;
+    assert_eq!(exit.exit_code, 1);
+    assert!(err.is_empty());
+    let denied: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(denied["error"], "HTTP destination is not public");
+    // The actual production entrypoint above built its blocking HTTP/Tokio
+    // client before rejecting the private destination. This second executable
+    // runs the owning native HTTP tests' explicitly test-only loopback transport
+    // inside the same production OCI builder, proving successful owned HTTP,
+    // redirects and resolver/runtime behavior without public-network reliance.
+    // These are ABI/Engine fixtures, not CP admission or action consumer proof.
+    let mut http_tests = native.clone();
+    http_tests.manifest.engine_name_nonce = uuid::Uuid::new_v4();
+    http_tests.invocation.argv = vec![
+        "/opt/attune/pack/native-http-tests".into(),
+        "--test-threads=4".into(),
+    ];
+    http_tests.invocation.env.insert(
+        "ATTUNE_CORE_HTTP_TEST_SCRIPT".into(),
+        "/opt/attune/pack/http-semantics.py".into(),
+    );
+    let (exit, _, out, _err) = run_captured(engine, policy, &http_tests, &[]).await?;
+    assert_eq!(exit.exit_code, 0);
+    assert!(String::from_utf8_lossy(&out).contains("test result: ok."));
+
+    // Complement the harness's intentional mode-exclusive production-policy
+    // case with the actual non-test action. No required test is silently lost
+    // because its build-time source path is absent inside the container.
+    let mut native_denial = native.clone();
+    native_denial.manifest.engine_name_nonce = uuid::Uuid::new_v4();
+    native_denial.invocation.argv = vec![
+        "python3".into(),
+        "/opt/attune/pack/http-semantics.py".into(),
+        "NativeHttpTests.test_nonpublic_destinations_cannot_reach_owned_listener".into(),
+    ];
+    native_denial.invocation.env.insert(
+        "ATTUNE_CORE_HTTP_BINARY".into(),
+        "/opt/attune/pack/native-http".into(),
+    );
+    let (exit, _, _out, err) = run_captured(engine, policy, &native_denial, &[]).await?;
+    assert_eq!(exit.exit_code, 0);
+    assert!(String::from_utf8_lossy(&err).contains("Ran 1 test"));
+    assert!(!String::from_utf8_lossy(&err).contains("skipped"));
+
+    let node_image = std::env::var("ATTUNE_TEST_NODE_IMAGE").expect("immutable Node image");
+    let mut node_policy = policy.clone();
+    node_policy.allowed_images.insert(node_image.clone());
+    let mut node = spec(node_image);
+    node.invocation.argv = vec!["node".into(), "-e".into(),
+        "const assert=require('node:assert'); const fs=require('node:fs'); const {Worker}=require('node:worker_threads'); assert(fs.statSync('/proc/self/fd').isDirectory()); const w=new Worker(\"require('node:worker_threads').parentPort.postMessage(42)\",{eval:true}); w.once('message',n=>{assert.equal(n,42);process.stdout.write('node-thread-ok')}); w.once('error',e=>{throw e});".into()];
+    let (exit, _, out, err) = run_captured(engine, &node_policy, &node, &[]).await?;
+    assert_eq!(exit.exit_code, 0);
+    assert_eq!(out, b"node-thread-ok");
+    assert!(err.is_empty());
     let mut settled = status;
     settled.publication = LaunchPublicationState::Published;
     cache
@@ -540,8 +628,9 @@ async fn run_captured(
     spec: &LaunchSpec,
     input: &[u8],
 ) -> Result<(ExitStatus, EngineResourceEvidence, Vec<u8>, Vec<u8>)> {
+    let binding = engine.observed_binding(policy.engine_id).await?;
     let image_env = engine
-        .image_environment(&spec.manifest.image.reference)
+        .image_environment_for_binding(&binding, policy, &spec.manifest.image)
         .await?;
     let prepared = policy.prepare(spec, &image_env)?;
     let container = match engine.create_once(&prepared).await? {

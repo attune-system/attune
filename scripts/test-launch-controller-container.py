@@ -16,6 +16,7 @@ import tempfile
 import uuid
 
 BASE = "debian@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587"
+NODE = "node@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee"
 PYTHON = "python@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df"
 
 
@@ -31,13 +32,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--test-binary", required=True, type=Path)
     parser.add_argument("--runner-binary", required=True, type=Path)
+    parser.add_argument("--native-http-binary", required=True, type=Path)
+    parser.add_argument("--native-http-tests", required=True, type=Path)
     args = parser.parse_args()
     binary = args.test_binary.resolve(strict=True)
     helper = args.runner_binary.resolve(strict=True)
-    for executable in (binary, helper):
+    native_http = args.native_http_binary.resolve(strict=True)
+    native_tests = args.native_http_tests.resolve(strict=True)
+    native_script = Path(__file__).resolve().with_name("test_native_http_action.py").resolve(strict=True)
+    for executable in (binary, helper, native_http, native_tests):
         dynamic = subprocess.run(["readelf", "-d", str(executable)], check=True, capture_output=True, text=True)
         if "(NEEDED)" in dynamic.stdout:
-            raise SystemExit("controller test and public helper must be statically linked (musl)")
+            raise SystemExit("all candidate controller/helper/native executables must be statically linked (musl)")
     owner = uuid.uuid4().hex
     volume = f"attune-controller-cache-test-{owner}"
     container = f"attune-controller-test-{owner}"
@@ -47,13 +53,22 @@ def main():
     image_created = False
     print(json.dumps({"owner": owner, "test_binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
                       "runner_binary_sha256": hashlib.sha256(helper.read_bytes()).hexdigest(),
+                      "native_http_sha256": hashlib.sha256(native_http.read_bytes()).hexdigest(),
+                      "native_http_tests_sha256": hashlib.sha256(native_tests.read_bytes()).hexdigest(),
+                      "native_http_script_sha256": hashlib.sha256(native_script.read_bytes()).hexdigest(),
                       "owned_volume": volume, "owned_container": container, "owned_image": image}), flush=True)
     try:
         docker("pull", PYTHON)
+        docker("pull", NODE)
         with tempfile.TemporaryDirectory(prefix="attune-controller-boundary-") as directory:
             context = Path(directory)
             shutil.copyfile(binary, context / "boundary-tests")
             shutil.copyfile(helper, context / "attune-workload-runner")
+            shutil.copyfile(native_http, context / "native-http")
+            shutil.copyfile(native_tests, context / "native-http-tests")
+            shutil.copyfile(native_script, context / "http-semantics.py")
+            (context / "native-http").chmod(0o755)
+            (context / "native-http-tests").chmod(0o755)
             (context / "boundary-tests").chmod(0o755)
             (context / "attune-workload-runner").chmod(0o755)
             (context / "Dockerfile").write_text(
@@ -61,6 +76,8 @@ def main():
                 "COPY --from=public-roots /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt\n"
                 "COPY boundary-tests /usr/local/bin/boundary-tests\n"
                 "COPY attune-workload-runner /usr/local/bin/attune-workload-runner\n"
+                "COPY native-http native-http-tests /usr/local/bin/\n"
+                "COPY http-semantics.py /usr/local/lib/http-semantics.py\n"
                 'ENTRYPOINT ["/usr/local/bin/boundary-tests"]\n'
             )
             docker("build", "--label", label, "-t", image, str(context))
@@ -79,6 +96,10 @@ def main():
             "-e", "ATTUNE_TEST_CACHE_ROOT=/var/lib/attune/launch",
             "-e", f"ATTUNE_TEST_CACHE_VOLUME={volume}",
             "-e", f"ATTUNE_TEST_PYTHON_IMAGE={PYTHON}",
+            "-e", f"ATTUNE_TEST_NODE_IMAGE={NODE}",
+            "-e", "ATTUNE_TEST_NATIVE_HTTP_BIN=/usr/local/bin/native-http",
+            "-e", "ATTUNE_TEST_NATIVE_HTTP_TESTS=/usr/local/bin/native-http-tests",
+            "-e", "ATTUNE_TEST_NATIVE_HTTP_SCRIPT=/usr/local/lib/http-semantics.py",
             "-e", "ATTUNE_TEST_WORKLOAD_RUNNER_BIN=/usr/local/bin/attune-workload-runner",
             image, "engine::tests::real_engine_cache_binding_and_python_publication",
             "--exact", "--ignored", "--nocapture", "--test-threads=4",

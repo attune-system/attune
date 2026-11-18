@@ -11,6 +11,7 @@ on:
       - 'crates/worker/src/runtime/launch_planning.rs'
       - 'crates/worker/src/workload_runner_main.rs'
       - 'crates/worker/Cargo.toml'
+      - 'crates/core-actions/**'
       - 'crates/launch-controller/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -22,6 +23,7 @@ on:
       - 'scripts/test-workload-runtime-images.py'
       - 'scripts/test-launch-controller-container.py'
       - 'scripts/test-workload-runner.py'
+      - 'scripts/test_native_http_action.py'
       - 'docker/Dockerfile.agent'
   workflow_dispatch:
 permissions:
@@ -143,6 +145,8 @@ jobs:
         run: cargo zigbuild --locked --target ${{ matrix.target }} -p attune-launch-controller --tests --message-format=json > "$RUNNER_TEMP/controller-artifacts.jsonl"
       - name: Build actual public helper from same candidate source
         run: cargo zigbuild --locked --profile test --target ${{ matrix.target }} -p attune-worker --bin attune-workload-runner --message-format=json > "$RUNNER_TEMP/runner-artifacts.jsonl"
+      - name: Build actual native HTTP action and owned local-transport tests
+        run: cargo zigbuild --locked --profile test --manifest-path crates/core-actions/Cargo.toml --target ${{ matrix.target }} --tests --message-format=json > "$RUNNER_TEMP/native-http-artifacts.jsonl"
       - name: Run owned controller container and actual Engine publication test
         run: |
           python3 - <<'PY'
@@ -154,5 +158,9 @@ jobs:
           artifacts = [json.loads(line) for line in (Path(os.environ['RUNNER_TEMP']) / 'runner-artifacts.jsonl').read_text().splitlines() if line.startswith('{')]
           helpers = [item['executable'] for item in artifacts if item.get('reason') == 'compiler-artifact' and item['target']['name'] == 'attune-workload-runner' and not item['profile'].get('test') and item.get('executable')]
           assert len(helpers) == 1, 'missing/ambiguous actual public helper executable'
-          subprocess.run(['python3', 'scripts/test-launch-controller-container.py', '--test-binary', tests[0], '--runner-binary', helpers[0]], check=True)
+          artifacts = [json.loads(line) for line in (Path(os.environ['RUNNER_TEMP']) / 'native-http-artifacts.jsonl').read_text().splitlines() if line.startswith('{')]
+          native = [item['executable'] for item in artifacts if item.get('reason') == 'compiler-artifact' and item['target']['name'] == 'attune-core-http_request' and not item['profile'].get('test') and item.get('executable')]
+          native_tests = [item['executable'] for item in artifacts if item.get('reason') == 'compiler-artifact' and item['target']['name'] == 'attune-core-http_request' and item['profile'].get('test') and item.get('executable')]
+          assert len(native) == len(native_tests) == 1, 'missing/ambiguous actual native HTTP executables'
+          subprocess.run(['python3', 'scripts/test-launch-controller-container.py', '--test-binary', tests[0], '--runner-binary', helpers[0], '--native-http-binary', native[0], '--native-http-tests', native_tests[0]], check=True)
           PY
