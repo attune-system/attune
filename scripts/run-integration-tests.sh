@@ -234,6 +234,20 @@ assert_fresh_project() {
 
 STACK_STARTED=false
 
+workload_startup_diagnostics() {
+  local diagnostic_root="$PROJECT_ROOT/.scratch/e2e-diagnostics"
+  local diagnostic_file
+  mkdir -p "$diagnostic_root"
+  diagnostic_file="$(mktemp "$diagnostic_root/${RUN_ID}.XXXXXX.jsonl")"
+  # The helper verifies project+service ownership and emits only fixed log
+  # categories and selected state fields. Never save raw logs or inspect env.
+  python3 "$PROJECT_ROOT/scripts/workload_startup_diagnostics.py" \
+    --project "$COMPOSE_PROJECT_NAME" > "$diagnostic_file" || \
+    log_error "Workload startup diagnostic collection unavailable"
+  cat "$diagnostic_file"
+  log_info "Sanitized startup diagnostics retained at $diagnostic_file"
+}
+
 wait_for_registered_worker() {
   local name_substring="$1"
   local max_wait="${2:-120}"
@@ -254,8 +268,8 @@ wait_for_registered_worker() {
     fi
 
     if [[ "$elapsed" -ge "$max_wait" ]]; then
-      log_error "Standalone worker did not register within ${max_wait}s"
-      compose logs --tail=80 worker-standalone sensor-standalone || true
+      log_error "Worker '${name_substring}' did not register within ${max_wait}s"
+      workload_startup_diagnostics
       return 1
     fi
 
