@@ -105,7 +105,14 @@ fn main() -> Result<()> {
                 &passthrough,
             )?
             .with_workload_sandbox(
-                attune_common::workload_sandbox::WorkloadSandbox::from_environment(true)?,
+                if config
+                    .as_ref()
+                    .is_some_and(|config| config.workload.is_some())
+                {
+                    attune_common::workload_sandbox::WorkloadSandbox::NativeEffectsRequired
+                } else {
+                    attune_common::workload_sandbox::WorkloadSandbox::from_environment(true)?
+                },
             );
         let bootstrap = bootstrap_runtime_env("ATTUNE_WORKER_RUNTIMES", &environment)?;
         print_detect_only_report("ATTUNE_WORKER_RUNTIMES", &bootstrap, &environment)?;
@@ -133,11 +140,13 @@ fn main() -> Result<()> {
                 .map(|worker| worker.passthrough_env.as_slice())
                 .unwrap_or(&[]),
         )?
-        .with_workload_sandbox(
+        .with_workload_sandbox(if config.workload.is_some() {
+            attune_common::workload_sandbox::WorkloadSandbox::NativeEffectsRequired
+        } else {
             attune_common::workload_sandbox::WorkloadSandbox::from_environment(
                 config.artifacts.transport == attune_common::artifact_transport::TransportMode::Api,
-            )?,
-        );
+            )?
+        });
     let bootstrap = bootstrap_runtime_env("ATTUNE_WORKER_RUNTIMES", &child_environment)?;
     let agent_detected_runtimes = bootstrap.detected_runtimes.clone();
 

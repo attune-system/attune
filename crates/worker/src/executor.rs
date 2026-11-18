@@ -102,11 +102,20 @@ pub struct ActionExecutor {
     /// Concrete factual transfer/removal effects. Domain admission and
     /// completion remain in this executor; this is never a workload service.
     native_backend: Option<attune_workload_backend::configuration::NativeBackend>,
+    native_preparation: Option<NativePreparation>,
     action_cache_by_id: Arc<MetadataCache<String, Action>>,
     action_cache_by_ref: Arc<MetadataCache<String, Action>>,
     runtime_cache_by_id: Arc<MetadataCache<String, RuntimeModel>>,
     runtime_cache_by_ref: Arc<MetadataCache<String, RuntimeModel>>,
     runtime_versions_cache_by_runtime_id: Arc<MetadataCache<String, Vec<RuntimeVersionModel>>>,
+}
+
+/// Operator configuration and the already-installed public Runner. All action
+/// selection remains in the existing trusted executor and retained release.
+struct NativePreparation {
+    config: attune_common::workload_config::WorkloadConfig,
+    cache: Arc<attune_workload_backend::cache::CacheStore>,
+    runner: attune_common::workload_launch::PinnedLaunchInput,
 }
 
 /// Provider exit is durable evidence, not completion policy. This wrapper
@@ -377,12 +386,24 @@ struct LogAllocationSettings {
 }
 
 impl ActionExecutor {
-    pub fn with_native_backend(
+    pub fn with_native_execution(
         mut self,
-        backend: attune_workload_backend::configuration::NativeBackend,
-    ) -> Self {
-        self.native_backend = Some(backend);
-        self
+        config: attune_common::workload_config::WorkloadConfig,
+        configured: attune_workload_backend::configuration::ConfiguredBackend,
+    ) -> Result<Self> {
+        config.validate()?;
+        if configured.runner != config.helper {
+            return Err(Error::configuration(
+                "Native Runner pin does not match operator configuration",
+            ));
+        }
+        self.native_backend = Some(configured.backend);
+        self.native_preparation = Some(NativePreparation {
+            config,
+            cache: configured.cache,
+            runner: configured.runner,
+        });
+        Ok(self)
     }
 
     /// Integration startup must prove all consumers are ready before enabling
@@ -460,6 +481,7 @@ impl ActionExecutor {
             recorded_readiness: Default::default(),
             transport,
             native_backend: None,
+            native_preparation: None,
             action_cache_by_id: Arc::new(MetadataCache::new(
                 ACTION_CACHE_TTL,
                 ACTION_CACHE_MAX_ENTRIES,
@@ -753,8 +775,34 @@ impl ActionExecutor {
         execution: Execution,
         cancel_token: CancellationToken,
     ) -> Result<ExecutionOutcome> {
-        self.execute_started_with_effect(execution, cancel_token, None)
+        let isolated = if self.native_preparation.is_some() {
+            let spec = self.prepare_native_process(&execution).await?;
+            let launcher = self
+                .native_backend
+                .as_ref()
+                .ok_or_else(|| Error::invalid_state("Native process effects unavailable"))?
+                .launcher();
+            Some((spec, launcher))
+        } else {
+            None
+        };
+        self.execute_started_with_effect(execution, cancel_token, isolated)
             .await
+    }
+
+    /// The same path used by the trusted service, with no caller-supplied plan.
+    /// Exposed for the owning provider fixture; configuration is manager-only.
+    pub async fn execute_started_native(
+        &self,
+        execution: Execution,
+        cancel_token: CancellationToken,
+    ) -> Result<ExecutionResult> {
+        if self.native_preparation.is_none() {
+            return Err(Error::configuration("Native execution is not configured"));
+        }
+        self.execute_started_outcome(execution, cancel_token)
+            .await?
+            .result
     }
 
     /// The existing trusted loop retains preparation, capture, custody and
@@ -2111,6 +2159,181 @@ impl ActionExecutor {
         })
     }
 
+    async fn prepare_native_process(
+        &self,
+        execution: &Execution,
+    ) -> Result<attune_common::isolated_process::ProcessSpec> {
+        use attune_common::{
+            isolated_process::ProcessSpec,
+            pack_registry::storage::PackReleaseManifest,
+            repositories::{
+                delegated_execution::DelegatedExecutionRepository,
+                execution_runtime_admission::{
+                    ExecutionAdmissionRepository, ExistingExecutionAuthority,
+                },
+                pack_release::PackReleaseRepository,
+                runtime_authority::RuntimeAuthorityRepository,
+            },
+            workload_archive::ArchivePolicy,
+            workload_launch::{
+                LaunchInputKind, LaunchInvocation, LaunchPurpose, LaunchRoot, LaunchTarget,
+                PackAccess, PinnedLaunchInput, Sha256Digest,
+            },
+            workload_pack_input::{release_zip, ReleaseInputPin},
+        };
+        let denied = || Error::PermissionDenied("Native action preparation unavailable".into());
+        let native = self.native_preparation.as_ref().ok_or_else(denied)?;
+        let worker = self.worker_id.load(Ordering::Acquire);
+        let incarnation = *self.process_incarnation.get().ok_or_else(denied)?;
+        if worker <= 0
+            || execution.worker != Some(worker)
+            || execution.status != ExecutionStatus::Running
+        {
+            return Err(denied());
+        }
+        let snapshot = execution.executable_snapshot.as_ref().ok_or_else(denied)?;
+        if execution.pack_release != Some(snapshot.release.id)
+            || execution.pack_release_digest.as_deref() != Some(snapshot.release.digest.as_str())
+        {
+            return Err(denied());
+        }
+        let release = PackReleaseRepository::find_by_id(&self.pool, snapshot.release.id)
+            .await?
+            .filter(|release| {
+                release.digest == snapshot.release.digest
+                    && release.pack_ref == snapshot.executable.action.pack_ref
+            })
+            .ok_or_else(denied)?;
+        let manifest: PackReleaseManifest =
+            serde_json::from_value(release.manifest).map_err(|_| denied())?;
+        if manifest.version != release.version || manifest.pack_ref != release.pack_ref {
+            return Err(denied());
+        }
+        let mut tx = self.pool.begin().await?;
+        let attempt = match ExecutionAdmissionRepository::selected_authority(&mut tx, execution.id)
+            .await?
+        {
+            ExistingExecutionAuthority::Delegated => {
+                DelegatedExecutionRepository::current_attempt(&mut tx, execution.id).await?
+            }
+            ExistingExecutionAuthority::Recorded => {
+                self.recorded_readiness.require_ready()?;
+                RuntimeAuthorityRepository::current_worker_attempt(&mut tx, execution.id, worker)
+                    .await?
+            }
+        };
+        tx.commit().await?;
+        let master = self.secret_manager.encryption_key().ok_or_else(denied)?;
+        if let Some(retained) = attune_common::repositories::execution_process::ExecutionProcessRepository::retained_for_attempt(
+            &self.pool, execution.id, attempt, master,
+        ).await? {
+            // A replaced incarnation is rejected by the existing target check.
+            // Never mint another effect ID after an unknown create/commit.
+            return Ok(retained);
+        }
+        // Existing pack transport materializes this primary immutable archive
+        // for both volume and API managers. Never repack an unpacked tree.
+        let archive = attune_common::pack_transport::release_cache_path(
+            &self.packs_base_dir,
+            &release.pack_ref,
+            &release.digest,
+        )?
+        .parent()
+        .ok_or_else(denied)?
+        .join("pack.tar.gz");
+        let source = ReleaseInputPin {
+            pack_ref: release.pack_ref,
+            size_bytes: u64::try_from(release.archive_size).map_err(|_| denied())?,
+            sha256: Sha256Digest::parse(&release.digest)?,
+        };
+        let ceiling = native.config.storage;
+        let runner = native.runner.clone();
+        let cache = native.cache.clone();
+        let release_id = release.id;
+        let release_digest = release.digest;
+        let pack = tokio::task::spawn_blocking(move || {
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(archive)
+                .map_err(|_| Error::validation("Pinned release archive unavailable"))?;
+            let metadata = file
+                .metadata()
+                .map_err(|_| Error::validation("Pinned release archive unavailable"))?;
+            if !metadata.is_file()
+                || metadata.nlink() != 1
+                || metadata.mode() & 0o022 != 0
+                || !(metadata.uid() == 0 || metadata.uid() == unsafe { libc::geteuid() })
+            {
+                return Err(Error::PermissionDenied(
+                    "Pinned release archive ownership invalid".into(),
+                ));
+            }
+            let prepared = release_zip(
+                file,
+                &source,
+                &manifest,
+                attune_common::pack_format::Limits {
+                    compressed_bytes: ceiling.compressed_bytes,
+                    extracted_bytes: ceiling.expanded_bytes,
+                    file_bytes: ceiling.expanded_bytes,
+                    entries: ceiling.entries,
+                    ..Default::default()
+                },
+                &ArchivePolicy {
+                    root: LaunchInputKind::Pack,
+                    max_compressed_bytes: ceiling.compressed_bytes,
+                    max_expanded_bytes: ceiling.expanded_bytes,
+                    max_files: ceiling.entries,
+                },
+            )?;
+            let pin = PinnedLaunchInput {
+                // Pin IDs distinguish slots inside this one plan. Object ID and
+                // version come exclusively from the retained release record;
+                // the public Runner's operator pin is preserved unchanged.
+                pin_id: if runner.pin_id == 1 { 2 } else { 1 },
+                kind: LaunchInputKind::Pack,
+                object_id: release_id,
+                object_version: release_digest,
+                size_bytes: prepared.size_bytes(),
+                sha256: prepared.sha256().clone(),
+                max_expanded_bytes: prepared.expanded_bytes(),
+                max_files: prepared.entries(),
+            };
+            let mut body = prepared.into_file();
+            cache
+                .install_input(&pin, body.as_file_mut())
+                .map_err(|_| Error::validation("Pinned release ZIP installation failed"))?;
+            Ok::<_, Error>(pin)
+        })
+        .await
+        .map_err(|_| Error::invalid_state("Native release preparation did not complete"))??;
+        Ok(ProcessSpec {
+            intent: uuid::Uuid::new_v4(),
+            purpose: LaunchPurpose::Action,
+            target: LaunchTarget::Execution {
+                execution: execution.id,
+                worker,
+                worker_instance: incarnation,
+                attempt,
+            },
+            image: native.config.image.clone(),
+            platform: native.config.platform,
+            inputs: vec![pack, native.runner.clone()],
+            pack_access: PackAccess::ReadOnly,
+            stage: None,
+            timeout_ms: None,
+            // The existing context preparation below selects and freezes the
+            // executable, static argv0 and selected env before any provider IO.
+            invocation: LaunchInvocation {
+                argv: Vec::new(),
+                env: Default::default(),
+                working_root: LaunchRoot::Pack,
+            },
+        })
+    }
+
     /// The existing trusted preparer selects the program and environment. A
     /// launcher supplies effects, never executable discovery or domain policy.
     /// Native file selection uses the immutable manifest + admitted platform;
@@ -2253,11 +2476,30 @@ impl ActionExecutor {
             execution_input::SelectedExecutionInput,
             execution_process::ExecutionProcessRepository as Effects,
         };
-        self.prepare_isolated_native_invocation(&context, &mut spec)
-            .await?;
         let master = self.secret_manager.encryption_key().ok_or_else(|| {
             Error::PermissionDenied("Isolated action context encryption unavailable".into())
         })?;
+        let retained = Effects::retained_for_attempt(
+            &self.pool,
+            context.execution_id,
+            match spec.target {
+                attune_common::workload_launch::LaunchTarget::Execution { attempt, .. } => attempt,
+                _ => {
+                    return Err(Error::PermissionDenied(
+                        "Isolated action target unavailable".into(),
+                    ))
+                }
+            },
+            master,
+        )
+        .await?;
+        if retained
+            .as_ref()
+            .is_none_or(|value| value.intent != spec.intent)
+        {
+            self.prepare_isolated_native_invocation(&context, &mut spec)
+                .await?;
+        }
         let selected = SelectedExecutionInput::new(
             serde_json::to_value(&context.parameters)?,
             preparation.input_snapshot.clone().ok_or_else(|| {

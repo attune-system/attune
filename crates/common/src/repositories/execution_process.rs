@@ -647,6 +647,26 @@ impl ExecutionProcessRepository {
 
     /// Retain the exact frozen plan for trusted recovery; this is not execution
     /// authorization. Recovery must consume the same source/attempt gate.
+    pub async fn retained_for_attempt(
+        pool: &PgPool,
+        execution: i64,
+        attempt: Uuid,
+        master: &str,
+    ) -> Result<Option<ProcessSpec>> {
+        let record: Option<Record> = sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM execution_process_effect WHERE target->>'kind'='execution' \
+             AND (target->>'execution')::BIGINT=$1 AND target->>'attempt'=$2"
+        ))
+        .bind(execution)
+        .bind(attempt.to_string())
+        .fetch_optional(pool)
+        .await?;
+        record
+            .map(|value| value.context(master).map(|context| context.spec()))
+            .transpose()
+    }
+
+    /// Exact frozen material only, with no fresh disclosure or start authority.
     pub async fn retained_spec(pool: &PgPool, intent: Uuid, master: &str) -> Result<ProcessSpec> {
         let record: Record = sqlx::query_as(&format!(
             "SELECT {COLUMNS} FROM execution_process_effect WHERE intent=$1"

@@ -429,6 +429,10 @@ fn extract_release_archive(
         extract_pack_archive(file, &temporary, pack_ref)?;
         let extracted = temporary.join(pack_ref);
         std::fs::rename(extracted, temporary.join("pack"))?;
+        // Native admission converts the exact authenticated primary archive,
+        // never a mutable unpacked tree. Publish it with the same digest cache
+        // unit, as PackStorage already does for shared-volume consumers.
+        std::fs::copy(archive_path, temporary.join("pack.tar.gz"))?;
         std::fs::write(temporary.join(RELEASE_READY_MARKER), release_digest)?;
         match std::fs::rename(&temporary, &destination) {
             Ok(()) => Ok(()),
@@ -1205,6 +1209,12 @@ mod tests {
             .remove_release_tree(&release.digest, &release.pack_path.to_string_lossy())
             .unwrap();
         let downloaded = downloaded.unwrap();
+        let retained = std::fs::read(downloaded.parent().unwrap().join("pack.tar.gz")).unwrap();
+        let retained_digest = Sha256::digest(&retained)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(retained_digest, release.digest);
         for (path, contents, executable) in &files {
             let target = downloaded.join(path);
             assert_eq!(std::fs::read(&target).unwrap(), *contents);

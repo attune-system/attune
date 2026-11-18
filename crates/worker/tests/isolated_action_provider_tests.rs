@@ -27,6 +27,7 @@ use attune_common::{
         FindById, Update,
     },
     workload_archive::ArchivePolicy,
+    workload_config::{WorkloadBackendConfig, WorkloadConfig, WorkloadStorageLimits},
     workload_launch::*,
     workload_pack_input::{release_zip, ReleaseInputPin},
 };
@@ -36,6 +37,7 @@ use attune_worker::{
 };
 use attune_workload_backend::{
     cache::{CacheLimits, CacheStore},
+    configuration::{ConfiguredBackend, NativeBackend},
     kubernetes::{KubernetesLauncher, KubernetesPolicy},
 };
 use helpers::{ActionFixture, IdentityFixture, PackFixture, RuntimeFixture};
@@ -347,7 +349,7 @@ async fn owning_case(real_provider: bool) -> Result<()> {
         64 << 20,
         16,
     )?;
-    cache.install_input(&runner_pin, &mut File::open(runner_archive)?)?;
+    cache.install_input(&runner_pin, &mut File::open(&runner_archive)?)?;
     let jwt = JwtConfig {
         secret: "owned-worker-isolation-signing-key".into(),
         ..Default::default()
@@ -458,7 +460,7 @@ async fn owning_case(real_provider: bool) -> Result<()> {
         },
         None,
         None,
-        root.path().join("packs"),
+        publication_root.clone(),
         artifacts.clone(),
         root.path().join("runtimes"),
         api.clone(),
@@ -470,6 +472,39 @@ async fn owning_case(real_provider: bool) -> Result<()> {
         )?),
     )
     .with_worker_token_provider(tokens);
+    let executor = if let Some(backend) = &concrete {
+        // Real provider proof uses the same trusted producer as the service,
+        // not the hand-built ProcessSpec used by the process-double case.
+        executor.with_native_execution(
+            WorkloadConfig {
+                image: payload_image.clone(),
+                platform,
+                cache_root: root.path().join("cache"),
+                memory_bytes: 128 << 20,
+                scratch_bytes: 64 << 20,
+                storage: WorkloadStorageLimits {
+                    compressed_bytes: 64 << 20,
+                    expanded_bytes: 128 << 20,
+                    entries: 4096,
+                    artifacts: Default::default(),
+                },
+                helper: runner_pin.clone(),
+                helper_archive: runner_archive,
+                backend: WorkloadBackendConfig::Kubernetes {
+                    cluster: required("ATTUNE_ISOLATION_TEST_CLUSTER")?,
+                    namespace: required("ATTUNE_ISOLATION_TEST_NAMESPACE")?,
+                    helper_image: image("ATTUNE_ISOLATION_TEST_HELPER_IMAGE")?,
+                },
+            },
+            ConfiguredBackend {
+                backend: NativeBackend::Kubernetes(backend.clone()),
+                cache: cache.clone(),
+                runner: runner_pin.clone(),
+            },
+        )?
+    } else {
+        executor
+    };
     executor.set_worker_id(worker.id);
     executor.set_process_incarnation(incarnation)?;
     ensure!(
@@ -497,7 +532,7 @@ async fn owning_case(real_provider: bool) -> Result<()> {
             working_root: LaunchRoot::Pack,
         },
     };
-    let intent = spec.intent;
+    let mut intent = spec.intent;
     let heartbeat_stop = CancellationToken::new();
     let heartbeat_cancel = heartbeat_stop.clone();
     let heartbeat_pool = database.pool().clone();
@@ -513,16 +548,27 @@ async fn owning_case(real_provider: bool) -> Result<()> {
     let result = async {
         executor.acquire_log_custody(&delivery, worker.id).await?;
         executor.start_log_delivery(delivery.clone()).await?;
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(240),
-            executor.execute_started_isolated(
-                execution.clone(),
-                CancellationToken::new(),
-                spec,
-                launcher.clone(),
-            ),
-        )
+        let outcome = tokio::time::timeout(Duration::from_secs(240), async {
+            if real_provider {
+                executor
+                    .execute_started_native(execution.clone(), CancellationToken::new())
+                    .await
+            } else {
+                executor
+                    .execute_started_isolated(
+                        execution.clone(),
+                        CancellationToken::new(),
+                        spec,
+                        launcher.clone(),
+                    )
+                    .await
+            }
+        })
         .await??;
+        intent = Effects::retained_for_attempt(database.pool(), execution.id, attempt, MASTER)
+            .await?
+            .context("trusted producer did not retain its native intent")?
+            .intent;
         ensure!(outcome.exit_code == 0, "native action failed");
         let stored = ExecutionRepository::find_by_id(&database, execution.id)
             .await?
@@ -575,6 +621,13 @@ async fn owning_case(real_provider: bool) -> Result<()> {
         Ok::<_, anyhow::Error>(())
     }
     .await;
+    // Recover ownership for failure teardown too, including errors before the
+    // normal completion acknowledgement exposed the producer-selected intent.
+    if let Ok(Some(retained)) =
+        Effects::retained_for_attempt(database.pool(), execution.id, attempt, MASTER).await
+    {
+        intent = retained.intent;
+    }
     // Attempt/capture producers have joined. Stop transport without consuming
     // the custody deadline; no uncertain remote effect is treated as absence.
     executor.stop_log_delivery().await;
@@ -779,25 +832,39 @@ async fn owning_case(real_provider: bool) -> Result<()> {
     // Normal no-file cleanup uses the same concrete effect as the owning
     // trusted loop, after terminal/custody settlement and exact inventory.
     // Failure teardown still deletes only this test's UID-bound resource.
-    let cleanup = if let (Some(client), Ok(Some(identity))) = (client, &identity) {
-        if restart.is_ok() {
-            if let Some(backend) = concrete {
-                match Effects::retained_spec(database.pool(), intent, MASTER).await {
-                    Ok(spec) => backend
-                        .remove_stopped(&spec, identity)
-                        .await
-                        .map_err(anyhow::Error::from),
-                    Err(error) => Err(error.into()),
+    let cleanup = async {
+        if let (Some(client), Ok(Some(identity))) = (client, &identity) {
+            if restart.is_ok() {
+                let ResourceIdentity::Kubernetes {
+                    namespace,
+                    pod_name,
+                    pod_uid,
+                    ..
+                } = identity
+                else {
+                    anyhow::bail!("wrong provider identity")
+                };
+                let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+                if let Some(pod) = pods.get_opt(pod_name).await? {
+                    ensure!(
+                        pod.metadata.uid.as_deref() == Some(pod_uid),
+                        "owned resource replaced"
+                    );
+                    remove_owned(client, identity).await?;
+                    Err(anyhow::anyhow!(
+                        "trusted completion left its stopped Pod unremoved"
+                    ))
+                } else {
+                    Ok(())
                 }
             } else {
-                Err(anyhow::anyhow!("missing concrete cleanup owner"))
+                remove_owned(client, identity).await
             }
         } else {
-            remove_owned(client, identity).await
+            Ok(())
         }
-    } else {
-        Ok(())
-    };
+    }
+    .await;
     server_stop.cancel();
     let server_result = server.await;
     let db_cleanup = database.cleanup().await;

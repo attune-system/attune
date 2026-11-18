@@ -46,9 +46,15 @@ payload image need not contain a shell. No HTTP enrollment, dispatch or session
 credential is configured between these in-process components.
 
 The optional field is migration staging, not permission for activated managers
-to execute locally when configuration is missing. Service constructor/default
-activation and supported package/chart values remain incomplete. No published
-image pin or working default deployment is implied by this config/factory code.
+to execute locally when configuration is missing. An explicitly configured
+worker constructs the adapter and routes its existing action loop through the
+trusted native producer. Worker/agent startup selects `NativeEffectsRequired`;
+missed local workload/setup/probe wrappers deny before filesystem/PATH lookup,
+without invoking the legacy Bubblewrap prerequisite. This is a guard, not
+support for the remaining executable paths. Sensor construction, remote runtime
+discovery/setup and the other consumers, default activation and supported
+package/chart values remain incomplete. No published image pin or working
+default deployment is implied.
 
 A fixed Runner gate starts before pack code. Separate bounded stdout/stderr
 attach streams are established first. The trusted caller commits the existing
@@ -119,6 +125,14 @@ link graphs, hardlinks and special files are validated. Safe links remain
 confined to the selected fixed root; image-external venv interpreter links need
 `--copies`. Setup must create, archive, publish and execute real console scripts
 and internal links successfully in the same admitted immutable image/platform.
+
+API-backed pack caches now retain that exact authenticated primary archive with
+the atomic release cache publication, as shared-volume publication already does.
+The action producer reads only the digest-derived retained archive plus the
+same immutable release record's manifest, selects the configured image/platform
+and public Runner pin, and reuses existing attempt/intent evidence on recovery.
+Missing archive or unsupported runtime/CLI/origin proof denies admission; there
+is no reconstruction from an unpacked tree or local executable fallback.
 
 Setup's fixed Runner copies the primary release's regular-file project into
 `/opt/attune/runtime/project` before executing creation, dependency and hook
