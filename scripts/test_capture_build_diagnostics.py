@@ -15,7 +15,7 @@ class BuildEvidenceTests(unittest.TestCase):
     def test_compiler_failure_retains_code_location_and_exit_without_source_or_env(self):
         with tempfile.TemporaryDirectory(prefix="attune-build-evidence-") as directory:
             path = Path(directory) / "sanitized.jsonl"
-            script = "import sys; print('JWT_SECRET=owned-private-credential'); print('#22 2.1 error[E0432]: unresolved import `attune_worker::runtime`',file=sys.stderr); print('#22 2.1 --> crates/api/src/workload_prepare.rs:19:7',file=sys.stderr); print('19 | let secret=\\\"owned-private-credential\\\";',file=sys.stderr); print('https://user:owned-private-credential@example.invalid',file=sys.stderr); sys.exit(101)"
+            script = "import sys; print('JWT_SECRET=owned-private-credential'); print('#22 2.1 error[E0432]: unresolved import `attune_worker::runtime`',file=sys.stderr); print('#22 2.1 --> crates/api/src/lib.rs:19:7',file=sys.stderr); print('#22 2.1 --> crates/owned-private-credential.rs:1:1',file=sys.stderr); print('19 | let secret=\\\"owned-private-credential\\\";',file=sys.stderr); print('https://user:owned-private-credential@example.invalid',file=sys.stderr); sys.exit(101)"
             result = subprocess.run(["python3", str(TOOL), "--output", str(path), "--group", "initial-api", "--", "python3", "-c", script], capture_output=True, text=True)
             self.assertEqual(result.returncode, 101)
             artifact = path.read_text()
@@ -23,7 +23,7 @@ class BuildEvidenceTests(unittest.TestCase):
                 self.assertNotIn(private, artifact + result.stdout + result.stderr)
             records = [json.loads(line) for line in artifact.splitlines()]
             self.assertTrue(any(r.get("code") == "E0432" and r["category"] == "unresolved_import" for r in records))
-            self.assertTrue(any(r.get("file") == "crates/api/src/workload_prepare.rs" and r["line"] == 19 for r in records))
+            self.assertTrue(any(r.get("file") == "crates/api/src/lib.rs" and r["line"] == 19 for r in records))
             self.assertEqual(records[-1]["exit_code"], 101)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 

@@ -7,13 +7,14 @@ are neither echoed nor written to disk. This wrapper never retries a build.
 import argparse
 import json
 import os
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 import re
 import signal
 import stat
 import subprocess
 import sys
 import threading
+from workload_startup_diagnostics import command as bounded_command
 
 LINE_LIMIT = 16384
 INPUT_LIMIT = 16 * 1024 * 1024
@@ -23,7 +24,7 @@ ERRORS = {"E0432": "unresolved_import", "E0433": "unresolved_module", "E0583": "
           "E0599": "missing_method", "E0277": "unsatisfied_trait", "E0063": "missing_fields"}
 
 
-def events(line):
+def events(line, source_paths):
     text = re.sub(r"\x1b\[[0-9;]*m", "", line)
     result = []
     code = re.search(r"\berror\[(E[0-9]{4})\]:", text)
@@ -43,7 +44,7 @@ def events(line):
         if phrase in text:
             result.append({"kind": "build_condition", "category": known})
     location = re.search(r"(?:-->|couldn't read|failed to read)\s+[`\"]?(?:/build/)?((?:crates|packs|migrations|docker)/[A-Za-z0-9_./-]+)(?::([0-9]{1,9})(?::([0-9]{1,9}))?)?", text)
-    if location and len(location[1]) <= 512 and ".." not in PurePosixPath(location[1]).parts:
+    if location and location[1] in source_paths and len(location[1]) <= 512 and ".." not in PurePosixPath(location[1]).parts:
         value = {"kind": "source_location", "file": location[1]}
         if location[2]:
             value["line"] = int(location[2])
@@ -62,6 +63,14 @@ def main():
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", args.group):
         parser.error("one command and a bounded public build group are required")
+    # Never turn attacker-controlled build output into an arbitrary path/value
+    # channel. Emit locations only for files in the repository's tracked public
+    # source inventory. If enumeration fails, retain codes/categories only.
+    root = Path(__file__).resolve().parent.parent
+    paths, code, truncated_paths = bounded_command([
+        "git", "-C", str(root), "ls-files", "-z", "--", "crates", "packs", "migrations", "docker",
+    ], 2 * 1024 * 1024)
+    source_paths = set(paths.split("\0")) if not code and not truncated_paths else set()
     descriptor = os.open(args.output, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     metadata = os.fstat(descriptor)
     if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
@@ -123,12 +132,12 @@ def main():
                             buffer.extend(piece)
                     if end:
                         if not dropping:
-                            for value in events(buffer.decode("utf-8", errors="replace")):
+                            for value in events(buffer.decode("utf-8", errors="replace"), source_paths):
                                 emit(value)
                         buffer.clear()
                         dropping = False
             if buffer and not dropping:
-                for value in events(buffer.decode("utf-8", errors="replace")):
+                for value in events(buffer.decode("utf-8", errors="replace"), source_paths):
                     emit(value)
             status = child.wait()
         finally:
