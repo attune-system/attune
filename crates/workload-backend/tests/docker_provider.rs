@@ -45,6 +45,9 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> TestResult<Self> {
+        Self::with_image("ATTUNE_ISOLATION_TEST_PAYLOAD_IMAGE").await
+    }
+    async fn with_image(image_variable: &str) -> TestResult<Self> {
         let socket = PathBuf::from(required("ATTUNE_ISOLATION_TEST_DOCKER_SOCKET")?);
         let engine = DockerEngine::connect(&socket)?;
         let binding = engine.observed_binding(1).await?;
@@ -56,7 +59,7 @@ impl Fixture {
         if binding.platform != platform {
             return Err("owned Docker daemon platform mismatch".into());
         }
-        let image = image("ATTUNE_ISOLATION_TEST_PAYLOAD_IMAGE")?;
+        let image = image(image_variable)?;
         let helper_image = image.clone();
         let mut source = std::fs::File::open(required("ATTUNE_ISOLATION_TEST_RUNNER_PATH")?)?;
         let metadata = source.metadata()?;
@@ -418,8 +421,45 @@ async fn native_docker_gate_procfs_capture_files_and_recovery() -> TestResult {
         return Err("empty stdin framing changed".into());
     }
     python_setup_removed_builder_and_readonly_reuse(&f).await?;
+    node_threads_and_procfs_through_concrete_adapter().await?;
     // Keep the cache Arc in the fixture, never as a guest mount of its parent.
     drop(f.cache);
+    Ok(())
+}
+
+async fn node_threads_and_procfs_through_concrete_adapter() -> TestResult {
+    // The owned harness already pins/pulls this image for the retained Engine
+    // ABI coverage. Exercise it through the actual in-process adapter too,
+    // before retiring that older Engine-only callsink.
+    let f = Fixture::with_image("ATTUNE_TEST_NODE_IMAGE").await?;
+    let spec = f.spec(vec![
+        "node".into(),
+        "-e".into(),
+        r#"const assert=require('node:assert'); const fs=require('node:fs'); const {Worker}=require('node:worker_threads');
+assert(fs.statSync('/proc/self/fd').isDirectory());
+assert(!fs.existsSync('/var/run/docker.sock'));
+assert(!fs.existsSync('/var/run/secrets/kubernetes.io/serviceaccount/token'));
+assert.equal(process.env.SELECTED,'owned-selected-value');
+assert(!Object.keys(process.env).some(k=>/^(ATTUNE__|DOCKER_|KUBERNETES_)/.test(k)));
+const w=new Worker("require('node:worker_threads').parentPort.postMessage(42)",{eval:true});
+w.once('message',n=>{assert.equal(n,42);process.stdout.write('owned-node-thread');process.stderr.write('owned-node-stderr')});
+w.once('error',e=>{throw e});"#
+            .into(),
+    ]);
+    let resource = f
+        .launcher
+        .prepare(&spec, ProcessCreateDisposition::CreateOnce)
+        .await?;
+    let result = async { run(f.launcher.start(&spec, &resource).await?, vec![]).await }.await;
+    f.launcher.remove_stopped(&spec, &resource).await?;
+    let (exit, out, err) = result?;
+    if exit.exit_code != 0
+        || exit.oom_killed
+        || out != b"owned-node-thread"
+        || err != b"owned-node-stderr"
+    {
+        return Err("Node thread/procfs/separate capture failed through concrete adapter".into());
+    }
     Ok(())
 }
 

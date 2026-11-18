@@ -70,6 +70,7 @@ scripts/
 !scripts/seed-standard-pack-index.sh
 !scripts/check-db-test-threads.sh
 !scripts/prepare-file-evidence-upgrade.sql
+!scripts/package-cli-archive.py
 
 # Cargo lock (workspace handles this)
 # Uncomment if you want deterministic builds:
