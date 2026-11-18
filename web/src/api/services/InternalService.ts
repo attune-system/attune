@@ -123,7 +123,7 @@ export class InternalService {
    * @returns ControlResponse
    * @throws ApiError
    */
-  public static reconcile({
+  public static logDeliveryControlReconcile({
     requestBody,
   }: {
     requestBody: ControlRequest;
