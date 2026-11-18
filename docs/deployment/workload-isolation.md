@@ -87,7 +87,12 @@ policy before effects. Exit does not imply custody, file publication or removal.
 
 ## Storage, capture and readiness
 
-Inputs and runtime publication use canonical v1 ZIP only. Compressed length,
+Guest inputs and runtime publication use canonical v1 ZIP only. Source pack
+releases retain the existing `PackStorage::publish_release` runtime-v1 manifest
+and exact pinned archive size/digest. The trusted manager verifies that primary
+GNU TAR inventory against the retained manifest before streaming it into a ZIP;
+there is no TAR reader in the payload/transfer helper and no offline CLI-format
+fallback or publication rewrite. Compressed length,
 digest, decompressed bytes, entry counts/implicit parents, CRCs, path traversal,
 link graphs, hardlinks and special files are validated. Safe links remain
 confined to the selected fixed root; image-external venv interpreter links need
