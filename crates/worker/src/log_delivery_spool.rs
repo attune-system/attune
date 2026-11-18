@@ -85,6 +85,21 @@ struct OwnedSpool {
 #[derive(Clone)]
 pub struct LogDeliverySpool(Arc<OwnedSpool>);
 
+/// Own the private directory and custody key BEFORE making any registration
+/// request. No delivery can be read/written until the CP selects the worker ID.
+/// This owner is intentionally not Clone; binding consumes it without releasing
+/// the filesystem lease between enrollment and manager initialization.
+pub struct UnboundLogDeliverySpool(OwnedSpool);
+impl UnboundLogDeliverySpool {
+    pub fn bind_worker(mut self, worker: i64) -> Result<LogDeliverySpool> {
+        if worker <= 0 {
+            return Err(Error::validation("Invalid custody worker binding"));
+        }
+        self.0.worker = worker;
+        Ok(LogDeliverySpool(Arc::new(self.0)))
+    }
+}
+
 fn io(error: std::io::Error) -> Error {
     Error::Io(error.to_string())
 }
@@ -174,8 +189,21 @@ impl LogDeliverySpool {
         max_entry_bytes: u64,
         max_payload_bytes: u64,
     ) -> Result<Self> {
-        if worker <= 0
-            || max_payload_bytes == 0
+        if worker <= 0 {
+            return Err(Error::validation("Invalid log spool worker"));
+        }
+        Self::acquire_owner(root, max_bytes, max_entry_bytes, max_payload_bytes)
+            .await?
+            .bind_worker(worker)
+    }
+
+    pub async fn acquire_owner(
+        root: PathBuf,
+        max_bytes: u64,
+        max_entry_bytes: u64,
+        max_payload_bytes: u64,
+    ) -> Result<UnboundLogDeliverySpool> {
+        if max_payload_bytes == 0
             || max_entry_bytes <= (MAGIC.len() + NONCE_BYTES + 16) as u64
             || max_entry_bytes == u64::MAX
             || max_entry_bytes > max_bytes
@@ -209,16 +237,16 @@ impl LogDeliverySpool {
             }
             sync_directory(&root)?;
             let key = load_custody_key(&root)?;
-            Ok(Self(Arc::new(OwnedSpool {
+            Ok(UnboundLogDeliverySpool(OwnedSpool {
                 root,
-                worker,
+                worker: 0,
                 key,
                 max_bytes,
                 max_entry_bytes,
                 max_payload_bytes,
                 _lease: lease,
                 serialization: Mutex::new(()),
-            })))
+            }))
         })
         .await
         .map_err(|_| Error::internal("Log spool initialization task failed"))?
@@ -417,6 +445,38 @@ impl OwnedSpool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn custody_owner_precedes_worker_registration_and_survives_binding() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("custody");
+        let owner = LogDeliverySpool::acquire_owner(root.clone(), 4 * 1024 * 1024, 64 * 1024, 1024)
+            .await
+            .unwrap();
+        assert!(
+            LogDeliverySpool::acquire_owner(root.clone(), 4 * 1024 * 1024, 64 * 1024, 1024)
+                .await
+                .is_err()
+        );
+        let key = std::fs::read(root.join("custody.key")).unwrap();
+        let bound = owner.bind_worker(42).unwrap();
+        assert!(
+            LogDeliverySpool::acquire_owner(root.clone(), 4 * 1024 * 1024, 64 * 1024, 1024)
+                .await
+                .is_err()
+        );
+        drop(bound);
+        let next = LogDeliverySpool::acquire_owner(root.clone(), 4 * 1024 * 1024, 64 * 1024, 1024)
+            .await
+            .unwrap();
+        assert!(
+            std::fs::read(root.join("custody.key")).unwrap() == key,
+            "custody key changed across ownership binding"
+        );
+        let rebound = next.bind_worker(42).unwrap();
+        assert!(rebound.versions().await.unwrap().is_empty());
+        drop(rebound);
+    }
     fn delivery(version: i64) -> SpoolDelivery {
         SpoolDelivery {
             execution: 1,

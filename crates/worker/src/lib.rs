@@ -5,6 +5,7 @@
 
 pub mod artifacts;
 pub mod completion;
+pub mod custody_control;
 pub mod dynamic_runtime;
 pub mod env_setup;
 pub mod executor;
