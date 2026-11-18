@@ -79,6 +79,9 @@ pub trait LaunchIoHandle: Send + Sync {
         offset: u64,
         max_bytes: u32,
     ) -> LaunchIoResult<LaunchIoChunk>;
+    /// Finite authenticated readiness observation. Callers own readiness and
+    /// assignment/grant refresh before the one-shot stdin delivery.
+    async fn status(&self) -> LaunchIoResult<LaunchStatus>;
     async fn wait(&self) -> LaunchIoResult<LaunchStatus>;
     async fn cancel(&self, reason: LaunchStopReason) -> LaunchIoResult<LaunchStatus>;
     /// None means authenticated not-ready (Pending/Uploading/NotRequired), never
@@ -273,15 +276,19 @@ impl LaunchIoHandle for HttpLaunchHandle {
             eof,
         })
     }
+    async fn status(&self) -> LaunchIoResult<LaunchStatus> {
+        let status: LaunchStatus = decode(
+            self.transport
+                .dispatch(&self.launch, &["status"], self.request())
+                .await?,
+        )
+        .await?;
+        validate_status(&status, self.request())?;
+        Ok(status)
+    }
     async fn wait(&self) -> LaunchIoResult<LaunchStatus> {
         loop {
-            let status: LaunchStatus = decode(
-                self.transport
-                    .dispatch(&self.launch, &["status"], self.request())
-                    .await?,
-            )
-            .await?;
-            validate_status(&status, self.request())?;
+            let status = self.status().await?;
             if status.state == LaunchState::Stopped {
                 return Ok(status);
             }
@@ -475,6 +482,16 @@ mod tests {
             json(&mut socket, &status(&expected)).await;
             let (mut socket, _) = listener.accept().await.unwrap();
             let (headers, body) = request(&mut socket).await;
+            assert!(headers.starts_with("POST /v1/launches/71/status HTTP/1.1"));
+            assert!(headers.contains("x-attune-launch-dispatch: owned-dispatch"));
+            assert!(!headers.to_ascii_lowercase().contains("\nauthorization:"));
+            assert_eq!(
+                serde_json::from_slice::<LaunchRequest>(&body).unwrap(),
+                expected.request
+            );
+            json(&mut socket, &status(&expected)).await;
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let (headers, body) = request(&mut socket).await;
             assert!(headers.starts_with("PUT /v1/launches/71/stdin?admitted_digest="));
             assert!(!headers
                 .lines()
@@ -497,6 +514,7 @@ mod tests {
             HttpLaunchTransport::new(Url::parse(&format!("http://{address}/")).unwrap()).unwrap();
         let result = async {
             let handle = transport.launch(&launch).await?;
+            assert_eq!(handle.status().await?.request, launch.request);
             handle
                 .write_stdin(
                     &grant(&launch, LaunchIoChannel::Stdin),
