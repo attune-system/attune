@@ -169,12 +169,22 @@ pub struct ReserveArtifactUpload {
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactUploadGrant {
+    pub disposition: ArtifactUploadDisposition,
     pub operation_id: i64,
     pub version_id: i64,
     pub size_bytes: u64,
     pub sha256: Sha256Digest,
     pub expires_at: DateTime<Utc>,
     pub token: LaunchToken,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactUploadDisposition {
+    Upload,
+    /// Historical ACK only. Send an empty body to the operation's body route;
+    /// this grant cannot submit a new provider PUT or change stored metadata.
+    ReceiptOnly,
 }
 
 /// Historical acknowledgement of this exact reserved operation. The receipt
@@ -199,6 +209,20 @@ pub struct MissingArtifactFile {
     pub lease_id: Uuid,
     pub generation: i64,
     pub version_id: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactFileDisposition {
+    Missing,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactFileDispositionReceipt {
+    pub request: LaunchRequest,
+    pub publication_id: i64,
+    pub version_id: i64,
+    pub disposition: ArtifactFileDisposition,
 }
 
 #[cfg(test)]
