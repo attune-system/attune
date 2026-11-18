@@ -19,6 +19,10 @@ pub struct WorkloadConfig {
     pub memory_bytes: u64,
     pub scratch_bytes: u64,
     pub storage: WorkloadStorageLimits,
+    /// Same public Runner ZIP supplies the selected execution/setup helper on
+    /// both providers. Kubernetes bootstrap/transfer has its own image pin.
+    pub helper: PinnedLaunchInput,
+    pub helper_archive: PathBuf,
     pub backend: WorkloadBackendConfig,
 }
 
@@ -52,10 +56,6 @@ pub enum WorkloadBackendConfig {
         /// Trusted public helper image supplies the fixed startup binding probe;
         /// an otherwise valid native workload image need not contain a shell.
         helper_image: PinnedImage,
-        helper: PinnedLaunchInput,
-        /// Public canonical ZIP, installed from the trusted package/init volume.
-        /// No private plan, token or custody file is accepted here.
-        helper_archive: PathBuf,
     },
 }
 
@@ -114,6 +114,21 @@ impl WorkloadConfig {
         }
         crate::workload_artifact::validate_inventory(&[], self.storage.artifacts)
             .map_err(|_| invalid())?;
+        let helper = &self.helper;
+        if !absolute_child(&self.helper_archive)
+            || helper.kind != LaunchInputKind::Runner
+            || helper.pin_id <= 0
+            || helper.object_id <= 0
+            || helper.object_version.is_empty()
+            || helper.size_bytes == 0
+            || helper.size_bytes > self.storage.compressed_bytes
+            || helper.max_expanded_bytes == 0
+            || helper.max_expanded_bytes > self.storage.expanded_bytes
+            || helper.max_files == 0
+            || helper.max_files > self.storage.entries
+        {
+            return Err(invalid());
+        }
         match &self.backend {
             WorkloadBackendConfig::Kubernetes {
                 cluster,
@@ -142,28 +157,15 @@ impl WorkloadConfig {
                 binding,
                 pids_limit,
                 helper_image,
-                helper,
-                helper_archive,
             } => {
                 binding.validate_shape().map_err(|_| invalid())?;
                 if binding.platform != self.platform
                     || !absolute_child(socket)
-                    || !absolute_child(helper_archive)
                     || !engine_name(cache_volume)
                     || !engine_name(network)
                     || matches!(network.as_str(), "host" | "none")
                     || *pids_limit < 16
                     || !image(helper_image)
-                    || helper.kind != LaunchInputKind::Runner
-                    || helper.pin_id <= 0
-                    || helper.object_id <= 0
-                    || helper.object_version.is_empty()
-                    || helper.size_bytes == 0
-                    || helper.size_bytes > self.storage.compressed_bytes
-                    || helper.max_expanded_bytes == 0
-                    || helper.max_expanded_bytes > self.storage.expanded_bytes
-                    || helper.max_files == 0
-                    || helper.max_files > self.storage.entries
                 {
                     return Err(invalid());
                 }
@@ -184,6 +186,9 @@ mod tests {
         json!({"image":image,"platform":"linux/amd64","cache_root":"/var/lib/attune/workloads",
             "memory_bytes":268435456,"scratch_bytes":67108864,
             "storage":{"compressed_bytes":67108864,"expanded_bytes":134217728,"entries":4096},
+            "helper_archive":"/opt/attune/public/runner.zip",
+            "helper":{"pin_id":1,"kind":"runner","object_id":2,"object_version":"owned-helper",
+                "size_bytes":1024,"sha256":"a".repeat(64),"max_expanded_bytes":4096,"max_files":1},
             "backend":{"kind":"kubernetes","cluster":"owned-cluster","namespace":"workloads","helper_image":image}})
     }
     #[test]
@@ -217,6 +222,11 @@ mod tests {
             invalid["backend"].as_object_mut().unwrap().remove(field);
             assert!(serde_json::from_value::<WorkloadConfig>(invalid).is_err());
         }
+        for field in ["helper", "helper_archive"] {
+            let mut invalid = value.clone();
+            invalid.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<WorkloadConfig>(invalid).is_err());
+        }
         let mut invalid = value;
         invalid["image"]["reference"] = json!("fixture.invalid/runtime:latest");
         assert!(serde_json::from_value::<WorkloadConfig>(invalid)
@@ -231,9 +241,7 @@ mod tests {
         value["backend"] = json!({"kind":"docker","socket":"/var/run/docker.sock",
             "cache_volume":"owned-cache","network":"owned-network",
             "binding":{"engine_id":1,"daemon_id":"owned-daemon","platform":"linux/amd64"},
-            "pids_limit":64,"helper_image":helper_image,"helper_archive":"/opt/attune/public/runner.zip",
-            "helper":{"pin_id":1,"kind":"runner","object_id":2,"object_version":"owned-helper",
-                "size_bytes":1024,"sha256":"a".repeat(64),"max_expanded_bytes":4096,"max_files":1}});
+            "pids_limit":64,"helper_image":helper_image});
         serde_json::from_value::<WorkloadConfig>(value.clone())
             .unwrap()
             .validate()
@@ -241,7 +249,6 @@ mod tests {
         for (field, bad) in [
             ("network", json!("host")),
             ("socket", json!("tcp://remote:2375")),
-            ("helper_archive", json!("relative.zip")),
             ("pids_limit", json!(0)),
             ("cache_volume", json!("../other-volume")),
         ] {
@@ -262,7 +269,7 @@ mod tests {
             .validate()
             .is_err());
         let mut wrong_helper = value.clone();
-        wrong_helper["backend"]["helper"]["kind"] = json!("pack");
+        wrong_helper["helper"]["kind"] = json!("pack");
         assert!(serde_json::from_value::<WorkloadConfig>(wrong_helper)
             .unwrap()
             .validate()
