@@ -6,5 +6,10 @@ COPY --chmod=0555 attune-workload-runner /usr/local/bin/attune-workload-runner
 COPY --chmod=0555 echo /usr/local/libexec/attune/echo
 RUN test -x /bin/bash && /usr/local/bin/python3 --version \
     && ln -sf /usr/local/bin/python3 /usr/bin/python3 && /usr/bin/python3 --version
+# Owned negative controls: neither inherited environment nor an image health
+# command may bypass the private payload gate. Kubernetes ignores HEALTHCHECK;
+# the Docker adapter must explicitly disable it and clear the child environment.
+ENV ATTUNE__DUMMY_IMAGE_CREDENTIAL=owned-image-only
+HEALTHCHECK --interval=100ms --timeout=1s CMD ["/bin/sh", "-c", "printf inherited-healthcheck > /tmp/attune-healthcheck"]
 USER 1000:1000
 ENTRYPOINT ["/usr/local/bin/attune-workload-runner"]

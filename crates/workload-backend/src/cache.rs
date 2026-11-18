@@ -1,4 +1,4 @@
-//! Controller-owned, fixed-volume input cache. No engine archive API or caller
+//! Trusted-manager-owned, fixed-volume input cache. No engine archive API or caller
 //! paths are accepted. Bodies are canonical ZIP and extraction never follows
 //! links. All publication is serialized across controller processes sharing the
 //! volume; workload containers see only a selected `body` subdirectory.
@@ -63,6 +63,17 @@ struct WorkloadOwner {
 pub(crate) struct BindingSentinel {
     pub nonce: uuid::Uuid,
     pub payload: String,
+}
+/// Public physical-removal evidence. Only the Docker adapter records this
+/// after a received Remove ACK; it carries no invocation or publication grant.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeRemoval {
+    version: u8,
+    policy: Sha256Digest,
+    pub resource: attune_common::isolated_process::ResourceIdentity,
+    pub outcome: attune_common::workload_launch::LaunchExitOutcome,
+    pub payload_exited: bool,
 }
 struct Lock(File);
 impl Drop for Lock {
@@ -157,7 +168,181 @@ impl CacheStore {
             files: self.limits.files.min(stage.quota_files).min(100_000),
         })
     }
-    /// The concrete Docker adapter has already observed exact payload exit.
+    fn native_parent_locked(
+        &self,
+        spec: &attune_common::isolated_process::ProcessSpec,
+    ) -> Result<PathBuf> {
+        let digest =
+            crate::process_policy::public_digest(spec).map_err(|_| CacheError::PinMismatch)?;
+        let parent = self.root.join(format!("private/{}", spec.intent.simple()));
+        let meta = fs::symlink_metadata(&parent).map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                CacheError::LostArtifactStaging
+            } else {
+                CacheError::Io(e)
+            }
+        })?;
+        if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o022 != 0 {
+            return Err(CacheError::AttemptConflict);
+        }
+        let mut marker = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(parent.join("native-policy"))?;
+        let meta = marker.metadata()?;
+        if !meta.is_file()
+            || meta.nlink() != 1
+            || meta.uid() != unsafe { libc::geteuid() }
+            || meta.len() != 64
+        {
+            return Err(CacheError::AttemptConflict);
+        }
+        let mut body = Vec::new();
+        Read::by_ref(&mut marker).take(65).read_to_end(&mut body)?;
+        if body != digest.as_str().as_bytes() {
+            return Err(CacheError::AttemptConflict);
+        }
+        Ok(parent)
+    }
+    fn native_removal_locked(
+        &self,
+        spec: &attune_common::isolated_process::ProcessSpec,
+        parent: &Path,
+    ) -> Result<Option<NativeRemoval>> {
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(parent.join("native-removal.json"))
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let meta = file.metadata()?;
+        if !meta.is_file()
+            || meta.nlink() != 1
+            || meta.uid() != unsafe { libc::geteuid() }
+            || meta.mode() & 0o7777 != 0o600
+            || meta.len() > 65536
+        {
+            return Err(CacheError::UnsafeEntry);
+        }
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take(65537)
+            .read_to_end(&mut bytes)?;
+        let record: NativeRemoval =
+            serde_json::from_slice(&bytes).map_err(|_| CacheError::UnsafeEntry)?;
+        let digest =
+            crate::process_policy::public_digest(spec).map_err(|_| CacheError::PinMismatch)?;
+        let attune_common::isolated_process::ResourceIdentity::Docker {
+            engine_id,
+            daemon_id,
+            container_id,
+        } = &record.resource
+        else {
+            return Err(CacheError::AttemptConflict);
+        };
+        let binding = attune_common::workload_launch::LaunchEngineBinding {
+            engine_id: *engine_id,
+            daemon_id: daemon_id.clone(),
+            platform: spec.platform,
+        };
+        if record.version != 1
+            || record.policy != digest
+            || binding.validate_shape().is_err()
+            || Sha256Digest::parse(container_id).is_err()
+        {
+            return Err(CacheError::AttemptConflict);
+        }
+        // A retry after uncertain directory fsync must re-establish durability
+        // before this historical positive ACK can authorize local byte reads.
+        file.sync_all()?;
+        File::open(parent)?.sync_all()?;
+        Ok(Some(record))
+    }
+    pub(crate) fn native_removal(
+        &self,
+        spec: &attune_common::isolated_process::ProcessSpec,
+        resource: &attune_common::isolated_process::ResourceIdentity,
+    ) -> Result<Option<NativeRemoval>> {
+        let _lock = self.lock()?;
+        let parent = match self.native_parent_locked(spec) {
+            Ok(parent) => parent,
+            // No historical proof, NOT provider/data absence. Byte-read paths
+            // independently reject missing retained staging.
+            Err(CacheError::LostArtifactStaging) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let record = self.native_removal_locked(spec, &parent)?;
+        if record
+            .as_ref()
+            .is_some_and(|record| &record.resource != resource)
+        {
+            return Err(CacheError::AttemptConflict);
+        }
+        Ok(record)
+    }
+    pub(crate) fn record_native_removal(
+        &self,
+        spec: &attune_common::isolated_process::ProcessSpec,
+        resource: &attune_common::isolated_process::ResourceIdentity,
+        outcome: attune_common::workload_launch::LaunchExitOutcome,
+        payload_exited: bool,
+    ) -> Result<NativeRemoval> {
+        use std::io::Write;
+        let _lock = self.lock()?;
+        let parent = self.native_parent_locked(spec)?;
+        let attune_common::isolated_process::ResourceIdentity::Docker {
+            engine_id,
+            daemon_id,
+            container_id,
+        } = resource
+        else {
+            return Err(CacheError::AttemptConflict);
+        };
+        let binding = attune_common::workload_launch::LaunchEngineBinding {
+            engine_id: *engine_id,
+            daemon_id: daemon_id.clone(),
+            platform: spec.platform,
+        };
+        if binding.validate_shape().is_err() || Sha256Digest::parse(container_id).is_err() {
+            return Err(CacheError::AttemptConflict);
+        }
+        let record = NativeRemoval {
+            version: 1,
+            policy: crate::process_policy::public_digest(spec)
+                .map_err(|_| CacheError::PinMismatch)?,
+            resource: resource.clone(),
+            outcome,
+            payload_exited,
+        };
+        if let Some(prior) = self.native_removal_locked(spec, &parent)? {
+            if prior.resource != record.resource
+                || prior.payload_exited != record.payload_exited
+                || prior.outcome.exit_code != record.outcome.exit_code
+                || prior.outcome.oom_killed != record.outcome.oom_killed
+            {
+                return Err(CacheError::AttemptConflict);
+            }
+            return Ok(prior);
+        }
+        let body = serde_json::to_vec(&record).map_err(|_| CacheError::UnsafeEntry)?;
+        if body.len() > 65536 {
+            return Err(CacheError::Quota);
+        }
+        let mut pending = tempfile::NamedTempFile::new_in(&parent)?;
+        pending.write_all(&body)?;
+        pending.as_file().sync_all()?;
+        pending
+            .persist_noclobber(parent.join("native-removal.json"))
+            .map_err(|e| e.error)?;
+        File::open(&parent)?.sync_all()?;
+        // Use the same strict read path before returning even a new receipt.
+        self.native_removal_locked(spec, &parent)?
+            .ok_or(CacheError::AttemptConflict)
+    }
+    /// The concrete Docker adapter has persisted exact Wait+Remove evidence.
     /// This is selected-file I/O, not inventory/publication/cleanup authority.
     pub(crate) fn read_native_artifact(
         &self,
@@ -165,22 +350,13 @@ impl CacheStore {
         relative: &attune_common::artifact_transport::ValidatedRelativePath,
         remaining: u64,
     ) -> Result<Option<File>> {
-        let digest =
-            crate::process_policy::public_digest(spec).map_err(|_| CacheError::PinMismatch)?;
         let _lock = self.lock()?;
-        let parent = self.root.join(format!("private/{}", spec.intent.simple()));
-        let metadata = fs::symlink_metadata(&parent).map_err(|e| {
-            if e.kind() == io::ErrorKind::NotFound {
-                CacheError::LostArtifactStaging
-            } else {
-                CacheError::Io(e)
-            }
-        })?;
-        if !metadata.is_dir()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || fs::read(parent.join("native-policy"))? != digest.as_str().as_bytes()
-        {
-            return Err(CacheError::AttemptConflict);
+        let parent = self.native_parent_locked(spec)?;
+        let removed = self
+            .native_removal_locked(spec, &parent)?
+            .ok_or(CacheError::ArtifactPending)?;
+        if !removed.payload_exited {
+            return Err(CacheError::ArtifactPending);
         }
         crate::artifact_file::read_selected(
             &parent.join("artifacts"),
@@ -189,21 +365,20 @@ impl CacheStore {
             self.artifact_limits,
         )
     }
-    /// Only the Docker adapter calls this after exact successful container Wait.
+    /// Only the Docker adapter calls this after successful Wait+acknowledged Remove.
     /// Retain one exact body across retry/restart; publication remains caller-owned.
     pub(crate) fn archive_native_stage(
         &self,
         spec: &attune_common::isolated_process::ProcessSpec,
     ) -> Result<File> {
         let limits = self.native_stage_limits(spec)?;
-        let digest =
-            crate::process_policy::public_digest(spec).map_err(|_| CacheError::PinMismatch)?;
         let _lock = self.lock()?;
-        let parent = self.root.join(format!("private/{}", spec.intent.simple()));
-        if !fs::symlink_metadata(&parent)?.is_dir()
-            || fs::read(parent.join("native-policy"))? != digest.as_str().as_bytes()
-        {
-            return Err(CacheError::AttemptConflict);
+        let parent = self.native_parent_locked(spec)?;
+        let removed = self
+            .native_removal_locked(spec, &parent)?
+            .ok_or(CacheError::ArtifactPending)?;
+        if !removed.payload_exited || removed.outcome.exit_code != 0 || removed.outcome.oom_killed {
+            return Err(CacheError::ArtifactPending);
         }
         let destination = parent.join("publication.zip");
         match OpenOptions::new()
@@ -1461,6 +1636,138 @@ mod tests {
             invocation: old.invocation,
         }
     }
+    fn native_removed(
+        store: &CacheStore,
+        spec: &attune_common::isolated_process::ProcessSpec,
+    ) -> attune_common::isolated_process::ResourceIdentity {
+        let resource = attune_common::isolated_process::ResourceIdentity::Docker {
+            engine_id: 1,
+            daemon_id: "owned-daemon".into(),
+            container_id: "a".repeat(64),
+        };
+        // Pure filesystem fixture: models an already received positive ACK,
+        // never claims that a real provider was contacted by this unit test.
+        store
+            .record_native_removal(
+                spec,
+                &resource,
+                attune_common::workload_launch::LaunchExitOutcome {
+                    exit_code: 0,
+                    oom_killed: false,
+                },
+                true,
+            )
+            .unwrap();
+        resource
+    }
+    #[test]
+    fn native_removal_receipt_is_owned_digest_bound_and_survives_restart_without_invented_absence()
+    {
+        let root = tempfile::tempdir().unwrap();
+        let limits = CacheLimits {
+            compressed_bytes: 65536,
+            expanded_bytes: 65536,
+            files: 32,
+        };
+        let spec = native_setup();
+        let store = CacheStore::open(root.path().into(), limits)
+            .unwrap()
+            .for_current_test_user();
+        store.prepare_native_private(&spec).unwrap();
+        assert!(matches!(
+            store.archive_native_stage(&spec),
+            Err(CacheError::ArtifactPending)
+        ));
+        let resource = native_removed(&store, &spec);
+        drop(store);
+        let store = CacheStore::open(root.path().into(), limits)
+            .unwrap()
+            .for_current_test_user();
+        assert!(
+            store
+                .native_removal(&spec, &resource)
+                .unwrap()
+                .unwrap()
+                .payload_exited
+        );
+        let mut other = resource.clone();
+        if let attune_common::isolated_process::ResourceIdentity::Docker { container_id, .. } =
+            &mut other
+        {
+            *container_id = "b".repeat(64);
+        }
+        assert!(store.native_removal(&spec, &other).is_err());
+        let path = root.path().join(format!(
+            "private/{}/native-removal.json",
+            spec.intent.simple()
+        ));
+        let body = fs::read(&path).unwrap();
+        fs::hard_link(&path, root.path().join("receipt-alias")).unwrap();
+        assert!(store.native_removal(&spec, &resource).is_err());
+        fs::remove_file(root.path().join("receipt-alias")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(store.native_removal(&spec, &resource).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut record: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        record["policy"] = serde_json::json!("b".repeat(64));
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(store.native_removal(&spec, &resource).is_err());
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(root.path().join("not-a-receipt"), &path).unwrap();
+        assert!(store.native_removal(&spec, &resource).is_err());
+        fs::remove_file(&path).unwrap();
+        assert!(store.native_removal(&spec, &resource).unwrap().is_none());
+        assert!(matches!(
+            store.archive_native_stage(&spec),
+            Err(CacheError::ArtifactPending)
+        ));
+    }
+    #[test]
+    fn native_stage_requires_exited_success_not_never_started_failed_or_oom_removal() {
+        for (exited, code, oom, allowed) in [
+            (false, 0, false, false),
+            (true, 1, false, false),
+            (true, 0, true, false),
+            (true, 0, false, true),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let store = CacheStore::open(
+                root.path().into(),
+                CacheLimits {
+                    compressed_bytes: 65536,
+                    expanded_bytes: 65536,
+                    files: 32,
+                },
+            )
+            .unwrap()
+            .for_current_test_user();
+            let spec = native_setup();
+            store.prepare_native_private(&spec).unwrap();
+            fs::write(
+                root.path()
+                    .join(format!("private/{}/runtime/owned", spec.intent.simple())),
+                b"owned",
+            )
+            .unwrap();
+            let resource = attune_common::isolated_process::ResourceIdentity::Docker {
+                engine_id: 1,
+                daemon_id: "owned-daemon".into(),
+                container_id: "a".repeat(64),
+            };
+            store
+                .record_native_removal(
+                    &spec,
+                    &resource,
+                    attune_common::workload_launch::LaunchExitOutcome {
+                        exit_code: code,
+                        oom_killed: oom,
+                    },
+                    exited,
+                )
+                .unwrap();
+            assert_eq!(store.archive_native_stage(&spec).is_ok(), allowed);
+        }
+    }
     #[test]
     fn native_selected_artifact_checks_retained_policy_and_does_not_infer_lost_root_absence() {
         use attune_common::artifact_transport::ValidatedRelativePath;
@@ -1484,6 +1791,11 @@ mod tests {
             Err(CacheError::LostArtifactStaging)
         ));
         store.prepare_native_private(&spec).unwrap();
+        assert!(matches!(
+            store.read_native_artifact(&spec, &selected, 0),
+            Err(CacheError::ArtifactPending)
+        ));
+        native_removed(&store, &spec);
         assert!(store
             .read_native_artifact(&spec, &selected, 0)
             .unwrap()
@@ -1540,6 +1852,11 @@ mod tests {
             runtime.join("absolute-link"),
         )
         .unwrap();
+        assert!(matches!(
+            store.archive_native_stage(&spec),
+            Err(CacheError::ArtifactPending)
+        ));
+        native_removed(&store, &spec);
         let mut first = Vec::new();
         store
             .archive_native_stage(&spec)
@@ -1609,6 +1926,7 @@ mod tests {
                 4 => fs::write(runtime.join("oversized"), vec![0; 65537]).unwrap(),
                 _ => unreachable!(),
             }
+            native_removed(&store, &spec);
             assert!(store.archive_native_stage(&spec).is_err(), "case {case}");
             assert!(!runtime.parent().unwrap().join("publication.zip").exists());
         }

@@ -73,6 +73,9 @@ fn absolute_child(path: &Path) -> bool {
             .is_some_and(|s| !s.chars().any(char::is_control))
 }
 fn image(image: &PinnedImage) -> bool {
+    image.reference == format!("sha256:{}", image.sha256.as_str()) || registry_image(image)
+}
+fn registry_image(image: &PinnedImage) -> bool {
     image
         .reference
         .split_once("@sha256:")
@@ -135,7 +138,8 @@ impl WorkloadConfig {
                 namespace,
                 helper_image,
             } => {
-                if cluster.is_empty()
+                if !registry_image(&self.image)
+                    || cluster.is_empty()
                     || cluster.len() > 128
                     || cluster.chars().any(char::is_control)
                     || namespace.is_empty()
@@ -145,7 +149,7 @@ impl WorkloadConfig {
                     || !namespace
                         .bytes()
                         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-                    || !image(helper_image)
+                    || !registry_image(helper_image)
                 {
                     return Err(invalid());
                 }
@@ -230,6 +234,31 @@ mod tests {
         let mut invalid = value;
         invalid["image"]["reference"] = json!("fixture.invalid/runtime:latest");
         assert!(serde_json::from_value::<WorkloadConfig>(invalid)
+            .unwrap()
+            .validate()
+            .is_err());
+    }
+    #[test]
+    fn local_image_ids_are_immutable_docker_only_inputs_not_kubernetes_names() {
+        let mut value = fixture();
+        let local =
+            json!({"reference":format!("sha256:{}", "a".repeat(64)),"sha256":"a".repeat(64)});
+        value["image"] = local.clone();
+        value["backend"]["helper_image"] = local.clone();
+        assert!(serde_json::from_value::<WorkloadConfig>(value.clone())
+            .unwrap()
+            .validate()
+            .is_err());
+        value["backend"] = json!({"kind":"docker","socket":"/var/run/docker.sock",
+            "cache_volume":"owned-cache","network":"owned-network",
+            "binding":{"engine_id":1,"daemon_id":"owned-daemon","platform":"linux/amd64"},
+            "pids_limit":64,"helper_image":local});
+        serde_json::from_value::<WorkloadConfig>(value.clone())
+            .unwrap()
+            .validate()
+            .unwrap();
+        value["image"]["reference"] = json!(format!("sha256:{}", "b".repeat(64)));
+        assert!(serde_json::from_value::<WorkloadConfig>(value)
             .unwrap()
             .validate()
             .is_err());

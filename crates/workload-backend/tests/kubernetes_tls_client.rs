@@ -39,3 +39,39 @@ fn kubernetes_tls_client_initializes_in_fresh_process() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn docker_client_initializes_in_fresh_process_without_kubernetes_preinitialization() {
+    const CHILD: &str = "ATTUNE_DOCKER_CLIENT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                // Construction only: this fixed nonexistent socket is never
+                // connected. Kubernetes must not initialize Rustls for us.
+                let _client = attune_workload_backend::engine::DockerEngine::connect(
+                    std::path::Path::new("/tmp/attune-owned-client-test-never-connect.sock"),
+                )
+                .expect("Docker client must initialize independently of Kubernetes");
+            });
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "docker_client_initializes_in_fresh_process_without_kubernetes_preinitialization",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env_clear()
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "fresh Docker client failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
