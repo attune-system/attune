@@ -116,7 +116,7 @@ async fn main() -> Result<()> {
         }
     }
     // Exclusive ownership precedes loading either retained or initial state.
-    let state = SessionStore::open("/var/lib/attune/controller".into())?;
+    let state = Arc::new(SessionStore::open("/var/lib/attune/controller".into())?);
     let session = match state.retained()? {
         Some(session) => session,
         None => {
@@ -199,6 +199,9 @@ async fn main() -> Result<()> {
         }
     });
     let mut renew_close = close.clone();
+    // The process owner remains in main through lifecycle/server joins even
+    // if renewal exits first. A replacement must not overlap draining owners.
+    let renewal_state = state.clone();
     let renew = tokio::spawn(async move {
         let mut expiry = session.expires_at;
         loop {
@@ -211,7 +214,7 @@ async fn main() -> Result<()> {
             if remaining > Duration::from_secs(60) {
                 tokio::select! { _ = renew_close.changed() => return Ok(()), _ = tokio::time::sleep(remaining - Duration::from_secs(60)) => {} }
             }
-            let renewed = tokio::select! { _ = renew_close.changed() => return Ok(()), result = cp.renew_session(expiry, |session| state.persist(session)) => result };
+            let renewed = tokio::select! { _ = renew_close.changed() => return Ok(()), result = cp.renew_session(expiry, |session| renewal_state.persist(session)) => result };
             match renewed {
                 Ok(session) => expiry = session.expires_at,
                 Err(ControlError::Rejected(401 | 403)) => {
@@ -259,5 +262,6 @@ async fn main() -> Result<()> {
     if !server_done {
         server.await?;
     }
+    drop(state); // All owned tasks and frontend requests have settled/joined.
     outcome
 }

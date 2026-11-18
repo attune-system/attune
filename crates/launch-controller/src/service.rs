@@ -100,6 +100,11 @@ impl LaunchService {
             return Err(FrontError(StatusCode::SERVICE_UNAVAILABLE));
         }
         let mut entries = self.entries.lock().await;
+        // Closing may have begun while this admission waited for the owner
+        // lock. Shutdown must not drain the map before a late insertion.
+        if self.closing.load(Ordering::Acquire) {
+            return Err(FrontError(StatusCode::SERVICE_UNAVAILABLE));
+        }
         // Remove only completed tasks after the bounded raw-capture lifetime.
         // This never removes an Engine resource or CP ledger obligation.
         let mut retired = Vec::new();
@@ -158,6 +163,12 @@ impl LaunchService {
         let deadline = completed.clone();
         let retryable = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let failed = retryable.clone();
+        // Retiring completed entries above can await their owner. Recheck at
+        // the final insertion boundary; no await separates this from spawn and
+        // insertion under the same entries lock drained by shutdown.
+        if self.closing.load(Ordering::Acquire) {
+            return Err(FrontError(StatusCode::SERVICE_UNAVAILABLE));
+        }
         let task = tokio::spawn(async move {
             let result = actuator.run(&reserved, &running, minimum_free).await;
             let until = match result {
@@ -620,11 +631,30 @@ mod tests {
             .await
             .unwrap()
             .status();
-        service.shutdown().await;
+        // Deliberately park admission at the entries lock, then close local
+        // authority before letting it resume. No sleep or scheduler race.
+        let entries = service.entries.lock().await;
+        let admission = service.schedule(ReservedLaunch {
+            request: request.clone(),
+            dispatch_token: LaunchToken::new("target-dispatch".into()).unwrap(),
+        });
+        tokio::pin!(admission);
+        assert!(futures::poll!(&mut admission).is_pending());
+        let shutdown = service.shutdown();
+        tokio::pin!(shutdown);
+        assert!(futures::poll!(&mut shutdown).is_pending());
+        drop(entries);
+        let closed_admission = admission.await;
+        shutdown.await;
         front_stop.send(()).unwrap();
         front_task.await.unwrap();
         cp_stop.send(()).unwrap();
         cp_task.await.unwrap();
+        assert!(matches!(
+            closed_admission,
+            Err(FrontError(StatusCode::SERVICE_UNAVAILABLE))
+        ));
+        assert!(service.entries.lock().await.is_empty());
         assert_eq!(pending, StatusCode::NOT_FOUND);
         assert_eq!(denied, StatusCode::FORBIDDEN);
         assert_eq!(broad_bearer, StatusCode::UNAUTHORIZED);
