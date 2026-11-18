@@ -60,10 +60,11 @@ impl ExecutionHostConfig {
         let api_origin = values.get("ATTUNE_API_URL")
             .and_then(|value| reqwest::Url::parse(value).ok())
             .filter(|url| http_policy.allows_origin(url)
+                && (url.scheme()=="https" || matches!(http_policy,LaunchHttpPolicy::DevelopmentPlainHttp))
                 && url.host_str().is_some() && url.path()=="/"
                 && url.username().is_empty() && url.password().is_none()
                 && url.query().is_none() && url.fragment().is_none())
-            .ok_or_else(||invalid("ATTUNE_API_URL must be an admitted HTTPS API origin (literal loopback HTTP or explicit trusted development HTTP policy only)"))?;
+            .ok_or_else(||invalid("ATTUNE_API_URL must be an admitted HTTPS API origin (HTTP requires explicit trusted development policy)"))?;
         let enrollment = LaunchToken::new(
             values
                 .get("ATTUNE_WORKLOAD_ENROLLMENT_TOKEN")
@@ -130,6 +131,8 @@ mod tests {
     fn rejects_ambiguous_urls_and_requires_explicit_remote_development_http() {
         for url in [
             "http://owned-api.invalid/",
+            "http://127.0.0.1:8080/",
+            "http://[::1]:8080/",
             "https://user:password@owned-api.invalid/",
             "https://owned-api.invalid/api/v1",
             "https://owned-api.invalid/?token=secret",

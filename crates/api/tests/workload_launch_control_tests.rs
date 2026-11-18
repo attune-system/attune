@@ -1574,3 +1574,60 @@ async fn public_input_reservation_retains_revocation_and_settles_a_late_put() ->
     fixture.ctx.cleanup().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn count_only_stdin_authorization_is_denied_even_with_a_live_bound_grant() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let (reserved, lease) = fixture.running().await?;
+    let grant: LaunchIoGrant = fixture
+        .ok(
+            &reserved,
+            "io-grants",
+            &LaunchIoGrantRequest {
+                request: reserved.request.clone(),
+                channel: LaunchIoChannel::Stdin,
+            },
+            LAUNCH_DISPATCH_HEADER,
+            &reserved.dispatch_token,
+        )
+        .await?;
+    for offset in [0, 1, 4] {
+        let request = AuthorizeLaunchIoRequest {
+            request: reserved.request.clone(),
+            channel: LaunchIoChannel::Stdin,
+            offset,
+            bytes: 4,
+        };
+        let response = fixture
+            .ctx
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/workload-launches/{}/authorize-io",
+                        reserved.request.launch_id
+                    ))
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {}", fixture.credential))
+                    .header(LAUNCH_LEASE_HEADER, lease.token.as_str())
+                    .header(LAUNCH_IO_HEADER, grant.token.as_str())
+                    .body(Body::from(serde_json::to_vec(&request)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    let consumed: bool = sqlx::query_scalar(
+        "SELECT (operation->>'stdin_authorized')::boolean FROM workload_launch WHERE id=$1",
+    )
+    .bind(reserved.request.launch_id)
+    .fetch_one(&fixture.ctx.pool)
+    .await?;
+    assert!(
+        !consumed,
+        "rejected count/offset requests cannot consume exact stdin authority"
+    );
+    fixture.ctx.cleanup().await?;
+    Ok(())
+}

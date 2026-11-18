@@ -1605,12 +1605,13 @@ impl WorkloadLaunchRepository {
         lease: &LaunchToken,
         grant: &LaunchToken,
     ) -> Result<LaunchIoAuthorization> {
+        // Byte counts cannot authenticate the selected private stdin. No grant
+        // can opt out of the dedicated exact-payload/origin admission path.
+        if request.channel == LaunchIoChannel::Stdin {
+            return Err(denied());
+        }
         let mut tx = pool.begin().await?;
-        let mut record = if request.channel == LaunchIoChannel::Stdin {
-            Self::admitted(&mut tx, actor, &request.request).await?
-        } else {
-            Self::admitted_for_capture(&mut tx, actor, &request.request).await?
-        };
+        let record = Self::admitted_for_capture(&mut tx, actor, &request.request).await?;
         let now = Self::now(&mut tx).await?;
         Self::require_lease(&record, actor, &record.operation.handle(), lease, now)?;
         let permission:Option<(i64,DateTime<Utc>)>=sqlx::query_as("SELECT max_bytes,expires_at FROM workload_launch_io_grant WHERE launch=$1 AND channel=$2 AND token_hash=$3 AND expires_at>clock_timestamp() FOR SHARE")
@@ -1623,26 +1624,14 @@ impl WorkloadLaunchRepository {
         {
             return Err(denied());
         }
-        if request.channel != LaunchIoChannel::Stdin
-            && (!record.operation.capture_pending()
-                || record
-                    .operation
-                    .status
-                    .capture_deadline
-                    .is_some_and(|deadline| deadline <= now))
+        if !record.operation.capture_pending()
+            || record
+                .operation
+                .status
+                .capture_deadline
+                .is_some_and(|deadline| deadline <= now)
         {
             return Err(denied());
-        }
-        if request.channel == LaunchIoChannel::Stdin {
-            if request.offset != 0
-                || record.operation.cleanup_only()
-                || record.operation.stdin_authorized
-            {
-                return Err(denied());
-            }
-            // Reservation precedes external byte effects. An uncertain write is
-            // never retried by replacing/minting another stdin grant.
-            record.operation.stdin_authorized = true;
         }
         let expires_at = record
             .effect_deadline
