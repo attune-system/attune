@@ -36,7 +36,11 @@ pub struct CreateActionRequest {
     /// Entry point for action execution (e.g., path to script, function name)
     #[validate(length(min = 1, max = 1024))]
     #[schema(example = "/actions/slack/post_message.py")]
-    pub entrypoint: String,
+    pub entrypoint: Option<String>,
+    /// Typed source; exclusive with entrypoint.
+    pub launch: Option<attune_common::pack_format::LaunchSpec>,
+    pub parameter_delivery: Option<attune_common::models::ParameterDelivery>,
+    pub parameter_format: Option<attune_common::models::ParameterFormat>,
 
     /// Optional runtime ID for this action
     #[schema(example = 1)]
@@ -156,9 +160,14 @@ pub struct UpdateActionRequest {
     pub description: Option<String>,
 
     /// Entry point for action execution
-    #[validate(length(min = 1, max = 1024))]
     #[schema(example = "/actions/slack/post_message_v2.py")]
-    pub entrypoint: Option<String>,
+    #[serde(default, deserialize_with = "nullable_field")]
+    pub entrypoint: Option<Option<String>>,
+    /// Omission preserves, null clears, an object replaces the complete source.
+    #[serde(default, deserialize_with = "nullable_field")]
+    pub launch: Option<Option<attune_common::pack_format::LaunchSpec>>,
+    pub parameter_delivery: Option<attune_common::models::ParameterDelivery>,
+    pub parameter_format: Option<attune_common::models::ParameterFormat>,
 
     /// Runtime ID
     #[schema(example = 1)]
@@ -308,7 +317,13 @@ pub struct ActionResponse {
 
     /// Entry point
     #[schema(example = "/actions/slack/post_message.py")]
-    pub entrypoint: String,
+    pub entrypoint: Option<String>,
+    pub launch: Option<attune_common::pack_format::LaunchSpec>,
+    /// Definition-only ordering preview; never contains execution inputs.
+    pub argument_preview: Option<Vec<attune_common::action_cli::ArgumentPreview>>,
+
+    pub parameter_delivery: attune_common::models::ParameterDelivery,
+    pub parameter_format: attune_common::models::ParameterFormat,
 
     /// Runtime ID
     #[schema(example = 1)]
@@ -446,7 +461,10 @@ pub struct ActionSummary {
 
     /// Entry point
     #[schema(example = "/actions/slack/post_message.py")]
-    pub entrypoint: String,
+    pub entrypoint: Option<String>,
+    pub launch: Option<attune_common::pack_format::LaunchSpec>,
+    pub parameter_delivery: attune_common::models::ParameterDelivery,
+    pub parameter_format: attune_common::models::ParameterFormat,
 
     /// Runtime ID
     #[schema(example = 1)]
@@ -551,6 +569,16 @@ impl From<attune_common::models::action::Action> for ActionResponse {
         let worker_tolerations = action.worker_toleration_specs();
         let worker_affinity = action.worker_affinity_spec();
         Self {
+            argument_preview: action.launch.as_ref().and_then(|launch| {
+                attune_common::action_cli::describe_arguments(
+                    action
+                        .param_schema
+                        .as_ref()
+                        .unwrap_or(&serde_json::json!({})),
+                    launch.action_arguments().ok()?,
+                )
+                .ok()
+            }),
             id: action.id,
             r#ref: action.r#ref,
             pack: action.pack,
@@ -558,6 +586,9 @@ impl From<attune_common::models::action::Action> for ActionResponse {
             label: action.label,
             description: action.description,
             entrypoint: action.entrypoint,
+            launch: action.launch,
+            parameter_delivery: action.parameter_delivery,
+            parameter_format: action.parameter_format,
             runtime: action.runtime,
             enabled: action.enabled,
             runtime_ref: None,
@@ -602,6 +633,9 @@ impl From<attune_common::models::action::Action> for ActionSummary {
             label: action.label,
             description: action.description,
             entrypoint: action.entrypoint,
+            launch: action.launch,
+            parameter_delivery: action.parameter_delivery,
+            parameter_format: action.parameter_format,
             runtime: action.runtime,
             enabled: action.enabled,
             runtime_ref: None,
@@ -806,6 +840,14 @@ impl From<attune_common::repositories::queue_stats::QueueStats> for QueueStatsRe
     }
 }
 
+fn nullable_field<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,11 +855,14 @@ mod tests {
     #[test]
     fn test_create_action_request_validation() {
         let req = CreateActionRequest {
+            launch: None,
+            parameter_delivery: None,
+            parameter_format: None,
             r#ref: "".to_string(), // Invalid: empty
             pack_ref: "test-pack".to_string(),
             label: "Test Action".to_string(),
             description: Some("Test description".to_string()),
-            entrypoint: "/actions/test.py".to_string(),
+            entrypoint: Some("/actions/test.py".to_string()),
             runtime: None,
             enabled: None,
             runtime_ref: None,
@@ -847,11 +892,14 @@ mod tests {
     #[test]
     fn test_create_action_request_valid() {
         let req = CreateActionRequest {
+            launch: None,
+            parameter_delivery: None,
+            parameter_format: None,
             r#ref: "test.action".to_string(),
             pack_ref: "test-pack".to_string(),
             label: "Test Action".to_string(),
             description: Some("Test description".to_string()),
-            entrypoint: "/actions/test.py".to_string(),
+            entrypoint: Some("/actions/test.py".to_string()),
             runtime: None,
             enabled: Some(true),
             runtime_ref: None,
@@ -881,6 +929,9 @@ mod tests {
     #[test]
     fn test_update_action_request_all_none() {
         let req = UpdateActionRequest {
+            launch: None,
+            parameter_delivery: None,
+            parameter_format: None,
             label: None,
             description: None,
             entrypoint: None,

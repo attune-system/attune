@@ -304,6 +304,9 @@ pub async fn create_action(
 
     // Create action input
     let action_input = CreateActionInput {
+        launch: request.launch,
+        parameter_delivery: request.parameter_delivery.map(|value| value.to_string()),
+        parameter_format: request.parameter_format.map(|value| value.to_string()),
         r#ref: request.r#ref,
         pack: pack.id,
         pack_ref: pack.r#ref.clone(),
@@ -448,7 +451,12 @@ pub async fn update_action(
     let update_input = UpdateActionInput {
         label: request.label,
         description: request.description.map(Patch::Set),
-        entrypoint: request.entrypoint,
+        entrypoint: request
+            .entrypoint
+            .map(|value| value.map(Patch::Set).unwrap_or(Patch::Clear)),
+        launch: request
+            .launch
+            .map(|value| value.map(Patch::Set).unwrap_or(Patch::Clear)),
         runtime,
         enabled: request.enabled,
         runtime_version_constraint: request.runtime_version_constraint.map(|patch| match patch {
@@ -466,8 +474,8 @@ pub async fn update_action(
         param_schema: request.param_schema,
         out_schema: request.out_schema,
         output_policy: request.output_policy,
-        parameter_delivery: None,
-        parameter_format: None,
+        parameter_delivery: request.parameter_delivery.map(|value| value.to_string()),
+        parameter_format: request.parameter_format.map(|value| value.to_string()),
         output_format: request.output_format.map(|format| format.to_string()),
         accesses_mcp: request.accesses_mcp,
         default_execution_permission_set_refs: request.default_execution_permission_set_refs,
@@ -1141,6 +1149,7 @@ mod tests {
 
     fn make_action(pack_ref: &str, action_ref: &str) -> ActionModel {
         ActionModel {
+            launch: None,
             output_policy: Default::default(),
             id: 1,
             r#ref: action_ref.to_string(),
@@ -1148,7 +1157,7 @@ mod tests {
             pack_ref: pack_ref.to_string(),
             label: action_ref.to_string(),
             description: None,
-            entrypoint: "run.sh".to_string(),
+            entrypoint: Some("run.sh".to_string()),
             runtime: None,
             enabled: true,
             enabled_override: None,

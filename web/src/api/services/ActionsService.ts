@@ -3,12 +3,16 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { ActionReferenceVisibility } from "../models/ActionReferenceVisibility";
+import type { ArgumentPreview } from "../models/ArgumentPreview";
 import type { CreateActionRequest } from "../models/CreateActionRequest";
 import type { ExecutionOptionsAuthoritySource } from "../models/ExecutionOptionsAuthoritySource";
+import type { LaunchSpec } from "../models/LaunchSpec";
 import type { OutputFormat } from "../models/OutputFormat";
 import type { OutputPolicy } from "../models/OutputPolicy";
 import type { PaginatedResponse_ActionSearchHit } from "../models/PaginatedResponse_ActionSearchHit";
 import type { PaginatedResponse_ActionSummary } from "../models/PaginatedResponse_ActionSummary";
+import type { ParameterDelivery } from "../models/ParameterDelivery";
+import type { ParameterFormat } from "../models/ParameterFormat";
 import type { RetentionPolicyType } from "../models/RetentionPolicyType";
 import type { SuccessResponse } from "../models/SuccessResponse";
 import type { UpdateActionRequest } from "../models/UpdateActionRequest";
@@ -84,6 +88,10 @@ export class ActionsService {
        */
       accesses_mcp: boolean;
       /**
+       * Definition-only ordering preview; never contains execution inputs.
+       */
+      argument_preview?: Array<ArgumentPreview> | null;
+      /**
        * Per-action retention limit override for non-log artifacts created by executions.
        */
       artifact_retention_limit?: number | null;
@@ -107,7 +115,7 @@ export class ActionsService {
       /**
        * Entry point
        */
-      entrypoint: string;
+      entrypoint?: string | null;
       /**
        * Action ID
        */
@@ -120,6 +128,7 @@ export class ActionsService {
        * Human-readable label
        */
       label: string;
+      launch?: null | LaunchSpec;
       /**
        * Per-action retention limit override for stdout/stderr execution log artifacts.
        */
@@ -146,6 +155,8 @@ export class ActionsService {
        * Parameter schema (StackStorm-style with inline required/secret)
        */
       param_schema: Record<string, any> | null;
+      parameter_delivery: ParameterDelivery;
+      parameter_format: ParameterFormat;
       /**
        * Unique reference identifier
        */
@@ -294,6 +305,10 @@ export class ActionsService {
        */
       accesses_mcp: boolean;
       /**
+       * Definition-only ordering preview; never contains execution inputs.
+       */
+      argument_preview?: Array<ArgumentPreview> | null;
+      /**
        * Per-action retention limit override for non-log artifacts created by executions.
        */
       artifact_retention_limit?: number | null;
@@ -317,7 +332,7 @@ export class ActionsService {
       /**
        * Entry point
        */
-      entrypoint: string;
+      entrypoint?: string | null;
       /**
        * Action ID
        */
@@ -330,6 +345,7 @@ export class ActionsService {
        * Human-readable label
        */
       label: string;
+      launch?: null | LaunchSpec;
       /**
        * Per-action retention limit override for stdout/stderr execution log artifacts.
        */
@@ -356,6 +372,8 @@ export class ActionsService {
        * Parameter schema (StackStorm-style with inline required/secret)
        */
       param_schema: Record<string, any> | null;
+      parameter_delivery: ParameterDelivery;
+      parameter_format: ParameterFormat;
       /**
        * Unique reference identifier
        */
@@ -450,6 +468,10 @@ export class ActionsService {
        */
       accesses_mcp: boolean;
       /**
+       * Definition-only ordering preview; never contains execution inputs.
+       */
+      argument_preview?: Array<ArgumentPreview> | null;
+      /**
        * Per-action retention limit override for non-log artifacts created by executions.
        */
       artifact_retention_limit?: number | null;
@@ -473,7 +495,7 @@ export class ActionsService {
       /**
        * Entry point
        */
-      entrypoint: string;
+      entrypoint?: string | null;
       /**
        * Action ID
        */
@@ -486,6 +508,7 @@ export class ActionsService {
        * Human-readable label
        */
       label: string;
+      launch?: null | LaunchSpec;
       /**
        * Per-action retention limit override for stdout/stderr execution log artifacts.
        */
@@ -512,6 +535,8 @@ export class ActionsService {
        * Parameter schema (StackStorm-style with inline required/secret)
        */
       param_schema: Record<string, any> | null;
+      parameter_delivery: ParameterDelivery;
+      parameter_format: ParameterFormat;
       /**
        * Unique reference identifier
        */

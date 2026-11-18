@@ -4320,6 +4320,15 @@ async fn authority_upgrade_drains_old_delegation_and_preserves_recorded_bindings
     )
     .await
     .unwrap();
+    // Keep the authority cutover absent while allowing the current action
+    // repository to seed this owned historical fixture. The launch migration
+    // changes no authority state and has no dependency on that cutover.
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/20261118000001_action_command_launch.sql"
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
     let (db, snapshot, policy, human) = fixture_on_database(db, false, false, None).await;
     let migration =
         include_str!("../../../migrations/20261107000001_execution_authority_selection.sql");

@@ -339,6 +339,9 @@ impl WorkflowRegistrar {
         let entrypoint = format!("workflows/{}.workflow.yaml", workflow_name);
 
         let action_input = CreateActionInput {
+            launch: None,
+            parameter_delivery: None,
+            parameter_format: None,
             output_policy: Default::default(),
             output_format: Default::default(),
             r#ref: effective_ref.to_string(),
@@ -346,7 +349,7 @@ impl WorkflowRegistrar {
             pack_ref: pack_ref.to_string(),
             label: effective_label.to_string(),
             description: workflow.description.clone(),
-            entrypoint,
+            entrypoint: Some(entrypoint),
             runtime: None,
             enabled: true,
             runtime_version_constraint: None,
@@ -415,13 +418,17 @@ impl WorkflowRegistrar {
 
             // Update the existing companion action to stay in sync
             let update_input = UpdateActionInput {
+                launch: None,
                 output_policy: Default::default(),
                 label: Some(effective_label.to_string()),
                 description: Some(match workflow.description.clone() {
                     Some(description) => Patch::Set(description),
                     None => Patch::Clear,
                 }),
-                entrypoint: Some(format!("workflows/{}.workflow.yaml", workflow_name)),
+                entrypoint: Some(Patch::Set(format!(
+                    "workflows/{}.workflow.yaml",
+                    workflow_name
+                ))),
                 runtime: None,
                 enabled: None,
                 runtime_version_constraint: None,

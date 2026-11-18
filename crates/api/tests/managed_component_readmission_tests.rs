@@ -206,7 +206,7 @@ async fn direct_managed_edits_readmit_but_labels_need_no_key_or_runtime_grants()
     let workflow_file = authored_action["workflow_file"]
         .as_str()
         .ok_or("action workflow_file missing")?;
-    assert_eq!(root.entrypoint, workflow_file);
+    assert_eq!(root.entrypoint.as_deref(), Some(workflow_file));
     let stored_graph = attune_common::workflow::parser::parse_workflow_file(
         &source.join("actions").join(workflow_file),
     )?;

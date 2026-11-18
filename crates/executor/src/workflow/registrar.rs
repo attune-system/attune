@@ -268,6 +268,9 @@ impl WorkflowRegistrar {
         let entrypoint = format!("workflows/{}.workflow.yaml", workflow_name);
 
         let action_input = CreateActionInput {
+            launch: None,
+            parameter_delivery: None,
+            parameter_format: None,
             r#ref: effective_ref.to_string(),
             pack: pack_id,
             pack_ref: pack_ref.to_string(),
@@ -330,7 +333,8 @@ impl WorkflowRegistrar {
         if let Some(action) = existing_action {
             // Update the existing companion action to stay in sync
             let update_input = UpdateActionInput {
-                label: Some(effective_label.to_string()),
+                                launch: None,
+label: Some(effective_label.to_string()),
                 description: workflow.description.clone(),
                 entrypoint: Some(format!("workflows/{}.workflow.yaml", workflow_name)),
                 runtime: None,

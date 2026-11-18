@@ -3,8 +3,12 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { ActionReferenceVisibility } from "./ActionReferenceVisibility";
+import type { ArgumentPreview } from "./ArgumentPreview";
+import type { LaunchSpec } from "./LaunchSpec";
 import type { OutputFormat } from "./OutputFormat";
 import type { OutputPolicy } from "./OutputPolicy";
+import type { ParameterDelivery } from "./ParameterDelivery";
+import type { ParameterFormat } from "./ParameterFormat";
 import type { RetentionPolicyType } from "./RetentionPolicyType";
 import type { WorkerAffinity } from "./WorkerAffinity";
 import type { WorkerToleration } from "./WorkerToleration";
@@ -20,6 +24,10 @@ export type ApiResponse_ActionResponse = {
      * Hint that this action may invoke the Attune MCP server and spawn child executions.
      */
     accesses_mcp: boolean;
+    /**
+     * Definition-only ordering preview; never contains execution inputs.
+     */
+    argument_preview?: Array<ArgumentPreview> | null;
     /**
      * Per-action retention limit override for non-log artifacts created by executions.
      */
@@ -44,7 +52,7 @@ export type ApiResponse_ActionResponse = {
     /**
      * Entry point
      */
-    entrypoint: string;
+    entrypoint?: string | null;
     /**
      * Action ID
      */
@@ -57,6 +65,7 @@ export type ApiResponse_ActionResponse = {
      * Human-readable label
      */
     label: string;
+    launch?: null | LaunchSpec;
     /**
      * Per-action retention limit override for stdout/stderr execution log artifacts.
      */
@@ -83,6 +92,8 @@ export type ApiResponse_ActionResponse = {
      * Parameter schema (StackStorm-style with inline required/secret)
      */
     param_schema: Record<string, any> | null;
+    parameter_delivery: ParameterDelivery;
+    parameter_format: ParameterFormat;
     /**
      * Unique reference identifier
      */

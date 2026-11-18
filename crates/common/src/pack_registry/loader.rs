@@ -1620,15 +1620,18 @@ impl TransactionalPackComponentLoader<'_> {
                 None
             };
 
-            // For workflow actions the entrypoint is the workflow file path;
-            // for regular actions it comes from entry_point in the YAML.
-            let entrypoint = if let Some(ref wf_path) = workflow_file_field {
-                wf_path.clone()
+            let launch: Option<crate::pack_format::LaunchSpec> = data
+                .get("launch")
+                .cloned()
+                .map(serde_yaml_ng::from_value)
+                .transpose()
+                .map_err(|_| Error::validation("Invalid action launch metadata"))?;
+            let entrypoint = if let Some(ref path) = workflow_file_field {
+                Some(path.clone())
             } else {
                 data.get("entry_point")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string()
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
             };
 
             // Resolve runtime ID from runner_type (workflow actions have no
@@ -1663,7 +1666,13 @@ impl TransactionalPackComponentLoader<'_> {
             let parameter_delivery = data
                 .get("parameter_delivery")
                 .and_then(|v| v.as_str())
-                .unwrap_or("stdin")
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    launch
+                        .as_ref()
+                        .map(|launch| launch.default_parameter_delivery().to_string())
+                        .unwrap_or_else(|| "stdin".into())
+                })
                 .to_lowercase();
 
             let parameter_format = data
@@ -1797,7 +1806,14 @@ impl TransactionalPackComponentLoader<'_> {
                         Some(description) => Patch::Set(description),
                         None => Patch::Clear,
                     }),
-                    entrypoint: Some(entrypoint),
+                    entrypoint: Some(match entrypoint {
+                        Some(value) => Patch::Set(value),
+                        None => Patch::Clear,
+                    }),
+                    launch: Some(match launch.clone() {
+                        Some(value) => Patch::Set(value),
+                        None => Patch::Clear,
+                    }),
                     runtime: runtime_id,
                     enabled: None,
                     runtime_version_constraint: Some(match runtime_version_constraint {
@@ -1886,88 +1902,50 @@ impl TransactionalPackComponentLoader<'_> {
                 continue;
             }
 
-            // Use raw SQL to include parameter_delivery, parameter_format,
-            // output_format which are not in CreateActionInput
-            let create_result = sqlx::query_scalar::<_, i64>(
-                r#"
-                INSERT INTO action (
-                    ref, pack, pack_ref, label, description, entrypoint,
-                    runtime, enabled, runtime_version_constraint, required_worker_runtimes,
-                    worker_selector, worker_tolerations, worker_affinity,
-                    param_schema, out_schema, is_adhoc, parameter_delivery, parameter_format,
-                    output_format, accesses_mcp, default_execution_permission_set_refs,
-                    reference_visibility, reference_allowed_pack_refs,
-                    log_retention_policy, log_retention_limit,
-                    artifact_retention_policy, artifact_retention_limit, timeout_seconds, output_policy
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
-                RETURNING id
-                "#,
+            let action = ActionRepository::create_with_registry(
+                &mut *self.connection,
+                crate::repositories::action::CreateActionInput {
+                    r#ref: action_ref.clone(),
+                    pack: self.pack_id,
+                    pack_ref: self.pack_ref.clone(),
+                    label,
+                    description,
+                    entrypoint,
+                    launch,
+                    runtime: runtime_id,
+                    enabled: enabled.unwrap_or(true),
+                    runtime_version_constraint,
+                    required_worker_runtimes,
+                    worker_selector,
+                    worker_tolerations,
+                    worker_affinity,
+                    param_schema,
+                    out_schema,
+                    output_policy,
+                    output_format: output_format.parse().map_err(Error::validation)?,
+                    parameter_delivery: Some(parameter_delivery),
+                    parameter_format: Some(parameter_format),
+                    is_adhoc: false,
+                    accesses_mcp,
+                    default_execution_permission_set_refs,
+                    reference_visibility,
+                    reference_allowed_pack_refs,
+                    log_retention_policy,
+                    log_retention_limit,
+                    artifact_retention_policy,
+                    artifact_retention_limit,
+                    timeout_seconds,
+                },
+                Some(&self.candidate_schema_registry),
             )
-            .bind(&action_ref)
-            .bind(self.pack_id)
-            .bind(&self.pack_ref)
-            .bind(&label)
-            .bind(&description)
-            .bind(&entrypoint)
-            .bind(runtime_id)
-            .bind(enabled.unwrap_or(true))
-            .bind(&runtime_version_constraint)
-            .bind(&required_worker_runtimes)
-            .bind(&worker_selector)
-            .bind(&worker_tolerations)
-            .bind(&worker_affinity)
-            .bind(&param_schema)
-            .bind(&out_schema)
-            .bind(false) // is_adhoc
-            .bind(&parameter_delivery)
-            .bind(&parameter_format)
-            .bind(&output_format)
-            .bind(accesses_mcp)
-            .bind(&default_execution_permission_set_refs)
-            .bind(reference_visibility)
-            .bind(&reference_allowed_pack_refs)
-            .bind(log_retention_policy)
-            .bind(log_retention_limit)
-            .bind(artifact_retention_policy)
-            .bind(artifact_retention_limit)
-            .bind(timeout_seconds)
-            .bind(sqlx::types::Json(&output_policy))
-            .fetch_one(&mut *self.connection)
-            .await;
-
-            match create_result {
-                Ok(id) => {
-                    info!("Created action '{}' (ID: {})", action_ref, id);
-                    loaded_refs.push(action_ref.clone());
-                    result.actions_loaded += 1;
-
-                    // Link workflow definition if present
-                    if let Some(wf_id) = workflow_def_id {
-                        ActionRepository::link_workflow_def(&mut *self.connection, id, wf_id)
-                            .await?;
-                        info!(
-                            "Linked action '{}' (ID: {}) to workflow definition (ID: {})",
-                            action_ref, id, wf_id
-                        );
-                    }
-                }
-                Err(e) => {
-                    // Check for unique constraint violation (already exists race condition)
-                    if let sqlx::Error::Database(ref db_err) = e {
-                        if db_err.is_unique_violation() {
-                            info!(
-                                "Action '{}' already exists (concurrent creation), treating as update",
-                                action_ref
-                            );
-                            loaded_refs.push(action_ref);
-                            result.actions_updated += 1;
-                            continue;
-                        }
-                    }
-                    return Err(e.into());
-                }
+            .await?;
+            if let Some(workflow) = workflow_def_id {
+                ActionRepository::link_workflow_def(&mut *self.connection, action.id, workflow)
+                    .await?;
             }
+            info!("Created action '{}' (ID: {})", action_ref, action.id);
+            loaded_refs.push(action_ref);
+            result.actions_loaded += 1;
         }
 
         Ok(loaded_refs)

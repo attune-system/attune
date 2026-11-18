@@ -1095,3 +1095,25 @@ fn evidence_descriptors_are_bound_to_files_and_provenance_fails_closed() {
         .to_string()
         .contains("embedded provenance is unsupported"));
 }
+
+#[test]
+fn command_launch_and_native_cli_bindings_survive_archive_build_and_verify() {
+    let (dir, options) = fixture();
+    put(&options.source, "actions/command.yaml", "ref: demo.command\nrunner_type: native\nlaunch: {type: command, program: printf, arguments: [{literal: '%s', order: 0}]}\nparameters:\n  message:\n    type: string\n    default: value\n    cli: {kind: positional, order: 10}\n");
+    put(&options.source, "actions/native.yaml", "ref: demo.native\nrunner_type: native\nlaunch: {type: native, artifact: tool, arguments: [{literal: generate, order: 0}]}\nparam_schema:\n  message:\n    type: string\n    cli: {kind: option, name: --message, order: 10}\n");
+    let archive = dir.path().join("cli.tar.gz");
+    let release = build(&options, &archive, Limits::default()).unwrap();
+    assert!(release
+        .manifest()
+        .files
+        .iter()
+        .any(|file| file.path == "actions/command.yaml"));
+    verify(&archive, Limits::default()).unwrap();
+    put(&options.source, "actions/command.yaml", "ref: demo.command\nrunner_type: native\nlaunch: {type: command, program: printf}\nparameters:\n  token:\n    type: string\n    secret: true\n    cli: {kind: positional, order: 10}\n");
+    assert!(build(
+        &options,
+        &dir.path().join("bad-cli.tar.gz"),
+        Limits::default()
+    )
+    .is_err());
+}

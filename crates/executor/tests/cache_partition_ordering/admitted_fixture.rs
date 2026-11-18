@@ -75,7 +75,7 @@ async fn create_admitted_cache_partition_parent(
         standard_access: true,
     };
     let root_binding = InvocationBinding::Action {
-        action_ref: workflow_action.r#ref.clone(),
+action_ref: workflow_action.r#ref.clone(),
     };
     let policy = RuntimePolicy {
         owner,
@@ -85,7 +85,7 @@ async fn create_admitted_cache_partition_parent(
         invocations: vec![
             invocation(root_binding.clone()),
             invocation(InvocationBinding::Action {
-                action_ref: consume_action.r#ref.clone(),
+action_ref: consume_action.r#ref.clone(),
             }),
             invocation(InvocationBinding::WorkflowTask {
                 workflow_ref: workflow_action.r#ref.clone(),
@@ -137,7 +137,7 @@ async fn accept_cache_partition_parent(
     };
     let workflow_action = &snapshot.executable.action;
     let root_binding = InvocationBinding::Action {
-        action_ref: workflow_action.r#ref.clone(),
+action_ref: workflow_action.r#ref.clone(),
     };
     let mut acceptance = pool.begin().await?;
     CacheEntryRepository::protect_transaction(&mut acceptance, CacheTransactionMode::PinMutation)

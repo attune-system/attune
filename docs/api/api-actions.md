@@ -598,3 +598,19 @@ For detailed queue architecture and troubleshooting, see [Queue Architecture Doc
 ---
 
 **Last Updated:** January 27, 2025
+### Binary launch metadata
+
+Create/update/detail metadata exposes `launch` of type `command` or `native`,
+`parameter_delivery` (`none` or `stdin` for CLI-enabled actions), and
+`parameter_format: json`. Dynamic `cli` bindings remain in flat `param_schema`;
+fixed tokens are `launch.arguments` entries. Execution requests still use the
+ordinary `parameters` map, with no argv override.
+
+`entrypoint` and `launch` are exclusive nullable sources. In an update, omission
+preserves a source, `null` clears it, and a value replaces it. Switch both in
+one patch and explicitly repair incompatible delivery/schema settings. Command
+creation defaults to `none`; native creation defaults to `stdin`. Action detail
+responses include a value-free `argument_preview` in derived order.
+
+See the [action CLI contract](../plans/action-command-line-metadata.md) and
+[authoring example](../action-development-guide.md#calling-an-installed-binary-with-arguments).

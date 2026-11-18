@@ -593,7 +593,7 @@ async fn original_failed_task_fixture_with_file_api(
         .await
         .unwrap();
     let binding = InvocationBinding::Action {
-        action_ref: action.r#ref.clone(),
+action_ref: action.r#ref.clone(),
     };
     let snapshot = attune_common::repositories::managed_executable::ManagedExecutableRepository::resolve_invocation(&mut tx, &policy.policy, &binding).await.unwrap();
     let admitted = Admission::select(

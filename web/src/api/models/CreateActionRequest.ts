@@ -3,8 +3,11 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { ActionReferenceVisibility } from "./ActionReferenceVisibility";
+import type { LaunchSpec } from "./LaunchSpec";
 import type { OutputFormat } from "./OutputFormat";
 import type { OutputPolicy } from "./OutputPolicy";
+import type { ParameterDelivery } from "./ParameterDelivery";
+import type { ParameterFormat } from "./ParameterFormat";
 import type { RetentionPolicyType } from "./RetentionPolicyType";
 import type { WorkerAffinity } from "./WorkerAffinity";
 import type { WorkerToleration } from "./WorkerToleration";
@@ -38,11 +41,12 @@ export type CreateActionRequest = {
   /**
    * Entry point for action execution (e.g., path to script, function name)
    */
-  entrypoint: string;
+  entrypoint?: string | null;
   /**
    * Human-readable label
    */
   label: string;
+  launch?: null | LaunchSpec;
   /**
    * Optional per-action retention limit override for stdout/stderr execution log artifacts.
    */
@@ -68,6 +72,8 @@ export type CreateActionRequest = {
    * Parameter schema (StackStorm-style) defining expected inputs with inline required/secret
    */
   param_schema?: Record<string, any> | null;
+  parameter_delivery?: null | ParameterDelivery;
+  parameter_format?: null | ParameterFormat;
   /**
    * Unique reference identifier (e.g., "core.http", "aws.ec2.start_instance")
    */

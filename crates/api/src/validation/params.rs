@@ -311,6 +311,7 @@ mod tests {
 
     fn make_action(schema: Option<Value>) -> Action {
         Action {
+            launch: None,
             output_policy: Default::default(),
             id: 1,
             r#ref: "test.action".to_string(),
@@ -318,7 +319,7 @@ mod tests {
             pack_ref: "test".to_string(),
             label: "Test Action".to_string(),
             description: Some("Test action".to_string()),
-            entrypoint: "test.sh".to_string(),
+            entrypoint: Some("test.sh".to_string()),
             runtime: Some(1),
             enabled: true,
             enabled_override: None,

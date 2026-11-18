@@ -205,6 +205,21 @@ pub(super) fn validate(
             Ok(())
         };
         match launch {
+            LaunchSpec::Command { ref program, .. } => {
+                ensure!(
+                    kind == "actions"
+                        && (runner == "native"
+                            || crate::schema::RefValidator::validate_component_ref(&runner)
+                                .is_ok()),
+                    "command launch is action-only and requires native runtime"
+                );
+                launch.validate_action_source(
+                    None,
+                    launch.default_parameter_delivery(),
+                    crate::models::ParameterFormat::Json,
+                )?;
+                ensure!(!program.is_empty(), "command program is required");
+            }
             LaunchSpec::File { path } => {
                 ensure!(
                     matches!(
@@ -215,8 +230,21 @@ pub(super) fn validate(
                 );
                 require_data(&files, &path)?;
             }
-            LaunchSpec::Native { artifact } => {
-                ensure!(runner == "native", "native launch requires native runtime");
+            LaunchSpec::Native {
+                artifact,
+                arguments,
+            } => {
+                ensure!(
+                    kind == "actions" || arguments.is_empty(),
+                    "sensor CLI arguments are unsupported"
+                );
+                ensure!(
+                    runner == "native"
+                        || (kind == "actions"
+                            && crate::schema::RefValidator::validate_component_ref(&runner)
+                                .is_ok()),
+                    "native launch requires native runtime"
+                );
                 consume(&artifact, true)?;
             }
             LaunchSpec::JavaJar { artifact, jvm_args } => {

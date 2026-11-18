@@ -57,6 +57,28 @@ pub enum ActionCommands {
         #[arg(long)]
         entrypoint: Option<String>,
 
+        /// Clear the file source when switching to a typed launch.
+        #[arg(long, conflicts_with = "entrypoint")]
+        clear_entrypoint: bool,
+
+        /// Replace launch metadata from a JSON or YAML file.
+        #[arg(long)]
+        launch_file: Option<std::path::PathBuf>,
+
+        /// Clear the typed source when switching back to a file action.
+        #[arg(long, conflicts_with = "launch_file")]
+        clear_launch: bool,
+
+        /// Replace the flat parameter schema, including CLI bindings.
+        #[arg(long)]
+        parameters_file: Option<std::path::PathBuf>,
+
+        #[arg(long)]
+        parameter_delivery: Option<attune_common::models::ParameterDelivery>,
+
+        #[arg(long)]
+        parameter_format: Option<attune_common::models::ParameterFormat>,
+
         /// Update runtime ID
         #[arg(long)]
         runtime: Option<i64>,
@@ -147,7 +169,13 @@ struct Action {
     pack_ref: String,
     label: String,
     description: Option<String>,
-    entrypoint: String,
+    entrypoint: Option<String>,
+    #[serde(default)]
+    launch: Option<attune_common::pack_format::LaunchSpec>,
+    #[serde(default)]
+    parameter_delivery: attune_common::models::ParameterDelivery,
+    #[serde(default)]
+    parameter_format: attune_common::models::ParameterFormat,
     runtime: Option<i64>,
     #[serde(default)]
     runtime_ref: Option<String>,
@@ -170,7 +198,16 @@ struct ActionDetail {
     pack_ref: String,
     label: String,
     description: Option<String>,
-    entrypoint: String,
+    entrypoint: Option<String>,
+    #[serde(default)]
+    launch: Option<attune_common::pack_format::LaunchSpec>,
+    #[serde(default)]
+    argument_preview: Option<Vec<attune_common::action_cli::ArgumentPreview>>,
+
+    #[serde(default)]
+    parameter_delivery: attune_common::models::ParameterDelivery,
+    #[serde(default)]
+    parameter_format: attune_common::models::ParameterFormat,
     runtime: Option<i64>,
     #[serde(default)]
     runtime_ref: Option<String>,
@@ -190,14 +227,22 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 struct UpdateActionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    entrypoint: Option<String>,
+    entrypoint: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    launch: Option<Option<attune_common::pack_format::LaunchSpec>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parameter_delivery: Option<attune_common::models::ParameterDelivery>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parameter_format: Option<attune_common::models::ParameterFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    param_schema: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     runtime: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -244,6 +289,12 @@ pub async fn handle_action_command(
             label,
             description,
             entrypoint,
+            clear_entrypoint,
+            launch_file,
+            clear_launch,
+            parameters_file,
+            parameter_delivery,
+            parameter_format,
             runtime,
             enabled,
             timeout_seconds,
@@ -254,6 +305,12 @@ pub async fn handle_action_command(
                 label,
                 description,
                 entrypoint,
+                clear_entrypoint,
+                launch_file,
+                clear_launch,
+                parameters_file,
+                parameter_delivery,
+                parameter_format,
                 runtime,
                 enabled,
                 timeout_seconds,
@@ -456,6 +513,10 @@ async fn handle_show(
         }
         OutputFormat::Table => {
             output::print_section(&format!("Action: {}", action.action_ref));
+            if let Some(preview) = &action.argument_preview {
+                output::print_section("Argument bindings (definition preview)");
+                output::print_output(preview, OutputFormat::Yaml)?;
+            }
             let is_workflow = action.workflow_def.is_some();
             output::print_key_value_table(vec![
                 ("Reference", action.action_ref.clone()),
@@ -465,7 +526,10 @@ async fn handle_show(
                     "Description",
                     action.description.unwrap_or_else(|| "None".to_string()),
                 ),
-                ("Entry Point", action.entrypoint.clone()),
+                (
+                    "Entry Point",
+                    format_action_source(action.entrypoint.as_deref(), action.launch.as_ref()),
+                ),
                 (
                     "Runtime",
                     format_runtime(
@@ -497,6 +561,12 @@ async fn handle_update(
     label: Option<String>,
     description: Option<String>,
     entrypoint: Option<String>,
+    clear_entrypoint: bool,
+    launch_file: Option<std::path::PathBuf>,
+    clear_launch: bool,
+    parameters_file: Option<std::path::PathBuf>,
+    parameter_delivery: Option<attune_common::models::ParameterDelivery>,
+    parameter_format: Option<attune_common::models::ParameterFormat>,
     runtime: Option<i64>,
     enabled: Option<bool>,
     timeout_seconds: Option<i32>,
@@ -519,6 +589,12 @@ async fn handle_update(
     if label.is_none()
         && description.is_none()
         && entrypoint.is_none()
+        && !clear_entrypoint
+        && launch_file.is_none()
+        && !clear_launch
+        && parameters_file.is_none()
+        && parameter_delivery.is_none()
+        && parameter_format.is_none()
         && runtime.is_none()
         && enabled.is_none()
         && timeout_patch.is_none()
@@ -529,7 +605,23 @@ async fn handle_update(
     let request = UpdateActionRequest {
         label,
         description,
-        entrypoint,
+        entrypoint: if clear_entrypoint {
+            Some(None)
+        } else {
+            entrypoint.map(Some)
+        },
+        launch: if clear_launch {
+            Some(None)
+        } else {
+            launch_file
+                .as_deref()
+                .map(read_metadata)
+                .transpose()?
+                .map(Some)
+        },
+        param_schema: parameters_file.as_deref().map(read_metadata).transpose()?,
+        parameter_delivery,
+        parameter_format,
         runtime,
         enabled,
         timeout_seconds: timeout_patch,
@@ -556,7 +648,10 @@ async fn handle_update(
                     "Description",
                     action.description.unwrap_or_else(|| "None".to_string()),
                 ),
-                ("Entrypoint", action.entrypoint.clone()),
+                (
+                    "Entrypoint",
+                    format_action_source(action.entrypoint.as_deref(), action.launch.as_ref()),
+                ),
                 (
                     "Runtime",
                     format_runtime(
@@ -583,6 +678,12 @@ async fn handle_toggle(
 ) -> Result<()> {
     handle_update(
         action_ref,
+        None,
+        None,
+        None,
+        false,
+        None,
+        false,
         None,
         None,
         None,
@@ -767,4 +868,55 @@ async fn handle_execute(
     }
 
     Ok(())
+}
+
+fn format_action_source(
+    entrypoint: Option<&str>,
+    launch: Option<&attune_common::pack_format::LaunchSpec>,
+) -> String {
+    entrypoint
+        .map(str::to_owned)
+        .or_else(|| launch.and_then(|launch| serde_json::to_string(launch).ok()))
+        .unwrap_or_default()
+}
+
+fn read_metadata<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T> {
+    use std::io::Read;
+    let mut content = Vec::new();
+    std::fs::File::open(path)?
+        .take(1_048_577)
+        .read_to_end(&mut content)?;
+    if content.len() > 1_048_576 {
+        anyhow::bail!("Action metadata exceeds 1 MiB");
+    }
+    serde_yaml_ng::from_slice(&content).map_err(|_| anyhow::anyhow!("Invalid action metadata file"))
+}
+
+#[cfg(test)]
+mod action_cli_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn action_update_preserves_omission_null_and_complete_cli_metadata() {
+        assert_eq!(
+            serde_json::to_value(UpdateActionRequest::default()).unwrap(),
+            json!({})
+        );
+        let launch = serde_json::from_value(json!({"type":"command","program":"tool","arguments":[{"literal":"generate","order":0}]})).unwrap();
+        let request = UpdateActionRequest {
+            entrypoint: Some(None),
+            launch: Some(Some(launch)),
+            param_schema: Some(
+                json!({"value":{"type":"string","cli":{"kind":"positional","order":10}}}),
+            ),
+            parameter_delivery: Some(attune_common::models::ParameterDelivery::None),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["entrypoint"], serde_json::Value::Null);
+        assert_eq!(value["launch"]["arguments"][0]["literal"], "generate");
+        assert_eq!(value["param_schema"]["value"]["cli"]["order"], 10);
+        assert_eq!(value["parameter_delivery"], "none");
+    }
 }

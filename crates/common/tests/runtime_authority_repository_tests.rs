@@ -637,7 +637,7 @@ async fn managed_action_edit_creates_metadata_revision_without_rewriting_code_or
         &mut *tx,
         original_id,
         UpdateActionInput {
-            entrypoint: Some("edited.py".into()),
+            entrypoint: Some(attune_common::repositories::Patch::Set("edited.py".into())),
             default_execution_permission_set_refs: Some(vec![]),
             ..Default::default()
         },
@@ -654,14 +654,20 @@ async fn managed_action_edit_creates_metadata_revision_without_rewriting_code_or
     let edited = ManagedExecutableRepository::resolve_invocation(&mut tx, &revised.policy, binding)
         .await
         .unwrap();
-    assert_eq!(edited.executable.action.entrypoint, "edited.py");
+    assert_eq!(
+        edited.executable.action.entrypoint.as_deref(),
+        Some("edited.py")
+    );
     assert_eq!(edited.release.id, original.release.id);
     assert_eq!(edited.release.digest, original.release.digest);
     assert!(revised.policy.invocations[0].permission_sets.is_empty());
     let live = ExecutableSnapshotRepository::resolve_for_action(&mut *tx, original_id)
         .await
         .unwrap();
-    assert_eq!(live.executable.action.entrypoint, "edited.py");
+    assert_eq!(
+        live.executable.action.entrypoint.as_deref(),
+        Some("edited.py")
+    );
     let old =
         ManagedExecutableRepository::resolve_invocation(&mut tx, &fixture.policy.policy, binding)
             .await

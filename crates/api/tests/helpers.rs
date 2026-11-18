@@ -808,6 +808,9 @@ pub async fn create_test_action(
     ref_name: &str,
 ) -> Result<Action> {
     let input = CreateActionInput {
+        launch: None,
+        parameter_delivery: None,
+        parameter_format: None,
         output_policy: Default::default(),
         output_format: Default::default(),
         r#ref: ref_name.to_string(),
@@ -815,7 +818,7 @@ pub async fn create_test_action(
         pack_ref: pack_ref.to_string(),
         label: format!("Test Action {}", ref_name),
         description: Some(format!("Test action for {}", ref_name)),
-        entrypoint: "main.py".to_string(),
+        entrypoint: Some("main.py".to_string()),
         runtime: None,
         enabled: true,
         runtime_version_constraint: None,
