@@ -24,6 +24,7 @@
 
 mod action_output_mirror;
 pub mod dependency;
+pub mod launch_planning;
 pub mod local;
 pub mod log_writer;
 pub mod native;
