@@ -546,14 +546,21 @@ impl SensorWorkerRegistration {
                     .map(|alias| normalize_runtime_name(alias))
                     .chain(std::iter::once(runtime_name.clone()))
                     .collect::<std::collections::HashSet<_>>();
-                (runtime.id, (runtime_name, names))
+                (runtime.id, (runtime_name, names, runtime.execution_config))
             })
             .collect::<HashMap<_, _>>();
         for version in RuntimeVersionRepository::list(&self.pool).await? {
-            let Some((runtime_name, runtime_names)) = runtimes.get(&version.runtime) else {
+            let Some((runtime_name, runtime_names, parent_config)) = runtimes.get(&version.runtime)
+            else {
                 continue;
             };
-            if !configured.is_disjoint(runtime_names)
+            if version.execution_config.get("lifecycle").is_none()
+                && attune_common::runtime_lifecycle::validate_version_mode(
+                    parent_config,
+                    &version.execution_config,
+                )
+                .is_ok()
+                && !configured.is_disjoint(runtime_names)
                 && verify_registered_runtime_version(&version, &self.child_environment).await
             {
                 verified

@@ -721,8 +721,8 @@ credentials, and invocation-input-dependent preparation remain unavailable in th
 new recipe path. In particular, not reusing generations is the conservative initial
 implementation of configuration invalidation, not evidence that shared cache or
 lease fencing has been completed. New recipe consumers do not use legacy installer
-adapters or add a second snapshot format. The implementation has not received an
-independent code/security review or required CI yet.
+adapters or add a second snapshot format. Independent implementation reviews and subsequent validation are recorded below.
+Required CI still gates merge readiness.
 
 ### Local validation checkpoint — 2026-11-17
 
@@ -769,3 +769,47 @@ check is running on this base. The preceding 48-case results and image smoke
 checks describe the earlier checkpoint; they do not certify this new base or
 replace required CI. The PR remains a draft with the integration, review, and
 compatibility gaps listed above.
+
+
+### Readiness remediation — 2026-11-18
+
+The initial delivery received independent read-only Standards/security and Spec
+reviews, followed by rechecks. Standards findings were version-alias collisions
+and preparation timeouts bypassing the action budget. Spec findings were mixed
+legacy/lifecycle version selection, alternate versions depending on the default
+executable, and inline sources missing the action boundary/private input root.
+These are corrected with owner-qualified version access, mode checks before
+verification and selection, independent alternate discovery, one phase budget,
+and explicit inline source mapping. Rechecks also led to normal timeout/cancelled
+terminal results, omission of nonexistent sandbox input roots, and managed-only
+pack-file lookup. No additional concrete authority or disclosure defect was found
+within the reviewed trusted profile. The reviews were static, not penetration tests.
+
+Candidate routing now carries exact recipe requirements in the existing v1 test
+request and selects only workers advertising those startup operator admissions.
+The worker independently verifies the archived recipe and tools. This closes the
+previous possibility of dispatch to an unadmitted pool without introducing a
+language-specific scheduler or changing execution authority.
+
+Current command-level fixtures passed on Linux AMD64 with Bun 1.4.4, Python
+3.12.16/uv 0.9.10 (requirements and locked projects), PyPy implementation 7.3.20
+with Python 3.11.13, Deno 2.5.6, Gradle 8.14.3/Java 21.0.9, and GraalVM Native
+Image 25.0.1. They cover local imports, frozen locks, JAR/native resources, stdin
+JSON, immutable inputs, and Deno permission denial without network access.
+GraalVM's JVM temporary helper path is explicitly owned scratch. These checks are
+repeatable with `scripts/test-runtime-toolchains.py`; they do not certify arbitrary
+workloads, other architectures, or cross-host ABI compatibility.
+
+The CI full-stack runner now has a fresh-stack-only recipe fixture mode. It
+stages an owned copy of core, admits two fixed digests in the selected test pools,
+and exercises released and inline actions, preparation timeout classification,
+sensor events/rules, and admitted/rejected candidate tests via the public API.
+It does not alter the repository's shipped core components. Rust tests verify the
+fixture digests and cover scoped versions, absent default executables, mode
+rejection, preparation budgets/cancellation, and actual sensor bootstrap/cleanup.
+The Docker Rust test image includes runtime-read recipe fixtures and examples.
+
+Status remains work in progress until the updated tests and required CI pass on
+the final PR head. ARM64 execution and all broader deferred architecture milestones
+remain outside this initial delivery's validated guarantees. The PR handoff holds
+current command results and CI state; older checkpoints above are historical.

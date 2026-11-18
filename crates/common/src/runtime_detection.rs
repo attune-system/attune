@@ -259,6 +259,13 @@ impl RuntimeDetector {
         capabilities: &mut HashMap<String, serde_json::Value>,
         filter: Option<&[String]>,
     ) -> Result<()> {
+        capabilities.insert(
+            "runtime_recipe_digests".into(),
+            json!(self
+                .child_environment
+                .runtime_recipe_digests()
+                .collect::<Vec<_>>()),
+        );
         let mut instances = serde_json::Map::new();
         let registered_versions =
             crate::repositories::runtime_version::RuntimeVersionRepository::list(&self.pool)
@@ -278,26 +285,20 @@ impl RuntimeDetector {
             else {
                 continue;
             };
-            let Ok(tools) = recipe.discover(&self.child_environment).await else {
+            let Ok(digest) = recipe.require_admission(&self.child_environment) else {
                 continue;
             };
-            let digest = recipe
-                .digest()
-                .map_err(|error| crate::Error::validation(error.to_string()))?;
-            instances.insert(
-                runtime.r#ref.clone(),
-                json!({"digest":digest,"tools":tools}),
-            );
+            let tools = recipe.discover(&self.child_environment).await.ok();
             let mut versions = Vec::new();
-            if !registered_versions
+            let has_versions = registered_versions
                 .iter()
-                .any(|version| version.runtime == runtime.id)
-            {
+                .any(|version| version.runtime == runtime.id);
+            if !has_versions {
                 if let Some(primary) = recipe
                     .tools
                     .iter()
                     .find(|tool| tool.primary)
-                    .and_then(|tool| tools.get(&tool.name))
+                    .and_then(|tool| tools.as_ref()?.get(&tool.name))
                 {
                     versions.push(json!(primary.version));
                 }
@@ -306,24 +307,33 @@ impl RuntimeDetector {
                 .iter()
                 .filter(|version| version.runtime == runtime.id)
             {
-                if crate::runtime_lifecycle::verify_registered_version(
-                    version,
-                    &self.child_environment,
+                if crate::runtime_lifecycle::validate_version_mode(
+                    &runtime.execution_config,
+                    &version.execution_config,
                 )
-                .await
+                .is_ok()
+                    && crate::runtime_lifecycle::verify_registered_version(
+                        version,
+                        &self.child_environment,
+                    )
+                    .await
                 {
                     versions.push(json!(version.version));
                 }
             }
-            if let Some(map) = capabilities
-                .entry("runtime_versions".into())
-                .or_insert_with(|| json!({}))
-                .as_object_mut()
-            {
-                for name in runtime.aliases.iter().chain(std::iter::once(&runtime.name)) {
-                    map.insert(normalize_runtime_name(name), json!(versions));
-                }
+            if tools.is_none() && versions.is_empty() {
+                continue;
             }
+            let names: Vec<String> = runtime
+                .aliases
+                .iter()
+                .chain(std::iter::once(&runtime.name))
+                .map(|name| normalize_runtime_name(name))
+                .collect();
+            instances.insert(
+                runtime.r#ref.clone(),
+                json!({"digest":digest,"tools":tools,"versions":versions,"names":names}),
+            );
             let runtimes = capabilities
                 .entry("runtimes".into())
                 .or_insert_with(|| json!([]));

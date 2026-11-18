@@ -131,6 +131,10 @@ impl ChildProcessEnvironment {
         self.runtime_recipe_digests.contains(digest)
     }
 
+    pub fn runtime_recipe_digests(&self) -> impl Iterator<Item = &str> {
+        self.runtime_recipe_digests.iter().map(String::as_str)
+    }
+
     pub fn with_workload_sandbox(
         mut self,
         sandbox: crate::workload_sandbox::WorkloadSandbox,

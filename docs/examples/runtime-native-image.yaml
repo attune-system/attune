@@ -15,7 +15,7 @@ execution_config:
         primary: true
     extensions: [jar]
     prepare:
-      - command: ['{tool_native_image}', -jar, '{source_file}', '{output_dir}/application']
+      - command: ['{tool_native_image}', '-J-Djava.io.tmpdir={scratch_dir}', -jar, '{source_file}', '{output_dir}/application']
         timeout_seconds: 3600
     launch:
       command: ['{output_dir}/application']

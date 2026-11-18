@@ -597,26 +597,11 @@ fn worker_supports_runtime(
     runtime_versions: &[RuntimeVersion],
     sensor: &Sensor,
 ) -> bool {
-    if let Some(raw) = runtime.execution_config.get("lifecycle") {
-        let Ok(recipe) =
-            serde_json::from_value::<crate::runtime_lifecycle::RuntimeRecipe>(raw.clone())
-        else {
-            return false;
-        };
-        let Ok(digest) = recipe.digest() else {
-            return false;
-        };
-        if worker
-            .capabilities
-            .as_ref()
-            .and_then(|caps| caps.get("runtime_toolchains"))
-            .and_then(|instances| instances.get(&runtime.r#ref))
-            .and_then(|instance| instance.get("digest"))
-            .and_then(|value| value.as_str())
-            != Some(digest.as_str())
-        {
-            return false;
-        }
+    let is_recipe = runtime.execution_config.get("lifecycle").is_some();
+    if is_recipe
+        && crate::runtime_lifecycle::capability_for(worker.capabilities.as_ref(), runtime).is_none()
+    {
+        return false;
     }
     let Some(capabilities) = worker
         .capabilities
@@ -662,7 +647,11 @@ fn worker_supports_runtime(
         .filter_map(|value| value.as_str())
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
-    if advertised_versions.is_empty() {
+    if is_recipe {
+        advertised_versions =
+            crate::runtime_lifecycle::available_versions(worker.capabilities.as_ref(), runtime);
+    }
+    if advertised_versions.is_empty() && !is_recipe {
         advertised_versions.extend(
             capabilities
                 .get("detected_interpreters")
@@ -684,6 +673,13 @@ fn worker_supports_runtime(
     }
     let local_versions = runtime_versions
         .iter()
+        .filter(|version| {
+            crate::runtime_lifecycle::validate_version_mode(
+                &runtime.execution_config,
+                &version.execution_config,
+            )
+            .is_ok()
+        })
         .filter(|version| {
             advertised_versions
                 .iter()

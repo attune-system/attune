@@ -27,6 +27,70 @@ pub enum Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Exact runtime identity is authoritative; aliases only express generic tool
+/// requirements and must never supply another runtime's selected versions.
+pub fn capability_for<'a>(
+    capabilities: Option<&'a serde_json::Value>,
+    runtime: &crate::models::Runtime,
+) -> Option<&'a serde_json::Value> {
+    let recipe: RuntimeRecipe =
+        serde_json::from_value(runtime.execution_config.get("lifecycle")?.clone()).ok()?;
+    let digest = recipe.digest().ok()?;
+    let instance = capabilities?
+        .get("runtime_toolchains")?
+        .get(&runtime.r#ref)?;
+    (instance.get("digest")?.as_str()? == digest).then_some(instance)
+}
+
+pub fn available_versions(
+    capabilities: Option<&serde_json::Value>,
+    runtime: &crate::models::Runtime,
+) -> Vec<String> {
+    capability_for(capabilities, runtime)
+        .and_then(|instance| instance.get("versions")?.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Generic required_runtimes constraints may match any advertised instance.
+pub fn versions_matching_names(capabilities: &serde_json::Value, names: &[String]) -> Vec<String> {
+    capabilities
+        .get("runtime_toolchains")
+        .and_then(|value| value.as_object())
+        .into_iter()
+        .flat_map(|instances| instances.values())
+        .filter(|instance| {
+            instance
+                .get("names")
+                .and_then(|value| value.as_array())
+                .is_some_and(|aliases| {
+                    aliases
+                        .iter()
+                        .filter_map(|value| value.as_str())
+                        .any(|alias| names.iter().any(|name| name == alias))
+                })
+        })
+        .filter_map(|instance| instance.get("versions")?.as_array())
+        .flatten()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// A version cannot replace its parent's execution/admission model.
+pub fn validate_version_mode(
+    parent: &serde_json::Value,
+    version: &serde_json::Value,
+) -> Result<()> {
+    if parent.get("lifecycle").is_some() != version.get("lifecycle").is_some() {
+        return Err(invalid(
+            "Runtime parent and version must use the same lifecycle mode",
+        ));
+    }
+    Ok(())
+}
+
 pub async fn verify_registered_version(
     version: &crate::models::RuntimeVersion,
     environment: &ChildProcessEnvironment,
@@ -270,7 +334,7 @@ impl RuntimeRecipe {
         Ok(())
     }
 
-    fn require_admission(&self, environment: &ChildProcessEnvironment) -> Result<String> {
+    pub fn require_admission(&self, environment: &ChildProcessEnvironment) -> Result<String> {
         if !cfg!(unix) {
             return Err(invalid(
                 "Runtime recipes require Unix process-group supervision",
@@ -366,7 +430,38 @@ impl RuntimeRecipe {
             .and_then(|tool| tools.get(&tool.name))
             .map(|tool| tool.version.clone())
             .ok_or_else(|| invalid("Missing verified primary runtime tool"))?;
-        let pack_dir = pack_dir.canonicalize()?;
+        let existing_pack = match pack_dir.canonicalize() {
+            Ok(path) => Some(path),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && matches!(&source, RuntimeSource::Inline(_)) =>
+            {
+                None
+            }
+            Err(error) => return Err(error.into()),
+        };
+        std::fs::create_dir_all(generation_root)?;
+        if existing_pack.as_ref().is_some_and(|pack| {
+            generation_root
+                .canonicalize()
+                .is_ok_and(|root| root.starts_with(pack))
+        }) {
+            return Err(invalid(
+                "Runtime generation storage must be outside the workload release",
+            ));
+        }
+        let generation = tempfile::Builder::new()
+            .prefix("generation-")
+            .tempdir_in(generation_root)?
+            .keep();
+        let pack_dir = match existing_pack {
+            Some(path) => path,
+            None => {
+                let path = generation.join("input");
+                std::fs::create_dir(&path)?;
+                path
+            }
+        };
         let source_path = match &source {
             RuntimeSource::File(path) => {
                 let path = path.canonicalize()?;
@@ -379,16 +474,6 @@ impl RuntimeRecipe {
             }
             RuntimeSource::Inline(_) => None,
         };
-        std::fs::create_dir_all(generation_root)?;
-        if generation_root.canonicalize()?.starts_with(&pack_dir) {
-            return Err(invalid(
-                "Runtime generation storage must be outside the workload release",
-            ));
-        }
-        let generation = tempfile::Builder::new()
-            .prefix("generation-")
-            .tempdir_in(generation_root)?
-            .keep();
         // Diagnostic ownership only: builders in the trusted profile share a UID.
         // This file never grants reuse, publication, authority, or permission to
         // delete a generation without separate writer-termination evidence.
@@ -739,13 +824,11 @@ impl ProcessGroup {
         #[cfg(not(unix))]
         let _ = pid;
         #[cfg(unix)]
-        if pid != 0 {
-            if unsafe { libc::kill(-(pid as i32), libc::SIGKILL) } != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    self.0.store(pid, std::sync::atomic::Ordering::Release);
-                    return Err(error.into());
-                }
+        if pid != 0 && unsafe { libc::kill(-(pid as i32), libc::SIGKILL) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                self.0.store(pid, std::sync::atomic::Ordering::Release);
+                return Err(error.into());
             }
         }
         Ok(())

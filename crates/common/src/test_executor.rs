@@ -32,6 +32,22 @@ pub struct TestConfig {
 }
 
 impl TestConfig {
+    pub fn required_recipe_digests(&self) -> Result<Vec<String>> {
+        let mut digests: Vec<String> = self
+            .runners
+            .values()
+            .filter_map(|runner| runner.lifecycle.as_ref())
+            .map(|recipe| {
+                recipe
+                    .digest()
+                    .map_err(|error| Error::validation(error.to_string()))
+            })
+            .collect::<Result<_>>()?;
+        digests.sort();
+        digests.dedup();
+        Ok(digests)
+    }
+
     pub fn validate_policy(&self) -> Result<()> {
         if self
             .min_pass_rate
@@ -362,6 +378,8 @@ impl TestExecutor {
         python_interpreter: Option<&Path>,
     ) -> Result<TestSuiteResult> {
         let start_time = Instant::now();
+        let suite_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(runner_config.timeout.unwrap_or(300));
 
         let entry_point =
             confined_test_entrypoint(pack_dir, &runner_config.entry_point).map_err(|_| {
@@ -383,14 +401,18 @@ impl TestExecutor {
                     "Runtime test preparation requires an operator-owned generation root",
                 )
             })?;
-            let preparation = recipe.prepare(
-                pack_dir,
-                crate::runtime_lifecycle::RuntimeSource::File(&entry_point),
-                root,
-                &self.lifecycle_environment,
+            let preparation = tokio::time::timeout_at(
+                suite_deadline,
+                recipe.prepare(
+                    pack_dir,
+                    crate::runtime_lifecycle::RuntimeSource::File(&entry_point),
+                    root,
+                    &self.lifecycle_environment,
+                ),
             );
             Some(tokio::select! {
-                result = preparation => result.map_err(|error| Error::validation(error.to_string()))?,
+                result = preparation => result.map_err(|_| Error::Timeout("Runtime test preparation exceeded runner timeout".into()))?
+                    .map_err(|error| Error::validation(error.to_string()))?,
                 _ = self.cancellation.cancelled() => return Err(Error::validation("Runtime test preparation cancelled")),
             })
         } else {
@@ -457,7 +479,8 @@ impl TestExecutor {
             .as_ref()
             .map(|recipe| timeout_seconds.min(recipe.launch.timeout_seconds))
             .unwrap_or(timeout_seconds);
-        let timeout_duration = Duration::from_secs(timeout_seconds);
+        let timeout_duration = Duration::from_secs(timeout_seconds)
+            .min(suite_deadline.saturating_duration_since(tokio::time::Instant::now()));
         let outcome = if target.is_some() {
             self.run_command_prepared(
                 &command,

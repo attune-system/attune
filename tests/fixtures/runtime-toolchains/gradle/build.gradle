@@ -1,0 +1,6 @@
+plugins { id 'java' }
+
+jar {
+    archiveFileName = 'app.jar'
+    manifest { attributes 'Main-Class': 'Main' }
+}

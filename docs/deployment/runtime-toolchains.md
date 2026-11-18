@@ -30,6 +30,10 @@ new operator admission. A name filter may narrow the selected runtimes; it canno
 grant recipe admission. Required tools are actually probed before the instance is
 advertised under `worker.capabilities.runtime_toolchains`. Placement checks the
 owner-qualified runtime ref and exact recipe digest, rather than an alias alone.
+Verified versions are scoped to that same ref and digest. Shared aliases cannot
+borrow another recipe's or a legacy interpreter's versions. Registered versions
+must retain their parent's lifecycle mode. An admitted alternate version can be
+available even when the parent's default executable is absent.
 
 Agents still report their bootstrap interpreter inventory, but no longer turn that
 inventory into an automatic name filter. After connecting, they can discover any
@@ -45,7 +49,8 @@ See [Bun](../../packs/core/runtimes/bun.yaml),
 [optional PyPy](../../packs/core/runtimes/pypy.yaml). Gradle and GraalVM templates
 are [build examples](../examples/runtime-gradle.yaml) and
 [native-output examples](../examples/runtime-native-image.yaml), not installed
-toolchain images or claims of tested compatibility.
+toolchain images. Representative fixtures have passed command checks on Linux
+AMD64; each workload still needs validation in its provisioned pool.
 
 `tools` declares names, candidate binaries, argument arrays, a regex with a named
 `version` capture, and exactly one `primary` tool. Auxiliary versions remain
@@ -55,6 +60,8 @@ versions; invocation rechecks the selected primary version and fails on drift.
 action runtime selection remains authoritative. `workspace: true` provides an
 owned writable copy of the workload release, including source-relative imports.
 Symlinks/special files in copied inputs fail; copies have bounded file/byte counts.
+Ad hoc recipe actions use private inline files; when no pack exists, preparation
+creates an empty input root inside the private generation.
 
 `prepare` is an ordered list of commands. `when_file_exists` is a contained
 pack-relative regular file condition; missing required files should be enforced
@@ -104,6 +111,9 @@ Commands have bounded duration and captured output; setup/probe output is not
 copied into error diagnostics. Unix commands own process groups, including
 package-manager/compiler descendants. This is trusted-code supervision, not
 containment of processes that deliberately escape their group.
+Action and candidate-runner timeouts cover discovery, preparation, and invocation
+as one budget. Preparation expiry and cancellation preserve their terminal status
+and retain uncertain private files.
 
 Normal completed workloads explicitly remove their owned generation after process
 and output handling and confirmed process-group exit. Surviving or unreaped groups,
@@ -123,6 +133,30 @@ A runner can use `type: runtime` and a `lifecycle` recipe with its existing
 operator admission; the candidate cannot admit its own recipe. Candidate API-effect
 credentials are delivered only to the final test process, never preparation.
 Local CLI pack tests use the same recipe contract and admission settings.
+Candidate dispatch requires every runner recipe digest in the selected worker's
+startup admission capability. Workers still verify admission and required tools
+after downloading and verifying the immutable candidate archive.
+
+Repeatable command-level compatibility checks require Docker, Python, and PyYAML:
+
+```bash
+python3 scripts/test-runtime-toolchains.py deno --image denoland/deno:2.5.6
+python3 scripts/test-runtime-toolchains.py gradle --image gradle:8.14.3-jdk21
+python3 scripts/test-runtime-toolchains.py native_image --image ghcr.io/graalvm/native-image-community:25.0.1 --memory 6g
+```
+
+The runner uses an unprivileged UID, an owned writable directory, a read-only
+container root, and disabled networking. These test actual recipe commands and
+local imports/resources; they do not replace Attune admission and service tests.
+The fixtures also cover Bun, both uv modes, and PyPy with uv-provisioned images.
+GraalVM directs JVM temporary compiler helpers into owned scratch, where executing
+them is permitted; an unrelated system `/tmp` mount need not allow execution.
+
+The full-stack runner's `--runtime-lifecycle` flag admits fixed test-only recipes
+and adds components to an owned copy of core before bootstrap. It refuses
+`--no-startup`, retains staged inputs until teardown, and never changes the shipped
+core directory. CI uses it to test released/inline actions, preparation timeout,
+sensor events, and admitted/rejected candidate dispatch through the HTTP API.
 
 Compose's optional `toolchains` profile adds `worker-toolchains`, injecting the
 normal agent into an image with Python, Node, Bun, and uv. It admits no recipe by

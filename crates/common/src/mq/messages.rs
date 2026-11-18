@@ -689,6 +689,9 @@ pub struct PackTestRequestedPayload {
     /// test runner config, e.g. python for unittest/pytest runners)
     #[serde(default)]
     pub required_runtimes: Vec<String>,
+    /// Exact operator-admitted recipes needed by explicit lifecycle test runners.
+    #[serde(default)]
+    pub required_recipe_digests: Vec<String>,
     /// Mandatory pack-level placement constraints selected by the executor.
     #[serde(default = "default_json_object")]
     pub worker_selector: serde_json::Value,

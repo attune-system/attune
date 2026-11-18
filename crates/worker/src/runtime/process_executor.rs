@@ -493,6 +493,7 @@ pub async fn execute_streaming_cancellable(
         stdout_log_writer,
         stderr_log_writer,
         false,
+        None,
     )
     .await
 }
@@ -503,7 +504,7 @@ pub async fn execute_streaming_recipe(
     cmd: Command,
     _secrets: &HashMap<String, serde_json::Value>,
     parameters_stdin: Option<&str>,
-    timeout_secs: Option<u64>,
+    deadline: TokioInstant,
     max_stdout_bytes: usize,
     max_stderr_bytes: usize,
     output_format: OutputFormat,
@@ -515,6 +516,12 @@ pub async fn execute_streaming_recipe(
     stdout_log_writer: Option<BoundedLogFileWriter>,
     stderr_log_writer: Option<BoundedLogFileWriter>,
 ) -> RuntimeResult<ExecutionResult> {
+    let remaining = deadline.saturating_duration_since(TokioInstant::now());
+    let timeout_secs = Some(
+        remaining
+            .as_secs()
+            .saturating_add(u64::from(remaining.subsec_nanos() > 0)),
+    );
     execute_streaming_with_ownership(
         cmd,
         _secrets,
@@ -531,6 +538,7 @@ pub async fn execute_streaming_recipe(
         stdout_log_writer,
         stderr_log_writer,
         true,
+        Some(deadline),
     )
     .await
 }
@@ -552,6 +560,7 @@ async fn execute_streaming_with_ownership(
     stdout_log_writer: Option<BoundedLogFileWriter>,
     stderr_log_writer: Option<BoundedLogFileWriter>,
     require_group_exit: bool,
+    deadline_override: Option<TokioInstant>,
 ) -> RuntimeResult<ExecutionResult> {
     let start = Instant::now();
     // Reject a mismatched executable policy before any child output can escape.
@@ -563,8 +572,10 @@ async fn execute_streaming_with_ownership(
     .resolve(out_schema, output_format)
     .map_err(|error| RuntimeError::InvalidAction(error.to_string()))?;
     let delay_action_mirror = action_output_requires_delayed_mirror(output_policy);
-    let execution_deadline = timeout_secs
-        .and_then(|seconds| TokioInstant::now().checked_add(Duration::from_secs(seconds)));
+    let execution_deadline = deadline_override.or_else(|| {
+        timeout_secs
+            .and_then(|seconds| TokioInstant::now().checked_add(Duration::from_secs(seconds)))
+    });
     let log_finalization_timeout_ms = stdout_log_writer
         .as_ref()
         .map(BoundedLogFileWriter::finalization_timeout_ms)

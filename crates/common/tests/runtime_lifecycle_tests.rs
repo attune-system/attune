@@ -44,6 +44,66 @@ fn fixture() -> (tempfile::TempDir, RuntimeRecipe) {
     (root, recipe)
 }
 
+#[test]
+fn recipe_versions_never_fall_back_to_another_owner_or_legacy_alias() {
+    use attune_common::runtime_lifecycle::{available_versions, validate_version_mode};
+    let (_, recipe) = fixture();
+    let mut runtime: attune_common::models::Runtime = serde_json::from_value(serde_json::json!({
+        "id":1,"ref":"a.python","pack":null,"pack_ref":"a","description":null,
+        "name":"Python","aliases":["python"],"distributions":{},"installation":null,"installers":{},
+        "execution_config":{"lifecycle":recipe},"auto_detected":false,"detection_config":{},
+        "retired_at":null,"created":chrono::Utc::now(),"updated":chrono::Utc::now()
+    }))
+    .unwrap();
+    let digest = recipe.digest().unwrap();
+    let capabilities = serde_json::json!({
+        "runtime_versions":{"python":["99.0"]},
+        "detected_interpreters":[{"name":"python","version":"99.0"}],
+        "runtime_toolchains":{
+            "a.python":{"digest":digest,"versions":["3.11"],"names":["python"]},
+            "b.python":{"digest":digest,"versions":["3.12"],"names":["python"]}
+        }
+    });
+    assert_eq!(available_versions(Some(&capabilities), &runtime), ["3.11"]);
+    runtime.r#ref = "b.python".into();
+    assert_eq!(available_versions(Some(&capabilities), &runtime), ["3.12"]);
+    runtime.r#ref = "absent.python".into();
+    assert!(available_versions(Some(&capabilities), &runtime).is_empty());
+    runtime.r#ref = "a.python".into();
+    runtime.execution_config["lifecycle"]["env"] = serde_json::json!({"APP_REGION":"changed"});
+    assert!(available_versions(Some(&capabilities), &runtime).is_empty());
+    assert!(validate_version_mode(
+        &runtime.execution_config,
+        &serde_json::json!({"interpreter":{"binary":"python3"}})
+    )
+    .is_err());
+    assert!(validate_version_mode(&serde_json::json!({}), &runtime.execution_config).is_err());
+    assert!(validate_version_mode(&runtime.execution_config, &runtime.execution_config).is_ok());
+}
+
+#[tokio::test]
+async fn inline_recipe_owns_an_empty_input_root_when_no_pack_exists() {
+    let (root, recipe) = fixture();
+    let target = recipe
+        .prepare(
+            &root.path().join("missing-ad-hoc-pack"),
+            RuntimeSource::Inline("#!/bin/sh\nprintf inline-ok\n"),
+            &root.path().join("generations"),
+            &environment(&recipe),
+        )
+        .await
+        .unwrap();
+    assert!(target.generation.join("input").is_dir());
+    assert!(!root.path().join("missing-ad-hoc-pack").exists());
+    let output = tokio::process::Command::new(&target.command[0])
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"inline-ok");
+    target.cleanup().await.unwrap();
+}
+
 #[tokio::test]
 async fn runtime_generation_teardown_requires_confirmed_process_group_exit() {
     use attune_common::runtime_lifecycle::stop_owned_process_group;
@@ -325,6 +385,26 @@ fn bundled_toolchain_recipes_validate_and_hash_canonically() {
 }
 
 #[test]
+fn service_smoke_operator_digests_match_the_complete_canonical_recipe() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/runtime-services");
+    for name in ["fixture", "slow_fixture"] {
+        let definition: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join(format!("{name}.json"))).unwrap())
+                .unwrap();
+        let value = &definition["execution_config"]["lifecycle"];
+        let recipe: RuntimeRecipe = serde_json::from_value(value.clone()).unwrap();
+        recipe.validate().unwrap();
+        assert_eq!(*value, serde_json::to_value(&recipe).unwrap());
+        assert_eq!(
+            recipe.digest().unwrap(),
+            std::fs::read_to_string(root.join(format!("{name}.sha256")))
+                .unwrap()
+                .trim()
+        );
+    }
+}
+
+#[test]
 fn caller_environment_admission_is_bound_to_the_recipe_digest() {
     let (_, mut recipe) = fixture();
     let digest = recipe.digest().unwrap();
@@ -455,4 +535,52 @@ async fn candidate_runner_uses_shared_preparation_and_only_final_effect_credenti
     assert_eq!(result.passed, 1);
     assert_eq!(result.failed, 0);
     assert_eq!(std::fs::read_dir(generations).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn candidate_runner_timeout_includes_preparation_and_quarantines_target() {
+    use attune_common::test_executor::{DiscoveryConfig, RunnerConfig, TestConfig, TestExecutor};
+    let (root, mut recipe) = fixture();
+    let pack = root.path().join("pack");
+    std::fs::create_dir(&pack).unwrap();
+    executable(
+        &pack.join("test.nova"),
+        "#!/bin/sh\nprintf 'should-not-launch'\n",
+    );
+    recipe.prepare[0].command = vec!["/bin/sleep".into(), "30".into()];
+    let generations = root.path().join("generations");
+    let executor = TestExecutor::new(root.path().into())
+        .with_runtime_lifecycle(environment(&recipe), generations.clone());
+    let config = TestConfig {
+        enabled: true,
+        candidate_api_effects: false,
+        discovery: DiscoveryConfig {
+            method: "explicit".into(),
+            path: None,
+        },
+        runners: std::collections::HashMap::from([(
+            "fixture".into(),
+            RunnerConfig {
+                lifecycle: Some(recipe),
+                r#type: "runtime".into(),
+                entry_point: "test.nova".into(),
+                timeout: Some(1),
+                result_format: None,
+            },
+        )]),
+        result_format: None,
+        result_path: None,
+        min_pass_rate: None,
+        on_failure: Some("block".into()),
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        executor.execute_pack_tests_at(&pack, "example", "1.0.0", &config),
+    )
+    .await
+    .expect("Preparation ignored runner timeout")
+    .unwrap();
+    executor.process_owner().shutdown().await;
+    assert!(!config.accepts_result(&result));
+    assert_eq!(std::fs::read_dir(generations).unwrap().count(), 1);
 }

@@ -108,6 +108,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry
 COPY docker/ ./docker/
 COPY packaging/ ./packaging/
 COPY packs/ ./packs/
+COPY docs/examples/runtime-gradle.yaml docs/examples/runtime-native-image.yaml ./docs/examples/
+COPY tests/fixtures/runtime-services/ ./tests/fixtures/runtime-services/
 
 FROM debian:${DEBIAN_VERSION}-slim AS runtime
 
@@ -129,6 +131,8 @@ COPY --from=builder /build/migrations ./migrations
 COPY --from=builder /build/docker ./docker
 COPY --from=builder /build/packaging ./packaging
 COPY --from=builder /build/packs ./packs
+COPY --from=builder /build/docs/examples ./docs/examples
+COPY --from=builder /build/tests/fixtures/runtime-services ./tests/fixtures/runtime-services
 COPY --from=builder /build/docker-compose.yaml ./docker-compose.yaml
 COPY --from=builder /build/config.test.yaml ./config.test.yaml
 

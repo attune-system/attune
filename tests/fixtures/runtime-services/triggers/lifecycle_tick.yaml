@@ -1,0 +1,7 @@
+ref: core.lifecycle_tick
+label: Recipe sensor event fixture
+enabled: true
+type: lifecycle_fixture
+parameters: {}
+output:
+  message: {type: string, required: true}

@@ -1,0 +1,38 @@
+bun:
+  recipe: packs/core/runtimes/bun.yaml
+  source: actions/main.ts
+  setup: [[bun, install, --ignore-scripts, --no-env-file]]
+  discard: [node_modules]
+python_uv:
+  recipe: packs/core/runtimes/python_uv.yaml
+  inputs: python
+  source: actions/main.py
+python_uv_project:
+  recipe: packs/core/runtimes/python_uv_project.yaml
+  inputs: python
+  source: actions/main.py
+  setup: [[uv, lock, --offline, --python, '{tool_python}']]
+pypy:
+  recipe: packs/core/runtimes/pypy.yaml
+  inputs: python
+  source: actions/main.py
+deno:
+  recipe: packs/core/runtimes/deno.yaml
+  source: actions/main.ts
+  setup: [[deno, install, --entrypoint, --lock=deno.lock, actions/main.ts]]
+  checks:
+    - command: ['{tool_deno}', run, --cached-only, --frozen-lockfile, --no-prompt, actions/denied.ts]
+      stdout: "permission-denied\n"
+gradle:
+  recipe: docs/examples/runtime-gradle.yaml
+  source: src/main/java/Main.java
+native_image:
+  recipe: docs/examples/runtime-native-image.yaml
+  inputs: gradle
+  source: app.jar
+  setup:
+    - [mkdir, -p, classes/META-INF/native-image/fixture/app]
+    - [javac, -d, classes, src/main/java/Main.java]
+    - [cp, src/main/resources/message.txt, classes/message.txt]
+    - [cp, resource-config.json, classes/META-INF/native-image/fixture/app/resource-config.json]
+    - [jar, --create, --file, app.jar, --main-class, Main, -C, classes, .]

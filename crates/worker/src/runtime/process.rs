@@ -162,6 +162,7 @@ impl ProcessRuntime {
         context: ExecutionContext,
         recipe: attune_common::runtime_lifecycle::RuntimeRecipe,
     ) -> RuntimeResult<ExecutionResult> {
+        let started = std::time::Instant::now();
         use attune_common::runtime_lifecycle::RuntimeSource;
         if context.parameter_delivery != super::ParameterDelivery::Stdin
             || context.parameter_format != super::ParameterFormat::Json
@@ -170,6 +171,10 @@ impl ProcessRuntime {
                 "Toolchain actions require stdin JSON parameters".into(),
             ));
         }
+        let timeout_seconds = context.timeout.unwrap_or(recipe.launch.timeout_seconds);
+        let deadline = tokio::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(timeout_seconds))
+            .ok_or_else(|| RuntimeError::InvalidAction("Invalid toolchain timeout".into()))?;
         let pack_dir = context.working_dir.clone().unwrap_or_else(|| {
             self.packs_base_dir
                 .join(self.extract_pack_ref(&context.action_ref))
@@ -181,14 +186,30 @@ impl ProcessRuntime {
             _ => RuntimeSource::File(&action_file),
         };
         let root = self.runtime_envs_dir.join("lifecycle-generations");
-        let preparation = recipe.prepare(&pack_dir, source, &root, &self.child_environment);
+        let preparation = tokio::time::timeout_at(
+            deadline,
+            recipe.prepare(&pack_dir, source, &root, &self.child_environment),
+        );
         let target = if let Some(token) = &context.cancel_token {
             tokio::select! {
+                biased;
+                _ = token.cancelled() => return Ok(ExecutionResult::failure(-1, String::new(),
+                    "Runtime preparation cancelled; generation quarantined".into(), started.elapsed().as_millis() as u64)),
                 result = preparation => result,
-                _ = token.cancelled() => return Err(RuntimeError::SetupError("Runtime preparation cancelled; generation quarantined".into())),
             }
-        } else { preparation.await }
-            .map_err(|error| RuntimeError::SetupError(error.to_string()))?;
+        } else {
+            preparation.await
+        };
+        let target = match target {
+            Ok(result) => result.map_err(|error| RuntimeError::SetupError(error.to_string()))?,
+            Err(_) => {
+                let mut result = ExecutionResult::failure(-1, String::new(),
+                    format!("Runtime preparation exceeded execution timeout of {timeout_seconds} seconds; generation quarantined"),
+                    started.elapsed().as_millis() as u64);
+                result.timed_out = true;
+                return Ok(result);
+            }
+        };
         if let Some(expected) = &context.selected_runtime_version {
             if let Err(error) = target.validate_selected_version(expected) {
                 target
@@ -221,18 +242,20 @@ impl ProcessRuntime {
             .args(&target.command[1..])
             .current_dir(&target.working_dir);
         parameter_passing::apply_runtime_environment(&mut command, &env, &self.child_environment);
+        let mut input_roots = vec![target.generation.as_path()];
+        if pack_dir.is_dir() {
+            input_roots.push(pack_dir.as_path());
+        }
         let command = self
             .child_environment
-            .sandbox_workload(command.into_std(), &[&pack_dir, &target.generation])?;
+            .sandbox_workload(command.into_std(), &input_roots)?;
         let result = process_executor::execute_streaming_recipe(
             Command::from(command),
             &HashMap::new(),
             prepared.stdin_content(),
-            Some(
-                context
-                    .timeout
-                    .unwrap_or(recipe.launch.timeout_seconds)
-                    .min(recipe.launch.timeout_seconds),
+            deadline.min(
+                tokio::time::Instant::now()
+                    + std::time::Duration::from_secs(recipe.launch.timeout_seconds),
             ),
             context.max_stdout_bytes,
             context.max_stderr_bytes,
@@ -1675,6 +1698,174 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("not admitted"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recipe_timeout_includes_preparation_and_does_not_launch() {
+        let root = TempDir::new().unwrap();
+        let recipe: attune_common::runtime_lifecycle::RuntimeRecipe = serde_json::from_value(serde_json::json!({
+            "tools":[{"name":"fixture","binaries":["/bin/sh"],"args":["-c","printf 1"],"version_pattern":"(?<version>1)","primary":true}],
+            "extensions":["sh"],"prepare":[{"command":["/bin/sleep","30"]}],
+            "launch":{"command":["{tool_fixture}","{source_file}"]}
+        })).unwrap();
+        let environment =
+            attune_common::child_process_environment::ChildProcessEnvironment::from_parent(
+                [(
+                    "ATTUNE_RUNTIME_RECIPE_DIGESTS".into(),
+                    recipe.digest().unwrap().into(),
+                )],
+                &[],
+            )
+            .unwrap();
+        let runtime = ProcessRuntime::new(
+            "fixture".into(),
+            RuntimeExecutionConfig {
+                lifecycle: Some(recipe),
+                ..Default::default()
+            },
+            root.path().into(),
+            root.path().join("generations"),
+        )
+        .with_child_environment(environment);
+        let mut context = ExecutionContext::test_context(
+            "adhoc.action".into(),
+            Some("printf should-not-launch".into()),
+        );
+        context.timeout = Some(1);
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), runtime.execute(context))
+                .await
+                .expect("Preparation ignored action timeout");
+        let result = result.unwrap();
+        assert!(result.timed_out);
+        assert!(!result.is_success());
+        assert_eq!(
+            std::fs::read_dir(root.path().join("generations/lifecycle-generations"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recipe_launch_uses_only_the_remaining_execution_budget() {
+        let root = TempDir::new().unwrap();
+        let recipe: attune_common::runtime_lifecycle::RuntimeRecipe = serde_json::from_value(serde_json::json!({
+            "tools":[{"name":"fixture","binaries":["/bin/sh"],"args":["-c","printf 1"],"version_pattern":"(?<version>1)","primary":true}],
+            "extensions":["sh"],"prepare":[{"command":["/bin/sleep","0.6"]}],
+            "launch":{"command":["{tool_fixture}","{source_file}"]}
+        })).unwrap();
+        let environment =
+            attune_common::child_process_environment::ChildProcessEnvironment::from_parent(
+                [(
+                    "ATTUNE_RUNTIME_RECIPE_DIGESTS".into(),
+                    recipe.digest().unwrap().into(),
+                )],
+                &[],
+            )
+            .unwrap();
+        let runtime = ProcessRuntime::new(
+            "fixture".into(),
+            RuntimeExecutionConfig {
+                lifecycle: Some(recipe),
+                ..Default::default()
+            },
+            root.path().into(),
+            root.path().join("generations"),
+        )
+        .with_child_environment(environment);
+        let mut context = ExecutionContext::test_context(
+            "adhoc.action".into(),
+            Some("exec /bin/sleep 0.6".into()),
+        );
+        context.timeout = Some(1);
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), runtime.execute(context))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            result.timed_out,
+            "Preparation and launch each received a fresh timeout budget"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Linux bubblewrap and unprivileged namespaces"]
+    async fn sandbox_recipe_inline_uses_owned_inputs_and_private_writable_tmp() {
+        let root = TempDir::new().unwrap();
+        let recipe:attune_common::runtime_lifecycle::RuntimeRecipe = serde_json::from_value(serde_json::json!({
+            "tools":[{"name":"fixture","binaries":["/bin/sh"],"args":["-c","printf 1"],"version_pattern":"(?<version>1)","primary":true}],
+            "extensions":["sh"],"launch":{"command":["{tool_fixture}","{source_file}"]}
+        })).unwrap();
+        let environment =
+            attune_common::child_process_environment::ChildProcessEnvironment::from_parent(
+                [
+                    ("PATH".into(), "/usr/bin:/bin".into()),
+                    (
+                        "ATTUNE_RUNTIME_RECIPE_DIGESTS".into(),
+                        recipe.digest().unwrap().into(),
+                    ),
+                ],
+                &[],
+            )
+            .unwrap()
+            .with_workload_sandbox(attune_common::workload_sandbox::WorkloadSandbox::Bubblewrap);
+        let runtime = ProcessRuntime::new(
+            "fixture".into(),
+            RuntimeExecutionConfig {
+                lifecycle: Some(recipe),
+                ..Default::default()
+            },
+            root.path().join("missing-packs"),
+            root.path().join("generations"),
+        )
+        .with_child_environment(environment);
+        let context = ExecutionContext::test_context("adhoc.action".into(), Some("test \"$TMPDIR\" = /tmp && file=$(mktemp) && printf writable > \"$file\" && cat \"$file\"".into()));
+        let result = runtime.execute(context).await.unwrap();
+        assert!(result.is_success(), "{}", result.stderr);
+        assert_eq!(result.stdout, "writable");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recipe_cancelled_preparation_retains_cancelled_terminal_result() {
+        let root = TempDir::new().unwrap();
+        let recipe:attune_common::runtime_lifecycle::RuntimeRecipe = serde_json::from_value(serde_json::json!({
+            "tools":[{"name":"fixture","binaries":["/bin/sh"],"args":["-c","printf 1"],"version_pattern":"(?<version>1)","primary":true}],
+            "launch":{"command":["{tool_fixture}","{source_file}"]}
+        })).unwrap();
+        let environment =
+            attune_common::child_process_environment::ChildProcessEnvironment::from_parent(
+                [(
+                    "ATTUNE_RUNTIME_RECIPE_DIGESTS".into(),
+                    recipe.digest().unwrap().into(),
+                )],
+                &[],
+            )
+            .unwrap();
+        let runtime = ProcessRuntime::new(
+            "fixture".into(),
+            RuntimeExecutionConfig {
+                lifecycle: Some(recipe),
+                ..Default::default()
+            },
+            root.path().into(),
+            root.path().join("generations"),
+        )
+        .with_child_environment(environment);
+        let mut context =
+            ExecutionContext::test_context("adhoc.action".into(), Some("exit 0".into()));
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+        context.cancel_token = Some(cancellation);
+        let result = runtime.execute(context).await.unwrap();
+        assert!(!result.timed_out);
+        assert!(!result.is_success());
+        assert!(result.error.unwrap().contains("cancelled"));
     }
 
     fn make_shell_config() -> RuntimeExecutionConfig {
