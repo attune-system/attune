@@ -11,6 +11,9 @@ use crate::{
 use chrono::{DateTime, Utc};
 use sqlx::{types::Json, PgPool, Postgres, Transaction};
 
+mod action;
+pub use action::ClaimedActionSource;
+
 const ENROLLMENT_COLUMNS:&str="id,profile,identity,worker_name,generation,expires_at,revoked_at,worker,instance,custody_instance,registration_generation";
 #[derive(sqlx::FromRow)]
 struct Enrollment {

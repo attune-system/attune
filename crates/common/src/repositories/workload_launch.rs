@@ -19,12 +19,23 @@ use crate::{
     workload_launch_state::LaunchOperation, Error, Result,
 };
 
+mod artifact;
 mod output;
+pub use artifact::ArtifactAllocation;
 pub use output::{LaunchOutputCleanup, OutputBodyPermit};
 
 const COLUMNS: &str = "id,engine,image,owner,manifest,admitted_digest,encrypted_context,source_epochs,operation,dispatch_hash,lease_hash,controller";
 fn denied() -> Error {
     Error::PermissionDenied("Workload launch unavailable".into())
+}
+fn same_input(left: Option<&str>, right: Option<&str>) -> Result<bool> {
+    match (left, right) {
+        (None, None) => Ok(true),
+        (Some(left), Some(right)) => Ok(serde_json::from_str::<serde_json::Value>(left)
+            .map_err(|_| denied())?
+            == serde_json::from_str::<serde_json::Value>(right).map_err(|_| denied())?),
+        _ => Ok(false),
+    }
 }
 fn credential_hash(token: &LaunchToken) -> String {
     Sha256Digest::of_bytes(token.as_str().as_bytes())
@@ -80,6 +91,9 @@ struct FrozenContext {
     purpose: LaunchPurpose,
     target: LaunchTarget,
     invocation: LaunchInvocation,
+    // Private selected input is authenticated by the randomized ciphertext
+    // reference. It is never embedded in a public input archive or plan hash.
+    stdin_json: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -101,6 +115,23 @@ pub struct RuntimeStageBinding {
     pub pack_sha256: Sha256Digest,
     pub configuration_ciphertext_sha256: Sha256Digest,
     pub runtime_definition_sha256: Sha256Digest,
+}
+#[derive(sqlx::FromRow)]
+struct ActionAdmission {
+    id: i64,
+    source_target: Json<LaunchTarget>,
+    image: i64,
+    source_epochs: Json<Vec<SourceEpoch>>,
+    artifact_limits: Json<crate::workload_artifact::ArtifactLimits>,
+    expires_at: DateTime<Utc>,
+    revoked_at: Option<DateTime<Utc>>,
+}
+#[derive(sqlx::FromRow)]
+struct PrerequisiteSource {
+    source_target: Json<LaunchTarget>,
+    source_epochs: Json<Vec<SourceEpoch>>,
+    image: i64,
+    expires_at: DateTime<Utc>,
 }
 struct SourceProof {
     sources: Vec<(&'static str, i64)>,
@@ -393,8 +424,10 @@ impl WorkloadLaunchRepository {
                 } else {
                     "runtime_probe"
                 };
-                let source: Option<(Json<LaunchTarget>,Json<Vec<SourceEpoch>>,i64)>=sqlx::query_as("SELECT source_target,source_epochs,image FROM workload_launch_prerequisite WHERE id=$1 AND attempt=$2 AND purpose=$3 AND revoked_at IS NULL AND expires_at>clock_timestamp() FOR SHARE")
-                    .bind(admission).bind(attempt).bind(purpose).fetch_optional(&mut **tx).await?;
+                // Resolve immutable source identity without taking an admission
+                // lock ahead of its owner/execution/worker source locks.
+                let source: Option<(Json<LaunchTarget>,Json<Vec<SourceEpoch>>,i64)>=sqlx::query_as("SELECT source_target,source_epochs,image FROM workload_launch_prerequisite WHERE id=$1 AND attempt=$2 AND purpose=$3 AND revoked_at IS NULL AND ($4 OR expires_at>clock_timestamp())")
+                    .bind(admission).bind(attempt).bind(purpose).bind(allow_canceling).fetch_optional(&mut **tx).await?;
                 let (source, epochs, image) = source.ok_or_else(denied)?;
                 let source = source.0;
                 if matches!(
@@ -410,17 +443,24 @@ impl WorkloadLaunchRepository {
                     allow_canceling,
                 ))
                 .await?;
-                let deadline: DateTime<Utc> = sqlx::query_scalar(
-                    "SELECT expires_at FROM workload_launch_prerequisite WHERE id=$1",
-                )
-                .bind(admission)
-                .fetch_one(&mut **tx)
-                .await?;
-                sources.deadline = Some(
-                    sources
-                        .deadline
-                        .map_or(deadline, |existing| existing.min(deadline)),
-                );
+                let locked: Option<PrerequisiteSource> = sqlx::query_as(
+                    "SELECT source_target,source_epochs,image,expires_at FROM workload_launch_prerequisite WHERE id=$1 AND attempt=$2 AND purpose=$3 AND revoked_at IS NULL AND ($4 OR expires_at>clock_timestamp()) FOR SHARE",
+                ).bind(admission).bind(attempt).bind(purpose).bind(allow_canceling).fetch_optional(&mut **tx).await?;
+                let locked = locked.ok_or_else(denied)?;
+                let deadline = locked.expires_at;
+                if locked.source_target.0 != source
+                    || locked.source_epochs.0 != epochs.0
+                    || locked.image != image
+                {
+                    return Err(denied());
+                }
+                if !allow_canceling {
+                    sources.deadline = Some(
+                        sources
+                            .deadline
+                            .map_or(deadline, |existing| existing.min(deadline)),
+                    );
+                }
                 sources.sources.push(("admission", *admission));
                 sources.retained = Some(epochs.0);
                 sources.image = Some(image);
@@ -500,6 +540,38 @@ impl WorkloadLaunchRepository {
         }
         sources.sources.push(("image", record.image));
         sources.sources.push(("engine", record.engine));
+        for expected in record
+            .source_epochs
+            .iter()
+            .filter(|epoch| epoch.kind == "admission")
+        {
+            if sources.sources.contains(&("admission", expected.subject)) {
+                continue;
+            }
+            let root:ActionAdmission=sqlx::query_as("SELECT id,source_target,image,source_epochs,artifact_limits,expires_at,revoked_at FROM workload_launch_prerequisite WHERE id=$1 AND purpose='action' FOR SHARE")
+                .bind(expected.subject).fetch_optional(&mut **tx).await?.ok_or_else(denied)?;
+            let target = match &record.manifest.target {
+                LaunchTarget::Setup { admission, .. }
+                | LaunchTarget::RuntimeProbe { admission, .. } => {
+                    sqlx::query_scalar::<_, Json<LaunchTarget>>(
+                        "SELECT source_target FROM workload_launch_prerequisite WHERE id=$1",
+                    )
+                    .bind(admission)
+                    .fetch_one(&mut **tx)
+                    .await?
+                    .0
+                }
+                target => target.clone(),
+            };
+            if root.source_target.0 != target
+                || root.image != record.image
+                || root.revoked_at.is_some()
+                || (!capture && root.expires_at <= Self::now(tx).await?)
+            {
+                return Err(denied());
+            }
+            sources.sources.push(("admission", root.id));
+        }
         let epochs = workload_source::snapshot(tx, sources.sources.clone()).await?;
         Self::retained_epochs(&sources, &epochs, record.image, capture)?;
         Ok((epochs, sources.deadline))
@@ -613,6 +685,64 @@ impl WorkloadLaunchRepository {
         }
         Ok(context.invocation)
     }
+    /// Reserve an execution/worker-incarnation admission before any asynchronous
+    /// preparation. A retry may recover this exact record, never rebind it after
+    /// intervening source revocation or reuse it for a replacement worker.
+    pub async fn reserve_action_admission(
+        pool: &PgPool,
+        target: &LaunchTarget,
+        owner: i64,
+        image: i64,
+    ) -> Result<i64> {
+        let mut tx = pool.begin().await?;
+        let id = Self::reserve_action_admission_in(
+            &mut tx,
+            target,
+            owner,
+            image,
+            crate::workload_artifact::ArtifactLimits::default(),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+    pub(crate) async fn reserve_action_admission_in(
+        tx: &mut Transaction<'_, Postgres>,
+        target: &LaunchTarget,
+        owner: i64,
+        image: i64,
+        artifact_limits: crate::workload_artifact::ArtifactLimits,
+    ) -> Result<i64> {
+        crate::workload_artifact::validate_inventory(&[], artifact_limits)?;
+        let attempt = match target {
+            LaunchTarget::Execution { attempt, .. } => *attempt,
+            _ => return Err(denied()),
+        };
+        let mut proof = Self::source(tx, target, owner).await?;
+        let engine:Option<i64>=sqlx::query_scalar("SELECT i.engine FROM workload_execution_image i JOIN workload_engine e ON e.id=i.engine WHERE i.id=$1 AND i.revoked_at IS NULL AND NOT e.disabled AND i.platform=e.platform FOR SHARE OF i,e")
+            .bind(image).fetch_optional(&mut **tx).await?;
+        proof.sources.push(("image", image));
+        proof.sources.push(("engine", engine.ok_or_else(denied)?));
+        let epochs = workload_source::snapshot(tx, proof.sources).await?;
+        let expires = proof.deadline.ok_or_else(denied)?;
+        if expires <= Self::now(tx).await? {
+            return Err(denied());
+        }
+        sqlx::query("INSERT INTO workload_launch_prerequisite(purpose,attempt,source_target,image,source_epochs,expires_at,artifact_limits) VALUES('action',$1,$2,$3,$4,$5,$6) ON CONFLICT(source_target) WHERE purpose='action' DO NOTHING")
+            .bind(attempt).bind(Json(target)).bind(image).bind(Json(&epochs)).bind(expires).bind(Json(artifact_limits)).execute(&mut **tx).await?;
+        let admitted:ActionAdmission=sqlx::query_as("SELECT id,source_target,image,source_epochs,artifact_limits,expires_at,revoked_at FROM workload_launch_prerequisite WHERE purpose='action' AND source_target=$1 FOR SHARE")
+            .bind(Json(target)).fetch_one(&mut **tx).await?;
+        if admitted.image != image
+            || admitted.artifact_limits.0 != artifact_limits
+            || admitted.source_epochs.0 != epochs
+            || admitted.revoked_at.is_some()
+            || admitted.expires_at <= Self::now(tx).await?
+        {
+            return Err(denied());
+        }
+        Ok(admitted.id)
+    }
+
     /// One Setup admission covers the entire selected setup sequence in a
     /// single container; only its settled successful exit can publish a stage.
     /// Probe admissions retain the same immutable source and image boundary.
@@ -691,10 +821,76 @@ impl WorkloadLaunchRepository {
     pub async fn freeze_with_runtime_binding(
         pool: &PgPool,
         image_id: i64,
-        mut spec: LaunchSpec,
+        spec: LaunchSpec,
         master: &str,
         expected_runtime: Option<&RuntimeStageBinding>,
     ) -> Result<ReservedLaunch> {
+        Self::freeze_with_input_binding(pool, image_id, spec, master, expected_runtime, None).await
+    }
+    /// Trusted producer only. The selected stdin (including a Setup helper
+    /// plan) is part of the same immutable encrypted context as the invocation.
+    /// Later ready-input issuance must freshly authorize its recorded sources.
+    pub async fn freeze_with_input_binding(
+        pool: &PgPool,
+        image_id: i64,
+        spec: LaunchSpec,
+        master: &str,
+        expected_runtime: Option<&RuntimeStageBinding>,
+        stdin_json: Option<String>,
+    ) -> Result<ReservedLaunch> {
+        Self::freeze_materialized(
+            pool,
+            image_id,
+            spec,
+            master,
+            expected_runtime,
+            stdin_json,
+            None,
+        )
+        .await
+    }
+    /// Product action producers must retain the exact pre-preparation admission.
+    /// It also fences setup/probe child preparation through their recorded root.
+    pub async fn freeze_admitted_input(
+        pool: &PgPool,
+        admission: i64,
+        image_id: i64,
+        spec: LaunchSpec,
+        master: &str,
+        expected_runtime: Option<&RuntimeStageBinding>,
+        stdin_json: Option<String>,
+    ) -> Result<ReservedLaunch> {
+        Self::freeze_materialized(
+            pool,
+            image_id,
+            spec,
+            master,
+            expected_runtime,
+            stdin_json,
+            Some(admission),
+        )
+        .await
+    }
+    async fn freeze_materialized(
+        pool: &PgPool,
+        image_id: i64,
+        mut spec: LaunchSpec,
+        master: &str,
+        expected_runtime: Option<&RuntimeStageBinding>,
+        stdin_json: Option<String>,
+        admission: Option<i64>,
+    ) -> Result<ReservedLaunch> {
+        if let Some(input) = &stdin_json {
+            if input.len() > 8 * 1024 * 1024
+                || !serde_json::from_str::<serde_json::Value>(input)
+                    .map_err(|_| Error::validation("Invalid admitted stdin JSON"))?
+                    .is_object()
+            {
+                return Err(Error::validation(
+                    "Admitted stdin must be a bounded JSON object",
+                ));
+            }
+        }
         let mut tx = pool.begin().await?;
         let sources = Self::source(
             &mut tx,
@@ -737,7 +933,29 @@ impl WorkloadLaunchRepository {
         let mut sources = sources;
         sources.sources.push(("image", image_id));
         sources.sources.push(("engine", spec.manifest.engine_id));
+        let root: Option<ActionAdmission> = if let Some(admission) = admission {
+            let root:ActionAdmission=sqlx::query_as("SELECT id,source_target,image,source_epochs,artifact_limits,expires_at,revoked_at FROM workload_launch_prerequisite WHERE id=$1 AND purpose='action' FOR SHARE")
+                .bind(admission).fetch_optional(&mut *tx).await?.ok_or_else(denied)?;
+            if root.image != image_id
+                || root.source_target.0 != input_target
+                || root.revoked_at.is_some()
+                || root.expires_at <= Self::now(&mut tx).await?
+            {
+                return Err(denied());
+            }
+            sources.sources.push(("admission", root.id));
+            Some(root)
+        } else {
+            None
+        };
         let epochs = workload_source::snapshot(&mut tx, sources.sources.clone()).await?;
+        if root.as_ref().is_some_and(|root| {
+            root.source_epochs
+                .iter()
+                .any(|expected| !epochs.contains(expected))
+        }) {
+            return Err(denied());
+        }
         Self::retained_epochs(&sources, &epochs, image_id, false)?;
         for input in spec
             .manifest
@@ -823,6 +1041,7 @@ impl WorkloadLaunchRepository {
                 || context.purpose != manifest.purpose
                 || context.target != manifest.target
                 || context.invocation != spec.invocation
+                || !same_input(context.stdin_json.as_deref(), stdin_json.as_deref())?
             {
                 return Err(denied());
             }
@@ -856,6 +1075,7 @@ impl WorkloadLaunchRepository {
             purpose: spec.manifest.purpose,
             target: spec.manifest.target.clone(),
             invocation: spec.invocation.clone(),
+            stdin_json,
         })?;
         let encrypted_context = crypto::encrypt(&plaintext, master)?;
         spec.manifest.context = FrozenContextRef {
@@ -881,6 +1101,20 @@ impl WorkloadLaunchRepository {
         sqlx::query("INSERT INTO workload_launch(id,engine,image,owner,manifest,admitted_digest,encrypted_context,source_epochs,operation,dispatch_hash,encrypted_dispatch) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)")
             .bind(id).bind(spec.manifest.engine_id).bind(image_id).bind(spec.manifest.owner_identity_id).bind(Json(&spec.manifest))
             .bind(operation.status.request.admitted_digest.as_str()).bind(encrypted_context).bind(Json(&epochs)).bind(Json(&operation)).bind(credential_hash(&token)).bind(crypto::encrypt(token.as_str(),master)?).execute(&mut *tx).await?;
+        if matches!(
+            spec.manifest.purpose,
+            LaunchPurpose::Action | LaunchPurpose::Sensor | LaunchPurpose::CandidateTest
+        ) {
+            let limits = root
+                .as_ref()
+                .map_or_else(crate::workload_artifact::ArtifactLimits::default, |root| {
+                    root.artifact_limits.0
+                });
+            crate::workload_artifact::validate_inventory(&[], limits)?;
+            sqlx::query("INSERT INTO workload_artifact_publication(launch,max_total_bytes,max_entries) VALUES($1,$2,$3)")
+                .bind(id).bind(i64::try_from(limits.max_total_bytes).map_err(|_|denied())?)
+                .bind(i64::try_from(limits.max_entries).map_err(|_|denied())?).execute(&mut *tx).await?;
+        }
         tx.commit().await?;
         Ok(ReservedLaunch {
             request: operation.status.request,

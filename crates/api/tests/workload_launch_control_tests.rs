@@ -5,7 +5,7 @@ use attune_common::{
         delegated_execution::DelegatedExecutionRepository,
         execution::ExecutionRepository,
         workload_launch::{ControllerActor, WorkloadLaunchRepository as Ledger},
-        FindById,
+        Create, FindById,
     },
     workload_launch::*,
 };
@@ -127,6 +127,81 @@ impl Fixture {
     }
     async fn reserve(&self) -> Result<ReservedLaunch> {
         Ok(Ledger::freeze(&self.ctx.pool, self.image, self.spec.clone(), self.master()).await?)
+    }
+    async fn running(&self) -> Result<(ReservedLaunch, LaunchLease)> {
+        let reserved = self.reserve().await?;
+        let claim: ClaimedLaunch = self
+            .ok(
+                &reserved,
+                "claim",
+                &reserved.request,
+                LAUNCH_DISPATCH_HEADER,
+                &reserved.dispatch_token,
+            )
+            .await?;
+        let ClaimedLaunch::Active { spec, lease } = claim else {
+            return Err("active claim required".into());
+        };
+        let request = LaunchLeaseRequest {
+            handle: lease.handle.clone(),
+        };
+        let intent: LaunchCreateIntent = self
+            .ok(
+                &reserved,
+                "create-intent",
+                &request,
+                LAUNCH_LEASE_HEADER,
+                &lease.token,
+            )
+            .await?;
+        let resource = EngineResourceEvidence {
+            engine_id: spec.manifest.engine_id,
+            engine_name_nonce: spec.manifest.engine_name_nonce,
+            resource_id: "owned-artifact-fixture".into(),
+            admitted_digest: reserved.request.admitted_digest.clone(),
+            public_manifest_digest: Sha256Digest::of_bytes(b"owned-artifact-policy"),
+        };
+        let _: LaunchStatus = self
+            .ok(
+                &reserved,
+                "observe",
+                &ObserveLaunchRequest {
+                    handle: lease.handle.clone(),
+                    observation: LaunchObservation::Created {
+                        create_nonce: intent.create_nonce,
+                        resource: resource.clone(),
+                    },
+                },
+                LAUNCH_LEASE_HEADER,
+                &lease.token,
+            )
+            .await?;
+        let start: LaunchStartIntent = self
+            .ok(
+                &reserved,
+                "start",
+                &request,
+                LAUNCH_LEASE_HEADER,
+                &lease.token,
+            )
+            .await?;
+        let status: LaunchStatus = self
+            .ok(
+                &reserved,
+                "observe",
+                &ObserveLaunchRequest {
+                    handle: lease.handle.clone(),
+                    observation: LaunchObservation::Started {
+                        start_nonce: start.start_nonce,
+                        resource,
+                    },
+                },
+                LAUNCH_LEASE_HEADER,
+                &lease.token,
+            )
+            .await?;
+        assert_eq!(status.runtime_state, LaunchRuntimeState::Running);
+        Ok((reserved, lease))
     }
     async fn call<T: Serialize>(
         &self,
@@ -1014,6 +1089,288 @@ async fn controller_session_renewal_retains_exact_target_and_rejects_withdrawal(
         )
         .await?;
     assert_eq!(status, StatusCode::FORBIDDEN);
+    fixture.ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn private_stdin_is_bound_to_frozen_context_and_never_returned_to_controller() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let input = String::from("{\"message\":\"owned-private-stdin-value\"}");
+    let reserved = Ledger::freeze_with_input_binding(
+        &fixture.ctx.pool,
+        fixture.image,
+        fixture.spec.clone(),
+        fixture.master(),
+        None,
+        Some(input.clone()),
+    )
+    .await?;
+    let (manifest, encrypted): (String, String) =
+        sqlx::query_as("SELECT manifest::text,encrypted_context FROM workload_launch WHERE id=$1")
+            .bind(reserved.request.launch_id)
+            .fetch_one(&fixture.ctx.pool)
+            .await?;
+    assert!(!manifest.contains("owned-private-stdin-value"));
+    assert!(!encrypted.contains("owned-private-stdin-value"));
+    assert!(
+        !manifest.contains(Sha256Digest::of_bytes(input.as_bytes()).as_str()),
+        "no public plaintext-input digest"
+    );
+    let replay = Ledger::freeze_with_input_binding(
+        &fixture.ctx.pool,
+        fixture.image,
+        fixture.spec.clone(),
+        fixture.master(),
+        None,
+        Some("{ \"message\" : \"owned-private-stdin-value\" }".into()),
+    )
+    .await?;
+    assert_eq!(reserved.request, replay.request);
+    assert!(Ledger::freeze_with_input_binding(
+        &fixture.ctx.pool,
+        fixture.image,
+        fixture.spec.clone(),
+        fixture.master(),
+        None,
+        Some("{\"message\":\"changed\"}".into())
+    )
+    .await
+    .is_err());
+    let (status, body) = fixture
+        .call(
+            reserved.request.launch_id,
+            "claim",
+            &reserved.request,
+            LAUNCH_DISPATCH_HEADER,
+            &reserved.dispatch_token,
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.to_string().contains("owned-private-stdin-value"));
+    fixture.ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn action_preparation_reservation_cannot_revive_after_owner_restoration() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let owner = fixture.spec.manifest.owner_identity_id;
+    let admission = Ledger::reserve_action_admission(
+        &fixture.ctx.pool,
+        &fixture.spec.manifest.target,
+        owner,
+        fixture.image,
+    )
+    .await?;
+    // Preparation has not begun. A complete intervening freeze/restoration
+    // must remain visible to this reservation, even though current IAM allows it.
+    for frozen in [true, false] {
+        sqlx::query("UPDATE identity SET frozen=$2 WHERE id=$1")
+            .bind(owner)
+            .bind(frozen)
+            .execute(&fixture.ctx.pool)
+            .await?;
+    }
+    assert!(Ledger::freeze_admitted_input(
+        &fixture.ctx.pool,
+        admission,
+        fixture.image,
+        fixture.spec.clone(),
+        fixture.master(),
+        None,
+        Some("{}".into()),
+    )
+    .await
+    .is_err());
+    assert!(Ledger::reserve_action_admission(
+        &fixture.ctx.pool,
+        &fixture.spec.manifest.target,
+        owner,
+        fixture.image,
+    )
+    .await
+    .is_err());
+    let launches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workload_launch")
+        .fetch_one(&fixture.ctx.pool)
+        .await?;
+    assert_eq!(launches, 0, "old reservation cannot create a launch");
+    let deletion = sqlx::query("DELETE FROM workload_launch_prerequisite WHERE id=$1")
+        .bind(admission)
+        .execute(&fixture.ctx.pool)
+        .await;
+    assert!(
+        deletion.is_err(),
+        "retention cannot erase reservation evidence"
+    );
+
+    // A different newly admitted execution can use the restored owner. It does
+    // not reuse or mutate the old attempt/idempotency key.
+    let source =
+        helpers::delegated_source::token(&fixture.ctx, owner, &["standard".into()]).await?;
+    let claims = validate_token(&source, &fixture.ctx.state.jwt_config)?;
+    let execution = claims.metadata.unwrap()["execution_id"].as_i64().unwrap();
+    let row = ExecutionRepository::find_by_id(&fixture.ctx.pool, execution)
+        .await?
+        .unwrap();
+    let worker = row.worker.unwrap();
+    let instance = Uuid::new_v4();
+    sqlx::query("UPDATE worker SET meta=COALESCE(meta,'{}'::jsonb)||jsonb_build_object('registration_incarnation',$2::text) WHERE id=$1")
+        .bind(worker).bind(instance.to_string()).execute(&fixture.ctx.pool).await?;
+    let mut tx = fixture.ctx.pool.begin().await?;
+    let attempt = DelegatedExecutionRepository::current_attempt(&mut tx, execution).await?;
+    tx.commit().await?;
+    let target = LaunchTarget::Execution {
+        execution,
+        worker,
+        worker_instance: instance,
+        attempt,
+    };
+    let fresh =
+        Ledger::reserve_action_admission(&fixture.ctx.pool, &target, owner, fixture.image).await?;
+    assert_ne!(admission, fresh);
+    let mut spec = fixture.spec.clone();
+    spec.manifest.target = target;
+    Ledger::freeze_admitted_input(
+        &fixture.ctx.pool,
+        fresh,
+        fixture.image,
+        spec,
+        fixture.master(),
+        None,
+        Some("{}".into()),
+    )
+    .await?;
+    fixture.ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_close_waits_for_file_allocation_and_seals_exact_inventory() -> Result<()> {
+    use attune_common::{
+        models::{
+            ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType,
+            RetentionPolicyType,
+        },
+        repositories::artifact::{
+            ArtifactRepository, ArtifactVersionRepository, CreateArtifactInput,
+        },
+    };
+    let fixture = Fixture::new().await?;
+    let (reserved, _) = fixture.running().await?;
+    let LaunchTarget::Execution { execution, .. } = fixture.spec.manifest.target else {
+        unreachable!()
+    };
+    let artifact = ArtifactRepository::create(
+        &fixture.ctx.pool,
+        CreateArtifactInput {
+            r#ref: format!("owned_{}.file", Uuid::new_v4().simple()),
+            scope: OwnerType::Action,
+            owner: "owned.action".into(),
+            r#type: ArtifactType::FileText,
+            visibility: ArtifactVisibility::Private,
+            classification: ArtifactClassification::General,
+            retention_policy: RetentionPolicyType::Days,
+            retention_limit: 1,
+            name: None,
+            description: None,
+            content_type: None,
+            data: None,
+        },
+    )
+    .await?;
+    let mut allocation_tx = fixture.ctx.pool.begin().await?;
+    let proof = Ledger::authorize_artifact_allocation(
+        &mut allocation_tx,
+        &fixture.spec.manifest.target,
+        fixture.spec.manifest.owner_identity_id,
+    )
+    .await?;
+    let allocator_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *allocation_tx)
+        .await?;
+    let version = ArtifactVersionRepository::create_file_backed_with_conn(
+        &mut allocation_tx,
+        artifact.id,
+        &artifact.r#ref,
+        "text/plain".into(),
+        Some(execution),
+        None,
+        None,
+    )
+    .await?;
+    let app = fixture.ctx.app.clone();
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/api/v1/workload-launches/{}/stop",
+            reserved.request.launch_id
+        ))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {}", fixture.credential))
+        .header(LAUNCH_DISPATCH_HEADER, reserved.dispatch_token.as_str())
+        .body(Body::from(serde_json::to_vec(&StopLaunchRequest {
+            request: reserved.request.clone(),
+            reason: LaunchStopReason::Cancelled,
+        })?))?;
+    let mut stop = tokio::spawn(async move { app.oneshot(request).await });
+    // Observe the actual lock wait, rather than estimating it with a sleep.
+    let waiting =
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let blocked: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))",
+            ).bind(allocator_pid).fetch_one(&fixture.ctx.pool).await?;
+                if blocked {
+                    return Ok::<_, sqlx::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+    if !matches!(waiting, Ok(Ok(()))) {
+        stop.abort();
+        let _ = (&mut stop).await;
+        allocation_tx.rollback().await?;
+        fixture.ctx.cleanup().await?;
+        return Err("Run close did not reach the observed allocation fence".into());
+    }
+    Ledger::bind_artifact_file(&mut allocation_tx, &proof, version.id, 4096).await?;
+    allocation_tx.commit().await?;
+    let response = (&mut stop).await??;
+    assert_eq!(response.status(), StatusCode::OK);
+    let (state, count): (String, i64) = sqlx::query_as(
+        "SELECT p.state,(SELECT COUNT(*) FROM workload_artifact_file f WHERE f.publication=p.id) \
+         FROM workload_artifact_publication p WHERE p.launch=$1",
+    )
+    .bind(reserved.request.launch_id)
+    .fetch_one(&fixture.ctx.pool)
+    .await?;
+    assert_eq!((state.as_str(), count), ("pending", 1));
+    let mut late = fixture.ctx.pool.begin().await?;
+    assert!(Ledger::authorize_artifact_allocation(
+        &mut late,
+        &fixture.spec.manifest.target,
+        fixture.spec.manifest.owner_identity_id
+    )
+    .await
+    .is_err());
+    late.rollback().await?;
+    let status: String = sqlx::query_scalar("SELECT status::text FROM execution WHERE id=$1")
+        .bind(execution)
+        .fetch_one(&fixture.ctx.pool)
+        .await?;
+    assert_eq!(
+        status, "running",
+        "Run closure independently fences new allocation"
+    );
+    let mut later_transaction = fixture.ctx.pool.begin().await?;
+    assert!(
+        Ledger::bind_artifact_file(&mut later_transaction, &proof, version.id, 4096)
+            .await
+            .is_err()
+    );
+    later_transaction.rollback().await?;
     fixture.ctx.cleanup().await?;
     Ok(())
 }

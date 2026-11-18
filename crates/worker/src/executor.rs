@@ -619,7 +619,7 @@ impl ActionExecutor {
         };
         // The immutable contract is shared by validation, capture and redaction.
         let mut context = match self
-            .prepare_execution_context(&execution, &action, &mut preparation)
+            .prepare_execution_context(&execution, &action, &mut preparation, true, None)
             .await
         {
             Ok(ctx) => ctx,
@@ -993,12 +993,70 @@ impl ActionExecutor {
         }
     }
 
+    /// Trusted CP preparation reuses the existing admitted schemas, explicit
+    /// authority selection, input origins, API opt-in and runtime-version rules.
+    /// This performs no pack execution and returns no local capture authority.
+    /// The caller must freeze a CP-selected plan and revalidate the attempt and
+    /// input origins at the later disclosure/effect boundary.
+    pub async fn prepare_control_context(
+        &self,
+        execution_id: i64,
+        attempt: uuid::Uuid,
+    ) -> Result<ExecutionContext> {
+        let worker = self.worker_id.load(Ordering::Acquire);
+        if worker <= 0 || attempt.is_nil() {
+            return Err(Error::PermissionDenied(
+                "Control execution source unavailable".into(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        let execution = ExecutionRepository::find_by_id(&mut *tx, execution_id)
+            .await?
+            .filter(|execution| {
+                execution.worker == Some(worker)
+                    && execution.status == ExecutionStatus::Running
+                    && execution.executable_snapshot.is_some()
+            })
+            .ok_or_else(|| {
+                Error::PermissionDenied("Control execution source unavailable".into())
+            })?;
+        use attune_common::repositories::execution_runtime_admission::{
+            ExecutionAdmissionRepository, ExistingExecutionAuthority,
+        };
+        let current:uuid::Uuid=match ExecutionAdmissionRepository::selected_authority(&mut tx,execution_id).await? {
+            ExistingExecutionAuthority::Delegated=>attune_common::repositories::delegated_execution::DelegatedExecutionRepository::current_attempt(&mut tx,execution_id).await?,
+            ExistingExecutionAuthority::Recorded=>{
+                self.recorded_readiness.require_ready()?;
+                attune_common::repositories::runtime_authority::RuntimeAuthorityRepository::execution_admission(&mut tx,execution_id).await?
+                    .ok_or_else(||Error::PermissionDenied("Recorded execution source unavailable".into()))?;
+                attune_common::repositories::runtime_authority::RuntimeAuthorityRepository::current_worker_attempt(&mut tx,execution_id,worker).await?
+            }
+        };
+        if current != attempt {
+            return Err(Error::PermissionDenied(
+                "Control execution attempt changed".into(),
+            ));
+        }
+        tx.commit().await?;
+        let action = self.load_action(&execution).await?;
+        let mut preparation = ExecutionPreparation {
+            binding: self.schema_binding(execution_id).await?,
+            parameter_secret_paths: None,
+            stdout_path: Arc::new(OnceLock::new()),
+            stderr_path: Arc::new(OnceLock::new()),
+        };
+        self.prepare_execution_context(&execution, &action, &mut preparation, false, Some(attempt))
+            .await
+    }
+
     /// Prepare execution context from execution and action data
     async fn prepare_execution_context(
         &self,
         execution: &Execution,
         action: &Action,
         preparation: &mut ExecutionPreparation,
+        capture_locally: bool,
+        control_attempt: Option<uuid::Uuid>,
     ) -> Result<ExecutionContext> {
         debug!(
             "Preparing execution context for execution: {}",
@@ -1071,11 +1129,19 @@ impl ActionExecutor {
         env.insert("ATTUNE_API_URL".to_string(), self.api_url.clone());
         env.insert(
             "ATTUNE_ARTIFACTS_DIR".to_string(),
-            self.artifacts_dir.to_string_lossy().to_string(),
+            if control_attempt.is_some() {
+                attune_common::workload_artifact::ARTIFACTS_ROOT.into()
+            } else {
+                self.artifacts_dir.to_string_lossy().to_string()
+            },
         );
         env.insert(
             "ATTUNE_RUNTIME_ENVS_DIR".to_string(),
-            self.runtime_envs_dir.to_string_lossy().to_string(),
+            if control_attempt.is_some() {
+                attune_common::workload_launch::RUNTIME_ROOT.into()
+            } else {
+                self.runtime_envs_dir.to_string_lossy().to_string()
+            },
         );
         env.insert("ATTUNE_PACK_REF".to_string(), action.pack_ref.clone());
         if let Some(digest) = execution.pack_release_digest.as_ref() {
@@ -1118,7 +1184,7 @@ impl ActionExecutor {
                     &self.pool,
                     execution,
                     self.worker_id.load(Ordering::SeqCst),
-                    uuid::Uuid::new_v4(),
+                    control_attempt.unwrap_or_else(uuid::Uuid::new_v4),
                     execution_timeout as i64,
                     &self.jwt_config,
                     self.recorded_readiness,
@@ -1155,13 +1221,12 @@ impl ActionExecutor {
 
         // Add rule and trigger context if execution was triggered by enforcement
         if let Some(enforcement_id) = execution.enforcement {
-            if let Ok(Some(enforcement)) = sqlx::query_as::<
-                _,
-                attune_common::models::event::Enforcement,
-            >("SELECT * FROM enforcement WHERE id = $1")
-            .bind(enforcement_id)
-            .fetch_optional(&self.pool)
-            .await
+            if let Some(enforcement) =
+                attune_common::repositories::event::EnforcementRepository::find_by_id(
+                    &self.pool,
+                    enforcement_id,
+                )
+                .await?
             {
                 env.insert("ATTUNE_RULE".to_string(), enforcement.rule_ref);
                 env.insert("ATTUNE_TRIGGER".to_string(), enforcement.trigger_ref);
@@ -1248,9 +1313,63 @@ impl ActionExecutor {
         // match. The selected version's execution_config overrides the parent
         // runtime's config so the ProcessRuntime uses a version-specific
         // interpreter binary, environment commands, etc.
-        let (runtime_config_override, runtime_env_dir_suffix, selected_runtime_version) = self
-            .resolve_runtime_version(&runtime_record, execution, action)
-            .await;
+        let (runtime_config_override, runtime_env_dir_suffix, selected_runtime_version) =
+            if control_attempt.is_some() {
+                let snapshot = execution.executable_snapshot.as_ref().ok_or_else(|| {
+                    Error::PermissionDenied("Pinned control runtime unavailable".into())
+                })?;
+                match runtime_record.as_ref() {
+                    Some(runtime) => {
+                        let versions = &snapshot.executable.runtime_versions;
+                        match select_best_version(
+                            versions,
+                            action.runtime_version_constraint.as_deref(),
+                        ) {
+                            Some(version) => (
+                                Some(serde_json::from_value::<RuntimeExecutionConfig>(
+                                    version.execution_config.clone(),
+                                )?),
+                                Some(format!(
+                                    "{}-{}",
+                                    normalize_runtime_name(&runtime.name),
+                                    version.version
+                                )),
+                                Some(version.version.clone()),
+                            ),
+                            None if versions.is_empty()
+                                && action.runtime_version_constraint.is_none() =>
+                            {
+                                (
+                                    Some(serde_json::from_value::<RuntimeExecutionConfig>(
+                                        runtime.execution_config.clone(),
+                                    )?),
+                                    None,
+                                    None,
+                                )
+                            }
+                            None => {
+                                return Err(Error::PermissionDenied(
+                                    "No pinned runtime version satisfies the control execution"
+                                        .into(),
+                                ))
+                            }
+                        }
+                    }
+                    None if action.runtime.is_none()
+                        && action.runtime_version_constraint.is_none() =>
+                    {
+                        (None, None, None)
+                    }
+                    None => {
+                        return Err(Error::PermissionDenied(
+                            "Pinned control runtime unavailable".into(),
+                        ))
+                    }
+                }
+            } else {
+                self.resolve_runtime_version(&runtime_record, execution, action)
+                    .await
+            };
 
         // Recheck the exact captured config selected after worker placement.
         attune_common::execution_env::validate_selected_environment(
@@ -1260,22 +1379,32 @@ impl ActionExecutor {
         )?;
 
         // Determine the pack directory for this action
-        let pack_dir = execution
-            .executable_snapshot
-            .as_ref()
-            .and_then(|snapshot| {
-                attune_common::pack_transport::release_cache_path(
-                    &self.packs_base_dir,
-                    &action.pack_ref,
-                    &snapshot.release.digest,
-                )
-                .ok()
-            })
-            .unwrap_or_else(|| self.packs_base_dir.join(&action.pack_ref));
+        let pack_dir = if control_attempt.is_some() {
+            PathBuf::from(attune_common::workload_launch::PACK_ROOT)
+        } else {
+            execution
+                .executable_snapshot
+                .as_ref()
+                .and_then(|snapshot| {
+                    attune_common::pack_transport::release_cache_path(
+                        &self.packs_base_dir,
+                        &action.pack_ref,
+                        &snapshot.release.digest,
+                    )
+                    .ok()
+                })
+                .unwrap_or_else(|| self.packs_base_dir.join(&action.pack_ref))
+        };
 
         // Construct code_path for pack actions
         // Pack actions have their script files in packs/{pack_ref}/actions/{entrypoint}
-        let code_path = if action.pack_ref.starts_with("core") || !action.is_adhoc {
+        let code_path = if control_attempt.is_some() && !action.is_adhoc {
+            let entry =
+                attune_common::artifact_transport::ValidatedRelativePath::new(&entry_point)?;
+            Some(pack_dir.join("actions").join(entry.as_path()))
+        } else if control_attempt.is_some() {
+            None
+        } else if action.pack_ref.starts_with("core") || !action.is_adhoc {
             // This is a pack action, construct the file path
             let action_file_path = pack_dir.join("actions").join(&entry_point);
 
@@ -1334,14 +1463,28 @@ impl ActionExecutor {
         // Resolve the working directory from the runtime's execution_config.
         // The ProcessRuntime also does this internally, but setting it in the
         // context allows the executor to override if needed.
-        let working_dir: Option<StdPathBuf> = if pack_dir.exists() {
+        let working_dir: Option<StdPathBuf> = if control_attempt.is_some() || pack_dir.exists() {
             Some(pack_dir)
         } else {
             None
         };
-        let log_artifacts = self
-            .allocate_execution_log_artifacts(execution, action, preparation)
+        let (stdout_log_writer, stderr_log_writer) = if capture_locally {
+            let logs = self
+                .allocate_execution_log_artifacts(execution, action, preparation)
+                .await?;
+            (Some(logs.stdout_writer), Some(logs.stderr_writer))
+        } else {
+            // The CP records silent attempts too. The execution-only custodian
+            // allocates/writes streams later through target-scoped control APIs.
+            crate::completion::register(
+                &self.pool,
+                execution,
+                self.worker_id.load(Ordering::Acquire),
+                self.worker_instance,
+            )
             .await?;
+            (None, None)
+        };
 
         let context = ExecutionContext {
             execution_id: execution.id,
@@ -1363,8 +1506,8 @@ impl ActionExecutor {
             max_stderr_bytes: self.max_stderr_bytes,
             stdout_log_path: None,
             stderr_log_path: None,
-            stdout_log_writer: Some(log_artifacts.stdout_writer),
-            stderr_log_writer: Some(log_artifacts.stderr_writer),
+            stdout_log_writer,
+            stderr_log_writer,
             parameter_delivery: action.parameter_delivery,
             parameter_format: action.parameter_format,
             output_format: binding.output_format,

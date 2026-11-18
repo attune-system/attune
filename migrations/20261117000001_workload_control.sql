@@ -274,16 +274,20 @@ CREATE TRIGGER log_custody_operation_retain BEFORE DELETE ON log_custody_operati
 
 CREATE TABLE workload_launch_prerequisite (
     id BIGSERIAL PRIMARY KEY,
-    purpose TEXT NOT NULL CHECK (purpose IN ('setup','runtime_probe')),
+    purpose TEXT NOT NULL CHECK (purpose IN ('action','setup','runtime_probe')),
     attempt UUID NOT NULL,
     source_target JSONB NOT NULL CHECK (source_target->>'kind' IN ('execution','sensor','candidate_test')),
     stage_binding JSONB,
+    artifact_limits JSONB NOT NULL DEFAULT '{"max_total_bytes":268435456,"max_entries":4096}',
     image BIGINT NOT NULL CHECK (image>0),
     source_epochs JSONB NOT NULL CHECK (jsonb_typeof(source_epochs)='array' AND jsonb_array_length(source_epochs)>0),
     revoked_at TIMESTAMPTZ,
     expires_at TIMESTAMPTZ NOT NULL,
     created TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
+CREATE UNIQUE INDEX workload_action_admission_once ON workload_launch_prerequisite(source_target) WHERE purpose='action';
+CREATE TRIGGER workload_prerequisite_retain BEFORE DELETE ON workload_launch_prerequisite
+FOR EACH ROW EXECUTE FUNCTION retain_workload_control_tombstone();
 CREATE FUNCTION revoke_workload_prerequisite_epoch() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     PERFORM bump_workload_source_epoch('admission',OLD.id);

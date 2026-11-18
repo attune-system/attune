@@ -1656,6 +1656,17 @@ impl RuntimeAuthorityRepository {
         Ok(record)
     }
 
+    /// Exact current recorded worker nonce. This metadata projection grants no
+    /// credential/disclosure authority; callers still validate the admission.
+    pub async fn current_worker_attempt(
+        conn: &mut PgConnection,
+        execution: i64,
+        worker: i64,
+    ) -> Result<Uuid> {
+        sqlx::query_scalar("SELECT f.attempt FROM runtime_authority_execution_fence f JOIN execution e ON e.id=f.execution WHERE f.execution=$1 AND e.worker=$2 AND e.status='running'")
+            .bind(execution).bind(worker).fetch_optional(conn).await?.ok_or_else(||Error::PermissionDenied("Recorded worker attempt unavailable".into()))
+    }
+
     /// Called by the currently assigned worker before starting an actual attempt.
     /// Retrying this operation with the same attempt ID is idempotent.
     pub async fn begin_execution_attempt(
