@@ -14,7 +14,10 @@ use attune_common::{
 };
 use attune_workload_backend::{configuration, engine::DockerEngine};
 use owning_worker::{run_interpreted_suite, run_native_fixture, NativeOwningFixture, OwningCase};
-use std::{os::unix::fs::PermissionsExt, path::PathBuf};
+use std::{
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+};
 
 fn required(name: &str) -> Result<String> {
     std::env::var(name)
@@ -28,6 +31,35 @@ fn image(name: &str) -> Result<PinnedImage> {
         .context("immutable candidate image required")?;
     let sha256 = Sha256Digest::parse(digest)?;
     Ok(PinnedImage { reference, sha256 })
+}
+fn runner_input(
+    archive: &Path,
+    runner: &Path,
+    platform: LaunchPlatform,
+) -> Result<PinnedLaunchInput> {
+    let metadata = std::fs::metadata(runner)?;
+    ensure!(
+        metadata.is_file() && metadata.len() > 0 && metadata.len() <= 64 * 1024 * 1024,
+        "owned public Runner exceeds fixture input bound"
+    );
+    owning_worker::runner_zip(archive, runner, platform)?;
+    std::fs::set_permissions(archive, std::fs::Permissions::from_mode(0o444))?;
+    let bytes = std::fs::read(archive)?;
+    Ok(PinnedLaunchInput {
+        pin_id: 1,
+        kind: LaunchInputKind::Runner,
+        object_id: 2,
+        object_version: format!(
+            "owned-docker-runner-{}",
+            Sha256Digest::of_bytes(&bytes).as_str()
+        ),
+        size_bytes: bytes.len() as u64,
+        sha256: Sha256Digest::of_bytes(&bytes),
+        // The preceding Engine case installs this same ZIP into the same
+        // digest-addressed cache. Its receipt binds these exact observed bounds.
+        max_expanded_bytes: metadata.len(),
+        max_files: 1,
+    })
 }
 async fn fixture() -> Result<NativeOwningFixture> {
     let root = tempfile::Builder::new()
@@ -51,22 +83,7 @@ async fn fixture() -> Result<NativeOwningFixture> {
         "once-built absolute binary paths required"
     );
     let archive = root.path().join("runner.zip");
-    owning_worker::runner_zip(&archive, &runner, platform)?;
-    std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o444))?;
-    let bytes = std::fs::read(&archive)?;
-    let helper = PinnedLaunchInput {
-        pin_id: 1,
-        kind: LaunchInputKind::Runner,
-        object_id: 2,
-        object_version: format!(
-            "owned-docker-runner-{}",
-            Sha256Digest::of_bytes(&bytes).as_str()
-        ),
-        size_bytes: bytes.len() as u64,
-        sha256: Sha256Digest::of_bytes(&bytes),
-        max_expanded_bytes: 134_217_728,
-        max_files: 8,
-    };
+    let helper = runner_input(&archive, &runner, platform)?;
     // This is an explicitly owned test daemon. Production operator bindings are
     // persisted admission inputs; neither path silently rebinds retained inputs.
     let engine = DockerEngine::connect(&socket)?;
@@ -107,6 +124,95 @@ async fn fixture() -> Result<NativeOwningFixture> {
         echo,
         runner,
     })
+}
+
+// ZIP/cache proof only: these public bytes are never launched as a Runner.
+#[test]
+fn docker_runner_pin_reuses_engine_cache_receipt() -> Result<()> {
+    use attune_workload_backend::cache::{CacheError, CacheLimits, CacheStore};
+    use std::{fs::File, io::Write};
+
+    for platform in [LaunchPlatform::LinuxAmd64, LaunchPlatform::LinuxArm64] {
+        let root = tempfile::tempdir()?;
+        let runner = root.path().join("once-built-runner");
+        let payload = b"owned public Runner packaging regression";
+        std::fs::write(&runner, payload)?;
+        let engine_archive = root.path().join("engine-runner.zip");
+        // Match engine_tests::real_engine_cache_binding_and_python_publication,
+        // including its ZIP defaults and exact expanded-byte/entry ceilings.
+        let mut engine_file = File::create_new(&engine_archive)?;
+        {
+            let mut zip = zip::ZipWriter::new(&mut engine_file);
+            zip.start_file(
+                format!("linux-{}", platform.native_arch()),
+                zip::write::SimpleFileOptions::default().unix_permissions(0o755),
+            )?;
+            zip.write_all(payload)?;
+            zip.finish()?;
+        }
+        let engine_pin = PinnedLaunchInput {
+            pin_id: 20,
+            ..owning_worker::pin(
+                LaunchInputKind::Runner,
+                21,
+                "owned-public-helper".into(),
+                &engine_archive,
+                payload.len() as u64,
+                1,
+            )?
+        };
+        let cache = CacheStore::open(
+            root.path().join("shared-cache"),
+            CacheLimits {
+                compressed_bytes: 64 << 20,
+                expanded_bytes: 128 << 20,
+                files: 4096,
+            },
+        )?;
+        let existing = cache.install_input(&engine_pin, &mut File::open(&engine_archive)?)?;
+        let receipt = existing
+            .parent()
+            .context("missing cache parent")?
+            .join("receipt");
+        let retained = std::fs::read(&receipt)?;
+        let old_worker_pin = PinnedLaunchInput {
+            max_expanded_bytes: 128 << 20,
+            max_files: 8,
+            ..engine_pin.clone()
+        };
+        ensure!(matches!(
+            cache.install_input(&old_worker_pin, &mut File::open(&engine_archive)?),
+            Err(CacheError::PinMismatch)
+        ));
+        ensure!(
+            std::fs::read(&receipt)? == retained,
+            "mismatched pin changed receipt"
+        );
+
+        let archive = root.path().join("worker-runner.zip");
+        let helper = runner_input(&archive, &runner, platform)?;
+        ensure!(helper.sha256 == engine_pin.sha256, "Runner ZIP changed");
+        ensure!(
+            helper.size_bytes == engine_pin.size_bytes,
+            "Runner ZIP size changed"
+        );
+        ensure!(helper.max_expanded_bytes == engine_pin.max_expanded_bytes);
+        ensure!(helper.max_files == engine_pin.max_files);
+        let installed = cache.install_input(&helper, &mut File::open(&archive)?)?;
+        ensure!(
+            installed == existing,
+            "Runner was not reused from the same cache"
+        );
+        ensure!(
+            std::fs::read(&receipt)? == retained,
+            "reuse changed receipt"
+        );
+        let selected = installed.join(format!("linux-{}", platform.native_arch()));
+        ensure!(std::fs::read(&selected)? == payload);
+        ensure!(std::fs::metadata(selected)?.permissions().mode() & 0o111 != 0);
+        cache.open_input_archive(&helper)?;
+    }
+    Ok(())
 }
 
 #[tokio::test]

@@ -66,7 +66,8 @@ def main():
     if owning:
         listed = subprocess.check_output([str(owning), "--list", "--format", "terse"], text=True)
         expected = {"docker_native_owning_worker", "docker_native_cli_owning_worker",
-                    "docker_command_owning_worker", "docker_interpreted_owning_worker"}
+                    "docker_command_owning_worker", "docker_interpreted_owning_worker",
+                    "docker_runner_pin_reuses_engine_cache_receipt"}
         actual = {line.removesuffix(": test") for line in listed.splitlines() if line.endswith(": test")}
         if actual != expected:
             raise SystemExit("owning worker test inventory differs; refusing zero/partial or inherited K8s coverage")
