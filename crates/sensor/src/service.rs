@@ -42,6 +42,7 @@ struct SensorServiceInner {
     sensor_worker_registration: Arc<RwLock<SensorWorkerRegistration>>,
     heartbeat_interval: u64,
     heartbeat_task: Mutex<Option<HeartbeatTask>>,
+    metrics_task: Mutex<Option<HeartbeatTask>>,
     detected_runtimes: RwLock<Option<Vec<DetectedRuntime>>>,
 }
 
@@ -249,7 +250,8 @@ impl SensorService {
             .map(|sensor| sensor.allow_insecure_notifier_ws)
             .unwrap_or(false);
         let sensor_worker_registration = SensorWorkerRegistration::new(db.clone(), &config)
-            .with_child_environment(child_environment.clone());
+            .with_child_environment(child_environment.clone())
+            .with_incarnation(worker_token_provider.instance_id());
         let worker_name = sensor_worker_registration.worker_name().to_string();
 
         let sensor_manager = Arc::new(SensorManager::new(
@@ -299,6 +301,7 @@ impl SensorService {
                 sensor_worker_registration: Arc::new(RwLock::new(sensor_worker_registration)),
                 heartbeat_interval,
                 heartbeat_task: Mutex::new(None),
+                metrics_task: Mutex::new(None),
                 detected_runtimes: RwLock::new(None),
             }),
         })
@@ -341,7 +344,50 @@ impl SensorService {
             .await?;
         info!("Sensor worker registered with ID: {}", worker_id);
         self.inner.sensor_manager.set_worker_id(worker_id);
+        let incarnation = self
+            .inner
+            .sensor_worker_registration
+            .read()
+            .await
+            .incarnation();
+        let heartbeat_pool = self.inner.db.clone();
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let interval = Duration::from_secs(self.inner.heartbeat_interval.clamp(1, 30));
+        let handle = tokio::spawn(async move {
+            run_bound_heartbeat(interval, task_cancellation, || {
+                attune_common::repositories::runtime::WorkerRepository::heartbeat_incarnation(
+                    &heartbeat_pool,
+                    worker_id,
+                    incarnation,
+                )
+            })
+            .await;
+        });
+        *self.inner.heartbeat_task.lock().await = Some(HeartbeatTask {
+            cancellation,
+            handle,
+        });
 
+        if let Err(error) = self.start_registered_components().await {
+            if let Err(cleanup) = self.stop().await {
+                return Err(anyhow::anyhow!(
+                    "Sensor startup failed: {error}; cleanup failed: {cleanup}"
+                ));
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn start_registered_components(&self) -> Result<()> {
+        if self.inner.config.workload.is_some() {
+            let mut registration = self.inner.sensor_worker_registration.write().await;
+            registration
+                .discover_native_capabilities(&self.inner.config, &self.inner.sensor_manager)
+                .await?;
+            registration.update_capabilities().await?;
+        }
         // Start rule lifecycle listener
         info!("Starting rule lifecycle listener...");
         if let Err(e) = self.inner.rule_lifecycle_listener.start().await {
@@ -369,7 +415,7 @@ impl SensorService {
         let cancellation = CancellationToken::new();
         let task_cancellation = cancellation.clone();
         let handle = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(heartbeat_interval));
+            let mut ticker = tokio::time::interval(Duration::from_secs(heartbeat_interval.max(1)));
 
             loop {
                 tokio::select! {
@@ -404,19 +450,11 @@ impl SensorService {
                     }
                     Err(e) => error!("Failed to collect sensor worker metrics: {}", e),
                 }
-
-                let heartbeat = tokio::select! {
-                    _ = task_cancellation.cancelled() => break,
-                    result = async { registration.read().await.heartbeat().await } => result,
-                };
-                if let Err(e) = heartbeat {
-                    error!("Failed to send sensor worker heartbeat: {}", e);
-                }
             }
 
             info!("Heartbeat loop stopped");
         });
-        *self.inner.heartbeat_task.lock().await = Some(HeartbeatTask {
+        *self.inner.metrics_task.lock().await = Some(HeartbeatTask {
             cancellation,
             handle,
         });
@@ -437,25 +475,19 @@ impl SensorService {
     pub async fn stop(&self) -> Result<()> {
         info!("Stopping Sensor Service - initiating graceful shutdown");
 
-        // 1. Deregister sensor worker first to stop receiving new work
-        info!("Marking sensor worker as inactive to stop receiving new work");
-        if let Err(e) = self
-            .inner
-            .sensor_worker_registration
-            .read()
-            .await
-            .deregister()
-            .await
-        {
-            error!("Failed to deregister sensor worker: {}", e);
+        // Cordon scheduling while the original live source can still finalize
+        // its stopped files. Do not expire/mint its retained lease or epochs.
+        let registration = self.inner.sensor_worker_registration.read().await;
+        if let Some(worker) = registration.worker_id() {
+            attune_common::repositories::runtime::WorkerRepository::cordon_for_shutdown(
+                &self.inner.db,
+                worker,
+                registration.incarnation(),
+                "Sensor service shutdown",
+            )
+            .await?;
         }
-
-        // 2. Stop heartbeat
-        info!("Stopping heartbeat updates");
-        if let Some(task) = self.inner.heartbeat_task.lock().await.take() {
-            stop_heartbeat_task(task, HEARTBEAT_STOP_TIMEOUT).await;
-        }
-
+        drop(registration);
         // 3. Stop sensor processes with timeout
         let shutdown_timeout = self
             .inner
@@ -487,6 +519,20 @@ impl SensorService {
             error!("Failed to stop rule lifecycle listener: {}", e);
         }
 
+        // Join heartbeat before deregistration; a late tick cannot revive the
+        // inactive instance. Maintenance from an old incarnation is fenced.
+        if let Some(task) = self.inner.metrics_task.lock().await.take() {
+            stop_heartbeat_task(task, HEARTBEAT_STOP_TIMEOUT).await;
+        }
+        if let Some(task) = self.inner.heartbeat_task.lock().await.take() {
+            stop_heartbeat_task(task, HEARTBEAT_STOP_TIMEOUT).await;
+        }
+        self.inner
+            .sensor_worker_registration
+            .read()
+            .await
+            .deregister()
+            .await?;
         // 5. Close message queue connection
         info!("Closing message queue connection...");
         if let Err(e) = self.inner.mq.close().await {
@@ -537,6 +583,29 @@ impl SensorService {
         }
 
         HealthStatus::Healthy
+    }
+}
+
+async fn run_bound_heartbeat<F, Fut>(
+    interval: Duration,
+    cancellation: CancellationToken,
+    mut heartbeat: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = attune_common::Result<()>>,
+{
+    let mut ticker = tokio::time::interval(interval);
+    loop {
+        tokio::select! {
+            _ = cancellation.cancelled() => break,
+            _ = ticker.tick() => {}
+        }
+        tokio::select! {
+            _ = cancellation.cancelled() => break,
+            result = heartbeat() => if let Err(error) = result {
+                error!("Failed to send bound sensor heartbeat: {}", error);
+            }
+        }
     }
 }
 
@@ -664,6 +733,31 @@ mod tests {
             HealthStatus::Unhealthy("error".to_string()).to_string(),
             "unhealthy: error"
         );
+    }
+
+    #[tokio::test]
+    async fn bound_sensor_heartbeat_progresses_while_discovery_holds_registration() {
+        let registration = Arc::new(RwLock::new(()));
+        let discovery = registration.write().await;
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let cancellation = CancellationToken::new();
+        let stop = cancellation.clone();
+        let task = tokio::spawn(async move {
+            run_bound_heartbeat(Duration::from_millis(1), stop, || {
+                sender.send(()).unwrap();
+                async { Ok(()) }
+            })
+            .await;
+        });
+        let observed = tokio::time::timeout(Duration::from_secs(2), async {
+            receiver.recv().await.unwrap();
+            receiver.recv().await.unwrap();
+        })
+        .await;
+        cancellation.cancel();
+        task.await.unwrap();
+        drop(discovery);
+        observed.unwrap();
     }
 
     #[tokio::test]

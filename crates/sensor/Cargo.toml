@@ -19,6 +19,7 @@ name = "attune-sensor-agent"
 path = "src/agent_main.rs"
 
 [dependencies]
+attune-worker = { path = "../worker" }
 attune-workload-backend = { path = "../workload-backend" }
 attune-common = { path = "../common" }
 tokio = { workspace = true }

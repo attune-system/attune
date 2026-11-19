@@ -620,6 +620,16 @@ incarnations retain all obligations. Effects predating the allocation hooks lack
 complete inventory proof and cannot clear on an empty selection. This is not
 completed cross-incarnation restart recovery: no publication authority or original
 source epoch is rebound to a new manager. Provider/PG lifecycle acceptance is still
-required. Recipes/setup and native discovery remain denied pending the shared
-producer. Sensor registration must first use the existing fenced WorkerRepository
-incarnation methods; the genuine runtime-probe source check is not weakened.
+required. Native registration records the same incarnation used by sensor worker
+API tokens and assignment ownership through the existing WorkerRepository methods.
+Heartbeat is independently owned and starts before discovery, so a long guest probe
+or registration-lock wait cannot starve its 90-second source fence. Stale instance
+heartbeats, capability writes and deregistration cannot overwrite a replacement.
+Discovery uses NativeRuntimeProbeDriver with authenticated release transport and
+the common pinned input converter. Only verified guest names, versions and recipe
+digests enter worker capabilities; global runtime availability is unchanged.
+Managed recipes use the captured operator digest admission, selected caller
+snapshot and fixed private recipe invocation, with a read-only Pack and no shared
+Runtime input or Stage. Legacy dependency setup remains denied until the existing
+coordinated native installer is wired. Native agent detect-only remains explicitly
+denied; ordinary native agent startup uses registered guest discovery.

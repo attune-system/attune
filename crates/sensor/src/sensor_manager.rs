@@ -1462,6 +1462,8 @@ impl SensorManager {
                     token_response.token,
                     token_expires_at,
                     &exec_config,
+                    &runtime,
+                    selected_version.as_deref(),
                     reset_failure_count,
                 )
                 .await;

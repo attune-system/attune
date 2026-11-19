@@ -683,6 +683,7 @@ version = "0.11.1"
 dependencies = [
  "anyhow",
  "attune-common",
+ "attune-worker",
  "attune-workload-backend",
  "chrono",
  "clap",

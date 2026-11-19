@@ -10,15 +10,17 @@ use attune_common::agent_runtime_detection::{detect_runtimes, DetectedRuntime};
 use attune_common::child_process_environment::ChildProcessEnvironment;
 use attune_common::config::Config;
 use attune_common::error::Result;
-use attune_common::models::{RuntimeVersion, Worker, WorkerRole, WorkerStatus, WorkerType};
-use attune_common::repositories::{List, RuntimeRepository, RuntimeVersionRepository};
+use attune_common::models::{RuntimeVersion, WorkerRole, WorkerType};
+use attune_common::repositories::{
+    runtime::{CreateWorkerInput, WorkerRepository},
+    List, RuntimeRepository, RuntimeVersionRepository,
+};
 use attune_common::runtime_detection::{normalize_runtime_name, RuntimeDetector};
 use attune_common::scheduling::{
     validate_label_map, validate_taints, WORKER_LABELS_CAPABILITY_KEY, WORKER_TAINTS_CAPABILITY_KEY,
 };
-use chrono::Utc;
 use serde_json::json;
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::process::Command;
@@ -39,12 +41,23 @@ pub struct SensorWorkerRegistration {
     child_environment: ChildProcessEnvironment,
     pool: PgPool,
     worker_id: Option<i64>,
+    incarnation: uuid::Uuid,
     worker_name: String,
     host: Option<String>,
     capabilities: HashMap<String, serde_json::Value>,
 }
 
 impl SensorWorkerRegistration {
+    /// The same acknowledged identity signs manager tokens and owns assignments.
+    pub fn with_incarnation(mut self, incarnation: uuid::Uuid) -> Self {
+        self.incarnation = incarnation;
+        self
+    }
+
+    pub fn incarnation(&self) -> uuid::Uuid {
+        self.incarnation
+    }
+
     pub fn with_child_environment(mut self, environment: ChildProcessEnvironment) -> Self {
         self.child_environment = environment;
         self
@@ -266,6 +279,7 @@ impl SensorWorkerRegistration {
             child_environment: Default::default(),
             pool,
             worker_id: None,
+            incarnation: uuid::Uuid::new_v4(),
             worker_name,
             host,
             capabilities,
@@ -279,66 +293,23 @@ impl SensorWorkerRegistration {
 
         info!("Registering sensor worker: {}", self.worker_name);
 
-        // Check if sensor worker with this name already exists
-        let existing = sqlx::query_as::<_, Worker>(
-            "SELECT * FROM worker WHERE name = $1 AND worker_role = 'sensor' ORDER BY created DESC LIMIT 1",
+        let worker = WorkerRepository::register_incarnation(
+            &self.pool,
+            CreateWorkerInput {
+                name: self.worker_name.clone(),
+                worker_type: WorkerType::Local,
+                runtime: None,
+                host: self.host.clone(),
+                port: None,
+                status: None,
+                capabilities: Some(serde_json::to_value(&self.capabilities)?),
+                meta: None,
+            },
+            WorkerRole::Sensor,
+            self.incarnation,
         )
-        .bind(&self.worker_name)
-        .fetch_optional(&self.pool)
         .await?;
-
-        let worker_id = if let Some(existing_worker) = existing {
-            info!(
-                "Sensor worker '{}' already exists (ID: {}), updating status",
-                self.worker_name, existing_worker.id
-            );
-
-            // Update existing sensor worker to active status with new heartbeat
-            sqlx::query(
-                r#"
-                UPDATE worker
-                SET status = $1,
-                    capabilities = $2,
-                    last_heartbeat = $3,
-                    updated = $4,
-                    host = $5
-                WHERE id = $6
-                "#,
-            )
-            .bind(WorkerStatus::Active)
-            .bind(serde_json::to_value(&self.capabilities)?)
-            .bind(Utc::now())
-            .bind(Utc::now())
-            .bind(&self.host)
-            .bind(existing_worker.id)
-            .execute(&self.pool)
-            .await?;
-
-            existing_worker.id
-        } else {
-            // Insert new sensor worker
-            let row = sqlx::query(
-                r#"
-                INSERT INTO worker (name, worker_type, worker_role, host, status, capabilities, last_heartbeat)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                RETURNING id
-                "#,
-            )
-            .bind(&self.worker_name)
-            .bind(WorkerType::Local) // Sensor workers are always local
-            .bind(WorkerRole::Sensor)
-            .bind(&self.host)
-            .bind(WorkerStatus::Active)
-            .bind(serde_json::to_value(&self.capabilities)?)
-            .bind(Utc::now())
-            .fetch_one(&self.pool)
-            .await?;
-
-            let worker_id: i64 = row.get("id");
-            info!("Sensor worker registered with ID: {}", worker_id);
-            worker_id
-        };
-
+        let worker_id = worker.id;
         self.worker_id = Some(worker_id);
         Ok(worker_id)
     }
@@ -346,22 +317,8 @@ impl SensorWorkerRegistration {
     /// Send heartbeat to update last_heartbeat timestamp
     pub async fn heartbeat(&self) -> Result<()> {
         if let Some(worker_id) = self.worker_id {
-            sqlx::query(
-                r#"
-                UPDATE worker
-                SET last_heartbeat = $1,
-                    status = $2,
-                    updated = $3
-                WHERE id = $4
-                "#,
-            )
-            .bind(Utc::now())
-            .bind(WorkerStatus::Active)
-            .bind(Utc::now())
-            .bind(worker_id)
-            .execute(&self.pool)
-            .await?;
-
+            WorkerRepository::heartbeat_incarnation(&self.pool, worker_id, self.incarnation)
+                .await?;
             debug!("Sensor worker heartbeat sent");
         }
 
@@ -373,20 +330,8 @@ impl SensorWorkerRegistration {
         if let Some(worker_id) = self.worker_id {
             info!("Deregistering sensor worker: {}", self.worker_name);
 
-            sqlx::query(
-                r#"
-                UPDATE worker
-                SET status = $1,
-                    updated = $2
-                WHERE id = $3
-                "#,
-            )
-            .bind(WorkerStatus::Inactive)
-            .bind(Utc::now())
-            .bind(worker_id)
-            .execute(&self.pool)
-            .await?;
-
+            WorkerRepository::deregister_incarnation(&self.pool, worker_id, self.incarnation)
+                .await?;
             info!("Sensor worker deregistered");
         }
 
@@ -415,20 +360,13 @@ impl SensorWorkerRegistration {
     /// Update sensor worker capabilities in the database
     pub async fn update_capabilities(&self) -> Result<()> {
         if let Some(worker_id) = self.worker_id {
-            sqlx::query(
-                r#"
-                UPDATE worker
-                SET capabilities = $1,
-                    updated = $2
-                WHERE id = $3
-                "#,
+            WorkerRepository::update_incarnation_capabilities(
+                &self.pool,
+                worker_id,
+                self.incarnation,
+                serde_json::to_value(&self.capabilities)?,
             )
-            .bind(serde_json::to_value(&self.capabilities)?)
-            .bind(Utc::now())
-            .bind(worker_id)
-            .execute(&self.pool)
             .await?;
-
             info!("Sensor worker capabilities updated");
         }
 
@@ -495,6 +433,180 @@ impl SensorWorkerRegistration {
             self.capabilities
         );
 
+        Ok(())
+    }
+
+    pub(crate) async fn discover_native_capabilities(
+        &mut self,
+        config: &Config,
+        manager: &crate::sensor_manager::SensorManager,
+    ) -> Result<()> {
+        use attune_common::repositories::{
+            runtime_version::RuntimeVersionRepository, List, RuntimeRepository,
+        };
+        let admitted = self
+            .child_environment
+            .native_runtime_recipe_digests()
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>();
+        let filter = std::env::var("ATTUNE_SENSOR_RUNTIMES")
+            .ok()
+            .map(|names| {
+                names
+                    .split(',')
+                    .map(|n| n.trim().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .or_else(|| {
+                config
+                    .sensor
+                    .as_ref()?
+                    .capabilities
+                    .as_ref()?
+                    .get("runtimes")?
+                    .as_array()
+                    .map(|names| {
+                        names
+                            .iter()
+                            .filter_map(|n| n.as_str().map(str::to_owned))
+                            .collect()
+                    })
+            });
+        let versions = RuntimeVersionRepository::list(&self.pool).await?;
+        let mut legacy_versions = Vec::new();
+        let mut proved_digests = std::collections::BTreeSet::new();
+        let mut instances = serde_json::Map::new();
+        let mut names = std::collections::BTreeSet::from(["native".to_owned()]);
+        for runtime in RuntimeRepository::list(&self.pool).await? {
+            if filter.as_ref().is_some_and(|filter| {
+                !attune_common::runtime_detection::runtime_aliases_match_filter(
+                    &runtime.aliases,
+                    filter,
+                ) && !attune_common::runtime_detection::runtime_aliases_match_filter(
+                    std::slice::from_ref(&runtime.name),
+                    filter,
+                )
+            }) {
+                continue;
+            }
+            let Some(raw) = runtime.execution_config.get("lifecycle") else {
+                let mut available = manager
+                    .probe_native_runtime(&runtime, None, &admitted)
+                    .await
+                    .is_ok();
+                for version in versions.iter().filter(|v| v.runtime == runtime.id) {
+                    if manager
+                        .probe_native_runtime(&runtime, Some(version), &admitted)
+                        .await
+                        .is_ok()
+                    {
+                        let mut version = version.clone();
+                        version.available = true;
+                        legacy_versions.push(version);
+                        available = true;
+                    }
+                }
+                if available {
+                    names.extend(
+                        runtime
+                            .aliases
+                            .iter()
+                            .chain(std::iter::once(&runtime.name))
+                            .map(|n| normalize_runtime_name(n)),
+                    );
+                }
+                continue;
+            };
+            let Ok(recipe) = serde_json::from_value::<
+                attune_common::runtime_lifecycle::RuntimeRecipe,
+            >(raw.clone()) else {
+                continue;
+            };
+            let Ok(digest) = recipe.digest() else {
+                continue;
+            };
+            if !admitted.contains(&digest) {
+                continue;
+            }
+            let tools = manager
+                .probe_native_runtime(&runtime, None, &admitted)
+                .await
+                .ok();
+            if tools.is_some() {
+                proved_digests.insert(digest.clone());
+            }
+            let mut available = Vec::new();
+            for version in versions.iter().filter(|v| v.runtime == runtime.id) {
+                if let Ok(tools) = manager
+                    .probe_native_runtime(&runtime, Some(version), &admitted)
+                    .await
+                {
+                    let selected_recipe = version
+                        .execution_config
+                        .get("lifecycle")
+                        .cloned()
+                        .and_then(|value| {
+                            serde_json::from_value::<
+                                    attune_common::runtime_lifecycle::RuntimeRecipe,
+                                >(value)
+                                .ok()
+                        });
+                    if let Some(primary) = selected_recipe
+                        .as_ref()
+                        .and_then(|recipe| recipe.tools.iter().find(|t| t.primary))
+                        .and_then(|t| tools.get(&t.name))
+                    {
+                        if attune_common::version_matching::runtime_version_matches_worker(
+                            version,
+                            &primary.version,
+                        ) {
+                            if let Some(recipe) = &selected_recipe {
+                                if let Ok(digest) = recipe.digest() {
+                                    proved_digests.insert(digest);
+                                }
+                            }
+                            available.push(version.version.clone());
+                        }
+                    }
+                }
+            }
+            if tools.is_none() && available.is_empty() {
+                continue;
+            }
+            if !versions.iter().any(|v| v.runtime == runtime.id) {
+                if let Some(primary) = recipe
+                    .tools
+                    .iter()
+                    .find(|t| t.primary)
+                    .and_then(|t| tools.as_ref()?.get(&t.name))
+                {
+                    available.push(primary.version.clone());
+                }
+            }
+            let aliases = runtime
+                .aliases
+                .iter()
+                .chain(std::iter::once(&runtime.name))
+                .map(|n| normalize_runtime_name(n))
+                .collect::<Vec<_>>();
+            names.extend(aliases.clone());
+            instances.insert(
+                runtime.r#ref,
+                json!({"digest":digest,"tools":tools,"versions":available,"names":aliases}),
+            );
+        }
+        self.capabilities.insert("runtimes".into(), json!(names));
+        self.capabilities
+            .insert("runtime_toolchains".into(), json!(instances));
+        self.capabilities
+            .insert("runtime_recipe_digests".into(), json!(proved_digests));
+        self.capabilities.insert(
+            RUNTIME_VERSIONS_CAPABILITY_KEY.into(),
+            attune_worker::version_verify::build_runtime_versions_capability(
+                &legacy_versions,
+                filter.as_deref(),
+            ),
+        );
         Ok(())
     }
 
@@ -924,6 +1036,59 @@ mod tests {
         registration.update_capabilities().await.unwrap();
 
         registration.deregister().await.unwrap();
+    }
+
+    // PostgreSQL execution is coordinated; this stays compiled until granted.
+    #[tokio::test]
+    async fn stale_sensor_incarnation_cannot_maintain_replacement_registration() {
+        use attune_common::repositories::FindById;
+        let (config, pool, database) = isolated_test_context().await;
+        let tokens = attune_common::auth::WorkerTokenProvider::new(
+            1,
+            "sensor-fixture",
+            attune_common::auth::jwt::JwtConfig {
+                secret: "fixture-signing-secret".into(),
+                access_token_expiration: 60,
+                refresh_token_expiration: 60,
+            },
+        );
+        let environment = ChildProcessEnvironment::from_parent([], &[])
+            .unwrap()
+            .with_workload_sandbox(
+                attune_common::workload_sandbox::WorkloadSandbox::NativeEffectsRequired,
+            );
+        let mut old = SensorWorkerRegistration::new(pool.clone(), &config)
+            .with_incarnation(tokens.instance_id())
+            .with_child_environment(environment.clone());
+        old.add_capability(RUNTIME_VERSIONS_CAPABILITY_KEY.into(), json!({}));
+        let worker = old.register(&config).await.unwrap();
+        let replacement_instance = uuid::Uuid::new_v4();
+        let mut replacement = SensorWorkerRegistration::new(pool.clone(), &config)
+            .with_incarnation(replacement_instance)
+            .with_child_environment(environment);
+        replacement.add_capability(RUNTIME_VERSIONS_CAPABILITY_KEY.into(), json!({}));
+        assert_eq!(replacement.register(&config).await.unwrap(), worker);
+        old.add_capability("stale_writer".into(), json!(true));
+        old.update_capabilities().await.unwrap();
+        old.heartbeat().await.unwrap();
+        old.deregister().await.unwrap();
+        let current = WorkerRepository::find_by_id(&pool, worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.worker_role, WorkerRole::Sensor);
+        assert_eq!(
+            current.status,
+            Some(attune_common::models::WorkerStatus::Active)
+        );
+        assert_eq!(
+            current.meta.unwrap()["registration_incarnation"],
+            replacement_instance.to_string()
+        );
+        assert!(current.capabilities.unwrap().get("stale_writer").is_none());
+        replacement.deregister().await.unwrap();
+        drop((old, replacement, pool));
+        database.cleanup().await.unwrap();
     }
 
     #[tokio::test]

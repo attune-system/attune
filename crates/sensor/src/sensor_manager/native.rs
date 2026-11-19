@@ -184,103 +184,73 @@ impl SensorManager {
         &self,
         release: attune_common::models::PackRelease,
     ) -> Result<attune_common::workload_launch::PinnedLaunchInput> {
-        use attune_common::{
-            pack_registry::storage::PackReleaseManifest,
-            workload_archive::ArchivePolicy,
-            workload_launch::{LaunchInputKind, PinnedLaunchInput, Sha256Digest},
-            workload_pack_input::{release_zip, ReleaseInputPin},
-        };
-        let denied = || Error::PermissionDenied("Native pack input unavailable".into());
-        let native = self.inner.native.as_ref().ok_or_else(denied)?;
-        let manifest: PackReleaseManifest =
-            serde_json::from_value(release.manifest).map_err(|_| denied())?;
-        if manifest.version != release.version || manifest.pack_ref != release.pack_ref {
-            return Err(denied().into());
-        }
-        // Existing pack transport materializes this primary immutable archive
-        // for both volume and API managers. Never repack an unpacked tree.
-        let archive = attune_common::pack_transport::release_cache_path(
-            &self.inner.packs_base_dir,
-            &release.pack_ref,
-            &release.digest,
-        )?
-        .parent()
-        .ok_or_else(denied)?
-        .join("pack.tar.gz");
-        let source = ReleaseInputPin {
-            pack_ref: release.pack_ref,
-            size_bytes: u64::try_from(release.archive_size).map_err(|_| denied())?,
-            sha256: Sha256Digest::parse(&release.digest)?,
-        };
-        let ceiling = self
+        let native = self
+            .inner
+            .native
+            .as_ref()
+            .ok_or_else(|| anyhow!("Native pack input unavailable"))?;
+        let operator = self
             .inner
             .workload_config
             .as_ref()
-            .ok_or_else(denied)?
-            .storage;
-        let runner = native.runner.clone();
+            .ok_or_else(|| anyhow!("Native config unavailable"))?;
+        self.inner
+            .pack_transport
+            .sync_release(&release.pack_ref, release.id, &release.digest)
+            .await?;
+        let packs = std::path::PathBuf::from(&self.inner.packs_base_dir);
+        let limits = operator.storage;
         let cache = native.cache.clone();
-        let release_id = release.id;
-        let release_digest = release.digest;
-        let pack = tokio::task::spawn_blocking(move || {
-            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(archive)
-                .map_err(|_| Error::validation("Pinned release archive unavailable"))?;
-            let metadata = file
-                .metadata()
-                .map_err(|_| Error::validation("Pinned release archive unavailable"))?;
-            if !metadata.is_file()
-                || metadata.nlink() != 1
-                || metadata.mode() & 0o022 != 0
-                || !(metadata.uid() == 0 || metadata.uid() == unsafe { libc::geteuid() })
-            {
-                return Err(Error::PermissionDenied(
-                    "Pinned release archive ownership invalid".into(),
-                ));
-            }
-            let prepared = release_zip(
-                file,
-                &source,
-                &manifest,
-                attune_common::pack_format::Limits {
-                    compressed_bytes: ceiling.compressed_bytes,
-                    extracted_bytes: ceiling.expanded_bytes,
-                    file_bytes: ceiling.expanded_bytes,
-                    entries: ceiling.entries,
-                    ..Default::default()
-                },
-                &ArchivePolicy {
-                    root: LaunchInputKind::Pack,
-                    max_compressed_bytes: ceiling.compressed_bytes,
-                    max_expanded_bytes: ceiling.expanded_bytes,
-                    max_files: ceiling.entries,
-                },
-            )?;
-            let pin = PinnedLaunchInput {
-                // Pin IDs distinguish slots inside this one plan. Object ID and
-                // version come exclusively from the retained release record;
-                // the public Runner's operator pin is preserved unchanged.
-                pin_id: if runner.pin_id == 1 { 2 } else { 1 },
-                kind: LaunchInputKind::Pack,
-                object_id: release_id,
-                object_version: release_digest,
-                size_bytes: prepared.size_bytes(),
-                sha256: prepared.sha256().clone(),
-                max_expanded_bytes: prepared.expanded_bytes(),
-                max_files: prepared.entries(),
-            };
-            let mut body = prepared.into_file();
-            cache
-                .install_input(&pin, body.as_file_mut())
-                .map_err(|_| Error::validation("Pinned release ZIP installation failed"))?;
-            Ok::<_, Error>(pin)
+        let pin_id = if native.runner.pin_id == 1 { 2 } else { 1 };
+        tokio::task::spawn_blocking(move || {
+            attune_workload_backend::pack_input::install_release(
+                &cache, release, &packs, limits, pin_id,
+            )
         })
         .await
-        .map_err(|_| Error::invalid_state("Native release preparation did not complete"))??;
-        Ok(pack)
+        .map_err(|_| anyhow!("Native release preparation did not complete"))?
+        .map_err(Into::into)
+    }
+
+    /// Source authority is verified by the same driver used by worker discovery.
+    pub(crate) async fn probe_native_runtime(
+        &self,
+        runtime: &attune_common::models::Runtime,
+        version: Option<&attune_common::models::RuntimeVersion>,
+        admitted: &std::collections::BTreeSet<String>,
+    ) -> attune_common::Result<attune_common::repositories::runtime_probe_process::VerifiedToolMap>
+    {
+        let denied = || Error::PermissionDenied("Native sensor discovery unavailable".into());
+        let configured = self.inner.native.as_ref().ok_or_else(denied)?;
+        let config = self.inner.workload_config.as_ref().ok_or_else(denied)?;
+        let master = self.inner.encryption_key.as_deref().ok_or_else(denied)?;
+        let pack = attune_common::repositories::PackRepository::find_by_id(
+            &self.inner.db,
+            runtime.pack.ok_or_else(denied)?,
+        )
+        .await?
+        .ok_or_else(denied)?;
+        let release = attune_common::repositories::PackReleaseRepository::find_by_id(
+            &self.inner.db,
+            pack.active_release.ok_or_else(denied)?,
+        )
+        .await?
+        .ok_or_else(denied)?;
+        let pin = self
+            .prepare_native_pack(release)
+            .await
+            .map_err(|_| denied())?;
+        attune_worker::native_runtime_probe::NativeRuntimeProbeDriver::new(
+            &self.inner.db,
+            self.inner.worker_id.load(Ordering::Acquire),
+            self.inner.worker_instance,
+            config,
+            configured,
+            master,
+            &self.inner.child_environment,
+        )?
+        .verify(runtime, version, admitted, &pin)
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -293,6 +263,8 @@ impl SensorManager {
         token: String,
         token_expires_at: DateTime<Utc>,
         config: &RuntimeExecutionConfig,
+        runtime: &attune_common::models::Runtime,
+        selected_version: Option<&str>,
         reset: bool,
     ) -> Result<SensorInstance> {
         let native = self
@@ -312,7 +284,7 @@ impl SensorManager {
             .ok_or_else(|| anyhow!("Native sensor encryption unavailable"))?;
         // The shared private-generation producer must integrate before recipes
         // and environment setup can be admitted. Never run their local effects.
-        if attune_workload_backend::planning::needs_runtime(config) {
+        if config.lifecycle.is_none() && attune_workload_backend::planning::needs_runtime(config) {
             return Err(anyhow!(
                 "Sensor runtime requires the native private-generation producer"
             ));
@@ -347,7 +319,42 @@ impl SensorManager {
         }
         let pack = self.prepare_native_pack(release).await?;
         let entry = format!("sensors/{}", sensor.entrypoint);
-        let argv = if matches!(config.interpreter.binary.as_str(), "" | "native" | "none") {
+        let argv = if let Some(recipe) = &config.lifecycle {
+            recipe.validate()?;
+            if !self
+                .inner
+                .child_environment
+                .admits_native_runtime_recipe(&recipe.digest()?)
+            {
+                return Err(anyhow!("Native sensor recipe not admitted"));
+            }
+            let version = selected_version
+                .map(|selected| {
+                    binding
+                        .executable
+                        .runtime_versions
+                        .iter()
+                        .find(|v| v.version == selected)
+                        .ok_or_else(|| anyhow!("Pinned sensor runtime version unavailable"))
+                })
+                .transpose()?;
+            let admitted = self
+                .inner
+                .child_environment
+                .native_runtime_recipe_digests()
+                .map(str::to_owned)
+                .collect();
+            self.probe_native_runtime(runtime, version, &admitted)
+                .await?;
+            attune_workload_backend::planning::runtime_recipe_argv(
+                operator.platform,
+                recipe,
+                "/usr/local/bin:/usr/bin:/bin",
+                &entry,
+                false,
+                selected_version,
+            )?
+        } else if matches!(config.interpreter.binary.as_str(), "" | "native" | "none") {
             vec![attune_workload_backend::planning::native_program(
                 &entry,
                 pack_revision.path.join(&entry).is_dir(),
@@ -400,13 +407,17 @@ impl SensorManager {
                 self.inner.notifier_ws_url.clone(),
             ),
         ]);
-        let environment = attune_workload_backend::planning::action_environment(
-            config,
-            &selected,
-            &entry,
-            false,
-            PackAccess::ReadOnly,
-        )?;
+        let environment = if let Some(recipe) = &config.lifecycle {
+            selected_recipe_environment(recipe, &self.inner.child_environment, &selected)?
+        } else {
+            attune_workload_backend::planning::action_environment(
+                config,
+                &selected,
+                &entry,
+                false,
+                PackAccess::ReadOnly,
+            )?
+        };
         let context = Context {
             bootstrap_json: String::from_utf8(bootstrap)
                 .map_err(|_| anyhow!("Sensor bootstrap encoding invalid"))?,
@@ -569,6 +580,30 @@ impl SensorManager {
             .store(sensitive, Ordering::Release);
         Ok(instance)
     }
+}
+
+fn selected_recipe_environment(
+    recipe: &attune_common::runtime_lifecycle::RuntimeRecipe,
+    captured: &ChildProcessEnvironment,
+    context: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
+    recipe.validate()?;
+    if !captured.admits_native_runtime_recipe(&recipe.digest()?) {
+        return Err(anyhow!("Native sensor recipe not admitted"));
+    }
+    let mut selected = context.clone();
+    for name in &recipe.permitted_caller_env {
+        if let Some(value) = captured.get(name) {
+            selected.insert(
+                name.clone(),
+                value
+                    .to_str()
+                    .ok_or_else(|| anyhow!("Sensor caller environment is not UTF-8"))?
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(attune_workload_backend::planning::runtime_recipe_environment(&selected)?)
 }
 
 fn encode_bootstrap(config: &serde_json::Value, triggers: &impl Serialize) -> Result<Vec<u8>> {
@@ -818,6 +853,46 @@ async fn acknowledge_ready_file(
 mod file_receipt_tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn native_recipe_environment_uses_admitted_caller_snapshot_and_private_sensor_context() {
+        let recipe: attune_common::runtime_lifecycle::RuntimeRecipe = serde_json::from_value(serde_json::json!({
+            "tools":[{"name":"python","binaries":["python3"],"version_pattern":"(?<version>3[.]12)","primary":true}],
+            "launch":{"command":["{tool_python}","{source_file}"]},
+            "permitted_caller_env":["APP_REGION"]
+        })).unwrap();
+        let captured = ChildProcessEnvironment::from_parent(
+            [
+                (
+                    "ATTUNE_RUNTIME_RECIPE_DIGESTS".into(),
+                    recipe.digest().unwrap().into(),
+                ),
+                ("APP_REGION".into(), "region-a".into()),
+                ("JWT_SECRET".into(), "manager-only-secret".into()),
+                ("ATTUNE_API_TOKEN".into(), "manager-only-token".into()),
+            ],
+            &["APP_REGION".into()],
+        )
+        .unwrap()
+        .with_workload_sandbox(
+            attune_common::workload_sandbox::WorkloadSandbox::NativeEffectsRequired,
+        );
+        let context = BTreeMap::from([
+            ("ATTUNE_SENSOR_ID".into(), "42".into()),
+            ("ATTUNE_API_TOKEN".into(), "admitted-sensor-token".into()),
+        ]);
+        let selected = selected_recipe_environment(&recipe, &captured, &context).unwrap();
+        assert_eq!(selected.len(), 3);
+        assert_eq!(selected["APP_REGION"], "region-a");
+        assert_eq!(selected["ATTUNE_API_TOKEN"], "admitted-sensor-token");
+        assert!(!selected.contains_key("JWT_SECRET"));
+        let denied = ChildProcessEnvironment::from_parent([], &[])
+            .unwrap()
+            .with_workload_sandbox(
+                attune_common::workload_sandbox::WorkloadSandbox::NativeEffectsRequired,
+            );
+        assert!(selected_recipe_environment(&recipe, &denied, &context).is_err());
+    }
 
     #[tokio::test]
     async fn ready_receipt_uses_only_completion_without_plaintext_or_local_staging() {
