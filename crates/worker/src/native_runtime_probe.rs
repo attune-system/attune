@@ -260,15 +260,14 @@ impl<'a> NativeRuntimeProbeDriver<'a> {
                 stderr_log_writer: None,
             },
         );
-        tokio::pin!(future);
         let mut check = tokio::time::interval(std::time::Duration::from_secs(1));
-        let result = loop {
-            tokio::select! {
-                result=&mut future=>break result.map_err(|_|denied())?,
-            _=tokio::time::sleep_until(deadline)=>{cancel.cancel();let _=(&mut future).await;return Err(denied());},
-                _=check.tick()=>if Probe::validate_source(&self.pool,spec.intent,master).await.is_err(){cancel.cancel();let _=(&mut future).await;return Err(denied());}
+        let source_checks = async {
+            loop {
+                check.tick().await;
+                Probe::validate_source(&self.pool, spec.intent, master).await?;
             }
         };
+        let result = await_probe_execution(future, source_checks, deadline, &cancel).await?;
         if result.exit_code != 0
             || result.error.is_some()
             || result.logs_incomplete
@@ -285,6 +284,36 @@ impl<'a> NativeRuntimeProbeDriver<'a> {
         backend.remove_stopped(&spec, &resource).await?;
         Probe::acknowledge_removed(&self.pool, spec.intent, Some(&resource)).await?;
         Probe::tools(&self.pool, spec.intent, master).await
+    }
+}
+
+// A pending source query must not suspend execution's deadline/cancellation polling.
+async fn await_probe_execution(
+    execution: impl std::future::Future<
+        Output = crate::runtime::RuntimeResult<crate::runtime::ExecutionResult>,
+    >,
+    source_checks: impl std::future::Future<Output = Result<()>>,
+    deadline: tokio::time::Instant,
+    cancel: &CancellationToken,
+) -> Result<crate::runtime::ExecutionResult> {
+    tokio::pin!(execution);
+    let completed = {
+        tokio::pin!(source_checks);
+        tokio::select! {
+            result = &mut execution => Some(result),
+            _ = tokio::time::sleep_until(deadline) => None,
+            _ = &mut source_checks => None,
+        }
+    };
+    match completed {
+        Some(result) => result.map_err(|_| denied()),
+        None => {
+            // Drop the pending source query before joining durable Stop/capture.
+            // Cancellation alone never proves either has settled.
+            cancel.cancel();
+            let _ = execution.await;
+            Err(denied())
+        }
     }
 }
 
@@ -619,5 +648,206 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+}
+
+// The setup tests reuse this process double; both supervise the real isolated
+// executor, with physical Stop observable before its durable acknowledgement.
+#[cfg(test)]
+pub(crate) mod supervision_tests {
+    use super::*;
+    use attune_common::{isolated_process::ProcessIo, workload_stdin::LaunchStdinPayload};
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex,
+        },
+        time::Duration,
+    };
+    use tokio::sync::oneshot;
+
+    struct Control {
+        waiting: Mutex<Option<oneshot::Sender<()>>>,
+        stopped: Mutex<Option<oneshot::Sender<LaunchStopReason>>>,
+        stop_ack: Mutex<Option<oneshot::Receiver<bool>>>,
+        writes: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessControl for Control {
+        async fn write_stdin_once(&self, payload: LaunchStdinPayload) -> Result<()> {
+            assert_eq!(payload.as_bytes(), b"{}");
+            assert_eq!(self.writes.fetch_add(1, Ordering::SeqCst), 0);
+            Ok(())
+        }
+
+        async fn wait(&self) -> Result<LaunchExitOutcome> {
+            self.waiting
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(())
+                .unwrap();
+            std::future::pending().await
+        }
+
+        async fn stop(&self, reason: LaunchStopReason) -> Result<LaunchExitOutcome> {
+            self.stopped
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(reason)
+                .unwrap();
+            let ack = self.stop_ack.lock().unwrap().take().unwrap();
+            if !ack.await.unwrap() {
+                return Err(Error::execution("Uncertain stopped-writer acknowledgement"));
+            }
+            Ok(LaunchExitOutcome {
+                exit_code: 0,
+                oom_killed: false,
+            })
+        }
+    }
+
+    pub(crate) struct PendingProcess {
+        pub process: ProcessIo,
+        pub waiting: oneshot::Receiver<()>,
+        pub stopped: oneshot::Receiver<LaunchStopReason>,
+        pub stop_ack: oneshot::Sender<bool>,
+        pub writes: Arc<AtomicUsize>,
+    }
+
+    pub(crate) fn pending_process() -> PendingProcess {
+        let (waiting_tx, waiting) = oneshot::channel();
+        let (stopped_tx, stopped) = oneshot::channel();
+        let (stop_ack, ack) = oneshot::channel();
+        let writes = Arc::new(AtomicUsize::new(0));
+        PendingProcess {
+            process: ProcessIo {
+                resource: ResourceIdentity::Kubernetes {
+                    cluster: "owned-fixture".into(),
+                    namespace: "owned".into(),
+                    pod_name: "pending-native-process".into(),
+                    pod_uid: Uuid::new_v4().to_string(),
+                },
+                stdout: Box::pin(std::io::Cursor::new(Vec::<u8>::new())),
+                stderr: Box::pin(std::io::Cursor::new(Vec::<u8>::new())),
+                control: Arc::new(Control {
+                    waiting: Mutex::new(Some(waiting_tx)),
+                    stopped: Mutex::new(Some(stopped_tx)),
+                    stop_ack: Mutex::new(Some(ack)),
+                    writes: writes.clone(),
+                }),
+            },
+            waiting,
+            stopped,
+            stop_ack,
+            writes,
+        }
+    }
+
+    pub(crate) async fn execute(
+        process: ProcessIo,
+        cancel: CancellationToken,
+        timeout_secs: Option<u64>,
+    ) -> crate::runtime::RuntimeResult<crate::runtime::ExecutionResult> {
+        crate::runtime::process_executor::execute_isolated_cancellable(
+            process,
+            LaunchStdinPayload::from_bytes(b"{}".to_vec()).unwrap(),
+            crate::runtime::process_executor::IsolatedCaptureOptions {
+                timeout_secs,
+                max_stdout_bytes: 1024,
+                max_stderr_bytes: 1024,
+                output_format: attune_common::models::OutputFormat::Text,
+                output_policy: Default::default(),
+                out_schema: None,
+                cancel_token: Some(cancel),
+                stdout_log_writer: None,
+                stderr_log_writer: None,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn signal<T>(receiver: oneshot::Receiver<T>) -> T {
+        tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .expect("supervision stopped polling while a database check was pending")
+            .expect("supervisor dropped without settling")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_source_check_does_not_suspend_probe_deadline_or_stop_join() {
+        let PendingProcess {
+            process,
+            waiting,
+            stopped,
+            stop_ack,
+            writes,
+        } = pending_process();
+        let cancel = CancellationToken::new();
+        let (checking_tx, checking) = oneshot::channel();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        // The absolute probe budget includes reserve/create/start time.
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let task = tokio::spawn(async move {
+            let checks = async {
+                checking_tx.send(()).unwrap();
+                std::future::pending::<Result<()>>().await
+            };
+            await_probe_execution(
+                execute(process, cancel.clone(), Some(120)),
+                checks,
+                deadline,
+                &cancel,
+            )
+            .await
+        });
+        signal(checking).await;
+        signal(waiting).await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(signal(stopped).await, LaunchStopReason::Cancelled);
+        assert!(
+            !task.is_finished(),
+            "Stop/capture must remain joined until acknowledged"
+        );
+        stop_ack.send(true).unwrap();
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_source_check_cancels_probe_and_waits_for_uncertain_stop() {
+        let PendingProcess {
+            process,
+            waiting,
+            stopped,
+            stop_ack,
+            writes,
+        } = pending_process();
+        let cancel = CancellationToken::new();
+        let (revoke, revoked) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let checks = async {
+                revoked.await.unwrap();
+                Err(denied())
+            };
+            await_probe_execution(
+                execute(process, cancel.clone(), Some(120)),
+                checks,
+                tokio::time::Instant::now() + Duration::from_secs(120),
+                &cancel,
+            )
+            .await
+        });
+        signal(waiting).await;
+        revoke.send(()).unwrap();
+        assert_eq!(signal(stopped).await, LaunchStopReason::Cancelled);
+        assert!(!task.is_finished());
+        stop_ack.send(false).unwrap();
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
     }
 }

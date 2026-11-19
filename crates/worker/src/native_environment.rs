@@ -281,19 +281,23 @@ impl<'a> NativeEnvironmentInstaller<'a> {
                 stderr_log_writer: None,
             },
         );
-        tokio::pin!(future);
         let mut renew = tokio::time::interval(std::time::Duration::from_secs(15));
-        let result = loop {
-            tokio::select! {
-                result=&mut future=>break result.map_err(|_|denied())?,
-                _=renew.tick()=>{
-                    if !manager.renew_coordinated_environment_claim(&claimed.env_key,worker,claim,300).await.unwrap_or(false)
-                        || Setup::validate_source(self.pool,setup.intent,master).await.is_err() {
-                        cancel.cancel();let _=(&mut future).await;return Err(denied());
-                    }
+        let source_checks = async {
+            loop {
+                renew.tick().await;
+                if !manager
+                    .renew_coordinated_environment_claim(&claimed.env_key, worker, claim, 300)
+                    .await
+                    .unwrap_or(false)
+                    || Setup::validate_source(self.pool, setup.intent, master)
+                        .await
+                        .is_err()
+                {
+                    return Err(denied());
                 }
             }
         };
+        let result = await_setup_execution(future, source_checks, &cancel).await?;
         if result.exit_code != 0
             || result.error.is_some()
             || result.logs_incomplete
@@ -370,5 +374,108 @@ impl<'a> NativeEnvironmentInstaller<'a> {
         Setup::publish(self.pool, setup.intent, &resource, &pin, master).await?;
         self.finish_native_setup_removal(&setup, &resource).await?;
         Ok((pin, true))
+    }
+}
+
+// Keep renewal/source I/O beside execution, whose timeout and cancellation own Stop.
+async fn await_setup_execution(
+    execution: impl std::future::Future<
+        Output = crate::runtime::RuntimeResult<crate::runtime::ExecutionResult>,
+    >,
+    source_checks: impl std::future::Future<Output = Result<()>>,
+    cancel: &CancellationToken,
+) -> Result<crate::runtime::ExecutionResult> {
+    tokio::pin!(execution);
+    let completed = {
+        tokio::pin!(source_checks);
+        tokio::select! {
+            result = &mut execution => Some(result),
+            _ = &mut source_checks => None,
+        }
+    };
+    match completed {
+        Some(result) => result.map_err(|_| denied()),
+        None => {
+            // The query has ended/dropped; keep Stop and capture owned until joined.
+            cancel.cancel();
+            let _ = execution.await;
+            Err(denied())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native_runtime_probe::supervision_tests::{
+        execute, pending_process, signal, PendingProcess,
+    };
+    use std::{sync::atomic::Ordering, time::Duration};
+    use tokio::sync::oneshot;
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_renewal_does_not_suspend_setup_timeout_or_stop_join() {
+        let PendingProcess {
+            process,
+            waiting,
+            stopped,
+            stop_ack,
+            writes,
+        } = pending_process();
+        let cancel = CancellationToken::new();
+        let (renewing_tx, renewing) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let checks = async {
+                renewing_tx.send(()).unwrap();
+                std::future::pending::<Result<()>>().await
+            };
+            await_setup_execution(execute(process, cancel.clone(), Some(120)), checks, &cancel)
+                .await
+        });
+        signal(renewing).await;
+        signal(waiting).await;
+        tokio::time::advance(Duration::from_secs(120)).await;
+        assert_eq!(signal(stopped).await, LaunchStopReason::Timeout);
+        assert!(
+            !task.is_finished(),
+            "Stop/capture must remain joined until acknowledged"
+        );
+        stop_ack.send(true).unwrap();
+        let result = task.await.unwrap().unwrap();
+        assert!(result.timed_out);
+        assert!(!result.is_success());
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_renewal_does_not_suspend_setup_cancellation_or_hide_unknown_stop() {
+        let PendingProcess {
+            process,
+            waiting,
+            stopped,
+            stop_ack,
+            writes,
+        } = pending_process();
+        let cancel = CancellationToken::new();
+        let child = cancel.child_token();
+        let (renewing_tx, renewing) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let checks = async {
+                renewing_tx.send(()).unwrap();
+                std::future::pending::<Result<()>>().await
+            };
+            await_setup_execution(execute(process, child.clone(), None), checks, &child).await
+        });
+        signal(renewing).await;
+        signal(waiting).await;
+        cancel.cancel();
+        assert_eq!(signal(stopped).await, LaunchStopReason::Cancelled);
+        assert!(!task.is_finished());
+        stop_ack.send(false).unwrap();
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result.exit_code, -1);
+        assert!(result.error.is_some());
+        assert!(!result.is_success());
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
     }
 }
