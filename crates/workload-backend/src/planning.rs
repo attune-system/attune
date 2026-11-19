@@ -20,9 +20,10 @@ pub const RUNTIME_RECIPE_TIMEOUT_CHALLENGE_ENV: &str = "ATTUNE_LAUNCH_RECIPE_TIM
 pub const RUNTIME_RECIPE_TIMEOUT_CHALLENGE_BYTES: usize = 64;
 /// Fixed relative leaf under the native attempt's existing artifact root.
 pub const RUNTIME_RECIPE_TIMEOUT_RECEIPT: &str = ".attune-recipe-timeout";
-pub const CANDIDATE_PYTHON_PREP_CHALLENGE_ENV: &str = "ATTUNE_LAUNCH_CANDIDATE_PREP_CHALLENGE";
-pub const CANDIDATE_PYTHON_PREP_RECEIPT: &str = ".attune-candidate-python-prepared";
-pub const CANDIDATE_PYTHON_PREP_CHALLENGE_BYTES: usize = 64;
+pub use attune_common::workload_launch::{
+    CANDIDATE_PYTHON_PREP_CHALLENGE_BYTES, CANDIDATE_PYTHON_PREP_CHALLENGE_ENV,
+    CANDIDATE_PYTHON_PREP_RECEIPT,
+};
 /// Setup-owned source/project output retained with the published runtime.
 pub const PROJECT_ROOT: &str = "/opt/attune/runtime/project";
 /// Runtime invocations use their frozen setup project. Candidate Pack working
@@ -76,7 +77,7 @@ pub struct CandidatePythonPlan {
 impl CandidatePythonPlan {
     pub fn validate(&self) -> Result<()> {
         if self.version != 1
-            || !matches!(self.runner.as_str(), "unittest" | "pytest")
+            || !matches!(self.runner.as_str(), "unittest" | "pytest" | "script")
             || !(1..=3_600_000).contains(&self.timeout_ms)
         {
             return Err(PlanningError::Configuration);

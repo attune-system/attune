@@ -150,16 +150,8 @@ impl NativeCandidateTests {
             .map_err(|_| denied())?;
         let metadata: serde_yaml_ng::Value =
             serde_yaml_ng::from_slice(&yaml).map_err(|_| denied())?;
-        let testing: TestConfig =
-            serde_yaml_ng::from_value(metadata.get("testing").cloned().ok_or_else(denied)?)
-                .map_err(|_| denied())?;
-        testing.validate_policy()?;
-        let python = if testing.enabled
-            && testing
-                .runners
-                .values()
-                .any(|runner| matches!(runner.r#type.as_str(), "unittest" | "pytest"))
-        {
+        let testing = testing_config(&metadata)?;
+        let python = if python_required(&testing)? {
             use attune_common::pack_transport::{ApiPackTransport, PackFileTransport};
             source = Ledger::admit_python(&pool, source).await?;
             let pinned = source.python.as_ref().ok_or_else(denied)?;
@@ -317,7 +309,11 @@ impl NativeCandidateTests {
         // replaces it. Never mint new evidence for an existing older intent.
         let challenge =
             retained_recipe_challenge(retained.as_ref(), request.runner.lifecycle.is_some())?;
-        let python = matches!(request.runner.r#type.as_str(), "unittest" | "pytest");
+        let python = self.python.is_some()
+            && matches!(
+                request.runner.r#type.as_str(),
+                "unittest" | "pytest" | "script"
+            );
         let prep_challenge = retained_python_challenge(retained.as_ref(), python)?;
         let mut env = BTreeMap::from([
             ("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()),
@@ -357,7 +353,7 @@ impl NativeCandidateTests {
             argv
         } else {
             match request.runner.r#type.as_str() {
-                "script" => vec![
+                "script" if self.python.is_none() => vec![
                     if Path::new(entry).extension().and_then(|s| s.to_str()) == Some("sh") {
                         "/bin/sh"
                     } else {
@@ -366,7 +362,7 @@ impl NativeCandidateTests {
                     .into(),
                     guest,
                 ],
-                "unittest" | "pytest" => {
+                "unittest" | "pytest" | "script" => {
                     let plan = attune_workload_backend::planning::CandidatePythonPlan {
                         version: 1,
                         config: self.python.as_ref().ok_or_else(denied)?.clone(),
@@ -543,6 +539,46 @@ impl NativeCandidateTests {
         Ledger::capture(&self.pool, spec.intent, &resource, &capture, &self.master).await?;
         command_output(capture)
     }
+}
+fn testing_config(metadata: &serde_yaml_ng::Value) -> Result<TestConfig> {
+    let Some(value) = metadata.get("testing") else {
+        return Ok(TestConfig {
+            enabled: false,
+            candidate_api_effects: false,
+            discovery: attune_common::test_executor::DiscoveryConfig {
+                method: "auto".into(),
+                path: None,
+            },
+            runners: Default::default(),
+            result_format: None,
+            result_path: None,
+            min_pass_rate: None,
+            on_failure: None,
+        });
+    };
+    let config: TestConfig = serde_yaml_ng::from_value(value.clone()).map_err(|_| denied())?;
+    config.validate_policy()?;
+    Ok(config)
+}
+fn python_required(testing: &TestConfig) -> Result<bool> {
+    let required = testing.enabled
+        && testing
+            .runners
+            .values()
+            .any(|runner| matches!(runner.r#type.as_str(), "unittest" | "pytest"));
+    // Recipe+Python composition needs a coordinated pair of preparation/proof
+    // identities. Never silently execute a recipe before legacy global setup.
+    if required
+        && testing
+            .runners
+            .values()
+            .any(|runner| runner.lifecycle.is_some())
+    {
+        return Err(Error::validation(
+            "Candidate recipe and Python test composition is not supported",
+        ));
+    }
+    Ok(required)
 }
 fn retained_recipe_challenge(
     retained: Option<&ProcessSpec>,
@@ -830,6 +866,64 @@ impl Seek for BudgetWriter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn metadata_config(runners: serde_json::Value, enabled: bool) -> serde_yaml_ng::Value {
+        serde_yaml_ng::to_value(serde_json::json!({"ref":"candidate","testing":{
+            "enabled":enabled,"discovery":{"method":"auto"},"runners":runners
+        }}))
+        .unwrap()
+    }
+    #[test]
+    fn missing_and_disabled_testing_remain_no_ops_without_python_or_authority() {
+        let missing =
+            testing_config(&serde_yaml_ng::from_str("ref: candidate\n").unwrap()).unwrap();
+        assert!(!missing.enabled && missing.runners.is_empty() && !missing.candidate_api_effects);
+        assert!(!python_required(&missing).unwrap());
+        let disabled = testing_config(&metadata_config(
+            serde_json::json!({"py":{"type":"pytest","entry_point":"tests/check.py"}}),
+            false,
+        ))
+        .unwrap();
+        assert!(!disabled.enabled);
+        assert!(!python_required(&disabled).unwrap());
+    }
+    #[test]
+    fn malformed_present_testing_is_never_a_disabled_fallback() {
+        for yaml in [
+            "testing: null",
+            "testing: false",
+            "testing: {}",
+            "testing: invalid",
+        ] {
+            assert!(testing_config(&serde_yaml_ng::from_str(yaml).unwrap()).is_err());
+        }
+        let invalid = metadata_config(
+            serde_json::json!({"py":{"type":"pytest","entry_point":"tests/check.py","timeout":0}}),
+            false,
+        );
+        assert!(testing_config(&invalid).is_err());
+    }
+    #[test]
+    fn plain_script_mixtures_require_global_python_and_recipe_mixtures_deny() {
+        let metadata = metadata_config(
+            serde_json::json!({
+                "py":{"type":"pytest","entry_point":"tests/check.py"},
+                "shell":{"type":"script","entry_point":"tests/check.sh"}
+            }),
+            true,
+        );
+        assert!(python_required(&testing_config(&metadata).unwrap()).unwrap());
+        let scripts = metadata_config(
+            serde_json::json!({"shell":{"type":"script","entry_point":"tests/check.sh"}}),
+            true,
+        );
+        assert!(!python_required(&testing_config(&scripts).unwrap()).unwrap());
+        let recipe = serde_json::json!({"tools":[{"name":"tool","binaries":["tool"],"version_pattern":"(?<version>1)","primary":true}],"launch":{"command":["{tool_tool}","{source_file}"]}});
+        let mixed = metadata_config(
+            serde_json::json!({"py":{"type":"unittest","entry_point":"tests/check.py"},"recipe":{"type":"runtime","entry_point":"tests/run","lifecycle":recipe}}),
+            true,
+        );
+        assert!(python_required(&testing_config(&mixed).unwrap()).is_err());
+    }
     fn fixed_candidate_recipe() -> ProcessSpec {
         ProcessSpec {
             intent: Uuid::new_v4(),

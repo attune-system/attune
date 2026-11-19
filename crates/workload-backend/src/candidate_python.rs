@@ -33,8 +33,9 @@ pub(super) fn run(arguments: &[OsString]) -> io::Result<i32> {
             .map_err(|_| super::invalid())?;
     let generation = tempfile::Builder::new()
         .prefix("attune-candidate-python-")
-        .tempdir_in("/tmp")?;
-    let env_dir = generation.path().join("env");
+        .tempdir_in("/tmp")?
+        .keep();
+    let env_dir = generation.join("env");
     std::fs::create_dir(&env_dir)?;
     let (setup, interpreter) =
         candidate_python_setup(&plan.config, env_dir.to_str().ok_or_else(super::invalid)?)
@@ -99,16 +100,9 @@ pub(super) fn run(arguments: &[OsString]) -> io::Result<i32> {
         .and_then(Path::to_str)
         .ok_or_else(super::invalid)?;
     invocation.insert("PATH".into(), format!("{bin}:/usr/local/bin:/usr/bin:/bin"));
-    let mut command = std::process::Command::new(path);
-    command
-        .env_clear()
-        .envs(invocation)
-        .arg("-m")
-        .arg(&plan.runner)
-        .arg(entry);
-    if plan.runner == "pytest" {
-        command.arg("-v");
-    }
+    let (program, arguments) = final_command(&plan, &interpreter);
+    let mut command = std::process::Command::new(program);
+    command.env_clear().envs(invocation).args(arguments);
     command
         .current_dir(PACK_ROOT)
         .stdin(Stdio::inherit())
@@ -119,6 +113,22 @@ pub(super) fn run(arguments: &[OsString]) -> io::Result<i32> {
     // The owning provider cleans this private scratch after terminal/removal
     // proof; no shared ready marker or reusable runtime is published.
     Err(command.exec())
+}
+fn final_command(plan: &CandidatePythonPlan, interpreter: &str) -> (String, Vec<String>) {
+    let entry = format!("{PACK_ROOT}/{}", plan.entry);
+    if plan.runner == "script" {
+        let shell = if Path::new(&plan.entry).extension().and_then(|s| s.to_str()) == Some("sh") {
+            "/bin/sh"
+        } else {
+            "/bin/bash"
+        };
+        return (shell.into(), vec![entry]);
+    }
+    let mut args = vec!["-m".into(), plan.runner.clone(), entry];
+    if plan.runner == "pytest" {
+        args.push("-v".into());
+    }
+    (interpreter.into(), args)
 }
 
 fn write_prepared(root: &Path, challenge: &str) -> io::Result<()> {
@@ -280,12 +290,47 @@ mod tests {
         assert!(decoded.config.lifecycle.is_none());
     }
     #[test]
+    fn final_commands_preserve_shell_selection_and_python_module_arguments() {
+        let mut selected = plan();
+        let interpreter = "/tmp/owned-private/env/bin/python3";
+        assert_eq!(
+            final_command(&selected, interpreter),
+            (
+                interpreter.into(),
+                vec![
+                    "-m".into(),
+                    "pytest".into(),
+                    format!("{PACK_ROOT}/tests/check.py"),
+                    "-v".into()
+                ]
+            )
+        );
+        selected.runner = "unittest".into();
+        assert_eq!(
+            final_command(&selected, interpreter).1,
+            ["-m", "unittest", &format!("{PACK_ROOT}/tests/check.py")]
+        );
+        selected.runner = "script".into();
+        for (entry, shell) in [
+            ("tests/check.sh", "/bin/sh"),
+            ("tests/check.txt", "/bin/bash"),
+            ("-leading.sh", "/bin/sh"),
+        ] {
+            selected.entry = entry.into();
+            selected.validate().unwrap();
+            assert_eq!(
+                final_command(&selected, interpreter),
+                (shell.into(), vec![format!("{PACK_ROOT}/{entry}")])
+            );
+        }
+    }
+    #[test]
     fn malformed_or_unbounded_private_plans_fail_without_execution() {
         assert!(decode(&[]).is_err());
         assert!(decode(&[OsString::from("not-json")]).is_err());
         assert!(decode(&[OsString::from("a".repeat(RUNTIME_RECIPE_CHUNK_BYTES + 1))]).is_err());
         let mut invalid = plan();
-        invalid.runner = "script".into();
+        invalid.runner = "arbitrary".into();
         assert!(decode(&[serde_json::to_string(&invalid).unwrap().into()]).is_err());
     }
     #[test]

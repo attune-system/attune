@@ -28,6 +28,9 @@ pub const PACK_ROOT: &str = "/opt/attune/pack";
 pub const RUNTIME_ROOT: &str = "/opt/attune/runtime";
 pub const RUNNER_ROOT: &str = "/opt/attune/runner";
 pub const SCRATCH_ROOT: &str = "/tmp";
+pub const CANDIDATE_PYTHON_PREP_CHALLENGE_ENV: &str = "ATTUNE_LAUNCH_CANDIDATE_PREP_CHALLENGE";
+pub const CANDIDATE_PYTHON_PREP_RECEIPT: &str = ".attune-candidate-python-prepared";
+pub const CANDIDATE_PYTHON_PREP_CHALLENGE_BYTES: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(transparent)]

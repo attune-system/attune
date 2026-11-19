@@ -34,7 +34,7 @@ pub struct CandidateSource {
     pub effects: Option<CandidateEffectsSource>,
     pub python: Option<CandidatePythonSource>,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CandidatePythonSource {
     pub runtime: i64,
@@ -174,12 +174,73 @@ pub struct CandidateCapture {
     pub stderr: String,
     pub duration_ms: u64,
 }
+// This is a prerequisite for disclosing an aggregate result, not readiness for
+// another launch. Capture is trusted only after its owning native producer has
+// authenticated the fixed receipt; numeric success is deliberately irrelevant.
+fn prepared_python_capture(record: &Record, c: &Context, capture: &CandidateCapture) -> bool {
+    record.create_submitted
+        && record.stdin_consumed
+        && record.stop_requested
+        && record.resource_removed
+        && record.resource.is_some()
+        && record.candidate_capture.is_some()
+        && record.source_epochs.0 == c.source.epochs
+        && record.intent == c.intent
+        && record.target.0 == c.target
+        && c.source.python.is_some()
+        && record.exit_outcome.as_ref().is_some_and(|exit| {
+            exit.0.exit_code == capture.exit_code
+                && (!exit.0.oom_killed || capture.interruption.is_some())
+        })
+        && capture.interruption
+            != Some(crate::test_executor::TestProcessInterruption::PreparationUnverified)
+        && c.invocation.argv.first()
+            == Some(&format!("{RUNNER_ROOT}/linux-{}", c.platform.native_arch()))
+        && c.invocation.argv.get(1).map(String::as_str) == Some("run-candidate-python")
+        && c.invocation.working_root == LaunchRoot::Pack
+        && c.inputs.len() == 2
+        && c.inputs
+            .iter()
+            .filter(|p| p.kind == LaunchInputKind::Pack)
+            .count()
+            == 1
+        && c.inputs
+            .iter()
+            .filter(|p| p.kind == LaunchInputKind::Runner)
+            .count()
+            == 1
+        && c.invocation
+            .env
+            .get(CANDIDATE_PYTHON_PREP_CHALLENGE_ENV)
+            .is_some_and(|value| {
+                value.len() == CANDIDATE_PYTHON_PREP_CHALLENGE_BYTES
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+}
 /// Retain the caller's SQLx transaction through lease closure, result/terminal
 /// writes and COMMIT. This deadline is not a transferable execution authority.
 pub struct CandidateResultFence {
     deadline: DateTime<Utc>,
+    result_prepared: bool,
 }
 impl CandidateResultFence {
+    fn new(deadline: DateTime<Utc>, source: &CandidateSource) -> Self {
+        Self {
+            deadline,
+            result_prepared: source.python.is_none(),
+        }
+    }
+    /// Required for EVERY Some(result) before history or success/status writes.
+    /// A factual hard-Failed/no-history terminal uses the same live fence and
+    /// deadline without fabricating preparation for skipped/metadata-only tests.
+    pub fn require_result(&self) -> Result<()> {
+        if !self.result_prepared {
+            return Err(denied());
+        }
+        Ok(())
+    }
     pub async fn ensure_fresh(&self, tx: &mut Transaction<'_, Postgres>) -> Result<()> {
         fresh(tx, self.deadline).await
     }
@@ -599,6 +660,7 @@ impl CandidateProcessRepository {
     ) -> Result<CandidateResultFence> {
         let mut deadline = source(tx, s).await?;
         epochs(tx, s).await?;
+        let mut fence = CandidateResultFence::new(deadline, s);
         let mut after = 0i64;
         loop {
             let records:Vec<Record>=sqlx::query_as(&format!("SELECT {COLUMNS} FROM execution_process_effect WHERE purpose='candidate_test' AND (target->>'install')::BIGINT=$1 AND id>$2 ORDER BY id LIMIT 4"))
@@ -619,15 +681,20 @@ impl CandidateProcessRepository {
                 }
                 deadline = deadline.min(source(tx, &c.source).await?);
                 epochs(tx, &c.source).await?;
-                if let Some(value) = record.candidate_capture {
-                    let _: CandidateCapture =
-                        serde_json::from_str(&crypto::decrypt(&value, master)?)
+                if let Some(value) = record.candidate_capture.as_deref() {
+                    let capture: CandidateCapture =
+                        serde_json::from_str(&crypto::decrypt(value, master)?)
                             .map_err(|_| denied())?;
+                    if c.source.python == s.python && prepared_python_capture(&record, &c, &capture)
+                    {
+                        fence.result_prepared = true;
+                    }
                 }
             }
         }
         fresh(tx, deadline).await?;
-        Ok(CandidateResultFence { deadline })
+        fence.deadline = deadline;
+        Ok(fence)
     }
     /// Positive never-submitted cleanup tombstones. An unknown Create commit
     /// has create_submitted=true and can never take this path.
@@ -655,5 +722,176 @@ impl CandidateProcessRepository {
             }
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod preparation_result_tests {
+    use super::*;
+    fn captured() -> (Record, Context, CandidateCapture) {
+        let intent = Uuid::new_v4();
+        let instance = Uuid::new_v4();
+        let source = CandidateSource {
+            epochs: vec![],
+            install: 1,
+            worker: 2,
+            instance,
+            pack_id: None,
+            pack_ref: "owned".into(),
+            pack_version: "1.0.0".into(),
+            archive_key: "owned".into(),
+            archive_version: "owned".into(),
+            archive_digest: "a".repeat(64),
+            archive_size: 1,
+            archive_token_hash: "owned".into(),
+            effects: None,
+            python: Some(CandidatePythonSource {
+                runtime: 3,
+                provider_pack: 4,
+                release: 5,
+                release_digest: "b".repeat(64),
+                runtime_config: serde_json::json!({}),
+                distributions: serde_json::json!({}),
+            }),
+        };
+        let target = LaunchTarget::CandidateTest {
+            install: 1,
+            test_job: 1,
+            attempt: instance,
+        };
+        let c = Context {
+            source,
+            intent,
+            target: target.clone(),
+            image: PinnedImage {
+                reference: format!("owned.invalid/image@sha256:{}", "c".repeat(64)),
+                sha256: Sha256Digest::parse("c".repeat(64)).unwrap(),
+            },
+            platform: LaunchPlatform::LinuxAmd64,
+            inputs: [(1, LaunchInputKind::Pack), (2, LaunchInputKind::Runner)]
+                .into_iter()
+                .map(|(id, kind)| PinnedLaunchInput {
+                    pin_id: id,
+                    kind,
+                    object_id: id,
+                    object_version: "owned".into(),
+                    size_bytes: 1,
+                    sha256: Sha256Digest::of_bytes(b"owned"),
+                    max_expanded_bytes: 1,
+                    max_files: 1,
+                })
+                .collect(),
+            timeout_ms: Some(1000),
+            invocation: LaunchInvocation {
+                argv: vec![
+                    format!("{RUNNER_ROOT}/linux-amd64"),
+                    "run-candidate-python".into(),
+                ],
+                env: std::collections::BTreeMap::from([(
+                    CANDIDATE_PYTHON_PREP_CHALLENGE_ENV.into(),
+                    "d".repeat(64),
+                )]),
+                working_root: LaunchRoot::Pack,
+            },
+        };
+        let record = Record {
+            id: 1,
+            intent,
+            target: Json(target),
+            encrypted_context: String::new(),
+            source_epochs: Json(vec![]),
+            create_submitted: true,
+            stdin_consumed: true,
+            stop_requested: true,
+            resource: Some(Json(ResourceIdentity::Docker {
+                engine_id: 1,
+                daemon_id: "owned".into(),
+                container_id: "a".repeat(64),
+            })),
+            exit_outcome: Some(Json(LaunchExitOutcome {
+                exit_code: 1,
+                oom_killed: false,
+            })),
+            resource_removed: true,
+            candidate_capture: Some("opaque-pure-fact".into()),
+            created: Utc::now(),
+        };
+        let capture = CandidateCapture {
+            interruption: None,
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+            duration_ms: 1,
+        };
+        (record, c, capture)
+    }
+    #[test]
+    fn observed_nonzero_with_exact_preparation_can_admit_result() {
+        let (record, c, capture) = captured();
+        assert!(prepared_python_capture(&record, &c, &capture));
+        let fence = CandidateResultFence {
+            deadline: Utc::now(),
+            result_prepared: true,
+        };
+        assert!(fence.require_result().is_ok());
+    }
+    #[test]
+    fn cancellation_and_metadata_only_results_do_not_invent_preparation() {
+        let (_, context, _) = captured();
+        // These no-effect paths never observe a qualifying captured context.
+        for _path in ["cancelled-before-first-suite", "metadata-only-failures"] {
+            let fence = CandidateResultFence::new(Utc::now(), &context.source);
+            assert!(fence.require_result().is_err());
+        }
+    }
+    #[test]
+    fn no_python_source_requirement_is_the_only_no_effect_noop() {
+        let (_, mut context, _) = captured();
+        context.source.python = None;
+        assert!(CandidateResultFence::new(Utc::now(), &context.source)
+            .require_result()
+            .is_ok());
+    }
+    #[test]
+    fn unsubmitted_incomplete_and_unverified_states_cannot_supply_preparation() {
+        for change in 0..9 {
+            let (mut record, c, mut capture) = captured();
+            match change {
+                0 => record.create_submitted = false,
+                1 => record.stdin_consumed = false,
+                2 => record.stop_requested = false,
+                3 => record.resource_removed = false,
+                4 => record.resource = None,
+                5 => record.exit_outcome = None,
+                6 => record.candidate_capture = None,
+                7 => {
+                    capture.interruption =
+                        Some(crate::test_executor::TestProcessInterruption::PreparationUnverified)
+                }
+                _ => capture.exit_code = 0,
+            }
+            assert!(!prepared_python_capture(&record, &c, &capture));
+        }
+    }
+    #[test]
+    fn prechallenge_other_mode_or_mutated_context_cannot_supply_preparation() {
+        for change in 0..6 {
+            let (record, mut c, capture) = captured();
+            match change {
+                0 => c.invocation.env.clear(),
+                1 => {
+                    c.invocation
+                        .env
+                        .insert(CANDIDATE_PYTHON_PREP_CHALLENGE_ENV.into(), "D".repeat(64));
+                }
+                2 => c.invocation.argv[1] = "exec".into(),
+                3 => c.invocation.argv[0] = format!("{PACK_ROOT}/forged-runner"),
+                4 => {
+                    c.inputs.pop();
+                }
+                _ => c.intent = Uuid::new_v4(),
+            }
+            assert!(!prepared_python_capture(&record, &c, &capture));
+        }
     }
 }

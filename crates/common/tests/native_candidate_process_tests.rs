@@ -474,6 +474,7 @@ async fn source_fenced_result_close_and_finish_rollback_together() -> Result<()>
     let result = result(&source);
     let mut tx = db.begin().await?;
     let fence = Ledger::lock_result(&mut tx, &source, MASTER).await?;
+    fence.require_result()?; // Source requires no Python: existing result policy is unchanged.
     CandidateEffectRepository::close_on(&mut tx, lease).await?;
     let record = PackTestRepository::create_on(
         &mut tx,
@@ -774,5 +775,101 @@ async fn unverified_preparation_capture_settles_cleanup_but_never_fabricates_tes
     assert_eq!(history, 0);
     tx.rollback().await?;
     db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn python_zero_effect_cancellation_metadata_and_unsubmitted_states_cannot_publish_results(
+) -> Result<()> {
+    let (db, source, mut spec) = python_fixture().await?;
+    for _path in ["cancelled-before-first-suite", "metadata-only-errors"] {
+        let mut tx = db.begin().await?;
+        let fence = Ledger::lock_result(&mut tx, &source, MASTER).await?;
+        assert!(fence.require_result().is_err());
+        fence.ensure_fresh(&mut tx).await?; // Failed/no-history remains live.
+        tx.rollback().await?;
+    }
+    spec.invocation.argv = vec![
+        format!("{RUNNER_ROOT}/linux-amd64"),
+        "run-candidate-python".into(),
+    ];
+    spec.invocation
+        .env
+        .insert(CANDIDATE_PYTHON_PREP_CHALLENGE_ENV.into(), "d".repeat(64));
+    Ledger::reserve(db.pool(), &source, &spec, MASTER).await?;
+    Ledger::settle_unsubmitted(db.pool(), &source).await?;
+    assert!(Ledger::settled(db.pool(), &source, MASTER).await?);
+    let mut tx = db.begin().await?;
+    let fence = Ledger::lock_result(&mut tx, &source, MASTER).await?;
+    assert!(fence.require_result().is_err());
+    fence.ensure_fresh(&mut tx).await?;
+    tx.rollback().await?;
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn python_result_requires_exact_submitted_challenged_prepared_capture() -> Result<()> {
+    use attune_common::test_executor::TestProcessInterruption;
+    for case in [
+        "other-mode",
+        "prechallenge",
+        "unverified",
+        "prepared-final-exit1",
+    ] {
+        let (db, source, mut spec) = python_fixture().await?;
+        if case != "other-mode" {
+            spec.invocation.argv = vec![
+                format!("{RUNNER_ROOT}/linux-amd64"),
+                "run-candidate-python".into(),
+            ];
+        }
+        if case != "prechallenge" {
+            spec.invocation
+                .env
+                .insert(CANDIDATE_PYTHON_PREP_CHALLENGE_ENV.into(), "d".repeat(64));
+        }
+        let spec = Ledger::reserve(db.pool(), &source, &spec, MASTER).await?;
+        let resource = resource();
+        Ledger::begin_create(db.pool(), spec.intent, MASTER).await?;
+        Effects::record_resource(db.pool(), spec.intent, &resource).await?;
+        Ledger::consume_stdin(db.pool(), spec.intent, &resource, MASTER).await?;
+        Effects::record_exit(
+            db.pool(),
+            spec.intent,
+            &resource,
+            LaunchExitOutcome {
+                exit_code: 1,
+                oom_killed: false,
+            },
+        )
+        .await?;
+        Effects::request_stop(db.pool(), spec.intent).await?;
+        Ledger::acknowledge_removed(db.pool(), spec.intent, &resource).await?;
+        Ledger::capture(
+            db.pool(),
+            spec.intent,
+            &resource,
+            &CandidateCapture {
+                interruption: (case == "unverified")
+                    .then_some(TestProcessInterruption::PreparationUnverified),
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: "known final failure or static prep failure".into(),
+                duration_ms: 1,
+            },
+            MASTER,
+        )
+        .await?;
+        let mut tx = db.begin().await?;
+        let fence = Ledger::lock_result(&mut tx, &source, MASTER).await?;
+        assert_eq!(
+            fence.require_result().is_ok(),
+            case == "prepared-final-exit1"
+        );
+        fence.ensure_fresh(&mut tx).await?;
+        tx.rollback().await?;
+        db.cleanup().await?;
+    }
     Ok(())
 }
