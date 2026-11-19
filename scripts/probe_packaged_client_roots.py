@@ -209,7 +209,7 @@ class McpHttpProbe:
             # the unknown inspection ACK remains a failed probe.
         waited = None
         try:
-            if self.docker('stop', '--time', '5', self.identifier).strip() != self.identifier.encode():
+            if self.docker('stop', '--timeout', '5', self.identifier).strip() != self.identifier.encode():
                 fail('stop', 'ack_mismatch')
         except ProbeFailure as failure:
             fail('stop', str(failure))

@@ -100,8 +100,13 @@ class Docker:
             value['cleanup'] = True
             if value['State']['Running']:
                 value['State'].update(Running=False, ExitCode=137)
+            output = PRIVATE if self.fault == 'stop_echo' else reference.encode() + b'\n'
+            # Docker CLI's deprecated alias pollutes stdout before the ID ACK.
+            # Keep this modeled so the positive path catches alias regressions.
+            if '--time' in args:
+                output = b'Flag --time has been deprecated, use --timeout instead\n' + output
             return result(1 if self.fault in ('stop_ack', 'stop_and_wait_ack') else 0,
-                          out=PRIVATE if self.fault == 'stop_echo' else reference.encode() + b'\n')
+                          out=output)
         if op == 'wait':
             assert value['State']['Running'] is False
             if value['cleanup'] and self.fault in ('wait_ack', 'stop_and_wait_ack'):
@@ -155,6 +160,8 @@ class PackagedClientRootsTests(unittest.TestCase):
             self.assertEqual(args[args.index('--http-host') + 1], 'localhost:8090')
             for forbidden in ('--publish', '-p', '--auth-token', '--execution-token', '--login', '--password', '--profile', '--info'):
                 self.assertNotIn(forbidden, args)
+        for args in (args for args in docker.calls if args[1] == 'stop'):
+            self.assertEqual(args[2:4], ['--timeout', '5'])
         health = next(args for args in docker.calls if args[1] == 'exec')
         self.assertEqual(health[health.index('--header') + 1], 'Host: localhost:8090')
         self.assertEqual(health[-1], 'http://127.0.0.1:8090/health')
