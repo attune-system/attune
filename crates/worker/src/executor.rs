@@ -2129,7 +2129,9 @@ impl ActionExecutor {
             .into_iter()
             .filter(|version| Self::version_matches_worker(version, &advertised_versions))
             .map(|mut version| {
-                if runtime.execution_config.get("lifecycle").is_some() {
+                if self.native_preparation.is_some()
+                    || runtime.execution_config.get("lifecycle").is_some()
+                {
                     version.available = true;
                 }
                 version
