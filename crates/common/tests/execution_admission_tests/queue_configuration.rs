@@ -652,6 +652,15 @@ async fn mixed_queue_case(direct_key: bool, split_ceilings: bool, transferred: b
     Authority::activate_policy(&mut tx, revision.id)
         .await
         .unwrap();
+    if transferred {
+        // Configuration mutation uses exclusive admission. Actual item/source
+        // acceptance starts afresh with the production shared graph gate.
+        tx.commit().await.unwrap();
+        tx = db.begin().await.unwrap();
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
+            .await
+            .unwrap();
+    }
     let sources = if transferred {
         vec![
             transfer::Source::prepare(&mut tx, &snapshot, &policy, human, "first").await,
@@ -684,6 +693,11 @@ async fn mixed_queue_case(direct_key: bool, split_ceilings: bool, transferred: b
                 .bind(item).bind(source).execute(&mut *tx).await.unwrap();
         }
     }
+    let reclaimer = if transferred {
+        Some(transfer::blocked_reclaimer(&db, &mut tx, &sources).await)
+    } else {
+        None
+    };
     let mut accepted_transfers = Vec::new();
     for (index, item) in [&first, &second].into_iter().enumerate() {
         if transferred {
@@ -712,6 +726,7 @@ async fn mixed_queue_case(direct_key: bool, split_ceilings: bool, transferred: b
             accepted.ensure_fresh_on(&mut tx).await.unwrap();
         }
         tx.commit().await.unwrap();
+        reclaimer.unwrap().await.unwrap();
         tx = db.begin().await.unwrap();
         attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
             .await

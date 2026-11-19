@@ -123,8 +123,10 @@ reclamation cases exercise the owning record and canonical graph.
 This remains work in progress under disabled readiness gates. These fixtures do
 not establish coordinated consumer readiness. The public enqueue API still
 accepts literal secret fields only; its internal typed-transfer seam is not
-user-facing protected contributor support. Concurrent lifecycle coverage,
-complete affected-consumer validation and SQLx preparation remain restoration
+user-facing protected contributor support. The owned PostgreSQL capture/reclaim
+case also checks shared/exclusive graph ordering, cancellation with a bounded
+statement deadline, and visibility of committed source references. Complete
+affected-consumer validation and SQLx preparation remain restoration
 requirements. Existing live contributor credential resolution is not a
 substitute for these proofs.
 

@@ -47,6 +47,109 @@ pub(super) fn admit_source_effect(policy: &mut RuntimePolicy) {
     }
 }
 
+// The real acceptance transaction holds shared admission before inserting its
+// fixed owner/source references. A waiting collector must observe those exact
+// references after commit; cancellation must not strand a graph waiter.
+pub(super) async fn blocked_reclaimer(
+    db: &TestDatabase,
+    writer: &mut sqlx::PgConnection,
+    sources: &[Source],
+) -> tokio::task::JoinHandle<()> {
+    let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *writer)
+        .await
+        .unwrap();
+    let receipts = sources.iter().map(Source::receipt).collect::<Vec<_>>();
+    let mut survivor = None;
+    for cancel in [true, false] {
+        let pool = db.pool().clone();
+        let receipts = receipts.clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let collector = tokio::spawn(async move {
+            // Match the real bounded collector's socket ownership: dropping a
+            // task while its SQL statement is pending must dispose the session,
+            // rather than queue ROLLBACK behind the abandoned graph wait.
+            let mut connection = pool.acquire().await.unwrap().detach();
+            let mut tx = sqlx::Connection::begin(&mut connection).await.unwrap();
+            // The bounded collector also arms its statement deadline before
+            // graph admission. A server in an advisory wait need not notice a
+            // closed client socket until that statement is interrupted.
+            if cancel {
+                sqlx::query("SET LOCAL statement_timeout = '1000ms'")
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            send.send(pid).unwrap();
+            attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(
+                &mut tx,
+            )
+            .await
+            .unwrap();
+            assert_eq!(Fixed::reclaim_with_conn(&mut tx, 100).await.unwrap(), 0);
+            for receipt in receipts {
+                assert!(
+                    sqlx::query_scalar::<_, bool>("SELECT queue_input_holds_receipt($1)")
+                        .bind(receipt)
+                        .fetch_one(&mut *tx)
+                        .await
+                        .unwrap()
+                );
+                assert_eq!(
+                    sqlx::query("DELETE FROM runtime_input_receipt WHERE id=$1")
+                        .bind(receipt)
+                        .execute(&mut *tx)
+                        .await
+                        .unwrap()
+                        .rows_affected(),
+                    0
+                );
+            }
+            tx.commit().await.unwrap();
+        });
+        let pid = receive.await.unwrap();
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let blocked: bool = sqlx::query_scalar("SELECT $2=ANY(pg_blocking_pids($1))")
+                    .bind(pid)
+                    .bind(writer_pid)
+                    .fetch_one(&mut *writer)
+                    .await
+                    .unwrap();
+                if blocked {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if waited.is_err() {
+            collector.abort();
+            let _ = collector.await;
+            panic!("collector never waited on the actual shared acceptance transaction");
+        }
+        if cancel {
+            collector.abort();
+            assert!(collector.await.unwrap_err().is_cancelled());
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let clean: bool = sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='advisory')")
+                        .bind(pid).fetch_one(&mut *writer).await.unwrap();
+                    if clean { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }).await.expect("cancelled collector must release its pending graph admission");
+        } else {
+            survivor = Some(collector);
+        }
+    }
+    survivor.unwrap()
+}
+
 // This test owns the database and root key. Re-encrypt malformed metadata so
 // independent source/site/attempt/value validation, not only AEAD, is decisive.
 pub(super) async fn corrupt_owning_transfer(db: &TestDatabase, input: i64, other: &Source) {
