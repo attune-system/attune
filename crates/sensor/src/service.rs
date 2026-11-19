@@ -4,7 +4,8 @@
 //! and rule lifecycle listening.
 //!
 //! Shutdown follows the same pattern as the worker service:
-//! 1. Cordon placement and stop sensor processes while heartbeat remains live
+//! 1. Cordon placement and join sensor stop owners while heartbeat remains live
+//!    (the shutdown deadline observes failure; it never drops the stop owner)
 //! 2. Join heartbeat and metrics, then deregister the exact incarnation
 //! 3. Clear only this shutdown's owned cordon
 //! 4. Close MQ and DB connections
@@ -43,6 +44,7 @@ struct SensorServiceInner {
     heartbeat_interval: u64,
     heartbeat_task: Mutex<Option<HeartbeatTask>>,
     metrics_task: Mutex<Option<HeartbeatTask>>,
+    shutdown: Mutex<ShutdownOwner>,
     detected_runtimes: RwLock<Option<Vec<DetectedRuntime>>>,
 }
 
@@ -302,6 +304,7 @@ impl SensorService {
                 heartbeat_interval,
                 heartbeat_task: Mutex::new(None),
                 metrics_task: Mutex::new(None),
+                shutdown: Mutex::new(ShutdownOwner::default()),
                 detected_runtimes: RwLock::new(None),
             }),
         })
@@ -469,8 +472,21 @@ impl SensorService {
     /// Shutdown order (mirrors worker service pattern):
     /// Cordon placement and drain sensors without expiring finalization authority.
     /// Join maintenance, deregister this incarnation, clear its owned cordon,
-    /// and close shared connections.
+    /// and close shared connections. The configured deadline records failure;
+    /// it does not force cancellation of owned stop/capture futures. A blocked
+    /// durable fence can therefore delay return. Cancelling this caller leaves
+    /// the single shutdown task retained; another call joins that same task.
     pub async fn stop(&self) -> Result<()> {
+        let service = self.clone();
+        self.inner
+            .shutdown
+            .lock()
+            .await
+            .join(async move { service.stop_owned().await })
+            .await
+    }
+
+    async fn stop_owned(&self) -> Result<()> {
         info!("Stopping Sensor Service - initiating graceful shutdown");
 
         let registration = self.inner.sensor_worker_registration.read().await;
@@ -478,7 +494,7 @@ impl SensorService {
         let incarnation = registration.incarnation();
         drop(registration);
         let cordon_reason = format!("Sensor shutdown {}", uuid::Uuid::new_v4());
-        // 3. Stop sensor processes with timeout
+        // Observe the existing sensor-stop deadline without dropping its owner.
         let shutdown_timeout = self
             .inner
             .config
@@ -488,7 +504,7 @@ impl SensorService {
             .unwrap_or(30);
 
         info!(
-            "Waiting up to {} seconds for sensor processes to stop",
+            "Observing a {} second sensor-stop deadline; all owners remain joined",
             shutdown_timeout
         );
 
@@ -513,36 +529,45 @@ impl SensorService {
             }
             Ok::<_, anyhow::Error>(())
         };
-        let (cordoned, stopped) = tokio::join!(
+        let mut stop_task = tokio::spawn(async move { sensor_manager.stop().await });
+        let (cordoned, joined) = tokio::join!(
             cordon,
-            tokio::time::timeout(timeout_duration, sensor_manager.stop())
+            join_shutdown_stop(&mut stop_task, tokio::time::sleep(timeout_duration)),
         );
+        // A panicked/aborted manager does not prove its child writers joined.
+        // Do not proceed to maintenance/deregistration/pool closure in that case.
+        let stopped = joined?;
+        let mut failure = None;
         if let Err(error) = cordoned {
             warn!(%error, "Sensor shutdown cordon was not acknowledged");
+            failure = Some(error);
         }
         match stopped {
-
-            Ok(Ok(_)) => info!("All sensor processes stopped"),
-            Ok(Err(e)) => error!("Error stopping sensor processes: {}", e),
-            Err(_) => warn!(
-                "Shutdown timeout reached ({} seconds) - some sensor processes may have been interrupted",
-                shutdown_timeout
-            ),
+            Ok(()) => info!("Sensor stop owners joined"),
+            Err(error) => {
+                error!(%error, "Sensor stop owners joined with failure");
+                failure.get_or_insert(error);
+            }
         }
 
         // 4. Stop rule lifecycle listener
         info!("Stopping rule lifecycle listener...");
         if let Err(e) = self.inner.rule_lifecycle_listener.stop().await {
             error!("Failed to stop rule lifecycle listener: {}", e);
+            failure.get_or_insert(e);
         }
 
         // Join heartbeat before deregistration; a late tick cannot revive the
         // inactive instance. Maintenance from an old incarnation is fenced.
         if let Some(task) = self.inner.metrics_task.lock().await.take() {
-            stop_heartbeat_task(task, HEARTBEAT_STOP_TIMEOUT).await;
+            if let Err(error) = stop_heartbeat_task(task, HEARTBEAT_STOP_TIMEOUT).await {
+                failure.get_or_insert(error);
+            }
         }
         if let Some(task) = self.inner.heartbeat_task.lock().await.take() {
-            stop_heartbeat_task(task, HEARTBEAT_STOP_TIMEOUT).await;
+            if let Err(error) = stop_heartbeat_task(task, HEARTBEAT_STOP_TIMEOUT).await {
+                failure.get_or_insert(error);
+            }
         }
         let deregistered = self
             .inner
@@ -566,14 +591,22 @@ impl SensorService {
         info!("Closing message queue connection...");
         if let Err(e) = self.inner.mq.close().await {
             warn!("Error closing message queue: {}", e);
+            failure.get_or_insert(e.into());
         }
 
         // 6. Close database connection
         info!("Closing database connection...");
         self.inner.db.close().await;
 
-        deregistered?;
-        cleared?;
+        if let Err(error) = deregistered {
+            failure.get_or_insert(error.into());
+        }
+        if let Err(error) = cleared {
+            failure.get_or_insert(error.into());
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
         info!("Sensor Service stopped successfully");
 
         Ok(())
@@ -617,6 +650,64 @@ impl SensorService {
     }
 }
 
+/// The service retains this task even when a caller drops its wait future.
+/// Outcomes are cached so retrying stop never starts another shutdown owner.
+#[derive(Default)]
+struct ShutdownOwner {
+    task: Option<JoinHandle<Result<()>>>,
+    outcome: Option<std::result::Result<(), String>>,
+}
+impl ShutdownOwner {
+    async fn join(
+        &mut self,
+        work: impl std::future::Future<Output = Result<()>> + Send + 'static,
+    ) -> Result<()> {
+        if self.outcome.is_none() {
+            let task = self.task.get_or_insert_with(|| tokio::spawn(work));
+            let outcome = match task.await {
+                Ok(outcome) => outcome,
+                Err(error) => Err(anyhow::anyhow!("Sensor shutdown owner failed: {error}")),
+            };
+            self.task = None;
+            self.outcome = Some(outcome.map_err(|error| format!("{error:#}")));
+        }
+        self.outcome
+            .as_ref()
+            .expect("joined shutdown outcome")
+            .clone()
+            .map_err(anyhow::Error::msg)
+    }
+}
+
+/// The outer result is task ownership evidence; an inner error is a fully
+/// joined manager failure. Deadline expiry never aborts or drops this handle.
+async fn join_shutdown_stop(
+    task: &mut JoinHandle<Result<()>>,
+    deadline: impl std::future::Future<Output = ()>,
+) -> Result<Result<()>> {
+    let (elapsed, joined) = tokio::select! {
+        biased;
+        _ = deadline => {
+            warn!("Sensor-stop deadline elapsed; retaining and joining the stop owner");
+            (true, task.await)
+        }
+        joined = &mut *task => (false, joined),
+    };
+    let stopped =
+        joined.map_err(|error| anyhow::anyhow!("Sensor manager stop owner failed: {error}"))?;
+    if elapsed {
+        let detail = stopped
+            .err()
+            .map(|error| format!("; stop failed: {error:#}"))
+            .unwrap_or_default();
+        Ok(Err(anyhow::anyhow!(
+            "Sensor shutdown deadline elapsed; stop owner joined{detail}"
+        )))
+    } else {
+        Ok(stopped)
+    }
+}
+
 async fn run_bound_heartbeat<F, Fut>(
     interval: Duration,
     cancellation: CancellationToken,
@@ -640,17 +731,27 @@ async fn run_bound_heartbeat<F, Fut>(
     }
 }
 
-async fn stop_heartbeat_task(task: HeartbeatTask, wait: Duration) {
+async fn stop_heartbeat_task(task: HeartbeatTask, wait: Duration) -> Result<()> {
     task.cancellation.cancel();
     let mut handle = task.handle;
     match tokio::time::timeout(wait, &mut handle).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) if error.is_cancelled() => {}
-        Ok(Err(error)) => error!("Heartbeat task failed during shutdown: {}", error),
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(anyhow::anyhow!(
+            "Sensor maintenance task failed during shutdown: {error}"
+        )),
         Err(_) => {
-            warn!("Heartbeat task did not stop within {:?}; aborting", wait);
             handle.abort();
-            let _ = handle.await;
+            let joined = handle.await;
+            if let Err(error) = joined {
+                if !error.is_cancelled() {
+                    return Err(anyhow::anyhow!(
+                        "Sensor maintenance task failed during shutdown: {error}"
+                    ));
+                }
+            }
+            Err(anyhow::anyhow!(
+                "Sensor maintenance shutdown deadline elapsed; task aborted and joined"
+            ))
         }
     }
 }
@@ -753,6 +854,159 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    #[tokio::test]
+    async fn shutdown_deadline_joins_pending_owner_before_returning_failure() {
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let joined = Arc::new(AtomicBool::new(false));
+        let observed = joined.clone();
+        let mut stop = tokio::spawn(async move {
+            entered.send(()).unwrap();
+            released.await.unwrap();
+            observed.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        started.await.unwrap();
+        let (elapsed, deadline_seen) = tokio::sync::oneshot::channel();
+        let waiting = tokio::spawn(async move {
+            join_shutdown_stop(&mut stop, async move {
+                elapsed.send(()).unwrap();
+            })
+            .await
+        });
+        let deadline = tokio::time::timeout(Duration::from_secs(2), deadline_seen).await;
+        let pending = !waiting.is_finished() && !joined.load(Ordering::SeqCst);
+        release.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        deadline.unwrap().unwrap();
+        assert!(
+            pending,
+            "deadline released the wait before its owner joined"
+        );
+        assert!(joined.load(Ordering::SeqCst));
+        assert!(result.unwrap_err().to_string().contains("deadline elapsed"));
+    }
+
+    #[tokio::test]
+    async fn elapsed_shutdown_deadline_cannot_become_success_when_owner_is_ready() {
+        let mut stop = tokio::spawn(async { Ok(()) });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !stop.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let result = join_shutdown_stop(&mut stop, std::future::ready(()))
+            .await
+            .unwrap();
+        assert!(result.unwrap_err().to_string().contains("deadline elapsed"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_shutdown_waiter_retains_single_owner_and_cached_error() {
+        use std::sync::atomic::AtomicUsize;
+        let owner = Arc::new(Mutex::new(ShutdownOwner::default()));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let count = starts.clone();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let initial = owner.clone();
+        let first = tokio::spawn(async move {
+            initial
+                .lock()
+                .await
+                .join(async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    entered.send(()).unwrap();
+                    released.await.unwrap();
+                    Err(anyhow::anyhow!("owned manager stop failure"))
+                })
+                .await
+        });
+        started.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let retained = owner.lock().await;
+        assert!(retained
+            .task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished()));
+        assert!(retained.outcome.is_none());
+        drop(retained);
+        let retry = owner.clone();
+        let (retry_entered, retry_started) = tokio::sync::oneshot::channel();
+        let second = tokio::spawn(async move {
+            let mut owner = retry.lock().await;
+            retry_entered.send(()).unwrap();
+            owner
+                .join(async {
+                    panic!("duplicate shutdown owner");
+                })
+                .await
+        });
+        retry_started.await.unwrap();
+        let pending = !second.is_finished();
+        release.send(()).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(pending);
+        assert!(error.to_string().contains("owned manager stop failure"));
+        let mut owner = owner.lock().await;
+        assert!(owner.task.is_none());
+        assert!(owner
+            .join(async {
+                panic!("duplicate completed shutdown");
+            })
+            .await
+            .is_err());
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_stop_propagates_manager_error_and_task_panic() {
+        let mut failed = tokio::spawn(async { Err(anyhow::anyhow!("manager stop error")) });
+        let failed = join_shutdown_stop(&mut failed, std::future::pending())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(failed.to_string().contains("manager stop error"));
+        let mut panicked = tokio::spawn(async {
+            panic!("owned manager panic");
+        });
+        let error = join_shutdown_stop(&mut panicked, std::future::pending())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("stop owner failed"));
+        assert!(panicked.is_finished());
+    }
+
+    #[tokio::test]
+    async fn shutdown_owner_propagates_panic_and_does_not_repeat_shutdown() {
+        let mut owner = ShutdownOwner::default();
+        let error = owner
+            .join(async {
+                panic!("owned service shutdown panic");
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("shutdown owner failed"));
+        assert!(owner.task.is_none());
+        assert!(owner
+            .join(async {
+                panic!("duplicate service shutdown");
+            })
+            .await
+            .is_err());
+    }
+
     #[test]
     fn test_health_status_display() {
         assert_eq!(HealthStatus::Healthy.to_string(), "healthy");
@@ -802,16 +1056,18 @@ mod tests {
 
         let dropped = Arc::new(AtomicBool::new(false));
         let task_dropped = dropped.clone();
+        let (entered, started) = tokio::sync::oneshot::channel();
         let task = HeartbeatTask {
             cancellation: CancellationToken::new(),
             handle: tokio::spawn(async move {
                 let _dropped = Dropped(task_dropped);
+                entered.send(()).unwrap();
                 std::future::pending::<()>().await;
             }),
         };
-        tokio::task::yield_now().await;
+        started.await.unwrap();
 
-        stop_heartbeat_task(task, Duration::ZERO).await;
+        assert!(stop_heartbeat_task(task, Duration::ZERO).await.is_err());
 
         assert!(dropped.load(Ordering::SeqCst));
     }
