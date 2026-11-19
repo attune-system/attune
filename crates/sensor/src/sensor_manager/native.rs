@@ -116,6 +116,7 @@ impl NativeStartupStage {
         let _cancel_on_drop = cancel.clone().drop_guard();
         let deadline = self.deadline;
         let failed = self.failed.clone();
+        let interrupted_failed = failed.clone();
         let task = self.tasks.spawn(self.attempt.track_future(async move {
             use futures::FutureExt;
             let result = std::panic::AssertUnwindSafe(async move {
@@ -133,7 +134,12 @@ impl NativeStartupStage {
                     result = &mut operation => Some(result),
                 };
                 match completed {
-                    Some(_) if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline => {
+                    Some(result)
+                        if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline =>
+                    {
+                        if result.is_err() {
+                            interrupted_failed.store(true, Ordering::Release);
+                        }
                         cancel.cancel();
                         Err(anyhow!(
                             "Native sensor startup closed before accepting operation result"
@@ -144,7 +150,11 @@ impl NativeStartupStage {
                         cancel.cancel();
                         // Durable DB fencing may still be pending. Keep the
                         // original future, physical Stop and captures owned.
-                        let _ = operation.await;
+                        if operation.await.is_err() {
+                            // A tracker join is not clean Stop/capture evidence.
+                            // Preserve uncertainty even if the caller is gone.
+                            interrupted_failed.store(true, Ordering::Release);
+                        }
                         Err(anyhow!(
                             "Native sensor startup interrupted; operation joined"
                         ))
@@ -1651,8 +1661,7 @@ mod startup_ownership_tests {
         assert!(failed.load(Ordering::Acquire));
     }
 
-    #[tokio::test]
-    async fn manager_shutdown_cancels_and_joins_unregistered_startup_owners() {
+    pub(super) fn lazy_manager() -> (SensorManager, PgPool) {
         // Lazy pool + local transports: no DB/API requests or service setup.
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://unused:unused@unused.invalid/unused")
@@ -1685,6 +1694,12 @@ mod startup_ownership_tests {
                 worker_name: "ownership-fixture".into(),
             },
         );
+        (manager, pool)
+    }
+
+    #[tokio::test]
+    async fn manager_shutdown_cancels_and_joins_unregistered_startup_owners() {
+        let (manager, pool) = lazy_manager();
         *manager.inner.running.write().await = true;
         let tasks = manager.inner.native_startup_tasks.clone();
         let attempt = TaskTracker::new();
@@ -1940,6 +1955,11 @@ mod nested_startup_ownership_tests {
                         .await
                         .unwrap();
                     release_and_join(&stage, &state, window).await;
+                    assert_eq!(
+                        stage.failed.load(Ordering::Acquire),
+                        window == "resource-record" || window == "running",
+                        "joined uncertain outcome lost from shutdown latch"
+                    );
                 }
             }
         }
@@ -1996,6 +2016,10 @@ mod nested_startup_ownership_tests {
                 .await
                 .is_err());
             assert!(!entered.load(Ordering::Acquire));
+            assert!(
+                !stage.failed.load(Ordering::Acquire),
+                "proven no-effect cancellation latched failure"
+            );
             assert!(stage.tasks.is_empty() && stage.attempt.is_empty());
             stage.tasks.close();
             stage.attempt.close();
@@ -2036,5 +2060,64 @@ mod nested_startup_ownership_tests {
             !entered.load(Ordering::Acquire),
             "producer ran after its queued caller closed"
         );
+        assert!(
+            !stage.failed.load(Ordering::Acquire),
+            "unpolled producer was treated as uncertain cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_stop_preserves_joined_nested_failure_after_caller_disappears() {
+        for failure in ["stop", "capture", "completed-then-closed"] {
+            let (manager, pool) = super::startup_ownership_tests::lazy_manager();
+            let stage = NativeStartupStage::new(
+                manager.inner.native_startup_tasks.clone(),
+                TaskTracker::new(),
+                manager.inner.native_startup_stop.read().await.clone(),
+                tokio::time::Instant::now() + Duration::from_secs(60),
+                manager.inner.native_cleanup_failed.clone(),
+            );
+            if failure == "completed-then-closed" {
+                assert!(stage
+                    .run(|cancel| async move {
+                        cancel.cancel();
+                        Err::<(), _>(anyhow!(
+                            "controlled uncertain result observed while closing"
+                        ))
+                    })
+                    .await
+                    .is_err());
+                stage.tasks.close();
+                stage.attempt.close();
+                stage.tasks.wait().await;
+                stage.attempt.wait().await;
+            } else {
+                let state = Arc::new(Acknowledgements::default());
+                let caller = caller(
+                    stage.clone(),
+                    state.clone(),
+                    "installation",
+                    "running",
+                    failure == "stop",
+                    failure == "capture",
+                );
+                observed(&state.entered).await;
+                caller.abort();
+                assert!(caller.await.unwrap_err().is_cancelled());
+                let token = state.token.lock().unwrap().clone().unwrap();
+                timeout(Duration::from_secs(5), token.cancelled())
+                    .await
+                    .unwrap();
+                release_and_join(&stage, &state, "running").await;
+            }
+            assert!(stage.tasks.is_empty() && stage.attempt.is_empty());
+            assert!(manager.inner.sensors.read().await.is_empty());
+            assert!(manager.inner.native_cleanup_failed.load(Ordering::Acquire));
+            assert!(
+                manager.stop().await.is_err(),
+                "empty trackers erased uncertain nested outcome"
+            );
+            pool.close().await;
+        }
     }
 }
