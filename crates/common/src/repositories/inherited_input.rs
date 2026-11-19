@@ -6040,6 +6040,115 @@ async fn retained_input_approval(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queue_arrays_require_exact_dense_member_identity_and_preserve_json_types() {
+        let members = std::collections::BTreeMap::from([(11, None), (22, None)]);
+        let values = vec![
+            BoundValue {
+                path: "/items/0".into(),
+                value: json!({"nested":[false,{"token":"first"}]}),
+                source: SelectionSource::QueueContributor { item: 11 },
+            },
+            BoundValue {
+                path: "/items/1".into(),
+                value: json!({"message":"second"}),
+                source: SelectionSource::QueueContributor { item: 22 },
+            },
+        ];
+        let context = TraceContext {
+            values: &values,
+            queue_members: Some(&members),
+        };
+        let result = context.resolve_variable("items").unwrap();
+        assert!(result.is_array());
+        assert_eq!(result[0]["nested"], json!([false,{"token":"first"}]));
+        let (result, fields) = render(
+            "{{ items[0].nested[1].token + ':' + items[1].message }}",
+            &context,
+        )
+        .unwrap();
+        assert_eq!(result, json!("first:second"));
+        let selected = selected_sources(&values, &fields).unwrap();
+        assert!(selected
+            .iter()
+            .any(|read| matches!(read.source, SelectionSource::QueueContributor { item: 11 })));
+        assert!(selected
+            .iter()
+            .any(|read| matches!(read.source, SelectionSource::QueueContributor { item: 22 })));
+        let copy_values = || {
+            values
+                .iter()
+                .map(|bound| BoundValue {
+                    path: bound.path.clone(),
+                    value: bound.value.clone(),
+                    source: bound.source.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
+        for path in [
+            "/items/00",
+            "/items/2",
+            "/items/18446744073709551615",
+            "/items/0/extra",
+            "/items/-1",
+        ] {
+            let mut malformed = copy_values();
+            malformed[0].path = path.into();
+            assert!(
+                TraceContext {
+                    values: &malformed,
+                    queue_members: Some(&members)
+                }
+                .resolve_variable("items")
+                .is_err(),
+                "{path}"
+            );
+        }
+        let mut swapped = copy_values();
+        swapped[0].source = SelectionSource::QueueContributor { item: 22 };
+        assert!(TraceContext {
+            values: &swapped,
+            queue_members: Some(&members)
+        }
+        .resolve_variable("items")
+        .is_err());
+        assert!(TraceContext {
+            values: &values[..1],
+            queue_members: Some(&members)
+        }
+        .resolve_variable("items")
+        .is_err());
+        let unrelated = std::collections::BTreeMap::from([(11, None), (33, None)]);
+        assert!(TraceContext {
+            values: &values,
+            queue_members: Some(&unrelated)
+        }
+        .resolve_variable("items")
+        .is_err());
+    }
+
+    #[test]
+    fn ordinary_context_does_not_infer_queue_arrays_from_numeric_object_members() {
+        let values = vec![BoundValue {
+            path: "/items".into(),
+            value: json!({"0":{"nested":[false,7]}}),
+            source: SelectionSource::Authored {
+                origins: vec![],
+                target: None,
+                input_authority: None,
+                queue_input: None,
+            },
+        }];
+        assert_eq!(
+            TraceContext {
+                values: &values,
+                queue_members: None
+            }
+            .resolve_variable("items")
+            .unwrap(),
+            json!({"0":{"nested":[false,7]}})
+        );
+    }
 
     #[test]
     fn queue_input_id_never_downgrades_to_ordinary_authored_authority() {

@@ -1153,13 +1153,13 @@ impl WorkQueueDispatcher {
             )
             .await?;
             for secret in secrets.iter_mut().filter(|secret| {
-                attune_common::secret_values::pointer_suffix(path, &secret.json_path).is_some()
+                attune_common::secret_values::pointer_suffix(&secret.json_path, path).is_some()
             }) {
                 let provenance = if secret.json_path == path {
                     receipt.provenance()
                 } else {
                     let suffix =
-                        attune_common::secret_values::pointer_suffix(path, &secret.json_path)
+                        attune_common::secret_values::pointer_suffix(&secret.json_path, path)
                             .ok_or_else(|| anyhow!("Queue secret projection path mismatch"))?;
                     let projected = Inputs::project_queue_render(conn, &rendered, &suffix).await?;
                     if projected.value() != &secret.value {

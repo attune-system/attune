@@ -117,6 +117,7 @@ pub(super) async fn capture(
             .ok_or_else(denied)?;
         if raw.queue != queue.id
             || raw.queue_ref != queue.r#ref
+            || raw.status != crate::models::WorkQueueItemStatus::Leased
             || raw.lease_token.is_none()
             || raw.lease_token != item.lease_token
             || raw

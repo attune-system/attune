@@ -604,9 +604,57 @@ async fn mixed_queue_receipts_bind_each_contributor_and_structured_secret_after_
     WorkQueueItemRepository::attach_execution_to_lease(&mut *tx, lease, execution.id)
         .await
         .unwrap();
+    let mut missing_source = sqlx::Connection::begin(&mut *tx).await.unwrap();
+    sqlx::query("DELETE FROM recorded_queue_execution_input WHERE execution=$1 AND item=$2")
+        .bind(execution.id)
+        .bind(second.id)
+        .execute(&mut *missing_source)
+        .await
+        .unwrap();
+    assert!(
+        Batch::capture_managed(
+            &mut missing_source,
+            record.id,
+            &queue,
+            &items,
+            None,
+            QUEUE_KEY
+        )
+        .await
+        .is_err(),
+        "membership cannot replace a missing original contributor manifest"
+    );
+    missing_source.rollback().await.unwrap();
+    assert!(
+        Batch::capture_managed(&mut tx, record.id, &queue, &items[..1], None, QUEUE_KEY)
+            .await
+            .is_err(),
+        "a caller cannot omit a canonical member"
+    );
+    let duplicated = vec![items[0].clone(), items[0].clone()];
+    assert!(
+        Batch::capture_managed(&mut tx, record.id, &queue, &duplicated, None, QUEUE_KEY)
+            .await
+            .is_err(),
+        "duplicate members cannot stand for different original items"
+    );
     Batch::capture_managed(&mut tx, record.id, &queue, &items, None, QUEUE_KEY)
         .await
         .unwrap();
+    let mut missing_item = sqlx::Connection::begin(&mut *tx).await.unwrap();
+    sqlx::query("DELETE FROM runtime_accepted_batch_item WHERE admission=$1 AND item=$2")
+        .bind(record.id)
+        .bind(second.id)
+        .execute(&mut *missing_item)
+        .await
+        .unwrap();
+    assert!(
+        Admission::require(&mut missing_item, RuntimeOwner::Execution(execution.id))
+            .await
+            .is_err(),
+        "a retained batch requires every exact original item proof"
+    );
+    missing_item.rollback().await.unwrap();
     let fixed = Fixed::load(&mut tx, &queue, &first, &snapshot, QUEUE_KEY)
         .await
         .unwrap();
@@ -821,14 +869,27 @@ async fn mixed_queue_receipts_bind_each_contributor_and_structured_secret_after_
     let stored = Secrets::find_stored_by_entity(&mut *tx, ENTITY_EXECUTION_CONFIG, execution.id)
         .await
         .unwrap();
-    attune_common::key_access::authorize_execution_parameter_key_origins_with_conn(
-        &mut tx,
-        execution.id,
-        None,
-        &stored,
-    )
-    .await
-    .unwrap();
+    assert!(
+        attune_common::key_access::authorize_execution_parameter_key_origins_with_conn(
+            &mut tx,
+            execution.id,
+            None,
+            &stored,
+        )
+        .await
+        .is_err(),
+        "purpose receipts cannot be consumed as generic Key authority"
+    );
+    // Match the worker's typed receipt preparation, ordinary-source check and
+    // exact buffer binding; generic Key authorization deliberately denies them.
+    let deliveries =
+        Materialization::prepare_execution_input_receipts(&mut tx, execution.id, QUEUE_KEY)
+            .await
+            .unwrap();
+    assert!(!deliveries.is_empty());
+    for delivery in &deliveries {
+        delivery.ensure_fresh_on(&mut tx).await.unwrap();
+    }
     let current = ExecutionRepository::find_by_id(&mut *tx, execution.id)
         .await
         .unwrap()
@@ -950,11 +1011,14 @@ async fn mixed_queue_receipts_bind_each_contributor_and_structured_secret_after_
     IdentityRepository::delete(&mut *tx, other.id)
         .await
         .unwrap();
-    attune_common::key_access::authorize_execution_parameter_key_origins_with_conn(
-        &mut tx, retry.id, None, &replay,
-    )
-    .await
-    .unwrap();
+    let retry_deliveries =
+        Materialization::prepare_execution_input_receipts(&mut tx, retry.id, QUEUE_KEY)
+            .await
+            .unwrap();
+    assert!(!retry_deliveries.is_empty());
+    for delivery in &retry_deliveries {
+        delivery.ensure_fresh_on(&mut tx).await.unwrap();
+    }
     let retry_current = ExecutionRepository::find_by_id(&mut *tx, retry.id)
         .await
         .unwrap()

@@ -562,6 +562,6 @@ fn hash(value: &Value) -> Result<String> {
 }
 fn denied() -> Error {
     Error::PermissionDenied(
-        "Accepted ad-hoc batch source proof is missing, changed or outside its ceiling".into(),
+        "Accepted batch source proof is missing, changed or outside its ceiling".into(),
     )
 }
