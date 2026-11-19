@@ -61,6 +61,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, timeout, Duration};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::api_client::{ApiClient, SensorTokenScope};
@@ -774,6 +775,8 @@ struct SensorManagerInner {
     lifecycle_gate: RwLock<()>,
     lifecycle_locks: Mutex<HashMap<Id, Arc<Mutex<()>>>>,
     reconciliation_notify: Notify,
+    background_stop: RwLock<CancellationToken>,
+    background_tasks: Mutex<Vec<JoinHandle<()>>>,
     packs_base_dir: String,
     runtime_envs_dir: String,
     pack_transport: Arc<dyn PackFileTransport>,
@@ -828,6 +831,8 @@ impl SensorManager {
                 lifecycle_gate: RwLock::new(()),
                 lifecycle_locks: Mutex::new(HashMap::new()),
                 reconciliation_notify: Notify::new(),
+                background_stop: RwLock::new(CancellationToken::new()),
+                background_tasks: Mutex::new(Vec::new()),
                 packs_base_dir: config.packs_base_dir,
                 runtime_envs_dir: config.runtime_envs_dir,
                 pack_transport: config.pack_transport,
@@ -901,18 +906,22 @@ impl SensorManager {
             }
         }
 
-        // Start monitoring loop
+        let mut background = self.inner.background_tasks.lock().await;
+        if !*self.inner.running.read().await || !background.is_empty() {
+            return Ok(());
+        }
+        let cancellation = CancellationToken::new();
+        *self.inner.background_stop.write().await = cancellation.clone();
         let manager = self.clone();
-        tokio::spawn(async move {
-            manager.monitoring_loop().await;
+        let monitoring_stop = cancellation.clone();
+        let monitoring = tokio::spawn(async move {
+            manager.monitoring_loop(monitoring_stop).await;
         });
-
-        // Rule lifecycle messages are the fast path; this reconciliation loop
-        // covers missed messages or deployments where the API publisher is down.
         let manager = self.clone();
-        tokio::spawn(async move {
-            manager.lifecycle_reconciliation_loop().await;
+        let reconciliation = tokio::spawn(async move {
+            manager.lifecycle_reconciliation_loop(cancellation).await;
         });
+        background.extend([monitoring, reconciliation]);
 
         info!("Sensor manager started");
 
@@ -925,11 +934,13 @@ impl SensorManager {
 
         // Mark as not running
         *self.inner.running.write().await = false;
+        self.inner.background_stop.read().await.cancel();
 
         // Wait for starts and restarts that observed the running state before
         // shutdown. Holding this write guard also prevents new lifecycle work
         // from entering until every managed child has been terminated.
-        let _shutdown_guard = self.inner.lifecycle_gate.write().await;
+        let shutdown_guard = self.inner.lifecycle_gate.write().await;
+        let mut failure = None;
 
         // Collect sensor IDs to stop
         let sensor_ids: Vec<Id> = self.inner.sensors.read().await.keys().copied().collect();
@@ -939,11 +950,23 @@ impl SensorManager {
             info!("Stopping sensor {}", sensor_id);
             if let Err(e) = self.stop_sensor_locked(sensor_id).await {
                 error!("Failed to stop sensor {}: {}", sensor_id, e);
+                failure.get_or_insert(e);
             }
         }
 
+        // A reconciliation task may already be waiting to enter this gate.
+        // running=false fences launch; release the gate before joining it.
+        drop(shutdown_guard);
+        let tasks = std::mem::take(&mut *self.inner.background_tasks.lock().await);
+        for task in tasks {
+            if let Err(error) = task.await {
+                failure.get_or_insert(anyhow!("Sensor background task failed: {error}"));
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
         info!("Sensor manager stopped");
-
         Ok(())
     }
 
@@ -3483,12 +3506,14 @@ impl SensorManager {
     }
 
     /// Monitoring loop to check sensor health
-    async fn monitoring_loop(&self) {
+    async fn monitoring_loop(&self, cancellation: CancellationToken) {
         let mut interval = interval(Duration::from_secs(60));
 
         while *self.inner.running.read().await {
-            interval.tick().await;
-
+            tokio::select! { _ = cancellation.cancelled() => break, _ = interval.tick() => {} }
+            if !*self.inner.running.read().await {
+                break;
+            }
             debug!("Sensor manager monitoring check");
 
             let mut output_tasks = Vec::new();
@@ -3580,15 +3605,18 @@ impl SensorManager {
         info!("Sensor manager monitoring loop stopped");
     }
 
-    async fn lifecycle_reconciliation_loop(&self) {
+    async fn lifecycle_reconciliation_loop(&self, cancellation: CancellationToken) {
         let mut interval = interval(SENSOR_RECONCILIATION_INTERVAL);
 
         while *self.inner.running.read().await {
             tokio::select! {
                 _ = interval.tick() => {}
                 _ = self.inner.reconciliation_notify.notified() => {}
+                _ = cancellation.cancelled() => break,
             }
-
+            if !*self.inner.running.read().await {
+                break;
+            }
             if let Err(e) =
                 retry_lifecycle_reconciliation(|| self.reconcile_sensor_lifecycles()).await
             {
@@ -4019,6 +4047,20 @@ impl SensorManager {
     }
 }
 
+async fn drain_sensor_capture(handle: &mut Option<JoinHandle<()>>, wait: Duration) -> Result<()> {
+    if let Some(mut task) = handle.take() {
+        match timeout(wait, &mut task).await {
+            Ok(result) => result.map_err(|error| anyhow!("Sensor capture task failed: {error}"))?,
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                return Err(anyhow!("Native sensor capture incomplete"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Sensor instance managing a running sensor
 struct SensorInstance {
     native: Option<native::NativeSensor>,
@@ -4083,23 +4125,16 @@ impl SensorInstance {
         }
 
         if let Some(native) = &mut self.native {
-            native.stop().await?;
-            // Drain separate streams to genuine EOF and sealed custody. An
-            // uncertain drain retains the durable capture obligation.
-            for handle in [&mut self.stdout_handle, &mut self.stderr_handle] {
-                if let Some(mut task) = handle.take() {
-                    match timeout(Duration::from_secs(30), &mut task).await {
-                        Ok(result) => {
-                            result?;
-                        }
-                        Err(_) => {
-                            task.abort();
-                            let _ = task.await;
-                            return Err(anyhow!("Native sensor capture incomplete"));
-                        }
-                    }
-                }
-            }
+            let stopped = native.stop().await;
+            let (stdout, stderr) = tokio::join!(
+                drain_sensor_capture(&mut self.stdout_handle, Duration::from_secs(30)),
+                drain_sensor_capture(&mut self.stderr_handle, Duration::from_secs(30)),
+            );
+            // Every capture is joined even when the fence/other stream failed.
+            // Cancellation is incomplete capture, never an EOF receipt.
+            stopped?;
+            stdout?;
+            stderr?;
             native.settle_files().await?;
             self.native = None;
             return Ok(());

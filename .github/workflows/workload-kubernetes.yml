@@ -4,6 +4,7 @@ on:
     paths:
       - 'crates/common/**'
       - 'crates/worker/**'
+      - 'crates/sensor/**'
       - 'crates/workload-backend/**'
       - 'crates/core-actions/**'
       - 'Cargo.toml'
@@ -228,6 +229,23 @@ jobs:
           DATABASE_URL: postgresql://attune:attune@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/attune_test
           ATTUNE__DATABASE__URL: postgresql://attune:attune@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/attune_test
         run: cargo test --locked -p attune-worker --test isolated_action_provider_tests -- --include-ignored --nocapture --test-threads=4
+      - name: Run actual owning sensor interpreted setup and private recipe in the same Pod lane
+        env:
+          ATTUNE_TEST_RUN_ID: kubesensor-${{ matrix.arch }}
+          TEST_DB_ADMIN_URL: postgresql://attune:attune@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/postgres
+          TEST_DB_URL: postgresql://attune:attune@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/attune_test
+          DATABASE_URL: postgresql://attune:attune@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/attune_test
+          ATTUNE__DATABASE__URL: postgresql://attune:attune@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/attune_test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cluster=$(cat "$RUNNER_TEMP/attune-kind-owner")
+          test "$cluster" = "attune-wl-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          node="$cluster-control-plane"
+          test "$(docker --host unix:///var/run/docker.sock inspect --format '{{index .Config.Labels "io.x-k8s.kind.cluster"}}' "$node")" = "$cluster"
+          export ATTUNE_SENSOR_TEST_API_HOST=$(docker --host unix:///var/run/docker.sock inspect --format '{{(index .NetworkSettings.Networks "kind").Gateway}}' "$node")
+          test -n "$ATTUNE_SENSOR_TEST_API_HOST"
+          cargo test --locked -p attune-sensor --lib sensor_manager::native::provider_tests::kubernetes_native_sensor -- --exact --include-ignored --nocapture --test-threads=4
       - name: Remove and acknowledge only this run's cluster
         if: ${{ always() }}
         shell: bash

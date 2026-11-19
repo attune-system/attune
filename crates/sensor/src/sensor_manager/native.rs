@@ -85,26 +85,50 @@ impl NativeSensor {
     pub(super) async fn stop(&mut self) -> Result<()> {
         // A DB wait must not keep the known exact payload alive. Both owned
         // futures join before terminal evidence or publication can proceed.
-        let exit = attune_common::repositories::sensor_workload::native_effect::join_sensor_stop(
-            Ledger::stop_native_effect(&self.pool, self.workload, self.spec.intent),
-            self.control.stop(LaunchStopReason::Cancelled),
-        )
-        .await?;
-        Ledger::record_native_exit(
-            &self.pool,
-            self.workload,
-            self.spec.intent,
-            &self.resource,
-            exit,
-        )
-        .await?;
-        if let Some(task) = self.wait_task.take() {
-            task.abort();
-            let _ = task.await;
+        let stopped = async {
+            let exit =
+                attune_common::repositories::sensor_workload::native_effect::join_sensor_stop(
+                    Ledger::stop_native_effect(&self.pool, self.workload, self.spec.intent),
+                    self.control.stop(LaunchStopReason::Cancelled),
+                )
+                .await?;
+            Ledger::record_native_exit(
+                &self.pool,
+                self.workload,
+                self.spec.intent,
+                &self.resource,
+                exit,
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(())
         }
-        Ok(())
+        .await;
+        finish_native_stop(stopped, &mut self.wait_task).await
     }
 }
+async fn finish_native_stop(
+    stopped: Result<()>,
+    waiter: &mut Option<JoinHandle<attune_common::Result<LaunchExitOutcome>>>,
+) -> Result<()> {
+    let joined = join_owned_native_waiter(waiter).await;
+    stopped?;
+    joined
+}
+
+async fn join_owned_native_waiter(
+    waiter: &mut Option<JoinHandle<attune_common::Result<LaunchExitOutcome>>>,
+) -> Result<()> {
+    if let Some(task) = waiter.take() {
+        task.abort();
+        match task.await {
+            Ok(_) => {}
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => return Err(anyhow!("Native sensor waiter failed: {error}")),
+        }
+    }
+    Ok(())
+}
+
 impl SensorManager {
     pub(super) async fn reconcile_native_sensor(&self, sensor: Id) -> Result<()> {
         let Some((workload, effect)) =
@@ -1039,3 +1063,7 @@ mod file_receipt_tests {
         assert!(serde_json::to_vec(&payload).is_err());
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "../../tests/support/native_provider.rs"]
+mod provider_tests;
