@@ -806,6 +806,7 @@ impl WorkerRepository {
              ON CONFLICT (name) DO UPDATE SET status = 'active', last_heartbeat = NOW(), \
              host = EXCLUDED.host, port = EXCLUDED.port, capabilities = EXCLUDED.capabilities, \
              meta = COALESCE(worker.meta, '{{}}'::jsonb) || EXCLUDED.meta, updated = NOW() \
+             WHERE worker.worker_role = EXCLUDED.worker_role \
              RETURNING {WORKER_SELECT_COLUMNS}"
         ))
         .bind(input.name).bind(input.worker_type).bind(role).bind(input.runtime)

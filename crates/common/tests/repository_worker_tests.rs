@@ -959,3 +959,67 @@ async fn worker_timestamp_and_heartbeat_scenario() {
     run_subcase!(pool, test_update_changes_timestamp);
     run_subcase!(pool, test_heartbeat_updates_timestamp);
 }
+
+#[tokio::test]
+async fn worker_registration_rejects_cross_role_name_replacement() {
+    use attune_common::models::WorkerRole;
+    let pool = create_test_pool().await.unwrap();
+    let fixture = WorkerFixture::new("incarnation_role");
+    let original_input = fixture.create_input("action", WorkerType::Local);
+    let name = original_input.name.clone();
+    let original_instance = uuid::Uuid::new_v4();
+    let original = WorkerRepository::register_incarnation(
+        &pool,
+        original_input,
+        WorkerRole::Action,
+        original_instance,
+    )
+    .await
+    .unwrap();
+    let mut sensor_input = fixture.create_input("sensor", WorkerType::Local);
+    sensor_input.name = name.clone();
+    sensor_input.capabilities = Some(json!({"replacement":true}));
+    sensor_input.host = Some("replacement-host".into());
+    assert!(WorkerRepository::register_incarnation(
+        &pool,
+        sensor_input,
+        WorkerRole::Sensor,
+        uuid::Uuid::new_v4()
+    )
+    .await
+    .is_err());
+    let retained = WorkerRepository::find_by_id(&*pool, original.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.worker_role, original.worker_role);
+    assert_eq!(retained.status, original.status);
+    assert_eq!(retained.meta, original.meta);
+    assert_eq!(retained.capabilities, original.capabilities);
+    assert_eq!(retained.last_heartbeat, original.last_heartbeat);
+    assert_eq!(retained.host, original.host);
+    assert_eq!(retained.updated, original.updated);
+    let replacement_instance = uuid::Uuid::new_v4();
+    let mut same_role = fixture.create_input("replacement_action", WorkerType::Local);
+    same_role.name = name;
+    same_role.capabilities = Some(json!({"same_role_replacement":true}));
+    let replacement = WorkerRepository::register_incarnation(
+        &pool,
+        same_role,
+        WorkerRole::Action,
+        replacement_instance,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replacement.id, original.id);
+    assert_eq!(replacement.worker_role, WorkerRole::Action);
+    assert_eq!(
+        replacement.meta.as_ref().unwrap()["registration_incarnation"],
+        replacement_instance.to_string()
+    );
+    assert_eq!(
+        replacement.capabilities,
+        Some(json!({"same_role_replacement":true}))
+    );
+    pool.cleanup().await.unwrap();
+}
