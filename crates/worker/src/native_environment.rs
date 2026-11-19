@@ -1,5 +1,8 @@
 //! Existing coordinated native setup, shared by trusted worker and sensor loops.
 //! Source/claim admission remains in PackEnvironmentManager and its repositories.
+use crate::native_runtime_probe::{
+    await_native_preparation, stop_prepared_process, NativePreparationOptions,
+};
 use attune_common::{
     isolated_process::ProcessSpec,
     models::RuntimeExecutionConfig,
@@ -111,6 +114,8 @@ impl<'a> NativeEnvironmentInstaller<'a> {
         }
     }
 
+    /// Shutdown signals `cancel` and retains this future until its provider,
+    /// durable fence and capture owners have joined. Uncertainty remains debt.
     pub async fn install(
         &self,
         input: UpsertCoordinatedEnvironmentInput<'_>,
@@ -119,6 +124,16 @@ impl<'a> NativeEnvironmentInstaller<'a> {
         timeout: Option<u64>,
         cancel: Option<&CancellationToken>,
     ) -> Result<(PinnedLaunchInput, bool)> {
+        // Carry the existing caller budget through preparation and invocation;
+        // waiting on a claim or late provider ACK cannot mint another budget.
+        let deadline = timeout
+            .map(|seconds| {
+                tokio::time::Instant::now()
+                    .checked_add(std::time::Duration::from_secs(seconds))
+                    .ok_or_else(denied)
+            })
+            .transpose()?;
+        let cancel = cancel.cloned().unwrap_or_default().child_token();
         if config.lifecycle.is_some() {
             return Err(denied());
         }
@@ -164,7 +179,9 @@ impl<'a> NativeEnvironmentInstaller<'a> {
         let instance = self.incarnation;
         let claim_wait = std::time::Instant::now();
         let claimed = loop {
-            if timeout.is_some_and(|seconds| claim_wait.elapsed().as_secs() >= seconds) {
+            if deadline.is_some_and(|d| d <= tokio::time::Instant::now())
+                || timeout.is_some_and(|seconds| claim_wait.elapsed().as_secs() >= seconds)
+            {
                 return Err(denied());
             }
             let current = manager
@@ -176,7 +193,7 @@ impl<'a> NativeEnvironmentInstaller<'a> {
             {
                 return Err(denied());
             }
-            if cancel.is_some_and(|t| t.is_cancelled()) {
+            if cancel.is_cancelled() {
                 return Err(denied());
             }
             if let Some(pin) = Setup::published(self.pool, &binding).await? {
@@ -235,37 +252,64 @@ impl<'a> NativeEnvironmentInstaller<'a> {
         setup.timeout_ms = timeout
             .map(|s| s.checked_mul(1000).ok_or_else(denied))
             .transpose()?;
+        let options = NativePreparationOptions {
+            cancel: &cancel,
+            deadline,
+            stdout_bytes: 16 * 1024,
+            stderr_bytes: 16 * 1024,
+        };
+        options.check_open()?;
         let setup =
             Setup::reserve(self.pool, &claimed, worker, instance, &setup, &plan, master).await?;
-        let launcher = backend.launcher();
-        let create = Setup::begin_create(self.pool, setup.intent, master).await?;
-        let resource = launcher.prepare(&setup, create).await?;
-        Effects::record_resource(self.pool, setup.intent, &resource).await?;
-        let mut process = launcher.start(&setup, &resource).await?;
-        if process.resource != resource {
-            process
-                .control
-                .stop(LaunchStopReason::LaunchFailure)
-                .await?;
-            return Err(denied());
-        }
-        process.control = crate::executor::recording_process_control(
-            process.control,
-            self.pool.clone(),
-            setup.intent,
-            resource.clone(),
-        );
-        let payload = match Setup::consume_stdin(self.pool, setup.intent, &resource, master).await {
-            Ok(value) => value,
-            Err(error) => {
-                process
-                    .control
-                    .stop(LaunchStopReason::SourceRevoked)
-                    .await?;
-                return Err(error);
+        let (observed, resource_watch) = tokio::sync::watch::channel(None);
+        let current = &setup;
+        let operation = async move {
+            options.check_open()?;
+            let create = Setup::begin_create(self.pool, current.intent, master).await?;
+            options.check_open()?;
+            let launcher = backend.launcher();
+            let resource = launcher.prepare(current, create).await?;
+            observed.send_replace(Some(resource.clone()));
+            Effects::record_resource(self.pool, current.intent, &resource).await?;
+            options.check_open()?;
+            let mut process = launcher.start(current, &resource).await?;
+            if process.resource != resource {
+                let _ = stop_prepared_process(process, options).await;
+                return Err(denied());
+            }
+            process.control = crate::executor::recording_process_control(
+                process.control,
+                self.pool.clone(),
+                current.intent,
+                resource.clone(),
+            );
+            if options.check_open().is_err() {
+                let _ = stop_prepared_process(process, options).await;
+                return Err(denied());
+            }
+            match Setup::consume_stdin(self.pool, current.intent, &resource, master).await {
+                Ok(value) => Ok((process, value)),
+                Err(error) => {
+                    let _ = stop_prepared_process(process, options).await;
+                    Err(error)
+                }
             }
         };
-        let cancel = cancel.cloned().unwrap_or_default().child_token();
+        let (process, payload) =
+            await_native_preparation(
+                operation,
+                resource_watch,
+                options,
+                Effects::request_stop(self.pool, setup.intent),
+                |resource, reason| async move {
+                    backend.stop_retained(current, &resource, reason).await
+                },
+                |resource, exit| async move {
+                    Effects::record_exit(self.pool, current.intent, &resource, exit).await
+                },
+            )
+            .await?;
+        let resource = process.resource.clone();
         let future = crate::runtime::process_executor::execute_isolated_cancellable(
             process,
             payload,
@@ -297,7 +341,7 @@ impl<'a> NativeEnvironmentInstaller<'a> {
                 }
             }
         };
-        let result = await_setup_execution(future, source_checks, &cancel).await?;
+        let result = await_setup_execution(future, source_checks, &cancel, deadline).await?;
         if result.exit_code != 0
             || result.error.is_some()
             || result.logs_incomplete
@@ -384,6 +428,7 @@ async fn await_setup_execution(
     >,
     source_checks: impl std::future::Future<Output = Result<()>>,
     cancel: &CancellationToken,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<crate::runtime::ExecutionResult> {
     tokio::pin!(execution);
     let completed = {
@@ -391,6 +436,12 @@ async fn await_setup_execution(
         tokio::select! {
             result = &mut execution => Some(result),
             _ = &mut source_checks => None,
+            _ = async {
+                match deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => None,
         }
     };
     match completed {
@@ -429,8 +480,13 @@ mod tests {
                 renewing_tx.send(()).unwrap();
                 std::future::pending::<Result<()>>().await
             };
-            await_setup_execution(execute(process, cancel.clone(), Some(120)), checks, &cancel)
-                .await
+            await_setup_execution(
+                execute(process, cancel.clone(), Some(120)),
+                checks,
+                &cancel,
+                None,
+            )
+            .await
         });
         signal(renewing).await;
         signal(waiting).await;
@@ -464,7 +520,7 @@ mod tests {
                 renewing_tx.send(()).unwrap();
                 std::future::pending::<Result<()>>().await
             };
-            await_setup_execution(execute(process, child.clone(), None), checks, &child).await
+            await_setup_execution(execute(process, child.clone(), None), checks, &child, None).await
         });
         signal(renewing).await;
         signal(waiting).await;

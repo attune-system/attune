@@ -4,7 +4,7 @@
 //! are verified here. No action/execution object or manager-local probe is used.
 use attune_common::{
     child_process_environment::ChildProcessEnvironment,
-    isolated_process::{ProcessControl, ProcessSpec, ResourceIdentity},
+    isolated_process::{ProcessControl, ProcessIo, ProcessSpec, ResourceIdentity},
     models::{PackRelease, Runtime, RuntimeVersion},
     repositories::{
         runtime_probe_process::{
@@ -14,6 +14,7 @@ use attune_common::{
     },
     workload_config::{WorkloadConfig, WorkloadStorageLimits},
     workload_launch::*,
+    workload_stdin::LaunchStdinPayload,
     Error, Result,
 };
 use attune_workload_backend::configuration::ConfiguredBackend;
@@ -68,13 +69,17 @@ impl<'a> NativeRuntimeProbeDriver<'a> {
 
     /// Returns captured tools (an empty map for verified legacy availability).
     /// This does not publish capabilities or grant action completion authority.
+    /// Shutdown signals `cancel` and retains this future through its join; a
+    /// deadline closes launch admission without abandoning a pending ACK/fence.
     pub async fn verify(
         &self,
         runtime: &Runtime,
         version: Option<&RuntimeVersion>,
         admitted: &BTreeSet<String>,
         pack_pin: &PinnedLaunchInput,
+        cancel: Option<&CancellationToken>,
     ) -> Result<VerifiedToolMap> {
+        let cancel = cancel.cloned().unwrap_or_default().child_token();
         let native = self.configured;
         let backend = &native.backend;
         let master = self.master;
@@ -224,27 +229,63 @@ impl<'a> NativeRuntimeProbeDriver<'a> {
             },
         };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        let options = NativePreparationOptions {
+            cancel: &cancel,
+            deadline: Some(deadline),
+            stdout_bytes: crate::runtime::launch_planning::RUNTIME_TOOL_RESULT_BYTES,
+            stderr_bytes: 16384,
+        };
+        options.check_open()?;
         let spec = Probe::reserve(&self.pool, attempt, source, spec, master).await?;
-        let launcher = backend.launcher();
-        let disposition = Probe::begin_create(&self.pool, spec.intent, master).await?;
-        let resource = tokio::time::timeout_at(deadline, launcher.prepare(&spec, disposition))
-            .await
-            .map_err(|_| denied())??;
-        Probe::record_resource(&self.pool, spec.intent, &resource).await?;
-        let mut process = tokio::time::timeout_at(deadline, launcher.start(&spec, &resource))
-            .await
-            .map_err(|_| denied())??;
-        if process.resource != resource {
-            return Err(denied());
-        }
-        process.control = Arc::new(RecordingProbeControl {
-            inner: process.control,
-            pool: self.pool.clone(),
-            intent: spec.intent,
-            resource: resource.clone(),
-        });
-        let stdin = Probe::consume_stdin(&self.pool, spec.intent, &resource, master).await?;
-        let cancel = CancellationToken::new();
+        let (observed, resource_watch) = tokio::sync::watch::channel(None);
+        let current = &spec;
+        let operation = async move {
+            options.check_open()?;
+            let disposition = Probe::begin_create(&self.pool, current.intent, master).await?;
+            options.check_open()?;
+            let launcher = backend.launcher();
+            let resource = launcher.prepare(current, disposition).await?;
+            observed.send_replace(Some(resource.clone()));
+            Probe::record_resource(&self.pool, current.intent, &resource).await?;
+            options.check_open()?;
+            let mut process = launcher.start(current, &resource).await?;
+            if process.resource != resource {
+                let _ = stop_prepared_process(process, options).await;
+                return Err(denied());
+            }
+            process.control = Arc::new(RecordingProbeControl {
+                inner: process.control,
+                pool: self.pool.clone(),
+                intent: current.intent,
+                resource: resource.clone(),
+            });
+            if options.check_open().is_err() {
+                let _ = stop_prepared_process(process, options).await;
+                return Err(denied());
+            }
+            match Probe::consume_stdin(&self.pool, current.intent, &resource, master).await {
+                Ok(stdin) => Ok((process, stdin)),
+                Err(error) => {
+                    let _ = stop_prepared_process(process, options).await;
+                    Err(error)
+                }
+            }
+        };
+        let (process, stdin) =
+            await_native_preparation(
+                operation,
+                resource_watch,
+                options,
+                Probe::request_stop(&self.pool, spec.intent),
+                |resource, reason| async move {
+                    backend.stop_retained(current, &resource, reason).await
+                },
+                |resource, exit| async move {
+                    Probe::record_exit(&self.pool, current.intent, &resource, exit).await
+                },
+            )
+            .await?;
+        let resource = process.resource.clone();
         let future = crate::runtime::process_executor::execute_isolated_cancellable(
             process,
             stdin,
@@ -285,6 +326,136 @@ impl<'a> NativeRuntimeProbeDriver<'a> {
         Probe::acknowledge_removed(&self.pool, spec.intent, Some(&resource)).await?;
         Probe::tools(&self.pool, spec.intent, master).await
     }
+}
+
+/// The owning service must retain this future through shutdown. Cancellation
+/// closes local admission, but does not dispose an in-flight provider/DB future.
+#[derive(Clone, Copy)]
+pub(crate) struct NativePreparationOptions<'a> {
+    pub cancel: &'a CancellationToken,
+    pub deadline: Option<tokio::time::Instant>,
+    pub stdout_bytes: usize,
+    pub stderr_bytes: usize,
+}
+impl NativePreparationOptions<'_> {
+    pub(crate) fn check_open(&self) -> Result<()> {
+        if self.cancel.is_cancelled()
+            || self
+                .deadline
+                .is_some_and(|d| d <= tokio::time::Instant::now())
+        {
+            self.cancel.cancel();
+            return Err(denied());
+        }
+        Ok(())
+    }
+}
+
+pub(crate) async fn stop_prepared_process(
+    process: ProcessIo,
+    options: NativePreparationOptions<'_>,
+) -> crate::runtime::RuntimeResult<crate::runtime::ExecutionResult> {
+    crate::runtime::process_executor::stop_isolated(
+        process,
+        crate::runtime::process_executor::IsolatedCaptureOptions {
+            timeout_secs: None,
+            max_stdout_bytes: options.stdout_bytes,
+            max_stderr_bytes: options.stderr_bytes,
+            output_format: attune_common::models::OutputFormat::Text,
+            output_policy: Default::default(),
+            out_schema: None,
+            cancel_token: Some(options.cancel.clone()),
+            stdout_log_writer: None,
+            stderr_log_writer: None,
+        },
+    )
+    .await
+}
+
+// Domain repositories remain with each producer; only ownership of their
+// existing operations is shared. No new resource can be selected by this helper.
+pub(crate) async fn await_native_preparation<Stop, StopFuture, Record, RecordFuture>(
+    operation: impl std::future::Future<Output = Result<(ProcessIo, LaunchStdinPayload)>>,
+    mut observed: tokio::sync::watch::Receiver<Option<ResourceIdentity>>,
+    options: NativePreparationOptions<'_>,
+    fence: impl std::future::Future<Output = Result<()>>,
+    stop: Stop,
+    record: Record,
+) -> Result<(ProcessIo, LaunchStdinPayload)>
+where
+    Stop: FnOnce(ResourceIdentity, LaunchStopReason) -> StopFuture,
+    StopFuture: std::future::Future<Output = Result<LaunchExitOutcome>>,
+    Record: FnOnce(ResourceIdentity, LaunchExitOutcome) -> RecordFuture,
+    RecordFuture: std::future::Future<Output = Result<()>>,
+{
+    let mut operation = Box::pin(operation);
+    let completed = tokio::select! {
+        biased;
+        _ = options.cancel.cancelled() => None,
+        _ = async {
+            match options.deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        } => None,
+        result = &mut operation => Some(result),
+    };
+    let completed = match completed {
+        Some(Ok(prepared)) if options.check_open().is_ok() => return Ok(prepared),
+        other => other,
+    };
+    let reason = if options
+        .deadline
+        .is_some_and(|d| d <= tokio::time::Instant::now())
+    {
+        LaunchStopReason::Timeout
+    } else if options.cancel.is_cancelled() {
+        LaunchStopReason::Cancelled
+    } else {
+        LaunchStopReason::LaunchFailure
+    };
+    options.cancel.cancel();
+    let original = async {
+        let result = match completed {
+            Some(result) => result,
+            None => operation.as_mut().await,
+        };
+        // It has completed, so release its observation sender even if the
+        // future's completed state retains captures until destruction.
+        drop(operation);
+        if let Ok((process, _unused_payload)) = result {
+            // Includes a late Start/consume ACK after an earlier retained Stop.
+            // The actual returned control and both captures still have owners.
+            let _ = stop_prepared_process(process, options).await;
+        }
+    };
+    let physical = async {
+        loop {
+            let resource = observed.borrow_and_update().clone();
+            if let Some(resource) = resource {
+                let exit = stop(resource.clone(), reason).await?;
+                return Ok::<_, Error>(Some((resource, exit)));
+            }
+            if observed.changed().await.is_err() {
+                // No exact ACK is not absence. The submitted ledger stays debt.
+                return Ok(None);
+            }
+        }
+    };
+    // Keep all three futures live. In particular, a row lock cannot prevent
+    // physical Stop, and a late provider ACK cannot escape the original owner.
+    let (_, fenced, stopped) = tokio::join!(original, fence, physical);
+    if let Ok(Some((resource, exit))) = stopped {
+        // Resource recording has now joined; this is only a factual exit record,
+        // never a capture receipt, removal or publication acknowledgement.
+        let recorded = record(resource, exit).await;
+        fenced?;
+        recorded?;
+    } else {
+        fenced?;
+        stopped?;
+    }
+    Err(denied())
 }
 
 // A pending source query must not suspend execution's deadline/cancellation polling.
@@ -648,6 +819,397 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod preparation_tests {
+    use super::*;
+    use std::{
+        pin::Pin,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        task::{Context, Poll},
+        time::Duration,
+    };
+    use tokio::{
+        io::{AsyncRead, ReadBuf},
+        sync::{mpsc, oneshot},
+    };
+
+    pub(crate) struct StopRequest {
+        pub reason: LaunchStopReason,
+        pub ack: oneshot::Sender<bool>,
+    }
+    pub(crate) struct Control {
+        pub writes: AtomicUsize,
+        pub readers_dropped: Arc<AtomicUsize>,
+        stops: mpsc::UnboundedSender<StopRequest>,
+    }
+    #[async_trait::async_trait]
+    impl ProcessControl for Control {
+        async fn write_stdin_once(&self, _: LaunchStdinPayload) -> Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Err(denied())
+        }
+        async fn wait(&self) -> Result<LaunchExitOutcome> {
+            panic!("a closed startup gate must not enter invocation wait")
+        }
+        async fn stop(&self, reason: LaunchStopReason) -> Result<LaunchExitOutcome> {
+            let (ack, joined) = oneshot::channel();
+            self.stops.send(StopRequest { reason, ack }).unwrap();
+            if !joined.await.unwrap() {
+                return Err(Error::execution("Uncertain exact Stop acknowledgement"));
+            }
+            Ok(LaunchExitOutcome {
+                exit_code: 0,
+                oom_killed: false,
+            })
+        }
+    }
+    struct PendingReader(Arc<AtomicUsize>);
+    impl AsyncRead for PendingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+    impl Drop for PendingReader {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    pub(crate) fn control_fixture() -> (
+        ResourceIdentity,
+        Arc<Control>,
+        mpsc::UnboundedReceiver<StopRequest>,
+    ) {
+        let (stops, receiver) = mpsc::unbounded_channel();
+        let resource = ResourceIdentity::Kubernetes {
+            cluster: "owned-fixture".into(),
+            namespace: "owned".into(),
+            pod_name: "preparing-native-process".into(),
+            pod_uid: Uuid::new_v4().to_string(),
+        };
+        (
+            resource,
+            Arc::new(Control {
+                writes: AtomicUsize::new(0),
+                readers_dropped: Arc::new(AtomicUsize::new(0)),
+                stops,
+            }),
+            receiver,
+        )
+    }
+    pub(crate) fn process(resource: ResourceIdentity, control: Arc<Control>) -> ProcessIo {
+        ProcessIo {
+            resource,
+            stdout: Box::pin(PendingReader(control.readers_dropped.clone())),
+            stderr: Box::pin(PendingReader(control.readers_dropped.clone())),
+            control,
+        }
+    }
+    pub(crate) async fn next_stop(
+        receiver: &mut mpsc::UnboundedReceiver<StopRequest>,
+    ) -> StopRequest {
+        tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum BlockedPhase {
+        Record,
+        Start,
+        Consume,
+    }
+
+    async fn blocked_phase(phase: BlockedPhase, stopped_fact: bool) {
+        let (resource, control, mut stops) = control_fixture();
+        let cancel = CancellationToken::new();
+        let child = cancel.child_token();
+        let (blocked, waiting) = oneshot::channel();
+        let (operation_ack, operation_wait) = oneshot::channel();
+        let (fencing, fence_waiting) = oneshot::channel();
+        let (fence_ack, fence_wait) = oneshot::channel();
+        let original_joined = Arc::new(AtomicBool::new(false));
+        let fence_joined = Arc::new(AtomicBool::new(false));
+        let exit_recorded = Arc::new(AtomicBool::new(false));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let task = {
+            let control = control.clone();
+            let original_joined = original_joined.clone();
+            let fence_joined = fence_joined.clone();
+            let exit_recorded = exit_recorded.clone();
+            let starts = starts.clone();
+            tokio::spawn(async move {
+                let options = NativePreparationOptions {
+                    cancel: &child,
+                    deadline: None,
+                    stdout_bytes: 1024,
+                    stderr_bytes: 1024,
+                };
+                let (observed, receiver) = tokio::sync::watch::channel(None);
+                let source_resource = resource.clone();
+                let source_control = control.clone();
+                let joined = original_joined.clone();
+                let operation = async move {
+                    let result = async {
+                        observed.send_replace(Some(source_resource.clone()));
+                        let attached = if phase == BlockedPhase::Consume {
+                            starts.fetch_add(1, Ordering::SeqCst);
+                            Some(process(source_resource.clone(), source_control.clone()))
+                        } else {
+                            None
+                        };
+                        if phase == BlockedPhase::Start {
+                            starts.fetch_add(1, Ordering::SeqCst);
+                        }
+                        blocked.send(()).unwrap();
+                        operation_wait.await.unwrap();
+                        if phase == BlockedPhase::Record {
+                            options.check_open()?;
+                            starts.fetch_add(1, Ordering::SeqCst);
+                        }
+                        let process =
+                            attached.unwrap_or_else(|| process(source_resource, source_control));
+                        Ok((
+                            process,
+                            LaunchStdinPayload::from_bytes(b"{}".to_vec()).unwrap(),
+                        ))
+                    }
+                    .await;
+                    joined.store(true, Ordering::SeqCst);
+                    result
+                };
+                let physical = control.clone();
+                let factual_control = control.clone();
+                let recorded_fence = fence_joined.clone();
+                await_native_preparation(
+                    operation,
+                    receiver,
+                    options,
+                    async {
+                        fencing.send(()).unwrap();
+                        fence_wait.await.unwrap();
+                        fence_joined.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
+                    move |exact, reason| async move {
+                        assert_eq!(exact, resource);
+                        physical.stop(reason).await
+                    },
+                    move |_, _| async move {
+                        assert!(original_joined.load(Ordering::SeqCst));
+                        assert!(recorded_fence.load(Ordering::SeqCst));
+                        if phase != BlockedPhase::Record {
+                            assert_eq!(factual_control.readers_dropped.load(Ordering::SeqCst), 2);
+                        }
+                        exit_recorded.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+                .await
+            })
+        };
+        supervision_tests::signal(waiting).await;
+        cancel.cancel();
+        supervision_tests::signal(fence_waiting).await;
+        let stop = next_stop(&mut stops).await;
+        assert_eq!(stop.reason, LaunchStopReason::Cancelled);
+        assert!(!original_joined.load(Ordering::SeqCst));
+        assert!(!fence_joined.load(Ordering::SeqCst));
+        assert!(
+            !task.is_finished(),
+            "physical Stop must not drop the original DB/provider future"
+        );
+        stop.ack.send(stopped_fact).unwrap();
+        operation_ack.send(()).unwrap();
+        if phase != BlockedPhase::Record {
+            // A late Start/consume result still owns its actual control/streams,
+            // independently of both the first Stop ACK and the blocked fence.
+            let late = next_stop(&mut stops).await;
+            assert_eq!(late.reason, LaunchStopReason::Cancelled);
+            late.ack.send(false).unwrap();
+        }
+        assert!(!task.is_finished());
+        fence_ack.send(()).unwrap();
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(control.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            usize::from(phase != BlockedPhase::Record)
+        );
+        assert_eq!(exit_recorded.load(Ordering::SeqCst), stopped_fact);
+        assert_eq!(
+            control.readers_dropped.load(Ordering::SeqCst),
+            if phase == BlockedPhase::Record { 0 } else { 2 }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn known_resource_stops_while_resource_record_and_fence_are_blocked() {
+        blocked_phase(BlockedPhase::Record, true).await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn late_start_ack_joins_control_and_both_captures_before_durable_fence() {
+        blocked_phase(BlockedPhase::Start, true).await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn blocked_stdin_consumption_stops_without_delivery_or_replay() {
+        blocked_phase(BlockedPhase::Consume, true).await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn uncertain_known_stop_retains_debt_without_recording_an_exit() {
+        blocked_phase(BlockedPhase::Record, false).await;
+    }
+
+    async fn late_prepare(known_ack: bool) {
+        let (resource, control, mut stops) = control_fixture();
+        let expected_resource = resource.clone();
+        let (preparing, preparation_waiting) = oneshot::channel();
+        let (prepare_ack, prepare_wait) = oneshot::channel::<Result<ResourceIdentity>>();
+        let (record_ack, record_wait) = oneshot::channel();
+        let (fencing, fence_waiting) = oneshot::channel();
+        let (fence_ack, fence_wait) = oneshot::channel();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let recorded = Arc::new(AtomicBool::new(false));
+        let task = {
+            let starts = starts.clone();
+            let recorded = recorded.clone();
+            let control = control.clone();
+            tokio::spawn(async move {
+                let cancel = CancellationToken::new();
+                let options = NativePreparationOptions {
+                    cancel: &cancel,
+                    deadline: Some(tokio::time::Instant::now() + Duration::from_secs(120)),
+                    stdout_bytes: 1024,
+                    stderr_bytes: 1024,
+                };
+                let (observed, receiver) = tokio::sync::watch::channel(None);
+                let operation = async move {
+                    preparing.send(()).unwrap();
+                    let resource = prepare_wait.await.unwrap()?;
+                    observed.send_replace(Some(resource));
+                    record_wait.await.unwrap();
+                    options.check_open()?;
+                    starts.fetch_add(1, Ordering::SeqCst);
+                    Err(denied())
+                };
+                await_native_preparation(
+                    operation,
+                    receiver,
+                    options,
+                    async {
+                        fencing.send(()).unwrap();
+                        fence_wait.await.unwrap();
+                        Ok(())
+                    },
+                    move |resource, reason| async move {
+                        assert_eq!(resource, expected_resource);
+                        control.stop(reason).await
+                    },
+                    move |_, _| async move {
+                        recorded.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+                .await
+            })
+        };
+        supervision_tests::signal(preparation_waiting).await;
+        tokio::time::advance(Duration::from_secs(120)).await;
+        supervision_tests::signal(fence_waiting).await;
+        assert!(matches!(
+            stops.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(
+            !task.is_finished(),
+            "timeout must retain the submitted create future"
+        );
+        if known_ack {
+            prepare_ack.send(Ok(resource)).unwrap();
+            let stopped = next_stop(&mut stops).await;
+            assert_eq!(stopped.reason, LaunchStopReason::Timeout);
+            assert!(
+                !task.is_finished(),
+                "late ACK must retain blocked resource recording"
+            );
+            stopped.ack.send(true).unwrap();
+            record_ack.send(()).unwrap();
+        } else {
+            prepare_ack
+                .send(Err(Error::execution("Unknown create acknowledgement")))
+                .unwrap();
+            drop(record_ack);
+        }
+        fence_ack.send(()).unwrap();
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        assert_eq!(control.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(recorded.load(Ordering::SeqCst), known_ack);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_prepare_ack_after_deadline_is_stopped_without_starting() {
+        late_prepare(true).await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn unknown_create_after_deadline_does_not_invent_resource_or_exit() {
+        late_prepare(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn uninterrupted_preparation_returns_exact_input_without_opening_gate() {
+        let (resource, control, mut stops) = control_fixture();
+        let expected = b"{\"private\":\"unchanged\"}";
+        let token = CancellationToken::new();
+        let options = NativePreparationOptions {
+            cancel: &token,
+            deadline: None,
+            stdout_bytes: 1024,
+            stderr_bytes: 1024,
+        };
+        let (observed, receiver) = tokio::sync::watch::channel(None);
+        let attached = process(resource.clone(), control.clone());
+        let prepared = await_native_preparation(
+            async move {
+                observed.send_replace(Some(resource));
+                Ok((
+                    attached,
+                    LaunchStdinPayload::from_bytes(expected.to_vec()).unwrap(),
+                ))
+            },
+            receiver,
+            options,
+            async { panic!("ready preparation must not fence Stop") },
+            |_, _| async { panic!("ready preparation must not stop") },
+            |_, _| async { panic!("ready preparation must not record an exit") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(prepared.1.as_bytes(), expected);
+        assert_eq!(control.writes.load(Ordering::SeqCst), 0);
+        let cleanup = tokio::spawn(async move {
+            let token = CancellationToken::new();
+            stop_prepared_process(
+                prepared.0,
+                NativePreparationOptions {
+                    cancel: &token,
+                    deadline: None,
+                    stdout_bytes: 1024,
+                    stderr_bytes: 1024,
+                },
+            )
+            .await
+        });
+        next_stop(&mut stops).await.ack.send(true).unwrap();
+        assert!(!cleanup.await.unwrap().unwrap().is_success());
+        assert_eq!(control.readers_dropped.load(Ordering::SeqCst), 2);
+        assert_eq!(control.writes.load(Ordering::SeqCst), 0);
     }
 }
 

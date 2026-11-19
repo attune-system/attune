@@ -366,7 +366,7 @@ impl ActionExecutor {
             master,
             &self.child_environment,
         )?
-        .verify(runtime, version, admitted, &pin)
+        .verify(runtime, version, admitted, &pin, None)
         .await
     }
 

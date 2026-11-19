@@ -770,6 +770,23 @@ pub async fn execute_isolated_cancellable(
     payload: attune_common::workload_stdin::LaunchStdinPayload,
     options: IsolatedCaptureOptions<'_>,
 ) -> RuntimeResult<ExecutionResult> {
+    execute_isolated_inner(process, Some(payload), options).await
+}
+
+/// Retain Stop and both capture joins without authorizing or inventing stdin.
+/// No token state can open the gate through this entrypoint.
+pub(crate) async fn stop_isolated(
+    process: attune_common::isolated_process::ProcessIo,
+    options: IsolatedCaptureOptions<'_>,
+) -> RuntimeResult<ExecutionResult> {
+    execute_isolated_inner(process, None, options).await
+}
+
+async fn execute_isolated_inner(
+    process: attune_common::isolated_process::ProcessIo,
+    payload: Option<attune_common::workload_stdin::LaunchStdinPayload>,
+    options: IsolatedCaptureOptions<'_>,
+) -> RuntimeResult<ExecutionResult> {
     use attune_common::workload_launch::LaunchStopReason;
 
     let start = Instant::now();
@@ -791,26 +808,22 @@ pub async fn execute_isolated_cancellable(
         error: Some(output_policy.error),
     }
     .resolve(out_schema, output_format);
-    if validation.is_err() {
-        // The gate must remain closed even when preparation and capture policy
-        // disagree. Stop is still required; failure leaves provider uncertainty.
-        control
-            .stop(LaunchStopReason::LaunchFailure)
-            .await
-            .map_err(|_| {
-                RuntimeError::ExecutionFailed("Isolated process cleanup is uncertain".into())
-            })?;
-        return Err(RuntimeError::InvalidAction("Invalid output policy".into()));
-    }
     let execution_deadline = timeout_secs
         .and_then(|seconds| TokioInstant::now().checked_add(Duration::from_secs(seconds)));
-    let capture = ProcessCapture::new(
+    let closing = payload.is_none()
+        || validation.is_err()
+        || cancel_token
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        || execution_deadline.is_some_and(|deadline| deadline <= TokioInstant::now());
+    let capture = ProcessCapture::new_inner(
         process.stdout,
         process.stderr,
         stdout_log_writer,
         stderr_log_writer,
         (max_stdout_bytes, max_stderr_bytes),
         output_policy,
+        closing,
     );
     let policy = CapturePolicy {
         timeout_secs,
@@ -820,10 +833,39 @@ pub async fn execute_isolated_cancellable(
         out_schema,
         cancel_token: cancel_token.clone(),
     };
+    if validation.is_err() {
+        // Invalid policy still owns both streams. Do not discard their capture
+        // tasks on either a positive Stop or an uncertain stopped-writer reply.
+        capture.output_cancel.cancel();
+        let outcome = control.stop(LaunchStopReason::LaunchFailure).await;
+        let uncertain = outcome.is_err();
+        let captured = capture
+            .finish(
+                start,
+                policy,
+                (
+                    outcome
+                        .map(|exit| exit.exit_code)
+                        .map_err(|_| io::Error::other("Isolated process settlement is uncertain")),
+                    true,
+                    false,
+                    None,
+                ),
+            )
+            .await;
+        if uncertain {
+            return Err(RuntimeError::ExecutionFailed(
+                "Isolated process cleanup is uncertain".into(),
+            ));
+        }
+        captured?;
+        return Err(RuntimeError::InvalidAction("Invalid output policy".into()));
+    }
     // Do not open a held gate when cancellation/deadline is already observed.
-    let initial_interrupt = if cancel_token
-        .as_ref()
-        .is_some_and(CancellationToken::is_cancelled)
+    let initial_interrupt = if payload.is_none()
+        || cancel_token
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
     {
         Some(ExecutionInterrupt::Cancelled)
     } else if execution_deadline.is_some_and(|deadline| deadline <= TokioInstant::now()) {
@@ -834,12 +876,16 @@ pub async fn execute_isolated_cancellable(
     let input = match initial_interrupt {
         Some(interrupt) => Err(interrupt),
         None => {
-            await_execution(
-                control.write_stdin_once(payload),
-                cancel_token.as_ref(),
-                execution_deadline,
-            )
-            .await
+            if let Some(payload) = payload {
+                await_execution(
+                    control.write_stdin_once(payload),
+                    cancel_token.as_ref(),
+                    execution_deadline,
+                )
+                .await
+            } else {
+                Err(ExecutionInterrupt::Cancelled)
+            }
         }
     };
     let (outcome, input_error) = match input {
@@ -882,6 +928,80 @@ pub async fn execute_isolated_cancellable(
     capture.finish(start, policy, wait).await
 }
 
+#[cfg(test)]
+mod stop_only_tests {
+    use super::*;
+    use crate::native_runtime_probe::preparation_tests::{control_fixture, next_stop, process};
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_only_joins_both_captures_without_stdin_even_on_uncertain_stop_or_invalid_policy()
+    {
+        for (invalid_policy, live_token, positive_stop) in [
+            (false, false, true),
+            (false, true, false),
+            (true, true, true),
+            (true, true, false),
+        ] {
+            let (resource, control, mut stops) = control_fixture();
+            let attached = process(resource, control.clone());
+            let task = tokio::spawn(async move {
+                stop_isolated(
+                    attached,
+                    IsolatedCaptureOptions {
+                        timeout_secs: None,
+                        max_stdout_bytes: 1024,
+                        max_stderr_bytes: 1024,
+                        output_format: OutputFormat::Text,
+                        output_policy: ResolvedOutputPolicy {
+                            stdout: if invalid_policy {
+                                StdoutPolicy::Sanitized
+                            } else {
+                                StdoutPolicy::Public
+                            },
+                            ..Default::default()
+                        },
+                        out_schema: None,
+                        cancel_token: live_token.then(CancellationToken::new),
+                        stdout_log_writer: None,
+                        stderr_log_writer: None,
+                    },
+                )
+                .await
+            });
+            let stopped = next_stop(&mut stops).await;
+            assert_eq!(
+                stopped.reason,
+                if invalid_policy {
+                    attune_common::workload_launch::LaunchStopReason::LaunchFailure
+                } else {
+                    attune_common::workload_launch::LaunchStopReason::Cancelled
+                }
+            );
+            assert!(
+                !task.is_finished(),
+                "Stop uncertainty cannot dispose capture ownership"
+            );
+            assert_eq!(control.writes.load(Ordering::SeqCst), 0);
+            stopped.ack.send(positive_stop).unwrap();
+            let result = task.await.unwrap();
+            if invalid_policy {
+                assert!(result.is_err());
+            } else {
+                let result = result.unwrap();
+                assert!(!result.is_success());
+                assert!(result.logs_incomplete);
+                assert_eq!(result.log_capture_incomplete, Some((true, true)));
+                if !positive_stop {
+                    assert_eq!(result.exit_code, -1);
+                }
+            }
+            assert_eq!(control.writes.load(Ordering::SeqCst), 0);
+            assert_eq!(control.readers_dropped.load(Ordering::SeqCst), 2);
+        }
+    }
+}
+
 /// One capture/custody implementation for local legacy pipes and isolated
 /// non-TTY attach streams. Provider observation does not establish log custody.
 struct ProcessCapture {
@@ -913,6 +1033,30 @@ impl ProcessCapture {
         R: tokio::io::AsyncRead + Unpin + Send + 'static,
         E: tokio::io::AsyncRead + Unpin + Send + 'static,
     {
+        Self::new_inner(
+            stdout,
+            stderr,
+            stdout_log_writer,
+            stderr_log_writer,
+            limits,
+            output_policy,
+            false,
+        )
+    }
+
+    fn new_inner<R, E>(
+        stdout: R,
+        stderr: E,
+        stdout_log_writer: Option<BoundedLogFileWriter>,
+        stderr_log_writer: Option<BoundedLogFileWriter>,
+        limits: (usize, usize),
+        output_policy: ResolvedOutputPolicy,
+        closing: bool,
+    ) -> Self
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+        E: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
         let log_finalization_timeout_ms = stdout_log_writer
             .as_ref()
             .map(BoundedLogFileWriter::finalization_timeout_ms)
@@ -933,6 +1077,11 @@ impl ProcessCapture {
         let stdout_reader = BufReader::new(stdout);
         let stderr_reader = BufReader::new(stderr);
         let output_cancel = CancellationToken::new();
+        if closing {
+            // Close before spawning either reader. Invalid policy cannot race
+            // an unvalidated output write, and cancellation is never EOF.
+            output_cancel.cancel();
+        }
         let cancel_guard = output_cancel.clone().drop_guard();
         let pipe_drain = CancellationToken::new();
         let stdout_cancel = output_cancel.clone();
