@@ -731,6 +731,160 @@ async fn native_file_publication_keeps_revocation_permanent_after_exit() -> Resu
     Ok(())
 }
 
+#[tokio::test]
+async fn native_secret_input_file_publication_rejects_replaced_and_restored_ciphertext(
+) -> Result<()> {
+    use attune_common::{
+        auth::WorkerTokenProvider,
+        models::{enums::ArtifactBodyState, OwnerType},
+        repositories::{
+            artifact::ArtifactVersionRepository,
+            execution::UpdateExecutionInput,
+            execution_secret_value::ExecutionSecretValueRepository,
+            key::{CreateKeyInput, KeyRepository},
+            Update,
+        },
+        secret_provenance::SecretProvenance,
+        secret_values::{
+            prepare_secret_values, redaction_marker, SecretValueInput, ENTITY_EXECUTION_CONFIG,
+        },
+    };
+    use axum::http::StatusCode;
+    attune_common::auth::install_crypto_provider();
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let (spec, _, resource) = admitted(&ctx).await?;
+    let owner = ctx.user.as_ref().unwrap().id;
+    let master = ctx.state.config.security.encryption_key.as_deref().unwrap();
+    let LaunchTarget::Execution {
+        execution, worker, ..
+    } = spec.target
+    else {
+        unreachable!()
+    };
+    let key = KeyRepository::create_encrypted_in_pool(
+        &ctx.pool,
+        CreateKeyInput {
+            local_ref: format!("native_file_origin_{}", Uuid::new_v4().simple()),
+            owner_type: OwnerType::Identity,
+            owner_identity: Some(owner),
+            owner_pack: None,
+            owner_pack_ref: None,
+            owner_action: None,
+            owner_action_ref: None,
+            owner_sensor: None,
+            owner_sensor_ref: None,
+            name: "Owned native input origin".into(),
+            encrypted: true,
+            encryption_key_hash: None,
+            value: json!("owned-secret-input"),
+        },
+        master,
+    )
+    .await?;
+    let source_ref = serde_json::to_string(&SecretProvenance::key(
+        attune_common::key_access::key_origin(&key),
+    ))?;
+    let prepare = || {
+        prepare_secret_values(
+            vec![SecretValueInput {
+                json_path: "/value".into(),
+                value: json!("owned-secret-input"),
+                source_kind: "provenance".into(),
+                source_ref: Some(source_ref.clone()),
+            }],
+            master,
+        )
+    };
+    let original = prepare()?;
+    ExecutionSecretValueRepository::upsert_many(
+        &ctx.pool,
+        ENTITY_EXECUTION_CONFIG,
+        execution,
+        &original,
+    )
+    .await?;
+    ExecutionRepository::update(
+        &ctx.pool,
+        execution,
+        UpdateExecutionInput {
+            config: Some(json!({"value": redaction_marker()})),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let mut tx = ctx.pool.begin().await?;
+    let input = ExecutionInputRepository::restore(&mut tx, execution, Some(master), None).await?;
+    let (value, paths, snapshot, expiry) = input.into_parts();
+    assert_eq!(paths, vec!["/value".to_owned()]);
+    let selected = SelectedExecutionInput::new(value, snapshot)?;
+    expiry.ensure_fresh()?;
+    tx.commit().await?;
+    Effects::reserve(&ctx.pool, &spec, owner, &selected, master).await?;
+    Effects::begin_create(&ctx.pool, spec.intent, master).await?;
+    Effects::record_resource(&ctx.pool, spec.intent, &resource).await?;
+    let input = Effects::consume_stdin(&ctx.pool, spec.intent, &resource, master).await?;
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(input.as_bytes())?,
+        json!({"value":"owned-secret-input"})
+    );
+    let version = ordinary_file_version(&ctx, execution).await?;
+    Effects::record_exit(
+        &ctx.pool,
+        spec.intent,
+        &resource,
+        LaunchExitOutcome {
+            exit_code: 0,
+            oom_killed: false,
+        },
+    )
+    .await?;
+    let token = WorkerTokenProvider::new(
+        owner,
+        worker.to_string(),
+        ctx.state.jwt_config.as_ref().clone(),
+    )
+    .token()?;
+    let path = version.file_path.as_deref().unwrap();
+    assert_eq!(
+        file_upload_admission(&ctx, &token, path).await?,
+        StatusCode::OK
+    );
+
+    // Equal plaintext with new ciphertext is a new selected input. Restoring
+    // the exact old bytes cannot revive the effect's earlier source epochs.
+    ExecutionSecretValueRepository::upsert_many(
+        &ctx.pool,
+        ENTITY_EXECUTION_CONFIG,
+        execution,
+        &prepare()?,
+    )
+    .await?;
+    assert_eq!(
+        file_upload_admission(&ctx, &token, path).await?,
+        StatusCode::FORBIDDEN
+    );
+    ExecutionSecretValueRepository::upsert_many(
+        &ctx.pool,
+        ENTITY_EXECUTION_CONFIG,
+        execution,
+        &original,
+    )
+    .await?;
+    assert_eq!(
+        file_upload_admission(&ctx, &token, path).await?,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        ArtifactVersionRepository::find_by_id(&ctx.pool, version.id)
+            .await?
+            .unwrap()
+            .body_state,
+        Some(ArtifactBodyState::Pending)
+    );
+    ctx.cleanup().await?;
+    Ok(())
+}
+
 async fn stopped_file(
     ctx: &TestContext,
 ) -> Result<(
