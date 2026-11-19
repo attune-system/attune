@@ -440,6 +440,40 @@ impl ActionExecutor {
         self
     }
 
+    /// The ordinary pack-test handler owns policy and final publication. This
+    /// supplies only its existing manager identity and concrete native inputs.
+    pub(crate) async fn native_candidate_tests(
+        &self,
+        install: i64,
+        archive_token: &str,
+    ) -> Result<Arc<crate::native_candidate::NativeCandidateTests>> {
+        let denied = || Error::PermissionDenied("Native candidate manager unavailable".into());
+        let native = self.native_preparation.as_ref().ok_or_else(denied)?;
+        let configured = attune_workload_backend::configuration::ConfiguredBackend {
+            backend: self.native_backend.clone().ok_or_else(denied)?,
+            cache: native.cache.clone(),
+            runner: native.runner.clone(),
+        };
+        crate::native_candidate::NativeCandidateTests::new(
+            self.pool.clone(),
+            native.config.clone(),
+            configured,
+            self.worker_id.load(Ordering::Acquire),
+            *self.process_incarnation.get().ok_or_else(denied)?,
+            install,
+            archive_token,
+            self.worker_tokens.clone().ok_or_else(denied)?,
+            &self.api_url,
+            self.secret_manager
+                .encryption_key()
+                .ok_or_else(denied)?
+                .to_owned(),
+            self.child_environment.clone(),
+            None,
+        )
+        .await
+    }
+
     /// Create a new action executor
     #[allow(clippy::too_many_arguments)]
     pub fn new(

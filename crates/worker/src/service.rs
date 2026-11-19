@@ -13,6 +13,8 @@
 //! 5. **Set up runtime environments** — create per-version environments for packs
 //! 6. Start heartbeat, execution consumer, pack registration consumer, and cancel consumer
 
+mod native_candidate;
+
 use attune_common::auth::WorkerTokenProvider;
 use attune_common::config::Config;
 use attune_common::db::Database;
@@ -1353,6 +1355,7 @@ impl WorkerService {
         let runtime_envs_dir = self.runtime_envs_dir.clone();
         let pack_transport = self.pack_transport.clone();
         let child_environment = self.child_environment.clone();
+        let native_executor = self.config.workload.as_ref().map(|_| self.executor.clone());
         let candidate_api_url = std::env::var("ATTUNE_API_URL")
             .unwrap_or_else(|_| {
                 format!(
@@ -1378,6 +1381,7 @@ impl WorkerService {
                         let runtime_envs_dir = runtime_envs_dir.clone();
                         let pack_transport = pack_transport.clone();
                         let child_environment = child_environment.clone();
+                        let native_executor = native_executor.clone();
                         let candidate_api_url = candidate_api_url.clone();
 
                         let cancellation = CancellationToken::new();
@@ -1390,6 +1394,7 @@ impl WorkerService {
                                     packs_base_dir: packs_base_dir.as_path(),
                                     runtime_envs_dir: runtime_envs_dir.as_path(),
                                     api_url: &candidate_api_url,
+                                    native_executor: native_executor.as_deref(),
                                 },
                                 pack_transport.as_ref(),
                                 &payload,
@@ -1403,14 +1408,19 @@ impl WorkerService {
                                     payload.pack_install_id, payload.pack_ref, e
                                 );
                                 // Record the failure so the API's install finalizer can react.
-                                if let Err(mark_err) =
-                                    mark_pack_install_failed(&db_pool, &payload, &e.to_string())
-                                        .await
-                                {
-                                    error!(
-                                        "Failed to record pack install {} failure: {}",
-                                        payload.pack_install_id, mark_err
-                                    );
+                                // Native uncertainty must retain its install,
+                                // lease and provider debt. Only the fenced
+                                // handler transaction may publish its outcome.
+                                if native_executor.is_none() {
+                                    if let Err(mark_err) =
+                                        mark_pack_install_failed(&db_pool, &payload, &e.to_string())
+                                            .await
+                                    {
+                                        error!(
+                                            "Failed to record pack install {} failure: {}",
+                                            payload.pack_install_id, mark_err
+                                        );
+                                    }
                                 }
                                 return Err(format!("Failed to run pack tests: {}", e).into());
                             }
@@ -2276,6 +2286,7 @@ struct PackTestLocation<'a> {
     packs_base_dir: &'a std::path::Path,
     runtime_envs_dir: &'a std::path::Path,
     api_url: &'a str,
+    native_executor: Option<&'a ActionExecutor>,
 }
 
 /// Run a pack's test suite on this worker and persist the outcome.
@@ -2294,6 +2305,7 @@ async fn handle_pack_test(
         packs_base_dir,
         runtime_envs_dir,
         api_url,
+        native_executor,
     } = location;
 
     validate_mq_pack_ref(&payload.pack_ref, "PackTestRequested")?;
@@ -2330,6 +2342,19 @@ async fn handle_pack_test(
         );
         return Ok(());
     }
+    if let Some(executor) = native_executor {
+        return native_candidate::handle(
+            db_pool,
+            executor,
+            payload,
+            &install,
+            packs_base_dir,
+            api_url,
+            cancellation,
+        )
+        .await;
+    }
+
     if install.pack_ref != payload.pack_ref
         || install.pack_version != payload.pack_version
         || install.trigger_reason != payload.trigger_reason
