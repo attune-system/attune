@@ -29,7 +29,7 @@ pub fn executable_recipe() -> RuntimeRecipe {
     let mut recipe = recipe();
     recipe.workspace = true;
     recipe.prepare = serde_json::from_value(serde_json::json!([{"command":["{tool_python}","-c",
-        "import os,sys; assert sys.stdin.buffer.read()==b''; assert 'SELECTED' not in os.environ; assert 'ATTUNE_API_TOKEN' not in os.environ; p=os.getppid(); paths=[f'/proc/{p}/environ',f'/proc/{p}/fd/0']; [(exec(\"try:\\n open(path,'rb')\\nexcept PermissionError:\\n pass\\nelse:\\n raise AssertionError('parent context readable')\",{'path':path})) for path in paths]"
+        "import os,sys; assert sys.stdin.buffer.read()==b''; assert 'SELECTED' not in os.environ; assert 'ATTUNE_API_TOKEN' not in os.environ; p=os.getppid(); paths=['/proc/'+str(p)+'/environ','/proc/'+str(p)+'/fd/0']; [(exec(\"try:\\n open(path,'rb')\\nexcept PermissionError:\\n pass\\nelse:\\n raise AssertionError('parent context readable')\",{'path':path})) for path in paths]"
     ]}])).unwrap();
     recipe.launch = serde_json::from_value(
         serde_json::json!({"command":["{tool_python}","{source_file}"],"timeout_seconds":10}),

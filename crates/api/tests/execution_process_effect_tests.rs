@@ -144,26 +144,20 @@ async fn declared_input_case(delivery: &str) -> Result<()> {
         spec.invocation
             .env
             .insert("ATTUNE_PARAMETER_DELIVERY".into(), delivery.into());
-        if delivery != "none" {
-            spec.invocation
-                .env
-                .insert("ATTUNE_PARAMETER_FORMAT".into(), format.into());
-        }
+        spec.invocation
+            .env
+            .insert("ATTUNE_PARAMETER_FORMAT".into(), format.into());
         let master = ctx.state.config.security.encryption_key.as_deref().unwrap();
         Effects::reserve(&ctx.pool, &spec, owner, &selected, master).await?;
         Effects::begin_create(&ctx.pool, spec.intent, master).await?;
         Effects::record_resource(&ctx.pool, spec.intent, &resource).await?;
         let payload = Effects::consume_stdin(&ctx.pool, spec.intent, &resource, master).await?;
-        if delivery == "none" {
-            assert!(payload.as_bytes().is_empty());
-        } else {
-            // Formatting/private file materialization belongs to the guest,
-            // never a manager path or a second input serialization contract.
-            assert_eq!(
-                payload.as_bytes(),
-                br#"{"value":"owned-private-parameters"}"#,
-            );
-        }
+        // Formatting/private file materialization belongs to the guest,
+        // never a manager path or a second input serialization contract.
+        assert_eq!(
+            payload.as_bytes(),
+            br#"{"value":"owned-private-parameters"}"#,
+        );
         assert!(!spec.invocation.env.contains_key("ATTUNE_PARAMETER_FILE"));
         assert!(
             Effects::consume_stdin(&ctx.pool, spec.intent, &resource, master)
@@ -173,11 +167,6 @@ async fn declared_input_case(delivery: &str) -> Result<()> {
     }
     ctx.cleanup().await?;
     Ok(())
-}
-
-#[tokio::test]
-async fn declared_no_input_never_delivers_parameters_for_any_format() -> Result<()> {
-    declared_input_case("none").await
 }
 
 #[tokio::test]

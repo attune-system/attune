@@ -1,6 +1,6 @@
 #[cfg(target_os = "linux")]
 mod gated_runner;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod parameter_input;
 #[cfg(unix)]
 mod recipe_probe;

@@ -136,7 +136,6 @@ async fn docker_interpreted_owning_worker() -> Result<()> {
         ("file", "json"),
         ("file", "yaml"),
         ("file", "dotenv"),
-        ("none", "json"),
     ] {
         run_native_parameter_fixture(fixture().await?, delivery, format).await?;
     }

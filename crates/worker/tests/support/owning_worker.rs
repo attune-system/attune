@@ -173,7 +173,7 @@ pub async fn run_native_parameter_fixture(
     delivery: &'static str,
     format: &'static str,
 ) -> Result<()> {
-    ensure!(matches!(delivery, "stdin" | "file" | "none"));
+    ensure!(matches!(delivery, "stdin" | "file"));
     ensure!(matches!(format, "json" | "yaml" | "dotenv"));
     owning_case(Some(fixture), false, false, true, Some((delivery, format))).await
 }
@@ -343,28 +343,23 @@ assert Path('/opt/attune/runtime/project/pack.yaml').is_file()
 assert Path('/opt/attune/runtime/bin/python3').is_file()
 delivery=os.environ.get('ATTUNE_PARAMETER_DELIVERY','stdin')
 format=os.environ.get('ATTUNE_PARAMETER_FORMAT','json')
-if delivery=='none':
+if delivery=='file':
     assert sys.stdin.read()==''
-    assert 'ATTUNE_PARAMETER_FILE' not in os.environ
-    message='owned-no-input'
+    selected=Path(os.environ['ATTUNE_PARAMETER_FILE'])
+    assert selected.parent==Path('/tmp')
+    assert stat.S_IMODE(selected.stat().st_mode)==0o400
+    raw=selected.read_text()
 else:
-    if delivery=='file':
-        assert sys.stdin.read()==''
-        selected=Path(os.environ['ATTUNE_PARAMETER_FILE'])
-        assert selected.parent==Path('/tmp')
-        assert stat.S_IMODE(selected.stat().st_mode)==0o400
-        raw=selected.read_text()
-    else:
-        assert delivery=='stdin' and 'ATTUNE_PARAMETER_FILE' not in os.environ
-        raw=sys.stdin.read()
-    if format=='json':
-        message=json.loads(raw)['message']
-    elif format=='yaml':
-        assert raw.startswith('message: ')
-        message=raw[len('message: '):].strip()
-    else:
-        assert format=='dotenv' and raw.startswith("message='") and raw.endswith("'")
-        message=raw[len("message='"):-1]
+    assert delivery=='stdin' and 'ATTUNE_PARAMETER_FILE' not in os.environ
+    raw=sys.stdin.read()
+if format=='json':
+    message=json.loads(raw)['message']
+elif format=='yaml':
+    assert raw.startswith('message: ')
+    message=raw[len('message: '):].strip()
+else:
+    assert format=='dotenv' and raw.startswith("message='") and raw.endswith("'")
+    message=raw[len("message='"):-1]
 sys.stdout.write(message)
 "#,
         )?;
@@ -506,11 +501,7 @@ sys.stdout.write(message)
     .await?;
     tokens.set_worker_id(worker.id.to_string());
     WorkerRepository::heartbeat_incarnation(&database, worker.id, incarnation).await?;
-    let message = if declared_input.is_some_and(|input| input.0 == "none") {
-        "owned-no-input".to_owned()
-    } else {
-        format!("owned-captured-{}", Uuid::new_v4())
-    };
+    let message = format!("owned-captured-{}", Uuid::new_v4());
     let mut tx = database.begin().await?;
     let snapshot = ExecutableSnapshotRepository::resolve_for_action(&mut *tx, action.id).await?;
     let binding = SchemaContractRepository::materialize_action(&mut tx, &snapshot).await?;

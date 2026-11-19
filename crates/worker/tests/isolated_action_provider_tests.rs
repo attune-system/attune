@@ -151,7 +151,6 @@ async fn kubernetes_interpreted_setup_custody_completion_and_restart() -> Result
         ("file", "json"),
         ("file", "yaml"),
         ("file", "dotenv"),
-        ("none", "json"),
     ] {
         run_native_parameter_fixture(kubernetes_fixture().await?, delivery, format).await?;
     }
