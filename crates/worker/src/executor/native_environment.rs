@@ -187,89 +187,17 @@ impl ActionExecutor {
         Ok(())
     }
 
-    /// Startup's existing registration loop owns the operator-admitted digest
-    /// set. This performs one real source-fenced guest probe, never host lookup.
+    /// Select and materialize the primary release through the existing action
+    /// input path; the shared driver independently verifies its source proof.
     pub(crate) async fn probe_registered_native_runtime(
         &self,
         runtime: &attune_common::models::Runtime,
         version: Option<&attune_common::models::RuntimeVersion>,
         admitted: &std::collections::BTreeSet<String>,
     ) -> Result<attune_common::repositories::runtime_probe_process::VerifiedToolMap> {
-        use attune_common::repositories::{
-            runtime_probe_process::{RuntimeProbeProcessRepository as Probe, RuntimeProbeSource},
-            FindById,
-        };
         let native = self.native_preparation.as_ref().ok_or_else(denied)?;
         let backend = self.native_backend.as_ref().ok_or_else(denied)?;
         let master = self.secret_manager.encryption_key().ok_or_else(denied)?;
-        loop {
-            let debt = Probe::unsettled(&self.pool, self.worker_id.load(Ordering::Acquire), master)
-                .await?;
-            if debt.is_empty() {
-                break;
-            }
-            for (old, submitted, retained) in debt {
-                if !submitted {
-                    Probe::request_stop(&self.pool, old.intent).await?;
-                    Probe::acknowledge_removed(&self.pool, old.intent, None).await?;
-                    continue;
-                }
-                let newly_observed = retained.is_none();
-                let resource = match retained {
-                    Some(resource) => resource,
-                    None => backend.launcher().prepare(&old,attune_common::isolated_process::ProcessCreateDisposition::ReconcileOnly).await?,
-                };
-                // A blocked DB fence cannot delay stopping an exact known writer.
-                // Settlement/removal/replacement still require BOTH acknowledgements.
-                let fence = async {
-                    if newly_observed {
-                        Probe::record_resource(&self.pool, old.intent, &resource).await?;
-                    }
-                    Probe::request_stop(&self.pool, old.intent).await
-                };
-                let (fenced, stopped) = tokio::join!(
-                    fence,
-                    backend.stop_retained(&old, &resource, LaunchStopReason::SourceRevoked)
-                );
-                fenced?;
-                let exit = stopped?;
-                Probe::record_exit(&self.pool, old.intent, &resource, exit).await?;
-                backend.remove_stopped(&old, &resource).await?;
-                Probe::acknowledge_removed(&self.pool, old.intent, Some(&resource)).await?;
-            }
-        }
-        let config = version
-            .map(|v| &v.execution_config)
-            .unwrap_or(&runtime.execution_config);
-        if let Some(version) = version {
-            attune_common::runtime_lifecycle::validate_version_mode(
-                &runtime.execution_config,
-                &version.execution_config,
-            )
-            .map_err(|_| denied())?;
-        }
-        let recipe = config
-            .get("lifecycle")
-            .cloned()
-            .map(serde_json::from_value::<attune_common::runtime_lifecycle::RuntimeRecipe>)
-            .transpose()
-            .map_err(|_| denied())?;
-        if let Some(recipe) = &recipe {
-            let digest = recipe.digest().map_err(|_| denied())?;
-            if !admitted.contains(&digest)
-                || !self.child_environment.admits_native_runtime_recipe(&digest)
-            {
-                return Err(denied());
-            }
-        }
-        let definition = attune_common::runtime_detection::NativeRuntimeVerification {
-            registered_version: version.is_some(),
-            execution_config: config.clone(),
-            distributions: version
-                .map(|v| &v.distributions)
-                .unwrap_or(&runtime.distributions)
-                .clone(),
-        };
         let pack = attune_common::repositories::pack::PackRepository::find_by_id(
             &self.pool,
             runtime.pack.ok_or_else(denied)?,
@@ -282,130 +210,23 @@ impl ActionExecutor {
         )
         .await?
         .ok_or_else(denied)?;
-        let source = RuntimeProbeSource {
-            worker: self.worker_id.load(Ordering::Acquire),
-            incarnation: *self.process_incarnation.get().ok_or_else(denied)?,
-            runtime: runtime.id,
-            runtime_version: version.map(|v| v.id),
-            runtime_version_string: version.map(|v| v.version.clone()),
-            provider_pack: pack.id,
-            release: release.id,
-            release_digest: release.digest.clone(),
-            runtime_config: runtime.execution_config.clone(),
-            version_config: version.map(|v| v.execution_config.clone()),
-            runtime_distributions: runtime.distributions.clone(),
-            version_distributions: version.map(|v| v.distributions.clone()),
+        let pin = self.prepare_native_pack(release).await?;
+        let configured = attune_workload_backend::configuration::ConfiguredBackend {
+            backend: backend.clone(),
+            cache: native.cache.clone(),
+            runner: native.runner.clone(),
         };
-        let pack_pin = self.prepare_native_pack(release).await?;
-        // A mutable runtime row cannot borrow an unrelated active release. Read
-        // metadata only from the verified retained ZIP, never an unpacked tree.
-        let archive = native
-            .cache
-            .open_input_archive(&pack_pin)
-            .map_err(|_| denied())?;
-        crate::runtime::launch_planning::validate_runtime_release_metadata(
-            archive,
-            &runtime.r#ref,
-            &runtime.execution_config,
-            version.map(|v| (v.version.as_str(), &v.execution_config)),
-            Some((&runtime.distributions, version.map(|v| &v.distributions))),
-        )
-        .map_err(|_| denied())?;
-        let attempt = uuid::Uuid::new_v4();
-        let spec = ProcessSpec {
-            intent: uuid::Uuid::new_v4(),
-            purpose: LaunchPurpose::RuntimeProbe,
-            // The repository replaces this with its genuine retained admission.
-            target: LaunchTarget::RuntimeProbe {
-                admission: runtime.id,
-                attempt,
-            },
-            image: native.config.image.clone(),
-            platform: native.config.platform,
-            inputs: vec![pack_pin, native.runner.clone()],
-            pack_access: PackAccess::ReadOnly,
-            stage: None,
-            timeout_ms: Some(120000),
-            invocation: LaunchInvocation {
-                argv: match &recipe {
-                    Some(recipe) => crate::runtime::launch_planning::runtime_tool_probe_argv(
-                        native.config.platform,
-                        recipe,
-                        "/usr/local/bin:/usr/bin:/bin",
-                    ),
-                    None => crate::runtime::launch_planning::runtime_verification_argv(
-                        native.config.platform,
-                        &definition,
-                        "/usr/local/bin:/usr/bin:/bin",
-                    ),
-                }
-                .map_err(|_| denied())?,
-                env: Default::default(),
-                working_root: LaunchRoot::Pack,
-            },
-        };
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
-        let spec = Probe::reserve(&self.pool, attempt, source, spec, master).await?;
-        let launcher = backend.launcher();
-        let disposition = Probe::begin_create(&self.pool, spec.intent, master).await?;
-        let resource = tokio::time::timeout_at(deadline, launcher.prepare(&spec, disposition))
-            .await
-            .map_err(|_| denied())??;
-        Probe::record_resource(&self.pool, spec.intent, &resource).await?;
-        let mut process = tokio::time::timeout_at(deadline, launcher.start(&spec, &resource))
-            .await
-            .map_err(|_| denied())??;
-        if process.resource != resource {
-            return Err(denied());
-        }
-        process.control = Arc::new(RecordingProcessControl {
-            inner: process.control,
-            pool: self.pool.clone(),
-            intent: spec.intent,
-            resource: resource.clone(),
-        });
-        let stdin = Probe::consume_stdin(&self.pool, spec.intent, &resource, master).await?;
-        let cancel = CancellationToken::new();
-        let future = crate::runtime::process_executor::execute_isolated_cancellable(
-            process,
-            stdin,
-            crate::runtime::process_executor::IsolatedCaptureOptions {
-                timeout_secs: Some(120),
-                max_stdout_bytes: crate::runtime::launch_planning::RUNTIME_TOOL_RESULT_BYTES,
-                max_stderr_bytes: 16384,
-                output_format: attune_common::models::OutputFormat::Text,
-                output_policy: Default::default(),
-                out_schema: None,
-                cancel_token: Some(cancel.clone()),
-                stdout_log_writer: None,
-                stderr_log_writer: None,
-            },
-        );
-        tokio::pin!(future);
-        let mut check = tokio::time::interval(std::time::Duration::from_secs(1));
-        let result = loop {
-            tokio::select! {
-                result=&mut future=>break result.map_err(|_|denied())?,
-            _=tokio::time::sleep_until(deadline)=>{cancel.cancel();let _=(&mut future).await;return Err(denied());},
-                _=check.tick()=>if Probe::validate_source(&self.pool,spec.intent,master).await.is_err(){cancel.cancel();let _=(&mut future).await;return Err(denied());}
-            }
-        };
-        if result.exit_code != 0
-            || result.error.is_some()
-            || result.logs_incomplete
-            || result.timed_out
-            || result.stdout_truncated
-            || result.stderr_truncated
-        {
-            return Err(denied());
-        }
-        let tools = serde_json::from_str(&result.stdout).map_err(|_| denied())?;
-        Probe::complete(&self.pool, spec.intent, &resource, &tools, master).await?;
-        // Positive exact removal follows captured receipt, never inferred 404.
-        Probe::request_stop(&self.pool, spec.intent).await?;
-        backend.remove_stopped(&spec, &resource).await?;
-        Probe::acknowledge_removed(&self.pool, spec.intent, Some(&resource)).await?;
-        Probe::tools(&self.pool, spec.intent, master).await
+        crate::native_runtime_probe::NativeRuntimeProbeDriver::new(
+            &self.pool,
+            self.worker_id.load(Ordering::Acquire),
+            *self.process_incarnation.get().ok_or_else(denied)?,
+            &native.config,
+            &configured,
+            master,
+            &self.child_environment,
+        )?
+        .verify(runtime, version, admitted, &pin)
+        .await
     }
 
     async fn finish_native_setup_removal(
