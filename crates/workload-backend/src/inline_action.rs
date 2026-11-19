@@ -162,7 +162,7 @@ fn materialize(
     file.write_all(source.as_bytes())?;
     file.flush()?;
     file.as_file()
-        .set_permissions(std::fs::Permissions::from_mode(0o400))?;
+        .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     Ok(Some(file))
 }
 
@@ -215,7 +215,7 @@ mod tests {
         assert_eq!(file.path().extension().unwrap(), "sh");
         assert_eq!(
             file.as_file().metadata().unwrap().permissions().mode() & 0o777,
-            0o400
+            0o600
         );
         let source = std::fs::read_to_string(file.path()).unwrap();
         assert!(source.contains("name='secret'\\''$(touch marker)'"));
@@ -225,6 +225,13 @@ mod tests {
         assert!(!arguments
             .iter()
             .any(|arg| arg.contains("secret") || arg.contains("touch marker")));
+        // Legacy inline files are writable by their owning payload. This is
+        // still private scratch, never the read-only Pack or Runtime input.
+        std::fs::write(file.path(), "owned private rewrite").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(file.path()).unwrap(),
+            "owned private rewrite"
+        );
         let path = file.path().to_owned();
         drop(file);
         assert!(!path.exists());

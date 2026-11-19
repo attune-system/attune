@@ -31,34 +31,6 @@ fn bounded_native_timeout(
         .transpose()
 }
 
-#[cfg(test)]
-mod inline_deadline_tests {
-    use super::bounded_native_timeout;
-    use std::time::Duration;
-
-    #[test]
-    fn preparation_spends_existing_deadline_instead_of_resetting_it() {
-        assert_eq!(
-            bounded_native_timeout(Some(120), Some(900), Duration::from_millis(400)).unwrap(),
-            Some(500)
-        );
-        assert_eq!(
-            bounded_native_timeout(Some(2), Some(9000), Duration::from_millis(400)).unwrap(),
-            Some(1600)
-        );
-        assert_eq!(
-            bounded_native_timeout(None, Some(900), Duration::from_millis(400)).unwrap(),
-            Some(500)
-        );
-        assert!(bounded_native_timeout(Some(120), Some(400), Duration::from_millis(400)).is_err());
-        assert!(bounded_native_timeout(Some(u64::MAX), None, Duration::ZERO).is_err());
-        assert_eq!(
-            bounded_native_timeout(None, None, Duration::ZERO).unwrap(),
-            None
-        );
-    }
-}
-
 impl ActionExecutor {
     pub(super) async fn prepare_isolated_interpreted(
         &self,
@@ -520,5 +492,33 @@ impl ActionExecutor {
         )?
         .install(input, config, inputs, timeout, cancel)
         .await
+    }
+}
+
+#[cfg(test)]
+mod inline_deadline_tests {
+    use super::bounded_native_timeout;
+    use std::time::Duration;
+
+    #[test]
+    fn preparation_spends_existing_deadline_instead_of_resetting_it() {
+        assert_eq!(
+            bounded_native_timeout(Some(120), Some(900), Duration::from_millis(400)).unwrap(),
+            Some(500)
+        );
+        assert_eq!(
+            bounded_native_timeout(Some(2), Some(9000), Duration::from_millis(400)).unwrap(),
+            Some(1600)
+        );
+        assert_eq!(
+            bounded_native_timeout(None, Some(900), Duration::from_millis(400)).unwrap(),
+            Some(500)
+        );
+        assert!(bounded_native_timeout(Some(120), Some(400), Duration::from_millis(400)).is_err());
+        assert!(bounded_native_timeout(Some(u64::MAX), None, Duration::ZERO).is_err());
+        assert_eq!(
+            bounded_native_timeout(None, None, Duration::ZERO).unwrap(),
+            None
+        );
     }
 }
