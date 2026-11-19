@@ -3200,15 +3200,20 @@ async fn native_sensor_effect_fences_stale_generation_replay_and_restart() {
 
 #[tokio::test]
 async fn native_sensor_files_are_generation_bound_and_replacement_cannot_publish_or_clear() {
-    native_sensor_file_case(false).await;
+    native_sensor_file_case(false, false).await;
 }
 
 #[tokio::test]
 async fn native_sensor_file_publication_rechecks_original_deadline_after_target_wait() {
-    native_sensor_file_case(true).await;
+    native_sensor_file_case(true, false).await;
 }
 
-async fn native_sensor_file_case(deadline_wait: bool) {
+#[tokio::test]
+async fn native_sensor_physical_stop_is_not_blocked_by_durable_assignment_lock() {
+    native_sensor_file_case(false, true).await;
+}
+
+async fn native_sensor_file_case(deadline_wait: bool, stop_wait: bool) {
     use attune_common::{
         isolated_process::ResourceIdentity,
         models::enums::{
@@ -3326,6 +3331,75 @@ async fn native_sensor_file_case(deadline_wait: bool) {
         .await
         .unwrap();
     tx.commit().await.unwrap();
+    if stop_wait {
+        let mut barrier = pool.begin().await.unwrap();
+        let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *barrier)
+            .await
+            .unwrap();
+        sqlx::query("SELECT workload FROM sensor_workload_assignment WHERE workload=$1 FOR UPDATE")
+            .bind(workload.workload_id)
+            .execute(&mut *barrier)
+            .await
+            .unwrap();
+        let stopped = std::sync::Arc::new(tokio::sync::Notify::new());
+        let signal = stopped.clone();
+        let task_pool = pool.clone();
+        let mut task = tokio::spawn(async move {
+            let exit =
+                attune_common::repositories::sensor_workload::native_effect::join_sensor_stop(
+                    SensorWorkloadRepository::stop_native_effect(
+                        &task_pool,
+                        workload.workload_id,
+                        intent,
+                    ),
+                    async move {
+                        signal.notify_one();
+                        Ok(LaunchExitOutcome {
+                            exit_code: 137,
+                            oom_killed: false,
+                        })
+                    },
+                )
+                .await?;
+            SensorWorkloadRepository::record_native_exit(
+                &task_pool,
+                workload.workload_id,
+                intent,
+                &resource,
+                exit,
+            )
+            .await?;
+            Ok::<_, attune_common::Error>(())
+        });
+        let observed=async {
+            tokio::time::timeout(std::time::Duration::from_secs(5),stopped.notified()).await?;
+            tokio::time::timeout(std::time::Duration::from_secs(5),async {
+                loop {
+                    let waiting:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))")
+                        .bind(blocker).fetch_one(&*pool).await?;
+                    if waiting {return Ok::<_,sqlx::Error>(());}
+                    tokio::task::yield_now().await;
+                }
+            }).await??;
+            anyhow::ensure!(!task.is_finished(),"physical stop alone cannot acknowledge durable settlement");
+            Ok::<_,anyhow::Error>(())
+        }.await;
+        barrier.rollback().await.unwrap();
+        if observed.is_err() {
+            task.abort();
+        }
+        let joined = (&mut task).await;
+        let retained = SensorWorkloadRepository::native_effect(&pool, workload.workload_id)
+            .await
+            .unwrap()
+            .unwrap();
+        pool.cleanup().await.unwrap();
+        observed.unwrap();
+        joined.unwrap().unwrap();
+        assert!(retained.stop_requested && retained.exit.is_some());
+        return;
+    }
     if deadline_wait {
         // Shorten the existing run lease BEFORE stop captures it; never mint
         // publication authority after release or move a retained deadline.

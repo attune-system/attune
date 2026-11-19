@@ -284,3 +284,17 @@ impl SensorWorkloadRepository {
         Ok(())
     }
 }
+
+/// Join the two owned facts for an already-known exact sensor resource. The
+/// trusted loop selects the concrete Stop future; this helper grants no Run,
+/// Start or provider-selection authority. Neither error cancels the other
+/// owner, and no settlement is acknowledged until both futures have joined.
+pub async fn join_sensor_stop(
+    fence: impl std::future::Future<Output = Result<()>>,
+    physical: impl std::future::Future<Output = Result<LaunchExitOutcome>>,
+) -> Result<LaunchExitOutcome> {
+    let (fenced, stopped) = tokio::join!(fence, physical);
+    let exit = stopped?;
+    fenced?;
+    Ok(exit)
+}

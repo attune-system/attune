@@ -83,9 +83,13 @@ impl NativeSensor {
         .await
     }
     pub(super) async fn stop(&mut self) -> Result<()> {
-        // Run is durably fenced before the provider call, including after revoke.
-        Ledger::stop_native_effect(&self.pool, self.workload, self.spec.intent).await?;
-        let exit = self.control.stop(LaunchStopReason::Cancelled).await?;
+        // A DB wait must not keep the known exact payload alive. Both owned
+        // futures join before terminal evidence or publication can proceed.
+        let exit = attune_common::repositories::sensor_workload::native_effect::join_sensor_stop(
+            Ledger::stop_native_effect(&self.pool, self.workload, self.spec.intent),
+            self.control.stop(LaunchStopReason::Cancelled),
+        )
+        .await?;
         Ledger::record_native_exit(
             &self.pool,
             self.workload,
@@ -128,15 +132,23 @@ impl SensorManager {
         {
             return Err(anyhow!("Retained sensor context binding invalid"));
         }
-        Ledger::stop_native_effect(&self.inner.db, workload, spec.intent).await?;
-        if !effect.create_submitted {
-            return Err(anyhow!(
-                "Sensor intent retained before create; capture/publication settlement required"
-            ));
-        }
-        let resource = match effect.resource {
-            Some(resource) => resource,
+        let (resource, exit) = match effect.resource {
+            Some(resource) => {
+                let exit =
+                    attune_common::repositories::sensor_workload::native_effect::join_sensor_stop(
+                        Ledger::stop_native_effect(&self.inner.db, workload, spec.intent),
+                        native
+                            .backend
+                            .stop_retained(&spec, &resource, LaunchStopReason::Shutdown),
+                    )
+                    .await?;
+                (resource, exit)
+            }
             None => {
+                Ledger::stop_native_effect(&self.inner.db, workload, spec.intent).await?;
+                if !effect.create_submitted {
+                    return Err(anyhow!("Sensor intent retained before create; capture/publication settlement required"));
+                }
                 let resource = native
                     .backend
                     .launcher()
@@ -144,13 +156,13 @@ impl SensorManager {
                     .await?;
                 Ledger::record_native_resource(&self.inner.db, workload, spec.intent, &resource)
                     .await?;
-                resource
+                let exit = native
+                    .backend
+                    .stop_retained(&spec, &resource, LaunchStopReason::Shutdown)
+                    .await?;
+                (resource, exit)
             }
         };
-        let exit = native
-            .backend
-            .stop_retained(&spec, &resource, LaunchStopReason::Shutdown)
-            .await?;
         Ledger::record_native_exit(&self.inner.db, workload, spec.intent, &resource, exit).await?;
         settle_files(
             &self.inner.db,
@@ -852,6 +864,40 @@ mod file_receipt_tests {
             assert_eq!(result.is_ok(), success);
             server.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn failed_durable_fence_still_joins_owned_physical_stop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let terminal = Arc::new(AtomicBool::new(false));
+        let (signal, finish, stopped) = (started.clone(), release.clone(), terminal.clone());
+        let task = tokio::spawn(async move {
+            attune_common::repositories::sensor_workload::native_effect::join_sensor_stop(
+                async { Err(Error::PermissionDenied("owned fence unavailable".into())) },
+                async move {
+                    signal.notify_one();
+                    finish.notified().await;
+                    stopped.store(true, Ordering::Release);
+                    Ok(LaunchExitOutcome {
+                        exit_code: 137,
+                        oom_killed: false,
+                    })
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        assert!(
+            !task.is_finished(),
+            "failed fencing must not cancel physical ownership"
+        );
+        release.notify_one();
+        assert!(task.await.unwrap().is_err());
+        assert!(terminal.load(Ordering::Acquire));
     }
 
     #[test]
