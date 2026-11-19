@@ -242,6 +242,78 @@ impl KubernetesLauncher {
         }
         Ok(pod)
     }
+    async fn wait_retained(
+        &self,
+        spec: &ProcessSpec,
+        resource: &ResourceIdentity,
+    ) -> Result<LaunchExitOutcome> {
+        loop {
+            let pod = self.cleanup_exact(spec, resource).await?;
+            if let Some(outcome) = payload_outcome(&pod) {
+                return Ok(outcome);
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    /// Stop only the retained payload namespace. The helper and staging stay
+    /// alive until the owning loop authorizes final removal. Current image
+    /// admission/private invocation are deliberately not cleanup prerequisites.
+    pub async fn stop_retained(
+        &self,
+        spec: &ProcessSpec,
+        resource: &ResourceIdentity,
+        _: LaunchStopReason,
+    ) -> Result<LaunchExitOutcome> {
+        let pod = tokio::time::timeout(Duration::from_secs(15), self.cleanup_exact(spec, resource))
+            .await
+            .map_err(|_| invalid())??;
+        if let Some(outcome) = payload_outcome(&pod) {
+            return Ok(outcome);
+        }
+        // The fixed helper kills only the payload PID namespace. Namespace
+        // teardown may close exec before its reply; only the subsequent exact
+        // payload terminated observation proves stop, never this exec response.
+        let signal = async {
+            let mut process = self
+                .pods()
+                .exec(
+                    &pod_name(spec),
+                    [BOOTSTRAP_RUNNER, "terminate"],
+                    &AttachParams {
+                        container: Some(PAYLOAD_CONTAINER.into()),
+                        // kube requires at least one stream. The fixed helper
+                        // receives no stdin and its bounded output is discarded.
+                        stdout: true,
+                        stderr: false,
+                        tty: false,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|_| invalid())?;
+            let stdout = process.stdout().ok_or_else(invalid)?;
+            let status = process.take_status().ok_or_else(invalid)?;
+            let drain = async {
+                let mut ignored = Vec::new();
+                stdout
+                    .take(1025)
+                    .read_to_end(&mut ignored)
+                    .await
+                    .map_err(|_| invalid())?;
+                if ignored.len() > 1024 {
+                    return Err(invalid());
+                }
+                Ok(())
+            };
+            let (drained, _) = tokio::join!(drain, status);
+            drained?;
+            process.join().await.map_err(|_| invalid())
+        };
+        let _signal_result = tokio::time::timeout(Duration::from_secs(5), signal).await;
+        tokio::time::timeout(Duration::from_secs(15), self.wait_retained(spec, resource))
+            .await
+            .map_err(|_| invalid())?
+    }
     /// Read one owning-loop-selected artifact after exact payload termination.
     /// Missing selected files are distinct from invalid/lost staging and provider
     /// failures. This effect never acknowledges publication or removes the Pod.
@@ -536,6 +608,23 @@ impl KubernetesLauncher {
         Ok(())
     }
 }
+fn payload_outcome(pod: &Pod) -> Option<LaunchExitOutcome> {
+    let terminal = pod
+        .status
+        .as_ref()?
+        .container_statuses
+        .as_ref()?
+        .iter()
+        .find(|status| status.name == PAYLOAD_CONTAINER)?
+        .state
+        .as_ref()?
+        .terminated
+        .as_ref()?;
+    Some(LaunchExitOutcome {
+        exit_code: terminal.exit_code,
+        oom_killed: terminal.reason.as_deref() == Some("OOMKilled"),
+    })
+}
 fn require_stopped_payload(pod: &Pod) -> Result<()> {
     pod.status
         .as_ref()
@@ -652,61 +741,15 @@ impl ProcessControl for PodControl {
         writer.shutdown().await.map_err(|_| invalid())
     }
     async fn wait(&self) -> Result<LaunchExitOutcome> {
-        loop {
-            let pod = self
-                .launcher
-                .cleanup_exact(&self.spec, &self.resource)
-                .await?;
-            if let Some(terminal) = pod
-                .status
-                .and_then(|s| s.container_statuses)
-                .unwrap_or_default()
-                .into_iter()
-                .find(|s| s.name == PAYLOAD_CONTAINER)
-                .and_then(|s| s.state)
-                .and_then(|s| s.terminated)
-            {
-                return Ok(LaunchExitOutcome {
-                    exit_code: terminal.exit_code,
-                    oom_killed: terminal.reason.as_deref() == Some("OOMKilled"),
-                });
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    }
-    async fn stop(&self, _: LaunchStopReason) -> Result<LaunchExitOutcome> {
         self.launcher
-            .cleanup_exact(&self.spec, &self.resource)
-            .await?;
-        self.stdin.lock().await.take();
-        // The fixed helper kills only the payload PID namespace. Namespace
-        // teardown may close exec before its reply; only the subsequent exact
-        // payload terminated observation proves stop, never this exec response.
-        let signal = async {
-            let mut process = self
-                .launcher
-                .pods()
-                .exec(
-                    &pod_name(&self.spec),
-                    [BOOTSTRAP_RUNNER, "terminate"],
-                    &AttachParams {
-                        container: Some(PAYLOAD_CONTAINER.into()),
-                        stdout: false,
-                        stderr: false,
-                        tty: false,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .map_err(|_| invalid())?;
-            let status = process.take_status().ok_or_else(invalid)?;
-            let _ = status.await;
-            process.join().await.map_err(|_| invalid())
-        };
-        let _signal_result = tokio::time::timeout(Duration::from_secs(5), signal).await;
-        tokio::time::timeout(Duration::from_secs(15), self.wait())
+            .wait_retained(&self.spec, &self.resource)
             .await
-            .map_err(|_| invalid())?
+    }
+    async fn stop(&self, reason: LaunchStopReason) -> Result<LaunchExitOutcome> {
+        self.stdin.lock().await.take();
+        self.launcher
+            .stop_retained(&self.spec, &self.resource, reason)
+            .await
     }
 }
 fn verify_pod_policy(
@@ -858,6 +901,116 @@ mod tests {
             },
         };
         (policy, spec)
+    }
+    #[tokio::test]
+    async fn retained_stop_uses_original_uid_and_exit_not_current_admission_or_exec_ack() {
+        for scenario in 0..5 {
+            let (mut policy, mut spec) = fixture();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = Client::try_from(kube::Config::new(
+                format!("http://{}", listener.local_addr().unwrap())
+                    .parse()
+                    .unwrap(),
+            ))
+            .unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let cache = CacheStore::open(
+                root.path().join("cache"),
+                crate::cache::CacheLimits {
+                    compressed_bytes: 1024,
+                    expanded_bytes: 4096,
+                    files: 32,
+                },
+            )
+            .unwrap()
+            .for_current_test_user();
+            let name = pod_name(&spec);
+            let uid = uuid::Uuid::new_v4().to_string();
+            let resource = ResourceIdentity::Kubernetes {
+                cluster: policy.cluster.clone(),
+                namespace: policy.namespace.clone(),
+                pod_name: name.clone(),
+                pod_uid: uid.clone(),
+            };
+            let proof = public_digest(&spec).unwrap();
+            let pod = |running: bool| {
+                serde_json::json!({"apiVersion":"v1","kind":"Pod",
+                "metadata":{"name":name,"namespace":policy.namespace,
+                    "uid":if scenario==2 {"foreign-uid"} else {uid.as_str()},
+                    "labels":{OWNER:spec.intent.to_string()},
+                    "annotations":{PROOF:if scenario==3 {"wrong-proof"} else {proof.as_str()}}},
+                "status":{"containerStatuses":[{"name":PAYLOAD_CONTAINER,"image":"owned",
+                    "imageID":"owned","ready":false,"restartCount":0,
+                    "state":if running {json!({"running":{}})} else {
+                        json!({"terminated":{"exitCode":137,"reason":if scenario==0 {"OOMKilled"} else {"Error"}}})
+                    }}]}})
+                .to_string()
+            };
+            let running = matches!(scenario, 1 | 4);
+            let initial = pod(running);
+            let terminal = pod(false);
+            let path = format!("/api/v1/namespaces/{}/pods/{name}", policy.namespace);
+            let mut script = vec![(false, "200 OK", initial)];
+            if running {
+                // An exec response is not exit evidence. Namespace teardown can
+                // close the transport; only a fresh exact-UID terminal GET wins.
+                script.push((true,"403 Forbidden",r#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","code":403}"#.into()));
+                script.push((false,if scenario==4 {"404 Not Found"} else {"200 OK"},
+                    if scenario==4 {r#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}"#.into()} else {terminal}));
+            }
+            policy.allowed_images.clear();
+            policy.helper_image.reference =
+                format!("changed.invalid/helper@sha256:{}", "c".repeat(64));
+            policy.helper_image.sha256 = Sha256Digest::parse("c".repeat(64)).unwrap();
+            spec.invocation.argv.clear();
+            spec.invocation.env.clear();
+            let launcher = KubernetesLauncher::new(client, policy, Arc::new(cache));
+            let server = tokio::spawn(async move {
+                for (exec, status, body) in script {
+                    let (mut stream, _) =
+                        tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    let mut request = Vec::new();
+                    let mut buffer = [0; 1024];
+                    while !request.windows(4).any(|v| v == b"\r\n\r\n") {
+                        let count = stream.read(&mut buffer).await.unwrap();
+                        assert!(count > 0);
+                        request.extend_from_slice(&buffer[..count]);
+                        assert!(request.len() < 8192);
+                    }
+                    let request = String::from_utf8(request).unwrap();
+                    let first = request.lines().next().unwrap();
+                    if exec {
+                        assert!(first.starts_with(&format!("GET {path}/exec?")));
+                        assert!(first.contains("container=payload"));
+                        assert!(first.contains("command=terminate"));
+                        assert!(first.contains("stdout=true"));
+                        assert!(!first.contains("stdin=true"));
+                    } else {
+                        assert_eq!(first, format!("GET {path} HTTP/1.1"));
+                    }
+                    stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                }
+                listener
+            });
+            let outcome = launcher
+                .stop_retained(&spec, &resource, LaunchStopReason::Cancelled)
+                .await;
+            let listener = server.await.unwrap();
+            assert_eq!(outcome.is_ok(), scenario < 2);
+            if let Ok(exit) = outcome {
+                assert_eq!(exit.exit_code, 137);
+                assert_eq!(exit.oom_killed, scenario == 0);
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), listener.accept())
+                    .await
+                    .is_err(),
+                "stop must not attach/start/delete a resource or operate its transfer helper"
+            );
+        }
     }
     #[test]
     fn ordinary_pod_contains_no_private_invocation_or_platform_authority() {

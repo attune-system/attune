@@ -788,7 +788,81 @@ async fn reconcile_missing_intent_never_creates_and_changed_uid_never_starts() -
     }
     let rejected = f.launcher.start(&spec, &changed).await.is_err();
     let rejected_cleanup = f.launcher.remove_stopped(&spec, &changed).await.is_err();
-    f.cleanup(&resource).await?;
+    let recovery = async {
+        // A recovered manager has no ProcessIo/ProcessControl. Wait only for
+        // the fixed gate to be running; never attach, seed or open its stdin.
+        let pods: Api<Pod> = Api::namespaced(f.client.clone(), &f.policy.namespace);
+        let ResourceIdentity::Kubernetes {
+            pod_name, pod_uid, ..
+        } = &resource
+        else {
+            return Err("expected exact owned Pod".into());
+        };
+        tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                let pod = pods.get(pod_name).await?;
+                if pod.metadata.uid.as_ref() != Some(pod_uid) {
+                    return Err::<(), Box<dyn std::error::Error + Send + Sync>>(
+                        "recovered Pod UID changed".into(),
+                    );
+                }
+                if pod
+                    .status
+                    .and_then(|status| status.container_statuses)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|status| {
+                        status.name == "payload"
+                            && status
+                                .state
+                                .as_ref()
+                                .is_some_and(|state| state.running.is_some())
+                    })
+                {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await??;
+        let mut public_spec = spec.clone();
+        public_spec.invocation.argv.clear();
+        public_spec.invocation.env.clear();
+        assert!(revoked
+            .stop_retained(&public_spec, &changed, LaunchStopReason::Cancelled)
+            .await
+            .is_err());
+        let outcome = revoked
+            .stop_retained(&public_spec, &resource, LaunchStopReason::Cancelled)
+            .await?;
+        if outcome.exit_code == 0 || outcome.oom_killed {
+            return Err("unopened retained gate must stop without running the action".into());
+        }
+        let pod = pods.get(pod_name).await?;
+        if pod.metadata.uid.as_ref() != Some(pod_uid)
+            || !pod
+                .status
+                .and_then(|status| status.container_statuses)
+                .unwrap_or_default()
+                .iter()
+                .any(|status| {
+                    status.name == "transfer"
+                        && status
+                            .state
+                            .as_ref()
+                            .is_some_and(|state| state.running.is_some())
+                })
+        {
+            return Err("retained stop removed the transfer helper/private staging".into());
+        }
+        revoked.remove_stopped(&public_spec, &resource).await?;
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    }
+    .await;
+    if recovery.is_err() {
+        f.cleanup(&resource).await?;
+    }
+    recovery?;
     assert!(rejected);
     assert!(rejected_cleanup);
     assert!(denied_run);

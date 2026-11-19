@@ -27,6 +27,8 @@ pub enum PlanningError {
     Path,
     #[error("runtime configuration requires an admitted setup/publication or is unsupported")]
     Configuration,
+    #[error("runtime lifecycle recipes require an isolated private-generation execution path")]
+    Lifecycle,
     #[error("forbidden authority or control variable in workload environment")]
     Environment,
     #[error("private setup plan exceeds bounds")]
@@ -161,10 +163,11 @@ pub fn validate_cli_exec(
     Ok(())
 }
 pub fn needs_runtime(config: &RuntimeExecutionConfig) -> bool {
-    config
-        .environment
-        .as_ref()
-        .is_some_and(|environment| environment.env_type != "none")
+    config.lifecycle.is_some()
+        || config
+            .environment
+            .as_ref()
+            .is_some_and(|environment| environment.env_type != "none")
         || config.dependencies.is_some()
 }
 /// `selected` has already passed CP origin/authority admission; no ambient
@@ -175,6 +178,7 @@ pub fn setup_plan(
     selected: &BTreeMap<String, String>,
     hooks: &[Vec<String>],
 ) -> Result<SetupPlan> {
+    require_legacy_configuration(config)?;
     let vars = variables(config, None, true, PackAccess::ReadOnly)?;
     let mut environment = runtime_environment(config, selected, &vars)?;
     for (key, value) in [
@@ -233,6 +237,7 @@ pub fn interpreted_argv(
     has_runtime: bool,
     pack_access: PackAccess,
 ) -> Result<Vec<String>> {
+    require_legacy_configuration(config)?;
     if config.interpreter.binary.is_empty() || (needs_runtime(config) && !has_runtime) {
         return Err(PlanningError::Configuration);
     }
@@ -260,6 +265,7 @@ pub fn action_environment(
     has_runtime: bool,
     pack_access: PackAccess,
 ) -> Result<BTreeMap<String, String>> {
+    require_legacy_configuration(config)?;
     if needs_runtime(config) && !has_runtime {
         return Err(PlanningError::Configuration);
     }
@@ -292,6 +298,15 @@ pub fn action_environment(
     output.extend(selected.clone());
     validate_environment(&output, true)?;
     Ok(output)
+}
+/// Recipe discovery, per-step cwd/deadline and retained launch targets cannot be
+/// represented by the legacy environment/dependency plan. Never ignore recipe
+/// metadata even when an interpreter or an existing runtime is also present.
+fn require_legacy_configuration(config: &RuntimeExecutionConfig) -> Result<()> {
+    if config.lifecycle.is_some() {
+        return Err(PlanningError::Lifecycle);
+    }
+    Ok(())
 }
 fn variables(
     config: &RuntimeExecutionConfig,
@@ -462,6 +477,47 @@ fn render(template: &str, vars: &BTreeMap<&str, String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lifecycle_recipes_never_fall_through_legacy_planning() {
+        let recipe: attune_common::runtime_lifecycle::RuntimeRecipe =
+            serde_json::from_value(serde_json::json!({
+            "tools":[{
+                "name":"fixture", "binaries":["fixture"],
+                "version_pattern":"(?<version>1)", "primary":true
+            }],
+            "prepare":[{"command":["{tool_fixture}","build"],"cwd":"{workspace_dir}"}],
+            "launch":{"command":["{tool_fixture}","{source_file}"]}
+            }))
+            .unwrap();
+        // Both recipe-only configurations and recipes with legacy fields must
+        // retain their distinct preparation/launch semantics.
+        for mut config in [RuntimeExecutionConfig::default(), python()] {
+            config.lifecycle = Some(recipe.clone());
+            assert!(needs_runtime(&config));
+            assert!(matches!(
+                setup_plan(&config, &BTreeMap::new(), &[]),
+                Err(PlanningError::Lifecycle)
+            ));
+            for access in [PackAccess::ReadOnly, PackAccess::CandidateCopy] {
+                for has_runtime in [false, true] {
+                    assert!(matches!(
+                        interpreted_argv(&config, "actions/tool", has_runtime, access),
+                        Err(PlanningError::Lifecycle)
+                    ));
+                    assert!(matches!(
+                        action_environment(
+                            &config,
+                            &BTreeMap::new(),
+                            "actions/tool",
+                            has_runtime,
+                            access
+                        ),
+                        Err(PlanningError::Lifecycle)
+                    ));
+                }
+            }
+        }
+    }
     #[test]
     fn selected_image_native_command_path_never_changes_project_path_rules() {
         let mut native: RuntimeExecutionConfig =

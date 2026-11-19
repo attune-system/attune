@@ -9,7 +9,9 @@ use crate::{
 use attune_common::{
     isolated_process::{ProcessLauncher, ProcessSpec, ResourceIdentity},
     workload_config::{WorkloadBackendConfig, WorkloadConfig},
-    workload_launch::{LaunchInputKind, LaunchPlatform, PinnedLaunchInput},
+    workload_launch::{
+        LaunchExitOutcome, LaunchInputKind, LaunchPlatform, LaunchStopReason, PinnedLaunchInput,
+    },
     Error, Result,
 };
 use std::{
@@ -32,6 +34,21 @@ impl NativeBackend {
         match self {
             Self::Kubernetes(v) => v.clone(),
             Self::Docker(v) => v.clone(),
+        }
+    }
+    /// Stop an exactly retained resource after the caller durably closes Run.
+    /// Recovery needs no surviving attach/control object or private invocation.
+    /// The returned exit is a provider fact, not publication/cleanup authority;
+    /// helper and private staging remain for the owning receipt policy.
+    pub async fn stop_retained(
+        &self,
+        spec: &ProcessSpec,
+        resource: &ResourceIdentity,
+        reason: LaunchStopReason,
+    ) -> Result<LaunchExitOutcome> {
+        match self {
+            Self::Kubernetes(v) => v.stop_retained(spec, resource, reason).await,
+            Self::Docker(v) => v.stop_retained(spec, resource, reason).await,
         }
     }
     pub async fn remove_stopped(

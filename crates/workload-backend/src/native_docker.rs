@@ -420,6 +420,43 @@ impl DockerLauncher {
         .map_err(|_| common_error(EngineError::Transport))?
         .map_err(|_| common_error(EngineError::OwnershipMismatch))
     }
+    /// Stop using the original public ownership evidence, including after
+    /// restart or image-admission changes. No attach/start or private invocation
+    /// is needed. Stop/Wait uncertainty retains the resource and private bytes.
+    pub async fn stop_retained(
+        &self,
+        spec: &ProcessSpec,
+        resource: &ResourceIdentity,
+        _: LaunchStopReason,
+    ) -> attune_common::Result<LaunchExitOutcome> {
+        if let Some(record) = self.cached_removal(spec, resource).await? {
+            return Ok(record.outcome);
+        }
+        let (id, _) = self
+            .cleanup_exact(spec, resource)
+            .await
+            .map_err(common_error)?;
+        let response = self
+            .engine
+            .control
+            .post(DockerEngine::url(&["containers", &id, "stop"]))
+            .query(&[("t", "5")])
+            .send()
+            .await
+            .map_err(|_| common_error(EngineError::Transport))?;
+        if !matches!(
+            response.status(),
+            StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
+        ) {
+            return Err(common_error(EngineError::Rejected(
+                response.status().as_u16(),
+            )));
+        }
+        tokio::time::timeout(Duration::from_secs(20), self.wait_id(&id))
+            .await
+            .map_err(|_| common_error(EngineError::Transport))?
+            .map_err(common_error)
+    }
     /// Final cleanup, called only after the owning loop's terminal/custody and
     /// file/runtime receipts. Byte-read paths use seal_removed directly and
     /// retain staging; this path reclaims bytes but keeps exact removal evidence.
@@ -741,41 +778,11 @@ impl ProcessControl for DockerControl {
             .map_err(common_error)?;
         self.launcher.wait_id(&id).await.map_err(common_error)
     }
-    async fn stop(&self, _: LaunchStopReason) -> attune_common::Result<LaunchExitOutcome> {
+    async fn stop(&self, reason: LaunchStopReason) -> attune_common::Result<LaunchExitOutcome> {
         self.writer.lock().await.take();
-        if let Ok(Some(record)) = self
-            .launcher
-            .cached_removal(&self.spec, &self.resource)
+        self.launcher
+            .stop_retained(&self.spec, &self.resource, reason)
             .await
-        {
-            return Ok(record.outcome);
-        }
-        let (id, _) = self
-            .launcher
-            .cleanup_exact(&self.spec, &self.resource)
-            .await
-            .map_err(common_error)?;
-        let response = self
-            .launcher
-            .engine
-            .control
-            .post(DockerEngine::url(&["containers", &id, "stop"]))
-            .query(&[("t", "5")])
-            .send()
-            .await
-            .map_err(|_| common_error(EngineError::Transport))?;
-        if !matches!(
-            response.status(),
-            StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
-        ) {
-            return Err(common_error(EngineError::Rejected(
-                response.status().as_u16(),
-            )));
-        }
-        tokio::time::timeout(Duration::from_secs(20), self.launcher.wait_id(&id))
-            .await
-            .map_err(|_| common_error(EngineError::Transport))?
-            .map_err(common_error)
     }
 }
 
@@ -956,6 +963,13 @@ mod tests {
             .await
             .expect("rejection must precede transport");
             assert!(result.is_err());
+            assert!(tokio::time::timeout(
+                Duration::from_secs(1),
+                launcher.stop_retained(&spec, &resource, LaunchStopReason::Cancelled),
+            )
+            .await
+            .expect("retained stop must reject before transport")
+            .is_err());
         }
         assert!(
             tokio::time::timeout(Duration::from_millis(10), listener.accept())
@@ -963,6 +977,128 @@ mod tests {
                 .is_err(),
             "rejected cleanup must not contact Engine"
         );
+    }
+    #[tokio::test]
+    async fn retained_stop_needs_original_ownership_but_no_run_policy_or_private_context() {
+        // Real wire requests against an owned local Engine fixture. A Stop ACK
+        // or a missing resource alone must never invent a successful exit.
+        for scenario in 0..4 {
+            let root = tempfile::tempdir().unwrap();
+            let socket = root.path().join("retained-stop.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let (mut launcher, mut spec, cache_root) = fixture(&socket);
+            launcher.cache.prepare_native_private(&spec).unwrap();
+            let stage = cache_root
+                .path()
+                .join("cache/private")
+                .join(spec.intent.simple().to_string());
+            let marker = stage.join("artifacts/retained");
+            std::fs::write(&marker, b"retained-private-bytes").unwrap();
+            let id = "c".repeat(64);
+            let resource = ResourceIdentity::Docker {
+                engine_id: 5,
+                daemon_id: "owned-daemon".into(),
+                container_id: id.clone(),
+            };
+            let digest = crate::process_policy::public_digest(&spec).unwrap();
+            let owned = serde_json::json!({"Id":if scenario == 1 {"d".repeat(64)} else {id.clone()},
+                "Name":format!("/{}",DockerLauncher::name(&spec)),"Config":{"Labels":{
+                    "attune.io/process-intent":spec.intent.to_string(),
+                    "attune.io/process-policy":digest.as_str(),"attune.io/process-engine":"owned-daemon"}},
+                "State":{"Status":"running"}}).to_string();
+            spec.invocation.argv.clear();
+            spec.invocation.env.clear();
+            launcher.policy.allowed_images.clear();
+            launcher.bootstrap.sha256 = Sha256Digest::of_bytes(b"replacement-helper");
+            let info = r#"{"ID":"owned-daemon","OSType":"linux","Architecture":"amd64","SecurityOptions":["name=seccomp,profile=builtin"]}"#.to_string();
+            let mut script = vec![
+                (
+                    "GET".to_string(),
+                    "/info".to_string(),
+                    "200 OK",
+                    info.clone(),
+                ),
+                ("GET".to_string(), "/info".to_string(), "200 OK", info),
+                (
+                    "GET".to_string(),
+                    format!("/containers/{id}/json"),
+                    "200 OK",
+                    owned,
+                ),
+            ];
+            if scenario != 1 {
+                script.push((
+                    "POST".into(),
+                    format!("/containers/{id}/stop?t=5"),
+                    if scenario == 2 {
+                        "404 Not Found"
+                    } else {
+                        "204 No Content"
+                    },
+                    String::new(),
+                ));
+                if scenario != 2 {
+                    script.push((
+                        "POST".into(),
+                        format!("/containers/{id}/wait?condition=not-running"),
+                        "200 OK",
+                        r#"{"StatusCode":137}"#.into(),
+                    ));
+                    script.push((
+                        "GET".into(),
+                        format!("/containers/{id}/json"),
+                        "200 OK",
+                        serde_json::json!({"State":{"Running":scenario == 3,"OOMKilled":false}})
+                            .to_string(),
+                    ));
+                }
+            }
+            let server = tokio::spawn(async move {
+                for (method, path, status, body) in script {
+                    let (mut stream, _) =
+                        tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    let mut bytes = Vec::new();
+                    let mut buf = [0; 1024];
+                    while !bytes.windows(4).any(|v| v == b"\r\n\r\n") {
+                        let n = stream.read(&mut buf).await.unwrap();
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&buf[..n]);
+                        assert!(bytes.len() < 8192);
+                    }
+                    let request = String::from_utf8(bytes).unwrap();
+                    assert_eq!(
+                        request.lines().next().unwrap(),
+                        format!("{method} /{API}{path} HTTP/1.1")
+                    );
+                    stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                }
+                listener
+            });
+            let outcome = launcher
+                .stop_retained(&spec, &resource, LaunchStopReason::Cancelled)
+                .await;
+            let listener = server.await.unwrap();
+            assert_eq!(outcome.is_ok(), scenario == 0);
+            if let Ok(exit) = outcome {
+                assert_eq!(exit.exit_code, 137);
+                assert!(!exit.oom_killed);
+            }
+            assert_eq!(std::fs::read(&marker).unwrap(), b"retained-private-bytes");
+            assert!(launcher
+                .cache
+                .native_removal(&spec, &resource)
+                .unwrap()
+                .is_none());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), listener.accept())
+                    .await
+                    .is_err(),
+                "stop must never create/start/attach/remove"
+            );
+        }
     }
     #[test]
     fn local_candidate_image_uses_exact_config_id_without_tag_or_registry_alias() {

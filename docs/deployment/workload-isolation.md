@@ -24,6 +24,13 @@ create. Resource identity is the exact Docker daemon/container or Kubernetes
 cluster/namespace/Pod UID. There is no caller-selected host path, mount policy,
 container selector, HTTP dispatch credential or independent scheduler.
 
+After a manager restart, the concrete `stop_retained` effect uses the original
+public spec and resource identity without requiring a surviving stream/control
+object, private invocation or current image admission. The caller must durably
+close Run first. Stop returns only an observed exit; a Stop/exec reply or 404 is
+not exit proof. It retains the transfer helper and private staging, and the
+existing receipt policy still governs `remove_stopped`.
+
 `crates/workload-backend` holds the two concrete adapters, safe ZIP/cache code
 and public `attune-workload-runner`. The former standalone controller service,
 frontend, session store and TLS proxy are retired. Their HTTP protocol is not a
@@ -78,6 +85,12 @@ workload/setup/install/probe calls fail before executable lookup or Bubblewrap
 startup. This is a migration deny guard, not proof that every caller migrated;
 raw unguarded command sinks still require inventory and removal before activation.
 Environment clearing and secret-bearing parent protection remain independent.
+
+Language-neutral `execution_config.lifecycle` recipes are also a required
+migration path. Legacy native setup/invocation planners reject them explicitly;
+they cannot ignore recipe tools, working directories or launch metadata. Native
+recipe execution must preserve attempt-private generations without shared reuse.
+The trusted local recipe profile is not an isolated-backend fallback.
 
 A fixed Runner gate starts before pack code. Separate bounded stdout/stderr
 attach streams are established first. The trusted caller commits the existing
