@@ -504,6 +504,10 @@ fi
 # The only effectful CI input phase: reuse the just-built images/Runner before
 # any manager or infrastructure starts. Unknown preparation retains recovery inputs.
 if [[ -n "$NATIVE_CI_ADMISSION" ]]; then
+  # Build does not fetch image-only infrastructure/bootstrap services. Acquire
+  # those dependencies explicitly before native up/run enforces --pull never;
+  # the once-built manager and Runner images are excluded from this pull.
+  compose pull postgres rabbitmq init-packs
   python3 "$PROJECT_ROOT/scripts/prepare-native-ci-inputs.py" \
     --root "$NATIVE_ROOT" --socket "$ATTUNE_E2E_DOCKER_SOCKET"
   NATIVE_PROFILES="$NATIVE_ROOT/profiles.json"

@@ -438,6 +438,9 @@ Guest profiles reuse the existing owning Docker fixture budgets (512 MiB memory,
 128 MiB scratch, 64/128 MiB compressed/expanded inputs, 4096 entries and 128 PIDs).
 Generated managers and the bootstrap initializer start using immutable IDs;
 mutable build tags are retained as source observations, not launch authority.
+After that build, CI explicitly pulls only the image-only `postgres`, `rabbitmq`
+and `init-packs` dependencies before startup. Subsequent native starts retain
+`--pull never`; this acquisition excludes every built manager and Runner image.
 E2E resets, all seven registrations, original tier selection and recipe admission
 are retained, with the lifecycle override last.
 

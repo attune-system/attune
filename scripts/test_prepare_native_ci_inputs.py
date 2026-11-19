@@ -255,7 +255,7 @@ class Runner(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
 
     def test_one_captured_build_then_native_inputs_before_any_start_and_failure_retention(self):
-        for fault in ('none', 'build', 'create-unknown'):
+        for fault in ('none', 'build', 'dependency-pull', 'create-unknown'):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 supplied = root / 'admission.json'
@@ -280,6 +280,13 @@ if args[0] == 'compose':
     if args[0] == 'build':
         print('#1 DONE 0.0s')
         sys.exit(8 if os.environ['FAULT'] == 'build' else 0)
+    elif args[0] == 'pull':
+        if args[1:] != ['postgres','rabbitmq','init-packs']: sys.exit(96)
+        if os.environ['FAULT'] == 'dependency-pull': sys.exit(9)
+        record.with_suffix('.acquired').write_text('image-only-dependencies')
+    elif args[0] in ('up','run'):
+        # A fresh endpoint has no implicit infrastructure image cache.
+        if not record.with_suffix('.acquired').exists(): sys.exit(95)
     elif args[:2] == ['ps','-q']: print('owned-fixture-container')
     elif args[0] == 'exec': print('1')
     elif args[0] not in ('ps','up','wait','run','down'): sys.exit(97)
@@ -344,10 +351,18 @@ os.execv(sys.executable, [sys.executable, script, *args])
                     self.assertTrue(all(c['host'] == 'unix://' + str(root / 'inert.sock') and c['context'] is None for c in cli))
                     inputs = Path(record.read_text())
                     self.assertTrue((inputs / 'admission.json').exists())
+                    pulls = [c for c in cli if 'pull' in c['args'] and '--pull' not in c['args']]
+                    self.assertEqual(len(pulls), 0 if fault == 'build' else 1)
+                    if pulls:
+                        self.assertEqual(pulls[0]['args'][-4:], ['pull','postgres','rabbitmq','init-packs'])
+                        self.assertLess(calls.index(builds[0]), calls.index(pulls[0]))
                     if fault != 'none':
                         self.assertNotEqual(result.returncode, 0)
                         if fault == 'build':
                             self.assertEqual(result.returncode, 8)
+                        if fault == 'dependency-pull':
+                            self.assertEqual(result.returncode, 9)
+                            self.assertFalse(any(c.get('phase') == 'prepare' for c in calls))
                         self.assertFalse(any('up' in c['args'] for c in cli))
                         self.assertFalse((inputs / 'profiles.json').exists())
                         self.assertIn('retained', result.stdout)
@@ -356,6 +371,7 @@ os.execv(sys.executable, [sys.executable, script, *args])
                     prepared = next(i for i,c in enumerate(calls) if c.get('phase') == 'prepare')
                     first_start = next(i for i,c in enumerate(calls) if 'up' in c.get('args', []))
                     self.assertLess(calls.index(builds[0]), prepared)
+                    self.assertLess(calls.index(pulls[0]), prepared)
                     self.assertLess(prepared, first_start)
                     startup = next(c['args'] for c in cli if 'up' in c['args'] and 'worker-toolchains' in c['args'])
                     for service in module.compose.MANAGERS:
