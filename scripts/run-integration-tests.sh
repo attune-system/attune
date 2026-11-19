@@ -70,6 +70,7 @@ DO_STARTUP=true
 DO_STANDALONE=false
 DO_RUNTIME_LIFECYCLE=false
 NATIVE_PROFILES=""
+NATIVE_CI_ADMISSION=""
 NATIVE_ROOT=""
 COMPOSE_LOCATION=()
 TEST_ARGS=()
@@ -85,6 +86,9 @@ while [[ $# -gt 0 ]]; do
       DO_STARTUP=false; shift ;;
     --standalone)
       DO_STANDALONE=true; shift ;;
+    --native-ci-admission)
+      [[ $# -ge 2 && -n "$2" ]] || { echo "ERROR: --native-ci-admission requires explicit operator JSON" >&2; exit 2; }
+      NATIVE_CI_ADMISSION="$2"; shift 2 ;;
     --native-profiles)
       [[ $# -ge 2 && -n "$2" ]] || { echo "ERROR: --native-profiles requires an operator JSON file" >&2; exit 2; }
       NATIVE_PROFILES="$2"; shift 2 ;;
@@ -112,10 +116,11 @@ while [[ $# -gt 0 ]]; do
       echo "  --no-startup      Skip stack startup (never tears down an existing stack)"
       echo "  --standalone    Include standalone worker/sensor services"
       echo "  --native-profiles <JSON>  Use all seven explicit native profiles and prebuilt images"
+      echo "  --native-ci-admission <JSON>  Build once, then prepare owned native CI inputs"
       echo "  --runtime-lifecycle  Admit recipe fixtures only in this fresh owned stack"
       echo ""
       echo "Environment:"
-      echo "  ATTUNE_E2E_DOCKER_SOCKET  Required absolute Unix socket for --native-profiles"
+      echo "  ATTUNE_E2E_DOCKER_SOCKET  Required absolute Unix socket for native modes"
       echo "  ATTUNE_E2E_RUN_ID         Optional unique run identity"
       echo "  ATTUNE_E2E_SERIAL_BUILD   Set to 1 to build one service at a time"
       echo "  ATTUNE_E2E_PROJECT_NAME  Optional Compose project for a pre-started stack"
@@ -153,21 +158,28 @@ if [[ "$DO_RUNTIME_LIFECYCLE" == true && "$DO_STARTUP" == false ]]; then
   exit 2
 fi
 
-# Native acceptance never consults a Docker context or rebuilds admitted inputs.
+# Native acceptance never consults a Docker context. Manual pins stay prebuilt.
+if [[ -n "$NATIVE_CI_ADMISSION" ]]; then
+  if [[ -n "$NATIVE_PROFILES" || "$DO_BUILD" != true || ! -r "$NATIVE_CI_ADMISSION" || "${ATTUNE_E2E_SERIAL_BUILD:-0}" == 1 ]]; then
+    echo "ERROR: native CI requires readable admission, one fresh nonserial build, and no manual profiles" >&2
+    exit 2
+  fi
+  NATIVE_CI_ADMISSION="$(realpath "$NATIVE_CI_ADMISSION")"
+fi
 # The standalone services have no supplied native profiles in this contract.
-if [[ -n "$NATIVE_PROFILES" ]]; then
+if [[ -n "$NATIVE_PROFILES" || -n "$NATIVE_CI_ADMISSION" ]]; then
   if [[ "$DO_STARTUP" != true || "$DO_STANDALONE" == true ]]; then
     echo "ERROR: native profiles require fresh startup and do not admit standalone services" >&2
     exit 2
   fi
-  if [[ ! -r "$NATIVE_PROFILES" || "${ATTUNE_E2E_DOCKER_SOCKET:-}" != /* || ! -S "${ATTUNE_E2E_DOCKER_SOCKET:-}" ]]; then
+  if [[ ( -n "$NATIVE_PROFILES" && ! -r "$NATIVE_PROFILES" ) || "${ATTUNE_E2E_DOCKER_SOCKET:-}" != /* || ! -S "${ATTUNE_E2E_DOCKER_SOCKET:-}" ]]; then
     echo "ERROR: native profiles require readable JSON and ATTUNE_E2E_DOCKER_SOCKET naming an explicit Unix socket" >&2
     exit 2
   fi
-  NATIVE_PROFILES="$(realpath "$NATIVE_PROFILES")"
+  [[ -z "$NATIVE_PROFILES" ]] || NATIVE_PROFILES="$(realpath "$NATIVE_PROFILES")"
   export DOCKER_HOST="unix://${ATTUNE_E2E_DOCKER_SOCKET}"
   unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
-  DO_BUILD=false
+  [[ -z "$NATIVE_PROFILES" ]] || DO_BUILD=false
   COMPOSE_LOCATION=(--project-directory "$PROJECT_ROOT")
 fi
 
@@ -410,9 +422,11 @@ if [[ "$DO_STARTUP" == true ]]; then
   # alter the next startup behavior of an existing project.
   assert_fresh_project
 fi
-if [[ -n "$NATIVE_PROFILES" ]]; then
-  mkdir -p "$PROJECT_ROOT/.scratch"
-  NATIVE_ROOT="$(mktemp -d "$PROJECT_ROOT/.scratch/native-e2e-${RUN_ID}.XXXXXX")"
+prepare_native_profiles() {
+  if [[ -z "$NATIVE_ROOT" ]]; then
+    mkdir -p "$PROJECT_ROOT/.scratch"
+    NATIVE_ROOT="$(mktemp -d "$PROJECT_ROOT/.scratch/native-e2e-${RUN_ID}.XXXXXX")"
+  fi
   # Validate all sources before contacting the explicit endpoint. Existing
   # external resources must carry io.attune.test.owner=$RUN_ID. No creation,
   # enrollment, pull, or cleanup-by-absence is performed by this materializer.
@@ -436,7 +450,23 @@ services:
       ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672/attune_${ATTUNE_E2E_RUN_ID}
 EOF
   COMPOSE_FILES+=(-f "$NATIVE_ROOT/toolchains-e2e.yaml")
+  if [[ -n "$NATIVE_CI_ADMISSION" ]]; then
+    COMPOSE_FILES+=(-f "$NATIVE_ROOT/launch-images.json")
+  fi
+  if [[ -n "$RUNTIME_FIXTURE_ROOT" ]]; then
+    COMPOSE_FILES+=(-f "$RUNTIME_FIXTURE_ROOT/fixtures/compose.yaml")
+  fi
   log_info "Explicit native inputs retained at $NATIVE_ROOT"
+}
+if [[ -n "$NATIVE_CI_ADMISSION" ]]; then
+  mkdir -p "$PROJECT_ROOT/.scratch"
+  NATIVE_ROOT="$(mktemp -d "$PROJECT_ROOT/.scratch/native-e2e-${RUN_ID}.XXXXXX")"
+  python3 "$PROJECT_ROOT/scripts/prepare-native-ci-inputs.py" --plan \
+    --root "$NATIVE_ROOT" --owner "$RUN_ID" --project "$COMPOSE_PROJECT_NAME" \
+    --admission "$NATIVE_CI_ADMISSION"
+  COMPOSE_FILES+=(-f "$NATIVE_ROOT/build-images.json")
+elif [[ -n "$NATIVE_PROFILES" ]]; then
+  prepare_native_profiles
 fi
 if [[ "$DO_RUNTIME_LIFECYCLE" == true ]]; then
   mkdir -p "$PROJECT_ROOT/.scratch"
@@ -453,6 +483,9 @@ if [[ "$DO_BUILD" == true ]]; then
     migrations init-user init-pack-binaries init-packs init-agent pack-release-upgrade
     api executor executor-2 notifier supervisor
   )
+  if [[ -n "$NATIVE_CI_ADMISSION" ]]; then
+    BUILD_SERVICES+=(worker-shell worker-python worker-node worker-full worker-toolchains sensor)
+  fi
   if [[ "${ATTUNE_E2E_SERIAL_BUILD:-0}" == "1" ]]; then
     # Compose can submit a multi-service BuildKit graph concurrently despite its
     # engine-call parallel limit. Separate foreground calls bound Rust builds.
@@ -466,6 +499,15 @@ if [[ "$DO_BUILD" == true ]]; then
     initial_build_with_diagnostics initial-services "${BUILD_SERVICES[@]}"
   fi
   log_success "Build complete"
+fi
+
+# The only effectful CI input phase: reuse the just-built images/Runner before
+# any manager or infrastructure starts. Unknown preparation retains recovery inputs.
+if [[ -n "$NATIVE_CI_ADMISSION" ]]; then
+  python3 "$PROJECT_ROOT/scripts/prepare-native-ci-inputs.py" \
+    --root "$NATIVE_ROOT" --socket "$ATTUNE_E2E_DOCKER_SOCKET"
+  NATIVE_PROFILES="$NATIVE_ROOT/profiles.json"
+  prepare_native_profiles
 fi
 
 # ── Step 2: Start stack ───────────────────────────────────────────────────

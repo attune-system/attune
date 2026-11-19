@@ -151,6 +151,7 @@ jobs:
           python3 scripts/test_core_bootstrap_failure.py
           python3 scripts/test_prepare_native_compose.py
           python3 scripts/test_native_compose_runner.py
+          python3 scripts/test_prepare_native_ci_inputs.py
           python3 scripts/test_workload_startup_diagnostics.py
           python3 scripts/test_capture_build_diagnostics.py
           python3 scripts/test_docker_source_graph.py
@@ -438,14 +439,31 @@ jobs:
     env:
       ATTUNE_E2E_RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
       ATTUNE_E2E_CARGO_BUILD_JOBS: 2
+      ATTUNE_E2E_DOCKER_SOCKET: /var/run/docker.sock
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
+      - name: Admit this CI candidate's native namespace
+        run: |
+          python3 -m pip install --disable-pip-version-check 'PyYAML==6.0.3'
+          umask 077
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          # Positive IDs belong to this job's explicit operator namespace, not DB rows.
+          admission = {'engine_id': 1, 'helper_pin_id': 1, 'helper_object_id': 1,
+                       'object_version': 'ci:' + ':'.join(os.environ[k] for k in
+                           ('GITHUB_SHA', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT'))}
+          (Path(os.environ['RUNNER_TEMP']) / 'attune-native-admission.json').write_text(json.dumps(admission))
+          PY
+
       - name: Run tier 1 and live-API SSE tests
         run: >-
           timeout --signal=TERM --kill-after=120s 110m
-          bash scripts/run-integration-tests.sh --runtime-lifecycle --tier 1
+          bash scripts/run-integration-tests.sh
+          --native-ci-admission "$RUNNER_TEMP/attune-native-admission.json"
+          --runtime-lifecycle --tier 1
           tests/e2e/api/test_sse_execution_stream.py
           tests/e2e/api/test_runtime_lifecycle.py -x
 

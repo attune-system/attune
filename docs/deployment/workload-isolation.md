@@ -414,18 +414,64 @@ custody completion before removing those volumes/inputs; this runner does not
 provide that proof or rotate retained keys. Failed teardown also retains lifecycle
 fixture binds. `--no-teardown` keeps those same inputs for recovery.
 
-Selecting native mode in the checked-in full-stack CI call still requires actual
-operator profiles, Runner object pins/archive bytes, prebuilt images, and
-prepared run-owned endpoint/volumes/networks. The current CI call is unchanged
-and continues selecting the legacy startup path. The repository supplies no genuine operator profile
-for automatic CI creation; it does not replace that input with invented pins or
-binding IDs. Pure mocked runner tests are wired into script validation. They
-prove composition and failure handling, never native provider acceptance. The
-historical b98 smoke failure was legacy sandbox startup failure; this integration
-must pass the real full-stack lane before it can be called fixed or activated.
+The checked-in required full-stack smoke call now explicitly uses
+`--native-ci-admission "$RUNNER_TEMP/attune-native-admission.json"`. This is an
+owned CI preparation path, separate from manually prebuilt `--native-profiles`.
+The workflow supplies positive `engine_id`, `helper_pin_id`, and
+`helper_object_id` values in its reviewed operator namespace (currently `1` for
+each), plus `object_version: ci:<source-sha>:<github-run-id>:<attempt>`.
+The owner must be `ci-<github-run-id>-<attempt>`. These are WorkloadConfig
+admission identities, not claims of database rows or a published release. They
+are never allocated from observed daemon/image/archive values. Both the explicit
+namespace and actual observations remain in the retained input directory.
 
-The existing `init-agent` copies the once-built public Runner ZIP alongside its
-binaries; it does not mint an object pin or assert image compatibility.
+This mode requires fresh startup, the explicit Unix socket, and one build;
+`--no-build`, attach, standalone services, manual profiles, and serial per-service
+builds cannot be combined with it. It writes a run-owned image-tag override and
+uses the runner's existing initial build with its existing sanitized diagnostic
+capture exactly once. That build includes the same six distinct runtime image
+build definitions (both sensors share one image), plus the existing `init-agent`.
+There is no second Runner, helper or payload build. After the build and before
+any stack service starts, `scripts/prepare-native-ci-inputs.py` observes the
+explicit endpoint's daemon ID/platform and those actual built image IDs.
+Guest profiles reuse the existing owning Docker fixture budgets (512 MiB memory,
+128 MiB scratch, 64/128 MiB compressed/expanded inputs, 4096 entries and 128 PIDs).
+Generated managers and the bootstrap initializer start using immutable IDs;
+mutable build tags are retained as source observations, not launch authority.
+E2E resets, all seven registrations, original tier selection and recipe admission
+are retained, with the lifecycle override last.
+
+Only this explicit CI path creates the fourteen fresh cache/custody volumes and
+ordinary guest bridge. Every resource carries the exact run owner and a private
+creation nonce; existing names, volume users, nonlocal drivers/options, network
+users and unknown observations deny preparation. The nonce scopes resource
+names and never becomes an engine or object ID. A single fixed initializer uses
+the same observed `init-agent` image with network `none`, a read-only root, no CP
+environment or socket, and only the new volumes plus private input output bind.
+Its fixed shell checks every volume is empty, sets UID/GID 1000 and mode 0700,
+and copies the once-built public Runner ZIP from the image. The source file is
+UID0, single-linked and nonwritable; the host runner's UID1001 is never relabelled
+as manager1000. This requires an endpoint whose actual ownership satisfies that
+policy; there is no rootless ownership fallback. Actual ZIP size/SHA, regular
+executable platform entries and expansion/file bounds form the retained pin.
+
+The helper requires the exact retained initializer ID/image/mounts/fixed command,
+positive successful exit and stopped-state inspection before an acknowledged
+removal of that exact ID. Missing capture, failed inspection, ambiguous create,
+nonzero exit or uncertain removal fails and retains observations; no name-based
+force removal or 404/empty-list proof substitutes for settlement. The existing
+materializer then repeats owned resource/image checks before startup. Build
+failure also keeps the private CI plan and existing sanitized build diagnostics.
+No native inputs, project DB/object recovery volumes or custody keys are removed
+by this path. Compose teardown and a successful smoke exit still do not prove
+aggregate native workload settlement or complete reclamation.
+
+Pure mocked helper and runner tests are included in script validation. They
+exercise the single-build/start ordering, exact admission/observations and
+failure retention without contacting a daemon. This source change is not live
+native smoke evidence, production default activation, or readiness approval; the
+required full-stack lane must genuinely pass. The historical b98 smoke failure
+was a legacy sandbox startup failure.
 
 The Docker owning-worker target is
 `crates/worker/tests/isolated_docker_action_provider_tests.rs`. Its four native,
