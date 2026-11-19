@@ -41,12 +41,12 @@ pub(super) async fn await_startup<T>(
     startup: impl Future<Output = Result<T>>,
     stopping: CancellationToken,
     native: bool,
-    deadline: Option<Duration>,
+    deadline: Option<tokio::time::Instant>,
     sensor_ref: &str,
 ) -> Result<T> {
     let bounded = async {
         if let Some(deadline) = deadline {
-            match timeout(deadline, startup).await {
+            match tokio::time::timeout_at(deadline, startup).await {
                 Ok(result) => result,
                 Err(_) => Err(anyhow!("Sensor {sensor_ref} startup timed out")),
             }
@@ -58,6 +58,113 @@ pub(super) async fn await_startup<T>(
         biased;
         _ = stopping.cancelled(), if native => Err(anyhow!("Sensor {sensor_ref} startup cancelled by manager shutdown")),
         result = bounded => result,
+    }
+}
+
+/// The original managed-start stage budget. Nested setup/discovery jobs keep
+/// running under the manager's trackers after a caller drops its await, while
+/// the same cancellation signal requests their owned Stop/capture joins.
+#[derive(Clone)]
+pub(super) struct NativeStartupStage {
+    tasks: tokio_util::task::TaskTracker,
+    attempt: tokio_util::task::TaskTracker,
+    stopping: CancellationToken,
+    deadline: tokio::time::Instant,
+    failed: Arc<AtomicBool>,
+}
+impl NativeStartupStage {
+    pub(super) fn new(
+        tasks: tokio_util::task::TaskTracker,
+        attempt: tokio_util::task::TaskTracker,
+        stopping: CancellationToken,
+        deadline: tokio::time::Instant,
+        failed: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            tasks,
+            attempt,
+            stopping,
+            deadline,
+            failed,
+        }
+    }
+    /// Seconds-only installer API, bounded independently by the exact stage
+    /// deadline below. Rounding does not grant a new stage budget.
+    fn remaining_seconds(&self) -> Result<u64> {
+        let remaining = self
+            .deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| anyhow!("Native sensor startup deadline elapsed"))?;
+        Ok(remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0))
+    }
+    async fn run<T, F>(
+        &self,
+        operation: impl FnOnce(CancellationToken) -> F + Send + 'static,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T>> + Send + 'static,
+    {
+        self.remaining_seconds()?;
+        if self.stopping.is_cancelled() {
+            return Err(anyhow!("Native sensor startup cancelled"));
+        }
+        let cancel = self.stopping.child_token();
+        // Dropping this caller signals the retained operation; it never aborts
+        // the task that still owns prepare/start/Stop/capture acknowledgements.
+        let _cancel_on_drop = cancel.clone().drop_guard();
+        let deadline = self.deadline;
+        let failed = self.failed.clone();
+        let task = self.tasks.spawn(self.attempt.track_future(async move {
+            use futures::FutureExt;
+            let result = std::panic::AssertUnwindSafe(async move {
+                if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
+                    return Err(anyhow!(
+                        "Native sensor startup interrupted before operation"
+                    ));
+                }
+                let operation = operation(cancel.clone());
+                tokio::pin!(operation);
+                let completed = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => None,
+                    _ = tokio::time::sleep_until(deadline) => None,
+                    result = &mut operation => Some(result),
+                };
+                match completed {
+                    Some(_) if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline => {
+                        cancel.cancel();
+                        Err(anyhow!(
+                            "Native sensor startup closed before accepting operation result"
+                        ))
+                    }
+                    Some(result) => result,
+                    None => {
+                        cancel.cancel();
+                        // Durable DB fencing may still be pending. Keep the
+                        // original future, physical Stop and captures owned.
+                        let _ = operation.await;
+                        Err(anyhow!(
+                            "Native sensor startup interrupted; operation joined"
+                        ))
+                    }
+                }
+            })
+            .catch_unwind()
+            .await;
+            match result {
+                Ok(result) => result,
+                Err(_) => {
+                    failed.store(true, Ordering::Release);
+                    Err(anyhow!(
+                        "Native sensor startup operation panicked; evidence retained"
+                    ))
+                }
+            }
+        }));
+        task.await
+            .map_err(|_| anyhow!("Native sensor startup operation join failed"))?
     }
 }
 
@@ -426,6 +533,18 @@ impl SensorManager {
         admitted: &std::collections::BTreeSet<String>,
     ) -> attune_common::Result<attune_common::repositories::runtime_probe_process::VerifiedToolMap>
     {
+        self.probe_native_runtime_cancellable(runtime, version, admitted, None)
+            .await
+    }
+
+    async fn probe_native_runtime_cancellable(
+        &self,
+        runtime: &attune_common::models::Runtime,
+        version: Option<&attune_common::models::RuntimeVersion>,
+        admitted: &std::collections::BTreeSet<String>,
+        cancel: Option<&CancellationToken>,
+    ) -> attune_common::Result<attune_common::repositories::runtime_probe_process::VerifiedToolMap>
+    {
         let denied = || Error::PermissionDenied("Native sensor discovery unavailable".into());
         let configured = self.inner.native.as_ref().ok_or_else(denied)?;
         let config = self.inner.workload_config.as_ref().ok_or_else(denied)?;
@@ -455,7 +574,7 @@ impl SensorManager {
             master,
             &self.inner.child_environment,
         )?
-        .verify(runtime, version, admitted, &pin)
+        .verify(runtime, version, admitted, &pin, cancel)
         .await
     }
 
@@ -472,7 +591,7 @@ impl SensorManager {
         runtime: &attune_common::models::Runtime,
         selected_version: Option<&str>,
         reset: bool,
-        startup_tasks: tokio_util::task::TaskTracker,
+        startup_stage: NativeStartupStage,
     ) -> Result<SensorInstance> {
         let native = self
             .inner
@@ -517,7 +636,13 @@ impl SensorManager {
         if release.digest != pack_revision.digest {
             return Err(anyhow!("Sensor release pin changed"));
         }
-        let pack = self.prepare_native_pack(release).await?;
+        let manager = self.clone();
+        let pack = startup_stage
+            .run(move |_cancel| async move {
+                // Retain the blocking verified-cache write through startup cancellation too.
+                manager.prepare_native_pack(release).await
+            })
+            .await?;
         let mut inputs = vec![pack, native.runner.clone()];
         let has_runtime =
             config.lifecycle.is_none() && attune_workload_backend::planning::needs_runtime(config);
@@ -532,33 +657,64 @@ impl SensorManager {
                         .ok_or_else(|| anyhow!("Pinned sensor runtime version unavailable"))
                 })
                 .transpose()?;
-            let (pin, _) = attune_worker::native_environment::NativeEnvironmentInstaller::new(
-                &self.inner.db,
-                workload.worker_id,
-                workload.worker_instance,
-                operator,
-                native,
-                master,
-            )?
-            .install(
-                attune_common::pack_environment::UpsertCoordinatedEnvironmentInput {
-                    pack_id: sensor.pack.ok_or_else(|| anyhow!("Missing sensor pack"))?,
-                    pack_ref: sensor
-                        .pack_ref
-                        .as_deref()
-                        .ok_or_else(|| anyhow!("Missing sensor pack ref"))?,
-                    runtime_id: runtime.id,
-                    runtime_ref: &runtime.r#ref,
-                    runtime_version: version,
-                    env_path: std::path::Path::new(RUNTIME_ROOT),
-                    manifest_checksum: Some(&pack_revision.digest),
-                },
-                config,
+            let remaining = startup_stage.remaining_seconds()?;
+            let manager = self.clone();
+            let (sensor, workload, runtime, version, revision, config, setup_inputs) = (
+                sensor.clone(),
+                workload.clone(),
+                runtime.clone(),
+                version.cloned(),
+                pack_revision.clone(),
+                config.clone(),
                 inputs.clone(),
-                None,
-                None,
-            )
-            .await?;
+            );
+            let (pin, _) = startup_stage
+                .run(move |cancel| async move {
+                    let native = manager
+                        .inner
+                        .native
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("Native sensor backend unavailable"))?;
+                    let operator = manager
+                        .inner
+                        .workload_config
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("Native sensor config unavailable"))?;
+                    let master = manager
+                        .inner
+                        .encryption_key
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("Native sensor encryption unavailable"))?;
+                    attune_worker::native_environment::NativeEnvironmentInstaller::new(
+                        &manager.inner.db,
+                        workload.worker_id,
+                        workload.worker_instance,
+                        operator,
+                        native,
+                        master,
+                    )?
+                    .install(
+                        attune_common::pack_environment::UpsertCoordinatedEnvironmentInput {
+                            pack_id: sensor.pack.ok_or_else(|| anyhow!("Missing sensor pack"))?,
+                            pack_ref: sensor
+                                .pack_ref
+                                .as_deref()
+                                .ok_or_else(|| anyhow!("Missing sensor pack ref"))?,
+                            runtime_id: runtime.id,
+                            runtime_ref: &runtime.r#ref,
+                            runtime_version: version.as_ref(),
+                            env_path: std::path::Path::new(RUNTIME_ROOT),
+                            manifest_checksum: Some(&revision.digest),
+                        },
+                        &config,
+                        setup_inputs,
+                        Some(remaining),
+                        Some(&cancel),
+                    )
+                    .await
+                    .map_err(Into::into)
+                })
+                .await?;
             inputs.push(pin);
         }
         let entry = format!("sensors/{}", sensor.entrypoint);
@@ -587,7 +743,20 @@ impl SensorManager {
                 .native_runtime_recipe_digests()
                 .map(str::to_owned)
                 .collect();
-            self.probe_native_runtime(runtime, version, &admitted)
+            let (manager, probe_runtime, probe_version) =
+                (self.clone(), runtime.clone(), version.cloned());
+            startup_stage
+                .run(move |cancel| async move {
+                    manager
+                        .probe_native_runtime_cancellable(
+                            &probe_runtime,
+                            probe_version.as_ref(),
+                            &admitted,
+                            Some(&cancel),
+                        )
+                        .await
+                        .map_err(Into::into)
+                })
                 .await?;
             attune_workload_backend::planning::runtime_recipe_argv(
                 operator.platform,
@@ -747,7 +916,7 @@ impl SensorManager {
                 incarnation: workload.worker_instance,
             },
             self.inner.native_startup_tasks.clone(),
-            startup_tasks,
+            startup_stage.attempt.clone(),
             self.inner.native_cleanup_failed.clone(),
         );
         let launcher = native.backend.launcher();
@@ -1396,7 +1565,7 @@ mod startup_ownership_tests {
                 start,
                 CancellationToken::new(),
                 true,
-                Some(deadline),
+                Some(tokio::time::Instant::now() + deadline),
                 "fixture",
             ));
             observed(&ready).await;
@@ -1546,7 +1715,7 @@ mod startup_ownership_tests {
                 },
                 stopping,
                 true,
-                Some(Duration::from_secs(60)),
+                Some(tokio::time::Instant::now() + Duration::from_secs(60)),
                 "fixture",
             )
             .await;
@@ -1574,5 +1743,298 @@ mod startup_ownership_tests {
         assert!(tasks.is_closed() && tasks.is_empty());
         assert!(!failed.load(Ordering::Acquire));
         pool.close().await;
+    }
+}
+
+#[cfg(test)]
+mod nested_startup_ownership_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use tokio_util::task::TaskTracker;
+
+    #[derive(Default)]
+    struct Acknowledgements {
+        entered: Notify,
+        late_prepare: Notify,
+        stop_requested: Notify,
+        stop_ack: Notify,
+        capture_ack: Notify,
+        durable_ack: Notify,
+        stopped: Notify,
+        captured: Notify,
+        calls: AtomicUsize,
+        finished: AtomicBool,
+        dropped: AtomicBool,
+        accepted_cache: AtomicBool,
+        token: std::sync::Mutex<Option<CancellationToken>>,
+    }
+    struct OperationLifetime(Arc<Acknowledgements>);
+    impl Drop for OperationLifetime {
+        fn drop(&mut self) {
+            self.0.dropped.store(true, Ordering::Release);
+        }
+    }
+    async fn controlled_nested_operation(
+        state: Arc<Acknowledgements>,
+        cancel: CancellationToken,
+        window: &'static str,
+        uncertain_stop: bool,
+        uncertain_capture: bool,
+    ) -> Result<()> {
+        let _lifetime = OperationLifetime(state.clone());
+        state.calls.fetch_add(1, Ordering::AcqRel);
+        *state.token.lock().unwrap() = Some(cancel.clone());
+        state.entered.notify_one();
+        if window == "prepare" {
+            // The original provider call remains owned until its late ACK.
+            state.late_prepare.notified().await;
+        }
+        cancel.cancelled().await;
+        state.stop_requested.notify_one();
+        let (stop, capture, ()) = tokio::join!(
+            async {
+                state.stop_ack.notified().await;
+                state.stopped.notify_one();
+                if uncertain_stop {
+                    Err(anyhow!("controlled Stop ACK uncertain"))
+                } else {
+                    Ok(())
+                }
+            },
+            async {
+                state.capture_ack.notified().await;
+                state.captured.notify_one();
+                if uncertain_capture {
+                    Err(anyhow!("controlled capture ACK uncertain"))
+                } else {
+                    Ok(())
+                }
+            },
+            async {
+                state.durable_ack.notified().await;
+            },
+        );
+        state.finished.store(true, Ordering::Release);
+        stop?;
+        capture?;
+        // Deliberately return a late success after cancellation. The actual
+        // startup wrapper must not expose it as an accepted verification.
+        Ok(())
+    }
+    async fn observed(signal: &Notify) {
+        timeout(Duration::from_secs(5), signal.notified())
+            .await
+            .expect("owned nested-operation signal");
+    }
+    fn stage(deadline: tokio::time::Instant, stopping: CancellationToken) -> NativeStartupStage {
+        NativeStartupStage::new(
+            TaskTracker::new(),
+            TaskTracker::new(),
+            stopping,
+            deadline,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+    async fn release_and_join(stage: &NativeStartupStage, state: &Acknowledgements, window: &str) {
+        assert_eq!(state.calls.load(Ordering::Acquire), 1);
+        assert!(!state.finished.load(Ordering::Acquire));
+        assert!(!state.dropped.load(Ordering::Acquire));
+        assert_eq!(
+            stage.tasks.len(),
+            1,
+            "cancelled caller lost its nested owner"
+        );
+        if window == "prepare" {
+            state.late_prepare.notify_one();
+        }
+        observed(&state.stop_requested).await;
+        // Known physical stop/capture progress independently of a pending DB
+        // fence. Neither acknowledgement ends ownership of the other awaits.
+        state.stop_ack.notify_one();
+        observed(&state.stopped).await;
+        state.capture_ack.notify_one();
+        observed(&state.captured).await;
+        assert!(!state.finished.load(Ordering::Acquire));
+        assert!(!state.dropped.load(Ordering::Acquire));
+        assert_eq!(stage.tasks.len(), 1);
+        state.durable_ack.notify_one();
+        stage.attempt.close();
+        stage.tasks.close();
+        timeout(Duration::from_secs(5), async {
+            stage.attempt.wait().await;
+            stage.tasks.wait().await;
+        })
+        .await
+        .expect("retained nested future joined");
+        assert!(state.finished.load(Ordering::Acquire));
+        assert!(state.dropped.load(Ordering::Acquire));
+        assert!(!state.accepted_cache.load(Ordering::Acquire));
+        assert_eq!(
+            state.calls.load(Ordering::Acquire),
+            1,
+            "original operation was replayed"
+        );
+    }
+    fn caller(
+        stage: NativeStartupStage,
+        state: Arc<Acknowledgements>,
+        kind: &'static str,
+        window: &'static str,
+        uncertain_stop: bool,
+        uncertain_capture: bool,
+    ) -> JoinHandle<Result<()>> {
+        tokio::spawn(async move {
+            let (deadline, stopping) = (stage.deadline, stage.stopping.clone());
+            let operation_state = state.clone();
+            let result = await_startup(
+                stage.run(move |cancel| {
+                    controlled_nested_operation(
+                        operation_state,
+                        cancel,
+                        window,
+                        uncertain_stop,
+                        uncertain_capture,
+                    )
+                }),
+                stopping,
+                true,
+                Some(deadline),
+                kind,
+            )
+            .await;
+            if result.is_ok() {
+                state.accepted_cache.store(true, Ordering::Release);
+            }
+            result
+        })
+    }
+
+    #[tokio::test]
+    async fn startup_wrapper_retains_nested_install_and_probe_on_shutdown_and_caller_drop() {
+        for kind in ["installation", "discovery"] {
+            for window in ["prepare", "resource-record", "running", "post-execution"] {
+                for mode in ["shutdown", "caller-drop"] {
+                    let stage = stage(
+                        tokio::time::Instant::now() + Duration::from_secs(60),
+                        CancellationToken::new(),
+                    );
+                    let state = Arc::new(Acknowledgements::default());
+                    let caller = caller(
+                        stage.clone(),
+                        state.clone(),
+                        kind,
+                        window,
+                        window == "resource-record",
+                        window == "running",
+                    );
+                    observed(&state.entered).await;
+                    if mode == "caller-drop" {
+                        caller.abort();
+                        assert!(caller.await.unwrap_err().is_cancelled());
+                    } else {
+                        stage.stopping.cancel();
+                        assert!(caller.await.unwrap().is_err());
+                    }
+                    let token = state.token.lock().unwrap().clone().unwrap();
+                    timeout(Duration::from_secs(5), token.cancelled())
+                        .await
+                        .unwrap();
+                    release_and_join(&stage, &state, window).await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_wrapper_deadline_retains_nested_acks_without_resetting_budget() {
+        for kind in ["installation", "discovery"] {
+            // This exercises the real deadline, not a sleep used as readiness.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            let stage = stage(deadline, CancellationToken::new());
+            let state = Arc::new(Acknowledgements::default());
+            let caller = caller(stage.clone(), state.clone(), kind, "prepare", false, false);
+            observed(&state.entered).await;
+            assert!(caller.await.unwrap().is_err());
+            assert_eq!(stage.deadline, deadline);
+            release_and_join(&stage, &state, "prepare").await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let count = calls.clone();
+            assert!(stage
+                .run(move |_| async move {
+                    count.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                })
+                .await
+                .is_err());
+            assert_eq!(
+                calls.load(Ordering::Acquire),
+                0,
+                "later nested call reset the expired stage budget"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_stage_never_enters_nested_producer_or_accepts_verification() {
+        for expired in [true, false] {
+            let stop = CancellationToken::new();
+            let now = tokio::time::Instant::now();
+            let deadline = if expired {
+                now
+            } else {
+                stop.cancel();
+                now + Duration::from_secs(60)
+            };
+            let stage = stage(deadline, stop);
+            let entered = Arc::new(AtomicBool::new(false));
+            let called = entered.clone();
+            assert!(stage
+                .run(move |_| async move {
+                    called.store(true, Ordering::Release);
+                    Ok(())
+                })
+                .await
+                .is_err());
+            assert!(!entered.load(Ordering::Acquire));
+            assert!(stage.tasks.is_empty() && stage.attempt.is_empty());
+            stage.tasks.close();
+            stage.attempt.close();
+            stage.tasks.wait().await;
+            stage.attempt.wait().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_nested_owner_survives_caller_drop_before_producer_is_polled() {
+        let stage = stage(
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            CancellationToken::new(),
+        );
+        let entered = Arc::new(AtomicBool::new(false));
+        let called = entered.clone();
+        let mut awaiting = Box::pin(stage.run(move |_| async move {
+            called.store(true, Ordering::Release);
+            Ok(())
+        }));
+        std::future::poll_fn(|cx| {
+            assert!(awaiting.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(stage.tasks.len(), 1);
+        drop(awaiting);
+        assert!(!entered.load(Ordering::Acquire));
+        stage.tasks.close();
+        stage.attempt.close();
+        timeout(Duration::from_secs(5), async {
+            stage.tasks.wait().await;
+            stage.attempt.wait().await;
+        })
+        .await
+        .unwrap();
+        assert!(
+            !entered.load(Ordering::Acquire),
+            "producer ran after its queued caller closed"
+        );
     }
 }

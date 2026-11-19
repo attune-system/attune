@@ -1358,6 +1358,14 @@ impl SensorManager {
         let executable_snapshot = Some(binding.executable);
 
         let stopping = self.inner.native_startup_stop.read().await.clone();
+        let deadline = tokio::time::Instant::now() + SENSOR_STARTUP_TIMEOUT;
+        let startup_stage = native::NativeStartupStage::new(
+            self.inner.native_startup_tasks.clone(),
+            startup_tasks.clone(),
+            stopping.clone(),
+            deadline,
+            self.inner.native_cleanup_failed.clone(),
+        );
         let started = native::await_startup(
             self.start_standalone_sensor(
                 sensor.clone(),
@@ -1367,11 +1375,11 @@ impl SensorManager {
                 pack_revision,
                 definition_updated,
                 executable_snapshot,
-                startup_tasks.clone(),
+                startup_stage,
             ),
             stopping,
             self.inner.native.is_some(),
-            Some(SENSOR_STARTUP_TIMEOUT),
+            Some(deadline),
             &sensor.r#ref,
         )
         .await;
@@ -1440,7 +1448,7 @@ impl SensorManager {
         pack_revision: PackRevision,
         definition_updated: DateTime<Utc>,
         executable_snapshot: Option<attune_common::models::SensorExecutableSnapshot>,
-        startup_tasks: tokio_util::task::TaskTracker,
+        startup_stage: native::NativeStartupStage,
     ) -> Result<SensorInstance> {
         info!("Starting standalone sensor: {}", sensor.r#ref);
 
@@ -1543,7 +1551,7 @@ impl SensorManager {
                     &runtime,
                     selected_version.as_deref(),
                     reset_failure_count,
-                    startup_tasks,
+                    startup_stage,
                 )
                 .await;
         }
