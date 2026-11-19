@@ -11,7 +11,7 @@ import subprocess
 
 
 SERVICES = {
-    "worker-shell", "worker-python", "worker-node", "worker-full", "sensor",
+    "worker-shell", "worker-python", "worker-node", "worker-full", "worker-toolchains", "sensor", "sensor-secondary",
     "worker-standalone", "sensor-standalone",
 }
 SIGNATURES = {
@@ -29,6 +29,8 @@ SIGNATURES = {
     "tls_roots_missing": "No CA certificates were loaded from the system",
     "registration_failed": "Failed to register",
     "runtime_detection_failed": "Failed to detect runtimes",
+    "legacy_runtime_validation_failed": "Failed to validate runtimes",
+    "native_local_launch_denied": "local workload execution denied; native process effects are required",
 }
 
 

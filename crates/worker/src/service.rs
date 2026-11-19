@@ -62,6 +62,27 @@ use crate::version_verify;
 use attune_common::repositories::runtime::RuntimeRepository;
 use attune_common::repositories::List;
 
+async fn validate_manager_runtime_registry(
+    registry: &RuntimeRegistry,
+    native_effects: bool,
+) -> Result<()> {
+    if native_effects {
+        // Catalog entries are not native availability evidence. The registered
+        // incarnation's source-bound discovery validates admitted guest tools.
+        info!("Native runtime validation deferred to workload discovery");
+        return Ok(());
+    }
+    registry
+        .validate_all()
+        .await
+        .map_err(|e| Error::Internal(format!("Failed to validate runtimes: {}", e)))?;
+    info!(
+        "Successfully validated runtimes: {:?}",
+        registry.list_runtimes()
+    );
+    Ok(())
+}
+
 /// Controls how the worker initializes its runtime environment.
 ///
 /// The standard `attune-worker` binary uses `Worker` mode with proactive
@@ -503,16 +524,7 @@ impl WorkerService {
         ));
         info!("Registered built-in Native runtime");
 
-        // Validate all registered runtimes
-        runtime_registry
-            .validate_all()
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to validate runtimes: {}", e)))?;
-
-        info!(
-            "Successfully validated runtimes: {:?}",
-            runtime_registry.list_runtimes()
-        );
+        validate_manager_runtime_registry(&runtime_registry, config.workload.is_some()).await?;
 
         // Initialize secret manager
         let encryption_key = config.security.encryption_key.clone();
@@ -2722,6 +2734,34 @@ async fn mark_pack_install_failed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_manager_defers_catalog_probes_without_enabling_local_execution() {
+        let environment =
+            attune_common::child_process_environment::ChildProcessEnvironment::from_parent([], &[])
+                .unwrap()
+                .with_workload_sandbox(
+                    attune_common::workload_sandbox::WorkloadSandbox::NativeEffectsRequired,
+                );
+        let mut registry = RuntimeRegistry::new();
+        registry.register(Box::new(
+            NativeRuntime::new().with_child_environment(environment),
+        ));
+        let before = registry.list_runtimes();
+        validate_manager_runtime_registry(&registry, true)
+            .await
+            .unwrap();
+        assert_eq!(registry.list_runtimes(), before);
+        // The same legacy probe remains denied before it can spawn a command;
+        // native startup does not weaken the residual local-launch boundary.
+        let error = validate_manager_runtime_registry(&registry, false)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("local workload execution denied"));
+    }
 
     #[cfg(unix)]
     #[tokio::test]

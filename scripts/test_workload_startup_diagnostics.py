@@ -10,6 +10,14 @@ import workload_startup_diagnostics as diagnostics
 
 
 class DiagnosticsTests(unittest.TestCase):
+    def test_native_managers_and_legacy_probe_denial_are_classified_without_context(self):
+        self.assertTrue({'worker-shell', 'worker-python', 'worker-node', 'worker-full',
+                         'worker-toolchains', 'sensor', 'sensor-secondary'} <= diagnostics.SERVICES)
+        report = diagnostics.classify('secret=not-for-diagnostics\nFailed to validate runtimes: '
+                                      'local workload execution denied; native process effects are required')
+        self.assertEqual(report, {'legacy_runtime_validation_failed': 1, 'native_local_launch_denied': 1})
+        self.assertNotIn('not-for-diagnostics', json.dumps(report))
+
     def test_owned_worker_and_sensor_stderr_is_classified_without_secrets(self):
         ids = ["a" * 12, "b" * 12, "c" * 12]
         calls = []
