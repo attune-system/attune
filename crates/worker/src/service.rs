@@ -1136,8 +1136,12 @@ impl WorkerService {
 
                                 if let Some(config) = native_config.as_ref() {
                                     let mut current = registration.write().await;
-                                    current.detect_capabilities(config).await?;
-                                    current.update_capabilities().await?;
+                                    current.detect_capabilities(config).await.map_err(|_| {
+                                        MqError::Channel("Native runtime discovery unavailable".into())
+                                    })?;
+                                    current.update_capabilities().await.map_err(|_| {
+                                        MqError::Channel("Native runtime capability publication unavailable".into())
+                                    })?;
                                 } else if !filtered_runtime_names.is_empty() {
                                     let verify_result =
                                         version_verify::verify_all_runtime_versions(
