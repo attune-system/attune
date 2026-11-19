@@ -749,8 +749,14 @@ async fn native_secret_input_file_publication_rejects_replaced_and_restored_ciph
             executable_snapshot::ExecutableSnapshotRepository,
             execution::CreateExecutionInput,
             execution_secret_value::ExecutionSecretValueRepository,
+            identity::{
+                CreatePermissionAssignmentInput, CreatePermissionSetInput,
+                PermissionAssignmentRepository, PermissionSetRepository,
+            },
             key::{CreateKeyInput, KeyRepository},
+            recorded_input_authority::RecordedInputAuthorityRepository,
             schema_contract::{BindingOwner, SchemaContractRepository},
+            Create,
         },
         secret_provenance::SecretProvenance,
         secret_values::{
@@ -760,155 +766,187 @@ async fn native_secret_input_file_publication_rejects_replaced_and_restored_ciph
     use axum::http::StatusCode;
     attune_common::auth::install_crypto_provider();
     let ctx = TestContext::new().await?.with_admin_auth().await?;
-    let owner = ctx.user.as_ref().unwrap().id;
-    let master = ctx.state.config.security.encryption_key.as_deref().unwrap();
-    let key = KeyRepository::create_encrypted_in_pool(
-        &ctx.pool,
-        CreateKeyInput {
-            local_ref: format!("native_file_origin_{}", Uuid::new_v4().simple()),
-            owner_type: OwnerType::Identity,
-            owner_identity: Some(owner),
-            owner_pack: None,
-            owner_pack_ref: None,
-            owner_action: None,
-            owner_action_ref: None,
-            owner_sensor: None,
-            owner_sensor_ref: None,
-            name: "Owned native input origin".into(),
-            encrypted: true,
-            encryption_key_hash: None,
-            value: json!("owned-secret-input"),
-        },
-        master,
-    )
-    .await?;
-    let source_ref = serde_json::to_string(&SecretProvenance::key(
-        attune_common::key_access::key_origin(&key),
-    ))?;
-    let prepare = || {
-        prepare_secret_values(
-            vec![SecretValueInput {
-                json_path: "/value".into(),
+    let result = async {
+        let owner = ctx.user.as_ref().unwrap().id;
+        let master = ctx.state.config.security.encryption_key.as_deref().unwrap();
+        let key = KeyRepository::create_encrypted_in_pool(
+            &ctx.pool,
+            CreateKeyInput {
+                local_ref: format!("native_file_origin_{}", Uuid::new_v4().simple()),
+                owner_type: OwnerType::Identity,
+                owner_identity: Some(owner),
+                owner_pack: None,
+                owner_pack_ref: None,
+                owner_action: None,
+                owner_action_ref: None,
+                owner_sensor: None,
+                owner_sensor_ref: None,
+                name: "Owned native input origin".into(),
+                encrypted: true,
+                encryption_key_hash: None,
                 value: json!("owned-secret-input"),
-                source_kind: "provenance".into(),
-                source_ref: Some(source_ref.clone()),
-            }],
+            },
             master,
         )
-    };
-    let original = prepare()?;
-    let pack_ref = format!("secret_file_{}", Uuid::new_v4().simple());
-    let pack = helpers::create_test_pack(&ctx.pool, &pack_ref).await?;
-    let action_ref = format!("{pack_ref}.source");
-    let action = helpers::create_test_action(&ctx.pool, pack.id, &pack_ref, &action_ref).await?;
-    helpers::activate_test_pack_release_with_projections(
-        &ctx.pool,
-        &pack,
-        &attune_common::repositories::component_lifecycle::PackProjectionIds {
-            actions: vec![action.id],
-            ..Default::default()
-        },
-    )
-    .await?;
-    let mut tx = ctx.pool.begin().await?;
-    let snapshot = ExecutableSnapshotRepository::resolve_for_action(&mut *tx, action.id).await?;
-    let binding = SchemaContractRepository::materialize_action(&mut tx, &snapshot).await?;
-    let row = ExecutionRepository::create_pinned(
-        &mut *tx,
-        CreateExecutionInput {
-            action: Some(action.id),
-            action_ref,
-            executor: Some(owner),
-            permission_set_refs: vec!["standard".into()],
-            timeout_seconds: Some(300),
-            status: attune_common::models::ExecutionStatus::Requested,
-            ..Default::default()
-        },
-        &snapshot,
-    )
-    .await?;
-    let execution = row.id;
-    SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, execution, &binding).await?;
-    DelegatedExecutionRepository::select(&mut tx, execution, None).await?;
-    ExecutionRepository::initialize_config_with_conn(
-        &mut tx,
-        execution,
-        None,
-        &snapshot,
-        Some(json!({"value": redaction_marker()})),
-        &original,
-    )
-    .await?;
-    helpers::delegated::start(&mut tx, execution).await?;
-    tx.commit().await?;
-    let (spec, selected, resource) = admitted_execution(&ctx, execution).await?;
-    let LaunchTarget::Execution { worker, .. } = spec.target else {
-        unreachable!()
-    };
-    Effects::reserve(&ctx.pool, &spec, owner, &selected, master).await?;
-    Effects::begin_create(&ctx.pool, spec.intent, master).await?;
-    Effects::record_resource(&ctx.pool, spec.intent, &resource).await?;
-    let input = Effects::consume_stdin(&ctx.pool, spec.intent, &resource, master).await?;
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(input.as_bytes())?,
-        json!({"value":"owned-secret-input"})
-    );
-    let version = ordinary_file_version(&ctx, execution).await?;
-    Effects::record_exit(
-        &ctx.pool,
-        spec.intent,
-        &resource,
-        LaunchExitOutcome {
-            exit_code: 0,
-            oom_killed: false,
-        },
-    )
-    .await?;
-    let token = WorkerTokenProvider::new(
-        owner,
-        worker.to_string(),
-        ctx.state.jwt_config.as_ref().clone(),
-    )
-    .token()?;
-    let path = version.file_path.as_deref().unwrap();
-    assert_eq!(
-        file_upload_admission(&ctx, &token, path).await?,
-        StatusCode::OK
-    );
+        .await?;
+        let permission = PermissionSetRepository::create(
+            &ctx.pool,
+            CreatePermissionSetInput {
+                r#ref: format!("native_file_input_{}", Uuid::new_v4().simple()),
+                pack: None,
+                pack_ref: None,
+                label: None,
+                description: None,
+                grants: json!([{
+                    "resource":"keys", "actions":["read","decrypt"],
+                    "constraints":{"refs":[key.r#ref]}
+                }]),
+            },
+        )
+        .await?;
+        PermissionAssignmentRepository::create(
+            &ctx.pool,
+            CreatePermissionAssignmentInput {
+                identity: owner,
+                permset: permission.id,
+            },
+        )
+        .await?;
+        let source_ref = serde_json::to_string(&SecretProvenance::key(
+            attune_common::key_access::key_origin(&key),
+        ))?;
+        let prepare = || {
+            prepare_secret_values(
+                vec![SecretValueInput {
+                    json_path: "/value".into(),
+                    value: json!("owned-secret-input"),
+                    source_kind: "provenance".into(),
+                    source_ref: Some(source_ref.clone()),
+                }],
+                master,
+            )
+        };
+        let original = prepare()?;
+        let pack_ref = format!("secret_file_{}", Uuid::new_v4().simple());
+        let pack = helpers::create_test_pack(&ctx.pool, &pack_ref).await?;
+        let action_ref = format!("{pack_ref}.source");
+        let action =
+            helpers::create_test_action(&ctx.pool, pack.id, &pack_ref, &action_ref).await?;
+        helpers::activate_test_pack_release_with_projections(
+            &ctx.pool,
+            &pack,
+            &attune_common::repositories::component_lifecycle::PackProjectionIds {
+                actions: vec![action.id],
+                ..Default::default()
+            },
+        )
+        .await?;
+        let mut tx = ctx.pool.begin().await?;
+        let snapshot =
+            ExecutableSnapshotRepository::resolve_for_action(&mut *tx, action.id).await?;
+        let binding = SchemaContractRepository::materialize_action(&mut tx, &snapshot).await?;
+        let row = ExecutionRepository::create_pinned(
+            &mut *tx,
+            CreateExecutionInput {
+                action: Some(action.id),
+                action_ref,
+                executor: Some(owner),
+                permission_set_refs: vec!["standard".into()],
+                timeout_seconds: Some(300),
+                status: attune_common::models::ExecutionStatus::Requested,
+                ..Default::default()
+            },
+            &snapshot,
+        )
+        .await?;
+        let execution = row.id;
+        SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, execution, &binding)
+            .await?;
+        DelegatedExecutionRepository::select(&mut tx, execution, None).await?;
+        RecordedInputAuthorityRepository::capture_human(&mut tx, "execution", execution, owner)
+            .await?;
+        ExecutionRepository::initialize_config_with_conn(
+            &mut tx,
+            execution,
+            None,
+            &snapshot,
+            Some(json!({"value": redaction_marker()})),
+            &original,
+        )
+        .await?;
+        helpers::delegated::start(&mut tx, execution).await?;
+        tx.commit().await?;
+        let (spec, selected, resource) = admitted_execution(&ctx, execution).await?;
+        let LaunchTarget::Execution { worker, .. } = spec.target else {
+            unreachable!()
+        };
+        Effects::reserve(&ctx.pool, &spec, owner, &selected, master).await?;
+        Effects::begin_create(&ctx.pool, spec.intent, master).await?;
+        Effects::record_resource(&ctx.pool, spec.intent, &resource).await?;
+        let input = Effects::consume_stdin(&ctx.pool, spec.intent, &resource, master).await?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(input.as_bytes())?,
+            json!({"value":"owned-secret-input"})
+        );
+        let version = ordinary_file_version(&ctx, execution).await?;
+        Effects::record_exit(
+            &ctx.pool,
+            spec.intent,
+            &resource,
+            LaunchExitOutcome {
+                exit_code: 0,
+                oom_killed: false,
+            },
+        )
+        .await?;
+        let token = WorkerTokenProvider::new(
+            owner,
+            worker.to_string(),
+            ctx.state.jwt_config.as_ref().clone(),
+        )
+        .token()?;
+        let path = version.file_path.as_deref().unwrap();
+        assert_eq!(
+            file_upload_admission(&ctx, &token, path).await?,
+            StatusCode::OK
+        );
 
-    // Equal plaintext with new ciphertext is a new selected input. Restoring
-    // the exact old bytes cannot revive the effect's earlier source epochs.
-    ExecutionSecretValueRepository::upsert_many(
-        &ctx.pool,
-        ENTITY_EXECUTION_CONFIG,
-        execution,
-        &prepare()?,
-    )
-    .await?;
-    assert_eq!(
-        file_upload_admission(&ctx, &token, path).await?,
-        StatusCode::FORBIDDEN
-    );
-    ExecutionSecretValueRepository::upsert_many(
-        &ctx.pool,
-        ENTITY_EXECUTION_CONFIG,
-        execution,
-        &original,
-    )
-    .await?;
-    assert_eq!(
-        file_upload_admission(&ctx, &token, path).await?,
-        StatusCode::FORBIDDEN
-    );
-    assert_eq!(
-        ArtifactVersionRepository::find_by_id(&ctx.pool, version.id)
-            .await?
-            .unwrap()
-            .body_state,
-        Some(ArtifactBodyState::Pending)
-    );
+        // Equal plaintext with new ciphertext is a new selected input. Restoring
+        // the exact old bytes cannot revive the effect's earlier source epochs.
+        ExecutionSecretValueRepository::upsert_many(
+            &ctx.pool,
+            ENTITY_EXECUTION_CONFIG,
+            execution,
+            &prepare()?,
+        )
+        .await?;
+        assert_eq!(
+            file_upload_admission(&ctx, &token, path).await?,
+            StatusCode::FORBIDDEN
+        );
+        ExecutionSecretValueRepository::upsert_many(
+            &ctx.pool,
+            ENTITY_EXECUTION_CONFIG,
+            execution,
+            &original,
+        )
+        .await?;
+        assert_eq!(
+            file_upload_admission(&ctx, &token, path).await?,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            ArtifactVersionRepository::find_by_id(&ctx.pool, version.id)
+                .await?
+                .unwrap()
+                .body_state,
+            Some(ArtifactBodyState::Pending)
+        );
+        Ok(())
+    }
+    .await;
     ctx.cleanup().await?;
-    Ok(())
+    result
 }
 
 async fn stopped_file(
