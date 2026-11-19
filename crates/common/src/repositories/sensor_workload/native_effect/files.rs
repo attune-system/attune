@@ -310,7 +310,7 @@ impl SensorWorkloadRepository {
         if incomplete {
             return Err(denied());
         }
-        sqlx::query("UPDATE sensor_workload_assignment SET native_effect=NULL WHERE workload=$1")
+        sqlx::query("UPDATE sensor_workload_assignment SET native_effect=NULL,native_closed_generation=GREATEST(native_closed_generation,generation) WHERE workload=$1")
             .bind(workload)
             .execute(&mut *tx)
             .await?;

@@ -768,6 +768,10 @@ async fn native_sensor_ordinary_files_publish_after_stop_without_run_or_legacy_f
         .bind(workload.workload_id)
         .execute(&ctx.pool)
         .await?;
+    assert!(
+        !SensorWorkloadRepository::is_current_fence(&ctx.pool, workload.fence()).await?,
+        "clearing missing native evidence cannot revive the closed generation"
+    );
     assert_eq!(
         put(
             &ctx,

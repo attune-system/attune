@@ -186,7 +186,7 @@ impl SensorWorkloadRepository {
         workload: Id,
         effect: &SensorNativeEffect,
     ) -> Result<()> {
-        sqlx::query("UPDATE sensor_workload_assignment SET native_effect=$2 WHERE workload=$1")
+        sqlx::query("UPDATE sensor_workload_assignment SET native_effect=$2,native_closed_generation=CASE WHEN ($2->>'stop_requested')::BOOLEAN THEN GREATEST(native_closed_generation,generation) ELSE native_closed_generation END WHERE workload=$1")
             .bind(workload)
             .bind(Json(effect))
             .execute(&mut **tx)

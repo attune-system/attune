@@ -602,12 +602,14 @@ API upload/completion; Ready versions request a size receipt without reading gue
 or published plaintext. Every selected version, including an empty file, requires
 an exact positive receipt before acknowledged provider removal can clear the effect.
 Runtime-log versions retain their separate generation and sealing contracts.
-A monotonic assignment marker prevents unbound Pending versions from falling back
+A monotonic closed-generation frontier keeps old Sensor Run closed after effect
+clearance; the next admitted generation can provision normally. A separate
+monotonic assignment marker prevents unbound Pending versions from falling back
 to legacy owner/ref authorization after native effects have been used. Only an
 explicitly legacy-only assignment retains that path; Ready historical responses
 remain receipts and native/historical Ready files reject plaintext PUT staging.
-Stop retains the existing assignment lease and closes Run with its durable flag. Pending
-publication by the original manager requires that retained deadline and its fresh
+Stop retains the existing assignment lease and closes Run with its durable flag.
+Pending publication by the original manager requires that retained deadline and its fresh
 worker heartbeat, including after artifact/version waits. Neither stop nor release
 creates or extends publication authority; an expired or missing deadline retains
 pending files. Ready size acknowledgements are historical receipts, not new body

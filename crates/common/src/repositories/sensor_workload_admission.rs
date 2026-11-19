@@ -109,7 +109,7 @@ impl SensorWorkloadAdmissionRepository {
             "SELECT COUNT(*) FROM sensor_workload_assignment AS assignment \
              JOIN sensor_workload AS workload ON workload.id = assignment.workload \
              WHERE assignment.worker = $1 \
-               AND NOT COALESCE((assignment.native_effect->>'stop_requested')::BOOLEAN,false) AND assignment.lease_expires_at > clock_timestamp() \
+               AND assignment.lease_expires_at > clock_timestamp() \
                AND workload.sensor <> $2",
         )
         .bind(worker_id)
