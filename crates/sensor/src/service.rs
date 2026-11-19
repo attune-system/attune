@@ -75,6 +75,12 @@ impl SensorService {
     /// Create a new sensor service
     pub async fn new(config: Config) -> Result<Self> {
         info!("Initializing Sensor Service");
+        let native = match &config.workload {
+            Some(workload) => Some(Arc::new(
+                attune_workload_backend::configuration::configure(workload).await?,
+            )),
+            None => None,
+        };
         let child_environment =
             attune_common::child_process_environment::ChildProcessEnvironment::capture(
                 config
@@ -83,12 +89,14 @@ impl SensorService {
                     .map(|sensor| sensor.passthrough_env.as_slice())
                     .unwrap_or(&[]),
             )?
-            .with_workload_sandbox(
+            .with_workload_sandbox(if config.workload.is_some() {
+                attune_common::workload_sandbox::WorkloadSandbox::NativeEffectsRequired
+            } else {
                 attune_common::workload_sandbox::WorkloadSandbox::from_environment(
                     config.artifacts.transport
                         == attune_common::artifact_transport::TransportMode::Api,
-                )?,
-            );
+                )?
+            });
         config.validate_deployed_pack_transport()?;
         config.validate_deployed_artifact_transport()?;
         let configured_api_url = std::env::var("ATTUNE_API_URL").ok();
@@ -247,6 +255,8 @@ impl SensorService {
         let sensor_manager = Arc::new(SensorManager::new(
             db.clone(),
             SensorManagerConfig {
+                native,
+                workload_config: config.workload.clone(),
                 encryption_key: config.security.encryption_key.clone(),
                 child_environment,
                 api_url,

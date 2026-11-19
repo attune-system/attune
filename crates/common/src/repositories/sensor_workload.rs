@@ -1,3 +1,4 @@
+pub mod native_effect;
 use chrono::{DateTime, Utc};
 use sqlx::{Executor, PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
@@ -137,6 +138,16 @@ impl SensorWorkloadRepository {
         .fetch_one(&mut *connection)
         .await?;
 
+        let pending: bool = sqlx::query_scalar(
+            "SELECT native_effect IS NOT NULL FROM sensor_workload_assignment WHERE workload=$1",
+        )
+        .bind(workload.id)
+        .fetch_one(&mut *connection)
+        .await?;
+        if pending {
+            return Ok(AcquireSensorWorkloadOutcome::HeldByOther(assignment));
+        }
+
         let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
             .fetch_one(&mut *connection)
             .await?;
@@ -200,6 +211,7 @@ impl SensorWorkloadRepository {
                AND assignment.worker = $2 \
                AND assignment.worker_instance = $3 \
                AND assignment.generation = $4 \
+               AND assignment.native_effect IS NULL \
                AND assignment.lease_expires_at > clock_timestamp() \
              RETURNING assignment.workload AS workload_id, workload.sensor AS sensor_id, \
                        assignment.worker AS worker_id, assignment.worker_instance, \

@@ -10,6 +10,8 @@
 //! - Provisioning authentication tokens for sensor processes
 //! - Monitoring sensor health and restarting failed sensors
 
+mod native;
+
 use anyhow::{anyhow, Result};
 use attune_common::artifact_transport::{sync_local_file_to_transport, ArtifactFileTransport};
 use attune_common::auth::WorkerTokenProvider;
@@ -689,6 +691,8 @@ pub struct SensorManager {
 }
 
 pub struct SensorManagerConfig {
+    pub native: Option<Arc<attune_workload_backend::configuration::ConfiguredBackend>>,
+    pub workload_config: Option<attune_common::workload_config::WorkloadConfig>,
     pub encryption_key: Option<String>,
     pub child_environment: ChildProcessEnvironment,
     pub api_url: String,
@@ -760,6 +764,8 @@ fn remove_if_identity<T>(
 }
 
 struct SensorManagerInner {
+    native: Option<Arc<attune_workload_backend::configuration::ConfiguredBackend>>,
+    workload_config: Option<attune_common::workload_config::WorkloadConfig>,
     encryption_key: Option<String>,
     child_environment: ChildProcessEnvironment,
     db: PgPool,
@@ -812,6 +818,8 @@ impl SensorManager {
 
         Self {
             inner: Arc::new(SensorManagerInner {
+                native: config.native,
+                workload_config: config.workload_config,
                 encryption_key: config.encryption_key,
                 child_environment: config.child_environment,
                 db,
@@ -1215,6 +1223,9 @@ impl SensorManager {
             return Ok(());
         }
 
+        if self.inner.native.is_some() {
+            self.reconcile_native_sensor(sensor.id).await?;
+        }
         let Some(workload) = self.acquire_sensor_workload(sensor.id).await? else {
             info!(
                 "Skipping sensor {} because another worker owns its workload",
@@ -1303,7 +1314,7 @@ impl SensorManager {
 
         if !*self.inner.running.read().await {
             instance.cancel_token_rotation();
-            instance.stop().await;
+            instance.stop().await?;
             self.sync_sensor_file_artifacts(&sensor).await;
             self.persist_sensor_process_stopped(&sensor).await;
             let _ = SensorWorkloadRepository::release(&self.inner.db, workload.fence()).await;
@@ -1320,7 +1331,7 @@ impl SensorManager {
         let replaced = self.inner.sensors.write().await.insert(sensor.id, instance);
         if let Some(mut replaced) = replaced {
             replaced.cancel_token_rotation();
-            replaced.stop().await;
+            replaced.stop().await?;
             self.sync_sensor_file_artifacts(&replaced.sensor).await;
         }
         self.schedule_sensor_token_rotation(
@@ -1436,6 +1447,20 @@ impl SensorManager {
         let exec_config = version_config_override
             .clone()
             .unwrap_or_else(|| runtime.parsed_execution_config());
+        if self.inner.native.is_some() {
+            return self
+                .start_native_sensor(
+                    sensor,
+                    workload,
+                    pack_revision,
+                    definition_updated,
+                    token_response.token,
+                    token_expires_at,
+                    &exec_config,
+                    reset_failure_count,
+                )
+                .await;
+        }
         let rt_name = runtime.name.to_lowercase();
         let base_runtime_suffix = runtime
             .r#ref
@@ -2050,9 +2075,12 @@ impl SensorManager {
     async fn sensor_instance_running(&self, sensor_id: Id) -> bool {
         let instance_state = {
             let sensors = self.inner.sensors.read().await;
-            sensors
-                .get(&sensor_id)
-                .map(|instance| (instance.status.clone(), instance.child_process.is_some()))
+            sensors.get(&sensor_id).map(|instance| {
+                (
+                    instance.status.clone(),
+                    (instance.child_process.is_some() || instance.native.is_some()),
+                )
+            })
         };
 
         let Some((status, has_child)) = instance_state else {
@@ -2074,6 +2102,11 @@ impl SensorManager {
     }
 
     async fn sync_sensor_file_artifacts(&self, sensor: &Sensor) {
+        if self.inner.native.is_some() {
+            // Guest artifact publication requires exact stopped-tree receipts;
+            // manager filesystem paths cannot stand in for native artifacts.
+            return;
+        }
         if self.inner.artifact_transport.transport_mode() == "volume" {
             return;
         }
@@ -2184,7 +2217,10 @@ impl SensorManager {
         };
         if let Some(mut instance) = instance {
             instance.cancel_token_rotation();
-            instance.stop().await;
+            if let Err(error) = instance.stop().await {
+                warn!(%error, "Sensor stop remains incomplete");
+                return;
+            }
             if let Err(error) =
                 SensorWorkloadRepository::release(&self.inner.db, instance.workload.fence()).await
             {
@@ -2764,7 +2800,7 @@ impl SensorManager {
         };
         let old_fence = old_instance.workload.fence();
         old_instance.cancel_token_rotation();
-        old_instance.stop().await;
+        old_instance.stop().await?;
         self.sync_sensor_file_artifacts(&old_instance.sensor).await;
         self.persist_sensor_process_stopped(&old_instance.sensor)
             .await;
@@ -2844,7 +2880,7 @@ impl SensorManager {
             let sensor = instance.sensor.clone();
             let workload_fence = instance.workload.fence();
             instance.cancel_token_rotation();
-            instance.stop().await;
+            instance.stop().await?;
             self.sync_sensor_file_artifacts(&sensor).await;
             self.persist_sensor_process_stopped(&sensor).await;
             if let Err(error) =
@@ -3454,6 +3490,25 @@ impl SensorManager {
                 let mut exited = Vec::new();
 
                 for (sensor_id, instance) in sensors.iter_mut() {
+                    if let Some(native) = &mut instance.native {
+                        match native.poll_exit().await {
+                            Ok(Some(exit)) => {
+                                instance.cancel_token_rotation();
+                                exited.push(ExitedSensorProcess {
+                                    sensor: instance.sensor.clone(),
+                                    status: instance.status.clone(),
+                                    instance_identity: instance.token_rotation.clone(),
+                                    exit_code: Some(exit.exit_code),
+                                    signal: None,
+                                });
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                warn!(%error,"Native sensor exit/capture remains uncertain")
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(child) = instance.child_process.as_mut() {
                         match child.try_wait() {
                             Ok(Some(exit_status)) => {
@@ -3956,6 +4011,7 @@ impl SensorManager {
 
 /// Sensor instance managing a running sensor
 struct SensorInstance {
+    native: Option<native::NativeSensor>,
     prepared_target: Option<attune_common::runtime_lifecycle::PreparedTarget>,
     sensor: Sensor,
     sensor_ref: String,
@@ -3984,6 +4040,7 @@ impl SensorInstance {
         let sensor_ref = sensor.r#ref.clone();
         let (stdout_handle, stderr_handle) = output_handles;
         Self {
+            native: None,
             prepared_target: None,
             sensor,
             sensor_ref,
@@ -4009,12 +4066,32 @@ impl SensorInstance {
     }
 
     /// Stop the sensor
-    async fn stop(&mut self) {
+    async fn stop(&mut self) -> Result<()> {
         {
             let mut status = self.status.write().await;
             status.running = false;
         }
 
+        if let Some(native) = &mut self.native {
+            native.stop().await?;
+            // Drain separate streams to genuine EOF and sealed custody. An
+            // uncertain drain retains the durable capture obligation.
+            for handle in [&mut self.stdout_handle, &mut self.stderr_handle] {
+                if let Some(mut task) = handle.take() {
+                    match timeout(Duration::from_secs(30), &mut task).await {
+                        Ok(result) => {
+                            result?;
+                        }
+                        Err(_) => {
+                            task.abort();
+                            let _ = task.await;
+                            return Err(anyhow!("Native sensor capture incomplete"));
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
         // Capture ownership before wait() can erase the leader ID. A missing
         // ID is not proof that descendants have stopped.
         let recipe_group = self.child_process.as_ref().and_then(Child::id);
@@ -4047,6 +4124,7 @@ impl SensorInstance {
                     "Retaining sensor generation because process-group teardown is unconfirmed"),
             }
         }
+        Ok(())
     }
 
     /// Get sensor status
@@ -4957,7 +5035,7 @@ mod tests {
         instance.prepared_target = Some(target);
         assert_eq!(instance.definition_updated, definition_updated);
         assert_ne!(instance.sensor.updated, instance.definition_updated);
-        instance.stop().await;
+        instance.stop().await.unwrap();
 
         assert!(instance.stdout_handle.is_none());
         assert!(instance.stderr_handle.is_none());
@@ -5062,7 +5140,7 @@ mod tests {
         );
         assert_eq!(instance.definition_updated, definition_updated);
         assert_ne!(instance.sensor.updated, instance.definition_updated);
-        instance.stop().await;
+        instance.stop().await.unwrap();
 
         assert!(instance.stdout_handle.is_none());
         assert!(instance.stderr_handle.is_none());

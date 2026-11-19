@@ -441,6 +441,16 @@ impl SensorWorkerRegistration {
     /// The actual detection happens in `detect_capabilities_async`.
     /// Detect available runtimes using the unified runtime detector
     pub async fn detect_capabilities_async(&mut self, config: &Config) -> Result<()> {
+        if config.workload.is_some() {
+            // Host PATH/interpreter probes cannot advertise guest availability.
+            // Recipe/image discovery is integrated by the shared native producer.
+            self.capabilities.remove(RUNTIME_VERSIONS_CAPABILITY_KEY);
+            self.capabilities.remove("runtime_toolchains");
+            self.capabilities
+                .insert("runtimes".into(), json!(["native"]));
+            return Ok(());
+        }
+
         // If the agent has already populated runtime_versions via
         // `set_detected_runtimes`, skip DB-driven detection so we don't
         // clobber the agent-provided interpreter metadata.

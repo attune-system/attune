@@ -56,6 +56,14 @@ fn main() -> Result<()> {
         } else {
             None
         };
+        if config
+            .as_ref()
+            .is_some_and(|config| config.workload.is_some())
+        {
+            anyhow::bail!(
+                "Native sensor detection requires the configured guest discovery producer"
+            );
+        }
         let passthrough = config
             .as_ref()
             .and_then(|config| config.sensor.as_ref())
@@ -94,21 +102,26 @@ fn main() -> Result<()> {
         env!("CARGO_PKG_VERSION")
     );
 
-    let child_environment =
-        attune_common::child_process_environment::ChildProcessEnvironment::capture(
-            config
-                .sensor
-                .as_ref()
-                .map(|sensor| sensor.passthrough_env.as_slice())
-                .unwrap_or(&[]),
-        )?
-        .with_workload_sandbox(
-            attune_common::workload_sandbox::WorkloadSandbox::from_environment(
-                config.artifacts.transport == attune_common::artifact_transport::TransportMode::Api,
-            )?,
-        );
-    let bootstrap = bootstrap_runtime_env("ATTUNE_SENSOR_RUNTIMES", &child_environment)?;
-    let agent_detected_runtimes = bootstrap.detected_runtimes.clone();
+    let agent_detected_runtimes = if config.workload.is_some() {
+        None
+    } else {
+        let child_environment =
+            attune_common::child_process_environment::ChildProcessEnvironment::capture(
+                config
+                    .sensor
+                    .as_ref()
+                    .map(|sensor| sensor.passthrough_env.as_slice())
+                    .unwrap_or(&[]),
+            )?
+            .with_workload_sandbox(
+                attune_common::workload_sandbox::WorkloadSandbox::from_environment(
+                    config.artifacts.transport
+                        == attune_common::artifact_transport::TransportMode::Api,
+                )?,
+            );
+        let bootstrap = bootstrap_runtime_env("ATTUNE_SENSOR_RUNTIMES", &child_environment)?;
+        bootstrap.detected_runtimes.clone()
+    };
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async_main(args.name, config, agent_detected_runtimes))

@@ -3039,3 +3039,161 @@ async fn staged_sensor_source_checks_lease_after_queued_target_lock() {
     ));
     database.cleanup().await.unwrap();
 }
+
+#[tokio::test]
+async fn native_sensor_effect_fences_stale_generation_replay_and_restart() {
+    use attune_common::isolated_process::ResourceIdentity;
+    use attune_common::workload_launch::LaunchExitOutcome;
+    let (pool, sensor, worker, _) = setup_fixture().await;
+    create_active_rule(&pool, &sensor).await;
+    let master = "0123456789abcdef0123456789abcdef";
+    let incarnation = Uuid::new_v4();
+    let outcome = SensorWorkloadAdmissionRepository::acquire_with_encryption_key(
+        &pool,
+        acquire_input(sensor.id, worker.id, incarnation),
+        Some(master),
+    )
+    .await
+    .unwrap();
+    let AcquireEligibleSensorWorkloadOutcome::Acquired(workload) = outcome else {
+        panic!("admission")
+    };
+    let intent = Uuid::new_v4();
+    let stale = SensorWorkloadFence {
+        generation: workload.generation + 1,
+        ..workload.fence()
+    };
+    assert!(SensorWorkloadRepository::reserve_native_effect(
+        &pool,
+        sensor.id,
+        stale,
+        intent,
+        "private-sensor-token",
+        master
+    )
+    .await
+    .is_err());
+    SensorWorkloadRepository::reserve_native_effect(
+        &pool,
+        sensor.id,
+        workload.fence(),
+        intent,
+        "private-sensor-token",
+        master,
+    )
+    .await
+    .unwrap();
+    let retained = SensorWorkloadRepository::native_effect(&pool, workload.workload_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!retained.encrypted_context.contains("private-sensor-token"));
+    assert!(!retained.capture_complete());
+    SensorWorkloadRepository::consume_native_effect(
+        &pool,
+        sensor.id,
+        workload.fence(),
+        intent,
+        false,
+    )
+    .await
+    .unwrap();
+    // A lost create acknowledgement cannot become another CreateOnce.
+    assert!(SensorWorkloadRepository::consume_native_effect(
+        &pool,
+        sensor.id,
+        workload.fence(),
+        intent,
+        false
+    )
+    .await
+    .is_err());
+    let resource = ResourceIdentity::Docker {
+        engine_id: 1,
+        daemon_id: "owned-daemon".into(),
+        container_id: "exact-sensor".into(),
+    };
+    SensorWorkloadRepository::record_native_resource(
+        &pool,
+        workload.workload_id,
+        intent,
+        &resource,
+    )
+    .await
+    .unwrap();
+    SensorWorkloadRepository::consume_native_effect(
+        &pool,
+        sensor.id,
+        workload.fence(),
+        intent,
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(SensorWorkloadRepository::consume_native_effect(
+        &pool,
+        sensor.id,
+        workload.fence(),
+        intent,
+        true
+    )
+    .await
+    .is_err());
+    SensorWorkloadRepository::stop_native_effect(&pool, workload.workload_id, intent)
+        .await
+        .unwrap();
+    assert!(
+        !SensorWorkloadRepository::is_current_fence(&pool, workload.fence())
+            .await
+            .unwrap()
+    );
+    assert!(SensorWorkloadRepository::unsettled_native_for_sensor(
+        &pool,
+        sensor.id,
+        Uuid::new_v4()
+    )
+    .await
+    .unwrap()
+    .is_some());
+    // A new incarnation cannot increment the generation or discard obligations.
+    assert!(matches!(
+        SensorWorkloadRepository::acquire_or_renew(
+            &pool,
+            acquire_input(sensor.id, worker.id, Uuid::new_v4())
+        )
+        .await
+        .unwrap(),
+        AcquireSensorWorkloadOutcome::HeldByOther(_)
+    ));
+    SensorWorkloadRepository::record_native_exit(
+        &pool,
+        workload.workload_id,
+        intent,
+        &resource,
+        LaunchExitOutcome {
+            exit_code: 0,
+            oom_killed: false,
+        },
+    )
+    .await
+    .unwrap();
+    SensorWorkloadRepository::record_native_capture(&pool, workload.workload_id, intent, false)
+        .await
+        .unwrap();
+    let retained = SensorWorkloadRepository::native_effect(&pool, workload.workload_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !retained.capture_complete(),
+        "stdout does not prove stderr custody"
+    );
+    assert!(
+        SensorWorkloadRepository::native_effect(&pool, workload.workload_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "exit is not cleanup authority"
+    );
+    pool.cleanup().await.unwrap();
+}

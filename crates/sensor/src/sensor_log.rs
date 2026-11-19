@@ -123,7 +123,7 @@ impl RotatingLogWriter {
         &self.relative_path
     }
 
-    async fn ensure_writer(&mut self) -> anyhow::Result<()> {
+    pub(crate) async fn ensure_writer(&mut self) -> anyhow::Result<()> {
         if self.writer.is_none() {
             self.allocate_new_version_file().await?;
         }

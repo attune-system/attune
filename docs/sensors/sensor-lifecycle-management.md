@@ -569,3 +569,32 @@ async fn test_end_to_end_lifecycle() {
 - [Timer Sensor Implementation](../crates/core-timer-sensor/README.md)
 - [Token Security](token-security.md)
 - [Rule Lifecycle Events](rule-lifecycle.md)
+
+### Native managed sensor migration
+
+With `workload` configured, the sensor service constructs the closed native
+Kubernetes/Docker backend before any host runtime discovery. Its captured child
+policy denies residual local launches. The existing manager still owns placement,
+workload generation admission, token provisioning/renewal, configuration restoration,
+events and log artifacts. Ordinary released sensor entrypoints use private native
+resources with the retained release archive, configured image/platform and public
+Runner pins. Bootstrap stays exact stdin JSON with a 32 MiB sensor ceiling; the
+shared purpose-bound stdin constructor must be integrated before larger native
+bootstraps are supported. Host interpreter inventories are never guest evidence.
+
+Migration `20261119000008_sensor_native_effect.sql` adds encrypted retained effect
+context to the existing assignment row. Source epochs and the live generation fence
+protect create and one-shot stdin decisions. A lost create/commit acknowledgement
+cannot permit a second create. Stop expires the API assignment lease before provider
+settlement. Restart reconciles only the same retained intent, never replaying stdin.
+Separate bounded stdout/stderr readers use existing manager-owned encrypted log
+artifacts; only genuine EOF plus successful sealing records a capture receipt.
+
+This path is work in progress and does not activate deployment defaults. Runtime
+recipes/setup require the shared native discovery/private-generation producer and
+remain explicitly denied. Native stopped file-output inventory/publication receipts
+are also pending. Consequently stopped resources and their assignment evidence are
+retained, and a new generation (including retry or token-rotation restart) remains
+blocked until those obligations can be settled. Provider exit, 404, missing capture
+or a manager filesystem scan cannot clear them. Provider/PG fixtures and complete
+lifecycle acceptance remain required before activation.
