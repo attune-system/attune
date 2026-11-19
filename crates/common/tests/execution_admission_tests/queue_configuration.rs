@@ -1048,6 +1048,12 @@ async fn mixed_queue_receipts_bind_each_contributor_and_structured_secret_after_
             .await
             .is_err()
     );
+    assert!(
+        Materialization::prepare_execution_input_receipts(&mut revoked, retry.id, QUEUE_KEY)
+            .await
+            .is_err(),
+        "revoked policy denies new retry input delivery despite retained evidence"
+    );
     revoked.rollback().await.unwrap();
     tx.commit().await.unwrap();
     db.cleanup().await.unwrap();
@@ -1236,6 +1242,308 @@ async fn queue_input_creation_marker_never_backfills_history_or_accepts_updated_
         assert!(sqlx::query("UPDATE work_queue_item SET input_creation_transaction=pg_current_xact_id() WHERE id=$1").bind(item.id).execute(&mut *overwrite).await.is_err());
         overwrite.rollback().await.unwrap();
     }
+    tx.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn queue_key_versions_are_durable_non_value_cohorts_with_independent_binding_checks() {
+    use attune_common::{
+        crypto,
+        models::WorkQueueItemStatus,
+        repositories::{
+            key::{KeyRepository, UpdateKeyInput},
+            queue_configuration_input::QueueConfigurationInputRepository as Fixed,
+            work_queue::{LeaseWorkQueueItemsInput, WorkQueueItemRepository},
+        },
+    };
+    let (db, snapshot, policy, human) = fixture_with_defaults(true).await;
+    let plain = helpers::KeyFixture::new_pack(
+        policy.owner.pack_id,
+        &policy.owner.pack_ref,
+        "plain_revision",
+        "plain-before",
+    )
+    .create(&db)
+    .await
+    .unwrap();
+    let encrypted = helpers::KeyFixture::new_pack(
+        policy.owner.pack_id,
+        &policy.owner.pack_ref,
+        "encrypted_revision",
+        "unused",
+    )
+    .create(&db)
+    .await
+    .unwrap();
+    KeyRepository::update(
+        &db,
+        encrypted.id,
+        UpdateKeyInput {
+            encrypted: Some(true),
+            value: Some(
+                crypto::keystore::encrypt_json(&json!("encrypted-before"), QUEUE_KEY, encrypted.id)
+                    .unwrap(),
+            ),
+            encryption_key_hash: Some(
+                crypto::keystore::fingerprint(QUEUE_KEY, encrypted.id).unwrap(),
+            ),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut tx = db.begin().await.unwrap();
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await
+        .unwrap();
+    let queue =
+        WorkQueueRepository::find_by_ref(&mut *tx, &format!("{}.inbox", policy.owner.pack_ref))
+            .await
+            .unwrap()
+            .unwrap();
+    let queue=WorkQueueRepository::update(&mut *tx,queue.id,UpdateWorkQueueInput {action_params:Some(json!({"value":format!("{{{{ keystore['{}'] + ':' + keystore['{}'] }}}}",plain.r#ref,encrypted.r#ref)})),..Default::default()}).await.unwrap();
+    let revision = Authority::capture_policy(&mut tx, &policy).await.unwrap();
+    Authority::activate_policy(&mut tx, revision.id)
+        .await
+        .unwrap();
+    let first = accepted_record(
+        &mut tx,
+        &queue,
+        &snapshot,
+        human,
+        json!({"message":"first"}),
+    )
+    .await;
+    let second = accepted_record(
+        &mut tx,
+        &queue,
+        &snapshot,
+        human,
+        json!({"message":"second"}),
+    )
+    .await;
+    let original = Fixed::load(&mut tx, &queue, &first, &snapshot, QUEUE_KEY)
+        .await
+        .unwrap();
+    let stable = Fixed::load(&mut tx, &queue, &second, &snapshot, QUEUE_KEY)
+        .await
+        .unwrap();
+    assert!(original.compatible_fixed_inputs(&stable));
+    let versions: serde_json::Value = sqlx::query_scalar(
+        "SELECT binding->'key_versions' FROM work_queue_item_configuration_input WHERE item=$1",
+    )
+    .bind(first.id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(
+        versions,
+        json!({plain.r#ref.clone():{"key":plain.id,"revision":1},encrypted.r#ref.clone():{"key":encrypted.id,"revision":2}}),
+        "cohort identity contains only repository-owned IDs/revisions, never value fingerprints"
+    );
+    let changed = KeyRepository::update(
+        &mut *tx,
+        plain.id,
+        UpdateKeyInput {
+            value: Some(json!("plain-after")),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let third = accepted_record(
+        &mut tx,
+        &queue,
+        &snapshot,
+        human,
+        json!({"message":"plain changed"}),
+    )
+    .await;
+    let changed_plain = Fixed::load(&mut tx, &queue, &third, &snapshot, QUEUE_KEY)
+        .await
+        .unwrap();
+    assert!(!original.compatible_fixed_inputs(&changed_plain));
+    KeyRepository::update(
+        &mut *tx,
+        encrypted.id,
+        UpdateKeyInput {
+            value: Some(
+                crypto::keystore::encrypt_json(&json!("encrypted-after"), QUEUE_KEY, encrypted.id)
+                    .unwrap(),
+            ),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let fourth = accepted_record(
+        &mut tx,
+        &queue,
+        &snapshot,
+        human,
+        json!({"message":"encrypted changed"}),
+    )
+    .await;
+    let changed_encrypted = Fixed::load(&mut tx, &queue, &fourth, &snapshot, QUEUE_KEY)
+        .await
+        .unwrap();
+    assert!(!changed_plain.compatible_fixed_inputs(&changed_encrypted));
+    assert_eq!(
+        original.resolved_keys()[&plain.r#ref].value,
+        json!("plain-before")
+    );
+    assert_eq!(
+        original.resolved_keys()[&encrypted.r#ref].value,
+        json!("encrypted-before")
+    );
+    for expected in [vec![first.id, second.id], vec![third.id], vec![fourth.id]] {
+        let leased = WorkQueueItemRepository::lease_next_batch(
+            &mut *tx,
+            LeaseWorkQueueItemsInput {
+                separate_requesters: false,
+                queue: queue.id,
+                ready_statuses: vec![WorkQueueItemStatus::Queued],
+                limit: 10,
+                batch_coalescing: None,
+                leased_execution: None,
+                lease_token: uuid::Uuid::new_v4(),
+                lease_expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(leased.iter().map(|item|item.id).collect::<Vec<_>>(),expected,"retained version cohorts preserve FIFO progress without mixing different accepted credentials");
+    }
+    sqlx::query("UPDATE key SET input_revision=999999 WHERE id=$1")
+        .bind(plain.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let ignored: i64 = sqlx::query_scalar("SELECT input_revision FROM key WHERE id=$1")
+        .bind(plain.id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(
+        ignored, 3,
+        "supplied revisions never replace the database increment"
+    );
+    let latest = KeyRepository::update(
+        &mut *tx,
+        plain.id,
+        UpdateKeyInput {
+            value: Some(json!("plain-latest")),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        changed.updated, latest.updated,
+        "same transaction timestamps are deliberately equal"
+    );
+    let latest_revision: i64 = sqlx::query_scalar("SELECT input_revision FROM key WHERE id=$1")
+        .bind(plain.id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(
+        latest_revision, 4,
+        "same-transaction edits have distinct durable revisions"
+    );
+    let fifth = accepted_record(
+        &mut tx,
+        &queue,
+        &snapshot,
+        human,
+        json!({"message":"before synthetic collision"}),
+    )
+    .await;
+    let before_collision = Fixed::load(&mut tx, &queue, &fifth, &snapshot, QUEUE_KEY)
+        .await
+        .unwrap();
+    // Owned corruption fixture only: bypass the update trigger to force a tag
+    // collision. A cohort tag must never authorize different accepted bytes.
+    sqlx::query("ALTER TABLE key DISABLE TRIGGER advance_key_input_revision")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    KeyRepository::update(
+        &mut *tx,
+        plain.id,
+        UpdateKeyInput {
+            value: Some(json!("collision-value")),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("ALTER TABLE key ENABLE TRIGGER advance_key_input_revision")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let sixth = accepted_record(
+        &mut tx,
+        &queue,
+        &snapshot,
+        human,
+        json!({"message":"synthetic collision"}),
+    )
+    .await;
+    let collision = Fixed::load(&mut tx, &queue, &sixth, &snapshot, QUEUE_KEY)
+        .await
+        .unwrap();
+    let colliding_versions:Vec<serde_json::Value>=sqlx::query_scalar("SELECT binding->'key_versions' FROM work_queue_item_configuration_input WHERE item=ANY($1) ORDER BY item").bind([fifth.id,sixth.id].as_slice()).fetch_all(&mut *tx).await.unwrap();
+    assert_eq!(colliding_versions[0], colliding_versions[1]);
+    assert!(
+        !before_collision.compatible_fixed_inputs(&collision),
+        "exact sealed values/origins remain decisive even if optimization tags collide"
+    );
+    assert_eq!(
+        before_collision.resolved_keys()[&plain.r#ref].value,
+        json!("plain-latest")
+    );
+    sqlx::query("ALTER TABLE key DISABLE TRIGGER advance_key_input_revision")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE key SET input_revision=9223372036854775807 WHERE id=$1")
+        .bind(plain.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE key ENABLE TRIGGER advance_key_input_revision")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let mut overflow = sqlx::Connection::begin(&mut *tx).await.unwrap();
+    let failure = KeyRepository::update(
+        &mut *overflow,
+        plain.id,
+        UpdateKeyInput {
+            value: Some(json!("must-not-commit")),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&failure,attune_common::Error::Database(sqlx::Error::Database(error)) if error.code().as_deref()==Some("22003")),
+        "overflow must be the atomic BIGINT boundary"
+    );
+    overflow.rollback().await.unwrap();
+    let after_overflow: (i64, serde_json::Value) =
+        sqlx::query_as("SELECT input_revision,value FROM key WHERE id=$1")
+            .bind(plain.id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(
+        after_overflow,
+        (i64::MAX, json!("collision-value")),
+        "overflow fails atomically without changing accepted data"
+    );
     tx.rollback().await.unwrap();
     db.cleanup().await.unwrap();
 }

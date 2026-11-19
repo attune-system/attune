@@ -23,6 +23,13 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct KeyInputVersion {
+    key: Id,
+    revision: i64,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Binding {
     id: Id,
     item: Id,
@@ -41,7 +48,7 @@ struct Binding {
     declarations: Vec<DeclaredInputBinding>,
     keys: BTreeMap<String, KeyOrigin>,
     key_targets: BTreeMap<String, crate::runtime_authority::BoundRuntimeTarget>,
-    key_versions: BTreeMap<String, String>,
+    key_versions: BTreeMap<String, KeyInputVersion>,
     schema: ActionSchemaBinding,
 }
 #[derive(Serialize, Deserialize)]
@@ -65,6 +72,8 @@ impl QueueConfigurationInput {
             && self.sealed.binding.template_digest == other.sealed.binding.template_digest
             && self.sealed.binding.configuration == other.sealed.binding.configuration
             && self.sealed.binding.key_versions == other.sealed.binding.key_versions
+            && self.sealed.binding.keys == other.sealed.binding.keys
+            && self.sealed.binding.key_targets == other.sealed.binding.key_targets
             && self.sealed.binding.schema == other.sealed.binding.schema
             && self.sealed.configuration == other.sealed.configuration
             && self.sealed.keys == other.sealed.keys
@@ -249,8 +258,8 @@ impl QueueConfigurationInputRepository {
         if hash(&body)? != expected {
             return Err(denied());
         }
-        // Key versions hash their stored ciphertext plus qualified origin, never
-        // decrypted secret values. This is grouping, never authorization.
+        // Versions contain only repository-owned Key IDs and durable update
+        // revisions, never a value hash. Grouping is not authorization.
         hash(
             &json!({"policy":body["policy"],"configuration":body["configuration"],"template":body["template_digest"],
             "schema":body["item_schema_digest"],"keys":body["key_versions"]}),
@@ -503,9 +512,13 @@ impl QueueConfigurationInputRepository {
             }
             binding.key_versions.insert(
                 reference.clone(),
-                hash(
-                    &json!({"origin":crate::key_access::key_origin(&key),"stored_value":key.value}),
-                )?,
+                KeyInputVersion {
+                    key: key.id,
+                    revision: KeyRepository::input_revision(conn, key.id)
+                        .await?
+                        .filter(|revision| *revision > 0)
+                        .ok_or_else(denied)?,
+                },
             );
             binding.key_targets.insert(
                 reference.clone(),
@@ -741,6 +754,23 @@ pub(in crate::repositories) fn authenticate_stored(row: &Value, master: &str) ->
         || sealed.binding.item <= 0
         || sealed.binding.authority.policy_id != sealed.binding.policy
         || sealed.binding.authority.owner.pack_id != sealed.binding.pack
+        || sealed
+            .binding
+            .keys
+            .keys()
+            .ne(sealed.binding.key_versions.keys())
+        || sealed
+            .binding
+            .key_versions
+            .iter()
+            .any(|(reference, version)| {
+                version.revision <= 0
+                    || sealed
+                        .binding
+                        .keys
+                        .get(reference)
+                        .is_none_or(|origin| origin.key_id != version.key)
+            })
         || sealed
             .binding
             .keys
