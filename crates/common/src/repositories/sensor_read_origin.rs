@@ -260,10 +260,12 @@ impl SensorOriginFrontier {
             .clone();
         // Preparation is immutable evidence, not a live source permit. Preserve
         // the existing metadata-admission checks, once per actual generation.
-        if !self.live_checked.contains_key(&generation) {
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            self.live_checked.entry(generation)
+        {
             let fence =
                 validate_generation_binding_evidence(connection, generation, &binding).await?;
-            self.live_checked.insert(generation, fence);
+            entry.insert(fence);
         }
         let evidence = self
             .live_checked

@@ -226,8 +226,10 @@ pub(crate) async fn authorize_execution_parameter_origins_with_evidence(
     for secret in secrets {
         check_parameter_origins(
             connection,
-            &authorities,
-            recorded.then_some(execution),
+            ParameterOriginAuthority {
+                authorities: &authorities,
+                recorded_execution: recorded.then_some(execution),
+            },
             &secret.json_path,
             secret,
             &mut visited,
@@ -253,8 +255,10 @@ pub(crate) async fn authorize_execution_control_origins(
     for secret in secrets {
         check_parameter_origins(
             connection,
-            &authorities,
-            None,
+            ParameterOriginAuthority {
+                authorities: &authorities,
+                recorded_execution: None,
+            },
             &secret.json_path,
             secret,
             &mut std::collections::BTreeSet::new(),
@@ -282,8 +286,10 @@ pub async fn authorize_parameter_key_origins_with_conn(
     for secret in secrets {
         check_parameter_origins(
             connection,
-            &authorities,
-            None,
+            ParameterOriginAuthority {
+                authorities: &authorities,
+                recorded_execution: None,
+            },
             &secret.json_path,
             secret,
             &mut std::collections::BTreeSet::new(),
@@ -297,10 +303,15 @@ pub async fn authorize_parameter_key_origins_with_conn(
     Ok(())
 }
 
-fn check_parameter_origins<'a>(
-    connection: &'a mut sqlx::PgConnection,
+#[derive(Clone, Copy)]
+struct ParameterOriginAuthority<'a> {
     authorities: &'a [DelegationAuthority],
     recorded_execution: Option<Id>,
+}
+
+fn check_parameter_origins<'a>(
+    connection: &'a mut sqlx::PgConnection,
+    authority: ParameterOriginAuthority<'a>,
     destination_path: &'a str,
     secret: &'a crate::secret_values::StoredSecretValue,
     visited: &'a mut std::collections::BTreeSet<(String, Id, String)>,
@@ -308,6 +319,10 @@ fn check_parameter_origins<'a>(
     depth: usize,
 ) -> futures::future::BoxFuture<'a, Result<()>> {
     Box::pin(async move {
+        let ParameterOriginAuthority {
+            authorities,
+            recorded_execution,
+        } = authority;
         use crate::secret_provenance::{SecretOrigin, SecretProvenance};
         let denied =
             || Error::PermissionDenied("Execution secret origins are not authorized".into());
@@ -521,8 +536,7 @@ fn check_parameter_origins<'a>(
                     *fence = fence.clone().with_input_dependency(source);
                     check_parameter_origins(
                         &mut *connection,
-                        authorities,
-                        recorded_execution,
+                        authority,
                         destination_path,
                         parent,
                         visited,
