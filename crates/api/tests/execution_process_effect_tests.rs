@@ -33,6 +33,18 @@ async fn admitted_token(
 ) -> Result<(ProcessSpec, SelectedExecutionInput, ResourceIdentity)> {
     let claims = attune_common::auth::jwt::validate_token(token, &ctx.state.jwt_config)?;
     let execution = claims.metadata.unwrap()["execution_id"].as_i64().unwrap();
+    sqlx::query("UPDATE execution SET timeout_seconds=300,config=$2 WHERE id=$1")
+        .bind(execution)
+        .bind(json!({"value":"owned-private-parameters"}))
+        .execute(&ctx.pool)
+        .await?;
+    admitted_execution(ctx, execution).await
+}
+
+async fn admitted_execution(
+    ctx: &TestContext,
+    execution: i64,
+) -> Result<(ProcessSpec, SelectedExecutionInput, ResourceIdentity)> {
     let row = ExecutionRepository::find_by_id(&ctx.pool, execution)
         .await?
         .unwrap();
@@ -44,11 +56,6 @@ async fn admitted_token(
         &ctx.pool, worker, instance,
     )
     .await?;
-    sqlx::query("UPDATE execution SET timeout_seconds=300,config=$2 WHERE id=$1")
-        .bind(execution)
-        .bind(json!({"value":"owned-private-parameters"}))
-        .execute(&ctx.pool)
-        .await?;
     let mut tx = ctx.pool.begin().await?;
     let attempt = DelegatedExecutionRepository::current_attempt(&mut tx, execution).await?;
     let input = ExecutionInputRepository::restore(
@@ -739,10 +746,11 @@ async fn native_secret_input_file_publication_rejects_replaced_and_restored_ciph
         models::{enums::ArtifactBodyState, OwnerType},
         repositories::{
             artifact::ArtifactVersionRepository,
-            execution::UpdateExecutionInput,
+            executable_snapshot::ExecutableSnapshotRepository,
+            execution::CreateExecutionInput,
             execution_secret_value::ExecutionSecretValueRepository,
             key::{CreateKeyInput, KeyRepository},
-            Update,
+            schema_contract::{BindingOwner, SchemaContractRepository},
         },
         secret_provenance::SecretProvenance,
         secret_values::{
@@ -752,15 +760,8 @@ async fn native_secret_input_file_publication_rejects_replaced_and_restored_ciph
     use axum::http::StatusCode;
     attune_common::auth::install_crypto_provider();
     let ctx = TestContext::new().await?.with_admin_auth().await?;
-    let (spec, _, resource) = admitted(&ctx).await?;
     let owner = ctx.user.as_ref().unwrap().id;
     let master = ctx.state.config.security.encryption_key.as_deref().unwrap();
-    let LaunchTarget::Execution {
-        execution, worker, ..
-    } = spec.target
-    else {
-        unreachable!()
-    };
     let key = KeyRepository::create_encrypted_in_pool(
         &ctx.pool,
         CreateKeyInput {
@@ -796,29 +797,54 @@ async fn native_secret_input_file_publication_rejects_replaced_and_restored_ciph
         )
     };
     let original = prepare()?;
-    ExecutionSecretValueRepository::upsert_many(
+    let pack_ref = format!("secret_file_{}", Uuid::new_v4().simple());
+    let pack = helpers::create_test_pack(&ctx.pool, &pack_ref).await?;
+    let action_ref = format!("{pack_ref}.source");
+    let action = helpers::create_test_action(&ctx.pool, pack.id, &pack_ref, &action_ref).await?;
+    helpers::activate_test_pack_release_with_projections(
         &ctx.pool,
-        ENTITY_EXECUTION_CONFIG,
-        execution,
-        &original,
-    )
-    .await?;
-    ExecutionRepository::update(
-        &ctx.pool,
-        execution,
-        UpdateExecutionInput {
-            config: Some(json!({"value": redaction_marker()})),
+        &pack,
+        &attune_common::repositories::component_lifecycle::PackProjectionIds {
+            actions: vec![action.id],
             ..Default::default()
         },
     )
     .await?;
     let mut tx = ctx.pool.begin().await?;
-    let input = ExecutionInputRepository::restore(&mut tx, execution, Some(master), None).await?;
-    let (value, paths, snapshot, expiry) = input.into_parts();
-    assert_eq!(paths, vec!["/value".to_owned()]);
-    let selected = SelectedExecutionInput::new(value, snapshot)?;
-    expiry.ensure_fresh()?;
+    let snapshot = ExecutableSnapshotRepository::resolve_for_action(&mut *tx, action.id).await?;
+    let binding = SchemaContractRepository::materialize_action(&mut tx, &snapshot).await?;
+    let row = ExecutionRepository::create_pinned(
+        &mut *tx,
+        CreateExecutionInput {
+            action: Some(action.id),
+            action_ref,
+            executor: Some(owner),
+            permission_set_refs: vec!["standard".into()],
+            timeout_seconds: Some(300),
+            status: attune_common::models::ExecutionStatus::Requested,
+            ..Default::default()
+        },
+        &snapshot,
+    )
+    .await?;
+    let execution = row.id;
+    SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, execution, &binding).await?;
+    DelegatedExecutionRepository::select(&mut tx, execution, None).await?;
+    ExecutionRepository::initialize_config_with_conn(
+        &mut tx,
+        execution,
+        None,
+        &snapshot,
+        Some(json!({"value": redaction_marker()})),
+        &original,
+    )
+    .await?;
+    helpers::delegated::start(&mut tx, execution).await?;
     tx.commit().await?;
+    let (spec, selected, resource) = admitted_execution(&ctx, execution).await?;
+    let LaunchTarget::Execution { worker, .. } = spec.target else {
+        unreachable!()
+    };
     Effects::reserve(&ctx.pool, &spec, owner, &selected, master).await?;
     Effects::begin_create(&ctx.pool, spec.intent, master).await?;
     Effects::record_resource(&ctx.pool, spec.intent, &resource).await?;
