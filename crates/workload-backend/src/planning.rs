@@ -14,6 +14,9 @@ pub const SETUP_STDIN_LIMIT: usize = 1024 * 1024;
 /// Keep every private JSON fragment below Linux's per-argument byte limit.
 pub const RUNTIME_RECIPE_CHUNK_BYTES: usize = 32 * 1024;
 pub const RUNTIME_TOOL_RESULT_BYTES: usize = 4 * 1024 * 1024;
+pub const RUNTIME_RECIPE_TIMEOUT_CHALLENGE_ENV: &str = "ATTUNE_LAUNCH_RECIPE_TIMEOUT_CHALLENGE";
+pub const RUNTIME_RECIPE_TIMEOUT_CHALLENGE_BYTES: usize = 64;
+pub const RUNTIME_RECIPE_TIMEOUT_RECEIPT: &str = ".attune-recipe-timeout";
 /// Setup-owned source/project output retained with the published runtime.
 pub const PROJECT_ROOT: &str = "/opt/attune/runtime/project";
 /// Runtime invocations use their frozen setup project. Candidate Pack working

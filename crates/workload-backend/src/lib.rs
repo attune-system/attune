@@ -10,6 +10,7 @@ mod kubernetes_io;
 pub mod planning;
 mod probe_capture;
 mod process_policy;
+pub mod recipe_timeout;
 pub mod runner_protocol;
 #[cfg(test)]
 mod test_support;
