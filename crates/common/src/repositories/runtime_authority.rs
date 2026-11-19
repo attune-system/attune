@@ -170,6 +170,7 @@ pub(crate) enum InputAuthorityDependency {
     InquirySchema(Id),
     SecretBuffer(Id),
     ProvenanceBuffer(Id),
+    IdentityPresence(Id),
     ExecutionPresence(Id),
     WorkflowPresence(Id),
     ArtifactVersion(Id),

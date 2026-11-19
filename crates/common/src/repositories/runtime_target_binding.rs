@@ -130,6 +130,24 @@ pub(crate) async fn capture_grants(
     grants: &[AdmittedGrant],
     previous: &BTreeMap<String, GrantTargetBindings>,
 ) -> Result<BTreeMap<String, GrantTargetBindings>> {
+    Ok(
+        capture_grants_input_evidence(connection, owner, grants, previous)
+            .await?
+            .0,
+    )
+}
+
+pub(crate) async fn capture_grants_input_evidence(
+    connection: &mut PgConnection,
+    owner: &crate::runtime_authority::PackAuthorityOwner,
+    grants: &[AdmittedGrant],
+    previous: &BTreeMap<String, GrantTargetBindings>,
+) -> Result<(
+    BTreeMap<String, GrantTargetBindings>,
+    super::runtime_authority::ApprovalEffectFence,
+)> {
+    use super::runtime_authority::{ApprovalEffectFence, InputAuthorityDependency as Dependency};
+    let mut evidence = ApprovalEffectFence::from_input_approval(None)?;
     let mut bindings = BTreeMap::new();
     for grant in grants {
         let key = grant_key(grant)?;
@@ -138,6 +156,7 @@ pub(crate) async fn capture_grants(
         }
         // An unrelated metadata edit must not follow a deleted/recreated ref.
         if let Some(existing) = previous.get(&key) {
+            evidence = evidence.with_input_dependency(Dependency::Incomplete);
             bindings.insert(key, existing.clone());
             continue;
         }
@@ -220,6 +239,7 @@ pub(crate) async fn capture_grants(
                                     )?;
                                 }
                             }
+                            evidence = evidence.with_input_ownership(resolved.input_sources());
                             targets.insert(bound_target(&resolved).ok_or_else(|| {
                                 Error::validation("Concrete target has no stable identity")
                             })?);
@@ -260,20 +280,23 @@ pub(crate) async fn capture_grants(
                             .fetch_all(&mut *connection)
                             .await?;
                         for id in ids {
-                            let managing_pack = if *kind == OwnerType::Identity {
+                            let resolved = if *kind == OwnerType::Identity {
                                 None
                             } else {
-                                RuntimeTargetRepository::resolve(
-                                    connection,
-                                    runtime_target(table, id)?,
-                                    owner.sponsor_identity_id,
+                                Some(
+                                    RuntimeTargetRepository::resolve(
+                                        connection,
+                                        runtime_target(table, id)?,
+                                        owner.sponsor_identity_id,
+                                    )
+                                    .await?
+                                    .ok_or_else(|| {
+                                        Error::validation("Concrete policy owner is unavailable")
+                                    })?,
                                 )
-                                .await?
-                                .ok_or_else(|| {
-                                    Error::validation("Concrete policy owner is unavailable")
-                                })?
-                                .pack_id()
                             };
+                            let managing_pack =
+                                resolved.as_ref().and_then(ResolvedRuntimeTarget::pack_id);
                             if let AdmittedGrant::PackOwned { pack_id, .. } = grant {
                                 if *kind == OwnerType::Identity {
                                     continue;
@@ -281,6 +304,14 @@ pub(crate) async fn capture_grants(
                                 if managing_pack != Some(*pack_id) {
                                     continue;
                                 }
+                            }
+                            if let Some(resolved) = resolved {
+                                evidence = evidence.with_input_ownership(resolved.input_sources());
+                            } else {
+                                // The existing numeric identity selector held
+                                // this row; activity/login/IAM were never read.
+                                evidence = evidence
+                                    .with_input_dependency(Dependency::IdentityPresence(id));
                             }
                             owners.insert((table.into(), id, managing_pack));
                             matched = true;
@@ -311,12 +342,18 @@ pub(crate) async fn capture_grants(
                         "Concrete policy pack scope is unavailable",
                     ));
                 }
+                evidence = evidence.with_input_ownership(
+                    &ids.iter()
+                        .copied()
+                        .map(super::runtime_target::InputOwnershipDependency::Pack)
+                        .collect(),
+                );
                 binding.packs = Some(ids.into_iter().collect());
             }
         }
         bindings.insert(key, binding);
     }
-    Ok(bindings)
+    Ok((bindings, evidence))
 }
 
 fn runtime_target(table: &str, id: Id) -> Result<RuntimeTarget> {

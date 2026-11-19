@@ -477,9 +477,6 @@ impl ManagedSensorMetadataRepository {
             ApprovalEffectFence, InputAuthorityDependency as Dependency,
         };
         let mut evidence = ApprovalEffectFence::from_input_approval(None)?;
-        if !previous.is_empty() {
-            evidence = evidence.with_input_dependency(Dependency::Incomplete);
-        }
         let grants = metadata
             .purposes
             .values()
@@ -505,15 +502,15 @@ impl ManagedSensorMetadataRepository {
                 ));
             }
         }
-        metadata.concrete_targets =
-            runtime_target_binding::capture_grants(connection, &metadata.owner, &grants, previous)
-                .await?;
-        for binding in metadata.concrete_targets.values() {
-            match super::runtime_target::InputOwnershipDependency::from_bindings(binding) {
-                Ok(sources) => evidence = evidence.with_input_ownership(&sources),
-                Err(_) => evidence = evidence.with_input_dependency(Dependency::Incomplete),
-            }
-        }
+        let (targets, target_evidence) = runtime_target_binding::capture_grants_input_evidence(
+            connection,
+            &metadata.owner,
+            &grants,
+            previous,
+        )
+        .await?;
+        metadata.concrete_targets = targets;
+        evidence = evidence.intersect(&target_evidence);
         // Target resolution can wait on concurrent mutations. Check expiry only
         // after acquiring those locks, not against a pre-wait timestamp.
         let now = sqlx::query_scalar::<_, chrono::DateTime<Utc>>("SELECT clock_timestamp()")

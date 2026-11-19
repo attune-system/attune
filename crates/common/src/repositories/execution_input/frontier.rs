@@ -80,6 +80,7 @@ impl FrozenInputFrontier {
                 Dependency::InputContributors(id) => Some(("input_contributors", *id)),
                 Dependency::SecretBuffer(id) => Some(("input_secret_buffer", *id)),
                 Dependency::ProvenanceBuffer(id) => Some(("input_provenance_buffer", *id)),
+                Dependency::IdentityPresence(id) => Some(("input_identity_presence", *id)),
                 Dependency::ExecutionPresence(id) => Some(("input_execution_presence", *id)),
                 Dependency::WorkflowPresence(id) => Some(("input_workflow_presence", *id)),
                 Dependency::Ownership(ownership) => ownership_epoch(ownership),
@@ -101,7 +102,7 @@ pub(crate) fn origin_epoch(kind: &str) -> bool {
             | "input_workflow_presence"
             | "input_key_owner"
             | "input_key_class"
-            | "input_identity_ref"
+            | "input_identity_presence"
             | "input_sensor_live"
             | "input_pack_owner"
             | "input_pack_primary"
@@ -125,7 +126,6 @@ fn ownership_epoch(source: &Ownership) -> Option<(&'static str, i64)> {
     match source {
         Ownership::Key(id) => Some(("input_key_owner", *id)),
         Ownership::KeyClassification(id) => Some(("input_key_class", *id)),
-        Ownership::IdentityRef(id) => Some(("input_identity_ref", *id)),
         Ownership::SensorLive(id) => Some(("input_sensor_live", *id)),
         Ownership::Pack(id) => Some(("input_pack_owner", *id)),
         Ownership::PackPrimaryOwner(id) => Some(("input_pack_primary", *id)),
@@ -154,6 +154,7 @@ fn ownership_epoch(source: &Ownership) -> Option<(&'static str, i64)> {
 pub(crate) async fn retain_dependency(conn: &mut PgConnection, source: &Dependency) -> Result<()> {
     let (query, id) = match source {
         Dependency::Incomplete => return Err(denied()),
+        Dependency::IdentityPresence(id) => ("SELECT id FROM identity WHERE id=$1 FOR SHARE",*id),
         Dependency::ExecutionPresence(id) => ("SELECT id FROM execution WHERE id=$1 FOR SHARE",*id),
         Dependency::WorkflowPresence(id) => ("SELECT execution FROM workflow_execution WHERE execution=$1 FOR SHARE",*id),
         Dependency::InputContributors(id) => ("SELECT id FROM execution WHERE id=$1 FOR SHARE",*id),
@@ -189,7 +190,6 @@ pub(crate) async fn retain_dependency(conn: &mut PgConnection, source: &Dependen
                 Ownership::Pack(id) | Ownership::PackPrimaryOwner(id) => ("pack",id),
                 Ownership::Component(kind,id) => (kind.metadata().0,id),
                 Ownership::Key(id) | Ownership::KeyClassification(id) => ("key",id),
-                Ownership::IdentityRef(id) => ("identity",id),
                 Ownership::Execution(id) => ("execution",id),
                 Ownership::Enforcement(id) => ("enforcement",id),
                 Ownership::QueueItem(id) => ("work_queue_item",id),

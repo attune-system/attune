@@ -12,7 +12,7 @@ BEGIN
     EXECUTE format('ALTER TABLE workload_source_epoch ADD CONSTRAINT workload_source_epoch_kind_check CHECK ((%s) OR kind = ANY (%L::text[]))',
       existing, ARRAY['input_sponsor','input_contributors','input_secret_buffer','input_provenance_buffer',
         'input_execution_presence','input_workflow_presence',
-        'input_key_owner','input_key_class','input_identity_ref','input_sensor_live',
+        'input_key_owner','input_key_class','input_identity_presence','input_sensor_live',
         'input_pack_owner','input_pack_primary','input_action_owner','input_sensor_owner',
         'input_rule_owner','input_queue_owner','input_trigger_owner','input_execution_owner',
         'input_queue_item_owner','input_inquiry_owner','input_artifact_owner',
@@ -27,8 +27,8 @@ BEGIN
             FOR affected IN SELECT pack FROM pack_runtime_identity WHERE identity=OLD.id ORDER BY pack
             LOOP PERFORM bump_workload_source_epoch('input_sponsor',affected); END LOOP;
         END IF;
-        IF TG_OP='DELETE' OR OLD.login IS DISTINCT FROM NEW.login THEN
-            PERFORM bump_workload_source_epoch('input_identity_ref',OLD.id);
+        IF TG_OP='DELETE' THEN
+            PERFORM bump_workload_source_epoch('input_identity_presence',OLD.id);
         END IF;
     ELSIF TG_TABLE_NAME='pack_runtime_identity' THEN
         IF TG_OP<>'INSERT' THEN PERFORM bump_workload_source_epoch('input_sponsor',OLD.pack); END IF;
