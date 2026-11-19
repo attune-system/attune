@@ -33,6 +33,7 @@ Attune is a pre-production, event-driven automation/orchestration platform built
 14. Use `PgListener::listen_all()` once in the notifier. Do not use `PgListener::listen()` in a loop, or the listener can stop receiving notifications.
 15. When adding mutable `execution` or `worker` columns, update the history trigger with `IS DISTINCT FROM` checks; for large JSONB values, store digest summaries with `_jsonb_digest_summary()` instead of raw payloads.
 16. Clear inherited environments for pack-controlled processes, including setup and verification commands, using `ChildProcessEnvironment` before explicit context. Linux production entrypoints also protect secret-bearing parents from unprivileged inspection. For that boundary, allowlists, and precedence, read `docs/deployment/child-process-environments.md`.
+    Configured native managers retain trusted scheduling and custody; pack-controlled effects cross the fixed Pod/container adapter in `crates/workload-backend`. Residual local launches must deny. Native deployment activation stays gated until existing consumers and deployment acceptance pass; see `docs/deployment/workload-isolation.md`.
 17. Bind delegated execution grants to an explicit active owner and secret disclosure to recorded origins. For registration, token consumers, key delivery, or signing changes, read `docs/permissions/delegation-and-secret-disclosure.md`.
 18. Select execution authority through `execution_authority_selection`, independently of managed/ad hoc ownership. Missing or revoked recorded admissions never authorize delegation. Delegated runtime Key reads retain attempt-fenced provenance. Output secrecy follows the admitted output schema/channel policy; input secrets and API authority do not classify outputs. Protected output fields retain recorded origins; see `docs/permissions/delegation-and-secret-disclosure.md`.
 19. Own transaction boundaries with SQLx transactions or an explicit cancellation-safe session owner. Session advisory locks spanning commits require cancellation-safe ownership (such as `SessionLease`) before acquisition through publication and acknowledged unlock; uncertain cleanup must dispose the session. Preserve the vendored SQLx clean-session pool checks. See `docs/testing/sqlx-session-regressions.md`.
@@ -59,6 +60,7 @@ attune/
 │   ├── api/         REST API
 │   ├── executor/    scheduling, workflow orchestration, queue dispatch
 │   ├── worker/      action execution + universal agent binary
+│   ├── workload-backend/ fixed native Pod/container effects and guest Runner
 │   ├── workload-backend/ in-process Kubernetes/Docker effects + public Runner
 │   ├── sensor/      managed sensor runtime
 │   ├── notifier/    LISTEN/NOTIFY + WebSocket fanout

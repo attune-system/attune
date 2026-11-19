@@ -628,6 +628,86 @@ fn render(template: &str, vars: &BTreeMap<&str, String>) -> String {
     output
 }
 
+/// Verify mutable DB runtime projections against the exact retained provider
+/// release archive before native startup discovery. Never read a mutable tree.
+pub fn validate_runtime_release_archive(
+    archive: std::fs::File,
+    runtime_ref: &str,
+    runtime_config: &serde_json::Value,
+    version: Option<(&str, &serde_json::Value)>,
+) -> Result<()> {
+    validate_runtime_release_metadata(archive, runtime_ref, runtime_config, version, None)
+}
+pub fn validate_runtime_release_metadata(
+    archive: std::fs::File,
+    runtime_ref: &str,
+    runtime_config: &serde_json::Value,
+    version: Option<(&str, &serde_json::Value)>,
+    distributions: Option<(&serde_json::Value, Option<&serde_json::Value>)>,
+) -> Result<()> {
+    let mut archive = zip::ZipArchive::new(archive).map_err(|_| PlanningError::Configuration)?;
+    let mut matched = false;
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index(index)
+            .map_err(|_| PlanningError::Configuration)?;
+        let path = entry.name().map_err(|_| PlanningError::Configuration)?;
+        if !path.starts_with("runtimes/") || !(path.ends_with(".yaml") || path.ends_with(".yml")) {
+            continue;
+        }
+        if entry.size() > 1024 * 1024 {
+            return Err(PlanningError::Configuration);
+        }
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        entry
+            .take(1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| PlanningError::Configuration)?;
+        let metadata: serde_json::Value =
+            attune_common::runtime_lifecycle::parse_release_metadata(&bytes)
+                .map_err(|_| PlanningError::Configuration)?;
+        if metadata.get("ref").and_then(|r| r.as_str()) != Some(runtime_ref) {
+            continue;
+        }
+        let empty = serde_json::json!({});
+        if distributions
+            .is_some_and(|(base, _)| metadata.get("distributions").unwrap_or(&empty) != base)
+        {
+            return Err(PlanningError::Configuration);
+        }
+        if matched || metadata.get("execution_config") != Some(runtime_config) {
+            return Err(PlanningError::Configuration);
+        }
+        if let Some((version, version_config)) = version {
+            let declared = metadata
+                .get("versions")
+                .and_then(|v| v.as_array())
+                .and_then(|versions| {
+                    versions
+                        .iter()
+                        .find(|v| v.get("version").and_then(|v| v.as_str()) == Some(version))
+                })
+                .ok_or(PlanningError::Configuration)?;
+            if distributions
+                .and_then(|(_, version)| version)
+                .is_some_and(|expected| declared.get("distributions").unwrap_or(&empty) != expected)
+            {
+                return Err(PlanningError::Configuration);
+            }
+            if declared.get("execution_config") != Some(version_config) {
+                return Err(PlanningError::Configuration);
+            }
+        }
+        matched = true;
+    }
+    if !matched {
+        return Err(PlanningError::Configuration);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1079,84 +1159,4 @@ mod tests {
         .is_err());
         assert!(validate_runtime_release_archive(make(true), "owned.tool", &config, None).is_err());
     }
-}
-
-/// Verify mutable DB runtime projections against the exact retained provider
-/// release archive before native startup discovery. Never read a mutable tree.
-pub fn validate_runtime_release_archive(
-    archive: std::fs::File,
-    runtime_ref: &str,
-    runtime_config: &serde_json::Value,
-    version: Option<(&str, &serde_json::Value)>,
-) -> Result<()> {
-    validate_runtime_release_metadata(archive, runtime_ref, runtime_config, version, None)
-}
-pub fn validate_runtime_release_metadata(
-    archive: std::fs::File,
-    runtime_ref: &str,
-    runtime_config: &serde_json::Value,
-    version: Option<(&str, &serde_json::Value)>,
-    distributions: Option<(&serde_json::Value, Option<&serde_json::Value>)>,
-) -> Result<()> {
-    let mut archive = zip::ZipArchive::new(archive).map_err(|_| PlanningError::Configuration)?;
-    let mut matched = false;
-    for index in 0..archive.len() {
-        let entry = archive
-            .by_index(index)
-            .map_err(|_| PlanningError::Configuration)?;
-        let path = entry.name().map_err(|_| PlanningError::Configuration)?;
-        if !path.starts_with("runtimes/") || !(path.ends_with(".yaml") || path.ends_with(".yml")) {
-            continue;
-        }
-        if entry.size() > 1024 * 1024 {
-            return Err(PlanningError::Configuration);
-        }
-        use std::io::Read;
-        let mut bytes = Vec::new();
-        entry
-            .take(1024 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| PlanningError::Configuration)?;
-        let metadata: serde_json::Value =
-            attune_common::runtime_lifecycle::parse_release_metadata(&bytes)
-                .map_err(|_| PlanningError::Configuration)?;
-        if metadata.get("ref").and_then(|r| r.as_str()) != Some(runtime_ref) {
-            continue;
-        }
-        let empty = serde_json::json!({});
-        if distributions
-            .is_some_and(|(base, _)| metadata.get("distributions").unwrap_or(&empty) != base)
-        {
-            return Err(PlanningError::Configuration);
-        }
-        if matched || metadata.get("execution_config") != Some(runtime_config) {
-            return Err(PlanningError::Configuration);
-        }
-        if let Some((version, version_config)) = version {
-            let declared = metadata
-                .get("versions")
-                .and_then(|v| v.as_array())
-                .and_then(|versions| {
-                    versions
-                        .iter()
-                        .find(|v| v.get("version").and_then(|v| v.as_str()) == Some(version))
-                })
-                .ok_or(PlanningError::Configuration)?;
-            if distributions
-                .and_then(|(_, version)| version)
-                .is_some_and(|expected| declared.get("distributions").unwrap_or(&empty) != expected)
-            {
-                return Err(PlanningError::Configuration);
-            }
-            if declared.get("execution_config") != Some(version_config) {
-                return Err(PlanningError::Configuration);
-            }
-        }
-        matched = true;
-    }
-    if !matched {
-        return Err(PlanningError::Configuration);
-    }
-
-    Ok(())
 }
