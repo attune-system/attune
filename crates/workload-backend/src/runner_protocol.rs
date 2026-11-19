@@ -46,7 +46,8 @@ fn validate(invocation: &LaunchInvocation) -> io::Result<()> {
             || name.contains(['=', '\0'])
             || value.contains('\0')
             || upper.starts_with("ATTUNE__")
-            || upper.starts_with("ATTUNE_LAUNCH_")
+            || (upper.starts_with("ATTUNE_LAUNCH_")
+                && !private_recipe_challenge(invocation, name, value))
             || upper.starts_with("DOCKER_")
             || upper.starts_with("KUBERNETES_")
             || matches!(
@@ -73,6 +74,25 @@ fn validate(invocation: &LaunchInvocation) -> io::Result<()> {
         return Err(invalid());
     }
     Ok(())
+}
+fn private_recipe_challenge(invocation: &LaunchInvocation, name: &str, value: &str) -> bool {
+    use crate::planning::{
+        RUNTIME_RECIPE_TIMEOUT_CHALLENGE_BYTES, RUNTIME_RECIPE_TIMEOUT_CHALLENGE_ENV,
+    };
+    use attune_common::workload_launch::{LaunchRoot, RUNNER_ROOT};
+    name == RUNTIME_RECIPE_TIMEOUT_CHALLENGE_ENV
+        && value.len() == RUNTIME_RECIPE_TIMEOUT_CHALLENGE_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && ["linux-amd64", "linux-arm64"]
+            .iter()
+            .any(|file| invocation.argv.first() == Some(&format!("{RUNNER_ROOT}/{file}")))
+        && matches!(
+            invocation.argv.get(1).map(String::as_str),
+            Some("run-runtime-recipe" | "run-candidate-runtime-recipe")
+        )
+        && invocation.working_root == LaunchRoot::Pack
 }
 /// Exact reads avoid consuming any of the application's original stdin.
 /// Used by deterministic codec tests; the executable uses cancellable FD reads.

@@ -86,6 +86,9 @@ pub(crate) fn validate_invocation(spec: &ProcessSpec) -> Result<()> {
         return Err(invalid());
     }
     let has = |kind| spec.inputs.iter().any(|pin| pin.kind == kind);
+    // The codec accepts exactly one fixed-helper private control. Bind it to
+    // this public purpose, input set and Pack access before provider effects.
+    crate::recipe_timeout::retained_challenge(spec)?;
     match spec.invocation.working_root {
         LaunchRoot::Pack if !has(LaunchInputKind::Pack) => return Err(invalid()),
         LaunchRoot::Runtime if !has(LaunchInputKind::Runtime) && spec.stage.is_none() => {

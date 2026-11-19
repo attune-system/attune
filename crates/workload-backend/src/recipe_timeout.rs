@@ -233,6 +233,10 @@ mod tests {
         let mut first = recipe();
         assert!(retained_challenge(&first).unwrap().is_none());
         bind_challenge(&mut first, None).unwrap();
+        let frame = crate::runner_protocol::encode_start(&first.invocation).unwrap();
+        let decoded = crate::runner_protocol::read_start(frame.as_slice()).unwrap();
+        assert_eq!(decoded.env, first.invocation.env);
+        crate::process_policy::validate_invocation(&first).unwrap();
         let expected = first.invocation.env[RUNTIME_RECIPE_TIMEOUT_CHALLENGE_ENV].clone();
         assert!(valid(&expected));
         let retained = retained_challenge(&first).unwrap();
@@ -275,6 +279,10 @@ mod tests {
         candidate.purpose = LaunchPurpose::CandidateTest;
         candidate.pack_access = PackAccess::CandidateCopy;
         bind_challenge(&mut candidate, None).unwrap();
+        crate::runner_protocol::encode_start(&candidate.invocation).unwrap();
+        crate::process_policy::validate_invocation(&candidate).unwrap();
+        candidate.purpose = LaunchPurpose::Setup;
+        assert!(crate::process_policy::validate_invocation(&candidate).is_err());
     }
 
     #[test]
@@ -284,6 +292,7 @@ mod tests {
         let retained = retained_challenge(&spec).unwrap();
         spec.invocation.argv[1] = "exec".into();
         assert!(retained_challenge(&spec).is_err());
+        assert!(crate::runner_protocol::encode_start(&spec.invocation).is_err());
         spec.invocation.env.clear();
         assert!(bind_challenge(&mut spec, retained).is_err());
         bind_challenge(&mut spec, None).unwrap();
