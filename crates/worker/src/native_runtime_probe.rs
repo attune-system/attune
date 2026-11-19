@@ -19,7 +19,13 @@ use attune_common::{
 };
 use attune_workload_backend::configuration::ConfiguredBackend;
 use sqlx::PgPool;
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -229,8 +235,10 @@ impl<'a> NativeRuntimeProbeDriver<'a> {
             },
         };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        let start_submitted = AtomicBool::new(false);
         let options = NativePreparationOptions {
             cancel: &cancel,
+            start_submitted: &start_submitted,
             deadline: Some(deadline),
             stdout_bytes: crate::runtime::launch_planning::RUNTIME_TOOL_RESULT_BYTES,
             stderr_bytes: 16384,
@@ -248,6 +256,7 @@ impl<'a> NativeRuntimeProbeDriver<'a> {
             observed.send_replace(Some(resource.clone()));
             Probe::record_resource(&self.pool, current.intent, &resource).await?;
             options.check_open()?;
+            options.start_submitted.store(true, Ordering::Release);
             let mut process = launcher.start(current, &resource).await?;
             if process.resource != resource {
                 let _ = stop_prepared_process(process, options).await;
@@ -333,6 +342,8 @@ impl<'a> NativeRuntimeProbeDriver<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct NativePreparationOptions<'a> {
     pub cancel: &'a CancellationToken,
+    // Monotonic local fact selector, never provider submission/absence evidence.
+    pub start_submitted: &'a AtomicBool,
     pub deadline: Option<tokio::time::Instant>,
     pub stdout_bytes: usize,
     pub stderr_bytes: usize,
@@ -448,9 +459,15 @@ where
     if let Ok(Some((resource, exit))) = stopped {
         // Resource recording has now joined; this is only a factual exit record,
         // never a capture receipt, removal or publication acknowledgement.
-        let recorded = record(resource, exit).await;
-        fenced?;
-        recorded?;
+        if !options.start_submitted.load(Ordering::Acquire) {
+            let recorded = record(resource, exit).await;
+            fenced?;
+            recorded?;
+        } else {
+            // A prior retained Stop cannot stand in for a late attachment's
+            // Stop. Its Recording*Control alone records that positive exit.
+            fenced?;
+        }
     } else {
         fenced?;
         stopped?;
@@ -945,8 +962,10 @@ pub(crate) mod preparation_tests {
             let exit_recorded = exit_recorded.clone();
             let starts = starts.clone();
             tokio::spawn(async move {
+                let start_submitted = AtomicBool::new(false);
                 let options = NativePreparationOptions {
                     cancel: &child,
+                    start_submitted: &start_submitted,
                     deadline: None,
                     stdout_bytes: 1024,
                     stderr_bytes: 1024,
@@ -959,12 +978,14 @@ pub(crate) mod preparation_tests {
                     let result = async {
                         observed.send_replace(Some(source_resource.clone()));
                         let attached = if phase == BlockedPhase::Consume {
+                            options.start_submitted.store(true, Ordering::Release);
                             starts.fetch_add(1, Ordering::SeqCst);
                             Some(process(source_resource.clone(), source_control.clone()))
                         } else {
                             None
                         };
                         if phase == BlockedPhase::Start {
+                            options.start_submitted.store(true, Ordering::Release);
                             starts.fetch_add(1, Ordering::SeqCst);
                         }
                         blocked.send(()).unwrap();
@@ -1042,7 +1063,10 @@ pub(crate) mod preparation_tests {
             starts.load(Ordering::SeqCst),
             usize::from(phase != BlockedPhase::Record)
         );
-        assert_eq!(exit_recorded.load(Ordering::SeqCst), stopped_fact);
+        assert_eq!(
+            exit_recorded.load(Ordering::SeqCst),
+            stopped_fact && phase == BlockedPhase::Record
+        );
         assert_eq!(
             control.readers_dropped.load(Ordering::SeqCst),
             if phase == BlockedPhase::Record { 0 } else { 2 }
@@ -1082,8 +1106,10 @@ pub(crate) mod preparation_tests {
             let control = control.clone();
             tokio::spawn(async move {
                 let cancel = CancellationToken::new();
+                let start_submitted = AtomicBool::new(false);
                 let options = NativePreparationOptions {
                     cancel: &cancel,
+                    start_submitted: &start_submitted,
                     deadline: Some(tokio::time::Instant::now() + Duration::from_secs(120)),
                     stdout_bytes: 1024,
                     stderr_bytes: 1024,
@@ -1167,8 +1193,10 @@ pub(crate) mod preparation_tests {
         let (resource, control, mut stops) = control_fixture();
         let expected = b"{\"private\":\"unchanged\"}";
         let token = CancellationToken::new();
+        let start_submitted = AtomicBool::new(false);
         let options = NativePreparationOptions {
             cancel: &token,
+            start_submitted: &start_submitted,
             deadline: None,
             stdout_bytes: 1024,
             stderr_bytes: 1024,
@@ -1195,10 +1223,12 @@ pub(crate) mod preparation_tests {
         assert_eq!(control.writes.load(Ordering::SeqCst), 0);
         let cleanup = tokio::spawn(async move {
             let token = CancellationToken::new();
+            let start_submitted = AtomicBool::new(false);
             stop_prepared_process(
                 prepared.0,
                 NativePreparationOptions {
                     cancel: &token,
+                    start_submitted: &start_submitted,
                     deadline: None,
                     stdout_bytes: 1024,
                     stderr_bytes: 1024,

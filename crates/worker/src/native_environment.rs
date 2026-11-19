@@ -19,6 +19,7 @@ use attune_common::{
 };
 use attune_workload_backend::configuration::ConfiguredBackend;
 use sqlx::PgPool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_util::sync::CancellationToken;
 
 fn denied() -> Error {
@@ -252,8 +253,10 @@ impl<'a> NativeEnvironmentInstaller<'a> {
         setup.timeout_ms = timeout
             .map(|s| s.checked_mul(1000).ok_or_else(denied))
             .transpose()?;
+        let start_submitted = AtomicBool::new(false);
         let options = NativePreparationOptions {
             cancel: &cancel,
+            start_submitted: &start_submitted,
             deadline,
             stdout_bytes: 16 * 1024,
             stderr_bytes: 16 * 1024,
@@ -272,6 +275,7 @@ impl<'a> NativeEnvironmentInstaller<'a> {
             observed.send_replace(Some(resource.clone()));
             Effects::record_resource(self.pool, current.intent, &resource).await?;
             options.check_open()?;
+            options.start_submitted.store(true, Ordering::Release);
             let mut process = launcher.start(current, &resource).await?;
             if process.resource != resource {
                 let _ = stop_prepared_process(process, options).await;
