@@ -31,6 +31,7 @@ class Docker:
         self.fault, self.health = fault, health
         self.last = None
         self.logs_seen = False
+        self.health_seen = False
         self.inspect_failed = False
 
     def __call__(self, args, **kwargs):
@@ -64,10 +65,17 @@ class Docker:
             return result(out=identifier.encode() + b'\n')
         reference = args[-1]
         if op == 'inspect':
-            if self.fault == 'cleanup_inspect_timeout' and self.logs_seen and not self.inspect_failed:
+            if self.fault == 'cleanup_inspect_timeout' and (self.logs_seen or self.health_seen) and not self.inspect_failed:
                 self.inspect_failed = True
                 raise subprocess.TimeoutExpired(PRIVATE, 3, PRIVATE)
             value = next((v for v in self.containers.values() if reference in (v['Id'], v['Name'][1:])), None)
+            if value and value['cleanup'] and self.fault in ('exit_mismatch', 'running_mismatch'):
+                state = dict(value['State'])
+                if self.fault == 'exit_mismatch':
+                    state['ExitCode'] += 1
+                else:
+                    state['Running'] = True
+                value = dict(value, State=state)
             return result(out=json.dumps(value).encode()) if value else result(1, err=PRIVATE)
         value = self.containers.get(reference) if op != 'exec' else self.containers.get(args[2])
         assert value is not None, ('unexpected/foreign reference', args)
@@ -78,6 +86,7 @@ class Docker:
                 raise subprocess.TimeoutExpired(PRIVATE, 10, PRIVATE)
             return result(out=reference.encode() + b'\n')
         if op == 'exec':
+            self.health_seen = True
             return result(0 if self.health == 200 else 1,
                           err=f'  HTTP/1.1 {self.health} response\n'.encode())
         if op == 'logs':
@@ -91,18 +100,21 @@ class Docker:
             value['cleanup'] = True
             if value['State']['Running']:
                 value['State'].update(Running=False, ExitCode=137)
-            return result(1 if self.fault == 'stop_ack' else 0, out=reference.encode() + b'\n')
+            return result(1 if self.fault in ('stop_ack', 'stop_and_wait_ack') else 0,
+                          out=PRIVATE if self.fault == 'stop_echo' else reference.encode() + b'\n')
         if op == 'wait':
             assert value['State']['Running'] is False
-            if value['cleanup'] and self.fault == 'wait_ack':
+            if value['cleanup'] and self.fault in ('wait_ack', 'stop_and_wait_ack'):
                 raise subprocess.TimeoutExpired(PRIVATE, 10, PRIVATE)
+            if value['cleanup'] and self.fault == 'wait_echo':
+                return result(out=PRIVATE)
             return result(out=str(value['State']['ExitCode']).encode() + b'\n')
         if op == 'rm':
             assert not value['State']['Running']
             del self.containers[reference]
             if self.fault == 'remove_ack':
                 raise subprocess.TimeoutExpired(PRIVATE, 10, PRIVATE)
-            return result(out=reference.encode() + b'\n')
+            return result(out=PRIVATE if self.fault == 'remove_echo' else reference.encode() + b'\n')
         raise AssertionError(('unexpected command', args))
 
 
@@ -122,6 +134,12 @@ class PackagedClientRootsTests(unittest.TestCase):
         self.assertEqual(records[2]['http'], 200)
         self.assertEqual(records[3]['exit'], 1)
         self.assertTrue(all(row['cleanup_ack'] for row in records[2:]))
+        for record, code in zip(records[2:], (137, 1)):
+            self.assertIsNone(record['cleanup_failed_step'])
+            self.assertIsNone(record['cleanup_failure_reason'])
+            self.assertEqual(record['cleanup_wait_exit'], code)
+            self.assertEqual(record['cleanup_observed_exit'], code)
+            self.assertIs(record['cleanup_running'], False)
         self.assertNotIn(PRIVATE.decode(), output.getvalue())
         self.assertEqual(docker.containers, {})
         infos = [args for args in docker.calls if '--entrypoint' in args and 'run' in args]
@@ -175,21 +193,49 @@ class PackagedClientRootsTests(unittest.TestCase):
                 self.assertTrue(any(args[1] == 'rm' for args in docker.calls))
 
     def test_unknown_cleanup_fails_even_after_matching_caller_error(self):
-        for fault in ('stop_ack', 'wait_ack', 'remove_ack', 'cleanup_inspect_timeout'):
-            with self.subTest(fault=fault):
-                docker = Docker(fault)
-                result = self.http(docker)
-                self.assertFalse(result['passed'])
-                self.assertFalse(result['cleanup_ack'])
-                self.assertEqual(result['error'], 'cleanup_unknown')
-                self.assertEqual(docker.containers, {})
-                self.assertNotIn(PRIVATE.decode(), json.dumps(result))
+        faults = {
+            'stop_ack': ('stop', 'command_failed'),
+            'wait_ack': ('wait', 'command_timeout'),
+            'remove_ack': ('remove', 'command_timeout'),
+            'cleanup_inspect_timeout': ('inspect_before_stop', 'command_timeout'),
+            'stop_echo': ('stop', 'ack_mismatch'),
+            'wait_echo': ('wait', 'ack_mismatch'),
+            'remove_echo': ('remove', 'ack_mismatch'),
+            'exit_mismatch': ('inspect_after_wait', 'state_mismatch'),
+            'running_mismatch': ('inspect_after_wait', 'state_mismatch'),
+            'stop_and_wait_ack': ('stop', 'command_failed'),
+        }
+        for empty in (False, True):
+            for fault, (step, reason) in faults.items():
+                with self.subTest(fault=fault, empty=empty):
+                    docker = Docker(fault)
+                    result = self.http(docker, empty)
+                    self.assertFalse(result['passed'])
+                    self.assertFalse(result['cleanup_ack'])
+                    self.assertEqual(result['error'], 'cleanup_unknown')
+                    self.assertEqual(result['cleanup_failed_step'], step)
+                    self.assertEqual(result['cleanup_failure_reason'], reason)
+                    code = 1 if empty else 137
+                    self.assertEqual(result['cleanup_wait_exit'], None if fault in ('wait_ack', 'wait_echo', 'stop_and_wait_ack') else code)
+                    self.assertEqual(result['cleanup_observed_exit'], code + (fault == 'exit_mismatch'))
+                    self.assertIs(result['cleanup_running'], fault == 'running_mismatch')
+                    self.assertEqual(docker.containers, {})
+                    self.assertNotIn(PRIVATE.decode(), json.dumps(result))
+                    self.assertFalse(any(name in result for name in ('id', 'identifier', 'owner', 'labels', 'stdout', 'stderr', 'exception')))
+                    # Later wait/state failures cannot replace the first stop
+                    # failure, and every cleanup operation is still attempted.
+                    for op in ('stop', 'wait', 'rm'):
+                        self.assertTrue(any(args[1] == op for args in docker.calls))
+                    ops = [args[1] for args in docker.calls if args[-1] == docker.last['Id']]
+                    self.assertEqual(ops[-4:], ['stop', 'wait', 'inspect', 'rm'])
 
     def test_foreign_resource_is_never_stopped_or_removed(self):
         docker = Docker('foreign')
         result = self.http(docker)
         self.assertFalse(result['passed'])
         self.assertFalse(result['cleanup_ack'])
+        self.assertEqual(result['cleanup_failed_step'], 'inspect_before_stop')
+        self.assertEqual(result['cleanup_failure_reason'], 'resource_ownership')
         self.assertFalse(any(args[1] in ('stop', 'wait', 'rm') for args in docker.calls))
 
     def test_health_requires_exact_200_and_timeout_still_cleans_up(self):
