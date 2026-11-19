@@ -22,6 +22,8 @@ use std::{
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+#[path = "support/runtime_recipe.rs"]
+mod runtime_recipe;
 fn required(name: &str) -> TestResult<String> {
     std::env::var(name).map_err(|_| format!("missing owned Docker prerequisite: {name}").into())
 }
@@ -422,9 +424,66 @@ async fn native_docker_gate_procfs_capture_files_and_recovery() -> TestResult {
     }
     python_setup_removed_builder_and_readonly_reuse(&f).await?;
     candidate_copy_and_artifact_reuse(&f).await?;
+    runtime_recipe_discovery(&f).await?;
     node_threads_and_procfs_through_concrete_adapter().await?;
     // Keep the cache Arc in the fixture, never as a guest mount of its parent.
     drop(f.cache);
+    Ok(())
+}
+
+async fn runtime_recipe_discovery(f: &Fixture) -> TestResult {
+    use std::io::Write;
+    let recipe = runtime_recipe::recipe();
+    for matches in [true, false] {
+        let mut selected = recipe.clone();
+        if !matches {
+            selected.tools[0].version_pattern = "must-not-match-(?<version>[0-9]+)".into();
+        }
+        let mut body = tempfile::tempfile()?;
+        {
+            let mut archive = zip::ZipWriter::new(&mut body);
+            archive.start_file(
+                "runtimes/owned.json",
+                zip::write::SimpleFileOptions::default().unix_permissions(0o644),
+            )?;
+            archive.write_all(&serde_json::to_vec(&selected)?)?;
+            archive.finish()?;
+        }
+        let pack = f.input(LaunchInputKind::Pack, &mut body)?;
+        let mut probe = f.spec(attune_workload_backend::planning::runtime_tool_probe_argv(
+            f.platform,
+            &selected,
+            "/usr/bin:/bin",
+        )?);
+        probe.purpose = LaunchPurpose::RuntimeProbe;
+        probe.target = LaunchTarget::RuntimeProbe {
+            admission: 1,
+            attempt: Uuid::new_v4(),
+        };
+        probe.inputs = vec![pack.clone(), f.runner.clone()];
+        probe.invocation.working_root = LaunchRoot::Pack;
+        let resource = f
+            .launcher
+            .prepare(&probe, ProcessCreateDisposition::CreateOnce)
+            .await?;
+        let result =
+            async { run(f.launcher.start(&probe, &resource).await?, Vec::new()).await }.await;
+        f.launcher.remove_stopped(&probe, &resource).await?;
+        let (exit, out, err) = result?;
+        if exit.oom_killed
+            || (matches
+                && (exit.exit_code != 0 || !err.is_empty() || !runtime_recipe::valid_result(&out)))
+            || (!matches
+                && (exit.exit_code == 0
+                    || !out.is_empty()
+                    || err.len() > 1024
+                    || String::from_utf8_lossy(&err).contains("must-not-run-private")))
+        {
+            return Err(
+                "Docker runtime recipe discovery or rejected-version control failed".into(),
+            );
+        }
+    }
     Ok(())
 }
 

@@ -26,6 +26,8 @@ use std::{
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+#[path = "support/runtime_recipe.rs"]
+mod runtime_recipe;
 fn required(name: &str) -> TestResult<String> {
     std::env::var(name).map_err(|_| format!("missing owned provider prerequisite: {name}").into())
 }
@@ -749,6 +751,48 @@ async fn inspect_installed_command_without_manager_discovery(f: &Fixture) -> Tes
     let (exit, out, err) = f.run(&execution, Vec::new()).await?;
     if exit.exit_code != 0 || exit.oom_killed || out != b"owned-static-argv0" || !err.is_empty() {
         return Err("inspected program did not preserve hash/static argv0 execution".into());
+    }
+    // Reuse the same immutable image and public Runner. Recipe discovery runs
+    // only its tool commands, with a real defining input and no action stdin.
+    let recipe = runtime_recipe::recipe();
+    probe.inputs.retain(|pin| pin.kind != LaunchInputKind::Pack);
+    let runner_inputs = probe.inputs.clone();
+    for matches in [true, false] {
+        let mut selected = recipe.clone();
+        if !matches {
+            selected.tools[0].version_pattern = "must-not-match-(?<version>[0-9]+)".into();
+        }
+        probe.intent = Uuid::new_v4();
+        probe.target = LaunchTarget::RuntimeProbe {
+            admission: 1,
+            attempt: Uuid::new_v4(),
+        };
+        let mut pack = f.input(
+            LaunchInputKind::Pack,
+            vec![("runtimes/owned.json", serde_json::to_vec(&selected)?, false)],
+        )?;
+        pack.pin_id = 2;
+        probe.inputs = runner_inputs.clone();
+        probe.inputs.push(pack);
+        probe.invocation.argv = attune_workload_backend::planning::runtime_tool_probe_argv(
+            probe.platform,
+            &selected,
+            "/usr/bin:/bin",
+        )?;
+        let (exit, out, err) = f.run(&probe, Vec::new()).await?;
+        if exit.oom_killed
+            || (matches
+                && (exit.exit_code != 0 || !err.is_empty() || !runtime_recipe::valid_result(&out)))
+            || (!matches
+                && (exit.exit_code == 0
+                    || !out.is_empty()
+                    || err.len() > 1024
+                    || String::from_utf8_lossy(&err).contains("must-not-run-private")))
+        {
+            return Err(
+                "isolated runtime recipe discovery or rejected-version control failed".into(),
+            );
+        }
     }
     Ok(())
 }

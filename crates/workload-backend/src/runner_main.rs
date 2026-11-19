@@ -1,5 +1,7 @@
 #[cfg(target_os = "linux")]
 mod gated_runner;
+#[cfg(unix)]
+mod recipe_probe;
 // Public helper bytes only; no control-plane authority/configuration.
 use attune_common::child_process_environment::ChildProcessEnvironment;
 use attune_common::workload_launch::PACK_ROOT;
@@ -17,7 +19,7 @@ use std::{
 fn main() {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     if arguments.len() == 1 && (arguments[0] == "--help" || arguments[0] == "-h") {
-        println!("attune-workload-runner setup|exec|inspect-command-program: admitted OCI effects");
+        println!("attune-workload-runner setup|exec|inspect-command-program|inspect-runtime-tools: admitted OCI effects");
         return;
     }
     let result = match arguments.first().and_then(|value| value.to_str()) {
@@ -67,6 +69,8 @@ fn main() {
         Some("setup") if arguments.len() == 1 => setup(),
         Some("exec") => execute(&arguments[1..]),
         Some("inspect-command-program") => inspect_command_program(&arguments[1..]),
+        #[cfg(unix)]
+        Some("inspect-runtime-tools") => recipe_probe::inspect(&arguments[1..]),
         _ => Err(invalid()),
     };
     if result.is_err() {

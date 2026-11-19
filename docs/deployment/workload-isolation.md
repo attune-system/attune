@@ -113,6 +113,17 @@ helper before constructing the existing private exec envelope. Inspection
 output alone grants no launch authority; manager PATH/architecture discovery
 is not a substitute.
 
+The fixed Runner `inspect-runtime-tools` effect executes the existing
+`RuntimeRecipe::discover` tool probes inside an ordinary Probe. Its definition
+and explicit guest PATH are private invocation context. The helper constructs
+only that definition's exact local admission and a minimal child environment;
+it never reads ambient recipe-admission grants or a manager PATH. Both selected
+executable and canonical identity must be read-only. Only the bounded existing
+`VerifiedTool` map is returned. The trusted owner still checks captured operator
+admission, defining release, image/platform and successful Probe exit before
+accepting versions. Recipe preparation and launch are not run by this helper;
+their private-generation consumers and startup wiring remain migration gaps.
+
 ## Kubernetes effects
 
 The trusted worker uses a namespace-scoped Pod lifecycle/attach/exec identity in
