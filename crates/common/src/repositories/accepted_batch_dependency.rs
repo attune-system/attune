@@ -302,20 +302,28 @@ impl AcceptedBatchDependencyRepository {
     ) -> Result<usize> {
         let body = row.get("proof").ok_or_else(denied)?;
         let proof: ItemProof = serde_json::from_value(body.clone())?;
+        let admission = row
+            .get("admission")
+            .and_then(Value::as_i64)
+            .ok_or_else(denied)?;
+        let renderer: RuntimeAdmissionRecord = sqlx::query_as("SELECT id,owner_kind,owner_id,policy_revision,authority,authority_digest,revoked_at FROM runtime_authority_admission WHERE id=$1 FOR SHARE")
+            .bind(admission).fetch_optional(&mut *conn).await?.ok_or_else(denied)?;
+        if hash(&serde_json::to_value(&renderer.authority.0)?)? != renderer.authority_digest
+            || renderer.owner_kind != "execution"
+            || row.get("source_admission").and_then(Value::as_i64) != proof.source_admission
+            || row.get("target_policy").and_then(Value::as_i64) != Some(proof.authority.policy_id)
+            || matches!(renderer.authority.binding, InvocationBinding::Queue { .. })
+                != proof.queue_payload.is_some()
+        {
+            return Err(denied());
+        }
         if let Some(payload) = &proof.queue_payload {
             queue::authenticate(
                 &proof,
                 row.get("item").and_then(Value::as_i64).ok_or_else(denied)?,
                 master,
             )?;
-            queue::validate_origin(
-                conn,
-                row.get("admission")
-                    .and_then(Value::as_i64)
-                    .ok_or_else(denied)?,
-                &proof,
-            )
-            .await?;
+            queue::validate_origin(conn, admission, &proof).await?;
             if !matches!(proof.authority.binding, InvocationBinding::Queue { .. })
                 || row.get("configuration_input").and_then(Value::as_i64)
                     != Some(payload.fixed_input)
@@ -325,14 +333,27 @@ impl AcceptedBatchDependencyRepository {
             if row.get("proof_digest").and_then(Value::as_str) != Some(hash(body)?.as_str()) {
                 return Err(denied());
             }
+            let InvocationBinding::Queue { queue_ref, .. } = &renderer.authority.binding else {
+                return Err(denied());
+            };
+            queue::check_item(
+                conn,
+                &renderer,
+                row.get("item").and_then(Value::as_i64).ok_or_else(denied)?,
+                &proof,
+                queue_ref,
+            )
+            .await?;
             for (_, body, digest) in &proof.contributors {
                 super::recorded_input_authority::RecordedInputAuthorityRepository::from_manifest(
                     body, digest,
                 )?;
             }
+            queue::validate_contributor_origins(conn, &proof).await?;
             payload.restore(master)?;
             Ok(payload.field_count())
         } else if matches!(proof.authority.binding, InvocationBinding::Action { .. })
+            && matches!(renderer.authority.binding, InvocationBinding::Action { .. })
             && row.get("proof_digest").and_then(Value::as_str) == Some(hash(body)?.as_str())
             && row.get("configuration_input").is_none_or(Value::is_null)
         {

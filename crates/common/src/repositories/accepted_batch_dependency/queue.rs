@@ -52,8 +52,16 @@ impl QueuePayload {
         for field in &self.fields {
             let provenance: SecretProvenance =
                 serde_json::from_str(field.source_ref.as_deref().ok_or_else(denied)?)?;
-            if field.source_kind != "provenance" || provenance.origins.is_empty()
-                || provenance.origins.iter().any(|origin|!matches!(origin,SecretOrigin::Local {source_kind,..} if source_kind=="parameter_schema" || source_kind=="queue_item")) {
+            if field.source_kind != "provenance"
+                || provenance.origins.is_empty()
+                || provenance.origins.iter().any(|origin| match origin {
+                    SecretOrigin::Key(_) => false,
+                    SecretOrigin::Local { source_kind, .. } => {
+                        source_kind != "parameter_schema" && source_kind != "queue_item"
+                    }
+                    _ => true,
+                })
+            {
                 return Err(denied());
             }
         }
@@ -209,6 +217,7 @@ pub(super) async fn capture(
             contributors,
             queue_payload: Some(payload),
         };
+        validate_contributor_origins(conn, &proof).await?;
         seal(&mut proof, master)?;
         check_item(conn, &record, item.id, &proof, &queue.r#ref).await?;
         bytes = bytes
@@ -386,26 +395,31 @@ impl QueueContributorSource {
                         crate::secret_values::pointer_suffix(&payload_root, path)
                             .map(|_| String::new())
                     });
-                let origin = payload_path.map(|payload_path| SecretOrigin::QueueItem {
-                    queue_id: self.payload.queue,
-                    queue_ref: self.payload.queue_ref.clone(),
-                    pack_ref: self.payload.pack_ref.clone(),
-                    item_id: self.item,
-                    path: payload_path,
-                });
-                return Ok((selected, origin.into_iter().collect()));
-            }
-            if crate::secret_values::pointer_suffix(&root, path).is_some() {
-                return Ok((
-                    value,
-                    vec![SecretOrigin::QueueItem {
+                let origin = payload_path
+                    .as_ref()
+                    .map(|payload_path| SecretOrigin::QueueItem {
                         queue_id: self.payload.queue,
                         queue_ref: self.payload.queue_ref.clone(),
                         pack_ref: self.payload.pack_ref.clone(),
                         item_id: self.item,
-                        path: String::new(),
-                    }],
-                ));
+                        path: payload_path.clone(),
+                    });
+                let mut origins = origin.into_iter().collect::<Vec<_>>();
+                if let Some(payload_path) = payload_path {
+                    self.payload.append_origins(&payload_path, &mut origins)?;
+                }
+                return Ok((selected, origins));
+            }
+            if crate::secret_values::pointer_suffix(&root, path).is_some() {
+                let mut origins = vec![SecretOrigin::QueueItem {
+                    queue_id: self.payload.queue,
+                    queue_ref: self.payload.queue_ref.clone(),
+                    pack_ref: self.payload.pack_ref.clone(),
+                    item_id: self.item,
+                    path: String::new(),
+                }];
+                self.payload.append_origins("", &mut origins)?;
+                return Ok((value, origins));
             }
         }
         Err(denied())
@@ -430,6 +444,7 @@ pub(super) async fn source(
         return Err(denied());
     }
     validate_origin(conn, renderer.id, &proof).await?;
+    validate_contributor_origins(conn, &proof).await?;
     let payload = proof.queue_payload.clone().ok_or_else(denied)?;
     if fixed != Some(payload.fixed_input) {
         return Err(denied());
@@ -450,6 +465,77 @@ pub(super) async fn source(
         template: serde_json::from_value(proof.template)?,
         fence,
     })
+}
+
+impl QueuePayload {
+    fn append_origins(&self, path: &str, origins: &mut Vec<SecretOrigin>) -> Result<()> {
+        for field in &self.fields {
+            if crate::secret_values::pointer_suffix(&field.json_path, path).is_none()
+                && crate::secret_values::pointer_suffix(path, &field.json_path).is_none()
+            {
+                continue;
+            }
+            let provenance: SecretProvenance =
+                serde_json::from_str(field.source_ref.as_deref().ok_or_else(denied)?)?;
+            for origin in provenance.origins {
+                if !origins.contains(&origin) {
+                    origins.push(origin);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(super) async fn validate_contributor_origins(
+    conn: &mut PgConnection,
+    proof: &ItemProof,
+) -> Result<()> {
+    let payload = proof.queue_payload.as_ref().ok_or_else(denied)?;
+    if proof.contributors.is_empty() || proof.contributors.len() > 256 || payload.fields.len() > 256
+    {
+        return Err(denied());
+    }
+    let authorities = proof
+        .contributors
+        .iter()
+        .map(|(_, body, digest)| Contributors::from_manifest(body, digest))
+        .collect::<Result<Vec<_>>>()?;
+    for field in &payload.fields {
+        let provenance: SecretProvenance =
+            serde_json::from_str(field.source_ref.as_deref().ok_or_else(denied)?)?;
+        if field.source_kind != "provenance"
+            || provenance.origins.is_empty()
+            || provenance.origins.len() > 256
+        {
+            return Err(denied());
+        }
+        for origin in &provenance.origins {
+            match origin {
+                SecretOrigin::Local { source_kind, .. }
+                    if source_kind == "parameter_schema" || source_kind == "queue_item" => {}
+                SecretOrigin::Key(origin) => {
+                    // Every original source ceiling is independent. Metadata
+                    // resolution verifies the exact retained owner tuple; it
+                    // neither loads Key.value nor refreshes a sponsor's IAM.
+                    for authority in &authorities {
+                        for action in [crate::rbac::Action::Read]
+                            .into_iter()
+                            .chain(origin.encrypted.then_some(crate::rbac::Action::Decrypt))
+                        {
+                            if !Contributors::key_origin_allowed(conn, authority, origin, action)
+                                .await?
+                            {
+                                return Err(denied());
+                            }
+                        }
+                    }
+                }
+                _ => return Err(denied()),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn attestation_key(master: &str) -> [u8; 32] {

@@ -1166,7 +1166,9 @@ impl InheritedInputRepository {
                     if !exists {
                         return Err(denied());
                     }
-                    direct.insert(renderer);
+                    // The renderer is retained by the receipt's own typed
+                    // column and added to the returned graph below. Creation
+                    // and replay do not manufacture a self-dependency edge.
                 }
                 SelectionSource::Authored {
                     origins: source, ..

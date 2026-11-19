@@ -390,6 +390,13 @@ async fn stage_record(
         authored_schema: queue.item_schema.clone(),
         contract,
     };
+    let (payload, fields) = attune_common::secret_values::merge_contract_secret_redactions(
+        payload,
+        &[],
+        &attune_common::value_schema::CompiledContract::new(&binding.contract).unwrap(),
+    )
+    .unwrap();
+    let fields = attune_common::secret_values::prepare_secret_values(fields, QUEUE_KEY).unwrap();
     let item = WorkQueueItemRepository::create_bound_pinned(
         &mut *conn,
         CreateWorkQueueItemInput {
@@ -417,6 +424,9 @@ async fn stage_record(
     )
     .await
     .unwrap();
+    attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::replace_entity_with_conn(
+        &mut *conn, attune_common::secret_values::ENTITY_QUEUE_ITEM_PAYLOAD, item.id, &fields,
+    ).await.unwrap();
     let selected = Admission::select(
         conn,
         queue.pack.unwrap(),
@@ -464,6 +474,20 @@ async fn accepted_record(
 
 #[tokio::test]
 async fn mixed_queue_receipts_bind_each_contributor_and_structured_secret_after_item_retention() {
+    mixed_queue_case(false, false).await;
+}
+
+#[tokio::test]
+async fn direct_key_queue_sources_preserve_original_origins_without_reselecting_values() {
+    mixed_queue_case(true, false).await;
+}
+
+#[tokio::test]
+async fn queue_contributor_sources_cannot_union_separate_read_and_decrypt_ceilings() {
+    mixed_queue_case(true, true).await;
+}
+
+async fn mixed_queue_case(direct_key: bool, split_ceilings: bool) {
     use attune_common::{
         crypto,
         models::WorkQueueItemStatus,
@@ -515,6 +539,77 @@ async fn mixed_queue_receipts_bind_each_contributor_and_structured_secret_after_
     )
     .await
     .unwrap();
+    let key = KeyRepository::find_by_id(&*db, key.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let source_key = if direct_key {
+        let source = helpers::KeyFixture::new_pack(
+            policy.owner.pack_id,
+            &policy.owner.pack_ref,
+            "contributor_credential",
+            "source-value",
+        )
+        .create(&db)
+        .await
+        .unwrap();
+        KeyRepository::update(
+            &*db,
+            source.id,
+            UpdateKeyInput {
+                encrypted: Some(true),
+                encryption_key_hash: Some(
+                    crypto::keystore::fingerprint(QUEUE_KEY, source.id).unwrap(),
+                ),
+                value: Some(
+                    crypto::keystore::encrypt_json(&json!("source-value"), QUEUE_KEY, source.id)
+                        .unwrap(),
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        KeyRepository::find_by_id(&*db, source.id)
+            .await
+            .unwrap()
+            .unwrap()
+    } else {
+        KeyRepository::find_by_id(&*db, key.id)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    if direct_key {
+        use attune_common::repositories::identity::{
+            CreatePermissionAssignmentInput, CreatePermissionSetInput,
+            PermissionAssignmentRepository, PermissionSetRepository,
+        };
+        for actor in [human, other.id] {
+            let actions = if split_ceilings {
+                if actor == human {
+                    json!(["read"])
+                } else {
+                    json!(["decrypt"])
+                }
+            } else {
+                json!(["read", "decrypt"])
+            };
+            let set = PermissionSetRepository::create(&*db, CreatePermissionSetInput {
+                r#ref: format!("owned.queue-source-key-{actor}"), pack:None,pack_ref:None,label:None,description:None,
+                grants:json!([{"resource":"keys","actions":actions,"constraints":{"ids":[source_key.id]}}]),
+            }).await.unwrap();
+            PermissionAssignmentRepository::create(
+                &*db,
+                CreatePermissionAssignmentInput {
+                    identity: actor,
+                    permset: set.id,
+                },
+            )
+            .await
+            .unwrap();
+        }
+    }
     let mut tx = db.begin().await.unwrap();
     attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
         .await
@@ -525,29 +620,42 @@ async fn mixed_queue_receipts_bind_each_contributor_and_structured_secret_after_
             .unwrap()
             .unwrap();
     let queue=WorkQueueRepository::update(&mut *tx,queue.id,UpdateWorkQueueInput {
-        action_params:Some(json!({"value":format!("{{{{ keystore['{}'] + ':' + items[0].message + ':' + items[1].message }}}}",key.r#ref),
-            "connection":"{{ config.connection }}"})),..Default::default()
+        action_params:Some(json!({"value":format!("{{{{ keystore['{}'] + ':' + items[0].message.text + ':' + items[1].message.text }}}}",key.r#ref),
+            "connection":"{{ config.connection }}"})),
+        item_schema:Some(json!({"message":{"type":"object","properties":{"text":{"type":"string","secret":true}}}})),
+        ..Default::default()
     }).await.unwrap();
     let revision = Authority::capture_policy(&mut tx, &policy).await.unwrap();
     Authority::activate_policy(&mut tx, revision.id)
         .await
         .unwrap();
-    let first = accepted_record(
+    let first = stage_record(
         &mut tx,
         &queue,
         &snapshot,
         human,
-        json!({"message":"first"}),
+        json!({"message":{"text":"first"}}),
     )
     .await;
-    let second = accepted_record(
+    let second = stage_record(
         &mut tx,
         &queue,
         &snapshot,
         other.id,
-        json!({"message":"second"}),
+        json!({"message":{"text":"second"}}),
     )
     .await;
+    if split_ceilings {
+        for (item, source) in [(first.id, second.id), (second.id, first.id)] {
+            sqlx::query("INSERT INTO recorded_queue_item_input(item,contributor,expected_contributors,authority,authority_digest) SELECT $1,'independent-source',1,authority,authority_digest FROM recorded_execution_input_authority WHERE owner_kind='queue_item' AND owner_id=$2")
+                .bind(item).bind(source).execute(&mut *tx).await.unwrap();
+        }
+    }
+    for item in [&first, &second] {
+        Fixed::capture(&mut tx, &queue, item, &snapshot, QUEUE_KEY)
+            .await
+            .unwrap();
+    }
     WorkQueueItemRepository::update(
         &mut *tx,
         first.id,
@@ -621,6 +729,62 @@ async fn mixed_queue_receipts_bind_each_contributor_and_structured_secret_after_
     WorkQueueItemRepository::attach_execution_to_lease(&mut *tx, lease, execution.id)
         .await
         .unwrap();
+    if direct_key {
+        for (item, value) in [(first.id, "first"), (second.id, "second")] {
+            queue_key_source(
+                &mut tx,
+                item,
+                &attune_common::key_access::key_origin(&source_key),
+                value,
+            )
+            .await;
+        }
+        if split_ceilings {
+            assert!(
+                Batch::capture_managed(&mut tx, record.id, &queue, &items, None, QUEUE_KEY)
+                    .await
+                    .is_err(),
+                "Read from one original contributor and Decrypt from another cannot be combined"
+            );
+            tx.rollback().await.unwrap();
+            db.cleanup().await.unwrap();
+            return;
+        }
+        let mut wrong_owner = sqlx::Connection::begin(&mut *tx).await.unwrap();
+        let mut origin = attune_common::key_access::key_origin(&source_key);
+        origin.owner_ref = Some("unrelated.business".into());
+        queue_key_source(&mut wrong_owner, first.id, &origin, "first").await;
+        assert!(
+            Batch::capture_managed(&mut wrong_owner, record.id, &queue, &items, None, QUEUE_KEY)
+                .await
+                .is_err(),
+            "matching Key ID/value cannot substitute another owner-qualified origin"
+        );
+        wrong_owner.rollback().await.unwrap();
+    } else {
+        let mut unauthorized = sqlx::Connection::begin(&mut *tx).await.unwrap();
+        queue_key_source(
+            &mut unauthorized,
+            first.id,
+            &attune_common::key_access::key_origin(&key),
+            "first",
+        )
+        .await;
+        assert!(
+            Batch::capture_managed(
+                &mut unauthorized,
+                record.id,
+                &queue,
+                &items,
+                None,
+                QUEUE_KEY
+            )
+            .await
+            .is_err(),
+            "admitted fixed Key authority cannot replace a contributor's own source ceiling"
+        );
+        unauthorized.rollback().await.unwrap();
+    }
     let mut missing_source = sqlx::Connection::begin(&mut *tx).await.unwrap();
     sqlx::query("DELETE FROM recorded_queue_execution_input WHERE execution=$1 AND item=$2")
         .bind(execution.id)
@@ -685,11 +849,17 @@ async fn mixed_queue_receipts_bind_each_contributor_and_structured_secret_after_
     .unwrap();
     let contributors:Vec<serde_json::Value>=sqlx::query_scalar("SELECT authority->'grants' FROM recorded_queue_execution_input WHERE execution=$1 ORDER BY item")
         .bind(execution.id).fetch_all(&mut *tx).await.unwrap();
-    assert_eq!(
-        contributors,
-        vec![json!([]), json!([])],
-        "enqueue-only contributors carry no Key grants"
-    );
+    if direct_key {
+        assert!(contributors
+            .iter()
+            .all(|grants| grants.as_array().unwrap().len() == 1));
+    } else {
+        assert_eq!(
+            contributors,
+            vec![json!([]), json!([])],
+            "enqueue-only contributors carry no Key grants"
+        );
+    }
     let value_site = fixed
         .declarations()
         .iter()
@@ -703,6 +873,17 @@ async fn mixed_queue_receipts_bind_each_contributor_and_structured_secret_after_
     .fetch_one(&mut *tx)
     .await
     .unwrap();
+    assert_eq!(
+        original["queue_payload"]["fields"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        original["queue_payload"]["payload"]["message"]["text"],
+        attune_common::secret_values::redaction_marker()
+    );
     let other_proof: serde_json::Value = sqlx::query_scalar(
         "SELECT proof FROM runtime_accepted_batch_item WHERE admission=$1 AND item=$2",
     )
@@ -838,6 +1019,9 @@ async fn mixed_queue_receipts_bind_each_contributor_and_structured_secret_after_
     .await
     .unwrap();
     assert!(receipt.source_origins().iter().any(|origin|matches!(origin,attune_common::secret_provenance::SecretOrigin::Key(origin) if origin.key_id==key.id && origin.encrypted)));
+    if direct_key {
+        assert!(receipt.source_origins().iter().any(|origin|matches!(origin,attune_common::secret_provenance::SecretOrigin::Key(origin) if origin.key_id==source_key.id && origin.encrypted)),"contributor Key provenance remains distinct from admitted fixed credentials");
+    }
     let connection = fixed
         .declarations()
         .iter()
@@ -1079,6 +1263,18 @@ async fn mixed_queue_receipts_bind_each_contributor_and_structured_secret_after_
     let inputs:Vec<i64>=sqlx::query_scalar("SELECT configuration_input FROM runtime_accepted_batch_item WHERE admission=$1 ORDER BY item").bind(retry_record.id).fetch_all(&mut *tx).await.unwrap();
     assert_eq!(inputs.len(), 2);
     assert!(inputs.contains(&fixed.id()));
+    let retry_member: serde_json::Value = sqlx::query_scalar(
+        "SELECT proof FROM runtime_accepted_batch_item WHERE admission=$1 AND item=$2",
+    )
+    .bind(retry_record.id)
+    .bind(first.id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(
+        original, retry_member,
+        "retry preserves original authenticated member context and ciphertext"
+    );
     ExecutionRepository::delete(&mut *tx, execution.id)
         .await
         .unwrap();
@@ -1124,7 +1320,146 @@ async fn mixed_queue_receipts_bind_each_contributor_and_structured_secret_after_
     );
     revoked.rollback().await.unwrap();
     tx.commit().await.unwrap();
+    queue_manifest_conversion_boundary(&db, retry_record.id).await;
     db.cleanup().await.unwrap();
+}
+
+// The conversion operator sees a committed, populated Queue manifest whose
+// source items/execution have already been removed. It must authenticate the
+// original member box, preserve its bytes, and fail atomically on corruption.
+async fn queue_key_source(
+    conn: &mut sqlx::PgConnection,
+    item: i64,
+    origin: &attune_common::secret_provenance::KeyOrigin,
+    value: &str,
+) {
+    use attune_common::secret_values::{
+        prepare_secret_values, SecretValueInput, ENTITY_QUEUE_ITEM_PAYLOAD,
+    };
+    let fields = prepare_secret_values(
+        vec![SecretValueInput {
+            json_path: "/message/text".into(),
+            value: json!(value),
+            source_kind: "provenance".into(),
+            source_ref: Some(
+                serde_json::to_string(&attune_common::secret_provenance::SecretProvenance::key(
+                    origin.clone(),
+                ))
+                .unwrap(),
+            ),
+        }],
+        QUEUE_KEY,
+    )
+    .unwrap();
+    attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::replace_entity_with_conn(conn,ENTITY_QUEUE_ITEM_PAYLOAD,item,&fields).await.unwrap();
+}
+
+async fn queue_manifest_conversion_boundary(db: &TestDatabase, admission: i64) {
+    use attune_common::repositories::encryption_conversion::convert_offline;
+    let receipts: Vec<i64> = sqlx::query_scalar("SELECT id FROM runtime_input_receipt ORDER BY id")
+        .fetch_all(&**db)
+        .await
+        .unwrap();
+    for receipt in receipts {
+        attune_common::repositories::inherited_input::InheritedInputRepository::retention_parents(
+            &mut db.acquire().await.unwrap(),
+            receipt,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("owning receipt {receipt} must have a coherent retained graph: {error}")
+        });
+    }
+    sqlx::raw_sql("DO $$ BEGIN BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='attune_encryption_maintenance') THEN CREATE ROLE attune_encryption_maintenance NOLOGIN; END IF; EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END; BEGIN GRANT attune_encryption_maintenance TO CURRENT_USER; EXCEPTION WHEN unique_violation THEN NULL; END; END $$")
+        .execute(&**db).await.unwrap();
+    let before = queue_conversion_state(db).await;
+    let dry = convert_offline(db, QUEUE_KEY, false).await.unwrap();
+    assert!(!dry.applied);
+    assert!(
+        dry.fields_already_current >= 4,
+        "both member boxes and protected leaves are inventoried"
+    );
+    let applied = convert_offline(db, QUEUE_KEY, true).await.unwrap();
+    assert!(applied.applied);
+    assert_eq!(before, queue_conversion_state(db).await);
+    assert!(
+        convert_offline(db, "wrong-queue-conversion-master-32bytes", true)
+            .await
+            .is_err()
+    );
+    assert_eq!(before, queue_conversion_state(db).await);
+
+    let members: Vec<(i64, serde_json::Value)> = sqlx::query_as(
+        "SELECT item,proof FROM runtime_accepted_batch_item WHERE admission=$1 ORDER BY item",
+    )
+    .bind(admission)
+    .fetch_all(&**db)
+    .await
+    .unwrap();
+    assert_eq!(members.len(), 2);
+    let (item, original) = &members[0];
+    let mut rebound = original.clone();
+    for field in ["nonce", "ciphertext"] {
+        rebound["queue_payload"]["attestation"][field] =
+            members[1].1["queue_payload"]["attestation"][field].clone();
+    }
+    let mut malformed = original.clone();
+    malformed["queue_payload"]["attestation"]["ciphertext"] = json!([0, 1, 2]);
+    let mut omitted = original.clone();
+    omitted["queue_payload"]
+        .as_object_mut()
+        .unwrap()
+        .remove("attestation");
+    let mut downgraded = original.clone();
+    downgraded["queue_payload"] = serde_json::Value::Null;
+    downgraded["authority"]["binding"] = serde_json::to_value(InvocationBinding::Action {
+        action_ref: original["authority"]["binding"]["action_ref"]
+            .as_str()
+            .unwrap()
+            .into(),
+    })
+    .unwrap();
+    for body in [rebound, malformed, omitted, downgraded] {
+        replace_queue_manifest_fixture(db, admission, *item, &body).await;
+        let corrupt = queue_conversion_state(db).await;
+        assert!(convert_offline(db, QUEUE_KEY, true).await.is_err());
+        assert_eq!(
+            corrupt,
+            queue_conversion_state(db).await,
+            "failed conversion must not modify any owning ciphertext or revision"
+        );
+        replace_queue_manifest_fixture(db, admission, *item, original).await;
+        assert_eq!(before, queue_conversion_state(db).await);
+    }
+}
+
+async fn queue_conversion_state(db: &TestDatabase) -> serde_json::Value {
+    sqlx::query_scalar("SELECT jsonb_build_object('members',(SELECT jsonb_agg(to_jsonb(t) ORDER BY admission,item) FROM runtime_accepted_batch_item t),'inputs',(SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM work_queue_item_configuration_input t),'keys',(SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM key t),'fields',(SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM execution_secret_value t),'receipts',(SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM runtime_input_receipt t))")
+        .fetch_one(&**db).await.unwrap()
+}
+
+async fn replace_queue_manifest_fixture(
+    db: &TestDatabase,
+    admission: i64,
+    item: i64,
+    body: &serde_json::Value,
+) {
+    let mut tx = db.begin().await.unwrap();
+    sqlx::query(
+        "ALTER TABLE runtime_accepted_batch_item DISABLE TRIGGER guard_runtime_accepted_batch_item",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE runtime_accepted_batch_item SET proof=$3,proof_digest=$4,configuration_input=$5 WHERE admission=$1 AND item=$2")
+        .bind(admission).bind(item).bind(body).bind(fixture_digest(body)).bind(body["queue_payload"]["fixed_input"].as_i64()).execute(&mut *tx).await.unwrap();
+    sqlx::query(
+        "ALTER TABLE runtime_accepted_batch_item ENABLE TRIGGER guard_runtime_accepted_batch_item",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
 }
 
 #[tokio::test]
