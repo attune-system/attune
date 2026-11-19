@@ -210,16 +210,21 @@ impl LiveCustody {
     }
 
     async fn new() -> Result<Self> {
+        Self::new_with_adhoc(false).await
+    }
+
+    async fn new_with_adhoc(is_adhoc: bool) -> Result<Self> {
         use attune_common::repositories::{
             delegated_execution::DelegatedExecutionRepository, execution::ExecutionRepository,
         };
         use sha2::{Digest, Sha256};
         attune_common::auth::install_crypto_provider();
         let ctx = TestContext::new().await?.with_admin_auth().await?;
-        let process_token = helpers::delegated_source::token(
+        let process_token = helpers::delegated_source::token_with_adhoc(
             &ctx,
             ctx.user.as_ref().unwrap().id,
             &["standard".into()],
+            is_adhoc,
         )
         .await?;
         let claims =
@@ -335,6 +340,15 @@ impl LiveCustody {
 
 #[tokio::test]
 async fn delivery_issuance_is_scoped_and_revocation_cannot_be_restored() -> Result<()> {
+    delivery_issuance_is_scoped(false).await
+}
+
+#[tokio::test]
+async fn adhoc_delivery_issuance_is_scoped_and_revocation_cannot_be_restored() -> Result<()> {
+    delivery_issuance_is_scoped(true).await
+}
+
+async fn delivery_issuance_is_scoped(is_adhoc: bool) -> Result<()> {
     use attune_common::{
         models::ExecutionStatus,
         repositories::{
@@ -347,7 +361,7 @@ async fn delivery_issuance_is_scoped_and_revocation_cannot_be_restored() -> Resu
     };
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
-    let fixture = LiveCustody::new().await?;
+    let fixture = LiveCustody::new_with_adhoc(is_adhoc).await?;
     let mut tx = fixture.ctx.pool.begin().await?;
     LogDeliveryRepository::prepare(&mut tx, fixture.preparation.clone()).await?;
     ExecutionRepository::transition_worker(

@@ -36,15 +36,26 @@ pub async fn create(
 /// Create an independent managed source for an authorization route test. No
 /// permissions are assigned here: selected named sets must already be covered.
 pub async fn token(ctx: &super::TestContext, owner: i64, refs: &[String]) -> super::Result<String> {
+    token_with_adhoc(ctx, owner, refs, false).await
+}
+
+pub async fn token_with_adhoc(
+    ctx: &super::TestContext,
+    owner: i64,
+    refs: &[String],
+    is_adhoc: bool,
+) -> super::Result<String> {
     let pack_ref = format!("credential_{}", Uuid::new_v4().simple());
     let pack = super::create_test_pack(&ctx.pool, &pack_ref).await?;
     let action_ref = format!("{pack_ref}.source");
-    let action = super::create_test_action(&ctx.pool, pack.id, &pack_ref, &action_ref).await?;
+    let action =
+        super::create_test_action_with_adhoc(&ctx.pool, pack.id, &pack_ref, &action_ref, is_adhoc)
+            .await?;
     super::activate_test_pack_release_with_projections(
         &ctx.pool,
         &pack,
         &attune_common::repositories::component_lifecycle::PackProjectionIds {
-            actions: vec![action.id],
+            actions: if is_adhoc { vec![] } else { vec![action.id] },
             ..Default::default()
         },
     )

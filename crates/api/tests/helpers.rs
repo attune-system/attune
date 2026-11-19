@@ -807,6 +807,16 @@ pub async fn create_test_action(
     pack_ref: &str,
     ref_name: &str,
 ) -> Result<Action> {
+    create_test_action_with_adhoc(pool, pack_id, pack_ref, ref_name, false).await
+}
+
+pub async fn create_test_action_with_adhoc(
+    pool: &PgPool,
+    pack_id: i64,
+    pack_ref: &str,
+    ref_name: &str,
+    is_adhoc: bool,
+) -> Result<Action> {
     let input = CreateActionInput {
         launch: None,
         parameter_delivery: None,
@@ -828,7 +838,7 @@ pub async fn create_test_action(
         worker_affinity: serde_json::json!({}),
         param_schema: None,
         out_schema: None,
-        is_adhoc: false,
+        is_adhoc,
         accesses_mcp: false,
         default_execution_permission_set_refs: Vec::new(),
         reference_visibility: Default::default(),
