@@ -1358,11 +1358,15 @@ async fn command_inspection_is_not_action_authority_and_selection_is_exact() -> 
     tx.rollback().await?;
     let version = ordinary_file_version(&ctx, execution).await?;
     let mut tx = ctx.pool.begin().await?;
-    assert!(
-        Effects::prepare_file_publication(&mut tx, version.id, execution, attempt)
-            .await
-            .is_err()
-    );
+    assert!(Effects::prepare_file_publication(
+        &mut tx,
+        version.id,
+        execution,
+        attempt,
+        Some(master)
+    )
+    .await
+    .is_err());
     tx.rollback().await?;
     let mut wrong_program = program.clone();
     wrong_program.invocation_name = "/else".into();

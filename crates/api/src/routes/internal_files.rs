@@ -4948,7 +4948,7 @@ async fn authorize_version_mutation_source(
     let native = if version.body_state != Some(ArtifactBodyState::Ready) {
         if let Some((execution, attempt)) = native_binding {
             attune_common::repositories::execution_process::ExecutionProcessRepository::prepare_file_publication(
-                tx, version.id, execution, attempt,
+                tx, version.id, execution, attempt, state.config.security.encryption_key.as_deref(),
             ).await.map_err(map_transport_error)?
         } else {
             None
