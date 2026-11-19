@@ -745,6 +745,20 @@ services:
       com.datadoghq.tags.service: attune-worker-full
     restart: unless-stopped
 
+  # Explicit opt-in: operator-admitted recipes, trusted pack/dependency code.
+  worker-toolchains:
+    extends:
+      service: worker-full
+    profiles: [toolchains]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.toolchains
+    image: attune-worker-toolchains:local
+    container_name: attune-worker-toolchains
+    environment:
+      ATTUNE_WORKER_NAME: worker-toolchains-01
+      ATTUNE_RUNTIME_RECIPE_DIGESTS: ${ATTUNE_RUNTIME_RECIPE_DIGESTS:-}
+
   # Default sensor service now uses the injected sensor agent inside a stock runtime image.
   sensor: &sensor-service
     <<: *attune-service-logging

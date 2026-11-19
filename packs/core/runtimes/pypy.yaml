@@ -1,0 +1,34 @@
+ref: core.pypy
+pack_ref: core
+name: PyPy
+aliases: [pypy, pypy3]
+description: Optional trusted PyPy toolchain with separately reported implementation version
+distributions: {}
+execution_config:
+  lifecycle:
+    tools:
+      - name: python
+        binaries: [pypy3]
+        args: [-c, "import sys; print('.'.join(map(str, sys.version_info[:3])))"]
+        version_pattern: '(?<version>3\.\d+\.\d+)'
+        primary: true
+      - name: pypy_impl
+        binaries: [pypy3]
+        args: [-c, "import sys; print('.'.join(map(str, sys.pypy_version_info[:3])))"]
+        version_pattern: '(?<version>\d+\.\d+\.\d+)'
+      - name: uv
+        binaries: [uv]
+        args: [--version]
+        version_pattern: 'uv (?<version>\d+\.\d+\.\d+)'
+    extensions: [py]
+    prepare:
+      - command: ['{tool_uv}', venv, --python, '{tool_python}', '{env_dir}/venv']
+      - command: ['{tool_uv}', pip, install, --python, '{env_dir}/venv/bin/python', -r, '{pack_dir}/requirements.txt']
+        when_file_exists: requirements.txt
+    launch:
+      command: ['{env_dir}/venv/bin/python', -u, '{source_file}']
+      cwd: '{pack_dir}'
+    env:
+      UV_NO_CONFIG: '1'
+      UV_PYTHON_DOWNLOADS: never
+      PYTHONPATH: '{pack_dir}/lib'

@@ -10430,6 +10430,7 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
     pub(crate) async fn select_worker_for_pack_test(
         pool: &PgPool,
         required_runtimes: &[String],
+        required_recipe_digests: &[String],
         placement: WorkerPlacement,
         round_robin_counter: &AtomicUsize,
     ) -> Result<attune_common::models::Worker> {
@@ -10445,6 +10446,7 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
 
         let capable_workers: Vec<_> = workers
             .into_iter()
+            .filter(|worker| Self::worker_admits_test_recipes(worker, required_recipe_digests))
             .filter(|w| {
                 w.status == Some(attune_common::models::enums::WorkerStatus::Active) && !w.cordoned
             })
@@ -10482,7 +10484,7 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
                 normalized_required.join(", ")
             };
             return Err(anyhow::anyhow!(
-                "No active workers support the runtimes required for pack tests: {}",
+                "No active workers satisfy recipe admission, placement, and required pack-test runtimes: {}",
                 required
             ));
         }
@@ -10490,6 +10492,24 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
         let count = round_robin_counter.fetch_add(1, Ordering::Relaxed);
         let index = count % capable_workers.len();
         Ok(capable_workers[index].clone())
+    }
+
+    fn worker_admits_test_recipes(
+        worker: &attune_common::models::Worker,
+        digests: &[String],
+    ) -> bool {
+        digests.iter().all(|digest| {
+            worker
+                .capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.get("runtime_recipe_digests"))
+                .and_then(|value| value.as_array())
+                .is_some_and(|admitted| {
+                    admitted
+                        .iter()
+                        .any(|value| value.as_str() == Some(digest.as_str()))
+                })
+        })
     }
 
     fn effective_placement(
@@ -10585,6 +10605,13 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
     /// This checks the worker's capabilities.runtimes array against the runtime's aliases.
     /// If aliases are missing, fall back to the runtime's canonical name.
     fn worker_supports_runtime(worker: &attune_common::models::Worker, runtime: &Runtime) -> bool {
+        if runtime.execution_config.get("lifecycle").is_some() {
+            return attune_common::runtime_lifecycle::capability_for(
+                worker.capabilities.as_ref(),
+                runtime,
+            )
+            .is_some();
+        }
         let runtime_names = Self::runtime_capability_names(runtime);
 
         // Try to parse capabilities and check runtimes array
@@ -10661,10 +10688,14 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
                 continue;
             }
 
-            let advertised_versions = Self::worker_runtime_versions(
+            let mut advertised_versions = Self::worker_runtime_versions(
                 capabilities,
                 std::slice::from_ref(&normalized_runtime_name),
             );
+            advertised_versions.extend(attune_common::runtime_lifecycle::versions_matching_names(
+                capabilities,
+                std::slice::from_ref(&normalized_runtime_name),
+            ));
 
             if advertised_versions.is_empty() {
                 debug!(
@@ -10727,8 +10758,11 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
             .map(|name| normalize_runtime_name(&name))
             .collect();
 
-        let advertised_versions =
-            Self::worker_runtime_versions(capabilities, &candidate_runtime_names);
+        let advertised_versions = if runtime.execution_config.get("lifecycle").is_some() {
+            attune_common::runtime_lifecycle::available_versions(Some(capabilities), runtime)
+        } else {
+            Self::worker_runtime_versions(capabilities, &candidate_runtime_names)
+        };
 
         if advertised_versions.is_empty() {
             debug!(
@@ -13591,6 +13625,78 @@ true,
         };
 
         assert!(ExecutionScheduler::worker_supports_runtime(
+            &worker, &runtime
+        ));
+    }
+
+    #[test]
+    fn recipe_candidate_placement_requires_every_exact_operator_admission() {
+        let mut worker = create_test_worker("candidate-worker", 5);
+        assert!(ExecutionScheduler::worker_admits_test_recipes(&worker, &[]));
+        assert!(!ExecutionScheduler::worker_admits_test_recipes(
+            &worker,
+            &["a".repeat(64)]
+        ));
+        worker.capabilities = Some(serde_json::json!({"runtime_recipe_digests":["a".repeat(64)]}));
+        assert!(ExecutionScheduler::worker_admits_test_recipes(
+            &worker,
+            &["a".repeat(64)]
+        ));
+        assert!(!ExecutionScheduler::worker_admits_test_recipes(
+            &worker,
+            &["a".repeat(64), "b".repeat(64)]
+        ));
+    }
+
+    #[test]
+    fn test_worker_supports_runtime_recipe_requires_exact_ref_and_digest() {
+        use serde_json::json;
+        let mut worker = create_test_worker("recipe-worker", 5);
+        let recipe:attune_common::runtime_lifecycle::RuntimeRecipe=serde_json::from_value(json!({
+            "tools":[{"name":"tool","binaries":["tool"],"version_pattern":"(?<version>[0-9]+)","primary":true}],
+            "launch":{"command":["{tool_tool}","{source_file}"]}
+        })).unwrap();
+        let mut runtime:Runtime=serde_json::from_value(json!({
+            "id":1,"ref":"example.fixed","pack":null,"pack_ref":"example","description":null,
+            "name":"Shell","aliases":["shell"],"distributions":{},"installation":null,"installers":{},
+            "execution_config":{"lifecycle":recipe},"auto_detected":false,"detection_config":{},
+            "retired_at":null,"created":Utc::now(),"updated":Utc::now()
+        })).unwrap();
+        assert!(!ExecutionScheduler::worker_supports_runtime(
+            &worker, &runtime
+        ));
+        worker.capabilities = Some(
+            json!({"runtimes":["shell"],"runtime_toolchains":{"other.fixed":{"digest":recipe.digest().unwrap()}}}),
+        );
+        assert!(!ExecutionScheduler::worker_supports_runtime(
+            &worker, &runtime
+        ));
+        worker.capabilities.as_mut().unwrap()["runtime_toolchains"]["example.fixed"] =
+            json!({"digest":recipe.digest().unwrap()});
+        assert!(ExecutionScheduler::worker_supports_runtime(
+            &worker, &runtime
+        ));
+        let caps = worker.capabilities.as_mut().unwrap();
+        caps["runtime_versions"] = json!({"shell":["99.0"]});
+        caps["detected_interpreters"] = json!([{"name":"shell","version":"99.0"}]);
+        caps["runtime_toolchains"]["example.fixed"]["versions"] = json!(["1.0"]);
+        caps["runtime_toolchains"]["example.fixed"]["names"] = json!(["shell"]);
+        assert!(!ExecutionScheduler::worker_supports_runtime_constraint(
+            &worker,
+            &runtime,
+            Some(">=99")
+        ));
+        assert!(ExecutionScheduler::worker_supports_runtime_constraint(
+            &worker,
+            &runtime,
+            Some("=1.0")
+        ));
+        assert!(ExecutionScheduler::worker_supports_required_runtimes(
+            &worker,
+            &json!({"shell":"=1.0"})
+        ));
+        runtime.execution_config["lifecycle"]["env"] = json!({"APP_REGION":"changed"});
+        assert!(!ExecutionScheduler::worker_supports_runtime(
             &worker, &runtime
         ));
     }

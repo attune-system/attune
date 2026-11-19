@@ -1,0 +1,7 @@
+ref: core.lifecycle_sensor
+label: Recipe sensor fixture
+runner_type: core.lifecycle_fixture
+entry_point: lifecycle_sensor.py
+enabled: false
+trigger_types: [core.lifecycle_tick]
+parameters: {}

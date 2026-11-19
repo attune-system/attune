@@ -23,6 +23,7 @@ use tempfile::TempDir;
 
 fn make_python_config() -> RuntimeExecutionConfig {
     RuntimeExecutionConfig {
+        lifecycle: None,
         interpreter: InterpreterConfig {
             binary: "python3".to_string(),
             args: vec!["-u".to_string()],
@@ -84,6 +85,7 @@ with zipfile.ZipFile(wheel, "w", zipfile.ZIP_DEFLATED) as archive:
 
 fn make_shell_config() -> RuntimeExecutionConfig {
     RuntimeExecutionConfig {
+        lifecycle: None,
         interpreter: InterpreterConfig {
             binary: "/bin/bash".to_string(),
             args: vec![],
@@ -316,6 +318,7 @@ async fn test_unittest_uses_prepared_runtime_dependencies() {
         runners: HashMap::from([(
             "python".to_string(),
             RunnerConfig {
+                lifecycle: None,
                 r#type: "unittest".to_string(),
                 entry_point: "tests/test_dependency.py".to_string(),
                 timeout: Some(30),

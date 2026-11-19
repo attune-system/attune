@@ -1,0 +1,28 @@
+# Example: adapt output name/tasks to the workload, then admit its exact digest.
+ref: example.gradle_jvm
+pack_ref: example
+name: GradleJvm
+aliases: [gradlejvm]
+description: Trusted same-worker Gradle build and direct JVM launch
+distributions: {}
+execution_config:
+  lifecycle:
+    tools:
+      - name: java
+        binaries: [java]
+        args: [-version]
+        version_pattern: 'version "(?<version>[0-9.]+)'
+        primary: true
+      - name: gradle
+        binaries: [gradle]
+        args: [--version]
+        version_pattern: 'Gradle (?<version>[0-9.]+)'
+    extensions: [java]
+    workspace: true
+    prepare:
+      - command: ['{tool_gradle}', --offline, --no-daemon, --project-cache-dir, '{env_dir}/project-cache', jar]
+    launch:
+      command: ['{tool_java}', -jar, '{workspace_dir}/build/libs/app.jar']
+      cwd: '{workspace_dir}'
+    env:
+      GRADLE_USER_HOME: '{env_dir}/gradle-home'

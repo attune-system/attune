@@ -18,6 +18,71 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+#[tokio::test]
+async fn sensor_toolchains_require_an_advertised_exact_recipe_digest() {
+    use attune_common::repositories::Update;
+    let pool = create_test_pool().await.unwrap();
+    let pack = PackFixture::new_unique("sensor_toolchain")
+        .create(&pool)
+        .await
+        .unwrap();
+    let recipe:attune_common::runtime_lifecycle::RuntimeRecipe=serde_json::from_value(json!({
+        "tools":[{"name":"fixture","binaries":["fixture"],"version_pattern":"(?<version>[0-9]+)","primary":true}],
+        "launch":{"command":["{tool_fixture}","{source_file}"]}
+    })).unwrap();
+    let mut fixture = RuntimeFixture::new_unique(Some(pack.id), Some(pack.r#ref.clone()), "recipe");
+    fixture.execution_config = json!({"lifecycle":recipe});
+    let runtime = fixture.create(&pool).await.unwrap();
+    let sensor = SensorFixture::new_unique(
+        Some(pack.id),
+        Some(pack.r#ref.clone()),
+        runtime.id,
+        runtime.r#ref.clone(),
+        "recipe_sensor",
+    )
+    .create(&pool)
+    .await
+    .unwrap();
+    let worker = create_sensor_worker(&pool, &runtime.name).await;
+    let mut connection = pool.acquire().await.unwrap();
+    let result = SensorAdmissionRepository::worker_eligibility_by_sensor(
+        &mut connection,
+        std::slice::from_ref(&sensor),
+        worker.id,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !result[&sensor.id].eligible,
+        "runtime name alone cannot authorize placement"
+    );
+    drop(connection);
+    let mut capabilities = worker.capabilities.clone().unwrap();
+    capabilities["runtime_toolchains"] = json!({});
+    capabilities["runtime_toolchains"][&runtime.r#ref] = json!({"digest":recipe.digest().unwrap()});
+    WorkerRepository::update(
+        &pool,
+        worker.id,
+        attune_common::repositories::runtime::UpdateWorkerInput {
+            capabilities: Some(capabilities),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut connection = pool.acquire().await.unwrap();
+    let result = SensorAdmissionRepository::worker_eligibility_by_sensor(
+        &mut connection,
+        std::slice::from_ref(&sensor),
+        worker.id,
+    )
+    .await
+    .unwrap();
+    assert!(result[&sensor.id].eligible);
+    drop(connection);
+    pool.cleanup().await.unwrap();
+}
+
 async fn create_sensor_worker(pool: &PgPool, runtime_name: &str) -> Worker {
     let worker = WorkerRepository::create(
         pool,

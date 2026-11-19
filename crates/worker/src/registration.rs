@@ -214,7 +214,12 @@ impl WorkerRegistration {
     /// ]
     /// ```
     pub fn set_detected_runtimes(&mut self, runtimes: Vec<DetectedRuntime>) {
-        let mut runtime_versions: HashMap<String, Vec<String>> = HashMap::new();
+        let mut runtime_versions: HashMap<String, Vec<String>> = self
+            .capabilities
+            .get(RUNTIME_VERSIONS_CAPABILITY_KEY)
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
         let interpreters: Vec<serde_json::Value> = runtimes
             .iter()
             .map(|rt| {
@@ -310,6 +315,28 @@ impl WorkerRegistration {
             runtimes.push(json!("native"));
         }
 
+        let filter = std::env::var("ATTUNE_WORKER_RUNTIMES")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|name| name.trim().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .or_else(|| {
+                config_capabilities
+                    .and_then(|caps| caps.get("runtimes"))
+                    .and_then(|value| value.as_array())
+                    .map(|names| {
+                        names
+                            .iter()
+                            .filter_map(|name| name.as_str().map(str::to_owned))
+                            .collect()
+                    })
+            });
+        detector
+            .enrich_recipe_capabilities(&mut self.capabilities, filter.as_deref())
+            .await?;
         info!("Worker capabilities detected: {:?}", self.capabilities);
 
         Ok(())
@@ -556,10 +583,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_worker_capabilities() {
-        let (config, pool, _database) = isolated_test_context().await;
+        let (mut config, pool, database) = isolated_test_context().await;
+        config.worker = Some(
+            serde_json::from_value(json!({"capabilities": {"runtimes": ["python"]}})).unwrap(),
+        );
         let mut registration = WorkerRegistration::new(pool, &config);
 
         registration.detect_capabilities(&config).await.unwrap();
+        assert!(registration.capabilities["runtimes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("native")));
         registration.register().await.unwrap();
 
         // Add capability
@@ -567,6 +601,7 @@ mod tests {
         registration.update_capabilities().await.unwrap();
 
         registration.deregister().await.unwrap();
+        database.cleanup().await.unwrap();
     }
 
     #[test]
@@ -629,7 +664,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_detected_runtimes_populates_runtime_versions_capability() {
-        let pool = PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        let pool = PgPool::connect_lazy("postgres://unused@127.0.0.1:1/unused").unwrap();
         let config = Config {
             service_name: "attune".to_string(),
             environment: "test".to_string(),
@@ -664,11 +699,10 @@ mod tests {
         };
         let mut registration = WorkerRegistration::new(pool, &config);
 
-        registration.detect_capabilities(&config).await.unwrap();
-        assert!(registration.capabilities["runtimes"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("native")));
+        registration.add_capability(
+            RUNTIME_VERSIONS_CAPABILITY_KEY.to_string(),
+            json!({"python": ["3.11.14"]}),
+        );
 
         registration.set_detected_runtimes(vec![
             DetectedRuntime {
@@ -689,9 +723,10 @@ mod tests {
                 .get(RUNTIME_VERSIONS_CAPABILITY_KEY),
             Some(&json!({
                 "node": ["20.19.0"],
-                "python": ["3.12.13"]
+                "python": ["3.11.14", "3.12.13"]
             }))
         );
+        registration.pool.close().await;
     }
 
     #[test]

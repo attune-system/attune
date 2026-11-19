@@ -314,7 +314,8 @@ For each `queues/*.yaml`:
 
 - `testing.enabled: true` for publish candidates.
 - Runner entry points exist and are executable/readable.
-- Use implemented runner types: `script`, `unittest`, or `pytest`.
+- Use `script`, `unittest`, `pytest`, or `type: runtime` with an
+  [operator-admitted lifecycle recipe](../deployment/runtime-toolchains.md#candidate-tests-and-local-deployment).
 - Use `result_format: simple` unless the target Attune version proves another parser works.
 - Test output contains `Total Tests:`, `Passed:`, `Failed:`, and optionally `Skipped:`.
 - `min_pass_rate` is normally `1.0`; `on_failure` is normally `block`.

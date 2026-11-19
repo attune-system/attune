@@ -24,7 +24,11 @@ and activation; it does not bypass tests.
 Any API replica can stream the pinned object to the assigned worker. Access
 requires both that worker's JWT and the attempt-specific candidate token, and
 is denied for expired or completed attempts. Workers verify the digest before
-extracting all pack components into `.pack-test-attempts/<install-id>/<pack-ref>`.
+extracting all pack components into
+`runtime_envs_dir/.pack-test-attempts/<install-id>/files/<pack-ref>`. Test
+environments live beside those files under the attempt's `envs` directory.
+Candidate downloads also use writable runtime storage, so installed pack volumes
+can remain read-only in both worker transport modes.
 The active release and API staging tree are not modified by worker cleanup.
 
 Candidate objects remain protected from object maintenance during pending

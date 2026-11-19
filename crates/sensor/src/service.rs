@@ -198,6 +198,7 @@ impl SensorService {
             let transport =
                 attune_common::pack_transport::build_pack_transport_with_worker_token_provider(
                     &config.packs_base_dir,
+                    &config.runtime_envs_dir,
                     configured_api_url.as_deref(),
                     Some(worker_token_provider.clone()),
                     &config.packs.transport,

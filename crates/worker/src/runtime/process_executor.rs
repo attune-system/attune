@@ -462,7 +462,7 @@ pub async fn execute_streaming(
 /// * `cancel_token` - Optional cancellation token for graceful process termination
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_streaming_cancellable(
-    mut cmd: Command,
+    cmd: Command,
     _secrets: &HashMap<String, serde_json::Value>,
     parameters_stdin: Option<&str>,
     timeout_secs: Option<u64>,
@@ -477,6 +477,91 @@ pub async fn execute_streaming_cancellable(
     stdout_log_writer: Option<BoundedLogFileWriter>,
     stderr_log_writer: Option<BoundedLogFileWriter>,
 ) -> RuntimeResult<ExecutionResult> {
+    execute_streaming_with_ownership(
+        cmd,
+        _secrets,
+        parameters_stdin,
+        timeout_secs,
+        max_stdout_bytes,
+        max_stderr_bytes,
+        output_format,
+        output_policy,
+        out_schema,
+        cancel_token,
+        _stdout_log_path,
+        _stderr_log_path,
+        stdout_log_writer,
+        stderr_log_writer,
+        false,
+        None,
+    )
+    .await
+}
+
+/// Recipe generations may be removed only after their entire owned process group exits.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_streaming_recipe(
+    cmd: Command,
+    _secrets: &HashMap<String, serde_json::Value>,
+    parameters_stdin: Option<&str>,
+    deadline: TokioInstant,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
+    output_format: OutputFormat,
+    output_policy: ResolvedOutputPolicy,
+    out_schema: Option<&attune_common::value_schema::Contract>,
+    cancel_token: Option<CancellationToken>,
+    _stdout_log_path: Option<&Path>,
+    _stderr_log_path: Option<&Path>,
+    stdout_log_writer: Option<BoundedLogFileWriter>,
+    stderr_log_writer: Option<BoundedLogFileWriter>,
+) -> RuntimeResult<ExecutionResult> {
+    let remaining = deadline.saturating_duration_since(TokioInstant::now());
+    let timeout_secs = Some(
+        remaining
+            .as_secs()
+            .saturating_add(u64::from(remaining.subsec_nanos() > 0)),
+    );
+    execute_streaming_with_ownership(
+        cmd,
+        _secrets,
+        parameters_stdin,
+        timeout_secs,
+        max_stdout_bytes,
+        max_stderr_bytes,
+        output_format,
+        output_policy,
+        out_schema,
+        cancel_token,
+        _stdout_log_path,
+        _stderr_log_path,
+        stdout_log_writer,
+        stderr_log_writer,
+        true,
+        Some(deadline),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_streaming_with_ownership(
+    mut cmd: Command,
+    _secrets: &HashMap<String, serde_json::Value>,
+    parameters_stdin: Option<&str>,
+    timeout_secs: Option<u64>,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
+    output_format: OutputFormat,
+    output_policy: ResolvedOutputPolicy,
+    out_schema: Option<&attune_common::value_schema::Contract>,
+    cancel_token: Option<CancellationToken>,
+    _stdout_log_path: Option<&Path>,
+    _stderr_log_path: Option<&Path>,
+    stdout_log_writer: Option<BoundedLogFileWriter>,
+    stderr_log_writer: Option<BoundedLogFileWriter>,
+    require_group_exit: bool,
+    deadline_override: Option<TokioInstant>,
+) -> RuntimeResult<ExecutionResult> {
     let start = Instant::now();
     // Reject a mismatched executable policy before any child output can escape.
     OutputPolicy {
@@ -487,8 +572,10 @@ pub async fn execute_streaming_cancellable(
     .resolve(out_schema, output_format)
     .map_err(|error| RuntimeError::InvalidAction(error.to_string()))?;
     let delay_action_mirror = action_output_requires_delayed_mirror(output_policy);
-    let execution_deadline = timeout_secs
-        .and_then(|seconds| TokioInstant::now().checked_add(Duration::from_secs(seconds)));
+    let execution_deadline = deadline_override.or_else(|| {
+        timeout_secs
+            .and_then(|seconds| TokioInstant::now().checked_add(Duration::from_secs(seconds)))
+    });
     let log_finalization_timeout_ms = stdout_log_writer
         .as_ref()
         .map(BoundedLogFileWriter::finalization_timeout_ms)
@@ -819,9 +906,23 @@ pub async fn execute_streaming_cancellable(
     // group. Retain the guard through log finalization so cancellation, failed
     // capture or abort cannot leave a pipe-holding descendant behind. Preserve
     // normal, fully captured completion semantics by disarming only here.
-    #[cfg(unix)]
-    if !was_cancelled && !was_timed_out && !logs_incomplete && process_error.is_none() {
-        process_group_guard.0 = None;
+    if require_group_exit {
+        #[cfg(unix)]
+        {
+            let group = process_group_guard.0.take();
+            attune_common::runtime_lifecycle::stop_owned_process_group(group)
+                .await
+                .map_err(|error| RuntimeError::CleanupError(error.to_string()))?;
+        }
+        #[cfg(not(unix))]
+        return Err(RuntimeError::CleanupError(
+            "Recipe process-tree teardown is unavailable on this platform".into(),
+        ));
+    } else {
+        #[cfg(unix)]
+        if !was_cancelled && !was_timed_out && !logs_incomplete && process_error.is_none() {
+            process_group_guard.0 = None;
+        }
     }
 
     if was_timed_out {

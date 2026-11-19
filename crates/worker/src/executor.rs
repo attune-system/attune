@@ -319,6 +319,19 @@ struct LogAllocationSettings {
     flush_interval_ms: u64,
 }
 
+fn inline_action_source(
+    entrypoint: &str,
+    is_adhoc: bool,
+    runtime_name: Option<&str>,
+    config: Option<&RuntimeExecutionConfig>,
+    has_file: bool,
+) -> Option<String> {
+    (!has_file
+        && (runtime_name == Some("shell")
+            || (is_adhoc && config.is_some_and(|config| config.lifecycle.is_some()))))
+    .then(|| entrypoint.to_owned())
+}
+
 impl ActionExecutor {
     /// Integration startup must prove all consumers are ready before enabling
     /// recorded issuance. No production caller enables this yet.
@@ -1262,6 +1275,24 @@ impl ActionExecutor {
         let (runtime_config_override, runtime_env_dir_suffix, selected_runtime_version) = self
             .resolve_runtime_version(&runtime_record, execution, action)
             .await;
+        // Parent configuration is captured too, even without registered versions.
+        // Never substitute this worker's later authoring copy of the runtime.
+        if let Some(runtime) = &runtime_record {
+            attune_common::execution_env::validate_runtime_environment(&runtime.execution_config)?;
+            if runtime.execution_config.get("lifecycle").is_some()
+                && action.runtime_version_constraint.is_some()
+                && selected_runtime_version.is_none()
+            {
+                return Err(Error::validation(
+                    "No verified toolchain version satisfies the captured action constraint",
+                ));
+            }
+        }
+        let runtime_config_override = runtime_config_override.or_else(|| {
+            runtime_record
+                .as_ref()
+                .map(|runtime| runtime.parsed_execution_config())
+        });
 
         // Recheck the exact captured config selected after worker placement.
         attune_common::execution_env::validate_selected_environment(
@@ -1288,7 +1319,7 @@ impl ActionExecutor {
         // Pack actions have their script files in packs/{pack_ref}/actions/{entrypoint}
         let code_path = if action.launch.is_some() {
             None
-        } else if action.pack_ref.starts_with("core") || !action.is_adhoc {
+        } else if !action.is_adhoc {
             // This is a pack action, construct the file path
             let action_file_path = pack_dir.join("actions").join(&entry_point);
 
@@ -1338,11 +1369,13 @@ impl ActionExecutor {
         };
 
         // For shell actions without a file, use the entrypoint as inline code
-        let code = if runtime_name.as_deref() == Some("shell") && code_path.is_none() {
-            Some(entry_point.clone())
-        } else {
-            None
-        };
+        let code = inline_action_source(
+            &entry_point,
+            action.is_adhoc,
+            runtime_name.as_deref(),
+            runtime_config_override.as_ref(),
+            code_path.is_some(),
+        );
 
         // Resolve the working directory from the runtime's execution_config.
         // The ProcessRuntime also does this internally, but setting it in the
@@ -1591,6 +1624,17 @@ impl ActionExecutor {
             },
         };
 
+        let versions = versions
+            .into_iter()
+            .filter(|version| {
+                attune_common::runtime_lifecycle::validate_version_mode(
+                    &runtime.execution_config,
+                    &version.execution_config,
+                )
+                .is_ok()
+            })
+            .collect();
+
         let constraint = action.runtime_version_constraint.as_deref();
         let local_versions = self
             .filter_versions_for_worker(runtime, execution.worker, versions, action)
@@ -1689,10 +1733,22 @@ impl ActionExecutor {
         versions
             .into_iter()
             .filter(|version| Self::version_matches_worker(version, &advertised_versions))
+            .map(|mut version| {
+                if runtime.execution_config.get("lifecycle").is_some() {
+                    version.available = true;
+                }
+                version
+            })
             .collect()
     }
 
     fn worker_runtime_versions_for_runtime(worker: &Worker, runtime: &RuntimeModel) -> Vec<String> {
+        if runtime.execution_config.get("lifecycle").is_some() {
+            return attune_common::runtime_lifecycle::available_versions(
+                worker.capabilities.as_ref(),
+                runtime,
+            );
+        }
         let mut versions = Vec::new();
         let candidate_runtime_names: Vec<String> = runtime
             .aliases
@@ -2834,6 +2890,31 @@ impl ActionExecutor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recipe_inline_source_is_selected_at_the_action_boundary() {
+        let config = super::RuntimeExecutionConfig { lifecycle: Some(serde_json::from_value(serde_json::json!({
+            "tools":[{"name":"fixture","binaries":["tool"],"version_pattern":"(?<version>1)","primary":true}],
+            "launch":{"command":["{tool_fixture}","{source_file}"]}
+        })).unwrap()), ..Default::default() };
+        assert_eq!(
+            super::inline_action_source("console.log(1)", true, Some("Bun"), Some(&config), false)
+                .as_deref(),
+            Some("console.log(1)")
+        );
+        assert!(super::inline_action_source(
+            "missing.ts",
+            false,
+            Some("Bun"),
+            Some(&config),
+            false
+        )
+        .is_none());
+        assert!(
+            super::inline_action_source("source.ts", true, Some("Bun"), Some(&config), true)
+                .is_none()
+        );
+    }
+
     use super::*;
     use attune_common::artifact_transport::VolumeTransport;
     use attune_common::auth::jwt::{generate_execution_token, validate_token, JwtConfig};
