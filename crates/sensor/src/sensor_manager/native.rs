@@ -64,7 +64,7 @@ impl NativeSensor {
             self.workload,
             self.spec.intent,
             &self.resource,
-            exit.clone(),
+            exit,
         )
         .await?;
         Ok(Some(exit))
