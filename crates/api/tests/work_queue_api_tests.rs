@@ -1653,3 +1653,6 @@ async fn trace_report_enforces_per_queue_dispatch_visibility() {
         "work_queue_item origin should be reported when a queue dispatch is visible"
     );
 }
+
+#[path = "work_queue_payload_editor_tests.rs"]
+mod payload_editor_tests;

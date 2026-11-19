@@ -1662,22 +1662,18 @@ async fn queue_payload_editors(
     match user.claims.token_type {
         TokenType::Access => {}
         TokenType::Execution => {
-            let metadata = user.claims.metadata.as_ref().ok_or_else(|| {
-                ApiError::Unauthorized("Missing originating execution metadata".into())
-            })?;
-            let origin = user
-                .execution_id()
-                .ok_or_else(|| ApiError::Unauthorized("Missing originating execution".into()))?;
-            let action = metadata
-                .get("action_ref")
-                .and_then(JsonValue::as_str)
-                .ok_or_else(|| ApiError::Unauthorized("Missing originating action".into()))?;
-            let refs: Vec<String> =
-                serde_json::from_value(metadata.get("permission_set_refs").cloned().ok_or_else(
-                    || ApiError::Unauthorized("Missing originating selection".into()),
-                )?)
-                .map_err(|_| ApiError::Unauthorized("Invalid originating selection".into()))?;
-            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::validate_legacy_origin(connection, origin, identity, action, &refs).await?;
+            // Retain the active attempt and the selected credential ceiling.
+            // The sponsor's wider IAM authority is not the editing source.
+            let (snapshot, _) =
+                crate::authz::AuthorizationService::retain_legacy_execution_snapshot_on(
+                    connection, user,
+                )
+                .await?;
+            return Ok(vec![attune_common::delegation::DelegationAuthority::new(
+                snapshot.identity_id,
+                snapshot.identity_attributes,
+                snapshot.grants,
+            )]);
         }
         _ => {
             return Err(ApiError::Forbidden(
