@@ -777,6 +777,9 @@ struct SensorManagerInner {
     reconciliation_notify: Notify,
     background_stop: RwLock<CancellationToken>,
     background_tasks: Mutex<Vec<JoinHandle<()>>>,
+    native_startup_stop: RwLock<CancellationToken>,
+    native_startup_tasks: tokio_util::task::TaskTracker,
+    native_cleanup_failed: Arc<AtomicBool>,
     packs_base_dir: String,
     runtime_envs_dir: String,
     pack_transport: Arc<dyn PackFileTransport>,
@@ -833,6 +836,9 @@ impl SensorManager {
                 reconciliation_notify: Notify::new(),
                 background_stop: RwLock::new(CancellationToken::new()),
                 background_tasks: Mutex::new(Vec::new()),
+                native_startup_stop: RwLock::new(CancellationToken::new()),
+                native_startup_tasks: tokio_util::task::TaskTracker::new(),
+                native_cleanup_failed: Arc::new(AtomicBool::new(false)),
                 packs_base_dir: config.packs_base_dir,
                 runtime_envs_dir: config.runtime_envs_dir,
                 pack_transport: config.pack_transport,
@@ -875,8 +881,15 @@ impl SensorManager {
     pub async fn start(&self) -> Result<()> {
         info!("Starting sensor manager");
 
-        // Mark as running
-        *self.inner.running.write().await = true;
+        // Reset startup cancellation only when beginning a new manager run.
+        {
+            let mut running = self.inner.running.write().await;
+            if !*running {
+                *self.inner.native_startup_stop.write().await = CancellationToken::new();
+                self.inner.native_startup_tasks.reopen();
+            }
+            *running = true;
+        }
 
         // Load and start enabled sensors with rule or transport demand.
         let sensors = self.load_enabled_sensors().await?;
@@ -935,6 +948,9 @@ impl SensorManager {
         // Mark as not running
         *self.inner.running.write().await = false;
         self.inner.background_stop.read().await.cancel();
+        // Interrupt persistence/attachment waits before waiting for the gate.
+        // Dropping startup queues exact cleanup owned by native_startup_tasks.
+        self.inner.native_startup_stop.read().await.cancel();
 
         // Wait for starts and restarts that observed the running state before
         // shutdown. Holding this write guard also prevents new lifecycle work
@@ -962,6 +978,13 @@ impl SensorManager {
             if let Err(error) = task.await {
                 failure.get_or_insert(anyhow!("Sensor background task failed: {error}"));
             }
+        }
+        self.inner.native_startup_tasks.close();
+        self.inner.native_startup_tasks.wait().await;
+        if self.inner.native_cleanup_failed.load(Ordering::Acquire) {
+            failure.get_or_insert_with(|| {
+                anyhow!("Native sensor cleanup incomplete; evidence retained")
+            });
         }
         if let Some(error) = failure {
             return Err(error);
@@ -1198,6 +1221,32 @@ impl SensorManager {
     }
 
     async fn start_sensor_locked(&self, sensor: Sensor, reset_failure_count: bool) -> Result<()> {
+        let startup_tasks = tokio_util::task::TaskTracker::new();
+        let stopping = self.inner.native_startup_stop.read().await.clone();
+        let sensor_ref = sensor.r#ref.clone();
+        let result = native::await_startup(
+            self.start_sensor_attempt_locked(sensor, reset_failure_count, startup_tasks.clone()),
+            stopping,
+            self.inner.native.is_some(),
+            None,
+            &sensor_ref,
+        )
+        .await;
+        if result.is_err() {
+            // Covers cancellation during source preparation or instance-map
+            // transfer too, not only waits inside start_standalone_sensor.
+            startup_tasks.close();
+            startup_tasks.wait().await;
+        }
+        result
+    }
+
+    async fn start_sensor_attempt_locked(
+        &self,
+        sensor: Sensor,
+        reset_failure_count: bool,
+        startup_tasks: tokio_util::task::TaskTracker,
+    ) -> Result<()> {
         info!("Starting sensor {} ({})", sensor.r#ref, sensor.id);
 
         if !*self.inner.running.read().await {
@@ -1308,8 +1357,8 @@ impl SensorManager {
         let token_trigger_types = binding.triggers.keys().cloned().collect();
         let executable_snapshot = Some(binding.executable);
 
-        let started = match timeout(
-            SENSOR_STARTUP_TIMEOUT,
+        let stopping = self.inner.native_startup_stop.read().await.clone();
+        let started = native::await_startup(
             self.start_standalone_sensor(
                 sensor.clone(),
                 token_trigger_types,
@@ -1318,16 +1367,21 @@ impl SensorManager {
                 pack_revision,
                 definition_updated,
                 executable_snapshot,
+                startup_tasks.clone(),
             ),
+            stopping,
+            self.inner.native.is_some(),
+            Some(SENSOR_STARTUP_TIMEOUT),
+            &sensor.r#ref,
         )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(anyhow!("Sensor {} startup timed out", sensor.r#ref)),
-        };
+        .await;
         let mut instance = match started {
             Ok(instance) => instance,
             Err(error) => {
+                // Native Drop queued cleanup synchronously. The manager owns
+                // it even if this error/timeout join is itself cancelled.
+                startup_tasks.close();
+                startup_tasks.wait().await;
                 if let Err(release_error) =
                     SensorWorkloadRepository::release(&self.inner.db, workload.fence()).await
                 {
@@ -1386,6 +1440,7 @@ impl SensorManager {
         pack_revision: PackRevision,
         definition_updated: DateTime<Utc>,
         executable_snapshot: Option<attune_common::models::SensorExecutableSnapshot>,
+        startup_tasks: tokio_util::task::TaskTracker,
     ) -> Result<SensorInstance> {
         info!("Starting standalone sensor: {}", sensor.r#ref);
 
@@ -1488,6 +1543,7 @@ impl SensorManager {
                     &runtime,
                     selected_version.as_deref(),
                     reset_failure_count,
+                    startup_tasks,
                 )
                 .await;
         }

@@ -37,82 +37,250 @@ impl Context {
     }
 }
 
-pub(super) struct NativeSensor {
+pub(super) async fn await_startup<T>(
+    startup: impl Future<Output = Result<T>>,
+    stopping: CancellationToken,
+    native: bool,
+    deadline: Option<Duration>,
+    sensor_ref: &str,
+) -> Result<T> {
+    let bounded = async {
+        if let Some(deadline) = deadline {
+            match timeout(deadline, startup).await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow!("Sensor {sensor_ref} startup timed out")),
+            }
+        } else {
+            startup.await
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = stopping.cancelled(), if native => Err(anyhow!("Sensor {sensor_ref} startup cancelled by manager shutdown")),
+        result = bounded => result,
+    }
+}
+
+/// Cleanup is queued synchronously on cancellation; the manager owns the task
+/// through durable fencing, physical stop and every stream/waiter join.
+struct NativeStartupCleanup {
+    tasks: tokio_util::task::TaskTracker,
+    attempt: tokio_util::task::TaskTracker,
+    failed: Arc<AtomicBool>,
+    cleanup: Option<futures::future::BoxFuture<'static, Result<()>>>,
+}
+impl NativeStartupCleanup {
+    fn new(
+        tasks: tokio_util::task::TaskTracker,
+        attempt: tokio_util::task::TaskTracker,
+        failed: Arc<AtomicBool>,
+        cleanup: impl Future<Output = Result<()>> + Send + 'static,
+    ) -> Self {
+        Self {
+            tasks,
+            attempt,
+            failed,
+            cleanup: Some(Box::pin(cleanup)),
+        }
+    }
+    fn queue(&mut self) -> Option<JoinHandle<Result<()>>> {
+        use futures::FutureExt;
+        let cleanup = self.cleanup.take()?;
+        let failed = self.failed.clone();
+        Some(self.tasks.spawn(self.attempt.track_future(async move {
+            let result = std::panic::AssertUnwindSafe(cleanup)
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| {
+                    Err(anyhow!("Native sensor cleanup panicked; evidence retained"))
+                });
+            if result.is_err() {
+                failed.store(true, Ordering::Release);
+                warn!("Native sensor cleanup incomplete; exact evidence retained");
+            }
+            result
+        })))
+    }
+    async fn stop(&mut self) -> Result<()> {
+        self.queue()
+            .ok_or_else(|| anyhow!("Native sensor cleanup already owned"))?
+            .await?
+    }
+}
+impl Drop for NativeStartupCleanup {
+    fn drop(&mut self) {
+        let _ = self.queue();
+    }
+}
+
+struct NativeSensorContext {
     pool: PgPool,
     workload: Id,
     spec: ProcessSpec,
-    resource: ResourceIdentity,
+    resource: std::sync::OnceLock<ResourceIdentity>,
     backend: attune_workload_backend::configuration::NativeBackend,
     transport: Arc<dyn ArtifactFileTransport>,
     worker: Id,
     incarnation: uuid::Uuid,
-    control: Arc<dyn attune_common::isolated_process::ProcessControl>,
+}
+#[derive(Default)]
+struct NativeProcess {
+    control: Option<Arc<dyn attune_common::isolated_process::ProcessControl>>,
     wait_task: Option<JoinHandle<attune_common::Result<LaunchExitOutcome>>>,
+    stdout: Option<JoinHandle<()>>,
+    stderr: Option<JoinHandle<()>>,
+}
+pub(super) struct NativeSensor {
+    context: Arc<NativeSensorContext>,
+    // Only synchronous transfers hold this lock, never IO or database work.
+    process: Arc<std::sync::Mutex<NativeProcess>>,
+    cleanup: NativeStartupCleanup,
 }
 impl NativeSensor {
-    pub(super) async fn poll_exit(&mut self) -> Result<Option<LaunchExitOutcome>> {
-        if !self
-            .wait_task
-            .as_ref()
-            .is_some_and(|task| task.is_finished())
-        {
-            return Ok(None);
+    fn new(
+        context: NativeSensorContext,
+        tasks: tokio_util::task::TaskTracker,
+        attempt: tokio_util::task::TaskTracker,
+        failed: Arc<AtomicBool>,
+    ) -> Self {
+        let context = Arc::new(context);
+        let process = Arc::new(std::sync::Mutex::new(NativeProcess::default()));
+        let (cleanup_context, cleanup_process) = (context.clone(), process.clone());
+        let cleanup = NativeStartupCleanup::new(tasks, attempt, failed, async move {
+            let process =
+                std::mem::take(&mut *cleanup_process.lock().expect("native process owner"));
+            cleanup_context.stop(process).await
+        });
+        Self {
+            context,
+            process,
+            cleanup,
         }
-        let exit = self.wait_task.take().expect("finished task").await??;
+    }
+    pub(super) async fn poll_exit(&mut self) -> Result<Option<LaunchExitOutcome>> {
+        let task = {
+            let mut process = self.process.lock().expect("native process owner");
+            if !process
+                .wait_task
+                .as_ref()
+                .is_some_and(|task| task.is_finished())
+            {
+                return Ok(None);
+            }
+            process.wait_task.take().expect("finished task")
+        };
+        let exit = task.await??;
+        let context = &self.context;
         Ledger::record_native_exit(
-            &self.pool,
-            self.workload,
-            self.spec.intent,
-            &self.resource,
+            &context.pool,
+            context.workload,
+            context.spec.intent,
+            context
+                .resource
+                .get()
+                .ok_or_else(|| anyhow!("Native resource unconfirmed"))?,
             exit,
         )
         .await?;
         Ok(Some(exit))
     }
     pub(super) async fn settle_files(&self) -> Result<()> {
+        let context = &self.context;
         settle_files(
-            &self.pool,
-            self.workload,
-            &self.spec,
-            &self.resource,
-            &self.backend,
-            self.transport.as_ref(),
-            self.worker,
-            self.incarnation,
+            &context.pool,
+            context.workload,
+            &context.spec,
+            context
+                .resource
+                .get()
+                .ok_or_else(|| anyhow!("Native resource unconfirmed"))?,
+            &context.backend,
+            context.transport.as_ref(),
+            context.worker,
+            context.incarnation,
         )
         .await
     }
     pub(super) async fn stop(&mut self) -> Result<()> {
-        // A DB wait must not keep the known exact payload alive. Both owned
-        // futures join before terminal evidence or publication can proceed.
+        self.cleanup.stop().await
+    }
+}
+impl NativeSensorContext {
+    async fn stop(&self, mut process: NativeProcess) -> Result<()> {
+        let control = process.control.take();
         let stopped = async {
+            let resource = match self.resource.get() {
+                Some(resource) => resource.clone(),
+                None => {
+                    // Lost create ACK stays reconcile-only. A lookup error/404
+                    // retains the intent and never authorizes recreation.
+                    self.backend
+                        .launcher()
+                        .prepare(&self.spec, ProcessCreateDisposition::ReconcileOnly)
+                        .await?
+                }
+            };
+            let durable = async {
+                Ledger::record_native_resource(
+                    &self.pool,
+                    self.workload,
+                    self.spec.intent,
+                    &resource,
+                )
+                .await?;
+                Ledger::stop_native_effect(&self.pool, self.workload, self.spec.intent).await
+            };
+            let physical = async {
+                if let Some(control) = control.as_ref() {
+                    control.stop(LaunchStopReason::Cancelled).await
+                } else {
+                    self.backend
+                        .stop_retained(&self.spec, &resource, LaunchStopReason::Cancelled)
+                        .await
+                }
+            };
             let exit =
                 attune_common::repositories::sensor_workload::native_effect::join_sensor_stop(
-                    Ledger::stop_native_effect(&self.pool, self.workload, self.spec.intent),
-                    self.control.stop(LaunchStopReason::Cancelled),
+                    durable, physical,
                 )
                 .await?;
             Ledger::record_native_exit(
                 &self.pool,
                 self.workload,
                 self.spec.intent,
-                &self.resource,
+                &resource,
                 exit,
             )
             .await?;
-            Ok::<_, anyhow::Error>(())
-        }
-        .await;
-        finish_native_stop(stopped, &mut self.wait_task).await
+            Ok(())
+        };
+        join_native_startup_stop(
+            stopped,
+            &mut process.wait_task,
+            &mut process.stdout,
+            &mut process.stderr,
+        )
+        .await
     }
 }
-async fn finish_native_stop(
-    stopped: Result<()>,
+async fn join_native_startup_stop(
+    stopped: impl Future<Output = Result<()>>,
     waiter: &mut Option<JoinHandle<attune_common::Result<LaunchExitOutcome>>>,
+    stdout: &mut Option<JoinHandle<()>>,
+    stderr: &mut Option<JoinHandle<()>>,
 ) -> Result<()> {
-    let joined = join_owned_native_waiter(waiter).await;
+    let (stopped, joined, stdout, stderr) = tokio::join!(
+        stopped,
+        join_owned_native_waiter(waiter),
+        drain_sensor_capture(stdout, Duration::from_secs(30)),
+        drain_sensor_capture(stderr, Duration::from_secs(30)),
+    );
+    // No early return abandons another stream or waiter. Aborted captures are
+    // incomplete; only the capture writer itself can record an EOF receipt.
     stopped?;
-    joined
+    joined?;
+    stdout?;
+    stderr
 }
 
 async fn join_owned_native_waiter(
@@ -300,6 +468,7 @@ impl SensorManager {
         runtime: &attune_common::models::Runtime,
         selected_version: Option<&str>,
         reset: bool,
+        startup_tasks: tokio_util::task::TaskTracker,
     ) -> Result<SensorInstance> {
         let native = self
             .inner
@@ -522,26 +691,6 @@ impl SensorManager {
         )
         .await?;
         let spec = context.spec();
-        Ledger::consume_native_effect(
-            &self.inner.db,
-            sensor.id,
-            workload.fence(),
-            spec.intent,
-            false,
-        )
-        .await?;
-        let launcher = native.backend.launcher();
-        let resource = launcher
-            .prepare(&spec, ProcessCreateDisposition::CreateOnce)
-            .await?;
-        Ledger::record_native_resource(
-            &self.inner.db,
-            workload.workload_id,
-            spec.intent,
-            &resource,
-        )
-        .await?;
-        let io = launcher.start(&spec, &resource).await?;
         let mut log_config = self
             .inner
             .sensor_log_config
@@ -570,6 +719,56 @@ impl SensorManager {
                 self.inner.mirror_runtime_stdout_to_stdio && !sensitive,
                 self.inner.mirror_runtime_stderr_to_stdio && !sensitive,
             );
+        let transport = self
+            .inner
+            .api_client
+            .artifact_transport(self.inner.artifact_transport.base_dir())?;
+        Ledger::consume_native_effect(
+            &self.inner.db,
+            sensor.id,
+            workload.fence(),
+            spec.intent,
+            false,
+        )
+        .await?;
+        let owned = NativeSensor::new(
+            NativeSensorContext {
+                pool: self.inner.db.clone(),
+                workload: workload.workload_id,
+                spec: spec.clone(),
+                resource: std::sync::OnceLock::new(),
+                backend: native.backend.clone(),
+                transport,
+                worker: workload.worker_id,
+                incarnation: workload.worker_instance,
+            },
+            self.inner.native_startup_tasks.clone(),
+            startup_tasks,
+            self.inner.native_cleanup_failed.clone(),
+        );
+        let launcher = native.backend.launcher();
+        let resource = launcher
+            .prepare(&spec, ProcessCreateDisposition::CreateOnce)
+            .await?;
+        owned
+            .context
+            .resource
+            .set(resource.clone())
+            .map_err(|_| anyhow!("Native resource already owned"))?;
+        Ledger::record_native_resource(
+            &self.inner.db,
+            workload.workload_id,
+            spec.intent,
+            &resource,
+        )
+        .await?;
+        let io = launcher.start(&spec, &resource).await?;
+        {
+            let mut process = owned.process.lock().expect("native process owner");
+            process.control = Some(io.control.clone());
+            let waiter = io.control.clone();
+            process.wait_task = Some(tokio::spawn(async move { waiter.wait().await }));
+        }
         let stdout = capture(
             io.stdout,
             self.inner.artifact_transport.clone(),
@@ -594,6 +793,14 @@ impl SensorManager {
             true,
             stderr_mirror,
         );
+        {
+            let mut process = owned.process.lock().expect("native process owner");
+            process.stdout = Some(stdout);
+            process.stderr = Some(stderr);
+        }
+        // Persistence may wait; the gated process and captures are already owned.
+        self.persist_sensor_process_started(&sensor, None, reset)
+            .await;
         Ledger::consume_native_effect(
             &self.inner.db,
             sensor.id,
@@ -606,26 +813,8 @@ impl SensorManager {
             context.bootstrap_json.into_bytes(),
         )?;
         io.control.write_stdin_once(payload).await?;
-        self.persist_sensor_process_started(&sensor, None, reset)
-            .await;
-        let waiter = io.control.clone();
-        let wait_task = tokio::spawn(async move { waiter.wait().await });
         let instance = SensorInstance {
-            native: Some(NativeSensor {
-                pool: self.inner.db.clone(),
-                workload: workload.workload_id,
-                spec,
-                resource,
-                backend: native.backend.clone(),
-                transport: self
-                    .inner
-                    .api_client
-                    .artifact_transport(self.inner.artifact_transport.base_dir())?,
-                worker: workload.worker_id,
-                incarnation: workload.worker_instance,
-                control: io.control,
-                wait_task: Some(wait_task),
-            }),
+            native: Some(owned),
             prepared_target: None,
             sensor_ref: sensor.r#ref.clone(),
             sensor,
@@ -636,8 +825,8 @@ impl SensorManager {
                 last_poll: Some(Utc::now()),
             })),
             child_process: None,
-            stdout_handle: Some(stdout),
-            stderr_handle: Some(stderr),
+            stdout_handle: None,
+            stderr_handle: None,
             token_expires_at,
             token_rotation: Arc::new(SensorTokenRotation::default()),
             workload,
@@ -1067,3 +1256,319 @@ mod file_receipt_tests {
 #[cfg(all(test, unix))]
 #[path = "../../tests/support/native_provider.rs"]
 mod provider_tests;
+
+#[cfg(test)]
+mod startup_ownership_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use tokio_util::task::TaskTracker;
+
+    struct Joined(Arc<AtomicUsize>);
+    impl Drop for Joined {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    struct CleanupFixture {
+        physical: Arc<Notify>,
+        durable: Arc<Notify>,
+        joined: Arc<AtomicUsize>,
+        failed: Arc<AtomicBool>,
+        owner: NativeStartupCleanup,
+    }
+    impl CleanupFixture {
+        async fn new(tasks: TaskTracker, attempt: TaskTracker, fail_fence: bool) -> Self {
+            let physical = Arc::new(Notify::new());
+            let durable = Arc::new(Notify::new());
+            let joined = Arc::new(AtomicUsize::new(0));
+            let failed = Arc::new(AtomicBool::new(false));
+            let waiter_ready = Arc::new(Notify::new());
+            let waiter = {
+                let (ready, joined) = (waiter_ready.clone(), joined.clone());
+                tokio::spawn(async move {
+                    let _joined = Joined(joined);
+                    ready.notify_one();
+                    std::future::pending::<attune_common::Result<LaunchExitOutcome>>().await
+                })
+            };
+            waiter_ready.notified().await;
+            let streams = Arc::new(tokio::sync::Semaphore::new(0));
+            let capture = || {
+                let (streams, joined) = (streams.clone(), joined.clone());
+                tokio::spawn(async move {
+                    let permit = streams.acquire().await.unwrap();
+                    permit.forget();
+                    joined.fetch_add(1, Ordering::AcqRel);
+                })
+            };
+            let (stdout, stderr) = (capture(), capture());
+            let (fence_release, signal) = (durable.clone(), physical.clone());
+            let owner = NativeStartupCleanup::new(tasks, attempt, failed.clone(), async move {
+                let stopped = async {
+                    attune_common::repositories::sensor_workload::native_effect::join_sensor_stop(
+                        async {
+                            fence_release.notified().await;
+                            if fail_fence {
+                                Err(Error::PermissionDenied("owned fence unavailable".into()))
+                            } else {
+                                Ok(())
+                            }
+                        },
+                        async {
+                            // A pure process-control double, not provider proof.
+                            streams.add_permits(2);
+                            signal.notify_one();
+                            Ok(LaunchExitOutcome {
+                                exit_code: 137,
+                                oom_killed: false,
+                            })
+                        },
+                    )
+                    .await?;
+                    Ok(())
+                };
+                join_native_startup_stop(
+                    stopped,
+                    &mut Some(waiter),
+                    &mut Some(stdout),
+                    &mut Some(stderr),
+                )
+                .await
+            });
+            Self {
+                physical,
+                durable,
+                joined,
+                failed,
+                owner,
+            }
+        }
+    }
+
+    async fn observed(signal: &Notify) {
+        timeout(Duration::from_secs(5), signal.notified())
+            .await
+            .expect("owned signal");
+    }
+    async fn captures_joined(joined: &AtomicUsize) {
+        timeout(Duration::from_secs(5), async {
+            while joined.load(Ordering::Acquire) != 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all owned waiter/capture tasks joined");
+    }
+
+    #[tokio::test]
+    async fn startup_error_timeout_and_caller_cancel_keep_cleanup_owned_through_db_stall() {
+        for mode in ["error", "timeout", "caller-cancel"] {
+            let tasks = TaskTracker::new();
+            let attempt = TaskTracker::new();
+            let fixture = CleanupFixture::new(tasks.clone(), attempt.clone(), false).await;
+            let CleanupFixture {
+                physical,
+                durable,
+                joined,
+                failed,
+                owner,
+            } = fixture;
+            let pending = Arc::new(Notify::new());
+            let persistence = pending.clone();
+            let ready = Arc::new(Notify::new());
+            let entered = ready.clone();
+            let start = async move {
+                let _owner = owner;
+                entered.notify_one();
+                persistence.notified().await;
+                Err::<(), _>(anyhow!("startup persistence failed"))
+            };
+            let deadline = if mode == "timeout" {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(60)
+            };
+            let caller = tokio::spawn(await_startup(
+                start,
+                CancellationToken::new(),
+                true,
+                Some(deadline),
+                "fixture",
+            ));
+            observed(&ready).await;
+            if mode == "caller-cancel" {
+                caller.abort();
+                assert!(caller.await.unwrap_err().is_cancelled());
+            } else {
+                if mode == "error" {
+                    pending.notify_one();
+                }
+                assert!(caller.await.unwrap().is_err());
+            }
+            observed(&physical).await;
+            captures_joined(&joined).await;
+            attempt.close();
+            tasks.close();
+            let waiting = tokio::spawn(async move {
+                attempt.wait().await;
+                tasks.wait().await;
+            });
+            assert!(
+                !waiting.is_finished(),
+                "DB uncertainty must not report a completed join"
+            );
+            durable.notify_one();
+            timeout(Duration::from_secs(5), waiting)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!failed.load(Ordering::Acquire));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_cleanup_waiter_does_not_abort_physical_stop_or_capture_joins() {
+        let tasks = TaskTracker::new();
+        let attempt = TaskTracker::new();
+        let fixture = CleanupFixture::new(tasks.clone(), attempt.clone(), true).await;
+        let CleanupFixture {
+            physical,
+            durable,
+            joined,
+            failed,
+            mut owner,
+        } = fixture;
+        let caller = tokio::spawn(async move { owner.stop().await });
+        observed(&physical).await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        captures_joined(&joined).await;
+        durable.notify_one();
+        attempt.close();
+        tasks.close();
+        timeout(Duration::from_secs(5), async {
+            attempt.wait().await;
+            tasks.wait().await;
+        })
+        .await
+        .unwrap();
+        assert!(
+            failed.load(Ordering::Acquire),
+            "uncertain ledger must remain failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_join_failure_cannot_become_complete_cleanup() {
+        let tasks = TaskTracker::new();
+        let attempt = TaskTracker::new();
+        let failed = Arc::new(AtomicBool::new(false));
+        let stream = tokio::spawn(std::future::pending::<()>());
+        stream.abort();
+        let mut owner =
+            NativeStartupCleanup::new(tasks.clone(), attempt.clone(), failed.clone(), async {
+                join_native_startup_stop(async { Ok(()) }, &mut None, &mut Some(stream), &mut None)
+                    .await
+            });
+        assert!(owner.stop().await.is_err());
+        attempt.close();
+        tasks.close();
+        attempt.wait().await;
+        tasks.wait().await;
+        assert!(failed.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn manager_shutdown_cancels_and_joins_unregistered_startup_owners() {
+        // Lazy pool + local transports: no DB/API requests or service setup.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@unused.invalid/unused")
+            .unwrap();
+        let manager = SensorManager::new(
+            pool.clone(),
+            SensorManagerConfig {
+                native: None,
+                workload_config: None,
+                encryption_key: None,
+                child_environment: ChildProcessEnvironment::from_parent([], &[]).unwrap(),
+                api_url: "http://unused.invalid".into(),
+                worker_token_provider: None,
+                notifier_ws_url: "ws://unused.invalid".into(),
+                allow_insecure_notifier_ws: false,
+                mq_url: String::new(),
+                log_level: "warn".into(),
+                log_format: "json".into(),
+                packs_base_dir: "/unused".into(),
+                runtime_envs_dir: "/unused".into(),
+                pack_transport: Arc::new(attune_common::pack_transport::VolumePackTransport::new(
+                    "/unused",
+                )),
+                artifact_transport: Arc::new(
+                    attune_common::artifact_transport::VolumeTransport::new("/unused"),
+                ),
+                sensor_log_config: Default::default(),
+                mirror_runtime_stdout_to_stdio: false,
+                mirror_runtime_stderr_to_stdio: false,
+                worker_name: "ownership-fixture".into(),
+            },
+        );
+        *manager.inner.running.write().await = true;
+        let tasks = manager.inner.native_startup_tasks.clone();
+        let attempt = TaskTracker::new();
+        let fixture = CleanupFixture::new(tasks.clone(), attempt.clone(), false).await;
+        let CleanupFixture {
+            physical,
+            durable,
+            joined,
+            failed,
+            owner,
+        } = fixture;
+        let ready = Arc::new(Notify::new());
+        let entered = ready.clone();
+        let startup_manager = manager.clone();
+        let startup = tokio::spawn(async move {
+            let _gate = startup_manager.inner.lifecycle_gate.read().await;
+            let stopping = startup_manager
+                .inner
+                .native_startup_stop
+                .read()
+                .await
+                .clone();
+            let result = await_startup(
+                async move {
+                    let _owner = owner;
+                    entered.notify_one();
+                    std::future::pending::<Result<()>>().await
+                },
+                stopping,
+                true,
+                Some(Duration::from_secs(60)),
+                "fixture",
+            )
+            .await;
+            attempt.close();
+            attempt.wait().await;
+            result
+        });
+        observed(&ready).await;
+        assert!(manager.inner.sensors.read().await.is_empty());
+        let shutdown = tokio::spawn(async move { manager.stop().await });
+        observed(&physical).await;
+        captures_joined(&joined).await;
+        assert!(!shutdown.is_finished());
+        durable.notify_one();
+        assert!(timeout(Duration::from_secs(5), startup)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        timeout(Duration::from_secs(5), shutdown)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(tasks.is_closed() && tasks.is_empty());
+        assert!(!failed.load(Ordering::Acquire));
+        pool.close().await;
+    }
+}

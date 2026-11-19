@@ -613,8 +613,13 @@ async fn case_body(
                 .context("sensor used a residual local launcher")?;
             (
                 instance.workload.clone(),
-                native.spec.clone(),
-                native.resource.clone(),
+                native.context.spec.clone(),
+                native
+                    .context
+                    .resource
+                    .get()
+                    .context("native resource unconfirmed")?
+                    .clone(),
             )
         };
         observed = Some((workload.workload_id, spec.clone(), resource.clone()));
