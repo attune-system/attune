@@ -349,7 +349,8 @@ impl AcceptedBatchDependencyRepository {
                     body, digest,
                 )?;
             }
-            queue::validate_contributor_origins(conn, &proof).await?;
+            let parents = payload.transfer_parents(conn, master).await?;
+            queue::validate_contributor_origins(conn, &proof, &parents).await?;
             payload.restore(master)?;
             Ok(payload.field_count())
         } else if matches!(proof.authority.binding, InvocationBinding::Action { .. })

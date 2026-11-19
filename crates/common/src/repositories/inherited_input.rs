@@ -794,6 +794,61 @@ mod empty_root;
 pub(crate) use empty_root::PreparedEmptyRoot;
 pub struct InheritedInputRepository;
 impl InheritedInputRepository {
+    /// Conversion consumes the same bounded Queue graph reader. Source kind
+    /// comes from the independently retained renderer, never a mutable JSON tag.
+    pub(in crate::repositories) async fn authenticate_queue_storage_receipt(
+        conn: &mut PgConnection,
+        row: &Value,
+        master: &str,
+    ) -> Result<()> {
+        let renderer = row
+            .get("renderer_admission")
+            .and_then(Value::as_i64)
+            .ok_or_else(denied)?;
+        let record:RuntimeAdmissionRecord=sqlx::query_as("SELECT id,owner_kind,owner_id,policy_revision,authority,authority_digest,revoked_at FROM runtime_authority_admission WHERE id=$1 FOR SHARE")
+            .bind(renderer).fetch_optional(&mut *conn).await?.ok_or_else(denied)?;
+        if hash(&serde_json::to_value(&record.authority.0)?)? != record.authority_digest {
+            return Err(denied());
+        }
+        if !matches!(
+            record.authority.binding,
+            crate::runtime_authority::InvocationBinding::Queue { .. }
+        ) {
+            return Ok(());
+        }
+        let kind = match row.get("entity_kind").and_then(Value::as_str) {
+            Some("execution_config") => InputEntityKind::ExecutionConfig,
+            Some("execution_result") => InputEntityKind::ExecutionResult,
+            Some("workflow_variables") => InputEntityKind::WorkflowVariables,
+            _ => return Err(denied()),
+        };
+        let purpose = match row.get("destination_purpose").and_then(Value::as_str) {
+            Some("value") => InputSitePurpose::Value,
+            Some("condition") => InputSitePurpose::Condition,
+            Some("control") => InputSitePurpose::Control,
+            _ => return Err(denied()),
+        };
+        let site = InputSite {
+            execution: row
+                .get("execution")
+                .and_then(Value::as_i64)
+                .ok_or_else(denied)?,
+            kind,
+            purpose,
+            path: row
+                .get("destination_path")
+                .and_then(Value::as_str)
+                .ok_or_else(denied)?
+                .into(),
+        };
+        let origin = SecretOrigin::Entity {
+            entity_type: kind.origin_kind(purpose),
+            entity_id: row.get("id").and_then(Value::as_i64).ok_or_else(denied)?,
+            path: site.path.clone(),
+        };
+        Self::receipt_context(conn, &site, &origin, master).await?;
+        Ok(())
+    }
     /// Source phase only: retain a successful canonical Condition as CONTROL.
     /// Pending VALUE parents remain private preparation evidence, not published
     /// values. The returned opaque source can only be attached as control.
@@ -1166,6 +1221,15 @@ impl InheritedInputRepository {
                     if !exists {
                         return Err(denied());
                     }
+                    // Retention consumes immutable normalized edges only. The
+                    // authenticated reader validates the exact selected subset;
+                    // public Queue JSON never supplies IDs to this inventory.
+                    let parents:Vec<Id>=sqlx::query_scalar("SELECT edge.source_receipt FROM runtime_input_receipt_source edge JOIN runtime_accepted_batch_item member ON member.admission=$2 AND member.item=$3 JOIN work_queue_item_configuration_input fixed ON fixed.id=member.configuration_input WHERE edge.receipt=$1 AND fixed.source_receipts @> ARRAY[edge.source_receipt] ORDER BY edge.source_receipt LIMIT 257")
+                        .bind(receipt).bind(renderer).bind(item).fetch_all(&mut *conn).await?;
+                    if parents.len() > 256 || parents.iter().any(|parent| *parent >= receipt) {
+                        return Err(denied());
+                    }
+                    receipts.extend(parents);
                     // The renderer is retained by the receipt's own typed
                     // column and added to the returned graph below. Creation
                     // and replay do not manufacture a self-dependency edge.
@@ -2394,6 +2458,33 @@ impl InheritedInputRepository {
         })
     }
 
+    /// Queue issuance requires an actual delivered field of the live source.
+    /// This is distinct from retained receipt consumption after source cleanup.
+    pub(in crate::repositories) async fn queue_delivered_source(
+        conn: &mut PgConnection,
+        renderer: Id,
+        site: &InputSite,
+        origin: &SecretOrigin,
+        master: &str,
+    ) -> Result<ReceiptContext> {
+        let prepared = Self::prepare_source(conn, renderer, site, origin, master).await?;
+        let (actual, secrets) = stored_field(conn, site).await?.ok_or_else(denied)?;
+        if site.execution != renderer
+            || site.purpose != InputSitePurpose::Value
+            || restore_field(actual, &secrets, site, master)? != prepared.receipt.value
+            || (!secrets.is_empty()
+                && !secrets.iter().any(|field| {
+                    stored_provenance(field)
+                        .is_ok_and(|provenance| provenance.origins.contains(origin))
+                })
+                && !accepted_receipt(conn, prepared.receipt.id).await?)
+        {
+            return Err(denied());
+        }
+        prepared.receipt.ensure_fresh_on(conn).await?;
+        Ok(prepared.receipt)
+    }
+
     /// Same-transaction self publication only. The opaque receipt must have
     /// been returned by record_prepared, and the actual protected destination
     /// field must now contain that receipt. This takes no source/graph locks.
@@ -3350,8 +3441,46 @@ impl InheritedInputRepository {
                             .await?;
                     require_queue_marker(&declaration, &rendered.selections)?;
                     let source=super::accepted_batch_dependency::AcceptedBatchDependencyRepository::contributor_source(conn,&rendered.renderer,*item,encryption_key).await?;
-                    let (_, origins) = source.selection(&selected.context_path)?;
+                    let (_, mut origins) = source.selection(&selected.context_path)?;
                     fence = fence.intersect(source.fence());
+                    for parent in source.parents_for(&selected.context_path)? {
+                        let site = parent.site().clone();
+                        let context =
+                            Self::receipt_context(conn, &site, &parent.origin(), encryption_key)
+                                .await?;
+                        snapshot_parents.insert(parent.receipt());
+                        collect_source_receipts(&context, &mut source_receipts)?;
+                        graph_accounting.push(context.graph_accounting.clone());
+                        fence = fence.intersect(&context.fence);
+                        for public in context.public_sources {
+                            if !public_sources.contains(&public) {
+                                public_sources.push(public);
+                            }
+                        }
+                        for outcome in context.outcomes {
+                            if !outcomes.contains(&outcome) {
+                                outcomes.push(outcome);
+                            }
+                        }
+                        for native in context.native_sources {
+                            if !native_sources.contains(&native) {
+                                native_sources.push(native);
+                            }
+                        }
+                        for origin in context.origins {
+                            if !origins.contains(&origin) {
+                                origins.push(origin);
+                            }
+                        }
+                        let original = SecretOrigin::Entity {
+                            entity_type: site.kind.as_str().into(),
+                            entity_id: site.execution,
+                            path: site.path,
+                        };
+                        if !origins.contains(&original) {
+                            origins.push(original);
+                        }
+                    }
                     origins
                 }
                 SelectionSource::Authored {
@@ -4388,6 +4517,22 @@ impl InheritedInputRepository {
                         let source=super::accepted_batch_dependency::AcceptedBatchDependencyRepository::contributor_source(conn,&renderer_record,item,encryption_key).await?;
                         let (_, source_origins) = source.selection(&selected.context_path)?;
                         fence = Some(fence.ok_or_else(denied)?.intersect(source.fence()));
+                        for parent in source.parents_for(&selected.context_path)? {
+                            if parent.receipt() >= id {
+                                return Err(denied());
+                            }
+                            expected_sources.insert(parent.receipt());
+                            pending.push((parent.receipt(), Some(parent.site().clone())));
+                            let site = parent.site();
+                            let original = SecretOrigin::Entity {
+                                entity_type: site.kind.as_str().into(),
+                                entity_id: site.execution,
+                                path: site.path.clone(),
+                            };
+                            if !origins.contains(&original) {
+                                origins.push(original);
+                            }
+                        }
                         for origin in source_origins {
                             if !origins.contains(&origin) {
                                 origins.push(origin);

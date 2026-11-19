@@ -20,6 +20,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgConnection;
 use std::collections::BTreeMap;
+mod transfer;
+pub use transfer::QueueInputTransfer;
+pub(in crate::repositories) use transfer::QueueReceiptParent;
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,6 +42,7 @@ struct Binding {
     authority_digest: String,
     authority: crate::runtime_authority::SelectedRuntimeAuthority,
     contributor_digests: BTreeMap<String, String>,
+    source_receipts: Vec<Id>,
     executable_digest: String,
     item_schema_digest: String,
     template_digest: String,
@@ -57,6 +61,7 @@ struct Sealed {
     binding: Binding,
     configuration: Value,
     keys: BTreeMap<String, Value>,
+    transfers: Vec<transfer::TransferProof>,
 }
 
 /// Constructed only by validating an immutable owning record and active source
@@ -65,8 +70,26 @@ pub struct QueueConfigurationInput {
     sealed: Sealed,
     fence: super::runtime_authority::ApprovalEffectFence,
     metadata: Value,
+    acceptance_sources: Vec<transfer::LiveTransferSource>,
 }
 impl QueueConfigurationInput {
+    pub async fn ensure_fresh_on(&self, conn: &mut PgConnection) -> Result<()> {
+        for source in &self.acceptance_sources {
+            source.ensure_fresh_on(conn).await?;
+        }
+        self.fence.ensure_fresh_on(conn).await
+    }
+    pub(in crate::repositories) fn source_receipts(&self) -> &[Id] {
+        &self.sealed.binding.source_receipts
+    }
+    pub(in crate::repositories) async fn validate_transfers(
+        &self,
+        conn: &mut PgConnection,
+        fields: &[crate::secret_values::PreparedSecretValue],
+        master: &str,
+    ) -> Result<Vec<QueueReceiptParent>> {
+        validate_transfer_fields(conn, &self.sealed, fields, master).await
+    }
     pub fn compatible_fixed_inputs(&self, other: &Self) -> bool {
         self.sealed.binding.policy == other.sealed.binding.policy
             && self.sealed.binding.template_digest == other.sealed.binding.template_digest
@@ -245,9 +268,32 @@ impl QueueConfigurationInputRepository {
         id: Id,
         master: &str,
     ) -> Result<()> {
-        let row:Value=sqlx::query_scalar("SELECT jsonb_build_object('id',id,'item',item,'policy_revision',policy_revision,'configuration_revision',configuration_revision,'binding',binding,'binding_digest',binding_digest,'encrypted_context',encrypted_context,'encryption_key_hash',encryption_key_hash) FROM work_queue_item_configuration_input WHERE id=$1 FOR SHARE")
-            .bind(id).fetch_optional(conn).await?.ok_or_else(denied)?;
-        authenticate_stored(&row, master)
+        let row:Value=sqlx::query_scalar("SELECT jsonb_build_object('id',id,'item',item,'policy_revision',policy_revision,'configuration_revision',configuration_revision,'binding',binding,'binding_digest',binding_digest,'encrypted_context',encrypted_context,'encryption_key_hash',encryption_key_hash,'source_receipts',source_receipts) FROM work_queue_item_configuration_input WHERE id=$1 FOR SHARE")
+            .bind(id).fetch_optional(&mut *conn).await?.ok_or_else(denied)?;
+        authenticate_stored(&row, master)?;
+        let sealed: Sealed =
+            serde_json::from_value(crypto::decrypt_json(&row["encrypted_context"], master)?)?;
+        let fields = sealed
+            .transfers
+            .iter()
+            .map(|transfer| transfer.field().clone())
+            .collect::<Vec<_>>();
+        validate_transfer_fields(conn, &sealed, &fields, master).await?;
+        Ok(())
+    }
+    pub(in crate::repositories) async fn transfer_contexts(
+        conn: &mut PgConnection,
+        id: Id,
+        fields: &[crate::secret_values::PreparedSecretValue],
+        master: &str,
+    ) -> Result<(Vec<Id>, Vec<QueueReceiptParent>)> {
+        let row:Value=sqlx::query_scalar("SELECT jsonb_build_object('id',id,'item',item,'policy_revision',policy_revision,'configuration_revision',configuration_revision,'binding',binding,'binding_digest',binding_digest,'encrypted_context',encrypted_context,'encryption_key_hash',encryption_key_hash,'source_receipts',source_receipts) FROM work_queue_item_configuration_input WHERE id=$1 FOR SHARE")
+            .bind(id).fetch_optional(&mut *conn).await?.ok_or_else(denied)?;
+        authenticate_stored(&row, master)?;
+        let sealed: Sealed =
+            serde_json::from_value(crypto::decrypt_json(&row["encrypted_context"], master)?)?;
+        let contexts = validate_transfer_fields(conn, &sealed, fields, master).await?;
+        Ok((sealed.binding.source_receipts, contexts))
     }
     pub(in crate::repositories) async fn cohort_identity(
         conn: &mut PgConnection,
@@ -274,8 +320,9 @@ impl QueueConfigurationInputRepository {
         schema: &ActionSchemaBinding,
         payload_schema: &crate::value_schema::ValueSchemaBinding,
         contributors: &[(String, Value, String)],
+        source_receipts: &[Id],
     ) -> Result<()> {
-        let (owner,policy,configuration,body,expected):(Id,Id,Option<Id>,Value,String)=sqlx::query_as("SELECT item,policy_revision,configuration_revision,binding,binding_digest FROM work_queue_item_configuration_input WHERE id=$1 FOR SHARE")
+        let (owner,policy,configuration,body,expected,retained):(Id,Id,Option<Id>,Value,String,Vec<Id>)=sqlx::query_as("SELECT item,policy_revision,configuration_revision,binding,binding_digest,source_receipts FROM work_queue_item_configuration_input WHERE id=$1 FOR SHARE")
             .bind(id).fetch_optional(&mut *conn).await?.ok_or_else(denied)?;
         if hash(&body)? != expected {
             return Err(denied());
@@ -295,6 +342,8 @@ impl QueueConfigurationInputRepository {
             || binding.item != item
             || binding.policy != policy
             || binding.configuration != configuration
+            || binding.source_receipts != source_receipts
+            || binding.source_receipts != retained
             || binding.authority != *authority
             || digests.is_empty()
             || binding.contributor_digests != digests
@@ -344,8 +393,8 @@ impl QueueConfigurationInputRepository {
         if current.owner_kind != "execution" || current.authority != source.authority {
             return Err(denied());
         }
-        let fence = Authority::retained_admission_fence(conn, source.id).await?;
-        let row:Value = sqlx::query_scalar("SELECT jsonb_build_object('id',id,'item',item,'policy_revision',policy_revision,'configuration_revision',configuration_revision,'binding',binding,'binding_digest',binding_digest,'encrypted_context',encrypted_context,'encryption_key_hash',encryption_key_hash) FROM work_queue_item_configuration_input WHERE id=$1 FOR SHARE")
+        let mut fence = Authority::retained_admission_fence(conn, source.id).await?;
+        let row:Value = sqlx::query_scalar("SELECT jsonb_build_object('id',id,'item',item,'policy_revision',policy_revision,'configuration_revision',configuration_revision,'binding',binding,'binding_digest',binding_digest,'encrypted_context',encrypted_context,'encryption_key_hash',encryption_key_hash,'source_receipts',source_receipts) FROM work_queue_item_configuration_input WHERE id=$1 FOR SHARE")
             .bind(input).fetch_optional(&mut *conn).await?.ok_or_else(denied)?;
         authenticate_stored(&row, master)?;
         let sealed: Sealed =
@@ -359,6 +408,11 @@ impl QueueConfigurationInputRepository {
                 != Some(&serde_json::to_value(&sealed.binding.authority)?)
         {
             return Err(denied());
+        }
+        let fields: Vec<crate::secret_values::PreparedSecretValue> =
+            serde_json::from_value(accepted_body["queue_payload"]["fields"].clone())?;
+        for parent in validate_transfer_fields(conn, &sealed, &fields, master).await? {
+            fence = fence.intersect(parent.source_fence());
         }
         let first:Option<Id>=sqlx::query_scalar("SELECT configuration_input FROM runtime_accepted_batch_item WHERE admission=$1 AND proof->'queue_payload'->>'ordinal'='0'")
             .bind(source.id).fetch_optional(&mut *conn).await?.flatten();
@@ -439,6 +493,7 @@ impl QueueConfigurationInputRepository {
             sealed,
             fence,
             metadata,
+            acceptance_sources: Vec::new(),
         })
     }
 
@@ -451,6 +506,19 @@ impl QueueConfigurationInputRepository {
         snapshot: &ExecutionExecutableSnapshot,
         encryption_key: &str,
     ) -> Result<QueueConfigurationInput> {
+        Self::capture_with_transfers(conn, queue, item, snapshot, encryption_key, &[]).await
+    }
+
+    /// Internal protected-input producer. Capabilities have no serialized
+    /// constructor and remain bound to this exact item/acceptance transaction.
+    pub async fn capture_with_transfers(
+        conn: &mut PgConnection,
+        queue: &WorkQueue,
+        item: &WorkQueueItem,
+        snapshot: &ExecutionExecutableSnapshot,
+        encryption_key: &str,
+        transfers: &[QueueInputTransfer],
+    ) -> Result<QueueConfigurationInput> {
         if sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM work_queue_item_configuration_input WHERE item=$1)",
         )
@@ -458,7 +526,22 @@ impl QueueConfigurationInputRepository {
         .fetch_one(&mut *conn)
         .await?
         {
-            return Self::load(conn, queue, item, snapshot, encryption_key).await;
+            let retained = Self::load(conn, queue, item, snapshot, encryption_key).await?;
+            if !transfers.is_empty() {
+                let mut expected = Vec::new();
+                for transfer in transfers {
+                    expected.push(
+                        transfer
+                            .accepted(conn, &retained.sealed.binding, encryption_key)
+                            .await?,
+                    );
+                }
+                expected.sort_by(|a, b| a.path().cmp(b.path()));
+                if expected != retained.sealed.transfers {
+                    return Err(denied());
+                }
+            }
+            return Ok(retained);
         }
         let original: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM work_queue_item i JOIN work_queue_item_runtime_admission a ON a.item=i.id \
@@ -476,6 +559,26 @@ impl QueueConfigurationInputRepository {
         )
         .fetch_one(&mut *conn)
         .await?;
+        let mut accepted_transfers = Vec::new();
+        let mut fence = selected.effect_fence().clone();
+        for transfer in transfers {
+            accepted_transfers.push(transfer.accepted(conn, &binding, encryption_key).await?);
+            fence = fence.intersect(transfer.fence());
+        }
+        accepted_transfers.sort_by(|a, b| a.path().cmp(b.path()));
+        if accepted_transfers.len() > 256
+            || accepted_transfers
+                .windows(2)
+                .any(|pair| pair[0].path() == pair[1].path())
+        {
+            return Err(denied());
+        }
+        binding.source_receipts = accepted_transfers
+            .iter()
+            .map(|transfer| transfer.receipt())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
         let mut configuration = Value::Null;
         if binding
             .declarations
@@ -552,7 +655,13 @@ impl QueueConfigurationInputRepository {
             binding,
             configuration,
             keys: values,
+            transfers: accepted_transfers,
         };
+        let fields = transfer::fields(conn, item.id).await?;
+        for parent in validate_transfer_fields(conn, &sealed, &fields, encryption_key).await? {
+            fence = fence.intersect(parent.source_fence());
+        }
+        fence.ensure_fresh_on(conn).await?;
         let body = serde_json::to_value(&sealed.binding)?;
         let plaintext = serde_json::to_value(&sealed)?;
         if serde_json::to_vec(&plaintext)?.len() > 1024 * 1024 {
@@ -561,15 +670,20 @@ impl QueueConfigurationInputRepository {
         // The authenticated encrypted envelope includes the complete public
         // binding, preventing ciphertext substitution across items or policies.
         let ciphertext = crypto::encrypt_json(&plaintext, encryption_key)?;
-        sqlx::query("INSERT INTO work_queue_item_configuration_input(item,policy_revision,configuration_revision,binding,binding_digest,encrypted_context,encryption_key_hash,id) VALUES($1,$2,$3,$4,$5,$6,$7,$8)")
+        sqlx::query("INSERT INTO work_queue_item_configuration_input(item,policy_revision,configuration_revision,binding,binding_digest,encrypted_context,encryption_key_hash,id,source_receipts) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)")
             .bind(item.id).bind(sealed.binding.policy).bind(sealed.binding.configuration).bind(&body).bind(hash(&body)?)
-            .bind(ciphertext).bind(crypto::hash_encryption_key(encryption_key)).bind(sealed.binding.id).execute(&mut *conn).await?;
-        selected.ensure_fresh_on(conn).await?;
-        Ok(QueueConfigurationInput {
+            .bind(ciphertext).bind(crypto::hash_encryption_key(encryption_key)).bind(sealed.binding.id).bind(&sealed.binding.source_receipts).execute(&mut *conn).await?;
+        let input = QueueConfigurationInput {
             sealed,
-            fence: selected.effect_fence().clone(),
+            fence,
             metadata,
-        })
+            acceptance_sources: transfers
+                .iter()
+                .map(QueueInputTransfer::live_source)
+                .collect(),
+        };
+        input.ensure_fresh_on(conn).await?;
+        Ok(input)
     }
 
     pub async fn load(
@@ -581,20 +695,22 @@ impl QueueConfigurationInputRepository {
     ) -> Result<QueueConfigurationInput> {
         let selected =
             Admission::queue_batch(conn, queue, std::slice::from_ref(item), snapshot).await?;
-        let row: Option<(Id,Option<Id>,Value,String,Value,String,Id)> = sqlx::query_as(
-            "SELECT policy_revision,configuration_revision,binding,binding_digest,encrypted_context,encryption_key_hash,id FROM work_queue_item_configuration_input WHERE item=$1 FOR SHARE",
+        let row: Option<(Id,Option<Id>,Value,String,Value,String,Id,Vec<Id>)> = sqlx::query_as(
+            "SELECT policy_revision,configuration_revision,binding,binding_digest,encrypted_context,encryption_key_hash,id,source_receipts FROM work_queue_item_configuration_input WHERE item=$1 FOR SHARE",
         ).bind(item.id).fetch_optional(&mut *conn).await?;
-        let (policy, configuration, body, expected, encrypted, key_hash, id) =
+        let (policy, configuration, body, expected, encrypted, key_hash, id, source_receipts) =
             row.ok_or_else(denied)?;
         if hash(&body)? != expected || key_hash != crypto::hash_encryption_key(encryption_key) {
             return Err(denied());
         }
         let sealed: Sealed =
             serde_json::from_value(crypto::decrypt_json(&encrypted, encryption_key)?)?;
+        validate_transfer_ids(&sealed, encryption_key)?;
         if serde_json::to_value(&sealed.binding)? != body
             || sealed.binding.policy != policy
             || sealed.binding.configuration != configuration
             || sealed.binding.id != id
+            || sealed.binding.source_receipts != source_receipts
             || policy != selected.authority().policy_id
         {
             return Err(denied());
@@ -606,6 +722,7 @@ impl QueueConfigurationInputRepository {
         actual.keys = sealed.binding.keys.clone();
         actual.key_targets = sealed.binding.key_targets.clone();
         actual.key_versions = sealed.binding.key_versions.clone();
+        actual.source_receipts = sealed.binding.source_receipts.clone();
         if actual != sealed.binding || sealed.keys.keys().ne(sealed.binding.keys.keys()) {
             return Err(denied());
         }
@@ -623,11 +740,17 @@ impl QueueConfigurationInputRepository {
                 return Err(denied());
             }
         }
-        selected.ensure_fresh_on(conn).await?;
+        let fields = transfer::fields(conn, item.id).await?;
+        let mut fence = selected.effect_fence().clone();
+        for parent in validate_transfer_fields(conn, &sealed, &fields, encryption_key).await? {
+            fence = fence.intersect(parent.source_fence());
+        }
+        fence.ensure_fresh_on(conn).await?;
         Ok(QueueConfigurationInput {
             sealed,
-            fence: selected.effect_fence().clone(),
+            fence,
             metadata,
+            acceptance_sources: Vec::new(),
         })
     }
 }
@@ -710,6 +833,7 @@ async fn binding(
             authority_digest,
             authority: admitted,
             contributor_digests,
+            source_receipts: Vec::new(),
             executable_digest: hash(&serde_json::to_value(snapshot)?)?,
             item_schema_digest: hash(&item.schema_binding.clone().ok_or_else(denied)?)?,
             template_digest,
@@ -724,6 +848,51 @@ async fn binding(
         },
         metadata,
     ))
+}
+
+async fn validate_transfer_fields(
+    conn: &mut PgConnection,
+    sealed: &Sealed,
+    fields: &[crate::secret_values::PreparedSecretValue],
+    master: &str,
+) -> Result<Vec<QueueReceiptParent>> {
+    validate_transfer_ids(sealed, master)?;
+    if fields.len() > 256 {
+        return Err(denied());
+    }
+    let mut parents = Vec::new();
+    let mut paths = std::collections::BTreeSet::new();
+    for transfer in &sealed.transfers {
+        if !paths.insert(transfer.path())
+            || fields
+                .iter()
+                .filter(|field| field.json_path == transfer.path())
+                .count()
+                != 1
+            || fields
+                .iter()
+                .find(|field| field.json_path == transfer.path())
+                != Some(transfer.field())
+        {
+            return Err(denied());
+        }
+        parents.push(transfer.validate(conn, &sealed.binding, master).await?);
+    }
+    // Neither missing nor additional typed source fields can borrow an
+    // admitted transfer for a different selector or protected destination.
+    for field in fields {
+        let provenance: crate::secret_provenance::SecretProvenance =
+            serde_json::from_str(field.source_ref.as_deref().ok_or_else(denied)?)?;
+        if provenance
+            .origins
+            .iter()
+            .any(super::immutable_input_origin::is_input_receipt)
+            && !paths.contains(field.json_path.as_str())
+        {
+            return Err(denied());
+        }
+    }
+    Ok(parents)
 }
 
 /// Offline maintenance authenticates this new, current-verifier-only store
@@ -745,6 +914,8 @@ pub(in crate::repositories) fn authenticate_stored(row: &Value, master: &str) ->
         || row.get("item").and_then(Value::as_i64) != Some(sealed.binding.item)
         || row.get("policy_revision").and_then(Value::as_i64) != Some(sealed.binding.policy)
         || row.get("configuration_revision").and_then(Value::as_i64) != sealed.binding.configuration
+        || row.get("source_receipts")
+            != Some(&serde_json::to_value(&sealed.binding.source_receipts)?)
         || sealed.keys.keys().ne(sealed.binding.keys.keys())
     {
         return Err(denied());
@@ -781,6 +952,32 @@ pub(in crate::repositories) fn authenticate_stored(row: &Value, master: &str) ->
         return Err(denied());
     }
     sealed.binding.schema.validate()?;
+    validate_transfer_ids(&sealed, master)?;
+    Ok(())
+}
+
+fn validate_transfer_ids(sealed: &Sealed, master: &str) -> Result<()> {
+    if sealed.transfers.len() > 256
+        || sealed
+            .transfers
+            .windows(2)
+            .any(|pair| pair[0].path() >= pair[1].path())
+    {
+        return Err(denied());
+    }
+    for transfer in &sealed.transfers {
+        transfer.validate_shape(master)?;
+    }
+    let ids = sealed
+        .transfers
+        .iter()
+        .map(|transfer| transfer.receipt())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if ids != sealed.binding.source_receipts {
+        return Err(denied());
+    }
     Ok(())
 }
 

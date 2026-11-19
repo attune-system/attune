@@ -1,5 +1,7 @@
 //! Exact queue declaration metadata, independently of runtime readiness activation.
 use super::*;
+#[path = "queue_configuration/transfer.rs"]
+mod transfer;
 use attune_common::repositories::{
     declared_input::DeclaredInputRepository,
     work_queue::{UpdateWorkQueueInput, WorkQueueRepository},
@@ -366,6 +368,17 @@ async fn stage_record(
     actor: i64,
     payload: serde_json::Value,
 ) -> attune_common::models::WorkQueueItem {
+    stage_record_with_source(conn, queue, snapshot, actor, payload, None).await
+}
+
+async fn stage_record_with_source(
+    conn: &mut sqlx::PgConnection,
+    queue: &attune_common::models::WorkQueue,
+    snapshot: &ExecutionExecutableSnapshot,
+    actor: i64,
+    payload: serde_json::Value,
+    source_execution: Option<i64>,
+) -> attune_common::models::WorkQueueItem {
     use attune_common::{
         models::WorkQueueItemStatus,
         repositories::{
@@ -410,7 +423,7 @@ async fn stage_record(
             trace_tag: None,
             enqueue_source: "owned-contract".into(),
             requested_by_identity: Some(actor),
-            requested_by_execution: None,
+            requested_by_execution: source_execution,
             requested_by_enforcement: None,
             leased_execution: None,
             lease_token: None,
@@ -440,7 +453,7 @@ async fn stage_record(
             queue_ref: queue.r#ref.clone(),
             items: BTreeMap::from([(
                 item.id,
-                Some(HumanAttribution {
+                source_execution.is_none().then(|| HumanAttribution {
                     identity_id: actor,
                     login: format!("accepted-{actor}"),
                 }),
@@ -455,9 +468,15 @@ async fn stage_record(
     .unwrap();
     sqlx::query("INSERT INTO work_queue_item_runtime_admission(item,policy_revision,authority,authority_digest) VALUES($1,$2,$3,$4)")
         .bind(item.id).bind(selected.authority().policy_id).bind(sqlx::types::Json(selected.authority())).bind(fixture_digest(selected.authority())).execute(&mut *conn).await.unwrap();
-    RecordedInputAuthorityRepository::capture_human(conn, "queue_item", item.id, actor)
-        .await
-        .unwrap();
+    if let Some(source) = source_execution {
+        RecordedInputAuthorityRepository::copy(conn, "execution", source, "queue_item", item.id)
+            .await
+            .unwrap();
+    } else {
+        RecordedInputAuthorityRepository::capture_human(conn, "queue_item", item.id, actor)
+            .await
+            .unwrap();
+    }
     item
 }
 async fn accepted_record(
@@ -474,20 +493,20 @@ async fn accepted_record(
 
 #[tokio::test]
 async fn mixed_queue_receipts_bind_each_contributor_and_structured_secret_after_item_retention() {
-    mixed_queue_case(false, false).await;
+    mixed_queue_case(false, false, false).await;
 }
 
 #[tokio::test]
 async fn direct_key_queue_sources_preserve_original_origins_without_reselecting_values() {
-    mixed_queue_case(true, false).await;
+    mixed_queue_case(true, false, false).await;
 }
 
 #[tokio::test]
 async fn queue_contributor_sources_cannot_union_separate_read_and_decrypt_ceilings() {
-    mixed_queue_case(true, true).await;
+    mixed_queue_case(true, true, false).await;
 }
 
-async fn mixed_queue_case(direct_key: bool, split_ceilings: bool) {
+async fn mixed_queue_case(direct_key: bool, split_ceilings: bool, transferred: bool) {
     use attune_common::{
         crypto,
         models::WorkQueueItemStatus,
@@ -509,7 +528,7 @@ async fn mixed_queue_case(direct_key: bool, split_ceilings: bool) {
         secret_values::{prepare_secret_values, SecretValueInput, ENTITY_EXECUTION_CONFIG},
     };
     let database = create_test_pool().await.unwrap();
-    let (db, snapshot, policy, human) =
+    let (db, snapshot, mut policy, human) =
         fixture_with_queue_shape(database, true, false, None, false, true).await;
     let other = IdentityFixture::new_unique("second_contributor")
         .create(&db)
@@ -623,26 +642,40 @@ async fn mixed_queue_case(direct_key: bool, split_ceilings: bool) {
         action_params:Some(json!({"value":format!("{{{{ keystore['{}'] + ':' + items[0].message.text + ':' + items[1].message.text }}}}",key.r#ref),
             "connection":"{{ config.connection }}"})),
         item_schema:Some(json!({"message":{"type":"object","properties":{"text":{"type":"string","secret":true}}}})),
+        permission_set_refs:transferred.then(||attune_common::repositories::Patch::Set(Vec::new())),
         ..Default::default()
     }).await.unwrap();
+    if transferred {
+        transfer::admit_source_effect(&mut policy);
+    }
     let revision = Authority::capture_policy(&mut tx, &policy).await.unwrap();
     Authority::activate_policy(&mut tx, revision.id)
         .await
         .unwrap();
-    let first = stage_record(
+    let sources = if transferred {
+        vec![
+            transfer::Source::prepare(&mut tx, &snapshot, &policy, human, "first").await,
+            transfer::Source::prepare(&mut tx, &snapshot, &policy, other.id, "second").await,
+        ]
+    } else {
+        Vec::new()
+    };
+    let first = stage_record_with_source(
         &mut tx,
         &queue,
         &snapshot,
         human,
         json!({"message":{"text":"first"}}),
+        sources.first().map(|source| source.execution.id),
     )
     .await;
-    let second = stage_record(
+    let second = stage_record_with_source(
         &mut tx,
         &queue,
         &snapshot,
         other.id,
         json!({"message":{"text":"second"}}),
+        sources.get(1).map(|source| source.execution.id),
     )
     .await;
     if split_ceilings {
@@ -651,10 +684,41 @@ async fn mixed_queue_case(direct_key: bool, split_ceilings: bool) {
                 .bind(item).bind(source).execute(&mut *tx).await.unwrap();
         }
     }
-    for item in [&first, &second] {
-        Fixed::capture(&mut tx, &queue, item, &snapshot, QUEUE_KEY)
+    let mut accepted_transfers = Vec::new();
+    for (index, item) in [&first, &second].into_iter().enumerate() {
+        if transferred {
+            accepted_transfers.push(
+                sources[index]
+                    .accept(
+                        &mut tx,
+                        &queue,
+                        item,
+                        &snapshot,
+                        if index == 0 { "first" } else { "second" },
+                    )
+                    .await,
+            );
+        } else {
+            Fixed::capture(&mut tx, &queue, item, &snapshot, QUEUE_KEY)
+                .await
+                .unwrap();
+        }
+    }
+    if transferred {
+        // Publish while both original source attempts and effect fences remain
+        // live, then consume the retained binding after actual completion and
+        // execution-row cleanup in a later transaction.
+        for accepted in &accepted_transfers {
+            accepted.ensure_fresh_on(&mut tx).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+        tx = db.begin().await.unwrap();
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
             .await
             .unwrap();
+        for source in &sources {
+            source.complete_and_remove(&mut tx).await;
+        }
     }
     WorkQueueItemRepository::update(
         &mut *tx,

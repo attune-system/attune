@@ -2238,7 +2238,7 @@ impl FileEvidenceRetentionRepository {
             "pack_runtime_policy_revision"=>"jsonb_build_object('pack',r.pack,'release',jsonb_build_object('id',r.release),'policy',r.policy)",
             "pack_release"=>"jsonb_build_object('pack',r.pack)",
             "runtime_external_approval"=>"jsonb_build_object('pack',r.subject_pack)",
-            "work_queue_item_configuration_input"=>"jsonb_build_object('policy_revision',r.policy_revision,'configuration_revision',r.configuration_revision,'binding',r.binding,'binding_digest',r.binding_digest)",
+            "work_queue_item_configuration_input"=>"jsonb_build_object('policy_revision',r.policy_revision,'configuration_revision',r.configuration_revision,'binding',r.binding,'binding_digest',r.binding_digest,'source_receipts',r.source_receipts,'ciphertext_bytes',octet_length(r.encrypted_context::TEXT))",
             "runtime_declared_input_binding"=>"jsonb_build_object('policy_revision',r.policy_revision,'declaration',r.declaration,'declaration_digest',r.declaration_digest)",
             "schema_type_revision"=>"jsonb_build_object('release_id',r.release)",
             "managed_executable_metadata_revision"=>"jsonb_build_object('pack',r.pack,'action',r.action,'release',jsonb_build_object('id',r.release),'snapshot',r.snapshot)",
@@ -2282,6 +2282,28 @@ impl FileEvidenceRetentionRepository {
             )?;
             if let Some(revision) = body.get("configuration_revision").and_then(Value::as_i64) {
                 c.push("component_configuration_revision", revision, depth + 1)?;
+            }
+            let parents: Vec<i64> =
+                serde_json::from_value(body.get("source_receipts").cloned().ok_or_else(denied)?)?;
+            if parents.len() > 256
+                || parents.iter().any(|id| *id <= 0)
+                || parents.windows(2).any(|pair| pair[0] >= pair[1])
+                || binding.get("source_receipts") != body.get("source_receipts")
+            {
+                return Err(denied());
+            }
+            let ciphertext = usize::try_from(
+                body.get("ciphertext_bytes")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(denied)?,
+            )
+            .map_err(|_| denied())?;
+            c.charge_bytes(ciphertext)?;
+            // These normalized holds were installed under shared graph
+            // admission from authenticated transfer proofs. They retain data;
+            // runtime consumption independently checks source/ancestor fences.
+            for parent in parents {
+                c.push("runtime_input_receipt", parent, depth + 1)?;
             }
         }
         if node.kind == "runtime_declared_input_binding" {

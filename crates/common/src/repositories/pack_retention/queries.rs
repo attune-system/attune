@@ -30,6 +30,7 @@ impl Phase {
         };
         let predicates = match self {
             Self::Receipts => "NOT runtime_accepted_input_holds_control(receipt.id)
+                AND NOT queue_input_holds_receipt(receipt.id)
                 AND NOT file_evidence_pinned('runtime_input_receipt',receipt.id)
                 AND NOT EXISTS(SELECT 1 FROM execution e WHERE e.id=receipt.execution)
                 AND NOT EXISTS(SELECT 1 FROM runtime_input_receipt_source edge WHERE edge.source_receipt=receipt.id)

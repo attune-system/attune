@@ -38,10 +38,23 @@ pub(super) struct QueuePayload {
     schema: ValueSchemaBinding,
     payload: Value,
     fields: Vec<PreparedSecretValue>,
+    parent_receipts: Vec<Id>,
     context: Value,
     dispatch: Option<Id>,
 }
 impl QueuePayload {
+    pub(super) async fn transfer_parents(
+        &self,
+        conn: &mut PgConnection,
+        master: &str,
+    ) -> Result<Vec<crate::repositories::queue_configuration_input::QueueReceiptParent>> {
+        let (ids, parents) =
+            Fixed::transfer_contexts(conn, self.fixed_input, &self.fields, master).await?;
+        if ids != self.parent_receipts {
+            return Err(denied());
+        }
+        Ok(parents)
+    }
     pub(super) fn field_count(&self) -> usize {
         self.fields.len() + 1
     }
@@ -59,7 +72,7 @@ impl QueuePayload {
                     SecretOrigin::Local { source_kind, .. } => {
                         source_kind != "parameter_schema" && source_kind != "queue_item"
                     }
-                    _ => true,
+                    other => !crate::repositories::immutable_input_origin::is_input_receipt(other),
                 })
             {
                 return Err(denied());
@@ -201,12 +214,19 @@ pub(super) async fn capture(
             schema: raw.payload_binding()?,
             payload: raw.payload.clone(),
             fields,
+            parent_receipts: fixed.source_receipts().to_vec(),
             context: json!({
                 "id":raw.id,"item_key":raw.item_key,"priority":raw.priority,"metadata":raw.metadata,"enqueue_source":raw.enqueue_source,
                 "attempt_count":raw.attempt_count,"requested_by_identity":raw.requested_by_identity,"requested_by_execution":raw.requested_by_execution,"requested_by_enforcement":raw.requested_by_enforcement,
             }),
             dispatch,
         };
+        let parents = fixed
+            .validate_transfers(conn, &payload.fields, master)
+            .await?;
+        for parent in &parents {
+            fence = fence.intersect(parent.source_fence());
+        }
         payload.restore(master)?;
         let mut proof = ItemProof {
             source_admission: None,
@@ -217,7 +237,7 @@ pub(super) async fn capture(
             contributors,
             queue_payload: Some(payload),
         };
-        validate_contributor_origins(conn, &proof).await?;
+        validate_contributor_origins(conn, &proof, &parents).await?;
         seal(&mut proof, master)?;
         check_item(conn, &record, item.id, &proof, &queue.r#ref).await?;
         bytes = bytes
@@ -329,6 +349,7 @@ pub(super) async fn check_item(
         &schema,
         &payload.schema,
         &proof.contributors,
+        &payload.parent_receipts,
     )
     .await?;
     Ok(())
@@ -341,10 +362,52 @@ pub(in crate::repositories) struct QueueContributorSource {
     value: Value,
     template: WorkQueue,
     fence: ApprovalEffectFence,
+    parents: Vec<crate::repositories::queue_configuration_input::QueueReceiptParent>,
 }
 impl QueueContributorSource {
     pub(in crate::repositories) fn fence(&self) -> &ApprovalEffectFence {
         &self.fence
+    }
+    pub(in crate::repositories) fn parents_for(
+        &self,
+        path: &str,
+    ) -> Result<Vec<&crate::repositories::queue_configuration_input::QueueReceiptParent>> {
+        for (root, _) in self.roots()? {
+            let payload_root = if root.starts_with("/queue_items/") || root == "/queue_item" {
+                format!("{root}/payload")
+            } else {
+                root.clone()
+            };
+            let selected = if crate::secret_values::pointer_suffix(path, &root).is_some() {
+                if root == "/queue" || root == "/index" {
+                    return Ok(Vec::new());
+                }
+                crate::secret_values::pointer_suffix(path, &payload_root).or_else(|| {
+                    crate::secret_values::pointer_suffix(&payload_root, path).map(|_| String::new())
+                })
+            } else if crate::secret_values::pointer_suffix(&root, path).is_some() {
+                Some(String::new())
+            } else {
+                continue;
+            };
+            return Ok(selected
+                .map(|selected| {
+                    self.parents
+                        .iter()
+                        .filter(|parent| {
+                            crate::secret_values::pointer_suffix(parent.field_path(), &selected)
+                                .is_some()
+                                || crate::secret_values::pointer_suffix(
+                                    &selected,
+                                    parent.field_path(),
+                                )
+                                .is_some()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default());
+        }
+        Err(denied())
     }
     pub(in crate::repositories) fn roots(&self) -> Result<Vec<(String, Value)>> {
         let mut wrapper = self.payload.context.clone();
@@ -444,19 +507,22 @@ pub(super) async fn source(
         return Err(denied());
     }
     validate_origin(conn, renderer.id, &proof).await?;
-    validate_contributor_origins(conn, &proof).await?;
     let payload = proof.queue_payload.clone().ok_or_else(denied)?;
     if fixed != Some(payload.fixed_input) {
         return Err(denied());
     }
     check_item(conn, renderer, item, &proof, &payload.queue_ref).await?;
-    Fixed::authenticate_record(conn, payload.fixed_input, master).await?;
+    let parents = payload.transfer_parents(conn, master).await?;
+    validate_contributor_origins(conn, &proof, &parents).await?;
     let value = payload.restore(master)?;
     let count = match &renderer.authority.attribution {
         RequestAttribution::QueueBatch { items, .. } => items.len(),
         _ => return Err(denied()),
     };
-    let fence = RuntimeAuthorityRepository::retained_admission_fence(conn, renderer.id).await?;
+    let mut fence = RuntimeAuthorityRepository::retained_admission_fence(conn, renderer.id).await?;
+    for parent in &parents {
+        fence = fence.intersect(parent.source_fence());
+    }
     Ok(QueueContributorSource {
         payload,
         item,
@@ -464,6 +530,7 @@ pub(super) async fn source(
         value,
         template: serde_json::from_value(proof.template)?,
         fence,
+        parents,
     })
 }
 
@@ -478,6 +545,11 @@ impl QueuePayload {
             let provenance: SecretProvenance =
                 serde_json::from_str(field.source_ref.as_deref().ok_or_else(denied)?)?;
             for origin in provenance.origins {
+                // Canonical source edges retain/traverse typed parents. Do not
+                // reinterpret their receipt IDs as generic entity origins.
+                if crate::repositories::immutable_input_origin::is_input_receipt(&origin) {
+                    continue;
+                }
                 if !origins.contains(&origin) {
                     origins.push(origin);
                 }
@@ -490,6 +562,7 @@ impl QueuePayload {
 pub(super) async fn validate_contributor_origins(
     conn: &mut PgConnection,
     proof: &ItemProof,
+    parents: &[crate::repositories::queue_configuration_input::QueueReceiptParent],
 ) -> Result<()> {
     let payload = proof.queue_payload.as_ref().ok_or_else(denied)?;
     if proof.contributors.is_empty() || proof.contributors.len() > 256 || payload.fields.len() > 256
@@ -531,6 +604,11 @@ pub(super) async fn validate_contributor_origins(
                         }
                     }
                 }
+                other
+                    if crate::repositories::immutable_input_origin::is_input_receipt(other)
+                        && parents.iter().any(|parent| {
+                            parent.field_path() == field.json_path && parent.origin() == *other
+                        }) => {}
                 _ => return Err(denied()),
             }
         }

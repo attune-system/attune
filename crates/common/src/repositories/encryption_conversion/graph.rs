@@ -79,9 +79,7 @@ pub(super) async fn changes(
                     // Introduced after verifier conversion: only current
                     // verifiers are valid. Authenticate without rewriting the
                     // owning proof or sealed configuration ciphertext.
-                    crate::repositories::queue_configuration_input::authenticate_stored(
-                        &row, master,
-                    )?;
+                    crate::repositories::queue_configuration_input::QueueConfigurationInputRepository::authenticate_record(conn,id("id")?,master).await?;
                     report.fields_already_current += 1;
                     continue;
                 }
@@ -106,6 +104,9 @@ pub(super) async fn changes(
                     report.keys_converted += 1;
                 }
                 "execution_secret_value" | "runtime_input_receipt" => {
+                    if table == "runtime_input_receipt" {
+                        crate::repositories::inherited_input::InheritedInputRepository::authenticate_queue_storage_receipt(conn,&row,master).await?;
+                    }
                     let encrypted = row.get("encrypted_value").ok_or_else(corrupt)?;
                     let original: Option<String> = serde_json::from_value(
                         row.get("encryption_key_hash")
