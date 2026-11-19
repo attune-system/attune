@@ -106,9 +106,23 @@ impl SensorWorkloadRepository {
         if sensor_fence.is_some() && !Self::lock_current_fence(tx, sensor, fence).await? {
             return Err(denied());
         }
-        if !ready {
-            super::super::super::managed_sensor_metadata::ManagedSensorMetadataRepository::validate_generation(tx,workload,generation).await?;
+        if sensor_fence.is_none() && !ready {
+            // The assignment is also the effect's storage row. Retain it as a
+            // source BEFORE epochs, matching ordinary sensor admission. An
+            // unlocked EXISTS followed by epoch -> row lock could deadlock a
+            // stop/expiration update whose trigger revokes the workload epoch.
+            let selected:Option<i64>=sqlx::query_scalar("SELECT generation FROM sensor_workload_assignment WHERE workload=$1 AND generation=$2 AND worker=$3 AND worker_instance=$4 FOR NO KEY UPDATE")
+                .bind(workload).bind(generation).bind(owner).bind(incarnation).fetch_optional(&mut **tx).await?;
+            if selected != Some(generation) {
+                return Err(denied());
+            }
         }
+        let metadata = if !ready {
+            super::super::super::managed_sensor_metadata::ManagedSensorMetadataRepository::validate_generation(tx,workload,generation).await?;
+            super::super::super::managed_sensor_metadata::ManagedSensorMetadataRepository::for_generation(tx,workload,generation).await?
+        } else {
+            None
+        };
         // Worker source protection precedes epochs and operation locks.
         let deadline: DateTime<Utc> = sqlx::query_scalar("SELECT last_heartbeat+interval '90 seconds' FROM worker WHERE id=$1 AND status IN ('active','busy') AND last_heartbeat>clock_timestamp()-interval '90 seconds' FOR SHARE")
             .bind(owner).fetch_optional(&mut **tx).await?.ok_or_else(denied)?;
@@ -133,13 +147,7 @@ impl SensorWorkloadRepository {
         } else if !ready {
             // Stopped publication retains original source identity; no transfer
             // to a replacement incarnation is inferred from an expired lease.
-            let same:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sensor_workload_assignment WHERE workload=$1 AND generation=$2 AND worker=$3 AND worker_instance=$4)")
-                .bind(workload).bind(generation).bind(owner).bind(incarnation).fetch_one(&mut **tx).await?;
-            if !same {
-                return Err(denied());
-            }
-            super::super::super::managed_sensor_metadata::ManagedSensorMetadataRepository::validate_generation(tx,workload,generation).await?;
-            let metadata=super::super::super::managed_sensor_metadata::ManagedSensorMetadataRepository::for_generation(tx,workload,generation).await?.ok_or_else(denied)?;
+            let metadata = metadata.ok_or_else(denied)?;
             let epochs = super::super::super::workload_source::snapshot(
                 tx,
                 vec![
