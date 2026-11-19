@@ -9,6 +9,56 @@ use attune_common::{
 fn denied() -> Error {
     Error::PermissionDenied("Native runtime preparation unavailable".into())
 }
+fn bounded_native_timeout(
+    context_seconds: Option<u64>,
+    retained_ms: Option<u64>,
+    elapsed: std::time::Duration,
+) -> Result<Option<u64>> {
+    let context_ms = context_seconds
+        .map(|seconds| seconds.checked_mul(1000).ok_or_else(denied))
+        .transpose()?;
+    let bound = match (context_ms, retained_ms) {
+        (Some(context), Some(retained)) => Some(context.min(retained)),
+        (Some(bound), None) | (None, Some(bound)) => Some(bound),
+        (None, None) => None,
+    };
+    bound
+        .map(|ms| {
+            ms.checked_sub(u64::try_from(elapsed.as_millis()).map_err(|_| denied())?)
+                .filter(|remaining| *remaining > 0)
+                .ok_or_else(denied)
+        })
+        .transpose()
+}
+
+#[cfg(test)]
+mod inline_deadline_tests {
+    use super::bounded_native_timeout;
+    use std::time::Duration;
+
+    #[test]
+    fn preparation_spends_existing_deadline_instead_of_resetting_it() {
+        assert_eq!(
+            bounded_native_timeout(Some(120), Some(900), Duration::from_millis(400)).unwrap(),
+            Some(500)
+        );
+        assert_eq!(
+            bounded_native_timeout(Some(2), Some(9000), Duration::from_millis(400)).unwrap(),
+            Some(1600)
+        );
+        assert_eq!(
+            bounded_native_timeout(None, Some(900), Duration::from_millis(400)).unwrap(),
+            Some(500)
+        );
+        assert!(bounded_native_timeout(Some(120), Some(400), Duration::from_millis(400)).is_err());
+        assert!(bounded_native_timeout(Some(u64::MAX), None, Duration::ZERO).is_err());
+        assert_eq!(
+            bounded_native_timeout(None, None, Duration::ZERO).unwrap(),
+            None
+        );
+    }
+}
+
 impl ActionExecutor {
     pub(super) async fn prepare_isolated_interpreted(
         &self,
@@ -23,6 +73,13 @@ impl ActionExecutor {
             .ok_or_else(denied)?;
         let snapshot = execution.executable_snapshot.as_ref().ok_or_else(denied)?;
         let action = &snapshot.executable.action;
+        if context.code.is_some() {
+            // The root producer must supply its actual frozen restore evidence.
+            // This residual route stays closed until that hook is integrated.
+            return self
+                .prepare_isolated_inline(context, None, spec, execution)
+                .await;
+        }
         if config.lifecycle.is_some() {
             return self.prepare_isolated_recipe(context, spec, execution);
         }
@@ -90,17 +147,125 @@ impl ActionExecutor {
         } else {
             LaunchRoot::Pack
         };
-        spec.timeout_ms = context
-            .timeout
-            .map(|t| {
-                t.checked_mul(1000)
-                    .and_then(|ms| {
-                        ms.checked_sub(u64::try_from(started.elapsed().as_millis()).ok()?)
-                    })
-                    .filter(|ms| *ms > 0)
-                    .ok_or_else(denied)
+        spec.timeout_ms =
+            bounded_native_timeout(context.timeout, spec.timeout_ms, started.elapsed())?;
+        Ok(())
+    }
+
+    /// Root integration must call this before the file-only branch and pass
+    /// preparation.parameter_secret_paths.as_deref(), never schema-derived paths.
+    /// The owning producer still proves current source/origins and release binding.
+    pub(super) async fn prepare_isolated_inline(
+        &self,
+        context: &ExecutionContext,
+        frozen_paths: Option<&[String]>,
+        spec: &mut ProcessSpec,
+        execution: &Execution,
+    ) -> Result<()> {
+        use attune_workload_backend::inline_action_plan::{InlineActionPlan, LiteralInlineSource};
+        let started = std::time::Instant::now();
+        let snapshot = execution.executable_snapshot.as_ref().ok_or_else(denied)?;
+        let action = &snapshot.executable.action;
+        let config = context
+            .runtime_config_override
+            .as_ref()
+            .ok_or_else(denied)?;
+        let native = self.native_preparation.as_ref().ok_or_else(denied)?;
+        let source = LiteralInlineSource::from_snapshot(
+            context.code.as_deref().ok_or_else(denied)?,
+            action.entrypoint.as_deref().ok_or_else(denied)?,
+            frozen_paths,
+        )
+        .map_err(|_| denied())?;
+        if action.launch.is_some()
+            || context.code_path.is_some()
+            || context.entry_point != source.as_str()
+            || context.execution_id != execution.id
+            || context.action_ref != action.r#ref
+            || action.parameter_delivery == attune_common::models::ParameterDelivery::None
+            || spec.purpose != LaunchPurpose::Action
+            || !matches!(spec.target, LaunchTarget::Execution { execution: id, .. } if id == execution.id)
+            || spec.image != native.config.image
+            || spec.platform != native.config.platform
+            || spec.pack_access != PackAccess::ReadOnly
+            || spec.stage.is_some()
+            || spec
+                .inputs
+                .iter()
+                .filter(|pin| pin.kind == LaunchInputKind::Pack)
+                .count()
+                != 1
+            || spec
+                .inputs
+                .iter()
+                .filter(|pin| pin.kind == LaunchInputKind::Runner)
+                .count()
+                != 1
+            || spec.inputs.iter().any(|pin| match pin.kind {
+                LaunchInputKind::Pack => {
+                    pin.object_id != snapshot.release.id
+                        || pin.object_version != snapshot.release.digest
+                }
+                LaunchInputKind::Runner => pin != &native.runner,
+                LaunchInputKind::Runtime => false,
             })
-            .transpose()?;
+        {
+            return Err(denied());
+        }
+        if config.lifecycle.is_some() {
+            spec.timeout_ms =
+                bounded_native_timeout(context.timeout, spec.timeout_ms, started.elapsed())?;
+            return self.prepare_isolated_recipe_source(context, spec, execution, Some(source));
+        }
+        let has_runtime = crate::runtime::launch_planning::needs_runtime(config);
+        let retained = spec
+            .inputs
+            .iter()
+            .filter(|pin| pin.kind == LaunchInputKind::Runtime)
+            .cloned()
+            .collect::<Vec<_>>();
+        if retained.len() > 1 || (!has_runtime && !retained.is_empty()) {
+            return Err(denied());
+        }
+        if has_runtime {
+            if let Some(pin) = retained.first() {
+                native.cache.open_input_archive(pin).map_err(|_| denied())?;
+            }
+            let pin = self
+                .ensure_native_environment(context, spec, execution)
+                .await?;
+            match retained.first() {
+                Some(old) if old != &pin => return Err(denied()),
+                Some(_) => {}
+                None => spec.inputs.push(pin),
+            }
+        }
+        let plan = InlineActionPlan::new(config, source, has_runtime).map_err(|_| denied())?;
+        spec.invocation.argv = plan.argv(spec.platform).map_err(|_| denied())?;
+        let mut selected = context
+            .env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        selected.extend(
+            context
+                .execution_env
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        spec.invocation.env = crate::runtime::launch_planning::inline_action_environment(
+            config,
+            &selected,
+            has_runtime,
+        )
+        .map_err(|_| denied())?;
+        spec.invocation.working_root = if has_runtime {
+            LaunchRoot::Runtime
+        } else {
+            LaunchRoot::Pack
+        };
+        spec.timeout_ms =
+            bounded_native_timeout(context.timeout, spec.timeout_ms, started.elapsed())?;
         Ok(())
     }
 
@@ -113,6 +278,17 @@ impl ActionExecutor {
         spec: &mut ProcessSpec,
         execution: &Execution,
     ) -> Result<()> {
+        self.prepare_isolated_recipe_source(context, spec, execution, None)
+    }
+
+    fn prepare_isolated_recipe_source(
+        &self,
+        context: &ExecutionContext,
+        spec: &mut ProcessSpec,
+        execution: &Execution,
+        inline: Option<attune_workload_backend::inline_action_plan::LiteralInlineSource<'_>>,
+    ) -> Result<()> {
+        let started = std::time::Instant::now();
         let config = context
             .runtime_config_override
             .as_ref()
@@ -128,7 +304,7 @@ impl ActionExecutor {
         let snapshot = execution.executable_snapshot.as_ref().ok_or_else(denied)?;
         let action = &snapshot.executable.action;
         if action.launch.is_some()
-            || context.code.is_some()
+            || (context.code.is_some() != inline.is_some())
             || spec.pack_access != PackAccess::ReadOnly
             || spec.stage.is_some()
             || spec
@@ -138,14 +314,21 @@ impl ActionExecutor {
         {
             return Err(denied());
         }
-        let relative =
-            attune_common::artifact_transport::ValidatedRelativePath::new(&context.entry_point)?;
+        let source = match inline {
+            Some(source) => source.as_str().to_owned(),
+            None => {
+                let relative = attune_common::artifact_transport::ValidatedRelativePath::new(
+                    &context.entry_point,
+                )?;
+                format!("actions/{}", relative.as_str())
+            }
+        };
         spec.invocation.argv = crate::runtime::launch_planning::runtime_recipe_argv(
             spec.platform,
             recipe,
             "/usr/local/bin:/usr/bin:/bin",
-            &format!("actions/{}", relative.as_str()),
-            false,
+            &source,
+            inline.is_some(),
             context.selected_runtime_version.as_deref(),
         )
         .map_err(|_| denied())?;
@@ -165,14 +348,11 @@ impl ActionExecutor {
         })
         .map_err(|_| denied())?;
         spec.invocation.working_root = LaunchRoot::Pack;
-        spec.timeout_ms = Some(
-            context
-                .timeout
-                .unwrap_or(recipe.launch.timeout_seconds)
-                .checked_mul(1000)
-                .filter(|v| *v > 0)
-                .ok_or_else(denied)?,
-        );
+        spec.timeout_ms = bounded_native_timeout(
+            Some(context.timeout.unwrap_or(recipe.launch.timeout_seconds)),
+            spec.timeout_ms,
+            started.elapsed(),
+        )?;
         Ok(())
     }
 

@@ -30,6 +30,7 @@ pub mod execution_authority;
 pub mod execution_env;
 pub mod file_legacy_controller;
 mod http_client;
+pub mod inline_action;
 pub mod inquiry_callback_adapter;
 pub mod inquiry_options;
 pub mod inquiry_response_handle;

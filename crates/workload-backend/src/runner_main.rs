@@ -3,6 +3,8 @@ mod candidate_python;
 #[cfg(target_os = "linux")]
 mod gated_runner;
 #[cfg(unix)]
+mod inline_action;
+#[cfg(unix)]
 mod parameter_input;
 #[cfg(unix)]
 mod recipe_probe;
@@ -77,6 +79,11 @@ fn main() {
         Some("inspect-runtime-tools") => recipe_probe::inspect(&arguments[1..]),
         #[cfg(unix)]
         Some("inspect-runtime-verification") => recipe_probe::inspect_legacy(&arguments[1..]),
+        #[cfg(unix)]
+        Some("run-inline-action") => match inline_action::run(&arguments[1..]) {
+            Ok(code) => std::process::exit(code),
+            Err(error) => Err(error),
+        },
         #[cfg(unix)]
         Some("run-runtime-recipe") => recipe_probe::run(&arguments[1..]),
         #[cfg(unix)]

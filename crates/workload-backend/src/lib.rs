@@ -6,6 +6,7 @@ pub mod cache;
 pub mod candidate_prep;
 pub mod configuration;
 pub mod engine;
+pub mod inline_action_plan;
 pub mod kubernetes;
 mod kubernetes_io;
 pub mod pack_input;

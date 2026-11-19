@@ -47,28 +47,6 @@ fn get_env_setup_lock(env_dir: &Path) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
-fn bash_single_quote_escape(s: &str) -> String {
-    s.replace('\'', "'\\''")
-}
-
-fn shell_identifier(key: &str) -> String {
-    let mut identifier = String::with_capacity(key.len());
-    for (index, ch) in key.chars().enumerate() {
-        let valid = ch == '_' || ch.is_ascii_alphanumeric();
-        if valid && !(index == 0 && ch.is_ascii_digit()) {
-            identifier.push(ch);
-        } else {
-            identifier.push('_');
-        }
-    }
-
-    if identifier.is_empty() {
-        "_".to_string()
-    } else {
-        identifier
-    }
-}
-
 fn format_command_for_log(cmd: &Command) -> String {
     let command = cmd.as_std();
     format!(
@@ -852,43 +830,6 @@ impl ProcessRuntime {
         &self.config
     }
 
-    fn build_shell_inline_wrapper(
-        &self,
-        merged_parameters: &HashMap<String, serde_json::Value>,
-        code: &str,
-    ) -> RuntimeResult<String> {
-        let mut script = String::new();
-        script.push_str("#!/bin/bash\n");
-        script.push_str("set -e\n\n");
-
-        script.push_str("# Action parameters\n");
-        for (key, value) in merged_parameters {
-            let value_str = match value {
-                serde_json::Value::String(s) => s.clone(),
-                serde_json::Value::Number(n) => n.to_string(),
-                serde_json::Value::Bool(b) => b.to_string(),
-                _ => serde_json::to_string(value)?,
-            };
-            let escaped = bash_single_quote_escape(&value_str);
-            // Define shell variables for the inline action without exporting
-            // them into the process environment. This keeps secrets available
-            // to the current script while preventing leakage via `printenv`
-            // or to child processes spawned by the action.
-            let identifier = shell_identifier(key);
-            script.push_str(&format!(
-                "PARAM_{}='{}'\n",
-                identifier.to_uppercase(),
-                escaped
-            ));
-            script.push_str(&format!("{}='{}'\n", identifier, escaped));
-        }
-        script.push('\n');
-        script.push_str("# Action code\n");
-        script.push_str(code);
-
-        Ok(script)
-    }
-
     async fn materialize_inline_code(
         &self,
         execution_id: i64,
@@ -919,7 +860,7 @@ impl ProcessRuntime {
         };
 
         let inline_code = if effective_config.inline_execution.inject_shell_helpers {
-            self.build_shell_inline_wrapper(merged_parameters, code)?
+            attune_common::inline_action::shell_wrapper(merged_parameters, code)?
         } else {
             code.to_string()
         };
