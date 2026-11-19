@@ -684,6 +684,42 @@ impl WorkQueueDispatcher {
         } else {
             None
         };
+        let mut fixed_inputs = Vec::new();
+        for item in items.iter().filter(|_| !queue.is_adhoc) {
+            fixed_inputs.push(attune_common::repositories::queue_configuration_input::QueueConfigurationInputRepository::load(
+                &mut tx, queue, item, &dispatch_snapshot,
+                encryption_key.ok_or_else(||anyhow!("Managed queue fixed-input encryption is unavailable"))?,
+            ).await?);
+        }
+        if let Some(first) = fixed_inputs.first() {
+            if fixed_inputs
+                .iter()
+                .any(|input| !first.compatible_fixed_inputs(input))
+            {
+                return Err(anyhow!(
+                    "Queue batch spans incompatible accepted fixed-input bindings"
+                ));
+            }
+        }
+        let fixed_template = fixed_inputs
+            .first()
+            .map(|input| input.accepted_template(queue))
+            .transpose()?;
+        let queue = fixed_template.as_ref().unwrap_or(queue);
+        let fixed_context = fixed_template
+            .as_ref()
+            .map(|template| -> Result<ResolvedQueueContext> {
+                Ok(ResolvedQueueContext {
+                    parsed_config: serde_json::from_value(template.config.clone())?,
+                    pack_config: JsonValue::Null,
+                    pack_ref: template.pack_ref.clone(),
+                    concurrency: context.concurrency,
+                    batch_size: context.batch_size,
+                    inter_execution_delay_seconds: context.inter_execution_delay_seconds,
+                })
+            })
+            .transpose()?;
+        let context = fixed_context.as_ref().unwrap_or(context);
         let permission_set_refs = if let Some(admission) = &admission {
             admission.authority().selected_refs.clone()
         } else {
@@ -691,6 +727,8 @@ impl WorkQueueDispatcher {
         };
         let binding = if accepted_queue.is_some() {
             attune_common::repositories::ad_hoc_queue_admission::AdHocQueueAdmissionRepository::schema(&mut tx, items[0].id).await?
+        } else if let Some(input) = fixed_inputs.first() {
+            input.schema().clone()
         } else if recorded {
             attune_common::repositories::schema_contract::SchemaContractRepository::materialize_action_pair(&mut tx, &dispatch_snapshot).await?
         } else {
@@ -703,9 +741,15 @@ impl WorkQueueDispatcher {
             let first = iter.next().flatten();
             first.filter(|id| iter.all(|other| other == Some(*id)))
         };
-        let (pack_config, pack_secret_paths, pack_revision) = if let Some(reference) =
-            &context.pack_ref
+        let (pack_config, pack_secret_paths, pack_revision) = if let Some(input) =
+            fixed_inputs.first()
         {
+            (
+                input.configuration().clone(),
+                input.configuration_secret_paths(&mut tx).await?,
+                input.configuration_revision(),
+            )
+        } else if let Some(reference) = &context.pack_ref {
             let pack = PackRepository::find_by_ref(&mut *tx, reference)
                 .await?
                 .ok_or_else(|| anyhow!("Queue configuration owner is unavailable"))?;
@@ -748,6 +792,14 @@ impl WorkQueueDispatcher {
         let key_refs = key_context.referenced_key_refs(&queue.action_params)?;
         let keys = if key_refs.is_empty() {
             std::collections::BTreeMap::new()
+        } else if let Some(input) = fixed_inputs.first() {
+            let keys = input.resolved_keys();
+            if keys.keys().cloned().collect::<Vec<_>>() != key_refs {
+                return Err(anyhow!(
+                    "Queue record cannot change accepted fixed Key selectors"
+                ));
+            }
+            keys
         } else {
             if recorded {
                 let mut authorities = Vec::new();
@@ -785,12 +837,12 @@ impl WorkQueueDispatcher {
             keys,
         )?;
         let supplied_config = rendered_config.value.clone();
-        let config_with_defaults = if accepted_queue.is_some() {
+        let config_with_defaults = if accepted_queue.is_some() || !queue.is_adhoc {
             rendered_config.value.clone()
         } else {
             input_contract.apply_defaults(&rendered_config.value)?
         };
-        if accepted_queue.is_none() {
+        if accepted_queue.is_none() && queue.is_adhoc {
             input_contract.validate(&config_with_defaults)?;
         }
         attune_common::secret_values::validate_contract_secret_destination_paths(
@@ -805,7 +857,11 @@ impl WorkQueueDispatcher {
                 &input_contract,
             )?;
         let ad_hoc_secret_inputs = accepted_queue.as_ref().map(|_| secret_inputs.clone());
-        let mut prepared_secrets = if secret_inputs.is_empty() || ad_hoc_secret_inputs.is_some() {
+        let managed_secret_inputs = (!queue.is_adhoc).then(|| secret_inputs.clone());
+        let mut prepared_secrets = if secret_inputs.is_empty()
+            || ad_hoc_secret_inputs.is_some()
+            || managed_secret_inputs.is_some()
+        {
             Vec::new()
         } else {
             let encryption_key = encryption_key.ok_or_else(|| {
@@ -848,7 +904,7 @@ impl WorkQueueDispatcher {
             CreateExecutionInput {
                 action: Some(dispatch_action.id),
                 action_ref: dispatch_action.r#ref.clone(),
-                config: if accepted_queue.is_some() {
+                config: if accepted_queue.is_some() || !queue.is_adhoc {
                     None
                 } else {
                     Some(execution_config)
@@ -881,6 +937,10 @@ impl WorkQueueDispatcher {
             &dispatch_snapshot,
         )
         .await?;
+        WorkQueueItemRepository::attach_execution_to_lease(&mut *tx, lease_token, execution.id)
+            .await?;
+        // Manifest capture requires the exact execution attachment, before
+        // canonical admission or any renderer can consume accepted members.
         let mut initial_admission = None;
         let mut accepted_batch_fence = None;
         if let Some(admission) = &admission {
@@ -906,6 +966,11 @@ impl WorkQueueDispatcher {
                 // can consume canonical destination authority.
                 accepted_batch_fence = Some(attune_common::repositories::accepted_batch_dependency::AcceptedBatchDependencyRepository::capture(
                     &mut tx, record.id, &items.iter().map(|item| item.id).collect::<Vec<_>>(),
+                ).await?);
+            } else if !queue.is_adhoc {
+                accepted_batch_fence = Some(attune_common::repositories::accepted_batch_dependency::AcceptedBatchDependencyRepository::capture_managed(
+                    &mut tx,record.id,queue,&items,reserved_dispatch_id,
+                    encryption_key.ok_or_else(||anyhow!("Managed queue payload receipt encryption is unavailable"))?,
                 ).await?);
             }
         }
@@ -946,7 +1011,37 @@ impl WorkQueueDispatcher {
             )
             .await?;
         }
-        if !prepared_secrets.is_empty() && accepted_queue.is_none() {
+        if let (Some(input), Some(inputs)) = (fixed_inputs.first(), managed_secret_inputs) {
+            let inputs = Self::seal_fixed_queue_fields(
+                &mut tx,
+                execution.id,
+                input,
+                &rendered_config.value,
+                inputs,
+                encryption_key
+                    .ok_or_else(|| anyhow!("Managed queue receipt encryption is unavailable"))?,
+            )
+            .await?;
+            let (config,inputs)=attune_common::repositories::declared_input_materialization::DeclaredInputMaterializationRepository::workflow_child_defaults(
+                &mut tx,execution.id,&supplied_config,inputs,encryption_key,
+            ).await?;
+            prepared_secrets = prepare_secret_values(
+                inputs,
+                encryption_key.ok_or_else(|| {
+                    anyhow!("Managed queue default input encryption is unavailable")
+                })?,
+            )?;
+            execution = ExecutionRepository::initialize_config_with_conn(
+                &mut tx,
+                execution.id,
+                initial_admission,
+                &dispatch_snapshot,
+                Some(config),
+                &prepared_secrets,
+            )
+            .await?;
+        }
+        if !prepared_secrets.is_empty() && accepted_queue.is_none() && queue.is_adhoc {
             ExecutionSecretValueRepository::upsert_many_with_conn(
                 &mut tx,
                 ENTITY_EXECUTION_CONFIG,
@@ -962,9 +1057,6 @@ impl WorkQueueDispatcher {
         } else {
             Vec::new()
         };
-
-        WorkQueueItemRepository::attach_execution_to_lease(&mut *tx, lease_token, execution.id)
-            .await?;
 
         let dispatch = WorkQueueDispatchRepository::create(
             &mut *tx,
@@ -1010,6 +1102,95 @@ impl WorkQueueDispatcher {
             queue: queue.clone(),
             leased_item_ids: items.iter().map(|item| item.id).collect(),
         }))
+    }
+
+    async fn seal_fixed_queue_fields(
+        conn: &mut sqlx::PgConnection,
+        execution: i64,
+        input: &attune_common::repositories::queue_configuration_input::QueueConfigurationInput,
+        actual: &JsonValue,
+        mut secrets: Vec<attune_common::secret_values::SecretValueInput>,
+        key: &str,
+    ) -> Result<Vec<attune_common::secret_values::SecretValueInput>> {
+        use attune_common::repositories::inherited_input::{
+            InheritedInputRepository as Inputs, InputEntityKind, InputSite, InputSitePurpose,
+        };
+        for site in input.declarations() {
+            let path = site
+                .source_path
+                .strip_prefix("/queue/action_params")
+                .ok_or_else(|| anyhow!("Queue declaration path mismatch"))?;
+            let mut session = Inputs::begin_render(
+                conn,
+                execution,
+                &site.declaration_revision,
+                &site.source_path,
+                &site.expression,
+                InputSitePurpose::Value,
+            )
+            .await?;
+            Inputs::bind_queue_configuration(conn, &mut session, input.id(), key).await?;
+            Inputs::bind_queue_contributors(conn, &mut session, key).await?;
+            let rendered = Inputs::evaluate(conn, session).await?;
+            if actual.pointer(path) != Some(rendered.value()) {
+                return Err(anyhow!(
+                    "Accepted queue fixed input differs from rendered destination"
+                ));
+            }
+            let destination = InputSite {
+                execution,
+                kind: InputEntityKind::ExecutionConfig,
+                purpose: InputSitePurpose::Value,
+                path: path.into(),
+            };
+            let receipt = Inputs::record_render(
+                conn,
+                &rendered,
+                &destination,
+                rendered.value(),
+                rendered.selections(),
+                key,
+            )
+            .await?;
+            for secret in secrets.iter_mut().filter(|secret| {
+                attune_common::secret_values::pointer_suffix(path, &secret.json_path).is_some()
+            }) {
+                let provenance = if secret.json_path == path {
+                    receipt.provenance()
+                } else {
+                    let suffix =
+                        attune_common::secret_values::pointer_suffix(path, &secret.json_path)
+                            .ok_or_else(|| anyhow!("Queue secret projection path mismatch"))?;
+                    let projected = Inputs::project_queue_render(conn, &rendered, &suffix).await?;
+                    if projected.value() != &secret.value {
+                        return Err(anyhow!(
+                            "Queue secret leaf differs from admitted expression projection"
+                        ));
+                    }
+                    let destination = InputSite {
+                        execution,
+                        kind: InputEntityKind::ExecutionConfig,
+                        purpose: InputSitePurpose::Value,
+                        path: secret.json_path.clone(),
+                    };
+                    let leaf = Inputs::record_render(
+                        conn,
+                        &projected,
+                        &destination,
+                        projected.value(),
+                        projected.selections(),
+                        key,
+                    )
+                    .await?;
+                    leaf.ensure_fresh_on(conn).await?;
+                    leaf.provenance()
+                };
+                secret.source_kind = "provenance".into();
+                secret.source_ref = Some(serde_json::to_string(&provenance)?);
+            }
+            receipt.ensure_fresh_on(conn).await?;
+        }
+        Ok(secrets)
     }
 
     #[expect(

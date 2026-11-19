@@ -14,6 +14,7 @@ pub(super) struct Change {
 pub(super) const STORES: &[(&str, &str)] = &[
     ("key", "id"),
     ("work_queue_item_configuration_input", "id"),
+    ("runtime_accepted_batch_item", "admission,item"),
     ("execution_secret_value", "id"),
     ("runtime_input_receipt", "id"),
     ("runtime_accepted_input", "id"),
@@ -59,7 +60,9 @@ pub(super) async fn changes(
             let id = |column: &str| -> Result<i64> {
                 row.get(column).and_then(Value::as_i64).ok_or_else(corrupt)
             };
-            let identity = if table == "runtime_native_iteration_outcome_member" {
+            let identity = if table == "runtime_accepted_batch_item" {
+                json!({"admission":id("admission")?,"item":id("item")?})
+            } else if table == "runtime_native_iteration_outcome_member" {
                 json!({"snapshot":id("snapshot")?,"ordinal":id("ordinal")?})
             } else if table == "runtime_native_success_metadata_observation" {
                 json!({"snapshot":id("snapshot")?})
@@ -68,6 +71,10 @@ pub(super) async fn changes(
             };
             let values;
             match table {
+                "runtime_accepted_batch_item" => {
+                    report.fields_already_current+=crate::repositories::accepted_batch_dependency::AcceptedBatchDependencyRepository::authenticate_manifest(&row,master)?;
+                    continue;
+                }
                 "work_queue_item_configuration_input" => {
                     // Introduced after verifier conversion: only current
                     // verifiers are valid. Authenticate without rewriting the

@@ -157,7 +157,7 @@ impl ManagedExecutableRepository {
             if let InvocationBinding::Queue { queue_ref, .. } = &policy.invocations[index].binding {
                 if policy.invocations[index].source_id.is_none() {
                     let body:serde_json::Value=sqlx::query_scalar(
-                    "SELECT jsonb_build_object('action_params',action_params,'dispatch_action',dispatch_action,'dispatch_action_ref',dispatch_action_ref,'permission_set_refs',permission_set_refs,'item_schema',item_schema,'trace_tag_template',trace_tag_template,'config',config) FROM work_queue WHERE ref = $1 AND pack = $2 AND management_origin = 'pack' AND retired_at IS NULL FOR SHARE",
+                    "SELECT jsonb_build_object('batch_mode',batch_mode,'action_params',action_params,'dispatch_action',dispatch_action,'dispatch_action_ref',dispatch_action_ref,'permission_set_refs',permission_set_refs,'item_schema',item_schema,'trace_tag_template',trace_tag_template,'config',config) FROM work_queue WHERE ref = $1 AND pack = $2 AND management_origin = 'pack' AND retired_at IS NULL FOR SHARE",
                 ).bind(queue_ref).bind(policy.owner.pack_id).fetch_optional(&mut *connection).await?
                     .ok_or_else(|| Error::validation("Admitted queue source is unavailable"))?;
                     policy.invocations[index].dispatch_template_digest =

@@ -1,4 +1,4 @@
-//! Durable, bounded source accounting for accepted ad-hoc Action batches.
+//! Durable, bounded source accounting for typed Action and managed Queue batches.
 use super::runtime_authority::{
     ApprovalEffectFence, RuntimeAdmissionRecord, RuntimeAuthorityRepository,
 };
@@ -13,6 +13,9 @@ use serde_json::Value;
 use sqlx::PgConnection;
 use std::collections::BTreeSet;
 
+mod queue;
+pub(in crate::repositories) use queue::QueueContributorSource;
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ItemProof {
@@ -22,6 +25,17 @@ struct ItemProof {
     template: Value,
     schema: Value,
     contributors: Vec<(String, Value, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    queue_payload: Option<queue::QueuePayload>,
+}
+
+pub(in crate::repositories) struct BatchRetentionEvidence {
+    pub source: Option<Id>,
+    pub policy: Id,
+    pub input: Option<Id>,
+    pub bytes: usize,
+    pub schema: Value,
+    pub executable: Value,
 }
 
 pub struct AcceptedBatchDependencyRepository;
@@ -141,6 +155,7 @@ impl AcceptedBatchDependencyRepository {
                 template,
                 schema,
                 contributors,
+                queue_payload: None,
             };
             proof_bytes += serde_json::to_vec(&proof)?.len();
             if proof_bytes > 1024 * 1024 || expected_slots > 256 {
@@ -221,15 +236,156 @@ impl AcceptedBatchDependencyRepository {
         Ok(fence)
     }
 
+    pub(in crate::repositories) async fn copy_inherited(
+        conn: &mut PgConnection,
+        source: &RuntimeAdmissionRecord,
+        target: &RuntimeAdmissionRecord,
+    ) -> Result<()> {
+        if !matches!(
+            source.authority.attribution,
+            RequestAttribution::QueueBatch { .. }
+        ) {
+            return Ok(());
+        }
+        let mut expected = source.authority.0.clone();
+        expected.attempt = target.authority.attempt;
+        if source.id >= target.id || expected != target.authority.0 {
+            return Err(denied());
+        }
+        let original:bool=sqlx::query_scalar("SELECT xmin::text::numeric=mod(pg_current_xact_id()::text::numeric,4294967296) FROM runtime_authority_admission WHERE id=$1")
+            .bind(target.id).fetch_one(&mut *conn).await?;
+        let present: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM runtime_accepted_batch_manifest WHERE admission=$1)",
+        )
+        .bind(target.id)
+        .fetch_one(&mut *conn)
+        .await?;
+        if !original && !present {
+            return Err(denied());
+        }
+        Self::validate(conn, source).await?;
+        sqlx::query("INSERT INTO runtime_accepted_batch_manifest(admission,item_ids) SELECT $2,item_ids FROM runtime_accepted_batch_manifest WHERE admission=$1 ON CONFLICT DO NOTHING")
+            .bind(source.id).bind(target.id).execute(&mut *conn).await?;
+        sqlx::query("INSERT INTO runtime_accepted_batch_item(admission,item,source_admission,target_policy,proof,proof_digest,configuration_input) SELECT $2,item,source_admission,target_policy,proof,proof_digest,configuration_input FROM runtime_accepted_batch_item WHERE admission=$1 ON CONFLICT DO NOTHING")
+            .bind(source.id).bind(target.id).execute(&mut *conn).await?;
+        sqlx::query("INSERT INTO runtime_admission_dependency(admission,dependency,dependency_kind) SELECT $2,dependency,'accepted_item' FROM runtime_admission_dependency WHERE admission=$1 AND dependency_kind='accepted_item' ON CONFLICT DO NOTHING")
+            .bind(source.id).bind(target.id).execute(&mut *conn).await?;
+        Self::validate(conn, target).await?;
+        let exact:bool=sqlx::query_scalar("SELECT NOT EXISTS((SELECT item,source_admission,target_policy,proof,proof_digest,configuration_input FROM runtime_accepted_batch_item WHERE admission=$1 EXCEPT SELECT item,source_admission,target_policy,proof,proof_digest,configuration_input FROM runtime_accepted_batch_item WHERE admission=$2) UNION ALL (SELECT item,source_admission,target_policy,proof,proof_digest,configuration_input FROM runtime_accepted_batch_item WHERE admission=$2 EXCEPT SELECT item,source_admission,target_policy,proof,proof_digest,configuration_input FROM runtime_accepted_batch_item WHERE admission=$1))")
+            .bind(source.id).bind(target.id).fetch_one(conn).await?;
+        if !exact {
+            return Err(denied());
+        }
+        Ok(())
+    }
+    pub(in crate::repositories) fn authenticate_manifest(
+        row: &Value,
+        master: &str,
+    ) -> Result<usize> {
+        let body = row.get("proof").ok_or_else(denied)?;
+        if row.get("proof_digest").and_then(Value::as_str) != Some(hash(body)?.as_str()) {
+            return Err(denied());
+        }
+        let proof: ItemProof = serde_json::from_value(body.clone())?;
+        if let Some(payload) = proof.queue_payload {
+            if !matches!(proof.authority.binding, InvocationBinding::Queue { .. })
+                || row.get("configuration_input").and_then(Value::as_i64)
+                    != Some(payload.fixed_input)
+            {
+                return Err(denied());
+            }
+            for (_, body, digest) in &proof.contributors {
+                super::recorded_input_authority::RecordedInputAuthorityRepository::from_manifest(
+                    body, digest,
+                )?;
+            }
+            payload.restore(master)?;
+            Ok(payload.field_count())
+        } else if matches!(proof.authority.binding, InvocationBinding::Action { .. })
+            && row.get("configuration_input").is_none_or(Value::is_null)
+        {
+            Ok(0)
+        } else {
+            Err(denied())
+        }
+    }
+    pub(in crate::repositories) async fn retention_evidence(
+        conn: &mut PgConnection,
+        admission: Id,
+    ) -> Result<Vec<BatchRetentionEvidence>> {
+        let rows:Vec<(Option<Id>,Id,Value,String,Option<Id>)>=sqlx::query_as("SELECT source_admission,target_policy,proof,proof_digest,configuration_input FROM runtime_accepted_batch_item WHERE admission=$1 ORDER BY item LIMIT 257")
+            .bind(admission).fetch_all(conn).await?;
+        if rows.len() > 256 {
+            return Err(denied());
+        }
+        rows.into_iter()
+            .map(|(source, policy, body, expected, input)| {
+                if hash(&body)? != expected {
+                    return Err(denied());
+                }
+                let bytes = serde_json::to_vec(&body)?.len();
+                let proof: ItemProof = serde_json::from_value(body)?;
+                if proof.source_admission != source
+                    || proof.authority.policy_id != policy
+                    || proof
+                        .queue_payload
+                        .as_ref()
+                        .map(|payload| payload.fixed_input)
+                        != input
+                {
+                    return Err(denied());
+                }
+                Ok(BatchRetentionEvidence {
+                    source,
+                    policy,
+                    input,
+                    bytes,
+                    schema: proof.schema,
+                    executable: serde_json::to_value(proof.executable)?,
+                })
+            })
+            .collect()
+    }
+    pub async fn capture_managed(
+        conn: &mut PgConnection,
+        destination: Id,
+        queue: &WorkQueue,
+        items: &[crate::models::WorkQueueItem],
+        dispatch: Option<Id>,
+        master: &str,
+    ) -> Result<ApprovalEffectFence> {
+        queue::capture(conn, destination, queue, items, dispatch, master).await
+    }
+    pub(in crate::repositories) async fn contributor_source(
+        conn: &mut PgConnection,
+        renderer: &RuntimeAdmissionRecord,
+        item: Id,
+        master: &str,
+    ) -> Result<QueueContributorSource> {
+        queue::source(conn, renderer, item, master).await
+    }
+
     pub(crate) async fn validate(
         conn: &mut PgConnection,
         record: &RuntimeAdmissionRecord,
     ) -> Result<Vec<SelectedRuntimeAuthority>> {
         let RequestAttribution::QueueBatch { queue_ref, items } = &record.authority.attribution
         else {
-            return Ok(vec![]);
+            return if matches!(record.authority.binding, InvocationBinding::Queue { .. }) {
+                Err(denied())
+            } else {
+                Ok(vec![])
+            };
         };
-        if !matches!(record.authority.binding, InvocationBinding::Action { .. }) {
+        if matches!(record.authority.binding, InvocationBinding::Queue { .. })
+            && record.owner_kind != "execution"
+        {
+            return Err(denied());
+        }
+        if !matches!(
+            record.authority.binding,
+            InvocationBinding::Action { .. } | InvocationBinding::Queue { .. }
+        ) {
             return Ok(vec![]);
         }
         let manifest: Option<Vec<Id>> = sqlx::query_scalar(
@@ -242,14 +398,16 @@ impl AcceptedBatchDependencyRepository {
         if canonical_ids(&ids)? != items.keys().copied().collect::<Vec<_>>() {
             return Err(denied());
         }
-        let rows:Vec<(Id,Option<Id>,Id,Value,String)> = sqlx::query_as("SELECT item,source_admission,target_policy,proof,proof_digest FROM runtime_accepted_batch_item WHERE admission = $1 ORDER BY item")
+        let rows:Vec<(Id,Option<Id>,Id,Value,String,Option<Id>)> = sqlx::query_as("SELECT item,source_admission,target_policy,proof,proof_digest,configuration_input FROM runtime_accepted_batch_item WHERE admission = $1 ORDER BY item")
             .bind(record.id).fetch_all(&mut *conn).await?;
         if rows.iter().map(|row| row.0).collect::<Vec<_>>() != ids {
             return Err(denied());
         }
         let mut selections = Vec::new();
         let mut sources = BTreeSet::new();
-        for (item, source, policy, body, expected) in rows {
+        let mut ordinals = BTreeSet::new();
+        let mut queue_cohort = None;
+        for (item, source, policy, body, expected, fixed) in rows {
             if hash(&body)? != expected {
                 return Err(denied());
             }
@@ -257,11 +415,32 @@ impl AcceptedBatchDependencyRepository {
             if proof.source_admission != source || proof.authority.policy_id != policy {
                 return Err(denied());
             }
-            check_item(conn, record, item, &proof, queue_ref).await?;
+            if let InvocationBinding::Queue { .. } = &record.authority.binding {
+                let payload = proof.queue_payload.as_ref().ok_or_else(denied)?;
+                if fixed != Some(payload.fixed_input) || !ordinals.insert(payload.ordinal) {
+                    return Err(denied());
+                }
+                queue::check_item(conn, record, item, &proof, queue_ref).await?;
+                let cohort=super::queue_configuration_input::QueueConfigurationInputRepository::cohort_identity(conn,payload.fixed_input).await?;
+                if queue_cohort.as_ref().is_some_and(|first| first != &cohort) {
+                    return Err(denied());
+                }
+                queue_cohort = Some(cohort);
+            } else {
+                if proof.queue_payload.is_some() || fixed.is_some() {
+                    return Err(denied());
+                }
+                check_item(conn, record, item, &proof, queue_ref).await?;
+            }
             if let Some(source) = source {
                 sources.insert(source);
             }
             selections.push(proof.authority);
+        }
+        if matches!(record.authority.binding, InvocationBinding::Queue { .. })
+            && ordinals.into_iter().collect::<Vec<_>>() != (0..ids.len()).collect::<Vec<_>>()
+        {
+            return Err(denied());
         }
         let edges:Vec<Id> = sqlx::query_scalar("SELECT dependency FROM runtime_admission_dependency WHERE admission = $1 AND dependency_kind = 'accepted_item' ORDER BY dependency")
             .bind(record.id).fetch_all(conn).await?;

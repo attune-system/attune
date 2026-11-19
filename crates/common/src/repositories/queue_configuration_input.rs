@@ -31,6 +31,7 @@ struct Binding {
     policy: Id,
     authority_digest: String,
     authority: crate::runtime_authority::SelectedRuntimeAuthority,
+    contributor_digests: BTreeMap<String, String>,
     executable_digest: String,
     item_schema_digest: String,
     template_digest: String,
@@ -40,6 +41,7 @@ struct Binding {
     declarations: Vec<DeclaredInputBinding>,
     keys: BTreeMap<String, KeyOrigin>,
     key_targets: BTreeMap<String, crate::runtime_authority::BoundRuntimeTarget>,
+    key_versions: BTreeMap<String, String>,
     schema: ActionSchemaBinding,
 }
 #[derive(Serialize, Deserialize)]
@@ -55,8 +57,71 @@ struct Sealed {
 pub struct QueueConfigurationInput {
     sealed: Sealed,
     fence: super::runtime_authority::ApprovalEffectFence,
+    metadata: Value,
 }
 impl QueueConfigurationInput {
+    pub fn compatible_fixed_inputs(&self, other: &Self) -> bool {
+        self.sealed.binding.policy == other.sealed.binding.policy
+            && self.sealed.binding.template_digest == other.sealed.binding.template_digest
+            && self.sealed.binding.configuration == other.sealed.binding.configuration
+            && self.sealed.binding.key_versions == other.sealed.binding.key_versions
+            && self.sealed.binding.schema == other.sealed.binding.schema
+            && self.sealed.configuration == other.sealed.configuration
+            && self.sealed.keys == other.sealed.keys
+    }
+    pub async fn configuration_secret_paths(&self, conn: &mut PgConnection) -> Result<Vec<String>> {
+        self.fence.ensure_fresh_on(conn).await?;
+        let Some(id) = self.sealed.binding.configuration else {
+            return Ok(Vec::new());
+        };
+        let revision = Configuration::find(&mut *conn, id)
+            .await?
+            .ok_or_else(denied)?;
+        crate::value_schema::CompiledContract::new(&revision.contract()?)
+            .map_err(|_| denied())?
+            .secret_paths(&self.sealed.configuration)
+            .map_err(|_| denied())
+    }
+    pub fn accepted_template(&self, current: &WorkQueue) -> Result<WorkQueue> {
+        if current.id != self.sealed.binding.queue
+            || current.r#ref != self.sealed.binding.queue_ref
+            || current.pack != Some(self.sealed.binding.pack)
+        {
+            return Err(denied());
+        }
+        let mut queue = current.clone();
+        queue.action_params = self
+            .metadata
+            .get("action_params")
+            .cloned()
+            .ok_or_else(denied)?;
+        queue.item_schema = self
+            .metadata
+            .get("item_schema")
+            .cloned()
+            .ok_or_else(denied)?;
+        queue.config = self.metadata.get("config").cloned().ok_or_else(denied)?;
+        queue.dispatch_action = Some(
+            self.metadata["dispatch_action"]
+                .as_i64()
+                .ok_or_else(denied)?,
+        );
+        queue.dispatch_action_ref = self.metadata["dispatch_action_ref"]
+            .as_str()
+            .ok_or_else(denied)?
+            .into();
+        queue.permission_set_refs =
+            serde_json::from_value(self.metadata["permission_set_refs"].clone())?;
+        queue.trace_tag_template =
+            serde_json::from_value(self.metadata["trace_tag_template"].clone())?;
+        queue.batch_mode = serde_json::from_value(
+            self.metadata
+                .get("batch_mode")
+                .cloned()
+                .ok_or_else(denied)?,
+        )?;
+        Ok(queue)
+    }
     pub fn id(&self) -> Id {
         self.sealed.binding.id
     }
@@ -84,12 +149,25 @@ impl QueueConfigurationInput {
         crate::runtime_authority::BoundRuntimeTarget,
     )> {
         use crate::secret_provenance::SecretOrigin;
+        if path == "$queue_input" {
+            return Ok((
+                Value::Null,
+                Vec::new(),
+                crate::runtime_authority::BoundRuntimeTarget {
+                    kind: "queue".into(),
+                    id: self.sealed.binding.queue,
+                    pack_id: Some(self.sealed.binding.pack),
+                    owner_type: None,
+                    owner_id: None,
+                },
+            ));
+        }
         for (reference, origin) in &self.sealed.binding.keys {
             let root = format!(
                 "/keystore/{}",
                 reference.replace('~', "~0").replace('/', "~1")
             );
-            if let Some(suffix) = crate::secret_values::pointer_suffix(&root, path) {
+            if let Some(suffix) = crate::secret_values::pointer_suffix(path, &root) {
                 let value = self.sealed.keys[reference]
                     .pointer(&suffix)
                     .cloned()
@@ -107,7 +185,7 @@ impl QueueConfigurationInput {
             }
         }
         for root in ["/config", "/pack/config"] {
-            if let Some(suffix) = crate::secret_values::pointer_suffix(root, path) {
+            if let Some(suffix) = crate::secret_values::pointer_suffix(path, root) {
                 let value = self
                     .sealed
                     .configuration
@@ -153,6 +231,73 @@ impl QueueConfigurationInput {
 
 pub struct QueueConfigurationInputRepository;
 impl QueueConfigurationInputRepository {
+    pub(in crate::repositories) async fn authenticate_record(
+        conn: &mut PgConnection,
+        id: Id,
+        master: &str,
+    ) -> Result<()> {
+        let row:Value=sqlx::query_scalar("SELECT jsonb_build_object('id',id,'item',item,'policy_revision',policy_revision,'configuration_revision',configuration_revision,'binding',binding,'binding_digest',binding_digest,'encrypted_context',encrypted_context,'encryption_key_hash',encryption_key_hash) FROM work_queue_item_configuration_input WHERE id=$1 FOR SHARE")
+            .bind(id).fetch_optional(conn).await?.ok_or_else(denied)?;
+        authenticate_stored(&row, master)
+    }
+    pub(in crate::repositories) async fn cohort_identity(
+        conn: &mut PgConnection,
+        id: Id,
+    ) -> Result<String> {
+        let (body,expected):(Value,String)=sqlx::query_as("SELECT binding,binding_digest FROM work_queue_item_configuration_input WHERE id=$1 FOR SHARE")
+            .bind(id).fetch_optional(&mut *conn).await?.ok_or_else(denied)?;
+        if hash(&body)? != expected {
+            return Err(denied());
+        }
+        // Key versions hash their stored ciphertext plus qualified origin, never
+        // decrypted secret values. This is grouping, never authorization.
+        hash(
+            &json!({"policy":body["policy"],"configuration":body["configuration"],"template":body["template_digest"],
+            "schema":body["item_schema_digest"],"keys":body["key_versions"]}),
+        )
+    }
+    pub(in crate::repositories) async fn validate_item_binding(
+        conn: &mut PgConnection,
+        id: Id,
+        item: Id,
+        authority: &crate::runtime_authority::SelectedRuntimeAuthority,
+        executable: &ExecutionExecutableSnapshot,
+        schema: &ActionSchemaBinding,
+        payload_schema: &crate::value_schema::ValueSchemaBinding,
+        contributors: &[(String, Value, String)],
+    ) -> Result<()> {
+        let (owner,policy,configuration,body,expected):(Id,Id,Option<Id>,Value,String)=sqlx::query_as("SELECT item,policy_revision,configuration_revision,binding,binding_digest FROM work_queue_item_configuration_input WHERE id=$1 FOR SHARE")
+            .bind(id).fetch_optional(&mut *conn).await?.ok_or_else(denied)?;
+        if hash(&body)? != expected {
+            return Err(denied());
+        }
+        let binding: Binding = serde_json::from_value(body)?;
+        let mut digests = BTreeMap::new();
+        for (name, body, expected) in contributors {
+            super::recorded_input_authority::RecordedInputAuthorityRepository::from_manifest(
+                body, expected,
+            )?;
+            if digests.insert(name.clone(), expected.clone()).is_some() {
+                return Err(denied());
+            }
+        }
+        if binding.id != id
+            || owner != item
+            || binding.item != item
+            || binding.policy != policy
+            || binding.configuration != configuration
+            || binding.authority != *authority
+            || digests.is_empty()
+            || binding.contributor_digests != digests
+            || binding.authority_digest != hash(&serde_json::to_value(authority)?)?
+            || binding.executable_digest != hash(&serde_json::to_value(executable)?)?
+            || binding.schema != *schema
+            || binding.item_schema_digest != hash(&serde_json::to_value(payload_schema)?)?
+        {
+            return Err(denied());
+        }
+        Ok(())
+    }
     /// Exclusive graph admission must precede any source locks. The graph gate
     /// serializes receipt attachment against reclamation; the FK independently
     /// protects every retained receipt, including receipts for deleted items.
@@ -167,6 +312,7 @@ impl QueueConfigurationInputRepository {
             "WITH candidates AS (SELECT q.id FROM work_queue_item_configuration_input q \
              WHERE NOT EXISTS(SELECT 1 FROM work_queue_item i WHERE i.id=q.item) \
                AND NOT EXISTS(SELECT 1 FROM runtime_input_queue_configuration_reference r WHERE r.input=q.id) \
+               AND NOT EXISTS(SELECT 1 FROM runtime_accepted_batch_item batch WHERE batch.configuration_input=q.id) \
                AND NOT file_evidence_pinned('work_queue_item_configuration_input',q.id) \
              ORDER BY q.id LIMIT $1 FOR UPDATE SKIP LOCKED) \
              DELETE FROM work_queue_item_configuration_input q USING candidates c WHERE q.id=c.id RETURNING q.id",
@@ -195,6 +341,20 @@ impl QueueConfigurationInputRepository {
         authenticate_stored(&row, master)?;
         let sealed: Sealed =
             serde_json::from_value(crypto::decrypt_json(&row["encrypted_context"], master)?)?;
+        let (accepted_body,accepted_hash,fixed):(Value,String,Option<Id>)=sqlx::query_as("SELECT proof,proof_digest,configuration_input FROM runtime_accepted_batch_item WHERE admission=$1 AND item=$2 FOR SHARE")
+            .bind(source.id).bind(sealed.binding.item).fetch_optional(&mut *conn).await?.ok_or_else(denied)?;
+        if hash(&accepted_body)? != accepted_hash
+            || fixed != Some(input)
+            || accepted_body.get("authority")
+                != Some(&serde_json::to_value(&sealed.binding.authority)?)
+        {
+            return Err(denied());
+        }
+        let first:Option<Id>=sqlx::query_scalar("SELECT configuration_input FROM runtime_accepted_batch_item WHERE admission=$1 AND proof->'queue_payload'->>'ordinal'='0'")
+            .bind(source.id).fetch_optional(&mut *conn).await?.flatten();
+        if first != Some(input) {
+            return Err(denied());
+        }
         let accepted = &sealed.binding.authority;
         let renderer = &source.authority;
         if sealed.binding.id != input
@@ -260,7 +420,16 @@ impl QueueConfigurationInputRepository {
             }
         }
         fence.ensure_fresh_on(conn).await?;
-        Ok(QueueConfigurationInput { sealed, fence })
+        let metadata:Value = sqlx::query_scalar("SELECT metadata FROM managed_dispatch_metadata_revision WHERE policy_revision=$1 AND component_kind='queues' AND component_id=$2")
+            .bind(sealed.binding.policy).bind(sealed.binding.queue).fetch_optional(&mut *conn).await?.ok_or_else(denied)?;
+        if hash(&metadata)? != sealed.binding.template_digest {
+            return Err(denied());
+        }
+        Ok(QueueConfigurationInput {
+            sealed,
+            fence,
+            metadata,
+        })
     }
 
     /// Capture only during ORIGINAL item/admission creation. Repeating this call
@@ -333,6 +502,12 @@ impl QueueConfigurationInputRepository {
             if target.pack_id() != Some(binding.pack) {
                 return Err(denied());
             }
+            binding.key_versions.insert(
+                reference.clone(),
+                hash(
+                    &json!({"origin":crate::key_access::key_origin(&key),"stored_value":key.value}),
+                )?,
+            );
             binding.key_targets.insert(
                 reference.clone(),
                 crate::runtime_authority::BoundRuntimeTarget {
@@ -380,6 +555,7 @@ impl QueueConfigurationInputRepository {
         Ok(QueueConfigurationInput {
             sealed,
             fence: selected.effect_fence().clone(),
+            metadata,
         })
     }
 
@@ -410,12 +586,13 @@ impl QueueConfigurationInputRepository {
         {
             return Err(denied());
         }
-        let (mut actual, _) = binding(conn, queue, item, snapshot, policy).await?;
+        let (mut actual, metadata) = binding(conn, queue, item, snapshot, policy).await?;
         actual.id = id;
         actual.configuration = sealed.binding.configuration;
         actual.configuration_digest = sealed.binding.configuration_digest.clone();
         actual.keys = sealed.binding.keys.clone();
         actual.key_targets = sealed.binding.key_targets.clone();
+        actual.key_versions = sealed.binding.key_versions.clone();
         if actual != sealed.binding || sealed.keys.keys().ne(sealed.binding.keys.keys()) {
             return Err(denied());
         }
@@ -437,6 +614,7 @@ impl QueueConfigurationInputRepository {
         Ok(QueueConfigurationInput {
             sealed,
             fence: selected.effect_fence().clone(),
+            metadata,
         })
     }
 }
@@ -494,6 +672,20 @@ async fn binding(
             .1,
         );
     }
+    let contributors:Vec<(String,Value,String)>=sqlx::query_as("SELECT contributor,authority,authority_digest FROM (SELECT ''::TEXT AS contributor,authority,authority_digest FROM recorded_execution_input_authority WHERE owner_kind='queue_item' AND owner_id=$1 UNION ALL SELECT contributor,authority,authority_digest FROM recorded_queue_item_input WHERE item=$1) roots ORDER BY contributor")
+        .bind(item.id).fetch_all(&mut *conn).await?;
+    let mut contributor_digests = BTreeMap::new();
+    if contributors.is_empty() || contributors.len() > 256 {
+        return Err(denied());
+    }
+    for (name, body, expected) in contributors {
+        super::recorded_input_authority::RecordedInputAuthorityRepository::from_manifest(
+            &body, &expected,
+        )?;
+        if contributor_digests.insert(name, expected).is_some() {
+            return Err(denied());
+        }
+    }
     let schema = SchemaContractRepository::materialize_action_pair(conn, snapshot).await?;
     Ok((
         Binding {
@@ -504,6 +696,7 @@ async fn binding(
             policy,
             authority_digest,
             authority: admitted,
+            contributor_digests,
             executable_digest: hash(&serde_json::to_value(snapshot)?)?,
             item_schema_digest: hash(&item.schema_binding.clone().ok_or_else(denied)?)?,
             template_digest,
@@ -513,6 +706,7 @@ async fn binding(
             declarations,
             keys: BTreeMap::new(),
             key_targets: BTreeMap::new(),
+            key_versions: BTreeMap::new(),
             schema,
         },
         metadata,
@@ -543,6 +737,7 @@ pub(in crate::repositories) fn authenticate_stored(row: &Value, master: &str) ->
         return Err(denied());
     }
     if hash(&serde_json::to_value(&sealed.binding.authority)?)? != sealed.binding.authority_digest
+        || sealed.binding.contributor_digests.is_empty()
         || sealed.binding.id <= 0
         || sealed.binding.item <= 0
         || sealed.binding.authority.policy_id != sealed.binding.policy

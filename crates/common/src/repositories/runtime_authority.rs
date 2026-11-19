@@ -1379,7 +1379,18 @@ impl RuntimeAuthorityRepository {
         target: Id,
     ) -> Result<()> {
         let source = Self::require_retained_admission(connection, source).await?;
-        let target = Self::require_retained_admission(connection, target).await?;
+        let target: RuntimeAdmissionRecord = sqlx::query_as(&format!(
+            "SELECT {ADMISSION_COLUMNS} FROM runtime_authority_admission WHERE id=$1 FOR SHARE"
+        ))
+        .bind(target)
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(|| Error::PermissionDenied("Retry target admission is unavailable".into()))?;
+        super::accepted_batch_dependency::AcceptedBatchDependencyRepository::copy_inherited(
+            connection, &source, &target,
+        )
+        .await?;
+        let target = Self::require_retained_admission(connection, target.id).await?;
         let mut expected = source.authority.0.clone();
         expected.attempt = target.authority.attempt;
         if source.id >= target.id || expected != target.authority.0 {

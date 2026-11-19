@@ -1990,6 +1990,9 @@ impl WorkQueueItemRepository {
                        pack_release,
                        pack_release_digest,
                        executable_snapshot,
+                       (SELECT jsonb_build_object('policy',fixed.policy_revision,'config',fixed.configuration_revision,
+                           'template',fixed.binding->'template_digest','schema',fixed.binding->'item_schema_digest',
+                           'keys',fixed.binding->'key_versions') FROM work_queue_item_configuration_input fixed WHERE fixed.item=work_queue_item.id) AS fixed_configuration,
                        payload #> $7::text[] AS group_value
                 FROM work_queue_item
                 WHERE queue = $1
@@ -2011,6 +2014,10 @@ impl WorkQueueItemRepository {
                   AND item.pack_release IS NOT DISTINCT FROM anchor.pack_release
                   AND item.pack_release_digest IS NOT DISTINCT FROM anchor.pack_release_digest
                   AND item.executable_snapshot IS NOT DISTINCT FROM anchor.executable_snapshot
+                  AND (SELECT jsonb_build_object('policy',fixed.policy_revision,'config',fixed.configuration_revision,
+                           'template',fixed.binding->'template_digest','schema',fixed.binding->'item_schema_digest',
+                           'keys',fixed.binding->'key_versions') FROM work_queue_item_configuration_input fixed WHERE fixed.item=item.id)
+                      IS NOT DISTINCT FROM anchor.fixed_configuration
                   AND (
                         $8 = false
                         OR anchor.group_value IS NULL

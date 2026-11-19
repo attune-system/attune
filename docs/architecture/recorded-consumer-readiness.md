@@ -55,13 +55,39 @@ Restoration must preserve three distinct proofs:
    a credential parameter does not grant Key API access. Protected completion,
    acknowledgements, retries and leases retain their existing attempt fences.
 
-Current recorded dispatch instead resolves pack configuration and referenced
-Keys against all item contributors. That path cannot implement the first proof
-and rejects legitimate enqueue-only contributors. Accepted input receipts and
-worker origin validation also consume contributor evidence, so changing only the
-dispatch resolver is insufficient. Queue-owned configuration delivery needs its
-own exact binding through acceptance, receipt sealing, worker restoration and
-retry, without broadening contributor or runtime API grants.
+The non-activation implementation keeps fixed input material in the canonical
+v1 `work_queue_item_configuration_input` owning record. Its stable ID and exact
+item/queue/policy/configuration, target/schema, declaration and owner-qualified
+Key bindings are also authenticated inside its encrypted envelope. Key value or
+configuration drift does not select new bytes for historical items. Applicable
+policy and runtime-owner revocation still denies new effects. Record-dependent
+Key selectors are rejected deterministically at admission.
+
+Managed dispatch has an explicit Queue branch in the existing canonical v1
+`runtime_accepted_batch_manifest` / `runtime_accepted_batch_item` records. Each
+member retains its own fixed-input reference, independently captured contributor
+manifests, original payload/schema and encrypted protected payload fields.
+Canonical validation requires exact membership, execution attachment, unique
+dense member ordinals and a compatible admitted configuration cohort. The Action
+branch retains its separate invariants. Typed render selections preserve each
+member's provenance; a fixed-input receipt never supplies contributor or runtime
+API grants. Queue-authored sites require their exact fixed-input ID, including
+record-only expressions; missing bindings cannot fall back to nonqueue reads.
+
+Retries copy the accepted manifest and ciphertext. Original item IDs remain
+retained source references rather than lifetime owners. Owning fixed inputs can
+be reclaimed only after their original item, receipt references, accepted batch
+references and file-evidence pins are gone, under exclusive graph admission.
+Configuration and policy evidence remains retained independently of active
+authority. File-evidence closure and offline encryption authentication include
+the owning inputs and accepted manifests.
+
+This remains work in progress under disabled readiness gates. Contract fixtures
+cover slices of the binding, not coordinated consumer readiness. Protected
+contributor origins beyond locally supplied schema/queue-item payload fields,
+malformed-proof and concurrent lifecycle coverage, complete affected-consumer
+validation and SQLx preparation remain restoration requirements. Existing live
+contributor credential resolution is not a substitute for these proofs.
 
 Positive restoration evidence requires real publication/admission through
 terminal item acknowledgement, including mixed enqueue-only contributors,

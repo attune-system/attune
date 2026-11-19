@@ -105,6 +105,7 @@ impl InheritedInputRepository {
             let archive = if mixed_budget.is_some() {
                 let archive = PreparedReceiptArchive::new(
                     &RenderProof {
+                        queue_projection: None,
                         native: rendered.native.clone(),
                         site,
                         renderer: rendered.renderer.id,
@@ -134,6 +135,7 @@ impl InheritedInputRepository {
         let mixed_root = if let Some(budget) = &mixed_budget {
             let archive = PreparedReceiptArchive::new(
                 &RenderProof {
+                    queue_projection: None,
                     native: Some(NativeValueRecipe::OrdinarySuccess { snapshot: Id::MAX }),
                     site: InputSite {
                         execution: state.execution(),
@@ -236,6 +238,7 @@ impl InheritedInputRepository {
         let transaction = super::transaction(conn).await?;
         let fence = prepared.source.fence().clone();
         let rendered = RenderedReceiptContext {
+            queue_projection: None,
             transaction: transaction.clone(),
             renderer: renderer.clone(),
             declaration: None,
@@ -326,6 +329,7 @@ impl InheritedInputRepository {
                 // maximum-width ID. The held value ciphertext is unchanged.
                 let mut archive = archive.clone();
                 archive.body = serde_json::to_value(RenderProof {
+                    queue_projection: None,
                     native: rendered.native.clone(),
                     site: destination.site.clone(),
                     renderer: renderer.id,

@@ -107,7 +107,7 @@ async fn convert_locked(
         .execute(&mut *conn)
         .await?;
     // Forward-added owning store; follows the existing conversion-wide lock.
-    sqlx::query("LOCK TABLE work_queue_item_configuration_input IN ACCESS EXCLUSIVE MODE")
+    sqlx::query("LOCK TABLE work_queue_item_configuration_input, runtime_accepted_batch_item IN ACCESS EXCLUSIVE MODE")
         .execute(&mut *conn)
         .await?;
     let before = integrity::validate(conn).await?;

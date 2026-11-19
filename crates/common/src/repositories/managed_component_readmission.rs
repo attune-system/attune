@@ -26,7 +26,7 @@ impl ManagedComponentReadmission {
         let query = if kind == "rules" {
             "SELECT jsonb_build_object('rule_id',id,'rule_ref',ref,'pack_ref',pack_ref,'action',action,'action_ref',action_ref,'trigger',trigger,'trigger_ref',trigger_ref,'sensor_id',(SELECT sensor FROM trigger WHERE trigger.id = rule.trigger),'sensor_worker_selector',sensor_worker_selector,'sensor_worker_tolerations',sensor_worker_tolerations,'sensor_worker_affinity',sensor_worker_affinity,'conditions',conditions,'action_params',action_params,'trigger_params',trigger_params,'permission_set_refs',permission_set_refs,'trace_tag_template',trace_tag_template) FROM rule WHERE ref = $1 AND pack = $2 AND management_origin = 'pack' AND retired_at IS NULL FOR SHARE"
         } else {
-            "SELECT jsonb_build_object('action_params',action_params,'dispatch_action',dispatch_action,'dispatch_action_ref',dispatch_action_ref,'permission_set_refs',permission_set_refs,'item_schema',item_schema,'trace_tag_template',trace_tag_template,'config',config) FROM work_queue WHERE ref = $1 AND pack = $2 AND management_origin = 'pack' AND retired_at IS NULL FOR SHARE"
+            "SELECT jsonb_build_object('batch_mode',batch_mode,'action_params',action_params,'dispatch_action',dispatch_action,'dispatch_action_ref',dispatch_action_ref,'permission_set_refs',permission_set_refs,'item_schema',item_schema,'trace_tag_template',trace_tag_template,'config',config) FROM work_queue WHERE ref = $1 AND pack = $2 AND management_origin = 'pack' AND retired_at IS NULL FOR SHARE"
         };
         let mut body: Value = sqlx::query_scalar(query)
             .bind(reference)

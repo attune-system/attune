@@ -135,6 +135,7 @@ impl InheritedInputRepository {
             return Err(denied());
         }
         let source = RenderedReceiptContext {
+            queue_projection: None,
             result_reads: rendered.result_reads.clone(),
             empty_reads: rendered.empty_reads.clone(),
             wait_reads: rendered.wait_reads.clone(),

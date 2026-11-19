@@ -128,6 +128,9 @@ pub enum SelectionSource {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         queue_input: Option<Id>,
     },
+    QueueContributor {
+        item: Id,
+    },
     Inherited {
         receipt: Id,
         site: InputSite,
@@ -162,6 +165,7 @@ pub struct RenderSession {
     controls: Vec<ReadSelection>,
 }
 pub struct RenderedReceiptContext {
+    queue_projection: Option<String>,
     empty_reads: Vec<super::native_input_snapshot::empty_iteration::IssuedEmptyRead>,
     result_reads: Vec<super::native_input_snapshot::IssuedResultRead>,
     wait_reads: Vec<IssuedWaitRead>,
@@ -740,6 +744,8 @@ impl ReceiptContext {
 #[serde(deny_unknown_fields)]
 struct RenderProof {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    queue_projection: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     native: Option<NativeValueRecipe>,
     site: InputSite,
     renderer: Id,
@@ -1154,6 +1160,14 @@ impl InheritedInputRepository {
                     }
                     direct.insert(admission);
                 }
+                SelectionSource::QueueContributor { item } => {
+                    let exists:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM runtime_accepted_batch_item WHERE admission=$1 AND item=$2 AND configuration_input IS NOT NULL)")
+                        .bind(renderer).bind(item).fetch_one(&mut *conn).await?;
+                    if !exists {
+                        return Err(denied());
+                    }
+                    direct.insert(renderer);
+                }
                 SelectionSource::Authored {
                     origins: source, ..
                 } => {
@@ -1318,6 +1332,7 @@ impl InheritedInputRepository {
             return Err(denied());
         }
         let proof = RenderProof {
+            queue_projection: None,
             native: None,
             site: site.clone(),
             renderer: evidence.admission.id,
@@ -1795,6 +1810,7 @@ impl InheritedInputRepository {
             path,
         };
         let source = RenderedReceiptContext {
+            queue_projection: None,
             result_reads: rendered.result_reads.clone(),
             empty_reads: rendered.empty_reads.clone(),
             wait_reads: rendered.wait_reads.clone(),
@@ -2109,6 +2125,23 @@ impl InheritedInputRepository {
             )
             .await?;
         session.fence = session.fence.intersect(proof.fence());
+        let (_, origins, target) = proof.selection("$queue_input")?;
+        if session
+            .controls
+            .iter()
+            .any(|selection| selection.context_path == "$queue_input")
+        {
+            return Err(denied());
+        }
+        session.controls.push(ReadSelection {
+            context_path: "$queue_input".into(),
+            source: SelectionSource::Authored {
+                origins,
+                target: Some(target),
+                input_authority: None,
+                queue_input: Some(input),
+            },
+        });
         let mut paths = Vec::new();
         if session.permit.declaration.uses_pack_configuration() {
             paths.extend(["/config".to_owned(), "/pack/config".to_owned()]);
@@ -2134,6 +2167,41 @@ impl InheritedInputRepository {
                     queue_input: Some(input),
                 },
             )?;
+        }
+        Ok(())
+    }
+
+    pub async fn bind_queue_contributors(
+        conn: &mut PgConnection,
+        session: &mut RenderSession,
+        master: &str,
+    ) -> Result<()> {
+        require_transaction(conn, &session.transaction).await?;
+        if !session
+            .permit
+            .declaration
+            .source_path
+            .starts_with("/queue/")
+        {
+            return Err(denied());
+        }
+        let items = match &session.permit.source.authority.attribution {
+            crate::runtime_authority::RequestAttribution::QueueBatch { items, .. } => {
+                items.keys().copied().collect::<Vec<_>>()
+            }
+            _ => return Err(denied()),
+        };
+        for item in items {
+            let source=super::accepted_batch_dependency::AcceptedBatchDependencyRepository::contributor_source(conn,&session.permit.source,item,master).await?;
+            session.fence = session.fence.intersect(source.fence());
+            for (path, value) in source.roots()? {
+                insert(
+                    session,
+                    path,
+                    value,
+                    SelectionSource::QueueContributor { item },
+                )?;
+            }
         }
         Ok(())
     }
@@ -2594,9 +2662,47 @@ impl InheritedInputRepository {
         require_transaction(conn, &session.transaction).await?;
         let context = TraceContext {
             values: &session.values,
+            queue_members: queue_members(&session.permit.source),
         };
         let (value, fields) = render(&session.permit.declaration.expression, &context)?;
         Self::finish_render(conn, session, value, fields).await
+    }
+
+    pub async fn project_queue_render(
+        conn: &mut PgConnection,
+        rendered: &RenderedReceiptContext,
+        suffix: &str,
+    ) -> Result<RenderedReceiptContext> {
+        require_transaction(conn, &rendered.transaction).await?;
+        if rendered.native.is_some()
+            || rendered.literal.is_some()
+            || rendered.queue_projection.is_some()
+            || !suffix.starts_with('/')
+        {
+            return Err(denied());
+        }
+        let declaration =
+            authored_declaration(conn, &rendered.renderer, rendered.declaration).await?;
+        require_queue_marker(&declaration, &rendered.selections)?;
+        if !declaration.source_path.starts_with("/queue/") {
+            return Err(denied());
+        }
+        let value = rendered.value.pointer(suffix).cloned().ok_or_else(denied)?;
+        Ok(RenderedReceiptContext {
+            queue_projection: Some(suffix.into()),
+            result_reads: rendered.result_reads.clone(),
+            empty_reads: rendered.empty_reads.clone(),
+            wait_reads: rendered.wait_reads.clone(),
+            native: None,
+            transaction: rendered.transaction.clone(),
+            renderer: rendered.renderer.clone(),
+            declaration: rendered.declaration,
+            literal: None,
+            value,
+            selections: rendered.selections.clone(),
+            fence: rendered.fence.clone(),
+            purpose: rendered.purpose,
+        })
     }
 
     /// Apply the workflow condition's coercion to the single canonical evaluation.
@@ -2614,6 +2720,7 @@ impl InheritedInputRepository {
             &session.permit.declaration.expression,
             &TraceContext {
                 values: &session.values,
+                queue_members: queue_members(&session.permit.source),
             },
         )?;
         Self::finish_render(conn, session, value, fields).await
@@ -2688,12 +2795,14 @@ impl InheritedInputRepository {
             }
         }
         selections.extend(session.controls);
+        require_queue_marker(&session.permit.declaration, &selections)?;
         bounded(&value)?;
         if selections.len() > 256 {
             return Err(denied());
         }
         session.fence.ensure_fresh_on(conn).await?;
         Ok(RenderedReceiptContext {
+            queue_projection: None,
             result_reads: session.result_reads,
             empty_reads: session.empty_reads,
             wait_reads: session.wait_reads,
@@ -2760,6 +2869,7 @@ impl InheritedInputRepository {
         }
         fence.ensure_fresh_on(conn).await?;
         Ok(RenderedReceiptContext {
+            queue_projection: None,
             result_reads: Vec::new(),
             empty_reads: Vec::new(),
             wait_reads: Vec::new(),
@@ -2795,6 +2905,7 @@ impl InheritedInputRepository {
         let value = literal_value(conn, &source, &leaf).await?;
         fence.ensure_fresh_on(conn).await?;
         Ok(RenderedReceiptContext {
+            queue_projection: None,
             result_reads: Vec::new(),
             empty_reads: Vec::new(),
             wait_reads: Vec::new(),
@@ -3007,6 +3118,19 @@ impl InheritedInputRepository {
         if !related(conn, rendered.renderer.id, destination_admission.id).await? {
             return Err(denied());
         }
+        if rendered.declaration.is_some() {
+            let declaration =
+                authored_declaration(conn, &rendered.renderer, rendered.declaration).await?;
+            require_queue_marker(&declaration, &rendered.selections)?;
+            require_queue_destination(
+                &declaration,
+                rendered.queue_projection.as_deref(),
+                destination,
+                rendered.renderer.owner_id,
+            )?;
+        } else if rendered.queue_projection.is_some() {
+            return Err(denied());
+        }
         let mut fence = rendered.fence.intersect(&deadline);
         let mut origins = Vec::new();
         let mut public_sources = Vec::new();
@@ -3217,6 +3341,16 @@ impl InheritedInputRepository {
                         entity_id: *execution,
                         path: String::new(),
                     }]
+                }
+                SelectionSource::QueueContributor { item } => {
+                    let declaration =
+                        authored_declaration(conn, &rendered.renderer, rendered.declaration)
+                            .await?;
+                    require_queue_marker(&declaration, &rendered.selections)?;
+                    let source=super::accepted_batch_dependency::AcceptedBatchDependencyRepository::contributor_source(conn,&rendered.renderer,*item,encryption_key).await?;
+                    let (_, origins) = source.selection(&selected.context_path)?;
+                    fence = fence.intersect(source.fence());
+                    origins
                 }
                 SelectionSource::Authored {
                     origins,
@@ -3517,6 +3651,7 @@ impl InheritedInputRepository {
         prepared.fence.ensure_fresh_on(conn).await?;
         rendered.fence.ensure_fresh_on(conn).await?;
         let proof = RenderProof {
+            queue_projection: rendered.queue_projection.clone(),
             native: rendered.native.clone(),
             site: destination.clone(),
             renderer: rendered.renderer.id,
@@ -3842,6 +3977,9 @@ impl InheritedInputRepository {
                 return Err(denied());
             }
             let proof: RenderProof = serde_json::from_value(body)?;
+            if proof.queue_projection.is_some() && proof.declaration.is_none() {
+                return Err(denied());
+            }
             visited.insert(id, proof.site.clone());
             if expected_site
                 .as_ref()
@@ -3877,6 +4015,12 @@ impl InheritedInputRepository {
                 let declaration = serde_json::from_value(body)?;
                 DeclaredInputRepository::validate_declaration(conn, &renderer_record, &declaration)
                     .await?;
+                require_queue_destination(
+                    &declaration,
+                    proof.queue_projection.as_deref(),
+                    &proof.site,
+                    renderer_record.owner_id,
+                )?;
                 Some(declaration)
             } else if let Some(accepted) = proof.accepted {
                 if proof.literal.is_some() || !proof.selections.is_empty() || proof.native.is_some()
@@ -3988,6 +4132,9 @@ impl InheritedInputRepository {
                 }
                 expected_sources.insert(source);
                 pending.push((source, Some(site)));
+            }
+            if let Some(declaration) = declaration.as_ref() {
+                require_queue_marker(declaration, &proof.selections)?;
             }
             let mut expected_queue_inputs = BTreeSet::new();
             let mut expected_admissions = BTreeSet::new();
@@ -4229,6 +4376,20 @@ impl InheritedInputRepository {
                         };
                         if !origins.contains(&origin) {
                             origins.push(origin);
+                        }
+                    }
+                    SelectionSource::QueueContributor { item } => {
+                        let declaration = declaration.as_ref().ok_or_else(denied)?;
+                        if !declaration.source_path.starts_with("/queue/") {
+                            return Err(denied());
+                        }
+                        let source=super::accepted_batch_dependency::AcceptedBatchDependencyRepository::contributor_source(conn,&renderer_record,item,encryption_key).await?;
+                        let (_, source_origins) = source.selection(&selected.context_path)?;
+                        fence = Some(fence.ok_or_else(denied)?.intersect(source.fence()));
+                        for origin in source_origins {
+                            if !origins.contains(&origin) {
+                                origins.push(origin);
+                            }
                         }
                     }
                     SelectionSource::Authored {
@@ -4703,6 +4864,20 @@ fn retained_source_receipts(
 
 struct TraceContext<'a> {
     values: &'a [BoundValue],
+    queue_members: Option<
+        &'a std::collections::BTreeMap<Id, Option<crate::runtime_authority::HumanAttribution>>,
+    >,
+}
+fn queue_members(
+    record: &RuntimeAdmissionRecord,
+) -> Option<&std::collections::BTreeMap<Id, Option<crate::runtime_authority::HumanAttribution>>> {
+    match (&record.authority.binding, &record.authority.attribution) {
+        (
+            crate::runtime_authority::InvocationBinding::Queue { .. },
+            crate::runtime_authority::RequestAttribution::QueueBatch { items, .. },
+        ) => Some(items),
+        _ => None,
+    }
 }
 
 struct LoadingContext<'a> {
@@ -4733,7 +4908,11 @@ fn source_evaluation_result<T>(evaluated: Result<T>, source_error: Option<Error>
 }
 impl AsyncEvalContext for LoadingContext<'_> {
     fn workflow_function_source(&self, name: &str, args: &[Value]) -> Option<SelectedField> {
-        TraceContext { values: &[] }.workflow_function_source(name, args)
+        TraceContext {
+            values: &[],
+            queue_members: None,
+        }
+        .workflow_function_source(name, args)
     }
     fn resolve_variable<'a>(
         &'a self,
@@ -4743,6 +4922,7 @@ impl AsyncEvalContext for LoadingContext<'_> {
             let state = self.state.lock().await;
             let context = TraceContext {
                 values: &state.1.values,
+                queue_members: queue_members(&state.1.permit.source),
             };
             if name == "keystore"
                 && !state
@@ -4765,6 +4945,7 @@ impl AsyncEvalContext for LoadingContext<'_> {
             let state = self.state.lock().await;
             TraceContext {
                 values: &state.1.values,
+                queue_members: queue_members(&state.1.permit.source),
             }
             .call_workflow_function(name, args)
         })
@@ -4816,6 +4997,53 @@ impl EvalContext for TraceContext<'_> {
     }
     fn resolve_variable(&self, name: &str) -> EvalResult<Value> {
         let path = format!("/{}", escape(name));
+        // Queue members are explicitly typed arrays. Do not infer array shape
+        // from arbitrary numeric object keys in the generic receipt context.
+        if matches!(name, "items" | "queue_items") && self.queue_members.is_some() {
+            let expected = self.queue_members.unwrap();
+            if expected.is_empty() || expected.len() > 256 {
+                return Err(EvalError::TypeError(
+                    "Invalid admitted queue membership".into(),
+                ));
+            }
+            let mut members = std::collections::BTreeMap::new();
+            let mut sources = BTreeSet::new();
+            for bound in self
+                .values
+                .iter()
+                .filter(|bound| overlaps(&bound.path, &path))
+            {
+                let index = bound
+                    .path
+                    .strip_prefix(&format!("{path}/"))
+                    .and_then(|index| {
+                        index
+                            .parse::<usize>()
+                            .ok()
+                            .filter(|parsed| parsed.to_string() == index)
+                    });
+                let member = match &bound.source {
+                    SelectionSource::QueueContributor { item } => Some(*item),
+                    _ => None,
+                };
+                if member.is_none_or(|item| !expected.contains_key(&item) || !sources.insert(item))
+                    || index.is_none_or(|index| index >= expected.len())
+                    || members
+                        .insert(index.unwrap_or(256), bound.value.clone())
+                        .is_some()
+                {
+                    return Err(EvalError::TypeError(
+                        "Invalid admitted queue member array".into(),
+                    ));
+                }
+            }
+            if members.len() != expected.len() || members.keys().copied().ne(0..expected.len()) {
+                return Err(EvalError::TypeError(
+                    "Incomplete admitted queue member array".into(),
+                ));
+            }
+            return Ok(Value::Array(members.into_values().collect()));
+        }
         let mut root = json!({});
         for value in self
             .values
@@ -5064,6 +5292,65 @@ fn insert(
     });
     Ok(())
 }
+fn require_queue_destination(
+    declaration: &super::declared_input::DeclaredInputBinding,
+    projection: Option<&str>,
+    site: &InputSite,
+    renderer: Id,
+) -> Result<()> {
+    let Some(path) = declaration.source_path.strip_prefix("/queue/action_params") else {
+        return if projection.is_none() {
+            Ok(())
+        } else {
+            Err(denied())
+        };
+    };
+    let suffix = projection.unwrap_or("");
+    if (!suffix.is_empty() && !suffix.starts_with('/'))
+        || site.execution != renderer
+        || site.kind != InputEntityKind::ExecutionConfig
+        || site.purpose != InputSitePurpose::Value
+        || site.path != format!("{path}{suffix}")
+    {
+        return Err(denied());
+    }
+    check_site(site)
+}
+
+fn require_queue_marker(
+    declaration: &super::declared_input::DeclaredInputBinding,
+    selections: &[ReadSelection],
+) -> Result<()> {
+    let markers = selections
+        .iter()
+        .filter(|selection| selection.context_path == "$queue_input")
+        .collect::<Vec<_>>();
+    if !declaration.source_path.starts_with("/queue/") {
+        return if markers.is_empty() {
+            Ok(())
+        } else {
+            Err(denied())
+        };
+    }
+    let [marker] = markers.as_slice() else {
+        return Err(Error::PermissionDenied(
+            "Queue-authored site requires one exact queue_input marker".into(),
+        ));
+    };
+    match &marker.source {
+        SelectionSource::Authored {
+            origins,
+            target: Some(target),
+            input_authority: None,
+            queue_input: Some(input),
+        } if origins.is_empty() && target.kind == "queue" && *input > 0 => {
+            if selections.iter().any(|source|matches!(&source.source,SelectionSource::Authored {queue_input:other,..} if *other!=Some(*input))) {return Err(denied());}
+            Ok(())
+        }
+        _ => Err(denied()),
+    }
+}
+
 fn require_queue_input_id(
     declaration: &super::declared_input::DeclaredInputBinding,
     input: Option<Id>,
@@ -6027,7 +6314,14 @@ mod tests {
             value: json!(true),
             source: source.clone(),
         }];
-        let (value, fields) = render("succeeded()", &TraceContext { values: &values }).unwrap();
+        let (value, fields) = render(
+            "succeeded()",
+            &TraceContext {
+                values: &values,
+                queue_members: None,
+            },
+        )
+        .unwrap();
         assert_eq!(value, json!(true));
         assert_eq!(
             selected_sources(&values, &fields).unwrap(),
@@ -6098,7 +6392,10 @@ mod tests {
         let values = vec![parameter("/supplied", literal.clone())];
         let (value, fields) = render(
             "{{ parameters.supplied }}",
-            &TraceContext { values: &values },
+            &TraceContext {
+                values: &values,
+                queue_members: None,
+            },
         )
         .unwrap();
         assert_eq!(value, literal);
@@ -6121,7 +6418,10 @@ mod tests {
         ];
         let (value, fields) = render(
             "{{ upper(parameters.map[parameters.selector]) + parameters.suffix }}",
-            &TraceContext { values: &values },
+            &TraceContext {
+                values: &values,
+                queue_members: None,
+            },
         )
         .unwrap();
         assert_eq!(value, json!("ONE!"));
@@ -6142,14 +6442,20 @@ mod tests {
         let values = vec![parameter("/items", json!(["a", "b"]))];
         let (value, fields) = render(
             "{{ true or parameters.unavailable }}",
-            &TraceContext { values: &values },
+            &TraceContext {
+                values: &values,
+                queue_members: None,
+            },
         )
         .unwrap();
         assert_eq!(value, json!(true));
         assert!(fields.is_empty());
         let (value, fields) = render(
             "{{ parameters.items[-1] }}",
-            &TraceContext { values: &values },
+            &TraceContext {
+                values: &values,
+                queue_members: None,
+            },
         )
         .unwrap();
         assert_eq!(value, json!("b"));
@@ -6244,7 +6550,10 @@ mod tests {
         ];
         let (value, fields) = render(
             "{{ item.token + string(index) }}",
-            &TraceContext { values: &values },
+            &TraceContext {
+                values: &values,
+                queue_members: None,
+            },
         )
         .unwrap();
         assert_eq!(value, json!("second1"));

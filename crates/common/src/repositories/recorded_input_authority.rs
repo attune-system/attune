@@ -47,6 +47,24 @@ fn valid_input(authority: &InputAuthority) -> bool {
 }
 
 impl RecordedInputAuthorityRepository {
+    /// Decode only a genuinely captured, digest-bound input manifest. This
+    /// never reloads IAM or unions independently captured contributor grants.
+    pub(in crate::repositories) fn from_manifest(
+        body: &serde_json::Value,
+        expected: &str,
+    ) -> Result<DelegationAuthority> {
+        let snapshot: InputAuthority = serde_json::from_value(body.clone())?;
+        if !valid_input(&snapshot) || Self::digest(&snapshot)? != expected {
+            return Err(Error::PermissionDenied(
+                "Accepted queue contributor manifest is invalid".into(),
+            ));
+        }
+        Ok(DelegationAuthority::new(
+            snapshot.identity_id,
+            snapshot.attributes,
+            snapshot.grants,
+        ))
+    }
     pub async fn key_origin_allowed(
         connection: &mut PgConnection,
         authority: &DelegationAuthority,

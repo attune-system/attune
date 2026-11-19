@@ -2326,6 +2326,20 @@ impl FileEvidenceRetentionRepository {
             c.proof(&contract, 0)?;
         }
         if node.kind == "runtime_authority_admission" {
+            let batches=super::accepted_batch_dependency::AcceptedBatchDependencyRepository::retention_evidence(conn,node.id).await?;
+            c.rows(batches.len())?;
+            for batch in batches {
+                c.charge_bytes(batch.bytes)?;
+                c.push("pack_runtime_policy_revision", batch.policy, depth + 1)?;
+                if let Some(source) = batch.source {
+                    c.push("runtime_authority_admission", source, depth + 1)?;
+                }
+                if let Some(input) = batch.input {
+                    c.push("work_queue_item_configuration_input", input, depth + 1)?;
+                }
+                c.proof(&batch.schema, 0)?;
+                c.proof(&batch.executable, 0)?;
+            }
             // A purpose proof retains admissions independently of raw source
             // executions. Only C's actual entity/target origins pin raw rows.
             let parents:Vec<i64>=sqlx::query_scalar("SELECT dependency FROM runtime_admission_dependency WHERE admission=$1 ORDER BY dependency LIMIT 257")

@@ -2072,6 +2072,12 @@ async fn enqueue_queue_item_in_transaction(
     } else {
         attune_common::repositories::delegated_execution::DelegatedExecutionRepository::accept_queue_item(connection,queue,&item,&snapshot).await?;
     }
+    if !queue.is_adhoc {
+        attune_common::repositories::queue_configuration_input::QueueConfigurationInputRepository::capture(
+            connection, queue, &item, &snapshot,
+            state.config.security.encryption_key.as_deref().ok_or_else(|| ApiError::Forbidden("Managed queue fixed-input encryption is unavailable".into()))?,
+        ).await?;
+    }
     attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::replace_entity_with_conn(
         &mut *connection, attune_common::secret_values::ENTITY_QUEUE_ITEM_PAYLOAD, item.id, &secrets,
     ).await?;
