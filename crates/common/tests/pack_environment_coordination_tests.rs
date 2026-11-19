@@ -916,3 +916,138 @@ async fn native_setup_worker_revoke_restore_never_restores_reservation() {
     drop(manager);
     pool.cleanup().await.unwrap();
 }
+
+#[tokio::test]
+async fn native_setup_never_submitted_tombstone_settles_without_provider_absence() {
+    use attune_common::repositories::{
+        execution_process::ExecutionProcessRepository as Effects,
+        pack_environment_process::PackEnvironmentProcessRepository as Setup,
+    };
+    let (pool, claim, worker, instance, spec) = native_setup_fixture().await;
+    Setup::reserve(
+        &pool,
+        &claim,
+        worker.id,
+        instance,
+        &spec,
+        NATIVE_SETUP_PLAN,
+        NATIVE_SETUP_MASTER,
+    )
+    .await
+    .unwrap();
+    assert!(Setup::acknowledge_removed(&pool, spec.intent, None)
+        .await
+        .is_err());
+    Effects::request_stop(&pool, spec.intent).await.unwrap();
+    Setup::acknowledge_removed(&pool, spec.intent, None)
+        .await
+        .unwrap();
+    assert!(Setup::unsettled(&pool, claim.id, None, NATIVE_SETUP_MASTER)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        Setup::begin_create(&pool, spec.intent, NATIVE_SETUP_MASTER)
+            .await
+            .unwrap(),
+        attune_common::isolated_process::ProcessCreateDisposition::ReconcileOnly
+    );
+    assert!(Effects::retained_resource(&pool, spec.intent)
+        .await
+        .unwrap()
+        .is_none());
+    let reset =
+        sqlx::query("UPDATE execution_process_effect SET resource_removed=FALSE WHERE intent=$1")
+            .bind(spec.intent)
+            .execute(&*pool)
+            .await;
+    assert!(reset.is_err(), "cleanup acknowledgement was reversible");
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_setup_submitted_unknown_and_wrong_resource_never_acknowledge_removal() {
+    use attune_common::{
+        isolated_process::ResourceIdentity,
+        repositories::{
+            execution_process::ExecutionProcessRepository as Effects,
+            pack_environment_process::PackEnvironmentProcessRepository as Setup,
+        },
+        workload_launch::LaunchExitOutcome,
+    };
+    let (pool, claim, worker, instance, spec) = native_setup_fixture().await;
+    Setup::reserve(
+        &pool,
+        &claim,
+        worker.id,
+        instance,
+        &spec,
+        NATIVE_SETUP_PLAN,
+        NATIVE_SETUP_MASTER,
+    )
+    .await
+    .unwrap();
+    Setup::begin_create(&pool, spec.intent, NATIVE_SETUP_MASTER)
+        .await
+        .unwrap();
+    Effects::request_stop(&pool, spec.intent).await.unwrap();
+    assert!(Setup::acknowledge_removed(&pool, spec.intent, None)
+        .await
+        .is_err());
+    assert_eq!(
+        Setup::unsettled(&pool, claim.id, None, NATIVE_SETUP_MASTER)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let resource = ResourceIdentity::Kubernetes {
+        cluster: "owned".into(),
+        namespace: "owned".into(),
+        pod_name: "known".into(),
+        pod_uid: uuid::Uuid::new_v4().to_string(),
+    };
+    Effects::record_resource(&pool, spec.intent, &resource)
+        .await
+        .unwrap();
+    assert!(
+        Setup::acknowledge_removed(&pool, spec.intent, Some(&resource))
+            .await
+            .is_err()
+    );
+    Effects::record_exit(
+        &pool,
+        spec.intent,
+        &resource,
+        LaunchExitOutcome {
+            exit_code: 137,
+            oom_killed: false,
+        },
+    )
+    .await
+    .unwrap();
+    let wrong = ResourceIdentity::Kubernetes {
+        cluster: "owned".into(),
+        namespace: "owned".into(),
+        pod_name: "known".into(),
+        pod_uid: uuid::Uuid::new_v4().to_string(),
+    };
+    assert!(Setup::acknowledge_removed(&pool, spec.intent, Some(&wrong))
+        .await
+        .is_err());
+    // This models the owning caller's positive native Remove ACK, not a GET404.
+    Setup::acknowledge_removed(&pool, spec.intent, Some(&resource))
+        .await
+        .unwrap();
+    assert!(Setup::removal_recorded(&pool, spec.intent, &resource)
+        .await
+        .unwrap());
+    assert!(!Setup::removal_recorded(&pool, spec.intent, &wrong)
+        .await
+        .unwrap());
+    assert!(Setup::unsettled(&pool, claim.id, None, NATIVE_SETUP_MASTER)
+        .await
+        .unwrap()
+        .is_empty());
+    pool.cleanup().await.unwrap();
+}

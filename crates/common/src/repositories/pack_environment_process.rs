@@ -193,6 +193,52 @@ impl PackEnvironmentProcessRepository {
         }
         Ok(retained.spec())
     }
+    /// Bounded old-claim cleanup from retained evidence, never row age. The
+    /// caller must settle this batch before permitting replacement preparation.
+    pub async fn unsettled(
+        pool: &PgPool,
+        environment: i64,
+        except: Option<Uuid>,
+        master: &str,
+    ) -> Result<Vec<(ProcessSpec, bool)>> {
+        let rows:Vec<Record>=sqlx::query_as(&format!("SELECT {COLUMNS} FROM execution_process_effect WHERE purpose='setup' AND (target->>'admission')::BIGINT=$1 AND NOT resource_removed AND ($2::TEXT IS NULL OR target->>'attempt'<>$2) ORDER BY id LIMIT 16"))
+            .bind(environment).bind(except.map(|v|v.to_string())).fetch_all(pool).await?;
+        rows.into_iter()
+            .map(|old| Ok((old.context(master)?.spec(), old.create_submitted)))
+            .collect()
+    }
+    pub async fn removal_recorded(
+        pool: &PgPool,
+        intent: Uuid,
+        resource: &ResourceIdentity,
+    ) -> Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM execution_process_effect WHERE intent=$1 AND purpose='setup' AND resource=$2 AND resource_removed AND stop_requested)")
+            .bind(intent).bind(Json(resource)).fetch_one(pool).await?)
+    }
+    /// Only an acknowledged exact native removal, or a durable never-submitted
+    /// tombstone, can settle byte cleanup. No provider error is absence proof.
+    pub async fn acknowledge_removed(
+        pool: &PgPool,
+        intent: Uuid,
+        resource: Option<&ResourceIdentity>,
+    ) -> Result<()> {
+        let mut tx = pool.begin().await?;
+        let old = row(&mut tx, intent, true).await?;
+        let never_submitted = !old.create_submitted && old.resource.is_none() && resource.is_none();
+        let removed = old.create_submitted
+            && old.resource.as_ref().map(|r| &r.0) == resource
+            && resource.is_some()
+            && old.exit_outcome.is_some();
+        if !old.stop_requested || !(never_submitted || removed) {
+            return Err(denied());
+        }
+        sqlx::query("UPDATE execution_process_effect SET resource_removed=TRUE WHERE intent=$1")
+            .bind(intent)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
     /// Recover cleanup from immutable historical publication, independently of
     /// the mutable claim pointer. This never supplies new start/stdin authority.
     pub async fn retained_output(

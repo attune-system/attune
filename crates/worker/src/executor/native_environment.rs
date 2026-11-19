@@ -111,6 +111,57 @@ impl ActionExecutor {
         Ok(())
     }
 
+    async fn finish_native_setup_removal(
+        &self,
+        spec: &ProcessSpec,
+        resource: &attune_common::isolated_process::ResourceIdentity,
+    ) -> Result<()> {
+        if Setup::removal_recorded(&self.pool, spec.intent, resource).await? {
+            return Ok(());
+        }
+        Effects::request_stop(&self.pool, spec.intent).await?;
+        self.native_backend
+            .as_ref()
+            .ok_or_else(denied)?
+            .remove_stopped(spec, resource)
+            .await?;
+        Setup::acknowledge_removed(&self.pool, spec.intent, Some(resource)).await
+    }
+
+    async fn settle_old_native_setups(&self, environment: i64, master: &str) -> Result<()> {
+        let backend = self.native_backend.as_ref().ok_or_else(denied)?;
+        loop {
+            let debt = Setup::unsettled(&self.pool, environment, None, master).await?;
+            if debt.is_empty() {
+                return Ok(());
+            }
+            for (spec, submitted) in debt {
+                // Close publication/input before any uncertain provider wait.
+                Effects::request_stop(&self.pool, spec.intent).await?;
+                if !submitted {
+                    // Repository rechecks the first-submit bit under its lock;
+                    // a racing submitted create can never become absence.
+                    Setup::acknowledge_removed(&self.pool, spec.intent, None).await?;
+                    continue;
+                }
+                let resource = match Effects::retained_resource(&self.pool, spec.intent).await? {
+                    Some(resource) => resource,
+                    None => {
+                        let resource=backend.launcher().prepare(&spec,attune_common::isolated_process::ProcessCreateDisposition::ReconcileOnly).await?;
+                        Effects::record_resource(&self.pool, spec.intent, &resource).await?;
+                        resource
+                    }
+                };
+                let exit = backend
+                    .stop_retained(&spec, &resource, LaunchStopReason::SourceRevoked)
+                    .await?;
+                Effects::record_exit(&self.pool, spec.intent, &resource, exit).await?;
+                backend.remove_stopped(&spec, &resource).await?;
+                Setup::acknowledge_removed(&self.pool, spec.intent, Some(&resource)).await?;
+            }
+        }
+    }
+
     async fn ensure_native_environment(
         &self,
         context: &ExecutionContext,
@@ -153,16 +204,22 @@ impl ActionExecutor {
         .ok_or_else(denied)?;
         // Only published configuration and immutable public build inputs. Never
         // hash rendered private environment, parameters or a SetupPlan.
+        let engine = match &native.config.backend {
+            attune_common::workload_config::WorkloadBackendConfig::Docker { binding, .. } => {
+                Some(binding)
+            }
+            attune_common::workload_config::WorkloadBackendConfig::Kubernetes { .. } => None,
+        };
         let binding = attune_common::runtime_cache::sha256_bytes(&serde_json::to_vec(
             &serde_json::json!({
-                "image":action_spec.image,"platform":action_spec.platform,"pack":pack,
+                "image":action_spec.image,"platform":action_spec.platform,"engine":engine,"pack":pack,
                 "runner":native.runner,"runtime":runtime.id,"version":version.map(|v|v.id),"config":config,
             }),
         )?);
         if let Some(pin) = Setup::published(&self.pool, &binding).await? {
             if native.cache.open_input_archive(&pin).is_ok() {
                 let (spec, resource) = Setup::retained_output(&self.pool, &pin, master).await?;
-                backend.remove_stopped(&spec, &resource).await?;
+                self.finish_native_setup_removal(&spec, &resource).await?;
                 return Ok(pin);
             }
         }
@@ -212,7 +269,7 @@ impl ActionExecutor {
             if let Some(pin) = Setup::published(&self.pool, &binding).await? {
                 if native.cache.open_input_archive(&pin).is_ok() {
                     let (spec, resource) = Setup::retained_output(&self.pool, &pin, master).await?;
-                    backend.remove_stopped(&spec, &resource).await?;
+                    self.finish_native_setup_removal(&spec, &resource).await?;
                     return Ok(pin);
                 }
             }
@@ -224,6 +281,9 @@ impl ActionExecutor {
             }
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         };
+        // New claim/nonce fences late publication by any previous installer.
+        // Settle original resources before creating another generation.
+        self.settle_old_native_setups(claimed.id, master).await?;
         let claim = claimed.claim_id.ok_or_else(denied)?;
         let plan = crate::runtime::launch_planning::setup_plan(config, &Default::default(), &[])
             .map_err(|_| denied())?;
@@ -392,7 +452,7 @@ impl ActionExecutor {
         .await
         .map_err(|_| denied())??;
         Setup::publish(&self.pool, setup.intent, &resource, &pin, master).await?;
-        backend.remove_stopped(&setup, &resource).await?;
+        self.finish_native_setup_removal(&setup, &resource).await?;
         Ok(pin)
     }
 }

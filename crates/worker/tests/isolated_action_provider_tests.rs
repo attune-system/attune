@@ -155,14 +155,14 @@ async fn remove_owned(client: Client, identity: &ResourceIdentity) -> Result<()>
 #[ignore = "requires explicit owned Kubernetes namespace, pinned binaries/images and disposable PostgreSQL"]
 async fn kubernetes_native_action_custody_completion_and_restart() -> Result<()> {
     let _provider = KUBERNETES_CASE.lock().await;
-    owning_case(true, false, false).await
+    owning_case(true, false, false, false).await
 }
 
 // No provider effect is claimed: this catches actual preparer/custody/completion
 // regressions on PostgreSQL before the owning namespace job executes the Pod.
 #[tokio::test]
 async fn trusted_worker_completion_and_custody_repository_case() -> Result<()> {
-    owning_case(false, false, false).await
+    owning_case(false, false, false, false).await
 }
 
 // Each real case requires the owned node's fixed payload CPU budget. Retain
@@ -173,17 +173,29 @@ static KUBERNETES_CASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 #[ignore = "requires explicit owned Kubernetes namespace, pinned binaries/images and disposable PostgreSQL"]
 async fn kubernetes_native_cli_action_custody_completion_and_restart() -> Result<()> {
     let _provider = KUBERNETES_CASE.lock().await;
-    owning_case(true, true, false).await
+    owning_case(true, true, false, false).await
 }
 
 #[tokio::test]
 #[ignore = "requires explicit owned Kubernetes namespace, pinned binaries/images and disposable PostgreSQL"]
 async fn kubernetes_command_action_custody_completion_and_restart() -> Result<()> {
     let _provider = KUBERNETES_CASE.lock().await;
-    owning_case(true, true, true).await
+    owning_case(true, true, true, false).await
 }
 
-async fn owning_case(real_provider: bool, typed_cli: bool, command: bool) -> Result<()> {
+#[tokio::test]
+#[ignore = "requires explicit owned Kubernetes namespace, pinned binaries/images and disposable PostgreSQL"]
+async fn kubernetes_interpreted_setup_custody_completion_and_restart() -> Result<()> {
+    let _provider = KUBERNETES_CASE.lock().await;
+    owning_case(true, false, false, true).await
+}
+
+async fn owning_case(
+    real_provider: bool,
+    typed_cli: bool,
+    command: bool,
+    interpreted: bool,
+) -> Result<()> {
     attune_common::auth::install_crypto_provider();
     let root = tempfile::tempdir()?;
     let (platform, echo, runner, client, payload_image) = if real_provider {
@@ -264,10 +276,22 @@ async fn owning_case(real_provider: bool, typed_cli: bool, command: bool) -> Res
     let pack = PackFixture::new_unique("isolated_native")
         .create(&database)
         .await?;
-    let mut runtime = RuntimeFixture::new(Some(pack.id), Some(pack.r#ref.clone()), "native");
-    runtime.execution_config = json!({});
+    let mut runtime = RuntimeFixture::new(
+        Some(pack.id),
+        Some(pack.r#ref.clone()),
+        if interpreted { "python" } else { "native" },
+    );
+    runtime.execution_config = if interpreted {
+        json!({
+            "interpreter":{"binary":"python3","args":["-u"],"file_extension":".py"},
+            "environment":{"env_type":"virtualenv","dir_name":"venv","create_command":["python3","-m","venv","--copies","--without-pip","{env_dir}"],"interpreter_path":"{env_dir}/bin/python3"},
+            "dependencies":{"manifest_file":"input.txt","install_command":["{interpreter}","-c","from pathlib import Path; assert Path('{manifest_path}').read_text()=='owned offline dependency'; Path('{pack_dir}/installed-marker').write_text('prepared')"]}
+        })
+    } else {
+        json!({})
+    };
     let runtime = runtime.create(&database).await?;
-    let relative = "echo";
+    let relative = if interpreted { "echo.py" } else { "echo" };
     let binary_relative = format!("echo/linux-{}", platform.native_arch());
     let action = ActionFixture::new(pack.id, &pack.r#ref, "echo")
         .with_runtime(runtime.id)
@@ -307,14 +331,29 @@ async fn owning_case(real_provider: bool, typed_cli: bool, command: bool) -> Res
     std::fs::write(
         source.join("actions/echo.yaml"),
         format!(
-            "ref: {}\nrunner_type: native\nentry_point: {}\n",
-            action.r#ref, relative
+            "ref: {}\nrunner_type: {}\nentry_point: {}\n",
+            action.r#ref,
+            if interpreted { "python" } else { "native" },
+            relative
         ),
     )?;
     let executable = source.join("actions").join(&binary_relative);
     std::fs::copy(&echo, &executable)?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))?;
+    if interpreted {
+        std::fs::write(source.join("input.txt"), b"owned offline dependency")?;
+        std::fs::write(
+            source.join("actions/echo.py"),
+            br#"import json,sys
+from pathlib import Path
+assert Path('/opt/attune/runtime/project/installed-marker').read_text()=='prepared'
+assert Path('/opt/attune/runtime/project/pack.yaml').is_file()
+assert Path('/opt/attune/runtime/bin/python3').is_file()
+sys.stdout.write(json.load(sys.stdin)['message'])
+"#,
+        )?;
+    }
     if typed_cli {
         let bytes = std::fs::read(&executable)?;
         let path = format!("actions/{binary_relative}");
@@ -680,6 +719,18 @@ async fn owning_case(real_provider: bool, typed_cli: bool, command: bool) -> Res
             .find(|input| input.kind == LaunchInputKind::Pack)
             .context("retained native intent has no Pack pin")?;
         cache.open_input_archive(retained_pack)?;
+        if interpreted {
+            let pin=retained.inputs.iter().find(|p|p.kind==LaunchInputKind::Runtime).context("Setup Runtime pin missing")?;
+            cache.open_input_archive(pin)?;
+            let (setup,resource)=attune_common::repositories::pack_environment_process::PackEnvironmentProcessRepository::retained_output(database.pool(),pin,MASTER).await?;
+            ensure!(setup.purpose==LaunchPurpose::Setup && setup.image==retained.image && setup.platform==retained.platform,"Setup source binding changed");
+            ensure!(!setup.invocation.env.contains_key("ATTUNE_API_TOKEN"),"Setup received action API grant");
+            let mut tx=database.begin().await?;
+            ensure!(Effects::lock_completion(&mut tx,setup.intent,MASTER).await.is_err(),"Setup completed Action");
+            tx.rollback().await?;
+            // Reuse the durable exact removal ACK; never infer it from a 404.
+            ensure!(attune_common::repositories::pack_environment_process::PackEnvironmentProcessRepository::removal_recorded(database.pool(),setup.intent,&resource).await?,"Setup cleanup receipt missing");
+        }
         ensure!(outcome.exit_code == 0, "native action failed");
         let stored = ExecutionRepository::find_by_id(&database, execution.id)
             .await?
