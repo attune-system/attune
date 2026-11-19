@@ -531,3 +531,5 @@ mod tests {
 pub mod iam_ownership;
 
 pub mod work_queue_output;
+
+pub mod queue_configuration_input;

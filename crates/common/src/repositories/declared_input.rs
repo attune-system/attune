@@ -52,7 +52,8 @@ impl DeclaredInputBinding {
         )) || self.bare_workflow_condition()
             && crate::workflow::expression::uses_namespace(&self.expression, "config")
                 .unwrap_or(false)
-            || self.source_path.starts_with("/workflow/")
+            || (self.source_path.starts_with("/workflow/")
+                || self.source_path.starts_with("/queue/"))
                 && crate::template_resolver::workflow_template_uses_namespace(
                     &self.expression,
                     "config",
@@ -62,7 +63,9 @@ impl DeclaredInputBinding {
         if self.bare_workflow_condition() {
             crate::workflow::expression::uses_namespace_access(&self.expression, "keystore")
                 .unwrap_or(false)
-        } else if self.source_path.starts_with("/workflow/") {
+        } else if self.source_path.starts_with("/workflow/")
+            || self.source_path.starts_with("/queue/")
+        {
             crate::template_resolver::workflow_template_uses_lookup(&self.expression, "keystore")
         } else {
             KEY_LOOKUP.is_match(&self.expression)

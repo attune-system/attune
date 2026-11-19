@@ -194,6 +194,7 @@ impl ComponentConfigurationRepository {
                AND NOT EXISTS (SELECT 1 FROM runtime_secret_origin_reference p WHERE p.source_entity = 'component_configuration' AND p.source_id = r.id) \
                AND NOT file_evidence_pinned('component_configuration_revision',r.id) \
                 AND NOT EXISTS (SELECT 1 FROM runtime_input_configuration_reference p WHERE p.revision = r.id) \
+                AND NOT EXISTS (SELECT 1 FROM work_queue_item_configuration_input q WHERE q.configuration_revision = r.id) \
             ORDER BY r.created, r.id LIMIT $1 \
         ) DELETE FROM component_configuration_revision r USING expired e WHERE r.id = e.id RETURNING r.id")
             .bind(limit).fetch_all(&mut *tx).await?;
