@@ -50,6 +50,17 @@ fn fixed_recipe(spec: &ProcessSpec) -> Result<bool> {
         Some("run-candidate-runtime-recipe") if spec.purpose == LaunchPurpose::CandidateTest => {
             PackAccess::CandidateCopy
         }
+        Some("run-candidate-python") => {
+            if !crate::planning::candidate_python_recipe_invocation(&spec.invocation.argv)
+                .map_err(|_| unavailable())?
+            {
+                return Ok(false);
+            }
+            if spec.purpose != LaunchPurpose::CandidateTest {
+                return Err(unavailable());
+            }
+            PackAccess::CandidateCopy
+        }
         Some("run-runtime-recipe" | "run-candidate-runtime-recipe") => return Err(unavailable()),
         _ => return Ok(false),
     };
@@ -226,6 +237,71 @@ mod tests {
             });
         }
         spec
+    }
+
+    fn combined() -> ProcessSpec {
+        let metadata: serde_json::Value =
+            serde_yaml_ng::from_str(include_str!("../../../packs/core/runtimes/python.yaml"))
+                .unwrap();
+        let plan = crate::planning::CandidatePythonPlan {
+            version: 1,
+            config: serde_json::from_value(metadata["execution_config"].clone()).unwrap(),
+            runner: "runtime".into(),
+            entry: "tests/owned.py".into(),
+            timeout_ms: 1000,
+            recipe: Some(serde_json::from_value(serde_json::json!({
+                "tools":[{"name":"tool","binaries":["tool"],"version_pattern":"(?<version>1)","primary":true}],
+                "launch":{"command":["{tool_tool}","{source_file}"]}
+            })).unwrap()),
+        };
+        let mut spec = recipe();
+        spec.purpose = LaunchPurpose::CandidateTest;
+        spec.pack_access = PackAccess::CandidateCopy;
+        spec.invocation.argv =
+            crate::planning::candidate_python_argv(spec.platform, &plan).unwrap();
+        spec
+    }
+    #[test]
+    fn combined_candidate_controls_are_exact_independent_and_intent_retained() {
+        let mut spec = combined();
+        bind_challenge(&mut spec, None).unwrap();
+        crate::candidate_prep::bind_challenge(&mut spec, None).unwrap();
+        let original = spec.invocation.env.clone();
+        let recipe = retained_challenge(&spec).unwrap();
+        let python = crate::candidate_prep::retained_challenge(&spec).unwrap();
+        spec.invocation.env.clear();
+        bind_challenge(&mut spec, recipe).unwrap();
+        crate::candidate_prep::bind_challenge(&mut spec, python).unwrap();
+        assert_eq!(spec.invocation.env, original);
+        for change in 0..5 {
+            let mut invalid = combined();
+            match change {
+                0 => invalid.purpose = LaunchPurpose::Action,
+                1 => invalid.pack_access = PackAccess::ReadOnly,
+                2 => invalid.invocation.argv[0] = "/untrusted/runner".into(),
+                3 => invalid.invocation.argv.truncate(2),
+                _ => invalid.inputs.pop().map(|_| ()).unwrap(),
+            }
+            assert!(bind_challenge(&mut invalid, None).is_err());
+        }
+        let mut ordinary = combined();
+        let mut plan =
+            crate::planning::CandidatePythonPlan::from_arguments(&ordinary.invocation.argv[2..])
+                .unwrap();
+        plan.recipe = None;
+        plan.runner = "pytest".into();
+        ordinary.invocation.argv =
+            crate::planning::candidate_python_argv(ordinary.platform, &plan).unwrap();
+        bind_challenge(&mut ordinary, None).unwrap();
+        assert!(!ordinary
+            .invocation
+            .env
+            .contains_key(RUNTIME_RECIPE_TIMEOUT_CHALLENGE_ENV));
+        ordinary
+            .invocation
+            .env
+            .insert(RUNTIME_RECIPE_TIMEOUT_CHALLENGE_ENV.into(), "a".repeat(64));
+        assert!(retained_challenge(&ordinary).is_err());
     }
 
     #[test]

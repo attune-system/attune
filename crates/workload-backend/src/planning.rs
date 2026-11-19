@@ -73,16 +73,27 @@ pub struct CandidatePythonPlan {
     pub runner: String,
     pub entry: String,
     pub timeout_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<attune_common::runtime_lifecycle::RuntimeRecipe>,
 }
 impl CandidatePythonPlan {
     pub fn validate(&self) -> Result<()> {
         if self.version != 1
-            || !matches!(self.runner.as_str(), "unittest" | "pytest" | "script")
+            || !matches!(
+                self.runner.as_str(),
+                "unittest" | "pytest" | "script" | "runtime"
+            )
+            || (self.runner == "runtime") != self.recipe.is_some()
             || !(1..=3_600_000).contains(&self.timeout_ms)
         {
             return Err(PlanningError::Configuration);
         }
         pack_path(&self.entry)?;
+        if let Some(recipe) = &self.recipe {
+            recipe
+                .validate()
+                .map_err(|_| PlanningError::Configuration)?;
+        }
         candidate_python_setup(&self.config, "/tmp/attune-candidate-python-validation/env")?;
         if serde_json::to_vec(self)
             .map_err(|_| PlanningError::Bounds)?
@@ -93,6 +104,40 @@ impl CandidatePythonPlan {
         }
         Ok(())
     }
+    /// Decode the same bounded private v1 plan used by the fixed guest helper.
+    pub fn from_arguments(arguments: &[String]) -> Result<Self> {
+        if arguments.is_empty()
+            || arguments.len() > SETUP_STDIN_LIMIT / RUNTIME_RECIPE_CHUNK_BYTES + 1
+        {
+            return Err(PlanningError::Bounds);
+        }
+        let mut json = String::new();
+        for part in arguments {
+            if part.is_empty()
+                || part.len() > RUNTIME_RECIPE_CHUNK_BYTES
+                || json
+                    .len()
+                    .checked_add(part.len())
+                    .is_none_or(|size| size > SETUP_STDIN_LIMIT)
+            {
+                return Err(PlanningError::Bounds);
+            }
+            json.push_str(part);
+        }
+        let plan: Self = serde_json::from_str(&json).map_err(|_| PlanningError::Configuration)?;
+        plan.validate()?;
+        Ok(plan)
+    }
+}
+/// Closed timeout-control admission predicate. The caller additionally proves
+/// exact Runner/platform, purpose, writable Pack, inputs and absence of Stage.
+pub fn candidate_python_recipe_invocation(argv: &[String]) -> Result<bool> {
+    if argv.get(1).map(String::as_str) != Some("run-candidate-python") {
+        return Ok(false);
+    }
+    Ok(CandidatePythonPlan::from_arguments(&argv[2..])?
+        .recipe
+        .is_some())
 }
 pub fn candidate_python_argv(
     platform: LaunchPlatform,
@@ -841,6 +886,58 @@ pub fn validate_runtime_release_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn candidate_plan() -> CandidatePythonPlan {
+        CandidatePythonPlan {
+            version: 1,
+            config: python(),
+            runner: "pytest".into(),
+            entry: "tests/check.py".into(),
+            timeout_ms: 300_000,
+            recipe: None,
+        }
+    }
+    #[test]
+    fn combined_candidate_recipe_predicate_is_closed_and_keeps_ordinary_plan_bytes() {
+        let mut plan = candidate_plan();
+        assert!(!serde_json::to_value(&plan)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("recipe"));
+        let plain = candidate_python_argv(LaunchPlatform::LinuxAmd64, &plan).unwrap();
+        assert!(!candidate_python_recipe_invocation(&plain).unwrap());
+        plan.runner = "runtime".into();
+        assert!(plan.validate().is_err());
+        plan.recipe = Some(serde_json::from_value(serde_json::json!({
+            "tools":[{"name":"tool","binaries":["tool"],"version_pattern":"(?<version>1)","primary":true}],
+            "launch":{"command":["{tool_tool}","{source_file}"]}
+        })).unwrap());
+        let combined = candidate_python_argv(LaunchPlatform::LinuxArm64, &plan).unwrap();
+        assert!(candidate_python_recipe_invocation(&combined).unwrap());
+        let decoded = CandidatePythonPlan::from_arguments(&combined[2..]).unwrap();
+        assert_eq!(
+            decoded.recipe.unwrap().digest().unwrap(),
+            plan.recipe.as_ref().unwrap().digest().unwrap()
+        );
+        plan.runner = "script".into();
+        assert!(plan.validate().is_err());
+        assert!(candidate_python_recipe_invocation(&[
+            "runner".into(),
+            "run-candidate-python".into()
+        ])
+        .is_err());
+        assert!(candidate_python_recipe_invocation(&[
+            "runner".into(),
+            "run-candidate-python".into(),
+            "bad-json".into()
+        ])
+        .is_err());
+        assert!(
+            CandidatePythonPlan::from_arguments(&["a".repeat(RUNTIME_RECIPE_CHUNK_BYTES + 1)])
+                .is_err()
+        );
+        assert!(!candidate_python_recipe_invocation(&["runner".into(), "exec".into()]).unwrap());
+    }
     #[test]
     fn lifecycle_recipes_never_fall_through_legacy_planning() {
         let recipe: attune_common::runtime_lifecycle::RuntimeRecipe =

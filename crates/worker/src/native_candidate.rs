@@ -312,7 +312,7 @@ impl NativeCandidateTests {
         let python = self.python.is_some()
             && matches!(
                 request.runner.r#type.as_str(),
-                "unittest" | "pytest" | "script"
+                "unittest" | "pytest" | "script" | "runtime"
             );
         let prep_challenge = retained_python_challenge(retained.as_ref(), python)?;
         let mut env = BTreeMap::from([
@@ -339,15 +339,36 @@ impl NativeCandidateTests {
                     env.insert(name.clone(), value.to_str().ok_or_else(denied)?.to_owned());
                 }
             }
-            let argv = attune_workload_backend::planning::candidate_runtime_recipe_argv(
-                self.config.platform,
-                recipe,
-                "/usr/local/bin:/usr/bin:/bin",
-                entry,
-                false,
-                None,
-            )
-            .map_err(|_| denied())?;
+            let argv = if python {
+                let plan = attune_workload_backend::planning::CandidatePythonPlan {
+                    version: 1,
+                    config: self.python.as_ref().ok_or_else(denied)?.clone(),
+                    runner: "runtime".into(),
+                    entry: entry.into(),
+                    timeout_ms: request
+                        .runner
+                        .timeout
+                        .unwrap_or(300)
+                        .checked_mul(1000)
+                        .ok_or_else(denied)?,
+                    recipe: Some(recipe.clone()),
+                };
+                attune_workload_backend::planning::candidate_python_argv(
+                    self.config.platform,
+                    &plan,
+                )
+                .map_err(|_| denied())?
+            } else {
+                attune_workload_backend::planning::candidate_runtime_recipe_argv(
+                    self.config.platform,
+                    recipe,
+                    "/usr/local/bin:/usr/bin:/bin",
+                    entry,
+                    false,
+                    None,
+                )
+                .map_err(|_| denied())?
+            };
             env = attune_workload_backend::planning::runtime_recipe_environment(&env)
                 .map_err(|_| denied())?;
             argv
@@ -374,6 +395,7 @@ impl NativeCandidateTests {
                             .unwrap_or(300)
                             .checked_mul(1000)
                             .ok_or_else(denied)?,
+                        recipe: None,
                     };
                     attune_workload_backend::planning::candidate_python_argv(
                         self.config.platform,
@@ -566,18 +588,6 @@ fn python_required(testing: &TestConfig) -> Result<bool> {
             .runners
             .values()
             .any(|runner| matches!(runner.r#type.as_str(), "unittest" | "pytest"));
-    // Recipe+Python composition needs a coordinated pair of preparation/proof
-    // identities. Never silently execute a recipe before legacy global setup.
-    if required
-        && testing
-            .runners
-            .values()
-            .any(|runner| runner.lifecycle.is_some())
-    {
-        return Err(Error::validation(
-            "Candidate recipe and Python test composition is not supported",
-        ));
-    }
     Ok(required)
 }
 fn retained_recipe_challenge(
@@ -903,7 +913,7 @@ mod tests {
         assert!(testing_config(&invalid).is_err());
     }
     #[test]
-    fn plain_script_mixtures_require_global_python_and_recipe_mixtures_deny() {
+    fn script_and_recipe_mixtures_require_global_python_preparation() {
         let metadata = metadata_config(
             serde_json::json!({
                 "py":{"type":"pytest","entry_point":"tests/check.py"},
@@ -922,7 +932,7 @@ mod tests {
             serde_json::json!({"py":{"type":"unittest","entry_point":"tests/check.py"},"recipe":{"type":"runtime","entry_point":"tests/run","lifecycle":recipe}}),
             true,
         );
-        assert!(python_required(&testing_config(&mixed).unwrap()).is_err());
+        assert!(python_required(&testing_config(&mixed).unwrap()).unwrap());
     }
     fn fixed_candidate_recipe() -> ProcessSpec {
         ProcessSpec {
@@ -963,6 +973,38 @@ mod tests {
                 working_root: LaunchRoot::Pack,
             },
         }
+    }
+    #[test]
+    fn mixed_recipe_recovery_requires_both_original_intent_challenges() {
+        let metadata: serde_json::Value =
+            serde_yaml_ng::from_str(include_str!("../../../packs/core/runtimes/python.yaml"))
+                .unwrap();
+        let plan = attune_workload_backend::planning::CandidatePythonPlan {
+            version: 1,
+            config: serde_json::from_value(metadata["execution_config"].clone()).unwrap(),
+            runner: "runtime".into(),
+            entry: "tests/owned.py".into(),
+            timeout_ms: 1000,
+            recipe: Some(serde_json::from_value(serde_json::json!({
+                "tools":[{"name":"tool","binaries":["tool"],"version_pattern":"(?<version>1)","primary":true}],
+                "launch":{"command":["{tool_tool}","{source_file}"]}
+            })).unwrap()),
+        };
+        let mut spec = fixed_candidate_recipe();
+        spec.invocation.argv =
+            attune_workload_backend::planning::candidate_python_argv(spec.platform, &plan).unwrap();
+        assert!(retained_recipe_challenge(Some(&spec), true).is_err());
+        assert!(retained_python_challenge(Some(&spec), true).is_err());
+        recipe_timeout::bind_challenge(&mut spec, None).unwrap();
+        assert!(retained_python_challenge(Some(&spec), true).is_err());
+        candidate_prep::bind_challenge(&mut spec, None).unwrap();
+        let old = spec.clone();
+        let recipe = retained_recipe_challenge(Some(&old), true).unwrap();
+        let python = retained_python_challenge(Some(&old), true).unwrap();
+        spec.invocation.env.clear();
+        recipe_timeout::bind_challenge(&mut spec, recipe).unwrap();
+        candidate_prep::bind_challenge(&mut spec, python).unwrap();
+        assert_eq!(spec.invocation.env, old.invocation.env);
     }
     #[test]
     fn candidate_recipe_recovery_retains_proof_and_denies_prechallenge_intents() {

@@ -191,8 +191,8 @@ pub(super) fn run_candidate(arguments: &[OsString]) -> io::Result<()> {
     run_with_pack_access(arguments, true)
 }
 fn run_with_pack_access(arguments: &[OsString], candidate_copy: bool) -> io::Result<()> {
-    use attune_common::{runtime_lifecycle::RuntimeSource, workload_launch::PACK_ROOT};
-    use std::{path::Path, process::Stdio};
+    use attune_common::workload_launch::PACK_ROOT;
+    use std::path::Path;
     if candidate_copy {
         super::boundary_guard_basic()?;
         for (path, readonly) in [
@@ -217,135 +217,176 @@ fn run_with_pack_access(arguments: &[OsString], candidate_copy: bool) -> io::Res
     attune_common::parent_process_protection::protect_service_parent()
         .map_err(|_| super::invalid())?;
     let (recipe, path, source, inline, expected) = decode_run(arguments)?;
-    let environment = probe_environment(&recipe, &path)?;
     let mut invocation = std::env::vars().collect();
     let timeout_challenge = take_timeout_challenge(&mut invocation)?;
     let invocation = attune_workload_backend::planning::runtime_recipe_environment(&invocation)
         .map_err(|_| super::invalid())?;
-    let file = Path::new(PACK_ROOT).join(&source);
+    let code = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_selected(RecipeInvocation {
+            recipe: &recipe,
+            path: &path,
+            source: &source,
+            inline,
+            expected: expected.as_deref(),
+            invocation: &invocation,
+            timeout_challenge: timeout_challenge.as_deref(),
+        }))?;
+    std::process::exit(code)
+}
+
+/// Already selected private context. Callers protect the helper and validate
+/// its mount boundary before entering this shared guest recipe engine.
+pub(super) struct RecipeInvocation<'a> {
+    pub recipe: &'a RuntimeRecipe,
+    pub path: &'a str,
+    pub source: &'a str,
+    pub inline: bool,
+    pub expected: Option<&'a str>,
+    pub invocation: &'a std::collections::BTreeMap<String, String>,
+    pub timeout_challenge: Option<&'a str>,
+}
+
+pub(super) async fn run_selected(selected: RecipeInvocation<'_>) -> io::Result<i32> {
+    use attune_common::{runtime_lifecycle::RuntimeSource, workload_launch::PACK_ROOT};
+    use std::{path::Path, process::Stdio};
+    let RecipeInvocation {
+        recipe,
+        path,
+        source,
+        inline,
+        expected,
+        invocation,
+        timeout_challenge,
+    } = selected;
+    let environment = probe_environment(recipe, path)?;
+    let file = Path::new(PACK_ROOT).join(source);
     let source = if inline {
-        RuntimeSource::Inline(&source)
+        RuntimeSource::Inline(source)
     } else {
         RuntimeSource::File(&file)
     };
-    // /tmp belongs solely to this native attempt. Keep absolute generation paths
-    // stable through final execution, including venv shebangs and build outputs.
+    // This generation stays in the same native attempt as Python preparation.
     let generation_root = Path::new("/tmp/attune-lifecycle-generations");
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(async {
-        let target = recipe
-            .prepare_with_tool_validation(
-                Path::new(PACK_ROOT),
-                source,
-                generation_root,
-                &environment,
-                |tools| {
-                    for tool in tools.values() {
-                        super::readonly_path(&tool.executable, true)
-                            .and_then(|_| super::readonly_path(&tool.identity, true))
-                            .map_err(|_| {
-                                attune_common::runtime_lifecycle::Error::Invalid(
-                                    "Mutable runtime tool".into(),
-                                )
-                            })?;
-                    }
-                    if let Some(expected) = &expected {
-                        let primary = recipe
-                            .tools
-                            .iter()
-                            .find(|tool| tool.primary)
-                            .and_then(|tool| tools.get(&tool.name))
-                            .ok_or_else(|| {
-                                attune_common::runtime_lifecycle::Error::Invalid(
-                                    "Missing primary tool".into(),
-                                )
-                            })?;
-                        if primary.version != *expected
-                            && !attune_common::version_matching::matches_constraint(
-                                &primary.version,
-                                &format!("={expected}"),
+    let target = recipe
+        .prepare_with_tool_validation(
+            Path::new(PACK_ROOT),
+            source,
+            generation_root,
+            &environment,
+            |tools| {
+                for tool in tools.values() {
+                    super::readonly_path(&tool.executable, true)
+                        .and_then(|_| super::readonly_path(&tool.identity, true))
+                        .map_err(|_| {
+                            attune_common::runtime_lifecycle::Error::Invalid(
+                                "Mutable runtime tool".into(),
                             )
-                            .unwrap_or(false)
-                        {
-                            return Err(attune_common::runtime_lifecycle::Error::Invalid(
-                                "Runtime version drift".into(),
-                            ));
-                        }
+                        })?;
+                }
+                if let Some(expected) = expected {
+                    let primary = recipe
+                        .tools
+                        .iter()
+                        .find(|tool| tool.primary)
+                        .and_then(|tool| tools.get(&tool.name))
+                        .ok_or_else(|| {
+                            attune_common::runtime_lifecycle::Error::Invalid(
+                                "Missing primary tool".into(),
+                            )
+                        })?;
+                    if primary.version != expected
+                        && !attune_common::version_matching::matches_constraint(
+                            &primary.version,
+                            &format!("={expected}"),
+                        )
+                        .unwrap_or(false)
+                    {
+                        return Err(attune_common::runtime_lifecycle::Error::Invalid(
+                            "Runtime version drift".into(),
+                        ));
                     }
-                    Ok(())
-                },
-            )
-            .await
-            .map_err(|_| super::invalid())?;
-        if let Some(expected) = expected {
-            target
-                .validate_selected_version(&expected)
-                .map_err(|_| super::invalid())?;
-        }
-        let mut final_environment = invocation.clone();
-        final_environment.entry("PATH".into()).or_insert(path);
-        final_environment.extend(target.env);
-        for name in &recipe.permitted_caller_env {
-            if let Some(value) = invocation.get(name) {
-                final_environment.insert(name.clone(), value.clone());
-            }
-        }
-        // Revalidate expanded recipe values and retain the already-admitted
-        // invocation context. The recipe cannot set reserved Attune variables.
-        let mut final_environment =
-            attune_workload_backend::planning::runtime_recipe_environment(&final_environment)
-                .map_err(|_| super::invalid())?;
-        // Keep action input out of all tool probes/preparation, including
-        // file delivery. Only the protected helper materializes it now, after
-        // preparation has joined and immediately before the final child.
-        let prepared_input = if super::parameter_input::required(&final_environment)? {
-            use std::io::Read;
-            let mut bytes = Vec::new();
-            std::io::stdin()
-                .take(attune_common::workload_stdin::MAX_PRIVATE_STDIN_BYTES as u64 + 1)
-                .read_to_end(&mut bytes)?;
-            Some(super::parameter_input::prepare(
-                &mut final_environment,
-                &bytes,
-            )?)
-        } else {
-            None
-        };
-        let mut command = tokio::process::Command::new(&target.command[0]);
-        command
-            .env_clear()
-            .envs(final_environment)
-            .args(&target.command[1..])
-            .current_dir(target.working_dir)
-            .stdin(match &prepared_input {
-                Some(prepared) => Stdio::from(prepared.stdin.try_clone()?),
-                None => Stdio::inherit(),
-            })
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        command.process_group(0);
-        let child = command.spawn()?;
-        let status = wait_recipe_child(
-            child,
-            std::time::Duration::from_secs(recipe.launch.timeout_seconds),
-            timeout_challenge.as_deref(),
-            Path::new("/tmp/artifacts"),
+                }
+                Ok(())
+            },
         )
-        .await?;
-        drop(prepared_input);
-        // Output/custody and cleanup remain the owning worker's responsibility.
-        std::process::exit(status.code().unwrap_or(1));
-    })
+        .await
+        .map_err(|_| super::invalid())?;
+    if let Some(expected) = expected {
+        target
+            .validate_selected_version(expected)
+            .map_err(|_| super::invalid())?;
+    }
+    let mut final_environment = recipe_final_environment(recipe, path, invocation, target.env)?;
+    // Keep action input out of all tool probes/preparation, including
+    // file delivery. Only the protected helper materializes it now, after
+    // preparation has joined and immediately before the final child.
+    let prepared_input = if super::parameter_input::required(&final_environment)? {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::io::stdin()
+            .take(attune_common::workload_stdin::MAX_PRIVATE_STDIN_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        Some(super::parameter_input::prepare(
+            &mut final_environment,
+            &bytes,
+        )?)
+    } else {
+        None
+    };
+    let mut command = tokio::process::Command::new(&target.command[0]);
+    command
+        .env_clear()
+        .envs(final_environment)
+        .args(&target.command[1..])
+        .current_dir(target.working_dir)
+        .stdin(match &prepared_input {
+            Some(prepared) => Stdio::from(prepared.stdin.try_clone()?),
+            None => Stdio::inherit(),
+        })
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let child = command.spawn()?;
+    let status = wait_recipe_child(
+        child,
+        std::time::Duration::from_secs(recipe.launch.timeout_seconds),
+        timeout_challenge,
+        Path::new("/tmp/artifacts"),
+    )
+    .await?;
+    drop(prepared_input);
+    // Output/custody and cleanup remain the owning worker's responsibility.
+    Ok(status.code().unwrap_or(1))
+}
+fn recipe_final_environment(
+    recipe: &RuntimeRecipe,
+    path: &str,
+    invocation: &std::collections::BTreeMap<String, String>,
+    target: std::collections::BTreeMap<String, String>,
+) -> io::Result<std::collections::BTreeMap<String, String>> {
+    let mut environment = invocation.clone();
+    environment
+        .entry("PATH".into())
+        .or_insert_with(|| path.to_owned());
+    environment.extend(target);
+    for name in &recipe.permitted_caller_env {
+        if let Some(value) = invocation.get(name) {
+            environment.insert(name.clone(), value.clone());
+        }
+    }
+    // Revalidate expanded recipe values and retain the admitted invocation.
+    attune_workload_backend::planning::runtime_recipe_environment(&environment)
+        .map_err(|_| super::invalid())
 }
 
 /// Extract only the fixed private control. Other forbidden controls still fail
 /// ordinary environment validation. The helper is protected before this runs;
 /// neither prep's explicit environment nor final env_clear overlays retain it.
-fn take_timeout_challenge(
+pub(super) fn take_timeout_challenge(
     environment: &mut std::collections::BTreeMap<String, String>,
 ) -> io::Result<Option<String>> {
     use attune_workload_backend::planning::{
@@ -535,6 +576,40 @@ mod tests {
             "launch":{"command":["must-not-run-private-launch"]}
         }))
         .unwrap()
+    }
+    #[test]
+    fn combined_recipe_preserves_original_public_path_and_final_only_invocation() {
+        use std::{collections::BTreeMap, ffi::OsStr};
+        let mut recipe = recipe();
+        recipe.permitted_caller_env = vec!["PUBLIC_OVERRIDE".into()];
+        let path = "/usr/local/bin:/usr/bin:/bin";
+        let invocation = BTreeMap::from([
+            ("PATH".into(), path.into()),
+            ("PUBLIC_OVERRIDE".into(), "selected".into()),
+            ("ATTUNE_CANDIDATE_EFFECTS_TOKEN".into(), "final-only".into()),
+        ]);
+        let public = probe_environment(&recipe, path).unwrap();
+        assert_eq!(public.get("PATH"), Some(OsStr::new(path)));
+        assert!(public.get("ATTUNE_CANDIDATE_EFFECTS_TOKEN").is_none());
+        let final_env = recipe_final_environment(
+            &recipe,
+            path,
+            &invocation,
+            BTreeMap::from([("PUBLIC_OVERRIDE".into(), "recipe-default".into())]),
+        )
+        .unwrap();
+        assert_eq!(final_env["PATH"], path);
+        assert_eq!(final_env["PUBLIC_OVERRIDE"], "selected");
+        assert_eq!(final_env["ATTUNE_CANDIDATE_EFFECTS_TOKEN"], "final-only");
+        assert!(!final_env["PATH"].contains("attune-candidate-python"));
+        for name in [
+            attune_workload_backend::planning::RUNTIME_RECIPE_TIMEOUT_CHALLENGE_ENV,
+            attune_workload_backend::planning::CANDIDATE_PYTHON_PREP_CHALLENGE_ENV,
+        ] {
+            let mut unsafe_env = invocation.clone();
+            unsafe_env.insert(name.into(), "a".repeat(64));
+            assert!(recipe_final_environment(&recipe, path, &unsafe_env, BTreeMap::new()).is_err());
+        }
     }
     #[test]
     fn timeout_challenge_is_private_and_reserved_controls_are_not_broadly_removed() {

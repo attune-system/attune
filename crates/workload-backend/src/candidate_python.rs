@@ -16,21 +16,16 @@ pub(super) fn run(arguments: &[OsString]) -> io::Result<i32> {
     boundary()?;
     attune_common::parent_process_protection::protect_service_parent()
         .map_err(|_| super::invalid())?;
-    let challenge =
-        std::env::var(CANDIDATE_PYTHON_PREP_CHALLENGE_ENV).map_err(|_| super::invalid())?;
-    std::env::remove_var(CANDIDATE_PYTHON_PREP_CHALLENGE_ENV);
-    if !valid_challenge(&challenge) {
-        return Err(super::invalid());
-    }
     let plan = decode(arguments)?;
-    if std::env::var_os("ATTUNE_API_TOKEN").is_some() {
+    let mut selected = std::env::vars().collect();
+    let (challenge, timeout_challenge) = take_controls(&mut selected, plan.recipe.is_some())?;
+    if selected.contains_key("ATTUNE_API_TOKEN") {
         return Err(super::invalid());
     }
     // Retain invocation context in the protected helper. Preparation gets only
     // the separate public plan and null stdin, never this environment/stdin.
-    let mut invocation =
-        attune_workload_backend::planning::runtime_recipe_environment(&std::env::vars().collect())
-            .map_err(|_| super::invalid())?;
+    let mut invocation = attune_workload_backend::planning::runtime_recipe_environment(&selected)
+        .map_err(|_| super::invalid())?;
     let generation = tempfile::Builder::new()
         .prefix("attune-candidate-python-")
         .tempdir_in("/tmp")?
@@ -78,41 +73,69 @@ pub(super) fn run(arguments: &[OsString]) -> io::Result<i32> {
             )
             .await?;
         }
-        Ok::<_, io::Error>(())
-    })?;
-    drop(runtime);
-    let path = Path::new(&interpreter);
-    let metadata = path.metadata()?;
-    use std::os::unix::fs::PermissionsExt;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
-        return Err(super::invalid());
-    }
-    let entry = Path::new(PACK_ROOT).join(&plan.entry);
-    if !entry.metadata()?.is_file()
-        || !entry
-            .canonicalize()?
-            .starts_with(Path::new(PACK_ROOT).canonicalize()?)
-    {
-        return Err(super::invalid());
-    }
-    let bin = path
-        .parent()
-        .and_then(Path::to_str)
+        let path = Path::new(&interpreter);
+        let metadata = path.metadata()?;
+        use std::os::unix::fs::PermissionsExt;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+            return Err(super::invalid());
+        }
+        let entry = Path::new(PACK_ROOT).join(&plan.entry);
+        if !entry.metadata()?.is_file()
+            || !entry
+                .canonicalize()?
+                .starts_with(Path::new(PACK_ROOT).canonicalize()?)
+        {
+            return Err(super::invalid());
+        }
+        write_prepared(Path::new("/tmp/artifacts"), &challenge)?;
+        if let Some(recipe) = &plan.recipe {
+            // The recipe reapplies its original public lifecycle environment. The
+            // legacy global Python bin never supplies recipe discovery or PATH.
+            return super::recipe_probe::run_selected(super::recipe_probe::RecipeInvocation {
+                recipe,
+                path: "/usr/local/bin:/usr/bin:/bin",
+                source: &plan.entry,
+                inline: false,
+                expected: None,
+                invocation: &invocation,
+                timeout_challenge: timeout_challenge.as_deref(),
+            })
+            .await;
+        }
+        let bin = path
+            .parent()
+            .and_then(Path::to_str)
+            .ok_or_else(super::invalid)?;
+        invocation.insert("PATH".into(), format!("{bin}:/usr/local/bin:/usr/bin:/bin"));
+        let (program, arguments) = final_command(&plan, &interpreter);
+        let mut command = std::process::Command::new(program);
+        command.env_clear().envs(invocation).args(arguments);
+        command
+            .current_dir(PACK_ROOT)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        // Exec keeps the physical generation and exact interpreter path unchanged.
+        // The owning provider cleans this private scratch after terminal/removal
+        // proof; no shared ready marker or reusable runtime is published.
+        Err(command.exec())
+    })
+}
+fn take_controls(
+    environment: &mut std::collections::BTreeMap<String, String>,
+    recipe: bool,
+) -> io::Result<(String, Option<String>)> {
+    let prep = environment
+        .remove(CANDIDATE_PYTHON_PREP_CHALLENGE_ENV)
         .ok_or_else(super::invalid)?;
-    invocation.insert("PATH".into(), format!("{bin}:/usr/local/bin:/usr/bin:/bin"));
-    let (program, arguments) = final_command(&plan, &interpreter);
-    let mut command = std::process::Command::new(program);
-    command.env_clear().envs(invocation).args(arguments);
-    command
-        .current_dir(PACK_ROOT)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    write_prepared(Path::new("/tmp/artifacts"), &challenge)?;
-    // Exec keeps the physical generation and exact interpreter path unchanged.
-    // The owning provider cleans this private scratch after terminal/removal
-    // proof; no shared ready marker or reusable runtime is published.
-    Err(command.exec())
+    if !valid_challenge(&prep) {
+        return Err(super::invalid());
+    }
+    let timeout = super::recipe_probe::take_timeout_challenge(environment)?;
+    if recipe != timeout.is_some() {
+        return Err(super::invalid());
+    }
+    Ok((prep, timeout))
 }
 fn final_command(plan: &CandidatePythonPlan, interpreter: &str) -> (String, Vec<String>) {
     let entry = format!("{PACK_ROOT}/{}", plan.entry);
@@ -202,24 +225,19 @@ fn boundary() -> io::Result<()> {
 }
 
 fn decode(arguments: &[OsString]) -> io::Result<CandidatePythonPlan> {
-    if arguments.is_empty() || arguments.len() > SETUP_STDIN_LIMIT / RUNTIME_RECIPE_CHUNK_BYTES + 1
-    {
+    if arguments.len() > SETUP_STDIN_LIMIT / RUNTIME_RECIPE_CHUNK_BYTES + 1 {
         return Err(super::invalid());
     }
-    let mut json = String::new();
-    for part in arguments {
-        let part = part.to_str().ok_or_else(super::invalid)?;
-        if part.is_empty() || part.len() > RUNTIME_RECIPE_CHUNK_BYTES {
-            return Err(super::invalid());
-        }
-        json.push_str(part);
-        if json.len() > SETUP_STDIN_LIMIT {
-            return Err(super::invalid());
-        }
-    }
-    let plan: CandidatePythonPlan = serde_json::from_str(&json).map_err(|_| super::invalid())?;
-    plan.validate().map_err(|_| super::invalid())?;
-    Ok(plan)
+    let parts = arguments
+        .iter()
+        .map(|part| {
+            part.to_str()
+                .filter(|part| !part.is_empty() && part.len() <= RUNTIME_RECIPE_CHUNK_BYTES)
+                .map(String::from)
+                .ok_or_else(super::invalid)
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    CandidatePythonPlan::from_arguments(&parts).map_err(|_| super::invalid())
 }
 
 /// Zero-retention bounded-memory capture: drain both streams to real EOF and
@@ -265,6 +283,54 @@ async fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use attune_workload_backend::planning::RUNTIME_RECIPE_TIMEOUT_CHALLENGE_ENV;
+    #[test]
+    fn both_private_controls_are_consumed_before_any_child_environment() {
+        use std::collections::BTreeMap;
+        let mut environment = BTreeMap::from([
+            (CANDIDATE_PYTHON_PREP_CHALLENGE_ENV.into(), "a".repeat(64)),
+            (RUNTIME_RECIPE_TIMEOUT_CHALLENGE_ENV.into(), "b".repeat(64)),
+            ("PATH".into(), "/original/public/path".into()),
+            (
+                "ATTUNE_CANDIDATE_EFFECTS_TOKEN".into(),
+                "selected-final-only".into(),
+            ),
+        ]);
+        let (prep, timeout) = take_controls(&mut environment, true).unwrap();
+        assert_eq!(prep, "a".repeat(64));
+        assert_eq!(timeout, Some("b".repeat(64)));
+        assert!(!environment
+            .keys()
+            .any(|key| key.starts_with("ATTUNE_LAUNCH_")));
+        let final_env =
+            attune_workload_backend::planning::runtime_recipe_environment(&environment).unwrap();
+        assert_eq!(final_env["PATH"], "/original/public/path");
+        for change in 0..5 {
+            let mut invalid = BTreeMap::from([
+                (CANDIDATE_PYTHON_PREP_CHALLENGE_ENV.into(), "a".repeat(64)),
+                (RUNTIME_RECIPE_TIMEOUT_CHALLENGE_ENV.into(), "b".repeat(64)),
+            ]);
+            match change {
+                0 => {
+                    invalid.remove(CANDIDATE_PYTHON_PREP_CHALLENGE_ENV);
+                }
+                1 => {
+                    invalid.insert(CANDIDATE_PYTHON_PREP_CHALLENGE_ENV.into(), "A".repeat(64));
+                }
+                2 => {
+                    invalid.remove(RUNTIME_RECIPE_TIMEOUT_CHALLENGE_ENV);
+                }
+                3 => {
+                    invalid.insert(RUNTIME_RECIPE_TIMEOUT_CHALLENGE_ENV.into(), "B".repeat(64));
+                }
+                _ => {}
+            }
+            assert!(take_controls(&mut invalid, change != 4).is_err());
+        }
+        let mut ordinary =
+            BTreeMap::from([(CANDIDATE_PYTHON_PREP_CHALLENGE_ENV.into(), "a".repeat(64))]);
+        assert!(take_controls(&mut ordinary, false).unwrap().1.is_none());
+    }
     fn plan() -> CandidatePythonPlan {
         let metadata: serde_json::Value =
             serde_yaml_ng::from_str(include_str!("../../../packs/core/runtimes/python.yaml"))
@@ -275,6 +341,7 @@ mod tests {
             runner: "pytest".into(),
             entry: "tests/check.py".into(),
             timeout_ms: 300_000,
+            recipe: None,
         }
     }
     #[test]
