@@ -243,7 +243,8 @@ jobs:
           test "$cluster" = "attune-wl-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           node="$cluster-control-plane"
           test "$(docker --host unix:///var/run/docker.sock inspect --format '{{index .Config.Labels "io.x-k8s.kind.cluster"}}' "$node")" = "$cluster"
-          export ATTUNE_SENSOR_TEST_API_HOST=$(docker --host unix:///var/run/docker.sock inspect --format '{{(index .NetworkSettings.Networks "kind").Gateway}}' "$node")
+          ATTUNE_SENSOR_TEST_API_HOST=$(docker --host unix:///var/run/docker.sock inspect --format '{{(index .NetworkSettings.Networks "kind").Gateway}}' "$node")
+          export ATTUNE_SENSOR_TEST_API_HOST
           test -n "$ATTUNE_SENSOR_TEST_API_HOST"
           cargo test --locked -p attune-sensor --lib sensor_manager::native::provider_tests::kubernetes_native_sensor -- --exact --include-ignored --nocapture --test-threads=4
       - name: Run actual owning candidate handler with private Python recipe and result transactions
@@ -260,7 +261,8 @@ jobs:
           test "$cluster" = "attune-wl-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           node="$cluster-control-plane"
           test "$(docker --host unix:///var/run/docker.sock inspect --format '{{index .Config.Labels "io.x-k8s.kind.cluster"}}' "$node")" = "$cluster"
-          export ATTUNE_CANDIDATE_TEST_API_HOST=$(docker --host unix:///var/run/docker.sock inspect --format '{{(index .NetworkSettings.Networks "kind").Gateway}}' "$node")
+          ATTUNE_CANDIDATE_TEST_API_HOST=$(docker --host unix:///var/run/docker.sock inspect --format '{{(index .NetworkSettings.Networks "kind").Gateway}}' "$node")
+          export ATTUNE_CANDIDATE_TEST_API_HOST
           test -n "$ATTUNE_CANDIDATE_TEST_API_HOST"
           candidate_tmp=$(mktemp -d "$RUNNER_TEMP/attune-candidate-${{ matrix.arch }}.XXXXXX")
           trap 'rmdir "$candidate_tmp"' EXIT
