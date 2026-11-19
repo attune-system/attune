@@ -1046,9 +1046,14 @@ async fn failed_stop_still_joins_waiter_and_both_capture_owners() -> Result<()> 
         "aborted capture became EOF"
     );
     ensure!(
-        finish_native_stop(Err(anyhow!("owned durable stop failure")), &mut waiter)
-            .await
-            .is_err(),
+        join_native_startup_stop(
+            async { Err(anyhow!("owned durable stop failure")) },
+            &mut waiter,
+            &mut None,
+            &mut None,
+        )
+        .await
+        .is_err(),
         "stop failure became success"
     );
     ensure!(

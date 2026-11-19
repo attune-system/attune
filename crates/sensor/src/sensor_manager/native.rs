@@ -67,7 +67,7 @@ struct NativeStartupCleanup {
     tasks: tokio_util::task::TaskTracker,
     attempt: tokio_util::task::TaskTracker,
     failed: Arc<AtomicBool>,
-    cleanup: Option<futures::future::BoxFuture<'static, Result<()>>>,
+    cleanup: std::sync::Mutex<Option<futures::future::BoxFuture<'static, Result<()>>>>,
 }
 impl NativeStartupCleanup {
     fn new(
@@ -80,12 +80,16 @@ impl NativeStartupCleanup {
             tasks,
             attempt,
             failed,
-            cleanup: Some(Box::pin(cleanup)),
+            cleanup: std::sync::Mutex::new(Some(Box::pin(cleanup))),
         }
     }
     fn queue(&mut self) -> Option<JoinHandle<Result<()>>> {
         use futures::FutureExt;
-        let cleanup = self.cleanup.take()?;
+        let cleanup = self
+            .cleanup
+            .get_mut()
+            .expect("native cleanup owner")
+            .take()?;
         let failed = self.failed.clone();
         Some(self.tasks.spawn(self.attempt.track_future(async move {
             let result = std::panic::AssertUnwindSafe(cleanup)
