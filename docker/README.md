@@ -188,7 +188,7 @@ source ~/.bashrc  # or ~/.zshrc
 - Builds React application with Vite
 
 **Runtime Stage:**
-- Base: `nginx:1.25-alpine`
+- Base: `nginx:1.30.7-alpine`
 - Custom Nginx configuration
 - Static files in `/usr/share/nginx/html`
 - Environment injection script at startup
