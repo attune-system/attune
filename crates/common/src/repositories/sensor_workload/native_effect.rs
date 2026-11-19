@@ -1,7 +1,9 @@
 //! Sensor-owned native effect evidence. Live source locks precede epoch locks
 //! and the retained operation. Cleanup can close Run after source revocation.
+mod files;
 use super::*;
 use crate::{crypto, isolated_process::ResourceIdentity, workload_launch::LaunchExitOutcome};
+pub use files::SensorFileAllocation;
 use serde::{Deserialize, Serialize};
 use sqlx::types::Json;
 
@@ -14,6 +16,10 @@ fn denied() -> Error {
 pub struct SensorNativeEffect {
     pub intent: Uuid,
     pub generation: i64,
+    pub files_bound: bool,
+    pub publication_deadline: Option<DateTime<Utc>>,
+    pub worker: Id,
+    pub worker_instance: Uuid,
     pub encrypted_context: String,
     epochs: Vec<super::super::workload_source::SourceEpoch>,
     pub create_submitted: bool,
@@ -101,6 +107,10 @@ impl SensorWorkloadRepository {
         let effect = SensorNativeEffect {
             intent,
             generation: fence.generation,
+            files_bound: true,
+            publication_deadline: None,
+            worker: fence.worker_id,
+            worker_instance: fence.worker_instance,
             encrypted_context,
             epochs,
             create_submitted: false,
@@ -203,6 +213,16 @@ impl SensorWorkloadRepository {
     pub async fn stop_native_effect(pool: &PgPool, workload: Id, intent: Uuid) -> Result<()> {
         let mut tx = pool.begin().await?;
         let mut effect = Self::locked_native(&mut tx, workload, intent).await?;
+        // Retain the existing lease deadline; stop does not mint or renew
+        // publication authority. An already-expired/missing lease stays denied.
+        if !effect.stop_requested && effect.publication_deadline.is_none() {
+            effect.publication_deadline = sqlx::query_scalar(
+                "SELECT lease_expires_at FROM sensor_workload_assignment WHERE workload=$1",
+            )
+            .bind(workload)
+            .fetch_one(&mut *tx)
+            .await?;
+        }
         // Close the existing API/generation fence BEFORE provider settlement.
         // Historical context/resource remain available for cleanup only.
         sqlx::query("UPDATE sensor_workload_assignment SET lease_expires_at=clock_timestamp() WHERE workload=$1")
@@ -227,6 +247,16 @@ impl SensorWorkloadRepository {
             return Err(denied());
         }
         effect.exit = Some(exit);
+        // Retain the existing lease deadline; stop does not mint or renew
+        // publication authority. An already-expired/missing lease stays denied.
+        if !effect.stop_requested && effect.publication_deadline.is_none() {
+            effect.publication_deadline = sqlx::query_scalar(
+                "SELECT lease_expires_at FROM sensor_workload_assignment WHERE workload=$1",
+            )
+            .bind(workload)
+            .fetch_one(&mut *tx)
+            .await?;
+        }
         // Close the existing API/generation fence BEFORE provider settlement.
         // Historical context/resource remain available for cleanup only.
         sqlx::query("UPDATE sensor_workload_assignment SET lease_expires_at=clock_timestamp() WHERE workload=$1")

@@ -153,6 +153,23 @@ pub struct ApiResponse<T> {
 }
 
 impl ApiClient {
+    pub(crate) fn artifact_transport(
+        &self,
+        base: &str,
+    ) -> Result<Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>> {
+        let provider = self
+            .worker_token_provider
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Sensor file manager credential unavailable"))?;
+        Ok(Arc::new(
+            attune_common::artifact_transport::ApiTransport::new_with_worker_token_provider(
+                &self.base_url,
+                provider,
+                base,
+            )?,
+        ))
+    }
+
     /// Create a new API client
     pub fn new(
         base_url: String,

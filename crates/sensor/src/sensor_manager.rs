@@ -1225,6 +1225,11 @@ impl SensorManager {
 
         if self.inner.native.is_some() {
             self.reconcile_native_sensor(sensor.id).await?;
+            if let Some(instance) = self.inner.sensors.write().await.get_mut(&sensor.id) {
+                if instance.status.read().await.failed {
+                    instance.native = None;
+                }
+            }
         }
         let Some(workload) = self.acquire_sensor_workload(sensor.id).await? else {
             info!(
@@ -3494,6 +3499,9 @@ impl SensorManager {
                         match native.poll_exit().await {
                             Ok(Some(exit)) => {
                                 instance.cancel_token_rotation();
+                                if let Err(error) = instance.stop().await {
+                                    warn!(%error,"Retaining native sensor file/capture obligations after exit");
+                                }
                                 exited.push(ExitedSensorProcess {
                                     sensor: instance.sensor.clone(),
                                     status: instance.status.clone(),
@@ -4090,6 +4098,8 @@ impl SensorInstance {
                     }
                 }
             }
+            native.settle_files().await?;
+            self.native = None;
             return Ok(());
         }
         // Capture ownership before wait() can erase the leader ID. A missing

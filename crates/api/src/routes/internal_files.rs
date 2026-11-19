@@ -4785,6 +4785,67 @@ async fn authorize_version_mutation_source(
             "Recorded file version execution mismatch".into(),
         ));
     }
+    // Read only the immutable binding before source locks; target mutation locks
+    // follow in authorize_version_mutation_target. This does not borrow log policy.
+    let bound=attune_common::repositories::artifact::ArtifactVersionRepository::sensor_native_file_binding(&mut **tx,version.id).await.map_err(map_transport_error)?;
+    if bound.is_some()
+        && !matches!(
+            user.claims.token_type,
+            TokenType::Worker | TokenType::Sensor
+        )
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Native sensor files require their recorded sensor or manager source".into(),
+        ));
+    }
+    let sensor_file_expiry = if user.claims.token_type == TokenType::Worker
+        || user.claims.token_type == TokenType::Sensor
+    {
+        if let Some((_, _, _, worker, instance)) = bound {
+            let (actor, incarnation, fence) = if user.claims.token_type == TokenType::Sensor {
+                let fence = user.sensor_workload_fence().map_err(|_| {
+                    (
+                        StatusCode::FORBIDDEN,
+                        "Sensor file source fence unavailable".into(),
+                    )
+                })?;
+                (fence.worker_id, fence.worker_instance, Some(fence))
+            } else {
+                let actor = pack_candidate_worker_id(user)?;
+                let incarnation = user
+                    .claims
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("worker_instance"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| uuid::Uuid::parse_str(v).ok())
+                    .ok_or_else(|| {
+                        (
+                            StatusCode::FORBIDDEN,
+                            "Sensor file manager incarnation unavailable".into(),
+                        )
+                    })?;
+                (actor, incarnation, None)
+            };
+            if actor != worker || incarnation != instance {
+                return Err((StatusCode::FORBIDDEN, "Sensor file manager mismatch".into()));
+            }
+            SensorWorkloadRepository::authorize_native_file(
+                tx,
+                version.id,
+                actor,
+                incarnation,
+                fence,
+            )
+            .await
+            .map_err(map_transport_error)?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let process = Box::pin(user.validate_recorded_runtime_authority(tx))
         .await
         .map_err(map_transport_error)?;
@@ -4910,7 +4971,9 @@ async fn authorize_version_mutation_source(
     } else {
         None
     };
-    let native_publication_expiry = if let Some(native) = native {
+    let native_publication_expiry = if sensor_file_expiry.is_some() {
+        sensor_file_expiry
+    } else if let Some(native) = native {
         Some(native.retain(tx).await.map_err(map_transport_error)?)
     } else {
         None
@@ -4949,6 +5012,9 @@ async fn authorize_version_mutation_target(
     .await
     .map_err(map_repository_error)?
     .ok_or_else(|| (StatusCode::FORBIDDEN, "Artifact unavailable".into()))?;
+    SensorWorkloadRepository::require_native_file_target(tx, version.id)
+        .await
+        .map_err(map_transport_error)?;
     if let Some(credential) =
         attune_common::worker_delivery::credential(&user.claims).map_err(map_transport_error)?
     {

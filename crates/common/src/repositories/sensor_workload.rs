@@ -284,8 +284,14 @@ impl SensorWorkloadRepository {
     pub async fn release(pool: &PgPool, fence: SensorWorkloadFence) -> Result<bool> {
         let result = sqlx::query(
             "UPDATE sensor_workload_assignment \
-             SET worker = NULL, worker_instance = NULL, lease_expires_at = NULL, \
-                 assigned_at = NULL, renewed_at = NULL \
+             SET worker = CASE WHEN native_effect IS NULL THEN NULL ELSE worker END, \
+                 worker_instance = CASE WHEN native_effect IS NULL THEN NULL ELSE worker_instance END, \
+                 native_effect = CASE WHEN native_effect IS NULL THEN NULL ELSE native_effect || \
+                     jsonb_build_object('stop_requested',true,'publication_deadline', \
+                         CASE WHEN (native_effect->>'stop_requested')::BOOLEAN IS TRUE \
+                             OR native_effect->>'publication_deadline' IS NOT NULL \
+                         THEN native_effect->'publication_deadline' ELSE to_jsonb(lease_expires_at) END) END, \
+                 lease_expires_at = NULL, assigned_at = NULL, renewed_at = NULL \
              WHERE workload = $1 AND worker = $2 AND worker_instance = $3 \
                AND generation = $4",
         )

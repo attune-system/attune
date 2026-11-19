@@ -2821,6 +2821,37 @@ impl ArtifactVersionRepository {
     /// Find all file-backed versions for artifacts owned by a specific scope/owner.
     /// Used by standalone sensor agents to copy locally staged sensor artifacts
     /// back to the API-accessible artifact transport when a sensor process exits.
+    pub async fn sensor_native_file_binding<'e, E>(
+        executor: E,
+        version: i64,
+    ) -> Result<Option<(i64, i64, uuid::Uuid, i64, uuid::Uuid)>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        sqlx::query_as("SELECT sensor_workload,sensor_generation,sensor_native_intent,sensor_worker,sensor_worker_instance FROM artifact_version WHERE id=$1 AND sensor_native_intent IS NOT NULL")
+            .bind(version).fetch_optional(executor).await.map_err(Into::into)
+    }
+
+    /// Ordinary files allocated to one exact native sensor generation only.
+    pub async fn find_sensor_native_files<'e, E>(
+        executor: E,
+        workload: i64,
+        generation: i64,
+        intent: uuid::Uuid,
+    ) -> Result<Vec<ArtifactVersion>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
+        let query=format!("SELECT {} FROM artifact_version av WHERE av.sensor_workload=$1 AND av.sensor_generation=$2 AND av.sensor_native_intent=$3",Self::select_columns_with_alias("av"));
+        sqlx::query_as(&query)
+            .bind(workload)
+            .bind(generation)
+            .bind(intent)
+            .fetch_all(executor)
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn find_file_versions_by_scope_and_owner<'e, E>(
         executor: E,
         scope: OwnerType,

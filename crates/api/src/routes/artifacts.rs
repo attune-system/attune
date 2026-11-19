@@ -12,6 +12,9 @@
 //! - Upsert-and-allocate: create-or-reuse an artifact by ref and allocate a file-backed version path in one call
 //! - SSE streaming for file-backed artifacts (live tail while execution is running)
 
+#[path = "sensor_file_allocation.rs"]
+mod sensor_files;
+
 use axum::{
     body::{Body, Bytes},
     extract::{Multipart, Path, Query, State},
@@ -1243,6 +1246,7 @@ pub async fn create_version_file(
 ) -> ApiResult<impl IntoResponse> {
     crate::recorded_files::validate_file_descriptors(&user, &request.meta, &request.created_by)?;
     let mut tx = state.db.begin().await?;
+    let sensor_allocation = sensor_files::allocation(&mut tx, &user).await?;
     let retained = if user.claims.token_type == TokenType::Execution
         && !crate::recorded_consumers::is_recorded(&user)?
     {
@@ -1310,6 +1314,7 @@ pub async fn create_version_file(
         source.as_ref(),
     )
     .await?;
+    sensor_files::bind(&mut tx, sensor_allocation, version.id).await?;
     if retained.is_some() {
         // All source locks are already retained; repeat the clock checks after
         // target waits without releasing the admitted native Run fence.
@@ -3264,6 +3269,7 @@ pub async fn allocate_file_version_by_ref(
     )
     .await;
     let mut tx = state.db.begin().await?;
+    let sensor_allocation = sensor_files::allocation(&mut tx, &user).await?;
     let retained = if user.claims.token_type == TokenType::Execution {
         Some(
             crate::authz::AuthorizationService::retain_legacy_execution_snapshot_on(&mut tx, &user)
@@ -3360,6 +3366,7 @@ pub async fn allocate_file_version_by_ref(
         request.created_by,
     )
     .await?;
+    sensor_files::bind(&mut tx, sensor_allocation, version.id).await?;
     if retained.is_some() {
         attune_common::repositories::delegated_execution::DelegatedExecutionRepository::retain_claims(
             &mut tx, &user.claims,

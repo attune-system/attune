@@ -3197,3 +3197,432 @@ async fn native_sensor_effect_fences_stale_generation_replay_and_restart() {
     );
     pool.cleanup().await.unwrap();
 }
+
+#[tokio::test]
+async fn native_sensor_files_are_generation_bound_and_replacement_cannot_publish_or_clear() {
+    native_sensor_file_case(false).await;
+}
+
+#[tokio::test]
+async fn native_sensor_file_publication_rechecks_original_deadline_after_target_wait() {
+    native_sensor_file_case(true).await;
+}
+
+async fn native_sensor_file_case(deadline_wait: bool) {
+    use attune_common::{
+        isolated_process::ResourceIdentity,
+        models::enums::{
+            ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType,
+            RetentionPolicyType,
+        },
+        repositories::artifact::{
+            ArtifactRepository, ArtifactVersionRepository, CreateArtifactInput,
+        },
+        workload_launch::LaunchExitOutcome,
+    };
+    let (pool, sensor, worker, _) = setup_fixture().await;
+    create_active_rule(&pool, &sensor).await;
+    let artifact = ArtifactRepository::create(
+        &*pool,
+        CreateArtifactInput {
+            r#ref: format!("sensor.{}.ordinary", sensor.r#ref),
+            scope: OwnerType::Sensor,
+            owner: sensor.r#ref.clone(),
+            r#type: ArtifactType::FileText,
+            visibility: ArtifactVisibility::Private,
+            classification: ArtifactClassification::General,
+            retention_policy: RetentionPolicyType::Versions,
+            retention_limit: 10,
+            name: None,
+            description: None,
+            content_type: None,
+            data: None,
+        },
+    )
+    .await
+    .unwrap();
+    let historical = ArtifactVersionRepository::create_file_backed(
+        &*pool,
+        artifact.id,
+        &artifact.r#ref,
+        "text/plain".into(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let instance = Uuid::new_v4();
+    let outcome = SensorWorkloadAdmissionRepository::acquire_with_encryption_key(
+        &pool,
+        acquire_input(sensor.id, worker.id, instance),
+        Some("0123456789abcdef0123456789abcdef"),
+    )
+    .await
+    .unwrap();
+    let AcquireEligibleSensorWorkloadOutcome::Acquired(workload) = outcome else {
+        panic!("admission")
+    };
+    let intent = Uuid::new_v4();
+    SensorWorkloadRepository::reserve_native_effect(
+        &pool,
+        sensor.id,
+        workload.fence(),
+        intent,
+        "private bootstrap",
+        "0123456789abcdef0123456789abcdef",
+    )
+    .await
+    .unwrap();
+    SensorWorkloadRepository::consume_native_effect(
+        &pool,
+        sensor.id,
+        workload.fence(),
+        intent,
+        false,
+    )
+    .await
+    .unwrap();
+    let resource = ResourceIdentity::Docker {
+        engine_id: 1,
+        daemon_id: "owned".into(),
+        container_id: "exact".into(),
+    };
+    SensorWorkloadRepository::record_native_resource(
+        &pool,
+        workload.workload_id,
+        intent,
+        &resource,
+    )
+    .await
+    .unwrap();
+    SensorWorkloadRepository::consume_native_effect(
+        &pool,
+        sensor.id,
+        workload.fence(),
+        intent,
+        true,
+    )
+    .await
+    .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    let allocation =
+        SensorWorkloadRepository::lock_native_file_allocation(&mut tx, sensor.id, workload.fence())
+            .await
+            .unwrap()
+            .unwrap();
+    let version = ArtifactVersionRepository::create_file_backed_with_conn(
+        &mut tx,
+        artifact.id,
+        &artifact.r#ref,
+        "text/plain".into(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    SensorWorkloadRepository::bind_native_file(&mut tx, allocation, version.id)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    if deadline_wait {
+        // Shorten the existing run lease BEFORE stop captures it; never mint
+        // publication authority after release or move a retained deadline.
+        sqlx::query("UPDATE sensor_workload_assignment SET lease_expires_at=clock_timestamp()+interval '2 seconds' WHERE workload=$1")
+            .bind(workload.workload_id).execute(&*pool).await.unwrap();
+        SensorWorkloadRepository::stop_native_effect(&pool, workload.workload_id, intent)
+            .await
+            .unwrap();
+        SensorWorkloadRepository::record_native_exit(
+            &pool,
+            workload.workload_id,
+            intent,
+            &resource,
+            LaunchExitOutcome {
+                exit_code: 0,
+                oom_killed: false,
+            },
+        )
+        .await
+        .unwrap();
+        SensorWorkloadRepository::release(&pool, workload.fence())
+            .await
+            .unwrap();
+        let mut blocker = pool.begin().await.unwrap();
+        ArtifactVersionRepository::find_by_id_for_update(&mut blocker, version.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let task_pool = pool.clone();
+        let version_id = version.id;
+        let worker_id = worker.id;
+        let waiter = tokio::spawn(async move {
+            let mut tx = task_pool.begin().await.unwrap();
+            let proof = SensorWorkloadRepository::authorize_native_file(
+                &mut tx, version_id, worker_id, instance, None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            sender.send(pid).unwrap();
+            ArtifactVersionRepository::find_by_id_for_update(&mut tx, version_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let denied = proof.ensure_fresh_on(&mut tx).await.is_err();
+            tx.rollback().await.unwrap();
+            denied
+        });
+        let pid = receiver.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let blocked: bool =
+                    sqlx::query_scalar("SELECT cardinality(pg_blocking_pids($1))>0")
+                        .bind(pid)
+                        .fetch_one(&*pool)
+                        .await
+                        .unwrap();
+                if blocked {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("waiter must actually wait on the selected version");
+        let deadline = SensorWorkloadRepository::native_effect(&pool, workload.workload_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .publication_deadline
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let expired: bool = sqlx::query_scalar("SELECT clock_timestamp()>$1")
+                    .bind(deadline)
+                    .fetch_one(&*pool)
+                    .await
+                    .unwrap();
+                if expired {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recorded publication deadline must elapse");
+        blocker.rollback().await.unwrap();
+        assert!(
+            waiter.await.unwrap(),
+            "target wait must not hide expired original publication authority"
+        );
+        assert!(!SensorWorkloadRepository::native_files_complete(
+            &pool,
+            workload.workload_id,
+            intent
+        )
+        .await
+        .unwrap());
+        assert!(
+            SensorWorkloadRepository::native_effect(&pool, workload.workload_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        pool.cleanup().await.unwrap();
+        return;
+    }
+    assert!(
+        SensorWorkloadRepository::native_file_inventory(&pool, workload.workload_id, intent)
+            .await
+            .is_err(),
+        "running is not a closed inventory"
+    );
+    SensorWorkloadRepository::stop_native_effect(&pool, workload.workload_id, intent)
+        .await
+        .unwrap();
+    SensorWorkloadRepository::record_native_exit(
+        &pool,
+        workload.workload_id,
+        intent,
+        &resource,
+        LaunchExitOutcome {
+            exit_code: 0,
+            oom_killed: false,
+        },
+    )
+    .await
+    .unwrap();
+    SensorWorkloadRepository::record_native_capture(&pool, workload.workload_id, intent, false)
+        .await
+        .unwrap();
+    SensorWorkloadRepository::record_native_capture(&pool, workload.workload_id, intent, true)
+        .await
+        .unwrap();
+    SensorWorkloadRepository::release(&pool, workload.fence())
+        .await
+        .unwrap();
+    let retained = SensorWorkloadRepository::native_effect(&pool, workload.workload_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        retained.publication_deadline.is_some(),
+        "stop retains the pre-stop lease deadline"
+    );
+    let mut tx = pool.begin().await.unwrap();
+    let proof = SensorWorkloadRepository::authorize_native_file(
+        &mut tx, version.id, worker.id, instance, None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    ArtifactVersionRepository::find_by_id_for_update(&mut tx, version.id)
+        .await
+        .unwrap()
+        .unwrap();
+    proof.ensure_fresh_on(&mut tx).await.unwrap();
+    assert!(proof.approval_deadline().unwrap() <= retained.publication_deadline.unwrap());
+    tx.rollback().await.unwrap();
+    let selected =
+        SensorWorkloadRepository::native_file_inventory(&pool, workload.workload_id, intent)
+            .await
+            .unwrap();
+    assert_eq!(
+        selected.iter().map(|v| v.id).collect::<Vec<_>>(),
+        vec![version.id]
+    );
+    assert_ne!(selected[0].id, historical.id);
+    assert!(
+        !SensorWorkloadRepository::native_files_complete(&pool, workload.workload_id, intent)
+            .await
+            .unwrap()
+    );
+    let mut tx = pool.begin().await.unwrap();
+    assert!(
+        SensorWorkloadRepository::lock_native_file_allocation(&mut tx, sensor.id, workload.fence())
+            .await
+            .is_err(),
+        "stop closes allocation"
+    );
+    tx.rollback().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    assert!(SensorWorkloadRepository::authorize_native_file(
+        &mut tx,
+        version.id,
+        worker.id,
+        Uuid::new_v4(),
+        None
+    )
+    .await
+    .is_err());
+    tx.rollback().await.unwrap();
+    assert!(
+        SensorWorkloadRepository::acknowledge_native_removed(
+            &pool,
+            workload.workload_id,
+            intent,
+            worker.id,
+            Uuid::new_v4()
+        )
+        .await
+        .is_err(),
+        "replacement cannot clear"
+    );
+    assert!(
+        SensorWorkloadRepository::record_native_file_receipt(
+            &pool,
+            workload.workload_id,
+            intent,
+            version.id,
+            0
+        )
+        .await
+        .is_err(),
+        "zero is not a receipt while Pending"
+    );
+    assert!(
+        sqlx::query("DELETE FROM artifact_version WHERE id=$1")
+            .bind(version.id)
+            .execute(&*pool)
+            .await
+            .is_err(),
+        "retention cannot erase an obligation"
+    );
+    assert!(
+        sqlx::query("DELETE FROM sensor_workload_assignment WHERE workload=$1")
+            .bind(workload.workload_id)
+            .execute(&*pool)
+            .await
+            .is_err(),
+        "source retention cannot erase the retained provider intent"
+    );
+    ArtifactVersionRepository::mark_body_ready(
+        &pool,
+        version.id,
+        "owned-db-receipt-fixture",
+        0,
+        attune_common::workload_launch::Sha256Digest::of_bytes(b"").as_str(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    assert!(
+        SensorWorkloadRepository::authorize_native_file(
+            &mut tx,
+            version.id,
+            worker.id,
+            Uuid::new_v4(),
+            None
+        )
+        .await
+        .is_err(),
+        "Ready does not transfer publication identity"
+    );
+    tx.rollback().await.unwrap();
+    SensorWorkloadRepository::record_native_file_receipt(
+        &pool,
+        workload.workload_id,
+        intent,
+        version.id,
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(
+        SensorWorkloadRepository::native_files_complete(&pool, workload.workload_id, intent)
+            .await
+            .unwrap()
+    );
+    assert!(
+        SensorWorkloadRepository::acknowledge_native_removed(
+            &pool,
+            workload.workload_id,
+            intent,
+            worker.id,
+            Uuid::new_v4()
+        )
+        .await
+        .is_err(),
+        "even complete files do not transfer cleanup identity"
+    );
+    // This repository test supplies the owning provider acknowledgement as an
+    // input; it does not establish real provider stopped-writer evidence.
+    SensorWorkloadRepository::acknowledge_native_removed(
+        &pool,
+        workload.workload_id,
+        intent,
+        worker.id,
+        instance,
+    )
+    .await
+    .unwrap();
+    pool.cleanup().await.unwrap();
+}

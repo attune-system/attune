@@ -578,9 +578,11 @@ policy denies residual local launches. The existing manager still owns placement
 workload generation admission, token provisioning/renewal, configuration restoration,
 events and log artifacts. Ordinary released sensor entrypoints use private native
 resources with the retained release archive, configured image/platform and public
-Runner pins. Bootstrap stays exact stdin JSON with a 32 MiB sensor ceiling; the
-shared purpose-bound stdin constructor must be integrated before larger native
-bootstraps are supported. Host interpreter inventories are never guest evidence.
+Runner pins. Bootstrap stays exact stdin JSON with a 32 MiB sensor ceiling. Its
+exact JSON bytes are retained inside encrypted context; the purpose-bound sensor payload is
+constructed only after the durable one-shot stdin fence. General API stdin stays
+limited to 8 MiB and cannot serialize this sensor payload. Host interpreter
+inventories are never guest evidence.
 
 Migration `20261119000008_sensor_native_effect.sql` adds encrypted retained effect
 context to the existing assignment row. Source epochs and the live generation fence
@@ -590,11 +592,27 @@ settlement. Restart reconciles only the same retained intent, never replaying st
 Separate bounded stdout/stderr readers use existing manager-owned encrypted log
 artifacts; only genuine EOF plus successful sealing records a capture receipt.
 
-This path is work in progress and does not activate deployment defaults. Runtime
-recipes/setup require the shared native discovery/private-generation producer and
-remain explicitly denied. Native stopped file-output inventory/publication receipts
-are also pending. Consequently stopped resources and their assignment evidence are
-retained, and a new generation (including retry or token-rotation restart) remains
-blocked until those obligations can be settled. Provider exit, 404, missing capture
-or a manager filesystem scan cannot clear them. Provider/PG fixtures and complete
-lifecycle acceptance remain required before activation.
+This path is work in progress and does not activate deployment defaults. Ordinary
+file versions allocated through the sensor API retain exact workload/generation,
+intent and original manager incarnation in distinct version columns (migration
+`20261119000010_sensor_native_files.sql`). Stop closes allocation before selecting
+that inventory. Pending selected files use bounded stopped reads and authenticated
+API upload/completion; Ready versions request a size receipt without reading guest
+or published plaintext. Every selected version, including an empty file, requires
+an exact positive receipt before acknowledged provider removal can clear the effect.
+Runtime-log versions retain their separate generation and sealing contracts.
+Stop retains the existing assignment lease deadline before expiring Run. Pending
+publication by the original manager requires that retained deadline and its fresh
+worker heartbeat, including after artifact/version waits. Neither stop nor release
+creates or extends publication authority; an expired or missing deadline retains
+pending files. Ready size acknowledgements are historical receipts, not new body
+publication authority.
+
+Missing files, lost acknowledgements, incomplete capture and replaced manager
+incarnations retain all obligations. Effects predating the allocation hooks lack
+complete inventory proof and cannot clear on an empty selection. This is not
+completed cross-incarnation restart recovery: no publication authority or original
+source epoch is rebound to a new manager. Provider/PG lifecycle acceptance is still
+required. Recipes/setup and native discovery remain denied pending the shared
+producer. Sensor registration must first use the existing fenced WorkerRepository
+incarnation methods; the genuine runtime-probe source check is not weakened.

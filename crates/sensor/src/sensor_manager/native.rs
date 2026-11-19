@@ -18,17 +18,18 @@ struct Context {
     platform: LaunchPlatform,
     inputs: Vec<PinnedLaunchInput>,
     invocation: LaunchInvocation,
+    bootstrap_json: String,
 }
 impl Context {
-    fn spec(self) -> ProcessSpec {
+    fn spec(&self) -> ProcessSpec {
         ProcessSpec {
             intent: self.intent,
             purpose: LaunchPurpose::Sensor,
-            target: self.target,
-            image: self.image,
+            target: self.target.clone(),
+            image: self.image.clone(),
             platform: self.platform,
-            inputs: self.inputs,
-            invocation: self.invocation,
+            inputs: self.inputs.clone(),
+            invocation: self.invocation.clone(),
             pack_access: PackAccess::ReadOnly,
             stage: None,
             timeout_ms: None,
@@ -41,6 +42,10 @@ pub(super) struct NativeSensor {
     workload: Id,
     spec: ProcessSpec,
     resource: ResourceIdentity,
+    backend: attune_workload_backend::configuration::NativeBackend,
+    transport: Arc<dyn ArtifactFileTransport>,
+    worker: Id,
+    incarnation: uuid::Uuid,
     control: Arc<dyn attune_common::isolated_process::ProcessControl>,
     wait_task: Option<JoinHandle<attune_common::Result<LaunchExitOutcome>>>,
 }
@@ -64,6 +69,19 @@ impl NativeSensor {
         .await?;
         Ok(Some(exit))
     }
+    pub(super) async fn settle_files(&self) -> Result<()> {
+        settle_files(
+            &self.pool,
+            self.workload,
+            &self.spec,
+            &self.resource,
+            &self.backend,
+            self.transport.as_ref(),
+            self.worker,
+            self.incarnation,
+        )
+        .await
+    }
     pub(super) async fn stop(&mut self) -> Result<()> {
         // Run is durably fenced before the provider call, including after revoke.
         Ledger::stop_native_effect(&self.pool, self.workload, self.spec.intent).await?;
@@ -80,8 +98,6 @@ impl NativeSensor {
             task.abort();
             let _ = task.await;
         }
-        // Capture/file publication is an independent obligation. Do not remove
-        // a resource or discard its row merely because the payload exited.
         Ok(())
     }
 }
@@ -136,10 +152,20 @@ impl SensorManager {
             .stop_retained(&spec, &resource, LaunchStopReason::Shutdown)
             .await?;
         Ledger::record_native_exit(&self.inner.db, workload, spec.intent, &resource, exit).await?;
-        // Missing capture and file receipts are never invented by restart.
-        Err(anyhow!(
-            "Stopped sensor retained pending capture/file publication receipts"
-        ))
+        settle_files(
+            &self.inner.db,
+            workload,
+            &spec,
+            &resource,
+            &native.backend,
+            self.inner
+                .api_client
+                .artifact_transport(self.inner.artifact_transport.base_dir())?
+                .as_ref(),
+            self.inner.worker_id.load(Ordering::Acquire),
+            self.inner.worker_instance,
+        )
+        .await
     }
 
     async fn prepare_native_pack(
@@ -298,9 +324,6 @@ impl SensorManager {
             .filter(|v| !v.is_null())
             .unwrap_or_else(|| serde_json::json!({}));
         let bootstrap = encode_bootstrap(&config_value, &triggers)?;
-        // This constructor currently enforces the shared Runner bound. Fail
-        // before resource creation if the purpose-bound 32 MiB hook is absent.
-        let payload = attune_common::workload_stdin::LaunchStdinPayload::from_bytes(bootstrap)?;
         let release = attune_common::repositories::PackReleaseRepository::find_by_id(
             &self.inner.db,
             pack_revision.release_id,
@@ -373,6 +396,8 @@ impl SensorManager {
             PackAccess::ReadOnly,
         )?;
         let context = Context {
+            bootstrap_json: String::from_utf8(bootstrap)
+                .map_err(|_| anyhow!("Sensor bootstrap encoding invalid"))?,
             intent: uuid::Uuid::new_v4(),
             target: LaunchTarget::Sensor {
                 sensor: sensor.id,
@@ -480,6 +505,9 @@ impl SensorManager {
             true,
         )
         .await?;
+        let payload = attune_common::workload_stdin::LaunchStdinPayload::for_sensor_bootstrap(
+            context.bootstrap_json.into_bytes(),
+        )?;
         io.control.write_stdin_once(payload).await?;
         self.persist_sensor_process_started(&sensor, None, reset)
             .await;
@@ -491,6 +519,13 @@ impl SensorManager {
                 workload: workload.workload_id,
                 spec,
                 resource,
+                backend: native.backend.clone(),
+                transport: self
+                    .inner
+                    .api_client
+                    .artifact_transport(self.inner.artifact_transport.base_dir())?,
+                worker: workload.worker_id,
+                incarnation: workload.worker_instance,
                 control: io.control,
                 wait_task: Some(wait_task),
             }),
@@ -631,5 +666,205 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert_eq!(error, "Sensor bootstrap exceeds its 32 MiB delivery limit");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn settle_files(
+    pool: &PgPool,
+    workload: Id,
+    spec: &ProcessSpec,
+    resource: &ResourceIdentity,
+    backend: &attune_workload_backend::configuration::NativeBackend,
+    transport: &dyn ArtifactFileTransport,
+    worker: Id,
+    incarnation: uuid::Uuid,
+) -> Result<()> {
+    if !matches!(spec.target,LaunchTarget::Sensor{workload:id,worker:owner,worker_instance,..}
+        if id==workload && owner==worker && worker_instance==incarnation)
+    {
+        return Err(anyhow!(
+            "Replacement sensor incarnation cannot publish retained files"
+        ));
+    }
+    let effect = Ledger::native_effect(pool, workload)
+        .await?
+        .ok_or_else(|| anyhow!("Sensor effect unavailable"))?;
+    if effect.intent != spec.intent || !effect.capture_complete() {
+        return Err(anyhow!("Sensor capture receipts incomplete"));
+    }
+    let versions = Ledger::native_file_inventory(pool, workload, spec.intent).await?;
+    for version in versions {
+        let path = version
+            .file_path
+            .as_deref()
+            .ok_or_else(|| anyhow!("Native sensor file path unavailable"))?;
+        let bytes =
+            if version.body_state == Some(attune_common::models::enums::ArtifactBodyState::Ready) {
+                // API-ready bodies are immutable receipts; do not read plaintext or
+                // require a guest staging file for direct uploads, including empty.
+                let expected = version
+                    .size_bytes
+                    .and_then(|v| u64::try_from(v).ok())
+                    .ok_or_else(|| anyhow!("Ready sensor file size unavailable"))?;
+                acknowledge_ready_file(transport, path, expected).await?
+            } else {
+                let relative = attune_common::artifact_transport::ValidatedRelativePath::new(path)?;
+                let source = backend
+                    .read_stopped_artifact(spec, resource, &relative, i64::MAX as u64)
+                    .await?
+                    .ok_or_else(|| anyhow!("Allocated sensor file was not written"))?;
+                publish_stopped_file(
+                    transport,
+                    source,
+                    path,
+                    version.content_type.as_deref(),
+                    i64::MAX as u64,
+                )
+                .await?
+            };
+        Ledger::record_native_file_receipt(pool, workload, spec.intent, version.id, bytes).await?;
+    }
+    if !Ledger::native_files_complete(pool, workload, spec.intent).await? {
+        return Err(anyhow!("Sensor file obligations incomplete"));
+    }
+    backend.remove_stopped(spec, resource).await?;
+    Ledger::acknowledge_native_removed(pool, workload, spec.intent, worker, incarnation).await?;
+    Ok(())
+}
+
+async fn publish_stopped_file(
+    transport: &dyn ArtifactFileTransport,
+    source: std::fs::File,
+    path: &str,
+    content_type: Option<&str>,
+    max_bytes: u64,
+) -> attune_common::Result<u64> {
+    let (snapshot, size) = tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Seek};
+        let io_error = |_| Error::io("Stopped artifact snapshot I/O failed");
+        let mut source = source;
+        source.rewind().map_err(io_error)?;
+        let metadata = source.metadata().map_err(io_error)?;
+        if !metadata.is_file() {
+            return Err(Error::invalid_state(
+                "Stopped artifact is not a regular file",
+            ));
+        }
+        let expected = metadata.len();
+        if expected > max_bytes {
+            return Err(Error::validation(
+                "Stopped artifact exceeds publication bounds",
+            ));
+        }
+        let mut snapshot = tempfile::NamedTempFile::new().map_err(io_error)?;
+        let copied = std::io::copy(
+            &mut source.take(expected.saturating_add(1)),
+            snapshot.as_file_mut(),
+        )
+        .map_err(io_error)?;
+        if copied != expected {
+            return Err(Error::invalid_state(
+                "Stopped artifact changed before publication",
+            ));
+        }
+        snapshot.as_file().sync_all().map_err(io_error)?;
+        Ok::<_, Error>((snapshot, copied))
+    })
+    .await
+    .map_err(|_| Error::invalid_state("Stopped artifact snapshot did not complete"))??;
+    let uploaded = transport
+        .write_file_from_path(path, snapshot.path(), content_type)
+        .await
+        .map_err(|_| {
+            Error::retryable_transport("Native artifact upload acknowledgement pending")
+        })?;
+    if uploaded != size
+        || transport.complete_file(path).await.map_err(|_| {
+            Error::retryable_transport("Native artifact publication acknowledgement pending")
+        })? != Some(size)
+    {
+        return Err(Error::invalid_state(
+            "Artifact publication acknowledgement mismatch",
+        ));
+    }
+    Ok(size)
+}
+
+async fn acknowledge_ready_file(
+    transport: &dyn ArtifactFileTransport,
+    path: &str,
+    expected: u64,
+) -> Result<u64> {
+    if transport.complete_file(path).await? != Some(expected) {
+        return Err(anyhow!("Ready sensor file receipt mismatch"));
+    }
+    Ok(expected)
+}
+
+#[cfg(test)]
+mod file_receipt_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn ready_receipt_uses_only_completion_without_plaintext_or_local_staging() {
+        for (header, expected, success) in [
+            ("x-attune-size: 0\r\n", 0, true),
+            ("x-attune-size: 7\r\n", 7, true),
+            ("x-attune-size: 1\r\n", 0, false),
+            ("", 0, false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut chunk = [0u8; 1024];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert!(
+                        count > 0 && request.len() + count <= 8192,
+                        "bounded HTTP fixture header"
+                    );
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                let request = String::from_utf8_lossy(&request);
+                assert!(
+                    request.starts_with(
+                        "POST /api/v1/internal/artifacts/complete/files/versions/42/output.txt "
+                    ),
+                    "{request}"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n{header}\r\n"
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+            let transport = attune_common::artifact_transport::ApiTransport::new(
+                &format!("http://{address}"),
+                "owned-fixture-token",
+                "/nonexistent-native-staging",
+            )
+            .unwrap();
+            let result =
+                acknowledge_ready_file(&transport, "files/versions/42/output.txt", expected).await;
+            assert_eq!(result.is_ok(), success);
+            server.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn sensor_bootstrap_above_general_limit_is_sensor_only_and_private() {
+        let bytes = encode_bootstrap(
+            &serde_json::json!({"private":"x".repeat(9*1024*1024)}),
+            &Vec::<String>::new(),
+        )
+        .unwrap();
+        let payload =
+            attune_common::workload_stdin::LaunchStdinPayload::for_sensor_bootstrap(bytes).unwrap();
+        assert!(payload.validate_for(LaunchPurpose::Sensor).is_ok());
+        assert!(payload.validate_for(LaunchPurpose::Action).is_err());
+        assert!(serde_json::to_vec(&payload).is_err());
     }
 }
