@@ -760,6 +760,9 @@ impl WorkerService {
             .ok_or_else(|| Error::invalid_state("Worker registration incarnation unavailable"))?;
         self.executor.set_process_incarnation(incarnation)?;
         self.executor.start_log_delivery(delivery).await?;
+        self.heartbeat
+            .start_registered(self.db_pool.clone(), worker_id, incarnation)
+            .await?;
 
         info!("Worker registered with ID: {}", worker_id);
 
@@ -799,9 +802,6 @@ impl WorkerService {
                 );
             }
         }
-
-        // Start heartbeat
-        self.heartbeat.start().await?;
 
         // Start consuming execution messages
         self.start_execution_consumer().await?;

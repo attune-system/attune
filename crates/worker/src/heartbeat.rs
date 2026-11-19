@@ -44,6 +44,22 @@ impl HeartbeatManager {
     /// This spawns a background task that periodically updates the worker's heartbeat
     /// in the database. The task will continue running until `stop()` is called.
     pub async fn start(&self) -> Result<()> {
+        self.start_bound(None).await
+    }
+
+    /// Native discovery may hold the registration write lock while awaiting
+    /// guest effects. Heartbeats retain the acknowledged incarnation directly
+    /// so discovery cannot prevent its own lease from being renewed.
+    pub(crate) async fn start_registered(
+        &self,
+        pool: sqlx::PgPool,
+        worker_id: i64,
+        incarnation: uuid::Uuid,
+    ) -> Result<()> {
+        self.start_bound(Some((pool, worker_id, incarnation))).await
+    }
+
+    async fn start_bound(&self, binding: Option<(sqlx::PgPool, i64, uuid::Uuid)>) -> Result<()> {
         let mut task = self.task.lock().await;
         if task.is_some() {
             warn!("Heartbeat manager is already running");
@@ -72,8 +88,14 @@ impl HeartbeatManager {
                 let update_result = tokio::select! {
                     _ = task_cancellation.cancelled() => break,
                     result = async {
-                        let reg = registration.read().await;
-                        reg.update_heartbeat().await
+                        if let Some((pool, worker_id, incarnation)) = &binding {
+                            attune_common::repositories::runtime::WorkerRepository::heartbeat_incarnation(
+                                pool, *worker_id, *incarnation,
+                            ).await
+                        } else {
+                            let reg = registration.read().await;
+                            reg.update_heartbeat().await
+                        }
                     } => result,
                 };
 
@@ -149,6 +171,7 @@ mod tests {
         let pool = database.pool().clone();
         let mut registration = WorkerRegistration::new(pool.clone(), &config);
         let worker_id = registration.register().await.unwrap();
+        let incarnation = registration.registered_incarnation().unwrap();
         let initial_heartbeat = WorkerRepository::get_by_id(&pool, worker_id)
             .await
             .unwrap()
@@ -158,7 +181,11 @@ mod tests {
         let manager = HeartbeatManager::new(registration.clone(), 1);
 
         // Start heartbeat
-        manager.start().await.unwrap();
+        let discovery_guard = registration.write().await;
+        manager
+            .start_registered(pool.clone(), worker_id, incarnation)
+            .await
+            .unwrap();
         assert!(manager.is_running().await);
 
         let heartbeat_advanced = tokio::time::timeout(Duration::from_secs(5), async {
@@ -175,14 +202,16 @@ mod tests {
 
         // Stop and join the background task before asserting or cleaning up.
         manager.stop().await;
+        drop(discovery_guard);
         assert!(!manager.is_running().await);
-        assert!(
-            heartbeat_advanced,
-            "worker heartbeat did not advance within the timeout"
-        );
-
         // Deregister worker
         let reg = registration.read().await;
         reg.deregister().await.unwrap();
+        drop(reg);
+        database.cleanup().await.unwrap();
+        assert!(
+            heartbeat_advanced,
+            "worker heartbeat did not advance while discovery held registration"
+        );
     }
 }
