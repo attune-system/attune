@@ -208,23 +208,31 @@ impl ActionExecutor {
             if debt.is_empty() {
                 break;
             }
-            for (old, submitted, resource) in debt {
-                Probe::request_stop(&self.pool, old.intent).await?;
+            for (old, submitted, retained) in debt {
                 if !submitted {
+                    Probe::request_stop(&self.pool, old.intent).await?;
                     Probe::acknowledge_removed(&self.pool, old.intent, None).await?;
                     continue;
                 }
-                let resource = match resource {
+                let newly_observed = retained.is_none();
+                let resource = match retained {
                     Some(resource) => resource,
-                    None => {
-                        let resource=backend.launcher().prepare(&old,attune_common::isolated_process::ProcessCreateDisposition::ReconcileOnly).await?;
-                        Probe::record_resource(&self.pool, old.intent, &resource).await?;
-                        resource
-                    }
+                    None => backend.launcher().prepare(&old,attune_common::isolated_process::ProcessCreateDisposition::ReconcileOnly).await?,
                 };
-                let exit = backend
-                    .stop_retained(&old, &resource, LaunchStopReason::SourceRevoked)
-                    .await?;
+                // A blocked DB fence cannot delay stopping an exact known writer.
+                // Settlement/removal/replacement still require BOTH acknowledgements.
+                let fence = async {
+                    if newly_observed {
+                        Probe::record_resource(&self.pool, old.intent, &resource).await?;
+                    }
+                    Probe::request_stop(&self.pool, old.intent).await
+                };
+                let (fenced, stopped) = tokio::join!(
+                    fence,
+                    backend.stop_retained(&old, &resource, LaunchStopReason::SourceRevoked)
+                );
+                fenced?;
+                let exit = stopped?;
                 Probe::record_exit(&self.pool, old.intent, &resource, exit).await?;
                 backend.remove_stopped(&old, &resource).await?;
                 Probe::acknowledge_removed(&self.pool, old.intent, Some(&resource)).await?;
@@ -420,30 +428,35 @@ impl ActionExecutor {
     async fn settle_old_native_setups(&self, environment: i64, master: &str) -> Result<()> {
         let backend = self.native_backend.as_ref().ok_or_else(denied)?;
         loop {
-            let debt = Setup::unsettled(&self.pool, environment, None, master).await?;
+            let debt =
+                Setup::unsettled_with_resources(&self.pool, environment, None, master).await?;
             if debt.is_empty() {
                 return Ok(());
             }
-            for (spec, submitted) in debt {
-                // Close publication/input before any uncertain provider wait.
-                Effects::request_stop(&self.pool, spec.intent).await?;
+            for (spec, submitted, retained) in debt {
                 if !submitted {
-                    // Repository rechecks the first-submit bit under its lock;
-                    // a racing submitted create can never become absence.
+                    Effects::request_stop(&self.pool, spec.intent).await?;
+                    // The repository rechecks the create latch under its lock.
                     Setup::acknowledge_removed(&self.pool, spec.intent, None).await?;
                     continue;
                 }
-                let resource = match Effects::retained_resource(&self.pool, spec.intent).await? {
-                    Some(resource) => resource,
-                    None => {
-                        let resource=backend.launcher().prepare(&spec,attune_common::isolated_process::ProcessCreateDisposition::ReconcileOnly).await?;
-                        Effects::record_resource(&self.pool, spec.intent, &resource).await?;
-                        resource
-                    }
+                let newly_observed = retained.is_none();
+                let resource=match retained {
+                    Some(resource)=>resource,
+                    None=>backend.launcher().prepare(&spec,attune_common::isolated_process::ProcessCreateDisposition::ReconcileOnly).await?,
                 };
-                let exit = backend
-                    .stop_retained(&spec, &resource, LaunchStopReason::SourceRevoked)
-                    .await?;
+                let fence = async {
+                    if newly_observed {
+                        Effects::record_resource(&self.pool, spec.intent, &resource).await?;
+                    }
+                    Effects::request_stop(&self.pool, spec.intent).await
+                };
+                let (fenced, stopped) = tokio::join!(
+                    fence,
+                    backend.stop_retained(&spec, &resource, LaunchStopReason::SourceRevoked)
+                );
+                fenced?;
+                let exit = stopped?;
                 Effects::record_exit(&self.pool, spec.intent, &resource, exit).await?;
                 backend.remove_stopped(&spec, &resource).await?;
                 Setup::acknowledge_removed(&self.pool, spec.intent, Some(&resource)).await?;

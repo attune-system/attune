@@ -201,10 +201,32 @@ impl PackEnvironmentProcessRepository {
         except: Option<Uuid>,
         master: &str,
     ) -> Result<Vec<(ProcessSpec, bool)>> {
+        Ok(
+            Self::unsettled_with_resources(pool, environment, except, master)
+                .await?
+                .into_iter()
+                .map(|(spec, submitted, _)| (spec, submitted))
+                .collect(),
+        )
+    }
+    /// Exact retained identities permit physical stop without a second DB read.
+    /// They grant neither Run nor removal; durable fencing and exit remain required.
+    pub async fn unsettled_with_resources(
+        pool: &PgPool,
+        environment: i64,
+        except: Option<Uuid>,
+        master: &str,
+    ) -> Result<Vec<(ProcessSpec, bool, Option<ResourceIdentity>)>> {
         let rows:Vec<Record>=sqlx::query_as(&format!("SELECT {COLUMNS} FROM execution_process_effect WHERE purpose='setup' AND (target->>'admission')::BIGINT=$1 AND NOT resource_removed AND ($2::TEXT IS NULL OR target->>'attempt'<>$2) ORDER BY id LIMIT 16"))
             .bind(environment).bind(except.map(|v|v.to_string())).fetch_all(pool).await?;
         rows.into_iter()
-            .map(|old| Ok((old.context(master)?.spec(), old.create_submitted)))
+            .map(|old| {
+                Ok((
+                    old.context(master)?.spec(),
+                    old.create_submitted,
+                    old.resource.map(|r| r.0),
+                ))
+            })
             .collect()
     }
     pub async fn removal_recorded(
