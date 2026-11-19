@@ -211,6 +211,9 @@ fn docker_runner_pin_reuses_engine_cache_receipt() -> Result<()> {
         ensure!(std::fs::read(&selected)? == payload);
         ensure!(std::fs::metadata(selected)?.permissions().mode() & 0o111 != 0);
         cache.open_input_archive(&helper)?;
+        drop(cache);
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o700))?;
+        root.close()?;
     }
     Ok(())
 }
