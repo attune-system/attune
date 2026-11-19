@@ -1234,12 +1234,14 @@ impl RuntimeAuthorityRepository {
         .bind(releases.into_iter().collect::<Vec<_>>())
         .execute(&mut *connection)
         .await?;
-        super::declared_input::DeclaredInputRepository::capture(connection, &record).await?;
         // The exact policy ID is known now. Publish all dispatch source bodies
         // before activation or any rule/sensor producer can observe this policy.
         super::managed_component_readmission::ManagedComponentReadmission::capture_deployment_dispatch(
             connection, &record,
         ).await?;
+        // Queue declarations use the exact retained dispatch body above, never
+        // the mutable projection or a contributor-supplied expression.
+        super::declared_input::DeclaredInputRepository::capture(connection, &record).await?;
         let (_, dependencies) = lock_policy_with_deadline(connection, record.id).await?;
         approvals
             .fence

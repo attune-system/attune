@@ -1,6 +1,8 @@
 mod helpers;
 #[path = "execution_admission_tests/native_staged_completion.rs"]
 mod native_staged_completion;
+#[path = "execution_admission_tests/queue_configuration.rs"]
+mod queue_configuration;
 
 use attune_common::{
     models::{ExecutionExecutableSnapshot, ExecutionStatus},
