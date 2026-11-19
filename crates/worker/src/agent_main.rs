@@ -147,8 +147,13 @@ fn main() -> Result<()> {
                 config.artifacts.transport == attune_common::artifact_transport::TransportMode::Api,
             )?
         });
-    let bootstrap = bootstrap_runtime_env("ATTUNE_WORKER_RUNTIMES", &child_environment)?;
-    let agent_detected_runtimes = bootstrap.detected_runtimes.clone();
+    // Native managers discover inside admitted workload images only after
+    // custody and incarnation registration. Never probe the agent host here.
+    let agent_detected_runtimes = if config.workload.is_some() {
+        None
+    } else {
+        bootstrap_runtime_env("ATTUNE_WORKER_RUNTIMES", &child_environment)?.detected_runtimes
+    };
 
     // --- Build the tokio runtime and run the async portion ---
     let runtime = tokio::runtime::Runtime::new()?;

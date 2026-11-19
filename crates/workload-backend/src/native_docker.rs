@@ -1123,6 +1123,66 @@ mod tests {
         assert!(launcher.body(&spec, &[]).is_err());
     }
     #[tokio::test]
+    async fn removal_evidence_query_never_creates_cleanup_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("readonly-removal.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (launcher, spec, _cache) = fixture(&socket);
+        launcher.cache.prepare_native_private(&spec).unwrap();
+        let resource = ResourceIdentity::Docker {
+            engine_id: 5,
+            daemon_id: "owned-daemon".into(),
+            container_id: "a".repeat(64),
+        };
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut stream, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0; 1024];
+                while !bytes.windows(4).any(|value| value == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                    assert!(bytes.len() < 8192);
+                }
+                assert_eq!(
+                    String::from_utf8(bytes).unwrap().lines().next().unwrap(),
+                    format!("GET /{API}/info HTTP/1.1")
+                );
+                let body = r#"{"ID":"owned-daemon","OSType":"linux","Architecture":"amd64","SecurityOptions":["name=seccomp,profile=builtin"]}"#;
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        assert!(!launcher.removal_recorded(&spec, &resource).await.unwrap());
+        launcher
+            .cache
+            .record_native_removal(
+                &spec,
+                &resource,
+                LaunchExitOutcome {
+                    exit_code: 0,
+                    oom_killed: false,
+                },
+                true,
+            )
+            .unwrap();
+        assert!(launcher.removal_recorded(&spec, &resource).await.unwrap());
+        let mut changed = spec.clone();
+        changed
+            .invocation
+            .argv
+            .push("different-private-invocation".into());
+        assert!(launcher
+            .removal_recorded(&changed, &resource)
+            .await
+            .is_err());
+        server.await.unwrap();
+    }
+    #[tokio::test]
     async fn provider_404_without_received_removal_ack_cannot_become_selected_file_absence() {
         let root = tempfile::tempdir().unwrap();
         let socket = root.path().join("owned-unknown-removal.sock");
