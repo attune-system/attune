@@ -248,7 +248,7 @@ fn inline_recipe() -> attune_common::runtime_lifecycle::RuntimeRecipe {
         "workspace":true,"extensions":[".py"],
         "tools":[{"name":"python","binaries":["/usr/bin/python3"],"args":["--version"],"version_pattern":"Python (?<version>[0-9]+\\.[0-9]+\\.[0-9]+)","primary":true}],
         "prepare":[{"command":["{tool_python}","-c","import os,sys; from pathlib import Path; assert sys.stdin.read()==''; assert 'ATTUNE_API_TOKEN' not in os.environ; Path('recipe-private-marker').write_text('private')"]}],
-        "launch":{"command":["{tool_python}","{source_file}"],"timeout_seconds":120}
+        "launch":{"command":["{tool_python}","{source_file}"],"cwd":"{workspace_dir}","timeout_seconds":120}
     })).expect("fixed owning recipe")
 }
 fn inline_config(case: InlineCase) -> serde_json::Value {
@@ -1166,7 +1166,11 @@ sys.stdout.write(message)
             // Reuse the durable exact removal ACK; never infer it from a 404.
             ensure!(attune_common::repositories::pack_environment_process::PackEnvironmentProcessRepository::removal_recorded(database.pool(),setup.intent,&resource).await?,"Setup cleanup receipt missing");
         }
-        ensure!(outcome.exit_code == 0, "native action failed");
+        ensure!(
+            outcome.exit_code == 0,
+            "native action failed (exit {})",
+            outcome.exit_code
+        );
         let stored = ExecutionRepository::find_by_id(&database, execution.id)
             .await?
             .context("stored execution")?;
