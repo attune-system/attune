@@ -2894,6 +2894,10 @@ impl ActionExecutor {
         {
             self.prepare_isolated_native_invocation(&context, preparation, &mut spec)
                 .await?;
+            // The fixed helper consumes this private challenge before any
+            // untrusted child runs. Retained intents keep their original spec;
+            // recovery must never replace their evidence with a fresh nonce.
+            attune_workload_backend::recipe_timeout::bind_challenge(&mut spec, None)?;
         }
         let selected = SelectedExecutionInput::new(
             serde_json::to_value(&context.parameters)?,
@@ -2935,7 +2939,7 @@ impl ActionExecutor {
                 return Err(error);
             }
         };
-        crate::runtime::process_executor::execute_isolated_cancellable(
+        let mut result = crate::runtime::process_executor::execute_isolated_cancellable(
             process,
             payload,
             crate::runtime::process_executor::IsolatedCaptureOptions {
@@ -2951,7 +2955,25 @@ impl ActionExecutor {
             },
         )
         .await
-        .map_err(|_| Error::execution("Isolated action capture failed"))
+        .map_err(|_| Error::execution("Isolated action capture failed"))?;
+        if !result.timed_out
+            && !result.logs_incomplete
+            && attune_workload_backend::recipe_timeout::retained_challenge(&spec)?.is_some()
+            && attune_workload_backend::recipe_timeout::observed_timeout(
+                self.native_backend.as_ref().ok_or_else(|| {
+                    Error::PermissionDenied("Native recipe timeout evidence unavailable".into())
+                })?,
+                &spec,
+                &resource,
+            )
+            .await?
+        {
+            // Preserve the actual observed status and captured streams. Exit
+            // 124 (or any other numeric code) alone never means timed out.
+            result.timed_out = true;
+            result.error = Some("Runtime recipe launch timed out".into());
+        }
+        Ok(result)
     }
 
     /// Execute the action using the runtime registry
