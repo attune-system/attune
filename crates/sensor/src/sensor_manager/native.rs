@@ -637,7 +637,7 @@ impl SensorManager {
             ),
             (
                 "ATTUNE_ARTIFACTS_DIR".into(),
-                "/opt/attune/artifacts".into(),
+                attune_common::workload_artifact::ARTIFACTS_ROOT.into(),
             ),
             (
                 "ATTUNE_ALLOW_INSECURE_NOTIFIER_WS".into(),
