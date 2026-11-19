@@ -645,8 +645,12 @@ fn exchange_paths(left: &Path, right: &Path) -> Result<ExchangeOutcome> {
         .map_err(|_| Error::validation("Pack storage path contains a NUL byte"))?;
     // Both paths are siblings in the pack store, so RENAME_EXCHANGE provides
     // one atomic visibility point without a missing-directory interval.
+    // Use the kernel entrypoint: older musl versions do not export renameat2.
+    // SAFETY: both C strings remain live for this synchronous syscall; the
+    // architecture-specific syscall number and argument types come from libc.
     let result = unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             libc::AT_FDCWD,
             left.as_ptr(),
             libc::AT_FDCWD,
