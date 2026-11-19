@@ -1,4 +1,5 @@
-//! Fixed guest-only recipe discovery. Admission/provenance remain manager policy.
+//! Fixed guest runtime probes and private recipe execution. Admission,
+//! provenance and outcome classification remain trusted manager policy.
 use attune_common::{
     child_process_environment::ChildProcessEnvironment, runtime_lifecycle::RuntimeRecipe,
 };
@@ -217,9 +218,10 @@ fn run_with_pack_access(arguments: &[OsString], candidate_copy: bool) -> io::Res
         .map_err(|_| super::invalid())?;
     let (recipe, path, source, inline, expected) = decode_run(arguments)?;
     let environment = probe_environment(&recipe, &path)?;
-    let invocation =
-        attune_workload_backend::planning::runtime_recipe_environment(&std::env::vars().collect())
-            .map_err(|_| super::invalid())?;
+    let mut invocation = std::env::vars().collect();
+    let timeout_challenge = take_timeout_challenge(&mut invocation)?;
+    let invocation = attune_workload_backend::planning::runtime_recipe_environment(&invocation)
+        .map_err(|_| super::invalid())?;
     let file = Path::new(PACK_ROOT).join(&source);
     let source = if inline {
         RuntimeSource::Inline(&source)
@@ -307,23 +309,88 @@ fn run_with_pack_access(arguments: &[OsString], candidate_copy: bool) -> io::Res
             .kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
-        let mut child = command.spawn()?;
-        let group = child.id();
-        let result = tokio::time::timeout(
+        let child = command.spawn()?;
+        let status = wait_recipe_child(
+            child,
             std::time::Duration::from_secs(recipe.launch.timeout_seconds),
-            child.wait(),
+            timeout_challenge.as_deref(),
+            Path::new("/tmp/artifacts"),
         )
-        .await;
-        attune_common::runtime_lifecycle::stop_owned_process_group(group)
-            .await
-            .map_err(|_| super::invalid())?;
-        if result.is_err() {
-            child.wait().await?;
-        }
-        let status = result.map_err(|_| super::invalid())??;
+        .await?;
         // Output/custody and cleanup remain the owning worker's responsibility.
         std::process::exit(status.code().unwrap_or(1));
     })
+}
+
+/// Extract only the fixed private control. Other forbidden controls still fail
+/// ordinary environment validation. The helper is protected before this runs;
+/// neither prep's explicit environment nor final env_clear overlays retain it.
+fn take_timeout_challenge(
+    environment: &mut std::collections::BTreeMap<String, String>,
+) -> io::Result<Option<String>> {
+    use attune_workload_backend::planning::{
+        RUNTIME_RECIPE_TIMEOUT_CHALLENGE_BYTES, RUNTIME_RECIPE_TIMEOUT_CHALLENGE_ENV,
+    };
+    let challenge = environment.remove(RUNTIME_RECIPE_TIMEOUT_CHALLENGE_ENV);
+    if challenge.as_ref().is_some_and(|value| {
+        value.len() != RUNTIME_RECIPE_TIMEOUT_CHALLENGE_BYTES
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }) {
+        return Err(super::invalid());
+    }
+    Ok(challenge)
+}
+async fn wait_recipe_child(
+    mut child: tokio::process::Child,
+    timeout: std::time::Duration,
+    challenge: Option<&str>,
+    artifact_root: &std::path::Path,
+) -> io::Result<std::process::ExitStatus> {
+    let group = child.id();
+    let result = tokio::time::timeout(timeout, child.wait()).await;
+    if result.is_err() {
+        // Reap the exact leader while group termination is confirmed; otherwise
+        // its zombie alone can prevent positive group-disappearance evidence.
+        let (stopped, joined) = tokio::join!(
+            attune_common::runtime_lifecycle::stop_owned_process_group(group),
+            child.wait()
+        );
+        stopped.map_err(|_| super::invalid())?;
+        joined?;
+        // Parent classification still waits for whole-resource writer removal.
+        if let Some(challenge) = challenge {
+            write_timeout_receipt(artifact_root, challenge)?;
+        }
+        return Err(super::invalid());
+    }
+    attune_common::runtime_lifecycle::stop_owned_process_group(group)
+        .await
+        .map_err(|_| super::invalid())?;
+    // Every ordinary exit, including124, preserves its code and writes nothing.
+    result.map_err(|_| super::invalid())?
+}
+fn write_timeout_receipt(artifact_root: &std::path::Path, challenge: &str) -> io::Result<()> {
+    use attune_workload_backend::planning::{
+        RUNTIME_RECIPE_TIMEOUT_CHALLENGE_BYTES, RUNTIME_RECIPE_TIMEOUT_RECEIPT,
+    };
+    use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
+    if challenge.len() != RUNTIME_RECIPE_TIMEOUT_CHALLENGE_BYTES
+        || !challenge
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(super::invalid());
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(artifact_root.join(RUNTIME_RECIPE_TIMEOUT_RECEIPT))?;
+    file.write_all(challenge.as_bytes())?;
+    file.sync_all()
 }
 
 fn decode_run(
@@ -449,6 +516,104 @@ mod tests {
         }))
         .unwrap()
     }
+    #[test]
+    fn timeout_challenge_is_private_and_reserved_controls_are_not_broadly_removed() {
+        use attune_workload_backend::planning::*;
+        let mut environment = std::collections::BTreeMap::from([
+            (RUNTIME_RECIPE_TIMEOUT_CHALLENGE_ENV.into(), "a".repeat(64)),
+            ("PUBLIC".into(), "owned".into()),
+        ]);
+        assert!(runtime_recipe_environment(&environment).is_err());
+        let challenge = take_timeout_challenge(&mut environment).unwrap().unwrap();
+        assert_eq!(challenge.len(), 64);
+        assert!(!environment.contains_key(RUNTIME_RECIPE_TIMEOUT_CHALLENGE_ENV));
+        assert!(runtime_recipe_environment(&environment).is_ok());
+        let prep = probe_environment(&recipe(), "/usr/bin:/bin").unwrap();
+        assert!(prep.get(RUNTIME_RECIPE_TIMEOUT_CHALLENGE_ENV).is_none());
+        environment.insert("ATTUNE_LAUNCH_UNKNOWN".into(), "owned-control".into());
+        assert!(runtime_recipe_environment(&environment).is_err());
+        for value in ["short".into(), "A".repeat(64), "g".repeat(64)] {
+            let mut environment = std::collections::BTreeMap::from([(
+                RUNTIME_RECIPE_TIMEOUT_CHALLENGE_ENV.into(),
+                value,
+            )]);
+            assert!(take_timeout_challenge(&mut environment).is_err());
+        }
+    }
+    #[test]
+    fn timeout_receipt_rejects_precreation_and_aliases_without_overwriting() {
+        use attune_workload_backend::planning::RUNTIME_RECIPE_TIMEOUT_RECEIPT;
+        let root = tempfile::tempdir().unwrap();
+        let challenge = "b".repeat(64);
+        let leaf = root.path().join(RUNTIME_RECIPE_TIMEOUT_RECEIPT);
+        std::fs::write(&leaf, "guest-precreated").unwrap();
+        assert!(write_timeout_receipt(root.path(), &challenge).is_err());
+        assert_eq!(std::fs::read(&leaf).unwrap(), b"guest-precreated");
+        std::fs::remove_file(&leaf).unwrap();
+        let other = root.path().join("owned-target");
+        std::fs::write(&other, "untouched").unwrap();
+        std::os::unix::fs::symlink(&other, &leaf).unwrap();
+        assert!(write_timeout_receipt(root.path(), &challenge).is_err());
+        assert_eq!(std::fs::read(&other).unwrap(), b"untouched");
+    }
+    #[tokio::test]
+    async fn ordinary_exit_124_never_writes_a_timeout_receipt_or_inherits_challenge() {
+        use attune_workload_backend::planning::*;
+        let root = tempfile::tempdir().unwrap();
+        let mut environment = std::collections::BTreeMap::from([(
+            RUNTIME_RECIPE_TIMEOUT_CHALLENGE_ENV.into(),
+            "c".repeat(64),
+        )]);
+        let challenge = take_timeout_challenge(&mut environment).unwrap();
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .env_clear()
+            .envs(environment)
+            .args([
+                "-c",
+                r#"test -z "${ATTUNE_LAUNCH_RECIPE_TIMEOUT_CHALLENGE+x}" || exit 71; exit 124"#,
+            ])
+            .kill_on_drop(true)
+            .process_group(0);
+        let status = wait_recipe_child(
+            command.spawn().unwrap(),
+            std::time::Duration::from_secs(5),
+            challenge.as_deref(),
+            root.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status.code(), Some(124));
+        assert!(!root.path().join(RUNTIME_RECIPE_TIMEOUT_RECEIPT).exists());
+    }
+    #[tokio::test]
+    async fn own_child_timeout_writes_only_bounded_private_challenge_after_join() {
+        use attune_workload_backend::planning::*;
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let challenge = "d".repeat(64);
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .env_clear()
+            .args(["-c", "exec /bin/sleep 20"])
+            .kill_on_drop(true)
+            .process_group(0);
+        assert!(wait_recipe_child(
+            command.spawn().unwrap(),
+            std::time::Duration::from_millis(50),
+            Some(&challenge),
+            root.path()
+        )
+        .await
+        .is_err());
+        let path = root.path().join(RUNTIME_RECIPE_TIMEOUT_RECEIPT);
+        assert_eq!(std::fs::read(&path).unwrap(), challenge.as_bytes());
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
     #[tokio::test]
     async fn public_verification_collector_still_denies_native_manager_local_launches() {
         let environment = ChildProcessEnvironment::from_parent([], &[])
