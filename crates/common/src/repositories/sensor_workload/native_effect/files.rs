@@ -170,12 +170,52 @@ impl SensorWorkloadRepository {
         ))
         .map(Some)
     }
+    /// Missing binding does not authorize current-generation/native writes.
+    /// Only a positively legacy-only assignment may keep the legacy path. Its
+    /// source lock also serializes activation with final publication.
+    pub async fn guard_legacy_sensor_file(
+        tx: &mut Transaction<'_, Postgres>,
+        version: Id,
+        allow_ready_receipt: bool,
+    ) -> Result<Option<Id>> {
+        let source:Option<(Option<Id>,bool,Option<Uuid>)>=sqlx::query_as("SELECT s.id,COALESCE(v.body_state='ready',false),v.sensor_native_intent FROM artifact_version v JOIN artifact a ON a.id=v.artifact LEFT JOIN sensor s ON s.ref=a.owner WHERE v.id=$1 AND a.scope='sensor' AND a.classification<>'runtime_log'")
+            .bind(version).fetch_optional(&mut **tx).await?;
+        let Some((sensor, ready, bound)) = source else {
+            return Ok(None);
+        };
+        if ready && allow_ready_receipt {
+            return Ok(None);
+        }
+        if bound.is_some() {
+            if ready {
+                return Err(denied());
+            }
+            return Ok(None); // Exact native binding is authorized independently.
+        }
+        let sensor = sensor.ok_or_else(denied)?;
+        super::super::super::schema_type::SchemaTypeRepository::lock_selection(tx).await?;
+        let seen:Vec<bool>=sqlx::query_scalar("SELECT a.native_effect_seen FROM sensor_workload_assignment a JOIN sensor_workload w ON w.id=a.workload WHERE w.sensor=$1 ORDER BY a.workload FOR SHARE OF a")
+            .bind(sensor).fetch_all(&mut **tx).await?;
+        if seen.is_empty() || seen.into_iter().any(|native| native) {
+            return Err(denied());
+        }
+        Ok(Some(sensor))
+    }
+
     /// Recheck mutable target ownership AFTER its artifact lock/waits. Bindings
     /// cannot disappear from the inventory by changing artifact classification.
     pub async fn require_native_file_target(
         tx: &mut Transaction<'_, Postgres>,
         version: Id,
+        legacy_source: Option<Id>,
     ) -> Result<()> {
+        if let Some(sensor) = legacy_source {
+            let same:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM artifact_version v JOIN artifact a ON a.id=v.artifact JOIN sensor s ON s.ref=a.owner WHERE v.id=$1 AND s.id=$2 AND a.scope='sensor' AND a.classification<>'runtime_log' AND v.sensor_native_intent IS NULL)")
+                .bind(version).bind(sensor).fetch_one(&mut **tx).await?;
+            if !same {
+                return Err(denied());
+            }
+        }
         let valid:bool=sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM artifact_version WHERE id=$1 AND sensor_native_intent IS NOT NULL) OR EXISTS(SELECT 1 FROM artifact_version v JOIN artifact a ON a.id=v.artifact JOIN sensor_workload w ON w.id=v.sensor_workload JOIN sensor s ON s.id=w.sensor WHERE v.id=$1 AND a.scope='sensor' AND a.owner=s.ref AND a.classification<>'runtime_log' AND v.file_path IS NOT NULL)")
             .bind(version).fetch_one(&mut **tx).await?;
         if !valid {

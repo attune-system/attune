@@ -490,3 +490,308 @@ async fn staged_sensor_log_source_roundtrip_refresh_expiry_and_release() -> help
 mod object_seal_boundary;
 #[path = "support/object_seal_producers.rs"]
 mod object_seal_producers;
+
+/// Real internal-file HTTP handlers and an owned filesystem object store; provider
+/// stopped facts are repository fixture inputs, not Kubernetes/Docker OS proof.
+#[tokio::test]
+async fn native_sensor_ordinary_files_publish_after_stop_without_run_or_legacy_fallback(
+) -> helpers::Result<()> {
+    use attune_common::{
+        artifact_transport::DirectUploadResponse,
+        auth::jwt::{
+            generate_sensor_token_with_cache_authority_and_workload_fence,
+            generate_worker_token_with_instance,
+        },
+        isolated_process::ResourceIdentity,
+        repositories::{
+            artifact::ArtifactVersionRepository, runtime::WorkerRepository,
+            sensor_workload::SensorWorkloadRepository,
+        },
+        workload_launch::{LaunchExitOutcome, Sha256Digest},
+    };
+    use axum::{
+        body::Body,
+        http::{header, Method, Request},
+    };
+    use tower::ServiceExt;
+    let SensorLogFixture {
+        ctx,
+        pack,
+        sensor,
+        workload,
+        ..
+    } = sensor_log_fixture().await?;
+    WorkerRepository::update_heartbeat(&ctx.pool, workload.worker_id).await?;
+    let artifact = ArtifactRepository::create(
+        &ctx.pool,
+        CreateArtifactInput {
+            r#ref: format!("sensor.{}.ordinary", sensor.r#ref),
+            scope: OwnerType::Sensor,
+            owner: sensor.r#ref.clone(),
+            r#type: ArtifactType::FileBinary,
+            visibility: ArtifactVisibility::Private,
+            classification: ArtifactClassification::General,
+            retention_policy: RetentionPolicyType::Versions,
+            retention_limit: 10,
+            name: None,
+            description: None,
+            content_type: None,
+            data: None,
+        },
+    )
+    .await?;
+    let historical = ArtifactVersionRepository::create_file_backed(
+        &ctx.pool,
+        artifact.id,
+        &artifact.r#ref,
+        "application/octet-stream".into(),
+        None,
+        None,
+        None,
+    )
+    .await?;
+    let identity = ctx.user.as_ref().unwrap().id;
+    let manager = generate_worker_token_with_instance(
+        identity,
+        &workload.worker_id.to_string(),
+        workload.worker_instance,
+        &ctx.state.jwt_config,
+        Some(300),
+    )?;
+    let replacement = generate_worker_token_with_instance(
+        identity,
+        &workload.worker_id.to_string(),
+        uuid::Uuid::new_v4(),
+        &ctx.state.jwt_config,
+        Some(300),
+    )?;
+    let sensor_token = generate_sensor_token_with_cache_authority_and_workload_fence(
+        identity,
+        &sensor.r#ref,
+        vec![],
+        Some(&pack.r#ref),
+        &[],
+        &[],
+        workload.fence(),
+        &ctx.state.jwt_config,
+        Some(300),
+    )?;
+    let intent = uuid::Uuid::new_v4();
+    SensorWorkloadRepository::reserve_native_effect(
+        &ctx.pool,
+        sensor.id,
+        workload.fence(),
+        intent,
+        "private HTTP fixture",
+        ctx.state.config.security.encryption_key.as_deref().unwrap(),
+    )
+    .await?;
+    SensorWorkloadRepository::consume_native_effect(
+        &ctx.pool,
+        sensor.id,
+        workload.fence(),
+        intent,
+        false,
+    )
+    .await?;
+    let resource = ResourceIdentity::Kubernetes {
+        cluster: "owned-fixture".into(),
+        namespace: "owned-fixture".into(),
+        pod_name: "owned-fixture".into(),
+        pod_uid: uuid::Uuid::new_v4().to_string(),
+    };
+    SensorWorkloadRepository::record_native_resource(
+        &ctx.pool,
+        workload.workload_id,
+        intent,
+        &resource,
+    )
+    .await?;
+    SensorWorkloadRepository::consume_native_effect(
+        &ctx.pool,
+        sensor.id,
+        workload.fence(),
+        intent,
+        true,
+    )
+    .await?;
+    let mut selected = Vec::new();
+    for _ in 0..3 {
+        let response = ctx
+            .post(
+                &format!("/api/v1/artifacts/{}/versions/file", artifact.id),
+                json!({"content_type":"application/octet-stream"}),
+                Some(&sensor_token),
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body: Value = response.json().await?;
+        let id = body["data"]["id"].as_i64().unwrap();
+        let path = body["data"]["file_path"].as_str().unwrap().to_string();
+        assert!(
+            ArtifactVersionRepository::sensor_native_file_binding(&ctx.pool, id)
+                .await?
+                .is_some()
+        );
+        selected.push((id, path));
+    }
+    SensorWorkloadRepository::stop_native_effect(&ctx.pool, workload.workload_id, intent).await?;
+    SensorWorkloadRepository::record_native_exit(
+        &ctx.pool,
+        workload.workload_id,
+        intent,
+        &resource,
+        LaunchExitOutcome {
+            exit_code: 0,
+            oom_killed: false,
+        },
+    )
+    .await?;
+    SensorWorkloadRepository::release(&ctx.pool, workload.fence()).await?;
+    assert!(!SensorWorkloadRepository::is_current_fence(&ctx.pool, workload.fence()).await?);
+
+    async fn put(
+        ctx: &TestContext,
+        path: &str,
+        token: &str,
+        bytes: &[u8],
+        digest: bool,
+    ) -> helpers::Result<axum::response::Response> {
+        let mut request = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/api/v1/internal/files/{path}"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CONTENT_LENGTH, bytes.len().to_string());
+        if digest {
+            request = request.header("x-attune-sha256", Sha256Digest::of_bytes(bytes).as_str());
+        }
+        Ok(ctx
+            .app
+            .clone()
+            .oneshot(request.body(Body::from(bytes.to_vec()))?)
+            .await?)
+    }
+    // Neither a replacement manager nor the closed Sensor Run can publish.
+    assert_eq!(
+        put(&ctx, &selected[0].1, &replacement, b"denied", true)
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        put(&ctx, &selected[0].1, &sensor_token, b"denied", true)
+            .await?
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    // Missing binding must not fall through to a current manager's generic
+    // owner/ref authorization, including the no-digest plaintext staging path.
+    assert_eq!(
+        put(
+            &ctx,
+            historical.file_path.as_deref().unwrap(),
+            &manager,
+            b"denied plaintext",
+            false
+        )
+        .await?
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(!std::path::Path::new(&ctx.state.config.artifacts_dir)
+        .join(historical.file_path.as_ref().unwrap())
+        .exists());
+    for ((id, path), bytes) in selected
+        .iter()
+        .take(2)
+        .zip([b"ordinary native file".as_slice(), b"".as_slice()])
+    {
+        let response = put(&ctx, path, &manager, bytes, true).await?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let ready = ArtifactVersionRepository::find_by_id(&ctx.pool, *id)
+            .await?
+            .unwrap();
+        assert_eq!(
+            ready.body_state,
+            Some(attune_common::models::enums::ArtifactBodyState::Ready)
+        );
+        let receipt = ctx
+            .post(
+                &format!("/api/v1/internal/artifacts/complete/{path}"),
+                json!({}),
+                Some(&manager),
+            )
+            .await?;
+        assert_eq!(receipt.status(), StatusCode::OK);
+        assert_eq!(
+            receipt.headers().get("x-attune-size").unwrap().to_str()?,
+            bytes.len().to_string()
+        );
+        SensorWorkloadRepository::record_native_file_receipt(
+            &ctx.pool,
+            workload.workload_id,
+            intent,
+            *id,
+            bytes.len() as u64,
+        )
+        .await?;
+        // The API Ready branch needs no guest/local staging or plaintext PUT.
+        assert!(!std::path::Path::new(&ctx.state.config.artifacts_dir)
+            .join(path)
+            .exists());
+        let direct=ctx.post(&format!("/api/v1/internal/artifacts/direct-upload/{path}"),json!({"size_bytes":bytes.len(),"sha256":Sha256Digest::of_bytes(bytes).as_str(),"content_type":"application/octet-stream"}),Some(&manager)).await?;
+        assert_eq!(direct.status(), StatusCode::OK);
+        assert!(
+            matches!(direct.json::<DirectUploadResponse>().await?,DirectUploadResponse::AlreadyReady {size_bytes} if size_bytes==bytes.len() as u64)
+        );
+        assert_eq!(
+            put(&ctx, path, &manager, b"late plaintext", false)
+                .await?
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    SensorWorkloadRepository::record_native_capture(&ctx.pool, workload.workload_id, intent, false)
+        .await?;
+    SensorWorkloadRepository::record_native_capture(&ctx.pool, workload.workload_id, intent, true)
+        .await?;
+    assert!(
+        !SensorWorkloadRepository::native_files_complete(&ctx.pool, workload.workload_id, intent)
+            .await?,
+        "the remaining real Pending obligation blocks settlement"
+    );
+    // Fault injection: an orphaned old binding never becomes a legacy write
+    // grant merely because its ledger row was cleared. No provider cleanup is
+    // claimed or performed by this HTTP authorization fixture.
+    sqlx::query("UPDATE sensor_workload_assignment SET native_effect=NULL WHERE workload=$1")
+        .bind(workload.workload_id)
+        .execute(&ctx.pool)
+        .await?;
+    assert_eq!(
+        put(
+            &ctx,
+            &selected[2].1,
+            &manager,
+            b"orphaned old intent",
+            false
+        )
+        .await?
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        put(
+            &ctx,
+            historical.file_path.as_deref().unwrap(),
+            &manager,
+            b"old unbound",
+            false
+        )
+        .await?
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    ctx.cleanup().await?;
+    Ok(())
+}

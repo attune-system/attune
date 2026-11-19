@@ -1,5 +1,9 @@
 -- Ordinary files retain their exact allocation generation independently of logs.
 -- No reference FK: old versions and retained effects have independent retention.
+-- Monotonic boundary evidence survives effect clearance on this assignment.
+ALTER TABLE sensor_workload_assignment ADD COLUMN native_effect_seen BOOLEAN NOT NULL DEFAULT FALSE;
+UPDATE sensor_workload_assignment SET native_effect_seen=TRUE WHERE native_effect IS NOT NULL;
+
 ALTER TABLE artifact_version
     ADD COLUMN sensor_workload BIGINT,
     ADD COLUMN sensor_generation BIGINT,
@@ -73,3 +77,14 @@ END;
 $$;
 CREATE TRIGGER sensor_native_assignment_delete_guard BEFORE DELETE ON sensor_workload_assignment
     FOR EACH ROW EXECUTE FUNCTION sensor_native_assignment_delete_guard();
+
+CREATE FUNCTION sensor_native_boundary_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.native_effect_seen AND NOT NEW.native_effect_seen THEN
+        RAISE EXCEPTION 'native sensor boundary cannot revert to legacy';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER sensor_native_boundary_guard BEFORE UPDATE OF native_effect_seen ON sensor_workload_assignment
+    FOR EACH ROW EXECUTE FUNCTION sensor_native_boundary_guard();

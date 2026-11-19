@@ -11,6 +11,7 @@ use attune_common::{
 use sqlx::PgConnection;
 
 pub(crate) struct FileMutationProof {
+    pub sensor_legacy_source: Option<i64>,
     pub log_delivery: Option<attune_common::repositories::log_delivery::LogDeliveryFence>,
     pub credential_deadline: i64,
     pub process: Option<ValidatedRuntimeAuthority>,

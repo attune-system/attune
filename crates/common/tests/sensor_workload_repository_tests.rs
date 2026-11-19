@@ -3268,6 +3268,15 @@ async fn native_sensor_file_case(deadline_wait: bool, stop_wait: bool) {
     let AcquireEligibleSensorWorkloadOutcome::Acquired(workload) = outcome else {
         panic!("admission")
     };
+    let mut legacy_tx = pool.begin().await.unwrap();
+    assert!(
+        SensorWorkloadRepository::guard_legacy_sensor_file(&mut legacy_tx, historical.id, true)
+            .await
+            .unwrap()
+            .is_some(),
+        "positively legacy-only assignment retains its original path"
+    );
+    legacy_tx.rollback().await.unwrap();
     let intent = Uuid::new_v4();
     SensorWorkloadRepository::reserve_native_effect(
         &pool,
@@ -3344,7 +3353,7 @@ async fn native_sensor_file_case(deadline_wait: bool, stop_wait: bool) {
             .unwrap();
         let stopped = std::sync::Arc::new(tokio::sync::Notify::new());
         let signal = stopped.clone();
-        let task_pool = pool.clone();
+        let task_pool: PgPool = (*pool).clone();
         let mut task = tokio::spawn(async move {
             let exit =
                 attune_common::repositories::sensor_workload::native_effect::join_sensor_stop(
@@ -3429,7 +3438,7 @@ async fn native_sensor_file_case(deadline_wait: bool, stop_wait: bool) {
             .unwrap()
             .unwrap();
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        let task_pool = pool.clone();
+        let task_pool: PgPool = (*pool).clone();
         let version_id = version.id;
         let worker_id = worker.id;
         let waiter = tokio::spawn(async move {
@@ -3564,6 +3573,14 @@ async fn native_sensor_file_case(deadline_wait: bool, stop_wait: bool) {
     proof.ensure_fresh_on(&mut tx).await.unwrap();
     assert!(proof.approval_deadline().unwrap() <= retained.publication_deadline.unwrap());
     tx.rollback().await.unwrap();
+    let mut denied_legacy = pool.begin().await.unwrap();
+    assert!(
+        SensorWorkloadRepository::guard_legacy_sensor_file(&mut denied_legacy, historical.id, true)
+            .await
+            .is_err(),
+        "current native boundary denies unbound Pending, not owner/ref fallback"
+    );
+    denied_legacy.rollback().await.unwrap();
     let selected =
         SensorWorkloadRepository::native_file_inventory(&pool, workload.workload_id, intent)
             .await
@@ -3698,5 +3715,17 @@ async fn native_sensor_file_case(deadline_wait: bool, stop_wait: bool) {
     )
     .await
     .unwrap();
+    let mut denied_after_clear = pool.begin().await.unwrap();
+    assert!(
+        SensorWorkloadRepository::guard_legacy_sensor_file(
+            &mut denied_after_clear,
+            historical.id,
+            true
+        )
+        .await
+        .is_err(),
+        "effect clearance cannot restore an unbound Pending legacy grant"
+    );
+    denied_after_clear.rollback().await.unwrap();
     pool.cleanup().await.unwrap();
 }

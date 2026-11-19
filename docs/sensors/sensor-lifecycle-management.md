@@ -587,8 +587,9 @@ inventories are never guest evidence.
 Migration `20261119000008_sensor_native_effect.sql` adds encrypted retained effect
 context to the existing assignment row. Source epochs and the live generation fence
 protect create and one-shot stdin decisions. A lost create/commit acknowledgement
-cannot permit a second create. Stop expires the API assignment lease before provider
-settlement. Restart reconciles only the same retained intent, never replaying stdin.
+cannot permit a second create. The durable stop flag closes Sensor Run before terminal
+settlement; physical stop of a known exact resource progresses concurrently with
+the database fence. Both acknowledgements are required before publication. Restart reconciles only the same retained intent, never replaying stdin.
 Separate bounded stdout/stderr readers use existing manager-owned encrypted log
 artifacts; only genuine EOF plus successful sealing records a capture receipt.
 
@@ -601,7 +602,11 @@ API upload/completion; Ready versions request a size receipt without reading gue
 or published plaintext. Every selected version, including an empty file, requires
 an exact positive receipt before acknowledged provider removal can clear the effect.
 Runtime-log versions retain their separate generation and sealing contracts.
-Stop retains the existing assignment lease deadline before expiring Run. Pending
+A monotonic assignment marker prevents unbound Pending versions from falling back
+to legacy owner/ref authorization after native effects have been used. Only an
+explicitly legacy-only assignment retains that path; Ready historical responses
+remain receipts and native/historical Ready files reject plaintext PUT staging.
+Stop retains the existing assignment lease and closes Run with its durable flag. Pending
 publication by the original manager requires that retained deadline and its fresh
 worker heartbeat, including after artifact/version waits. Neither stop nor release
 creates or extends publication authority; an expired or missing deadline retains

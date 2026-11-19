@@ -54,7 +54,7 @@ impl SensorWorkloadRepository {
         instance: Uuid,
     ) -> Result<Option<(Id, SensorNativeEffect)>> {
         let row: Option<(Id, Json<SensorNativeEffect>)> = sqlx::query_as(
-            "SELECT a.workload,a.native_effect FROM sensor_workload_assignment a JOIN sensor_workload w ON w.id=a.workload WHERE w.sensor=$1 AND a.native_effect IS NOT NULL AND (a.worker_instance=$2 OR a.lease_expires_at IS NULL OR a.lease_expires_at<=clock_timestamp())")
+            "SELECT a.workload,a.native_effect FROM sensor_workload_assignment a JOIN sensor_workload w ON w.id=a.workload WHERE w.sensor=$1 AND a.native_effect IS NOT NULL AND (a.worker_instance=$2 OR COALESCE((a.native_effect->>'stop_requested')::BOOLEAN,false) OR a.lease_expires_at IS NULL OR a.lease_expires_at<=clock_timestamp())")
             .bind(sensor).bind(instance).fetch_optional(pool).await?;
         Ok(row.map(|(id, effect)| (id, effect.0)))
     }
@@ -121,7 +121,7 @@ impl SensorWorkloadRepository {
             stdout_complete: false,
             stderr_complete: false,
         };
-        let changed = sqlx::query("UPDATE sensor_workload_assignment SET native_effect=$2 WHERE workload=$1 AND native_effect IS NULL")
+        let changed = sqlx::query("UPDATE sensor_workload_assignment SET native_effect=$2,native_effect_seen=TRUE WHERE workload=$1 AND native_effect IS NULL")
             .bind(fence.workload_id).bind(Json(effect)).execute(&mut *tx).await?;
         if changed.rows_affected() != 1 {
             return Err(denied());
@@ -223,10 +223,9 @@ impl SensorWorkloadRepository {
             .fetch_one(&mut *tx)
             .await?;
         }
-        // Close the existing API/generation fence BEFORE provider settlement.
-        // Historical context/resource remain available for cleanup only.
-        sqlx::query("UPDATE sensor_workload_assignment SET lease_expires_at=clock_timestamp() WHERE workload=$1")
-            .bind(workload).execute(&mut *tx).await?;
+        // The durable stop flag closes Run in every centralized sensor fence.
+        // Preserve the original lease: expiration itself revokes its epoch and
+        // must not be manufactured by custody/evidence updates before deadline.
         effect.stop_requested = true;
         Self::write_native(&mut tx, workload, &effect).await?;
         tx.commit().await?;
@@ -257,10 +256,9 @@ impl SensorWorkloadRepository {
             .fetch_one(&mut *tx)
             .await?;
         }
-        // Close the existing API/generation fence BEFORE provider settlement.
-        // Historical context/resource remain available for cleanup only.
-        sqlx::query("UPDATE sensor_workload_assignment SET lease_expires_at=clock_timestamp() WHERE workload=$1")
-            .bind(workload).execute(&mut *tx).await?;
+        // The durable stop flag closes Run in every centralized sensor fence.
+        // Preserve the original lease: expiration itself revokes its epoch and
+        // must not be manufactured by custody/evidence updates before deadline.
         effect.stop_requested = true;
         Self::write_native(&mut tx, workload, &effect).await?;
         tx.commit().await?;

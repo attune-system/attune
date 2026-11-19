@@ -236,6 +236,20 @@ pub(crate) async fn upload_file(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     authorize_file_transfer(&state, &user, &file_path, FileOperation::Mutate).await?;
 
+    // Ready native/historical bodies have a receipt operation, never a new
+    // plaintext PUT (including the no-digest legacy staging branch below).
+    if let Some(version) =
+        ArtifactVersionRepository::find_unique_by_file_path(&state.db, &file_path)
+            .await
+            .map_err(map_repository_error)?
+    {
+        let mut tx = state.db.begin().await.map_err(map_sqlx_error)?;
+        SensorWorkloadRepository::guard_legacy_sensor_file(&mut tx, version.id, false)
+            .await
+            .map_err(map_transport_error)?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+    }
+
     let artifacts_dir = &state.config.artifacts_dir;
     let max_size = state.config.artifacts.max_upload_size;
 
@@ -4799,6 +4813,10 @@ async fn authorize_version_mutation_source(
             "Native sensor files require their recorded sensor or manager source".into(),
         ));
     }
+    let sensor_legacy_source =
+        SensorWorkloadRepository::guard_legacy_sensor_file(tx, version.id, true)
+            .await
+            .map_err(map_transport_error)?;
     let sensor_file_expiry = if user.claims.token_type == TokenType::Worker
         || user.claims.token_type == TokenType::Sensor
     {
@@ -4979,6 +4997,7 @@ async fn authorize_version_mutation_source(
         None
     };
     let proof = crate::recorded_files::FileMutationProof {
+        sensor_legacy_source,
         log_delivery,
         credential_deadline: user.claims.exp,
         process,
@@ -5012,9 +5031,13 @@ async fn authorize_version_mutation_target(
     .await
     .map_err(map_repository_error)?
     .ok_or_else(|| (StatusCode::FORBIDDEN, "Artifact unavailable".into()))?;
-    SensorWorkloadRepository::require_native_file_target(tx, version.id)
-        .await
-        .map_err(map_transport_error)?;
+    SensorWorkloadRepository::require_native_file_target(
+        tx,
+        version.id,
+        proof.sensor_legacy_source,
+    )
+    .await
+    .map_err(map_transport_error)?;
     if let Some(credential) =
         attune_common::worker_delivery::credential(&user.claims).map_err(map_transport_error)?
     {
