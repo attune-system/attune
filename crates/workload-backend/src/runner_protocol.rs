@@ -47,7 +47,7 @@ fn validate(invocation: &LaunchInvocation) -> io::Result<()> {
             || value.contains('\0')
             || upper.starts_with("ATTUNE__")
             || (upper.starts_with("ATTUNE_LAUNCH_")
-                && !private_recipe_challenge(invocation, name, value))
+                && !private_helper_challenge(invocation, name, value))
             || upper.starts_with("DOCKER_")
             || upper.starts_with("KUBERNETES_")
             || matches!(
@@ -75,25 +75,37 @@ fn validate(invocation: &LaunchInvocation) -> io::Result<()> {
     }
     Ok(())
 }
-fn private_recipe_challenge(invocation: &LaunchInvocation, name: &str, value: &str) -> bool {
+fn private_helper_challenge(invocation: &LaunchInvocation, name: &str, value: &str) -> bool {
     use crate::planning::{
+        CANDIDATE_PYTHON_PREP_CHALLENGE_BYTES, CANDIDATE_PYTHON_PREP_CHALLENGE_ENV,
         RUNTIME_RECIPE_TIMEOUT_CHALLENGE_BYTES, RUNTIME_RECIPE_TIMEOUT_CHALLENGE_ENV,
     };
     use attune_common::workload_launch::{LaunchRoot, RUNNER_ROOT};
-    name == RUNTIME_RECIPE_TIMEOUT_CHALLENGE_ENV
-        && value.len() == RUNTIME_RECIPE_TIMEOUT_CHALLENGE_BYTES
+    let mode = invocation.argv.get(1).map(String::as_str);
+    let expected_bytes = match name {
+        RUNTIME_RECIPE_TIMEOUT_CHALLENGE_ENV
+            if matches!(
+                mode,
+                Some("run-runtime-recipe" | "run-candidate-runtime-recipe")
+            ) =>
+        {
+            RUNTIME_RECIPE_TIMEOUT_CHALLENGE_BYTES
+        }
+        CANDIDATE_PYTHON_PREP_CHALLENGE_ENV if mode == Some("run-candidate-python") => {
+            CANDIDATE_PYTHON_PREP_CHALLENGE_BYTES
+        }
+        _ => return false,
+    };
+    value.len() == expected_bytes
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         && ["linux-amd64", "linux-arm64"]
             .iter()
             .any(|file| invocation.argv.first() == Some(&format!("{RUNNER_ROOT}/{file}")))
-        && matches!(
-            invocation.argv.get(1).map(String::as_str),
-            Some("run-runtime-recipe" | "run-candidate-runtime-recipe")
-        )
         && invocation.working_root == LaunchRoot::Pack
 }
+
 /// Exact reads avoid consuming any of the application's original stdin.
 /// Used by deterministic codec tests; the executable uses cancellable FD reads.
 pub fn read_start(mut source: impl Read) -> io::Result<LaunchInvocation> {

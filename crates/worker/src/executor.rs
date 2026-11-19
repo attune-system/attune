@@ -482,7 +482,7 @@ impl ActionExecutor {
                 .ok_or_else(denied)?
                 .to_owned(),
             self.child_environment.clone(),
-            None,
+            self.packs_base_dir.clone(),
         )
         .await
     }

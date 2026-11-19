@@ -37,7 +37,24 @@ pub(super) async fn handle(
     };
     let testing = native.testing();
     if !testing.enabled {
-        return Err(Error::validation("Native candidate tests are not enabled"));
+        // Preserve the ordinary handler's no-op policy without fabricating a
+        // test result/history or opening an unused candidate API lease.
+        native.settled().await?;
+        let mut tx = pool.begin().await?;
+        let fence = native.lock_result(&mut tx).await?;
+        let status = if payload.trigger_reason == "manual" {
+            PackInstallStatus::Succeeded
+        } else {
+            PackInstallStatus::Activating
+        };
+        PackInstallRepository::finish_running_on(&mut tx, install.id, status, None, None, None)
+            .await?
+            .ok_or_else(|| {
+                Error::invalid_state("Native candidate install changed before publication")
+            })?;
+        fence.ensure_fresh(&mut tx).await?;
+        tx.commit().await?;
+        return Ok(());
     }
     if testing.runners.values().any(|runner| {
         runner.lifecycle.is_none() && matches!(runner.r#type.as_str(), "unittest" | "pytest")

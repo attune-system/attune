@@ -86,9 +86,10 @@ pub(crate) fn validate_invocation(spec: &ProcessSpec) -> Result<()> {
         return Err(invalid());
     }
     let has = |kind| spec.inputs.iter().any(|pin| pin.kind == kind);
-    // The codec accepts exactly one fixed-helper private control. Bind it to
-    // this public purpose, input set and Pack access before provider effects.
+    // The codec accepts only the exact control for each fixed helper. Bind
+    // each to its purpose, input set and Pack access before provider effects.
     crate::recipe_timeout::retained_challenge(spec)?;
+    crate::candidate_prep::retained_challenge(spec)?;
     match spec.invocation.working_root {
         LaunchRoot::Pack if !has(LaunchInputKind::Pack) => return Err(invalid()),
         LaunchRoot::Runtime if !has(LaunchInputKind::Runtime) && spec.stage.is_none() => {
@@ -101,4 +102,114 @@ pub(crate) fn validate_invocation(spec: &ProcessSpec) -> Result<()> {
     }
     crate::runner_protocol::encode_start(&spec.invocation).map_err(|_| invalid())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use attune_common::workload_launch::{
+        LaunchPlatform, LaunchRoot, LaunchTarget, PinnedLaunchInput, RUNNER_ROOT,
+    };
+    use std::io::{Cursor, Read};
+
+    fn candidate(platform: LaunchPlatform) -> ProcessSpec {
+        let original =
+            crate::test_support::spec(format!("fixture.invalid/payload@sha256:{}", "a".repeat(64)));
+        let mut spec = ProcessSpec {
+            intent: original.manifest.engine_name_nonce,
+            purpose: LaunchPurpose::CandidateTest,
+            target: LaunchTarget::CandidateTest {
+                install: 1,
+                test_job: 1,
+                attempt: uuid::Uuid::new_v4(),
+            },
+            image: original.manifest.image,
+            platform,
+            inputs: Vec::new(),
+            pack_access: PackAccess::CandidateCopy,
+            stage: None,
+            timeout_ms: Some(1000),
+            invocation: original.invocation,
+        };
+        spec.invocation.argv = vec![
+            format!("{RUNNER_ROOT}/linux-{}", platform.native_arch()),
+            "run-candidate-python".into(),
+        ];
+        spec.invocation.working_root = LaunchRoot::Pack;
+        for (id, kind) in [(1, LaunchInputKind::Runner), (2, LaunchInputKind::Pack)] {
+            spec.inputs.push(PinnedLaunchInput {
+                pin_id: id,
+                kind,
+                object_id: id,
+                object_version: "owned-public-input".into(),
+                size_bytes: 1,
+                sha256: Sha256Digest::of_bytes(b"public-input"),
+                max_expanded_bytes: 1,
+                max_files: 1,
+            });
+        }
+        spec
+    }
+
+    #[test]
+    fn candidate_preparation_control_roundtrips_without_consuming_application_stdin() {
+        for platform in [LaunchPlatform::LinuxAmd64, LaunchPlatform::LinuxArm64] {
+            let mut spec = candidate(platform);
+            let public = public_digest(&spec).unwrap();
+            crate::candidate_prep::bind_challenge(&mut spec, None).unwrap();
+            validate_invocation(&spec).unwrap();
+            assert_eq!(public_digest(&spec).unwrap(), public);
+            for input in [b"".as_slice(), br#"{"owned":"exact one-shot input"}"#] {
+                let mut frame = crate::runner_protocol::encode_start(&spec.invocation).unwrap();
+                frame.extend_from_slice(input);
+                let mut cursor = Cursor::new(frame);
+                let decoded = crate::runner_protocol::read_start(&mut cursor).unwrap();
+                assert_eq!(decoded, spec.invocation);
+                let mut rest = Vec::new();
+                cursor.read_to_end(&mut rest).unwrap();
+                assert_eq!(rest, input);
+            }
+        }
+    }
+
+    #[test]
+    fn candidate_preparation_control_cannot_escape_its_fixed_process_policy() {
+        use crate::planning::CANDIDATE_PYTHON_PREP_CHALLENGE_ENV;
+        for mutation in 0..6 {
+            let mut spec = candidate(LaunchPlatform::LinuxAmd64);
+            crate::candidate_prep::bind_challenge(&mut spec, None).unwrap();
+            let private = spec.invocation.env[CANDIDATE_PYTHON_PREP_CHALLENGE_ENV].clone();
+            match mutation {
+                0 => spec.purpose = LaunchPurpose::Action,
+                1 => spec.pack_access = PackAccess::ReadOnly,
+                2 => spec.invocation.working_root = LaunchRoot::Scratch,
+                3 => spec.invocation.argv[0] = "/opt/attune/pack/forged-helper".into(),
+                4 => spec.invocation.argv[1] = "exec".into(),
+                _ => {
+                    spec.inputs.pop().unwrap();
+                }
+            }
+            let error = validate_invocation(&spec).unwrap_err();
+            assert!(!error.to_string().contains(&private));
+        }
+        for (name, value) in [
+            (
+                CANDIDATE_PYTHON_PREP_CHALLENGE_ENV.to_owned(),
+                "A".repeat(64),
+            ),
+            (
+                CANDIDATE_PYTHON_PREP_CHALLENGE_ENV.to_owned(),
+                "a".repeat(63),
+            ),
+            (
+                CANDIDATE_PYTHON_PREP_CHALLENGE_ENV.to_lowercase(),
+                "a".repeat(64),
+            ),
+            ("ATTUNE_LAUNCH_UNRECOGNIZED".into(), "a".repeat(64)),
+        ] {
+            let mut spec = candidate(LaunchPlatform::LinuxAmd64);
+            spec.invocation.env.insert(name, value);
+            assert!(crate::runner_protocol::encode_start(&spec.invocation).is_err());
+        }
+    }
 }
