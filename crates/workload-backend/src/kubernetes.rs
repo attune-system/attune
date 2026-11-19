@@ -728,8 +728,9 @@ struct PodControl {
 #[async_trait]
 impl ProcessControl for PodControl {
     async fn write_stdin_once(&self, payload: LaunchStdinPayload) -> Result<()> {
-        self.launcher.exact(&self.spec, &self.resource).await?;
         let mut writer = self.stdin.lock().await.take().ok_or_else(invalid)?;
+        payload.validate_for(self.spec.purpose)?;
+        self.launcher.exact(&self.spec, &self.resource).await?;
         writer
             .write_all(&self.header)
             .await

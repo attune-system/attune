@@ -197,3 +197,8 @@ notifier:
 # Agent binary distribution (serves the agent binary via API for remote downloads)
 agent:
   binary_dir: /opt/attune/agent
+
+# Native Docker activation remains gated on all-consumer acceptance. Do not put
+# placeholder image/Runner pins here. scripts/prepare-native-compose.py merges
+# explicit current WorkloadConfig per manager with this base, using private
+# cache/custody volumes and the exact public Runner archive. See workload-isolation.md.

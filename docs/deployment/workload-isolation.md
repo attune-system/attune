@@ -288,3 +288,77 @@ selects a developer/default cluster. Missing prerequisites fail. CI provisions
 only its own disposable cluster. Chart rollout/storage/RBAC, packaged-image
 acceptance, the full worker vertical and final independent security review
 remain required before readiness.
+
+## Explicit packaged native configuration (activation gated)
+
+The draft chart no longer assumes an external execution host, controller or
+enrollment API. Trusted worker/sensor managers remain in cluster with their CP
+configuration and private persistent custody. They use the fixed native Pod
+adapter in a separate operator-created restricted-PSA namespace. Role grants are
+limited to Pods (get/list/watch/create/delete/patch) and attach/exec (get/create).
+Guests have no SA token, CP mounts, sockets or shared writable runtime. Manager
+node selectors/tolerations/runtimeClass remain manager placement controls; the
+current closed guest policy has no arbitrary scheduling overrides. Supply actual
+candidate manager/helper images and the matching public Runner pin; no old release
+pin or render-only digest establishes support. Per-slot private PVCs and Recreate
+retain custody across restart. Add independent slots for capacity.
+
+For Compose acceptance, `scripts/prepare-native-compose.py` materializes the
+ordinary Compose configuration with explicit native Docker settings, retaining
+all services, worker profiles, sensor labels, recipe admission and dependencies.
+It makes no Docker call and does not change the default deployment. Provide a
+JSON map with exactly `worker-shell`, `worker-python`, `worker-node`, `worker-full`,
+`worker-toolchains`, `sensor`, and `sensor-secondary`. Each value contains:
+
+- `workload`: the exact current `common::workload_config::WorkloadConfig`, with
+  fixed `cache_root: /var/lib/attune/workloads`,
+  `helper_archive: /opt/attune/public/workload-runner.zip`, and Docker backend
+  `socket: /var/run/docker.sock`. Image and helper image pins, platform, limits,
+  exact public Runner object pin, observed daemon/engine binding, dedicated
+  cache volume and ordinary network are mandatory operator inputs.
+- `runner_source`: absolute path to the real public Runner ZIP from the same
+  candidate's existing agent/release packaging. Its bytes must match the pin;
+  no second helper build or invented object identity is supplied by this script.
+- `custody_volume`: a distinct persistent manager-private named volume.
+
+Provision each cache/custody volume explicitly on the admitted daemon, owned by
+UID/GID 1000 with mode 0700. Do not initialize over existing custody or rotate a
+lost custody key. Networks and volumes are external, named inputs; no implicit
+project-prefix inference binds a different volume. The manager alone mounts the
+socket and private cache root. The production adapter verifies daemon/platform,
+image and cache-volume binding before launching any guest, and mounts only
+selected immutable inputs plus attempt-private staging in guests. These bounds
+are not a hard live disk quota.
+
+```bash
+python3 scripts/prepare-native-compose.py --profiles /absolute/operator-profiles.json \
+  --socket-gid 999 --output /absolute/new-native-acceptance
+# Only after the coordinator grants the full integration lane:
+docker compose --project-directory "$PWD" \
+  -f /absolute/new-native-acceptance/compose.yaml --profile toolchains config
+```
+
+Use the actual socket GID, never the example number as an admission fact. Static
+preparation verifies source archive bytes and preserves configured coverage; it
+is not daemon, worker/PG custody, restart, runtime/probe, lifecycle, or smoke
+acceptance. Native managers must keep denying any residual local launch. Do not
+activate production defaults until every consumer and packaged profile passes.
+The existing `init-agent` copies the once-built public Runner ZIP alongside its
+binaries; it does not mint an object pin or assert image compatibility.
+
+The Docker owning-worker target is
+`crates/worker/tests/isolated_docker_action_provider_tests.rs`. Its four native,
+native-CLI, Command and interpreted cases construct the production configured
+Docker backend and call the shared `tests/support/owning_worker.rs` domain
+fixture used by Kubernetes. The shared support module retains the real preparer, repository,
+capture/custody and restart assertions; it adds no alternate execution path. The existing Docker publication CI
+lane builds the owning test executable once, alongside its once-built
+Echo/Runner, and passes it to `scripts/test-launch-controller-container.py
+--owning-worker-tests`. The driver reuses its same owned candidate images,
+cache volume, socket and network, with the job's disposable PostgreSQL server.
+Only the trusted manager receives the DB URL. Public candidate migrations and
+`config.test.yaml` are packaged for the real TestDatabase helper; no source tree
+is mounted into guests. Native profile tests require their explicit
+`ATTUNE_ISOLATION_TEST_*` inputs; they never select a developer/default engine
+or cluster. Authoring and static validation of this lane are not a passing
+Docker/PG owning-worker result.

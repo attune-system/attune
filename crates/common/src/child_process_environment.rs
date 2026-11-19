@@ -143,6 +143,22 @@ impl ChildProcessEnvironment {
             .filter(|digest| self.admits_runtime_recipe(digest))
     }
 
+    /// Admission to the native producer only. This never authorizes local
+    /// recipe discovery/preparation, whose separate policy remains unchanged.
+    pub fn admits_native_runtime_recipe(&self, digest: &str) -> bool {
+        matches!(
+            self.workload_sandbox,
+            crate::workload_sandbox::WorkloadSandbox::NativeEffectsRequired
+        ) && self.runtime_recipe_digests.contains(digest)
+    }
+
+    pub fn native_runtime_recipe_digests(&self) -> impl Iterator<Item = &str> {
+        self.runtime_recipe_digests
+            .iter()
+            .map(String::as_str)
+            .filter(|digest| self.admits_native_runtime_recipe(digest))
+    }
+
     pub fn with_workload_sandbox(
         mut self,
         sandbox: crate::workload_sandbox::WorkloadSandbox,
@@ -366,6 +382,41 @@ mod tests {
                 &names.into_iter().map(str::to_string).collect::<Vec<_>>()
             )
             .is_err());
+        }
+    }
+
+    #[test]
+    fn native_recipe_admission_does_not_authorize_local_execution_or_inherit_policy() {
+        use crate::workload_sandbox::WorkloadSandbox;
+        let digest = "a".repeat(64);
+        for (sandbox, local, native) in [
+            (WorkloadSandbox::Disabled, true, false),
+            (WorkloadSandbox::Bubblewrap, false, false),
+            (WorkloadSandbox::NativeEffectsRequired, false, true),
+        ] {
+            let environment = ChildProcessEnvironment::from_parent(
+                [(
+                    "ATTUNE_RUNTIME_RECIPE_DIGESTS".into(),
+                    digest.clone().into(),
+                )],
+                &[],
+            )
+            .unwrap()
+            .with_workload_sandbox(sandbox);
+            assert_eq!(environment.admits_runtime_recipe(&digest), local);
+            assert_eq!(environment.admits_native_runtime_recipe(&digest), native);
+            assert_eq!(
+                environment.runtime_recipe_digests().count(),
+                usize::from(local)
+            );
+            assert_eq!(
+                environment.native_runtime_recipe_digests().count(),
+                usize::from(native)
+            );
+            assert!(!environment.admits_native_runtime_recipe(&"b".repeat(64)));
+            let mut command = Command::new("owned-unavailable-program");
+            environment.apply(&mut command);
+            assert_eq!(command.get_envs().count(), 0);
         }
     }
 

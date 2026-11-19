@@ -38,7 +38,12 @@ def main():
     parser.add_argument("--native-http-tests", required=True, type=Path)
     parser.add_argument("--provider-tests", required=True, type=Path)
     parser.add_argument("--native-echo-binary", required=True, type=Path)
+    parser.add_argument("--owning-worker-tests", type=Path,
+                        help="once-built real owning-worker test executable; requires owned PG URL in environment")
     args = parser.parse_args()
+    owning = args.owning_worker_tests.resolve(strict=True) if args.owning_worker_tests else None
+    if owning and not os.environ.get("ATTUNE_OWNING_WORKER_DATABASE_URL"):
+        raise SystemExit("owning-worker acceptance requires explicit owned PostgreSQL URL")
     if os.environ.get("TEST_ARCH") not in ("amd64", "arm64"):
         raise SystemExit("owned Docker test requires TEST_ARCH=amd64 or arm64")
     binary = args.test_binary.resolve(strict=True)
@@ -48,10 +53,17 @@ def main():
     native_http = args.native_http_binary.resolve(strict=True)
     native_tests = args.native_http_tests.resolve(strict=True)
     native_script = Path(__file__).resolve().with_name("test_native_http_action.py").resolve(strict=True)
-    for executable in (binary, helper, native_http, native_tests, provider_tests, echo):
+    for executable in (binary, helper, native_http, native_tests, provider_tests, echo, *((owning,) if owning else ())):
         dynamic = subprocess.run(["readelf", "-d", str(executable)], check=True, capture_output=True, text=True)
         if "(NEEDED)" in dynamic.stdout:
             raise SystemExit("all candidate controller/helper/native executables must be statically linked (musl)")
+    if owning:
+        listed = subprocess.check_output([str(owning), "--list", "--format", "terse"], text=True)
+        expected = {"docker_native_owning_worker", "docker_native_cli_owning_worker",
+                    "docker_command_owning_worker", "docker_interpreted_owning_worker"}
+        actual = {line.removesuffix(": test") for line in listed.splitlines() if line.endswith(": test")}
+        if actual != expected:
+            raise SystemExit("owning worker test inventory differs; refusing zero/partial or inherited K8s coverage")
     owner = uuid.uuid4().hex
     volume = f"attune-controller-cache-test-{owner}"
     container = f"attune-controller-test-{owner}"
@@ -105,6 +117,22 @@ def main():
             (context / "boundary-tests").chmod(0o755)
             (context / "native-provider-tests").chmod(0o755)
             (context / "attune-workload-runner").chmod(0o755)
+            owning_copy = ""
+            if owning:
+                shutil.copyfile(owning, context / "owning-worker-tests")
+                shutil.copyfile(echo, context / "native-echo")
+                (context / "owning-worker-tests").chmod(0o555)
+                (context / "native-echo").chmod(0o555)
+                source_root = Path(__file__).resolve().parents[1]
+                shutil.copyfile(source_root / "config.test.yaml", context / "config.test.yaml")
+                shutil.copytree(source_root / "migrations", context / "migrations")
+                # TestDatabase hashes/reads migrations at its compile-time source
+                # location. Package those public candidate inputs at that exact
+                # location, never mount a developer source tree into guests.
+                owning_copy = ("COPY owning-worker-tests native-echo /usr/local/bin/\n"
+                               + "COPY " + json.dumps(["config.test.yaml", str(source_root / "config.test.yaml")]) + "\n"
+                               + "COPY " + json.dumps(["migrations", str(source_root / "migrations")]) + "\n"
+                               + "RUN " + json.dumps(["mkdir", "-p", str(source_root / "crates/worker")]) + "\n")
             (context / "Dockerfile").write_text(
                 f"FROM {PYTHON} AS public-roots\nFROM {BASE}\n"
                 "COPY --from=public-roots /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt\n"
@@ -112,7 +140,7 @@ def main():
                 "COPY attune-workload-runner /usr/local/bin/attune-workload-runner\n"
                 "COPY native-http native-http-tests /usr/local/bin/\n"
                 "COPY http-semantics.py /usr/local/lib/http-semantics.py\n"
-                'ENTRYPOINT ["/usr/local/bin/boundary-tests"]\n'
+                + owning_copy + 'ENTRYPOINT ["/usr/local/bin/boundary-tests"]\n'
             )
             docker("build", "--label", label, "-t", image, str(context))
             image_created = True
@@ -169,6 +197,30 @@ def main():
         native_base[native_base.index("--name") + 1] = container + "-native"
         docker(*native_base, "--entrypoint", "/usr/local/bin/native-provider-tests", image,
                "--include-ignored", "--nocapture", "--test-threads=4")
+        if owning:
+            worker_base = base.copy()
+            worker_base[worker_base.index("--name") + 1] = container + "-worker"
+            worker_base[worker_base.index("--network") + 1] = network
+            # Only the trusted test manager reaches this job's owned PostgreSQL.
+            # Guests still use the unchanged fixed native builder and get no DB URL.
+            database_url = os.environ["ATTUNE_OWNING_WORKER_DATABASE_URL"]
+            database_env = ["ATTUNE__DATABASE__URL", "TEST_DB_URL", "DATABASE_URL"]
+            child_env = dict(os.environ, **{key: database_url for key in database_env})
+            run_id = "dock-" + owner[:12]
+            command = ["docker", "--host", "unix:///var/run/docker.sock", *worker_base,
+                       "--add-host", "host.docker.internal:host-gateway",
+                       "--tmpfs", "/var/lib/attune/owning:rw,nosuid,nodev,mode=0700,uid=1000,gid=1000,size=536870912",
+                       "-e", "TMPDIR=/var/lib/attune/owning",
+                       "-e", "CARGO_MANIFEST_DIR=" + str(Path(__file__).resolve().parents[1] / "crates/worker"),
+                       "-e", "ATTUNE_ISOLATION_TEST_ECHO_PATH=/usr/local/bin/native-echo",
+                       "-e", "ATTUNE_TEST_RUN_ID=" + run_id,
+                       *[arg for key in database_env for arg in ("-e", key)],
+                       "--entrypoint", "/usr/local/bin/owning-worker-tests", image,
+                       "--include-ignored", "--nocapture", "--test-threads=4"]
+            print(json.dumps({"owner": owner,
+                              "owning_worker_tests_sha256": hashlib.sha256(owning.read_bytes()).hexdigest(),
+                              "owning_worker_run_id": run_id}), flush=True)
+            subprocess.run(command, env=child_env, check=True)
         if dummy.poll() is not None:
             raise RuntimeError("workload signaled the owned dummy credential process")
         tests_succeeded = True
@@ -177,7 +229,7 @@ def main():
             if dummy.poll() is None:
                 dummy.terminate()
             dummy.wait(timeout=10)
-        for owned_container in (container, container + "-native", container + "-init"):
+        for owned_container in (container, container + "-native", container + "-init", container + "-worker"):
             found = docker("inspect", owned_container, capture=True, check=False)
             if found.returncode == 0:
                 observed = json.loads(found.stdout)[0]
