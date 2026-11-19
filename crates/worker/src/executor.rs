@@ -413,6 +413,18 @@ fn inline_action_source(
     .then(|| entrypoint.to_owned())
 }
 
+fn release_contains_action_file(
+    manifest: &attune_common::pack_registry::storage::PackReleaseManifest,
+    entrypoint: &str,
+) -> bool {
+    let path = format!("actions/{entrypoint}");
+    let directory = format!("{path}/");
+    manifest
+        .files
+        .iter()
+        .any(|file| file.path == path || file.path.starts_with(&directory))
+}
+
 impl ActionExecutor {
     pub fn with_native_execution(
         mut self,
@@ -1748,9 +1760,39 @@ impl ActionExecutor {
         let code_path = if action.launch.is_some() {
             None
         } else if isolated_attempt.is_some() && !action.is_adhoc {
-            let entry =
-                attune_common::artifact_transport::ValidatedRelativePath::new(&entry_point)?;
-            Some(pack_dir.join("actions").join(entry.as_path()))
+            // Classify source from the same immutable release used by the
+            // native Pack pin. Manager filesystem existence cannot distinguish
+            // a released script from literal inline code inside the guest.
+            let unavailable = || Error::PermissionDenied("Pinned action source unavailable".into());
+            let snapshot = execution
+                .executable_snapshot
+                .as_ref()
+                .ok_or_else(unavailable)?;
+            let release =
+                attune_common::repositories::pack_release::PackReleaseRepository::find_by_id(
+                    &self.pool,
+                    snapshot.release.id,
+                )
+                .await?
+                .filter(|release| {
+                    release.digest == snapshot.release.digest && release.pack_ref == action.pack_ref
+                })
+                .ok_or_else(unavailable)?;
+            let manifest: attune_common::pack_registry::storage::PackReleaseManifest =
+                serde_json::from_value(release.manifest).map_err(|_| unavailable())?;
+            if manifest.format_version != 1
+                || manifest.pack_ref != action.pack_ref
+                || manifest.version != release.version
+            {
+                return Err(unavailable());
+            }
+            if release_contains_action_file(&manifest, &entry_point) {
+                let entry =
+                    attune_common::artifact_transport::ValidatedRelativePath::new(&entry_point)?;
+                Some(pack_dir.join("actions").join(entry.as_path()))
+            } else {
+                None
+            }
         } else if isolated_attempt.is_some() {
             None
         } else if !action.is_adhoc {
@@ -2678,6 +2720,16 @@ impl ActionExecutor {
             || manifest.version != release.version
         {
             return Err(unavailable());
+        }
+        if action.launch.is_none() && context.code.is_some() {
+            return self
+                .prepare_isolated_inline(
+                    context,
+                    preparation.parameter_secret_paths.as_deref(),
+                    spec,
+                    &execution,
+                )
+                .await;
         }
         if config.lifecycle.is_some() {
             return self.prepare_isolated_recipe(context, spec, &execution);
@@ -4136,6 +4188,40 @@ impl ActionExecutor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn released_action_source_classification_uses_exact_files_and_directories() {
+        use attune_common::pack_registry::storage::{PackReleaseFile, PackReleaseManifest};
+        let manifest = PackReleaseManifest {
+            format_version: 1,
+            pack_ref: "owned.pack".into(),
+            version: "1".into(),
+            files: [
+                "actions/script.sh",
+                "actions/native/linux-arm64",
+                "other/inline",
+            ]
+            .into_iter()
+            .map(|path| PackReleaseFile {
+                path: path.into(),
+                size: 1,
+                sha256: "a".repeat(64),
+                executable: false,
+            })
+            .collect(),
+        };
+        assert!(super::release_contains_action_file(&manifest, "script.sh"));
+        assert!(super::release_contains_action_file(&manifest, "native"));
+        assert!(!super::release_contains_action_file(&manifest, "script"));
+        assert!(!super::release_contains_action_file(
+            &manifest,
+            "printf 'inline code'"
+        ));
+        assert!(!super::release_contains_action_file(
+            &manifest,
+            "../other/inline"
+        ));
+    }
+
     #[test]
     fn recipe_inline_source_is_selected_at_the_action_boundary() {
         let config = super::RuntimeExecutionConfig { lifecycle: Some(serde_json::from_value(serde_json::json!({

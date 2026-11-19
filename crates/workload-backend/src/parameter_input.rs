@@ -38,14 +38,19 @@ pub(super) fn required(environment: &BTreeMap<String, String>) -> io::Result<boo
 
 pub(super) fn required_at_gate(invocation: &LaunchInvocation) -> io::Result<bool> {
     use attune_common::workload_launch::RUNNER_ROOT;
-    let recipe = ["linux-amd64", "linux-arm64"]
+    let private_preparation = ["linux-amd64", "linux-arm64"]
         .iter()
         .any(|file| invocation.argv.first() == Some(&format!("{RUNNER_ROOT}/{file}")))
         && matches!(
             invocation.argv.get(1).map(String::as_str),
-            Some("run-runtime-recipe" | "run-candidate-runtime-recipe" | "run-candidate-python")
+            Some(
+                "run-runtime-recipe"
+                    | "run-candidate-runtime-recipe"
+                    | "run-candidate-python"
+                    | "run-inline-action"
+            )
         );
-    Ok(required(&invocation.env)? && !recipe)
+    Ok(required(&invocation.env)? && !private_preparation)
 }
 
 fn format(environment: &BTreeMap<String, String>) -> io::Result<ParameterFormat> {
@@ -183,13 +188,14 @@ mod tests {
     }
 
     #[test]
-    fn fixed_recipe_materialization_is_deferred_until_after_preparation() {
+    fn fixed_helper_materialization_is_deferred_until_after_preparation() {
         let mut invocation = invocation("file", "json");
         assert!(required_at_gate(&invocation).unwrap());
         for mode in [
             "run-runtime-recipe",
             "run-candidate-runtime-recipe",
             "run-candidate-python",
+            "run-inline-action",
         ] {
             invocation.argv = vec![
                 format!(
