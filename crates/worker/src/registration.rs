@@ -87,6 +87,7 @@ impl WorkerRegistration {
             });
         let versions = RuntimeVersionRepository::list(&self.pool).await?;
         let mut legacy_versions = Vec::new();
+        let mut proved_digests = std::collections::BTreeSet::new();
         let mut instances = serde_json::Map::new();
         let mut names = std::collections::BTreeSet::from(["native".to_owned()]);
         for runtime in RuntimeRepository::list(&self.pool).await? {
@@ -144,6 +145,9 @@ impl WorkerRegistration {
                 .probe_registered_native_runtime(&runtime, None, admitted)
                 .await
                 .ok();
+            if tools.is_some() {
+                proved_digests.insert(digest.clone());
+            }
             let mut available = Vec::new();
             for version in versions.iter().filter(|v| v.runtime == runtime.id) {
                 if let Ok(tools) = executor
@@ -169,6 +173,11 @@ impl WorkerRegistration {
                             version,
                             &primary.version,
                         ) {
+                            if let Some(recipe) = &selected_recipe {
+                                if let Ok(digest) = recipe.digest() {
+                                    proved_digests.insert(digest);
+                                }
+                            }
                             available.push(version.version.clone());
                         }
                     }
@@ -203,7 +212,7 @@ impl WorkerRegistration {
         self.capabilities
             .insert("runtime_toolchains".into(), json!(instances));
         self.capabilities
-            .insert("runtime_recipe_digests".into(), json!(admitted));
+            .insert("runtime_recipe_digests".into(), json!(proved_digests));
         self.capabilities.insert(
             RUNTIME_VERSIONS_CAPABILITY_KEY.into(),
             crate::version_verify::build_runtime_versions_capability(
