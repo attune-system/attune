@@ -389,3 +389,17 @@ async fn legacy_verification_has_no_invented_tools_and_distribution_restore_revo
     assert!(Probe::tools(&db, spec.intent, MASTER).await.is_err());
     db.cleanup().await.unwrap();
 }
+
+#[tokio::test]
+async fn runtime_probe_migration_preserves_selected_execution_input_epochs() {
+    let db = create_test_pool().await.unwrap();
+    // The source kind predates native runtime discovery. Keep the old producer
+    // functional after installing199, including its permanent epoch tombstone.
+    sqlx::query("SELECT bump_workload_source_epoch('execution_input',9223372036854775806)")
+        .execute(&*db)
+        .await
+        .unwrap();
+    let epoch:i64=sqlx::query_scalar("SELECT epoch FROM workload_source_epoch WHERE kind='execution_input' AND subject=9223372036854775806").fetch_one(&*db).await.unwrap();
+    assert_eq!(epoch, 1);
+    db.cleanup().await.unwrap();
+}

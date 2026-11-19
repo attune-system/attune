@@ -2,7 +2,7 @@
 -- No scheduler, execution authority or reusable prepared environment is created.
 ALTER TABLE workload_source_epoch DROP CONSTRAINT workload_source_epoch_kind_check;
 ALTER TABLE workload_source_epoch ADD CONSTRAINT workload_source_epoch_kind_check CHECK
-    (kind IN ('owner','execution','worker','workload','sensor','admission','install','image','engine',
+    (kind IN ('owner','execution','worker','workload','sensor','admission','install','image','engine','execution_input',
               'runtime_definition','runtime_version_definition','runtime_provider','runtime_probe_admission'));
 CREATE TABLE runtime_probe_admission (
     id BIGSERIAL PRIMARY KEY,
