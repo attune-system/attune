@@ -1354,7 +1354,8 @@ mod tests {
 
         let first = storage.publish_release(&source, "demo", "1.0.0").unwrap();
         let repeated = storage.publish_release(&source, "demo", "1.0.0").unwrap();
-        let independent = PackStorage::new(temp.path().join("other-packs"))
+        let independent_storage = PackStorage::new(temp.path().join("other-packs"));
+        let independent = independent_storage
             .publish_release(&source, "demo", "1.0.0")
             .unwrap();
 
@@ -1382,6 +1383,19 @@ mod tests {
         assert!(first.archive_path.is_file());
         assert!(first.pack_path.join("pack.yaml").is_file());
         assert!(second.archive_path.is_file());
+
+        // Release trees stay sealed through every assertion. Dispose only
+        // these owned releases, then propagate temporary-root cleanup failure.
+        for (store, release) in [
+            (&storage, &first),
+            (&storage, &second),
+            (&independent_storage, &independent),
+        ] {
+            assert!(store
+                .remove_release_tree(&release.digest, release.pack_path.to_str().unwrap())
+                .unwrap());
+        }
+        temp.close().unwrap();
     }
 
     #[test]
@@ -1405,6 +1419,10 @@ mod tests {
         fs::write(&release.archive_path, b"tampered").unwrap();
 
         assert!(storage.publish_release(&source, "demo", "1.0.0").is_err());
+        assert!(storage
+            .remove_release_tree(&release.digest, release.pack_path.to_str().unwrap())
+            .unwrap());
+        temp.close().unwrap();
     }
 
     #[test]
