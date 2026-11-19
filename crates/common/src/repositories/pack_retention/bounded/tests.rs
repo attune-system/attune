@@ -963,6 +963,7 @@ async fn production_defaults_cross_ten_thousand_pins_and_persist_fast_continuati
     // Each invocation has the unchanged production cycle budget. Advance only
     // the owned durable deadline between calls, modelling scheduler/restart time.
     for _ in 0..6 {
+        let before = epoch_progress(db.pool()).await;
         let result = PackRetentionRepository::collect_bounded(db.pool(), Utc::now(), 0, &budgets)
             .await
             .unwrap();
@@ -970,10 +971,36 @@ async fn production_defaults_cross_ten_thousand_pins_and_persist_fast_continuati
         let progress = epoch_progress(db.pool()).await;
         if progress.pending {
             let delay = progress.next_attempt.unwrap() - progress.last_attempt.unwrap();
-            assert!(
-                delay >= chrono::Duration::seconds(1) && delay < chrono::Duration::seconds(2),
-                "unexpected pending delay {delay:?}; progress={progress:?}; result={result:?}"
-            );
+            match epoch(&result).outcome {
+                GraphReclamationOutcome::Progress | GraphReclamationOutcome::NoWork => {
+                    assert!(
+                        delay >= chrono::Duration::seconds(1)
+                            && delay < chrono::Duration::seconds(2),
+                        "unexpected continuation delay {delay:?}; progress={progress:?}; result={result:?}"
+                    );
+                }
+                GraphReclamationOutcome::LockDeferred
+                | GraphReclamationOutcome::DeadlineDeferred
+                    if epoch(&result).error.is_some() =>
+                {
+                    // A real bounded statement timeout uses the documented
+                    // retry backoff, not the successful-page continuation.
+                    // Retain the same one-second SQL-clock tolerance as above.
+                    let retry = chrono::Duration::from_std(budgets.retry_delay).unwrap();
+                    assert!(
+                        delay >= retry * 4 / 5
+                            && delay < retry * 6 / 5 + chrono::Duration::seconds(1),
+                        "unexpected deferred retry delay {delay:?}; progress={progress:?}; result={result:?}"
+                    );
+                }
+                GraphReclamationOutcome::DeadlineDeferred => {
+                    // Exhausting the cycle before this phase starts cannot
+                    // rewrite its previously persisted scheduling evidence.
+                    assert_eq!(progress.last_attempt, before.last_attempt);
+                    assert_eq!(progress.next_attempt, before.next_attempt);
+                }
+                outcome => panic!("unexpected pending outcome {outcome:?}: {result:?}"),
+            }
             assert!(result.backlog_pending() && !result.complete(), "{result:?}");
         }
         if epoch(&result).changed > 0 {
