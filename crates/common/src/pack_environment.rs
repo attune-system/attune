@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 /// Status of a pack environment
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Type)]
@@ -83,6 +84,7 @@ pub struct CoordinatedPackEnvironment {
     pub status: PackEnvironmentStatus,
     pub manifest_checksum: Option<String>,
     pub claimed_by_worker: Option<i64>,
+    pub claim_id: Option<Uuid>,
     pub claim_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub installed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub last_verified: Option<chrono::DateTime<chrono::Utc>>,
@@ -145,6 +147,7 @@ impl PackEnvironmentManager {
             status: row.try_get("status")?,
             manifest_checksum: row.try_get("manifest_checksum")?,
             claimed_by_worker: row.try_get("claimed_by_worker")?,
+            claim_id: row.try_get("claim_id")?,
             claim_expires_at: row.try_get("claim_expires_at")?,
             installed_at: row.try_get("installed_at")?,
             last_verified: row.try_get("last_verified")?,
@@ -372,7 +375,7 @@ impl PackEnvironmentManager {
     }
 
     async fn mark_environment_outdated(&self, env_id: i64) -> Result<()> {
-        sqlx::query("UPDATE pack_environment SET status = 'outdated' WHERE id = $1")
+        sqlx::query("UPDATE pack_environment SET status = 'outdated',claimed_by_worker=NULL,claim_id=NULL,claim_expires_at=NULL WHERE id = $1")
             .bind(env_id)
             .execute(&self.pool)
             .await?;
@@ -407,48 +410,32 @@ impl PackEnvironmentManager {
                 status = CASE
                     WHEN pack_environment.env_path IS DISTINCT FROM EXCLUDED.env_path
                         OR pack_environment.manifest_checksum IS DISTINCT FROM EXCLUDED.manifest_checksum
-                    THEN CASE
-                        WHEN pack_environment.status = 'installing'
-                            AND pack_environment.claim_expires_at IS NOT NULL
-                            AND pack_environment.claim_expires_at > NOW()
-                        THEN pack_environment.status
-                        ELSE 'outdated'::pack_environment_status_enum
-                    END
+                    THEN 'outdated'::pack_environment_status_enum
                     ELSE pack_environment.status
                 END,
                 install_error = CASE
                     WHEN pack_environment.env_path IS DISTINCT FROM EXCLUDED.env_path
                         OR pack_environment.manifest_checksum IS DISTINCT FROM EXCLUDED.manifest_checksum
-                    THEN NULL
-                    ELSE pack_environment.install_error
+                    THEN NULL ELSE pack_environment.install_error
                 END,
                 claimed_by_worker = CASE
                     WHEN pack_environment.env_path IS DISTINCT FROM EXCLUDED.env_path
                         OR pack_environment.manifest_checksum IS DISTINCT FROM EXCLUDED.manifest_checksum
-                    THEN CASE
-                        WHEN pack_environment.status = 'installing'
-                            AND pack_environment.claim_expires_at IS NOT NULL
-                            AND pack_environment.claim_expires_at > NOW()
-                        THEN pack_environment.claimed_by_worker
-                        ELSE NULL
-                    END
-                    ELSE pack_environment.claimed_by_worker
+                    THEN NULL ELSE pack_environment.claimed_by_worker
+                END,
+                claim_id = CASE
+                    WHEN pack_environment.env_path IS DISTINCT FROM EXCLUDED.env_path
+                        OR pack_environment.manifest_checksum IS DISTINCT FROM EXCLUDED.manifest_checksum
+                    THEN NULL ELSE pack_environment.claim_id
                 END,
                 claim_expires_at = CASE
                     WHEN pack_environment.env_path IS DISTINCT FROM EXCLUDED.env_path
                         OR pack_environment.manifest_checksum IS DISTINCT FROM EXCLUDED.manifest_checksum
-                    THEN CASE
-                        WHEN pack_environment.status = 'installing'
-                            AND pack_environment.claim_expires_at IS NOT NULL
-                            AND pack_environment.claim_expires_at > NOW()
-                        THEN pack_environment.claim_expires_at
-                        ELSE NULL
-                    END
-                    ELSE pack_environment.claim_expires_at
+                    THEN NULL ELSE pack_environment.claim_expires_at
                 END,
                 updated = NOW()
             RETURNING id, pack, pack_ref, runtime, runtime_ref, runtime_version, runtime_version_text,
-                      env_key, env_path, status, manifest_checksum, claimed_by_worker,
+                      env_key, env_path, status, manifest_checksum, claimed_by_worker, claim_id,
                       claim_expires_at, installed_at, last_verified, install_log, install_error,
                       metadata
             "#,
@@ -474,7 +461,7 @@ impl PackEnvironmentManager {
         let row = sqlx::query(
             r#"
             SELECT id, pack, pack_ref, runtime, runtime_ref, runtime_version, runtime_version_text,
-                   env_key, env_path, status, manifest_checksum, claimed_by_worker,
+                   env_key, env_path, status, manifest_checksum, claimed_by_worker, claim_id,
                    claim_expires_at, installed_at, last_verified, install_log, install_error,
                    metadata
             FROM pack_environment
@@ -489,36 +476,70 @@ impl PackEnvironmentManager {
             .transpose()
     }
 
-    pub async fn claim_coordinated_environment(
+    async fn lock_coordinated_environment(
         &self,
         env_key: &str,
         worker_id: i64,
+    ) -> Result<Transaction<'static, Postgres>> {
+        let mut transaction = self.pool.begin().await?;
+        // Source before target also serializes worker deletion's FK cleanup.
+        let _ = sqlx::query_scalar::<_, i64>("SELECT id FROM worker WHERE id=$1 FOR KEY SHARE")
+            .bind(worker_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        // Evaluate lease clocks only after this wait, in the following UPDATE.
+        // The owned transaction also serializes source replacement/takeover.
+        let _ = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM pack_environment WHERE env_key=$1 FOR UPDATE",
+        )
+        .bind(env_key)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        Ok(transaction)
+    }
+
+    pub async fn claim_coordinated_environment(
+        &self,
+        expected: &CoordinatedPackEnvironment,
+        worker_id: i64,
         lease_seconds: i64,
     ) -> Result<Option<CoordinatedPackEnvironment>> {
+        if lease_seconds <= 0 {
+            return Err(Error::validation("Invalid installation lease"));
+        }
+        let mut transaction = self
+            .lock_coordinated_environment(&expected.env_key, worker_id)
+            .await?;
         let row = sqlx::query(
             r#"
             UPDATE pack_environment
             SET status = 'installing',
                 claimed_by_worker = $2,
-                claim_expires_at = NOW() + ($3 * INTERVAL '1 second'),
+                claim_id = gen_random_uuid(),
+                claim_expires_at = clock_timestamp() + ($3 * INTERVAL '1 second'),
                 install_error = NULL,
                 updated = NOW()
-            WHERE env_key = $1
+            WHERE env_key = $1 AND id = $6
+              AND env_path = $4 AND manifest_checksum IS NOT DISTINCT FROM $5
               AND (
                   status IN ('pending', 'failed', 'outdated')
-                  OR (status = 'installing' AND (claim_expires_at IS NULL OR claim_expires_at <= NOW()))
+                  OR (status = 'installing' AND (claimed_by_worker IS NULL OR claim_expires_at IS NULL OR claim_expires_at <= clock_timestamp()))
               )
             RETURNING id, pack, pack_ref, runtime, runtime_ref, runtime_version, runtime_version_text,
-                      env_key, env_path, status, manifest_checksum, claimed_by_worker,
+                      env_key, env_path, status, manifest_checksum, claimed_by_worker, claim_id,
                       claim_expires_at, installed_at, last_verified, install_log, install_error,
                       metadata
             "#,
         )
-        .bind(env_key)
+        .bind(&expected.env_key)
         .bind(worker_id)
         .bind(lease_seconds)
-        .fetch_optional(&self.pool)
+        .bind(&expected.env_path)
+        .bind(&expected.manifest_checksum)
+        .bind(expected.id)
+        .fetch_optional(&mut *transaction)
         .await?;
+        transaction.commit().await?;
 
         row.map(|row| Self::coordinated_environment_from_row(&row))
             .transpose()
@@ -528,23 +549,34 @@ impl PackEnvironmentManager {
         &self,
         env_key: &str,
         worker_id: i64,
+        claim_id: Uuid,
         lease_seconds: i64,
     ) -> Result<bool> {
+        if lease_seconds <= 0 {
+            return Err(Error::validation("Invalid installation lease"));
+        }
+        let mut transaction = self
+            .lock_coordinated_environment(env_key, worker_id)
+            .await?;
         let updated = sqlx::query(
             r#"
             UPDATE pack_environment
-            SET claim_expires_at = NOW() + ($3 * INTERVAL '1 second'),
+            SET claim_expires_at = clock_timestamp() + ($4 * INTERVAL '1 second'),
                 updated = NOW()
             WHERE env_key = $1
               AND claimed_by_worker = $2
+              AND claim_id = $3
               AND status = 'installing'
+              AND claim_expires_at > clock_timestamp()
             "#,
         )
         .bind(env_key)
         .bind(worker_id)
+        .bind(claim_id)
         .bind(lease_seconds)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
 
         Ok(updated.rows_affected() > 0)
     }
@@ -553,28 +585,38 @@ impl PackEnvironmentManager {
         &self,
         env_key: &str,
         worker_id: i64,
+        claim_id: Uuid,
         manifest_checksum: Option<&str>,
     ) -> Result<bool> {
+        let mut transaction = self
+            .lock_coordinated_environment(env_key, worker_id)
+            .await?;
         let updated = sqlx::query(
             r#"
             UPDATE pack_environment
             SET status = 'ready',
-                manifest_checksum = $3,
+                manifest_checksum = $4,
                 installed_at = NOW(),
                 last_verified = NOW(),
                 claimed_by_worker = NULL,
+                claim_id = NULL,
                 claim_expires_at = NULL,
                 install_error = NULL,
                 updated = NOW()
             WHERE env_key = $1
               AND claimed_by_worker = $2
+              AND claim_id = $3
+              AND status = 'installing'
+              AND claim_expires_at > clock_timestamp()
             "#,
         )
         .bind(env_key)
         .bind(worker_id)
+        .bind(claim_id)
         .bind(manifest_checksum)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
 
         Ok(updated.rows_affected() > 0)
     }
@@ -583,25 +625,34 @@ impl PackEnvironmentManager {
         &self,
         env_key: &str,
         worker_id: i64,
+        claim_id: Uuid,
         error_message: &str,
     ) -> Result<bool> {
+        let mut transaction = self
+            .lock_coordinated_environment(env_key, worker_id)
+            .await?;
         let updated = sqlx::query(
             r#"
             UPDATE pack_environment
             SET status = 'failed',
-                install_error = $3,
+                install_error = $4,
                 claimed_by_worker = NULL,
+                claim_id = NULL,
                 claim_expires_at = NULL,
                 updated = NOW()
             WHERE env_key = $1
               AND claimed_by_worker = $2
+              AND claim_id = $3
+              AND status = 'installing'
             "#,
         )
         .bind(env_key)
         .bind(worker_id)
+        .bind(claim_id)
         .bind(error_message)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
 
         Ok(updated.rows_affected() > 0)
     }
@@ -612,6 +663,7 @@ impl PackEnvironmentManager {
             UPDATE pack_environment
             SET status = 'outdated',
                 claimed_by_worker = NULL,
+                claim_id = NULL,
                 claim_expires_at = NULL,
                 updated = NOW()
             WHERE env_key = $1

@@ -946,11 +946,7 @@ async fn coordinate_environment_setup(
             }
 
             if let Some(claimed) = env_manager
-                .claim_coordinated_environment(
-                    &coordinated.env_key,
-                    worker.id,
-                    INSTALL_CLAIM_LEASE_SECONDS,
-                )
+                .claim_coordinated_environment(&coordinated, worker.id, INSTALL_CLAIM_LEASE_SECONDS)
                 .await
                 .map_err(|e| e.to_string())?
             {
@@ -980,40 +976,56 @@ async fn coordinate_environment_setup(
             continue;
         };
 
+        let claim_id = claimed
+            .claim_id
+            .ok_or_else(|| "Installation claim fence is missing".to_string())?;
         let renewer = spawn_claim_renewer(
             env_manager.clone(),
             claimed.env_key.clone(),
             worker.id,
+            claim_id,
             target_label.clone(),
         );
 
         let install_result = process_runtime
             .setup_pack_environment(pack_dir, env_dir)
             .await;
-        let _ = renewer.send(());
+        // Join the sole renewal owner before acknowledging publication/failure.
+        let renewal_result = renewer.finish().await;
+        let install_result = install_result
+            .map_err(|error| error.to_string())
+            .and(renewal_result);
 
         match install_result {
             Ok(()) => {
-                env_manager
+                let published = env_manager
                     .mark_coordinated_environment_ready(
                         &claimed.env_key,
                         worker.id,
+                        claim_id,
                         manifest_checksum,
                     )
                     .await
                     .map_err(|e| e.to_string())?;
+                if !published {
+                    return Err("Installation claim was lost before publication".into());
+                }
                 return Ok(CoordinateSetupOutcome::Installed);
             }
             Err(e) => {
-                let error_message = e.to_string();
-                env_manager
+                let error_message = e;
+                let closed = env_manager
                     .mark_coordinated_environment_failed(
                         &claimed.env_key,
                         worker.id,
+                        claim_id,
                         &error_message,
                     )
                     .await
                     .map_err(|mark_err| mark_err.to_string())?;
+                if !closed {
+                    return Err("Installation claim was replaced before failure settlement".into());
+                }
 
                 if attempt + 1 == INSTALL_CLAIM_ATTEMPTS {
                     return Err(format!(
@@ -1133,47 +1145,51 @@ fn jitter_delay_ms() -> u64 {
     INSTALL_JITTER_MIN_MS + (u64::from_le_bytes(bytes) % INSTALL_JITTER_SPAN_MS)
 }
 
+struct ClaimRenewer {
+    stop: oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<Result<(), String>>,
+}
+impl ClaimRenewer {
+    async fn finish(self) -> Result<(), String> {
+        let _ = self.stop.send(());
+        self.task
+            .await
+            .map_err(|_| "Installation claim renewer did not finish".to_string())?
+    }
+}
+
 fn spawn_claim_renewer(
     env_manager: PackEnvironmentManager,
     env_key: String,
     worker_id: i64,
+    claim_id: Uuid,
     target_label: String,
-) -> oneshot::Sender<()> {
-    let (tx, mut rx) = oneshot::channel();
-    tokio::spawn(async move {
+) -> ClaimRenewer {
+    let (stop, mut stopped) = oneshot::channel();
+    let task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(INSTALL_CLAIM_RENEW_SECONDS));
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         interval.tick().await;
-
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    match env_manager
-                        .renew_coordinated_environment_claim(&env_key, worker_id, INSTALL_CLAIM_LEASE_SECONDS)
-                        .await
-                    {
+                    match env_manager.renew_coordinated_environment_claim(
+                        &env_key, worker_id, claim_id, INSTALL_CLAIM_LEASE_SECONDS,
+                    ).await {
                         Ok(true) => {}
-                        Ok(false) => {
-                            debug!(
-                                "Claim renewer for '{}' stopped because the install claim is no longer owned",
-                                target_label
-                            );
-                            break;
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to renew coordinated install claim for '{}': {}",
-                                target_label, e
-                            );
+                        Ok(false) => return Err("Installation claim renewal lost its fence".into()),
+                        Err(error) => {
+                            // A transient DB error does not extend the claim.
+                            // Subsequent renewal/ready still require live expiry.
+                            warn!(target = %target_label, %error, "Installation claim renewal failed");
                         }
                     }
                 }
-                _ = &mut rx => break,
+                _ = &mut stopped => return Ok(()),
             }
         }
     });
-
-    tx
+    ClaimRenewer { stop, task }
 }
 
 async fn load_worker_for_env_setup(db_pool: &PgPool, worker_id: i64) -> Option<Worker> {
