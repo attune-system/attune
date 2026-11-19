@@ -73,11 +73,13 @@ to execute locally when configuration is missing. An explicitly configured
 worker constructs the adapter and routes its existing action loop through the
 trusted native producer. Worker/agent startup selects `NativeEffectsRequired`;
 missed local workload/setup/probe wrappers deny before filesystem/PATH lookup,
-without invoking the legacy Bubblewrap prerequisite. This is a guard, not
-support for the remaining executable paths. Sensor construction, remote runtime
-discovery/setup and the other consumers, default activation and supported
-package/chart values remain incomplete. No published image pin or working
-default deployment is implied.
+without invoking the legacy Bubblewrap prerequisite. The source now includes
+native producers for runtime discovery, coordinated setup, actions, candidate
+tests and managed sensors. This implementation does not establish deployment
+readiness: owning provider, startup, recovery and full-stack acceptance are
+required before activation. Compose and chart configuration require explicit
+image/Runner pins and private cache/custody storage. No published image pin or
+working default deployment is implied.
 
 Configured native managers select `WorkloadSandbox::NativeEffectsRequired`
 through the existing child-environment interface. Residual guarded local
@@ -86,11 +88,12 @@ startup. This is a migration deny guard, not proof that every caller migrated;
 raw unguarded command sinks still require inventory and removal before activation.
 Environment clearing and secret-bearing parent protection remain independent.
 
-Language-neutral `execution_config.lifecycle` recipes are also a required
-migration path. Legacy native setup/invocation planners reject them explicitly;
-they cannot ignore recipe tools, working directories or launch metadata. Native
-recipe execution must preserve attempt-private generations without shared reuse.
-The trusted local recipe profile is not an isolated-backend fallback.
+Language-neutral `execution_config.lifecycle` recipes use the fixed native
+helper and one attempt-private generation for discovery, preparation and final
+invocation. They are never published into the reusable runtime cache. Shared
+legacy setup/invocation planners continue rejecting recipes explicitly rather
+than dropping their tools, working directories or launch metadata. The trusted
+local recipe profile is not an isolated-backend fallback.
 
 A fixed Runner gate starts before pack code. Separate bounded stdout/stderr
 attach streams are established first. The trusted caller commits the existing
@@ -101,6 +104,16 @@ header, clears its child environment and preserves the application's remaining
 stdin, including empty EOF, without adding a newline. Uncertain writes are not
 retried. Existing CLI executable verification and static invocation-name semantics
 remain part of selected invocation planning.
+
+Declared JSON, YAML, dotenv and parameter-file delivery retain one canonical
+JSON transport from the trusted producer. The guest formats that input after
+preparation and retains any private parameter file through the final child
+join. Inline action source is selected from the immutable action/release
+snapshot, not manager filesystem existence or parameter rendering. Direct and
+TempFile semantics are preserved; TempFile source is writable only in its
+private guest directory. Parameter files are created with mode `0400`. Secret-bearing
+stdin requires the retained canonical origin frontier; secret paths cannot be
+materialized into CLI arguments. Input-only consent does not grant API access.
 
 Installed-command selection uses the fixed Runner `inspect-command-program`
 effect inside an admitted image/platform probe with the defining Pack and the
@@ -121,8 +134,12 @@ it never reads ambient recipe-admission grants or a manager PATH. Both selected
 executable and canonical identity must be read-only. Only the bounded existing
 `VerifiedTool` map is returned. The trusted owner still checks captured operator
 admission, defining release, image/platform and successful Probe exit before
-accepting versions. Recipe preparation and launch are not run by this helper;
-their private-generation consumers and startup wiring remain migration gaps.
+accepting versions. Recipe preparation and launch are not run by this discovery
+helper. Registration uses the source-fenced probe driver; action, sensor and
+candidate producers separately select the admitted private-generation helper.
+Candidate suites that need global Python preparation complete it in the same
+attempt before their recipe, while preserving the recipe's own environment and
+PATH. Neither preparation phase receives the final candidate API credential.
 
 ## Kubernetes effects
 
