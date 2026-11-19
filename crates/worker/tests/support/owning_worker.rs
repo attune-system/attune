@@ -156,12 +156,279 @@ pub enum OwningCase {
     Command,
     Interpreted,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InlineCase {
+    ShellFile,
+    Direct,
+    TempFile,
+    Recipe,
+}
+
+impl NativeOwningFixture {
+    fn child(&self) -> Result<Self> {
+        Ok(Self {
+            root: tempfile::Builder::new()
+                .prefix("owning-case-")
+                .tempdir_in(self.root.path())?,
+            config: self.config.clone(),
+            configured: ConfiguredBackend {
+                backend: self.configured.backend.clone(),
+                cache: self.configured.cache.clone(),
+                runner: self.configured.runner.clone(),
+            },
+            echo: self.echo.clone(),
+            runner: self.runner.clone(),
+        })
+    }
+}
+
+/// One existing interpreted wrapper, one configured provider/cache/image. Every
+/// scenario joins full custody/restart/removal before the next attempt starts.
+pub async fn run_interpreted_suite(fixture: NativeOwningFixture) -> Result<()> {
+    let result = async {
+        run_native_fixture(fixture.child()?, OwningCase::Interpreted).await?;
+        for (delivery, format) in [
+            ("stdin", "yaml"),
+            ("stdin", "dotenv"),
+            ("file", "json"),
+            ("file", "yaml"),
+            ("file", "dotenv"),
+        ] {
+            run_native_parameter_fixture(fixture.child()?, delivery, format).await?;
+        }
+        for (case, delivery, format) in inline_scenarios() {
+            owning_case(
+                Some(fixture.child()?),
+                false,
+                false,
+                false,
+                Some((delivery, format)),
+                Some(case),
+            )
+            .await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    let NativeOwningFixture {
+        root, configured, ..
+    } = fixture;
+    drop(configured);
+    fn unseal(path: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::symlink_metadata(path)?.is_dir() {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+            for entry in std::fs::read_dir(path)? {
+                unseal(&entry?.path())?;
+            }
+        }
+        Ok(())
+    }
+    let cleanup = unseal(root.path()).and_then(|_| root.close());
+    result?;
+    cleanup?;
+    Ok(())
+}
+
+fn inline_scenarios() -> [(InlineCase, &'static str, &'static str); 7] {
+    [
+        (InlineCase::ShellFile, "stdin", "json"),
+        (InlineCase::Direct, "stdin", "json"),
+        (InlineCase::Direct, "file", "yaml"),
+        (InlineCase::Direct, "stdin", "dotenv"),
+        (InlineCase::TempFile, "stdin", "json"),
+        (InlineCase::TempFile, "file", "dotenv"),
+        (InlineCase::Recipe, "stdin", "json"),
+    ]
+}
+
+fn inline_recipe() -> attune_common::runtime_lifecycle::RuntimeRecipe {
+    serde_json::from_value(json!({
+        "workspace":true,"extensions":[".py"],
+        "tools":[{"name":"python","binaries":["/usr/bin/python3"],"args":["--version"],"version_pattern":"Python (?<version>[0-9]+\\.[0-9]+\\.[0-9]+)","primary":true}],
+        "prepare":[{"command":["{tool_python}","-c","import os,sys; from pathlib import Path; assert sys.stdin.read()==''; assert 'ATTUNE_API_TOKEN' not in os.environ; Path('recipe-private-marker').write_text('private')"]}],
+        "launch":{"command":["{tool_python}","{source_file}"],"timeout_seconds":120}
+    })).expect("fixed owning recipe")
+}
+fn inline_config(case: InlineCase) -> serde_json::Value {
+    match case {
+        InlineCase::Recipe => json!({"lifecycle":inline_recipe()}),
+        InlineCase::Direct => {
+            json!({"interpreter":{"binary":"/bin/bash","args":["--must-not-reach-direct","{pack_dir}"]},"inline_execution":{"strategy":"direct","extension":".ignored","inject_shell_helpers":true}})
+        }
+        InlineCase::ShellFile => {
+            json!({"interpreter":{"binary":"/bin/bash","args":["-e"]},"inline_execution":{"strategy":"temp_file","extension":"sh","inject_shell_helpers":true}})
+        }
+        InlineCase::TempFile => {
+            json!({"interpreter":{"binary":"/bin/bash","args":["--noprofile","--norc","--rcfile","literal{pack_dir}","-e"]},"inline_execution":{"strategy":"temp_file","extension":"sh","inject_shell_helpers":true}})
+        }
+    }
+}
+const INLINE_INPUT_READER: &str = r#"import json,os,sys,stat,shlex
+from pathlib import Path
+assert Path('/usr/local/libexec/attune/echo').is_file()
+for name in ['DATABASE_URL','JWT_SECRET','ENCRYPTION_KEY','ATTUNE__DUMMY_IMAGE_CREDENTIAL','ATTUNE_RUNTIME_RECIPE_DIGESTS']:
+    assert name not in os.environ,name
+assert not Path('/var/run/secrets/kubernetes.io/serviceaccount/token').exists()
+assert not Path('/var/run/docker.sock').exists()
+assert not Path('/tmp/inline-injection').exists()
+delivery=os.environ['ATTUNE_PARAMETER_DELIVERY']
+format=os.environ['ATTUNE_PARAMETER_FORMAT']
+if delivery=='file':
+    assert sys.stdin.read()==''
+    path=Path(os.environ['ATTUNE_PARAMETER_FILE'])
+    assert path.parent==Path('/tmp') and stat.S_IMODE(path.stat().st_mode)==0o400
+    raw=path.read_text()
+else:
+    assert delivery=='stdin' and 'ATTUNE_PARAMETER_FILE' not in os.environ
+    raw=sys.stdin.read()
+if format=='json': message=json.loads(raw)['message']
+elif format=='yaml':
+    assert raw.startswith('message: ')
+    message=raw[len('message: '):].strip()
+else:
+    assert format=='dotenv'
+    [field]=shlex.split(raw)
+    assert field.startswith('message=')
+    message=field[len('message='):]
+sys.stdout.write(message)
+"#;
+fn inline_source(case: InlineCase) -> String {
+    match case {
+        InlineCase::ShellFile => "inline-probe.sh".into(),
+        InlineCase::Direct => format!("exec /usr/bin/python3 -c '{}'",INLINE_INPUT_READER.replace('\'',"'\\''")),
+        InlineCase::TempFile => r#"[[ "$0" == /tmp/attune-inline-*/source-*.sh ]]
+[[ $(stat -c %a "$0") == 600 ]]
+[[ "$PARAM_MESSAGE" == "$message" ]]
+[[ -z $(printenv PARAM_MESSAGE || true) && -z $(printenv message || true) ]]
+[[ ! -v ATTUNE__DUMMY_IMAGE_CREDENTIAL && ! -v ATTUNE_RUNTIME_RECIPE_DIGESTS ]]
+[[ ! -e /var/run/docker.sock && ! -e /var/run/secrets/kubernetes.io/serviceaccount/token ]]
+[[ ! -e /tmp/inline-injection ]]
+if IFS= read -r unexpected; then exit 41; fi
+if [[ "$ATTUNE_PARAMETER_DELIVERY" == file ]]; then
+    [[ -f "$ATTUNE_PARAMETER_FILE" && $(stat -c %a "$ATTUNE_PARAMETER_FILE") == 400 ]]
+fi
+printf '%s' "$message"
+"#.into(),
+        InlineCase::Recipe => format!("from pathlib import Path\nassert Path(__file__).is_relative_to('/tmp/attune-lifecycle-generations')\nassert Path('recipe-private-marker').read_text()=='private'\n{INLINE_INPUT_READER}"),
+    }
+}
+
+fn assert_inline_invocation(
+    case: InlineCase,
+    spec: &ProcessSpec,
+    source: &str,
+    message: &str,
+) -> Result<()> {
+    ensure!(
+        spec.pack_access == PackAccess::ReadOnly
+            && spec.stage.is_none()
+            && spec.invocation.working_root == LaunchRoot::Pack,
+        "inline source mount/root contract changed"
+    );
+    ensure!(
+        spec.inputs
+            .iter()
+            .all(|pin| pin.kind != LaunchInputKind::Runtime),
+        "private inline recipe/shell borrowed shared Runtime"
+    );
+    ensure!(
+        !spec
+            .invocation
+            .argv
+            .iter()
+            .any(|value| value.contains(message))
+            && !spec
+                .invocation
+                .env
+                .values()
+                .any(|value| value.contains(message)),
+        "parameter value leaked into private launch argv/environment"
+    );
+    match case {
+        InlineCase::ShellFile => {
+            ensure!(
+                spec.invocation.argv
+                    == ["/bin/bash", "-e", &format!("{PACK_ROOT}/actions/{source}")],
+                "real released shell file was reclassified as inline"
+            );
+        }
+        InlineCase::Direct | InlineCase::TempFile => {
+            ensure!(
+                spec.invocation.argv.first()
+                    == Some(&format!(
+                        "{RUNNER_ROOT}/linux-{}",
+                        spec.platform.native_arch()
+                    ))
+                    && spec.invocation.argv.get(1).map(String::as_str) == Some("run-inline-action"),
+                "actual producer did not select fixed inline Runner"
+            );
+            let plan = attune_workload_backend::inline_action_plan::InlineActionPlan::decode(
+                &spec.invocation.argv[2..],
+            )?;
+            ensure!(
+                plan.source == source && plan.interpreter == "/bin/bash" && !plan.has_runtime,
+                "inline literal/interpreter binding changed"
+            );
+            if case == InlineCase::Direct {
+                ensure!(
+                    plan.strategy
+                        == attune_common::models::runtime::InlineExecutionStrategy::Direct
+                        && plan.arguments.is_empty()
+                        && !plan.shell_helpers
+                        && plan.extension.is_empty(),
+                    "Direct consumed TempFile args/helpers/extension"
+                );
+            } else {
+                ensure!(
+                    plan.strategy
+                        == attune_common::models::runtime::InlineExecutionStrategy::TempFile
+                        && plan.arguments
+                            == [
+                                "--noprofile",
+                                "--norc",
+                                "--rcfile",
+                                "literal{pack_dir}",
+                                "-e"
+                            ]
+                        && plan.shell_helpers
+                        && plan.extension == ".sh",
+                    "TempFile changed raw args/helpers/extension"
+                );
+            }
+        }
+        InlineCase::Recipe => {
+            ensure!(
+                spec.invocation.argv.get(1).map(String::as_str) == Some("run-runtime-recipe")
+                    && spec.invocation.argv.get(2).map(String::as_str) == Some("inline"),
+                "ad-hoc recipe did not use existing private-generation inline source"
+            );
+            let count: usize = spec
+                .invocation
+                .argv
+                .get(3)
+                .context("recipe source parts")?
+                .parse()?;
+            let selected = spec
+                .invocation
+                .argv
+                .get(4..4 + count)
+                .context("recipe source chunks")?
+                .concat();
+            let selected: String = serde_json::from_str(&selected)?;
+            ensure!(selected == source, "recipe literal changed");
+        }
+    }
+    Ok(())
+}
+
 pub async fn run_native_fixture(fixture: NativeOwningFixture, case: OwningCase) -> Result<()> {
     owning_case(
         Some(fixture),
         matches!(case, OwningCase::NativeCli | OwningCase::Command),
         matches!(case, OwningCase::Command),
         matches!(case, OwningCase::Interpreted),
+        None,
         None,
     )
     .await
@@ -175,13 +442,21 @@ pub async fn run_native_parameter_fixture(
 ) -> Result<()> {
     ensure!(matches!(delivery, "stdin" | "file"));
     ensure!(matches!(format, "json" | "yaml" | "dotenv"));
-    owning_case(Some(fixture), false, false, true, Some((delivery, format))).await
+    owning_case(
+        Some(fixture),
+        false,
+        false,
+        true,
+        Some((delivery, format)),
+        None,
+    )
+    .await
 }
 // Used by the original repository-double wrapper; the Docker-only target
 // compiles the same support module without selecting that separate case.
 #[allow(dead_code)]
 pub async fn run_repository_fixture() -> Result<()> {
-    owning_case(None, false, false, false, None).await
+    owning_case(None, false, false, false, None, None).await
 }
 
 async fn owning_case(
@@ -190,9 +465,14 @@ async fn owning_case(
     command: bool,
     interpreted: bool,
     declared_input: Option<(&'static str, &'static str)>,
+    inline: Option<InlineCase>,
 ) -> Result<()> {
     attune_common::auth::install_crypto_provider();
     let real_provider = native.is_some();
+    ensure!(
+        inline.is_none() || real_provider,
+        "inline acceptance requires the concrete provider"
+    );
     let (root, platform, echo, runner, native_config, configured) = if let Some(fixture) = native {
         (
             fixture.root,
@@ -253,9 +533,19 @@ async fn owning_case(
     let mut runtime = RuntimeFixture::new(
         Some(pack.id),
         Some(pack.r#ref.clone()),
-        if interpreted { "python" } else { "native" },
+        if inline == Some(InlineCase::Recipe) {
+            "inline_recipe"
+        } else if inline.is_some() {
+            "shell"
+        } else if interpreted {
+            "python"
+        } else {
+            "native"
+        },
     );
-    runtime.execution_config = if interpreted {
+    runtime.execution_config = if let Some(case) = inline {
+        inline_config(case)
+    } else if interpreted {
         json!({
             "interpreter":{"binary":"python3","args":["-u"],"file_extension":".py"},
             "environment":{"env_type":"virtualenv","dir_name":"venv","create_command":["python3","-m","venv","--copies","--without-pip","{env_dir}"],"interpreter_path":"{env_dir}/bin/python3"},
@@ -265,14 +555,62 @@ async fn owning_case(
         json!({})
     };
     let runtime = runtime.create(&database).await?;
-    let relative = if interpreted { "echo.py" } else { "echo" };
+    let relative = inline.map(inline_source).unwrap_or_else(|| {
+        if interpreted {
+            "echo.py".into()
+        } else {
+            "echo".into()
+        }
+    });
     let binary_relative = format!("echo/linux-{}", platform.native_arch());
-    let action = ActionFixture::new(pack.id, &pack.r#ref, "echo")
-        .with_runtime(runtime.id)
-        .with_entrypoint(relative)
-        .with_param_schema(json!({"message":{"type":"string","required":true}}))
-        .create(&database)
-        .await?;
+    let action = if inline == Some(InlineCase::Recipe) {
+        // Real ad-hoc authoring input. The repository resolves this row against
+        // its pack's active release; no released snapshot is fabricated/edited.
+        use attune_common::repositories::action::{ActionRepository, CreateActionInput};
+        ActionRepository::create(
+            &database,
+            CreateActionInput {
+                r#ref: format!("{}.echo", pack.r#ref),
+                pack: pack.id,
+                pack_ref: pack.r#ref.clone(),
+                label: "owning inline recipe".into(),
+                description: None,
+                entrypoint: Some(relative.clone()),
+                launch: None,
+                parameter_delivery: None,
+                parameter_format: None,
+                runtime: Some(runtime.id),
+                enabled: true,
+                runtime_version_constraint: None,
+                required_worker_runtimes: json!({}),
+                worker_selector: json!({}),
+                worker_tolerations: json!([]),
+                worker_affinity: json!({}),
+                param_schema: Some(json!({"message":{"type":"string","required":true}})),
+                out_schema: None,
+                output_policy: Default::default(),
+                output_format: Default::default(),
+                is_adhoc: true,
+                accesses_mcp: false,
+                default_execution_permission_set_refs: vec![],
+                reference_visibility: Default::default(),
+                reference_allowed_pack_refs: vec![],
+                artifact_retention_policy: None,
+                artifact_retention_limit: None,
+                log_retention_policy: None,
+                log_retention_limit: None,
+                timeout_seconds: None,
+            },
+        )
+        .await?
+    } else {
+        ActionFixture::new(pack.id, &pack.r#ref, "echo")
+            .with_runtime(runtime.id)
+            .with_entrypoint(&relative)
+            .with_param_schema(json!({"message":{"type":"string","required":true}}))
+            .create(&database)
+            .await?
+    };
     let action = if typed_cli {
         use attune_common::repositories::{
             action::{ActionRepository, UpdateActionInput},
@@ -317,17 +655,36 @@ async fn owning_case(
         source.join("pack.yaml"),
         format!("ref: {}\nversion: {}\n", pack.r#ref, pack.version),
     )?;
-    std::fs::write(
-        source.join("actions/echo.yaml"),
-        format!(
-            "ref: {}\nrunner_type: {}\nentry_point: {}\nparameter_delivery: {}\nparameter_format: {}\n",
-            action.r#ref,
-            if interpreted { "python" } else { "native" },
-            relative,
-            declared_input.map_or("stdin", |input| input.0),
-            declared_input.map_or("json", |input| input.1),
-        ),
-    )?;
+    if inline != Some(InlineCase::Recipe) {
+        std::fs::write(
+            source.join("actions/echo.yaml"),
+            serde_json::to_vec(&json!({
+                "ref":action.r#ref,"runner_type":runtime.name,"entry_point":relative,
+                "param_schema":action.param_schema,
+                "parameter_delivery":declared_input.map_or("stdin", |input|input.0),
+                "parameter_format":declared_input.map_or("json", |input|input.1)
+            }))?,
+        )?;
+    }
+    if inline.is_some() {
+        std::fs::create_dir_all(source.join("runtimes"))?;
+        std::fs::write(
+            source.join(format!("runtimes/{}.yaml", runtime.name)),
+            serde_json::to_vec(&json!({
+                "ref":runtime.r#ref,"name":runtime.name,"aliases":runtime.aliases,
+                "execution_config":runtime.execution_config,"distributions":runtime.distributions
+            }))?,
+        )?;
+    }
+    if inline == Some(InlineCase::ShellFile) {
+        std::fs::write(
+            source.join("actions/inline-probe.sh"),
+            format!(
+                "[[ ! -v PARAM_MESSAGE ]]\nexec /usr/bin/python3 -c '{}'",
+                INLINE_INPUT_READER.replace('\'', "'\\''")
+            ),
+        )?;
+    }
     let executable = source.join("actions").join(&binary_relative);
     std::fs::copy(&echo, &executable)?;
     use std::os::unix::fs::PermissionsExt;
@@ -435,7 +792,13 @@ sys.stdout.write(message)
         pack.id,
         release.id,
         &PackProjectionIds {
-            actions: vec![action.id],
+            // Ad-hoc definition remains the real authored row; only its pack
+            // and runtime belong to this immutable provider release.
+            actions: if inline == Some(InlineCase::Recipe) {
+                vec![]
+            } else {
+                vec![action.id]
+            },
             runtimes: vec![runtime.id],
             ..Default::default()
         },
@@ -501,9 +864,40 @@ sys.stdout.write(message)
     .await?;
     tokens.set_worker_id(worker.id.to_string());
     WorkerRepository::heartbeat_incarnation(&database, worker.id, incarnation).await?;
-    let message = format!("owned-captured-{}", Uuid::new_v4());
+    let message = if inline == Some(InlineCase::TempFile) {
+        format!(
+            "owned-captured-{}-'$(touch /tmp/inline-injection); tail",
+            Uuid::new_v4()
+        )
+    } else {
+        format!("owned-captured-{}", Uuid::new_v4())
+    };
     let mut tx = database.begin().await?;
     let snapshot = ExecutableSnapshotRepository::resolve_for_action(&mut *tx, action.id).await?;
+    if let Some(case) = inline {
+        ensure!(
+            snapshot.release.id == release.id && snapshot.release.digest == release.digest,
+            "snapshot release binding changed"
+        );
+        ensure!(
+            snapshot.executable.action.entrypoint.as_deref() == Some(relative.as_str()),
+            "literal source changed before admission"
+        );
+        ensure!(
+            snapshot.executable.action.is_adhoc == (case == InlineCase::Recipe),
+            "source classification was not genuinely authored"
+        );
+        let has_source = published
+            .manifest
+            .files
+            .iter()
+            .any(|file| file.path == format!("actions/{relative}"));
+        ensure!(
+            has_source == (case == InlineCase::ShellFile),
+            "fixture cannot distinguish actual released file from inline literal"
+        );
+    }
+
     let binding = SchemaContractRepository::materialize_action(&mut tx, &snapshot).await?;
     let execution = ExecutionRepository::create_pinned(
         &mut *tx,
@@ -599,6 +993,26 @@ sys.stdout.write(message)
         )?),
     )
     .with_worker_token_provider(tokens);
+    let executor = if inline.is_some() {
+        let captured =
+            attune_common::child_process_environment::ChildProcessEnvironment::from_parent(
+                inline.filter(|case| *case == InlineCase::Recipe).map(|_| {
+                    (
+                        std::ffi::OsString::from("ATTUNE_RUNTIME_RECIPE_DIGESTS"),
+                        std::ffi::OsString::from(
+                            inline_recipe().digest().expect("fixed recipe digest"),
+                        ),
+                    )
+                }),
+                &[],
+            )?
+            .with_workload_sandbox(
+                attune_common::workload_sandbox::WorkloadSandbox::NativeEffectsRequired,
+            );
+        executor.with_child_environment(captured)
+    } else {
+        executor
+    };
     let executor = if let (Some(config), Some(configured)) = (native_config, configured) {
         executor.with_native_execution(config, configured)?
     } else {
@@ -610,7 +1024,9 @@ sys.stdout.write(message)
         executor.set_process_incarnation(Uuid::new_v4()).is_err(),
         "native owner rebound"
     );
-    let spec = ProcessSpec {
+    let expected_image = payload_image.clone();
+    let expected_runner = runner_pin.clone();
+    let spec = (!real_provider).then(|| ProcessSpec {
         intent: Uuid::new_v4(),
         purpose: LaunchPurpose::Action,
         target: LaunchTarget::Execution {
@@ -630,8 +1046,11 @@ sys.stdout.write(message)
             env: BTreeMap::new(),
             working_root: LaunchRoot::Pack,
         },
-    };
-    let mut intent = spec.intent;
+    });
+    let mut intent = spec
+        .as_ref()
+        .map(|spec| spec.intent)
+        .unwrap_or_else(Uuid::nil);
     let heartbeat_stop = CancellationToken::new();
     let heartbeat_cancel = heartbeat_stop.clone();
     let heartbeat_pool = database.pool().clone();
@@ -667,7 +1086,7 @@ sys.stdout.write(message)
                     .execute_started_isolated(
                         execution.clone(),
                         CancellationToken::new(),
-                        spec,
+                        spec.context("repository double spec")?,
                         launcher.clone(),
                     )
                     .await
@@ -679,6 +1098,11 @@ sys.stdout.write(message)
                 .await?
                 .context("trusted producer did not retain its native intent")?;
         intent = retained.intent;
+        if let Some(case) = inline {
+            ensure!(retained.image == expected_image && retained.platform == platform,"inline image/platform pin changed");
+            ensure!(retained.inputs.iter().find(|pin|pin.kind==LaunchInputKind::Runner)==Some(&expected_runner),"inline Runner pin changed");
+            assert_inline_invocation(case,&retained,&relative,&message)?;
+        }
         if typed_cli {
             ensure!(
                 retained.invocation.argv.len() == 7

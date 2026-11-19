@@ -13,9 +13,7 @@ use attune_workload_backend::{
     configuration::{ConfiguredBackend, NativeBackend},
     kubernetes::{KubernetesLauncher, KubernetesPolicy},
 };
-use owning_worker::{
-    run_native_fixture, run_native_parameter_fixture, NativeOwningFixture, OwningCase,
-};
+use owning_worker::{run_interpreted_suite, run_native_fixture, NativeOwningFixture, OwningCase};
 use std::{collections::BTreeSet, fs::File, path::PathBuf, sync::Arc};
 fn required(name: &str) -> Result<String> {
     std::env::var(name).with_context(|| format!("missing owned fixture prerequisite: {name}"))
@@ -144,15 +142,5 @@ async fn kubernetes_command_action_custody_completion_and_restart() -> Result<()
 #[ignore = "requires explicit owned Kubernetes namespace, pinned binaries/images and disposable PostgreSQL"]
 async fn kubernetes_interpreted_setup_custody_completion_and_restart() -> Result<()> {
     let _provider = KUBERNETES_CASE.lock().await;
-    run_native_fixture(kubernetes_fixture().await?, OwningCase::Interpreted).await?;
-    for (delivery, format) in [
-        ("stdin", "yaml"),
-        ("stdin", "dotenv"),
-        ("file", "json"),
-        ("file", "yaml"),
-        ("file", "dotenv"),
-    ] {
-        run_native_parameter_fixture(kubernetes_fixture().await?, delivery, format).await?;
-    }
-    Ok(())
+    run_interpreted_suite(kubernetes_fixture().await?).await
 }
