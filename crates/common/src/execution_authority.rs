@@ -17,7 +17,6 @@ pub struct RecordedConsumerReadiness {
     pub notifier_delivery: bool,
     pub worker_completion: bool,
     pub native_executor_consumers: bool,
-    pub candidate_isolation: bool,
 }
 
 impl RecordedConsumerReadiness {
@@ -33,7 +32,6 @@ impl RecordedConsumerReadiness {
             (self.notifier_delivery, "notifier_delivery"),
             (self.worker_completion, "worker_completion"),
             (self.native_executor_consumers, "native_executor_consumers"),
-            (self.candidate_isolation, "candidate_isolation"),
         ]
         .into_iter()
         .filter_map(|(ready, consumer)| (!ready).then_some(consumer))
@@ -62,7 +60,7 @@ mod authority_consistency_tests {
         assert!(RecordedConsumerReadiness::default()
             .require_ready()
             .is_err());
-        for flags in 0u16..256 {
+        for flags in 0u16..128 {
             let readiness = RecordedConsumerReadiness {
                 execution_admission: flags & 1 != 0,
                 api_consumers: flags & 2 != 0,
@@ -71,11 +69,10 @@ mod authority_consistency_tests {
                 notifier_delivery: flags & 16 != 0,
                 worker_completion: flags & 32 != 0,
                 native_executor_consumers: flags & 64 != 0,
-                candidate_isolation: flags & 128 != 0,
             };
             let missing = readiness.missing_consumers();
-            assert_eq!(missing.len(), 8 - flags.count_ones() as usize);
-            assert_eq!(readiness.require_ready().is_ok(), flags == 255);
+            assert_eq!(missing.len(), 7 - flags.count_ones() as usize);
+            assert_eq!(readiness.require_ready().is_ok(), flags == 127);
             if let Err(error) = readiness.require_ready() {
                 for consumer in missing {
                     assert!(error.to_string().contains(consumer));

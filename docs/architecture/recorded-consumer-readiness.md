@@ -1,8 +1,8 @@
 # Recorded execution consumer readiness
 
 Recorded execution is currently denied by default. `RecordedConsumerReadiness`
-in `crates/common/src/execution_authority.rs` requires every consumer, including
-candidate isolation. Its missing-consumer diagnostics describe prerequisites;
+in `crates/common/src/execution_authority.rs` requires every authority and secret
+delivery consumer. Its missing-consumer diagnostics describe prerequisites;
 they are not a deployment toggle or evidence that a consumer is ready.
 
 ## Consumer inventory
@@ -20,7 +20,6 @@ establishing coordinated production startup or successful queue execution.
 | Notifier delivery | notifier `recorded_authority.rs`, `websocket_server.rs` | notifier `recorded_authority_transaction_tests` including revocation/delivery fencing |
 | Worker completion | worker `executor.rs`, common staged completion and worker-delivery repositories | worker `support/recorded_completion_cases.rs`, recorded restoration tests |
 | Native executor consumers | executor scheduler, retry manager, workflow/native common repositories | common native materialization, retry and outcome cases plus executor consumer tests |
-| Candidate isolation | worker `service.rs` candidate test handling, runtime preparation/verification, common sandbox | actual preparation and verification isolation, writer cleanup, and supported deployment-profile feasibility |
 
 Production enqueue, dispatch, scheduling and retry paths currently call the
 unready default. Worker construction also defaults to unready; its readiness
@@ -28,10 +27,39 @@ builder has no production caller. Replacing these calls requires evidence and a
 coordinated startup contract. Missing recorded evidence must never select an
 older delegated credential or ambient service identity.
 
-Candidate isolation is not established by a successful final-action sandbox
-launch. Preparation, verification and candidate executable paths must use the
-boundary, with supported profile prerequisites and cleanup proved. Host-only
-fixtures cannot certify Compose or persistent Kubernetes service profiles.
+### Current startup and compatibility gaps
+
+- `WorkerService::new` constructs `ActionExecutor` with its default readiness.
+  `ActionExecutor::with_recorded_readiness` validates the complete contract but
+  has no production caller. Worker registration advertises
+  `delegated_execution_authority_v1` when encryption is configured; that is not
+  recorded execution, input restoration or completion support.
+- Scheduler worker selection filters delegated capability for delegated work.
+  It has no corresponding recorded-worker compatibility filter. A registered
+  worker or successful heartbeat therefore cannot establish recorded readiness.
+- API authentication validates recorded credentials and rejects routes without
+  an explicit `RecordedRuntimeConsumer` marker. This protects unconverted
+  routes, but a marker alone does not prove the route's data-origin, revocation
+  or commit/delivery fences. API health exposes catalog compatibility rather
+  than a coordinated recorded-consumer handshake.
+- Notifier source and notification checks retain independent authorization and
+  delivery fences. Their presence does not establish API, worker or executor
+  support, and there is no shared startup handshake between these services.
+- Queue admission, dispatch, scheduling and retry still deny through default
+  readiness. The API also retains its explicit recorded enqueue rejection.
+
+The [coordinated authority cutover](../deployment/postgresql-only.md#execution-authority-cutover)
+requires compatible service releases before admission resumes. Any production
+wiring must preserve that release contract, reject unsupported workers, and
+validate the actual owning consumer paths. Neither configuration booleans nor
+process-hygiene and executable-sink inventories certify these seven consumers.
+
+Actions and sensors are trusted, inspected, approved cooperative workloads.
+Hostile sibling-process containment and candidate process isolation are not
+prerequisites for recorded authority or queue operation. Environment clearing,
+descriptor control, opt-in tokens, purpose-scoped credentials and secret-safe
+stdin delivery remain required. See the
+[trusted-workload plan](../plans/local-process-workload-isolation.md).
 
 ## Managed queue authority boundary
 
@@ -82,12 +110,23 @@ Configuration and policy evidence remains retained independently of active
 authority. File-evidence closure and offline encryption authentication include
 the owning inputs and accepted manifests.
 
-This remains work in progress under disabled readiness gates. Contract fixtures
-cover slices of the binding, not coordinated consumer readiness. Protected
-contributor origins beyond locally supplied schema/queue-item payload fields,
-malformed-proof and concurrent lifecycle coverage, complete affected-consumer
-validation and SQLx preparation remain restoration requirements. Existing live
-contributor credential resolution is not a substitute for these proofs.
+Contract fixtures cover mixed fixed/record expressions, structured secret
+subleaves, independent direct-Key ceilings and internal admitted-component
+receipt transfers. Transfer issuance validates the actual source attempt,
+selected authority, delivered field and exact destination queue/item. Retained
+consumption permits completed or removed source executions while independently
+checking retained policy, origin and disclosure fences. Authenticated per-field
+transfers determine the exact retained parent-receipt ID set; those IDs alone
+never authorize delivery. Corruption, conversion rollback and last-reference
+reclamation cases exercise the owning record and canonical graph.
+
+This remains work in progress under disabled readiness gates. These fixtures do
+not establish coordinated consumer readiness. The public enqueue API still
+accepts literal secret fields only; its internal typed-transfer seam is not
+user-facing protected contributor support. Concurrent lifecycle coverage,
+complete affected-consumer validation and SQLx preparation remain restoration
+requirements. Existing live contributor credential resolution is not a
+substitute for these proofs.
 
 Positive restoration evidence requires real publication/admission through
 terminal item acknowledgement, including mixed enqueue-only contributors,

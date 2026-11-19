@@ -85,7 +85,6 @@ mod tests {
             notifier_delivery: true,
             worker_completion: true,
             native_executor_consumers: true,
-            candidate_isolation: true,
         };
         assert!(ready.require_ready().is_ok());
         assert!(RecordedConsumerReadiness {
