@@ -56,14 +56,19 @@ pub(super) async fn handle(
         tx.commit().await?;
         return Ok(());
     }
-    if testing.runners.values().any(|runner| {
+    let has_python = testing.runners.values().any(|runner| {
         runner.lifecycle.is_none() && matches!(runner.r#type.as_str(), "unittest" | "pytest")
-    }) {
-        // A pinned-image Python alone is not parity with the existing private
-        // dependency environment. Keep this path explicit until that producer
-        // supplies its source-bound runtime input; never fall back to host setup.
+    });
+    if has_python
+        && testing
+            .runners
+            .values()
+            .any(|runner| runner.lifecycle.is_some())
+    {
+        // Combined preparation is enabled only after its fixed helper and
+        // retained challenge admission are integrated together.
         return Err(Error::validation(
-            "Native candidate Python dependency preparation is not yet available",
+            "Native candidate recipe and Python composition is not yet available",
         ));
     }
     let mut tests =
@@ -113,14 +118,22 @@ pub(super) async fn handle(
     // A known helper/preparation failure may terminate the install only after
     // factual settlement and the same live result fence as a parsed suite.
     // Unknown capture/removal fails above; revoked sources fail below.
-    let result = outcome.ok();
-    let result_json = result.as_ref().map(serde_json::to_value).transpose()?;
-
     // Keep the existing owner/epoch/opt-in context locks through disclosure,
     // lease closure and terminal publication. Pool wrappers would use another
     // session and break this atomic boundary.
     let mut tx = pool.begin().await?;
     let fence = native.lock_result(&mut tx).await?;
+    // Missing global preparation is a hard install failure even when suite
+    // policy would accept cancellation or metadata errors without a process.
+    // It cannot create history or an accepted result. Source failures remain
+    // errors from lock_result above, rather than terminal install writes.
+    let result = outcome
+        .and_then(|result| {
+            fence.require_result()?;
+            Ok(result)
+        })
+        .ok();
+    let result_json = result.as_ref().map(serde_json::to_value).transpose()?;
     if let Some(lease) = lease {
         CandidateEffectRepository::close_on(&mut tx, lease.id).await?;
     }
