@@ -35,8 +35,6 @@ impl ActionExecutor {
         }
         if action.launch.is_some()
             || context.code.is_some()
-            || action.parameter_delivery != attune_common::models::ParameterDelivery::Stdin
-            || action.parameter_format != attune_common::models::ParameterFormat::Json
             || spec.pack_access != PackAccess::ReadOnly
         {
             return Err(denied());
@@ -138,8 +136,6 @@ impl ActionExecutor {
         let action = &snapshot.executable.action;
         if action.launch.is_some()
             || context.code.is_some()
-            || action.parameter_delivery != attune_common::models::ParameterDelivery::Stdin
-            || action.parameter_format != attune_common::models::ParameterFormat::Json
             || spec.pack_access != PackAccess::ReadOnly
             || spec.stage.is_some()
             || spec

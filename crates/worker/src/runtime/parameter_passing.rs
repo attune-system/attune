@@ -48,130 +48,34 @@ pub fn apply_runtime_environment(
     }
 }
 
-/// Format parameters according to the specified format
+/// Format parameters using the canonical action input encoding.
 pub fn format_parameters(
     parameters: &HashMap<String, JsonValue>,
     format: ParameterFormat,
 ) -> Result<String, RuntimeError> {
-    match format {
-        ParameterFormat::Dotenv => format_dotenv(parameters),
-        ParameterFormat::Json => format_json(parameters),
-        ParameterFormat::Yaml => format_yaml(parameters),
-    }
-}
-
-/// Flatten nested JSON objects into dotted notation for dotenv format
-/// Example: {"headers": {"Content-Type": "application/json"}} becomes:
-///   headers.Content-Type=application/json
-fn flatten_parameters(
-    params: &HashMap<String, JsonValue>,
-    prefix: &str,
-) -> Result<HashMap<String, String>, RuntimeError> {
-    let mut flattened = HashMap::new();
-
-    for (key, value) in params {
-        // Names are record syntax, not quoted values. Validate every segment,
-        // including names whose empty object would otherwise emit no record.
-        if key.is_empty()
-            || !key
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))
-        {
-            return Err(RuntimeError::InvalidAction(
-                "Dotenv parameter names must use only ASCII letters, digits, _, . or -".to_string(),
-            ));
-        }
-        let full_key = if prefix.is_empty() {
-            key.clone()
-        } else {
-            format!("{}.{}", prefix, key)
-        };
-
-        let rendered = match value {
-            JsonValue::Object(map) => {
-                let nested_params = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                for (name, value) in flatten_parameters(&nested_params, &full_key)? {
-                    insert_dotenv_record(&mut flattened, name, value)?;
-                }
-                continue;
+    attune_common::action_input::format_parameters(parameters, format).map_err(
+        |error| match error {
+            attune_common::action_input::FormattingError::InvalidAction(message) => {
+                RuntimeError::InvalidAction(message)
             }
-            // Compact JSON escapes control characters inside arrays. Validate
-            // the final record bytes below, rather than rejecting typed data
-            // that has a safe representation.
-            JsonValue::Array(_) => serde_json::to_string(value).map_err(|_| {
-                RuntimeError::InvalidAction("Cannot serialize dotenv parameter array".to_string())
-            })?,
-            JsonValue::String(s) => s.clone(),
-            JsonValue::Number(n) => n.to_string(),
-            JsonValue::Bool(b) => b.to_string(),
-            JsonValue::Null => String::new(),
-        };
-        insert_dotenv_record(&mut flattened, full_key, rendered)?;
-    }
-
-    Ok(flattened)
+            attune_common::action_input::FormattingError::Serialization(_) => {
+                RuntimeError::ExecutionFailed(error.to_string())
+            }
+        },
+    )
 }
 
-fn insert_dotenv_record(
-    records: &mut HashMap<String, String>,
-    name: String,
-    value: String,
-) -> Result<(), RuntimeError> {
-    // Custom consumers do not share an escape decoder. Never emit physical
-    // record separators or controls, and never include names/values in errors.
-    if value
-        .chars()
-        .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
-    {
-        return Err(RuntimeError::InvalidAction(
-            "Dotenv parameter values cannot contain control characters or line separators; use JSON"
-                .to_string(),
-        ));
-    }
-    if records.insert(name, value).is_some() {
-        return Err(RuntimeError::InvalidAction(
-            "Dotenv parameter names collide after dotted flattening; use JSON".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-/// Format parameters as dotenv (key='value')
-/// Note: Parameter names are preserved as-is (case-sensitive)
-/// Nested objects are flattened with dot notation (e.g., headers.Content-Type)
+#[cfg(test)]
 fn format_dotenv(parameters: &HashMap<String, JsonValue>) -> Result<String, RuntimeError> {
-    let flattened = flatten_parameters(parameters, "")?;
-    let mut lines = Vec::new();
-
-    for (key, value) in flattened {
-        // Escape single quotes in value
-        let escaped_value = value.replace('\'', "'\\''");
-
-        lines.push(format!("{}='{}'", key, escaped_value));
-    }
-
-    // Sort lines for consistent output
-    lines.sort();
-
-    Ok(lines.join("\n"))
+    format_parameters(parameters, ParameterFormat::Dotenv)
 }
-
-/// Format parameters as JSON (compact, single-line)
-///
-/// Uses compact format so that actions reading stdin line-by-line
-/// (e.g., `json.loads(sys.stdin.readline())`) receive the entire
-/// JSON object on a single line.
+#[cfg(test)]
 fn format_json(parameters: &HashMap<String, JsonValue>) -> Result<String, RuntimeError> {
-    serde_json::to_string(parameters).map_err(|e| {
-        RuntimeError::ExecutionFailed(format!("Failed to serialize parameters to JSON: {}", e))
-    })
+    format_parameters(parameters, ParameterFormat::Json)
 }
-
-/// Format parameters as YAML
+#[cfg(test)]
 fn format_yaml(parameters: &HashMap<String, JsonValue>) -> Result<String, RuntimeError> {
-    serde_yaml_ng::to_string(parameters).map_err(|e| {
-        RuntimeError::ExecutionFailed(format!("Failed to serialize parameters to YAML: {}", e))
-    })
+    format_parameters(parameters, ParameterFormat::Yaml)
 }
 
 /// Create a temporary file with parameters

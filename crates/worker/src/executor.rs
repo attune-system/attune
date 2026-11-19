@@ -2257,98 +2257,27 @@ impl ActionExecutor {
         &self,
         release: attune_common::models::PackRelease,
     ) -> Result<attune_common::workload_launch::PinnedLaunchInput> {
-        use attune_common::{
-            pack_registry::storage::PackReleaseManifest,
-            workload_archive::ArchivePolicy,
-            workload_launch::{LaunchInputKind, PinnedLaunchInput, Sha256Digest},
-            workload_pack_input::{release_zip, ReleaseInputPin},
-        };
-        let denied = || Error::PermissionDenied("Native pack input unavailable".into());
-        let native = self.native_preparation.as_ref().ok_or_else(denied)?;
-        let manifest: PackReleaseManifest =
-            serde_json::from_value(release.manifest).map_err(|_| denied())?;
-        if manifest.version != release.version || manifest.pack_ref != release.pack_ref {
-            return Err(denied());
-        }
-        // Existing pack transport materializes this primary immutable archive
-        // for both volume and API managers. Never repack an unpacked tree.
-        let archive = attune_common::pack_transport::release_cache_path(
-            &self.packs_base_dir,
-            &release.pack_ref,
-            &release.digest,
-        )?
-        .parent()
-        .ok_or_else(denied)?
-        .join("pack.tar.gz");
-        let source = ReleaseInputPin {
-            pack_ref: release.pack_ref,
-            size_bytes: u64::try_from(release.archive_size).map_err(|_| denied())?,
-            sha256: Sha256Digest::parse(&release.digest)?,
-        };
+        let native = self
+            .native_preparation
+            .as_ref()
+            .ok_or_else(|| Error::PermissionDenied("Native pack input unavailable".into()))?;
         let ceiling = native.config.storage;
-        let runner = native.runner.clone();
         let cache = native.cache.clone();
-        let release_id = release.id;
-        let release_digest = release.digest;
-        let pack = tokio::task::spawn_blocking(move || {
-            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(archive)
-                .map_err(|_| Error::validation("Pinned release archive unavailable"))?;
-            let metadata = file
-                .metadata()
-                .map_err(|_| Error::validation("Pinned release archive unavailable"))?;
-            if !metadata.is_file()
-                || metadata.nlink() != 1
-                || metadata.mode() & 0o022 != 0
-                || !(metadata.uid() == 0 || metadata.uid() == unsafe { libc::geteuid() })
-            {
-                return Err(Error::PermissionDenied(
-                    "Pinned release archive ownership invalid".into(),
-                ));
-            }
-            let prepared = release_zip(
-                file,
-                &source,
-                &manifest,
-                attune_common::pack_format::Limits {
-                    compressed_bytes: ceiling.compressed_bytes,
-                    extracted_bytes: ceiling.expanded_bytes,
-                    file_bytes: ceiling.expanded_bytes,
-                    entries: ceiling.entries,
-                    ..Default::default()
-                },
-                &ArchivePolicy {
-                    root: LaunchInputKind::Pack,
-                    max_compressed_bytes: ceiling.compressed_bytes,
-                    max_expanded_bytes: ceiling.expanded_bytes,
-                    max_files: ceiling.entries,
-                },
-            )?;
-            let pin = PinnedLaunchInput {
-                // Pin IDs distinguish slots inside this one plan. Object ID and
-                // version come exclusively from the retained release record;
-                // the public Runner's operator pin is preserved unchanged.
-                pin_id: if runner.pin_id == 1 { 2 } else { 1 },
-                kind: LaunchInputKind::Pack,
-                object_id: release_id,
-                object_version: release_digest,
-                size_bytes: prepared.size_bytes(),
-                sha256: prepared.sha256().clone(),
-                max_expanded_bytes: prepared.expanded_bytes(),
-                max_files: prepared.entries(),
-            };
-            let mut body = prepared.into_file();
-            cache
-                .install_input(&pin, body.as_file_mut())
-                .map_err(|_| Error::validation("Pinned release ZIP installation failed"))?;
-            Ok::<_, Error>(pin)
+        let packs_base_dir = self.packs_base_dir.clone();
+        // Slot IDs distinguish the two retained inputs; the public Runner pin
+        // and the primary release identity remain unchanged.
+        let pin_id = if native.runner.pin_id == 1 { 2 } else { 1 };
+        tokio::task::spawn_blocking(move || {
+            attune_workload_backend::pack_input::install_release(
+                &cache,
+                release,
+                &packs_base_dir,
+                ceiling,
+                pin_id,
+            )
         })
         .await
-        .map_err(|_| Error::invalid_state("Native release preparation did not complete"))??;
-        Ok(pack)
+        .map_err(|_| Error::invalid_state("Native release preparation did not complete"))?
     }
 
     async fn prepare_native_process(
@@ -2928,6 +2857,19 @@ impl ActionExecutor {
         {
             self.prepare_isolated_native_invocation(&context, preparation, &mut spec)
                 .await?;
+            spec.invocation.env.remove("ATTUNE_PARAMETER_FILE");
+            spec.invocation.env.insert(
+                "ATTUNE_PARAMETER_DELIVERY".into(),
+                context.parameter_delivery.to_string(),
+            );
+            if context.parameter_delivery == attune_common::models::ParameterDelivery::None {
+                spec.invocation.env.remove("ATTUNE_PARAMETER_FORMAT");
+            } else {
+                spec.invocation.env.insert(
+                    "ATTUNE_PARAMETER_FORMAT".into(),
+                    context.parameter_format.to_string(),
+                );
+            }
             // The fixed helper consumes this private challenge before any
             // untrusted child runs. Retained intents keep their original spec;
             // recovery must never replace their evidence with a fresh nonce.

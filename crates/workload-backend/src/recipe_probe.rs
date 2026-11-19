@@ -294,16 +294,35 @@ fn run_with_pack_access(arguments: &[OsString], candidate_copy: bool) -> io::Res
         }
         // Revalidate expanded recipe values and retain the already-admitted
         // invocation context. The recipe cannot set reserved Attune variables.
-        let final_environment =
+        let mut final_environment =
             attune_workload_backend::planning::runtime_recipe_environment(&final_environment)
                 .map_err(|_| super::invalid())?;
+        // Keep action input out of all tool probes/preparation, including
+        // file delivery. Only the protected helper materializes it now, after
+        // preparation has joined and immediately before the final child.
+        let prepared_input = if super::parameter_input::required(&final_environment)? {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            std::io::stdin()
+                .take(attune_common::workload_stdin::MAX_PRIVATE_STDIN_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            Some(super::parameter_input::prepare(
+                &mut final_environment,
+                &bytes,
+            )?)
+        } else {
+            None
+        };
         let mut command = tokio::process::Command::new(&target.command[0]);
         command
             .env_clear()
             .envs(final_environment)
             .args(&target.command[1..])
             .current_dir(target.working_dir)
-            .stdin(Stdio::inherit())
+            .stdin(match &prepared_input {
+                Some(prepared) => Stdio::from(prepared.stdin.try_clone()?),
+                None => Stdio::inherit(),
+            })
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
@@ -317,6 +336,7 @@ fn run_with_pack_access(arguments: &[OsString], candidate_copy: bool) -> io::Res
             Path::new("/tmp/artifacts"),
         )
         .await?;
+        drop(prepared_input);
         // Output/custody and cleanup remain the owning worker's responsibility.
         std::process::exit(status.code().unwrap_or(1));
     })

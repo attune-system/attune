@@ -13,7 +13,9 @@ use attune_common::{
     },
 };
 use attune_workload_backend::{configuration, engine::DockerEngine};
-use owning_worker::{run_native_fixture, NativeOwningFixture, OwningCase};
+use owning_worker::{
+    run_native_fixture, run_native_parameter_fixture, NativeOwningFixture, OwningCase,
+};
 use std::{os::unix::fs::PermissionsExt, path::PathBuf};
 
 fn required(name: &str) -> Result<String> {
@@ -127,5 +129,16 @@ async fn docker_command_owning_worker() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires explicitly owned Docker manager volume/socket/network, PostgreSQL and once-built candidate binaries"]
 async fn docker_interpreted_owning_worker() -> Result<()> {
-    run_native_fixture(fixture().await?, OwningCase::Interpreted).await
+    run_native_fixture(fixture().await?, OwningCase::Interpreted).await?;
+    for (delivery, format) in [
+        ("stdin", "yaml"),
+        ("stdin", "dotenv"),
+        ("file", "json"),
+        ("file", "yaml"),
+        ("file", "dotenv"),
+        ("none", "json"),
+    ] {
+        run_native_parameter_fixture(fixture().await?, delivery, format).await?;
+    }
+    Ok(())
 }

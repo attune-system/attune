@@ -20,7 +20,10 @@ struct Input {
 }
 impl Input {
     fn new() -> io::Result<Self> {
-        let raw = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3) };
+        Self::duplicate(0)
+    }
+    fn duplicate(original: libc::c_int) -> io::Result<Self> {
+        let raw = unsafe { libc::fcntl(original, libc::F_DUPFD_CLOEXEC, 3) };
         if raw < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -35,7 +38,7 @@ impl Input {
             Ok(fd) => Ok(Self { fd, flags }),
             Err(error) => {
                 unsafe {
-                    libc::fcntl(0, libc::F_SETFL, flags);
+                    libc::fcntl(original, libc::F_SETFL, flags);
                 }
                 Err(error.into())
             }
@@ -50,13 +53,23 @@ impl Input {
     async fn exact(&self, bytes: &mut [u8]) -> io::Result<()> {
         let mut offset = 0;
         while offset < bytes.len() {
+            let count = self.read(&mut bytes[offset..]).await?;
+            if count == 0 {
+                return Err(invalid());
+            }
+            offset += count;
+        }
+        Ok(())
+    }
+    async fn read(&self, bytes: &mut [u8]) -> io::Result<usize> {
+        loop {
             let mut ready = self.fd.readable().await?;
             match ready.try_io(|fd| {
                 let count = unsafe {
                     libc::read(
                         fd.get_ref().as_raw_fd(),
-                        bytes[offset..].as_mut_ptr().cast(),
-                        bytes.len() - offset,
+                        bytes.as_mut_ptr().cast(),
+                        bytes.len(),
                     )
                 };
                 if count < 0 {
@@ -65,13 +78,29 @@ impl Input {
                     Ok(count as usize)
                 }
             }) {
-                Ok(Ok(0)) => return Err(invalid()),
-                Ok(Ok(count)) => offset += count,
+                Ok(Ok(count)) => return Ok(count),
                 Ok(Err(error)) => return Err(error),
                 Err(_) => {}
             }
         }
-        Ok(())
+    }
+    async fn document(&self, maximum: usize) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let count = self.read(&mut chunk).await?;
+            if count == 0 {
+                return Ok(bytes);
+            }
+            if bytes
+                .len()
+                .checked_add(count)
+                .is_none_or(|size| size > maximum)
+            {
+                return Err(invalid());
+            }
+            bytes.extend_from_slice(&chunk[..count]);
+        }
     }
     async fn context(&self) -> io::Result<attune_common::workload_launch::LaunchInvocation> {
         let mut magic = vec![0; START_MAGIC.len()];
@@ -110,10 +139,20 @@ pub fn run() -> io::Result<i32> {
             let mut terminate = signal(SignalKind::terminate())?;
             let mut interrupt = signal(SignalKind::interrupt())?;
             let input = Input::new()?;
-            let invocation = tokio::select! {
+            let mut invocation = tokio::select! {
                 result = input.context() => result?,
                 _ = terminate.recv() => return Ok(143),
                 _ = interrupt.recv() => return Ok(130),
+            };
+            let prepared_input = if super::parameter_input::required_at_gate(&invocation)? {
+                let bytes = tokio::select! {
+                    result=input.document(attune_common::workload_stdin::MAX_PRIVATE_STDIN_BYTES)=>result?,
+                    _=terminate.recv()=>return Ok(143),
+                    _=interrupt.recv()=>return Ok(130),
+                };
+                Some(super::parameter_input::prepare(&mut invocation.env, &bytes)?)
+            } else {
+                None
             };
             input.finish()?;
             let baseline = ChildProcessEnvironment::from_parent(std::env::vars_os(), &[])
@@ -126,7 +165,10 @@ pub fn run() -> io::Result<i32> {
                 .current_dir(attune_workload_backend::planning::working_directory(
                     invocation.working_root,
                 ))
-                .stdin(Stdio::inherit())
+                .stdin(match &prepared_input {
+                    Some(prepared) => Stdio::from(prepared.stdin.try_clone()?),
+                    None => Stdio::inherit(),
+                })
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit());
             #[cfg(unix)]
@@ -165,4 +207,62 @@ async fn stop_child(
         libc::kill(-pid, libc::SIGKILL);
     }
     child.wait().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use attune_common::workload_launch::{LaunchInvocation, LaunchRoot};
+    use std::{collections::BTreeMap, io::Write, net::Shutdown, os::unix::net::UnixStream};
+
+    #[tokio::test]
+    async fn gate_consumes_exact_header_then_real_eof_and_restores_owned_descriptor() {
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        let invocation = LaunchInvocation {
+            argv: vec!["/bin/selected".into()],
+            env: BTreeMap::from([
+                ("ATTUNE_PARAMETER_DELIVERY".into(), "file".into()),
+                ("ATTUNE_PARAMETER_FORMAT".into(), "yaml".into()),
+            ]),
+            working_root: LaunchRoot::Pack,
+        };
+        let frame = attune_workload_backend::runner_protocol::encode_start(&invocation).unwrap();
+        let sender = std::thread::spawn(move || {
+            writer.write_all(&frame).unwrap();
+            writer.write_all(br#"{"value":"input"}"#).unwrap();
+            writer.shutdown(Shutdown::Write).unwrap();
+        });
+        let input = Input::duplicate(reader.as_raw_fd()).unwrap();
+        let context = input.context().await.unwrap();
+        assert_eq!(context.argv, invocation.argv);
+        assert_eq!(context.env, invocation.env);
+        let bytes = input.document(1024).await.unwrap();
+        input.finish().unwrap();
+        sender.join().unwrap();
+        assert_eq!(bytes, br#"{"value":"input"}"#);
+        assert_eq!(
+            unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+            0,
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_rejects_truncated_header_and_oversized_document() {
+        for (bytes, header) in [(START_MAGIC[..2].to_vec(), true), (b"1234".to_vec(), false)] {
+            let (reader, mut writer) = UnixStream::pair().unwrap();
+            let sender = std::thread::spawn(move || {
+                writer.write_all(&bytes).unwrap();
+                writer.shutdown(Shutdown::Write).unwrap();
+            });
+            let input = Input::duplicate(reader.as_raw_fd()).unwrap();
+            let denied = if header {
+                input.context().await.is_err()
+            } else {
+                input.document(3).await.is_err()
+            };
+            input.finish().unwrap();
+            sender.join().unwrap();
+            assert!(denied);
+        }
+    }
 }

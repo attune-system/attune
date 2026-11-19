@@ -101,6 +101,95 @@ async fn admitted_token(
     ))
 }
 
+async fn declared_input_case(delivery: &str) -> Result<()> {
+    attune_common::auth::install_crypto_provider();
+    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let owner = ctx.user.as_ref().unwrap().id;
+    for format in ["json", "yaml", "dotenv"] {
+        let pack_ref = format!("declared_input_{}", Uuid::new_v4().simple());
+        let pack = helpers::create_test_pack(&ctx.pool, &pack_ref).await?;
+        let action_ref = format!("{pack_ref}.source");
+        let action =
+            helpers::create_test_action(&ctx.pool, pack.id, &pack_ref, &action_ref).await?;
+        // Author the real action BEFORE its immutable release/admission. No
+        // test rewrites a running execution's captured contract.
+        sqlx::query("UPDATE action SET parameter_delivery=$2,parameter_format=$3 WHERE id=$1")
+            .bind(action.id)
+            .bind(delivery)
+            .bind(format)
+            .execute(&ctx.pool)
+            .await?;
+        helpers::activate_test_pack_release_with_projections(
+            &ctx.pool,
+            &pack,
+            &attune_common::repositories::component_lifecycle::PackProjectionIds {
+                actions: vec![action.id],
+                ..Default::default()
+            },
+        )
+        .await?;
+        let execution = helpers::delegated_source::create(
+            &ctx.pool,
+            attune_common::repositories::execution::CreateExecutionInput {
+                action: Some(action.id),
+                action_ref,
+                executor: Some(owner),
+                permission_set_refs: vec!["standard".into()],
+                ..Default::default()
+            },
+        )
+        .await?;
+        let token = helpers::delegated_source::execution_token(&ctx, execution.id).await?;
+        let (mut spec, selected, resource) = admitted_token(&ctx, &token).await?;
+        spec.invocation
+            .env
+            .insert("ATTUNE_PARAMETER_DELIVERY".into(), delivery.into());
+        if delivery != "none" {
+            spec.invocation
+                .env
+                .insert("ATTUNE_PARAMETER_FORMAT".into(), format.into());
+        }
+        let master = ctx.state.config.security.encryption_key.as_deref().unwrap();
+        Effects::reserve(&ctx.pool, &spec, owner, &selected, master).await?;
+        Effects::begin_create(&ctx.pool, spec.intent, master).await?;
+        Effects::record_resource(&ctx.pool, spec.intent, &resource).await?;
+        let payload = Effects::consume_stdin(&ctx.pool, spec.intent, &resource, master).await?;
+        if delivery == "none" {
+            assert!(payload.as_bytes().is_empty());
+        } else {
+            // Formatting/private file materialization belongs to the guest,
+            // never a manager path or a second input serialization contract.
+            assert_eq!(
+                payload.as_bytes(),
+                br#"{"value":"owned-private-parameters"}"#,
+            );
+        }
+        assert!(!spec.invocation.env.contains_key("ATTUNE_PARAMETER_FILE"));
+        assert!(
+            Effects::consume_stdin(&ctx.pool, spec.intent, &resource, master)
+                .await
+                .is_err()
+        );
+    }
+    ctx.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn declared_no_input_never_delivers_parameters_for_any_format() -> Result<()> {
+    declared_input_case("none").await
+}
+
+#[tokio::test]
+async fn declared_file_input_transports_admitted_json_without_manager_paths() -> Result<()> {
+    declared_input_case("file").await
+}
+
+#[tokio::test]
+async fn declared_stdin_formats_keep_one_shot_canonical_transport() -> Result<()> {
+    declared_input_case("stdin").await
+}
+
 #[tokio::test]
 async fn exact_process_input_is_encrypted_and_consumed_once_across_recovery() -> Result<()> {
     attune_common::auth::install_crypto_provider();

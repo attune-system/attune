@@ -162,14 +162,26 @@ pub async fn run_native_fixture(fixture: NativeOwningFixture, case: OwningCase) 
         matches!(case, OwningCase::NativeCli | OwningCase::Command),
         matches!(case, OwningCase::Command),
         matches!(case, OwningCase::Interpreted),
+        None,
     )
     .await
+}
+/// Sequential variants of the same real producer/custody/cleanup case. No
+/// alternate preparer, resource policy or new provider prerequisite is used.
+pub async fn run_native_parameter_fixture(
+    fixture: NativeOwningFixture,
+    delivery: &'static str,
+    format: &'static str,
+) -> Result<()> {
+    ensure!(matches!(delivery, "stdin" | "file" | "none"));
+    ensure!(matches!(format, "json" | "yaml" | "dotenv"));
+    owning_case(Some(fixture), false, false, true, Some((delivery, format))).await
 }
 // Used by the original repository-double wrapper; the Docker-only target
 // compiles the same support module without selecting that separate case.
 #[allow(dead_code)]
 pub async fn run_repository_fixture() -> Result<()> {
-    owning_case(None, false, false, false).await
+    owning_case(None, false, false, false, None).await
 }
 
 async fn owning_case(
@@ -177,6 +189,7 @@ async fn owning_case(
     typed_cli: bool,
     command: bool,
     interpreted: bool,
+    declared_input: Option<(&'static str, &'static str)>,
 ) -> Result<()> {
     attune_common::auth::install_crypto_provider();
     let real_provider = native.is_some();
@@ -280,6 +293,21 @@ async fn owning_case(
     } else {
         action
     };
+    let action = if let Some((delivery, format)) = declared_input {
+        use attune_common::repositories::action::{ActionRepository, UpdateActionInput};
+        ActionRepository::update(
+            &database,
+            action.id,
+            UpdateActionInput {
+                parameter_delivery: Some(delivery.into()),
+                parameter_format: Some(format.into()),
+                ..Default::default()
+            },
+        )
+        .await?
+    } else {
+        action
+    };
     // Use the primary upload/initialization publication contract, including
     // its sidecar format_version:1 inventory. The offline CLI release format
     // is deliberately not an alternate producer/reader in this owning case.
@@ -292,10 +320,12 @@ async fn owning_case(
     std::fs::write(
         source.join("actions/echo.yaml"),
         format!(
-            "ref: {}\nrunner_type: {}\nentry_point: {}\n",
+            "ref: {}\nrunner_type: {}\nentry_point: {}\nparameter_delivery: {}\nparameter_format: {}\n",
             action.r#ref,
             if interpreted { "python" } else { "native" },
-            relative
+            relative,
+            declared_input.map_or("stdin", |input| input.0),
+            declared_input.map_or("json", |input| input.1),
         ),
     )?;
     let executable = source.join("actions").join(&binary_relative);
@@ -306,12 +336,36 @@ async fn owning_case(
         std::fs::write(source.join("input.txt"), b"owned offline dependency")?;
         std::fs::write(
             source.join("actions/echo.py"),
-            br#"import json,sys
+            br#"import json,sys,os,stat
 from pathlib import Path
 assert Path('/opt/attune/runtime/project/installed-marker').read_text()=='prepared'
 assert Path('/opt/attune/runtime/project/pack.yaml').is_file()
 assert Path('/opt/attune/runtime/bin/python3').is_file()
-sys.stdout.write(json.load(sys.stdin)['message'])
+delivery=os.environ.get('ATTUNE_PARAMETER_DELIVERY','stdin')
+format=os.environ.get('ATTUNE_PARAMETER_FORMAT','json')
+if delivery=='none':
+    assert sys.stdin.read()==''
+    assert 'ATTUNE_PARAMETER_FILE' not in os.environ
+    message='owned-no-input'
+else:
+    if delivery=='file':
+        assert sys.stdin.read()==''
+        selected=Path(os.environ['ATTUNE_PARAMETER_FILE'])
+        assert selected.parent==Path('/tmp')
+        assert stat.S_IMODE(selected.stat().st_mode)==0o400
+        raw=selected.read_text()
+    else:
+        assert delivery=='stdin' and 'ATTUNE_PARAMETER_FILE' not in os.environ
+        raw=sys.stdin.read()
+    if format=='json':
+        message=json.loads(raw)['message']
+    elif format=='yaml':
+        assert raw.startswith('message: ')
+        message=raw[len('message: '):].strip()
+    else:
+        assert format=='dotenv' and raw.startswith("message='") and raw.endswith("'")
+        message=raw[len("message='"):-1]
+sys.stdout.write(message)
 "#,
         )?;
     }
@@ -452,7 +506,11 @@ sys.stdout.write(json.load(sys.stdin)['message'])
     .await?;
     tokens.set_worker_id(worker.id.to_string());
     WorkerRepository::heartbeat_incarnation(&database, worker.id, incarnation).await?;
-    let message = format!("owned-captured-{}", Uuid::new_v4());
+    let message = if declared_input.is_some_and(|input| input.0 == "none") {
+        "owned-no-input".to_owned()
+    } else {
+        format!("owned-captured-{}", Uuid::new_v4())
+    };
     let mut tx = database.begin().await?;
     let snapshot = ExecutableSnapshotRepository::resolve_for_action(&mut *tx, action.id).await?;
     let binding = SchemaContractRepository::materialize_action(&mut tx, &snapshot).await?;

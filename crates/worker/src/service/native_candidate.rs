@@ -93,9 +93,11 @@ pub(super) async fn handle(
         .await;
     tests.process_owner().shutdown().await;
     native.settled().await?;
-    let result = outcome?;
-    let accepted = testing.accepts_result(&result);
-    let result_json = serde_json::to_value(&result)?;
+    // A known helper/preparation failure may terminate the install only after
+    // factual settlement and the same live result fence as a parsed suite.
+    // Unknown capture/removal fails above; revoked sources fail below.
+    let result = outcome.ok();
+    let result_json = result.as_ref().map(serde_json::to_value).transpose()?;
 
     // Keep the existing owner/epoch/opt-in context locks through disclosure,
     // lease closure and terminal publication. Pool wrappers would use another
@@ -106,46 +108,50 @@ pub(super) async fn handle(
         CandidateEffectRepository::close_on(&mut tx, lease.id).await?;
     }
     let history = match (
+        result.as_ref(),
         install.pack_id,
         PackRepository::find_by_ref(&mut *tx, &payload.pack_ref).await?,
     ) {
-        (Some(expected), Some(pack)) if expected == pack.id => Some(
+        (Some(result), Some(expected), Some(pack)) if expected == pack.id => Some(
             PackTestRepository::create_on(
                 &mut tx,
                 pack.id,
                 &payload.pack_version,
                 &payload.trigger_reason,
-                &result,
+                result,
             )
             .await?
             .id,
         ),
         _ => None,
     };
-    let (status, error) = if accepted {
-        (
+    let (status, error) = match result.as_ref() {
+        Some(result) if testing.accepts_result(result) => (
             if payload.trigger_reason == "manual" {
                 PackInstallStatus::Succeeded
             } else {
                 PackInstallStatus::Activating
             },
             None,
-        )
-    } else {
-        (
+        ),
+        Some(result) => (
             PackInstallStatus::Failed,
             Some(format!(
                 "Pack tests did not pass ({}/{} passed)",
                 result.passed, result.total_tests,
             )),
-        )
+        ),
+        None => (
+            PackInstallStatus::Failed,
+            Some("Native candidate preparation or test processing failed".into()),
+        ),
     };
     PackInstallRepository::finish_running_on(
         &mut tx,
         install.id,
         status,
         history,
-        Some(result_json),
+        result_json,
         error,
     )
     .await?

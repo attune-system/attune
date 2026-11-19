@@ -706,7 +706,13 @@ impl ExecutionProcessRepository {
             return Ok(Vec::new());
         }
         let Some(launch) = &action.launch else {
-            return Ok(context.stdin.as_bytes().to_vec());
+            return if action.parameter_delivery == ParameterDelivery::None {
+                Ok(Vec::new())
+            } else {
+                // Transport remains the canonical admitted JSON. The fixed
+                // guest gate handles declared formats/private parameter files.
+                Ok(context.stdin.as_bytes().to_vec())
+            };
         };
         if !matches!(
             launch,

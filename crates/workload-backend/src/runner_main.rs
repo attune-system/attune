@@ -1,5 +1,7 @@
 #[cfg(target_os = "linux")]
 mod gated_runner;
+#[cfg(target_os = "linux")]
+mod parameter_input;
 #[cfg(unix)]
 mod recipe_probe;
 // Public helper bytes only; no control-plane authority/configuration.
