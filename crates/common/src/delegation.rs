@@ -19,6 +19,13 @@ pub struct DelegationAuthority {
     grants: Vec<Grant>,
 }
 
+/// Dimensions used by the first successful input-origin grant. This is not a
+/// grant and cannot be supplied or deserialized by a caller.
+pub(crate) struct InputOriginGrantEvidence {
+    pub(crate) current_pack_owner: bool,
+    pub(crate) artifact_visibility: bool,
+}
+
 impl DelegationAuthority {
     pub fn new(
         identity_id: Id,
@@ -116,6 +123,14 @@ impl DelegationAuthority {
         target: &crate::repositories::runtime_target::ResolvedRuntimeTarget,
         action: Action,
     ) -> bool {
+        self.input_origin_grant_evidence(target, action).is_some()
+    }
+
+    pub(crate) fn input_origin_grant_evidence(
+        &self,
+        target: &crate::repositories::runtime_target::ResolvedRuntimeTarget,
+        action: Action,
+    ) -> Option<InputOriginGrantEvidence> {
         let mut context = target.context().clone();
         context.identity_id = self.identity_id;
         context.identity_attributes = self.context.identity_attributes.clone();
@@ -123,20 +138,47 @@ impl DelegationAuthority {
             && context.visibility == Some(crate::models::ArtifactVisibility::Private)
             && !(context.owner_type == Some(crate::models::OwnerType::Identity)
                 && context.owner_identity_id == Some(self.identity_id));
-        self.grants.iter().any(|grant| {
-            let explicit = grant.constraints.as_ref().is_some_and(|scope| {
-                scope.managing_pack_id.is_some()
-                    || scope.owner.is_some()
-                    || scope.owner_types.is_some()
-                    || scope.owner_refs.is_some()
-                    || scope.refs.is_some()
-                    || scope.ids.is_some()
-                    || scope.pack_refs.is_some()
-                    || scope.visibility.is_some()
-                    || scope.execution_scope.is_some()
-            });
-            (!private || explicit) && grant.allows(target.resource(), action, &context)
-        })
+        self.grants
+            .iter()
+            .find(|grant| {
+                let explicit = grant.constraints.as_ref().is_some_and(|scope| {
+                    scope.managing_pack_id.is_some()
+                        || scope.owner.is_some()
+                        || scope.owner_types.is_some()
+                        || scope.owner_refs.is_some()
+                        || scope.refs.is_some()
+                        || scope.ids.is_some()
+                        || scope.pack_refs.is_some()
+                        || scope.visibility.is_some()
+                        || scope.execution_scope.is_some()
+                });
+                (!private || explicit) && grant.allows(target.resource(), action, &context)
+            })
+            .map(|grant| {
+                let scope = grant.constraints.as_ref();
+                let explicit = scope.is_some_and(|scope| {
+                    scope.managing_pack_id.is_some()
+                        || scope.owner.is_some()
+                        || scope.owner_types.is_some()
+                        || scope.owner_refs.is_some()
+                        || scope.refs.is_some()
+                        || scope.ids.is_some()
+                        || scope.pack_refs.is_some()
+                        || scope.visibility.is_some()
+                        || scope.execution_scope.is_some()
+                });
+                InputOriginGrantEvidence {
+                    current_pack_owner: scope.is_some_and(|scope| {
+                        scope.pack_owner.is_some()
+                            || target.resource() == Resource::Packs
+                                && scope
+                                    .owner
+                                    .is_some_and(|owner| owner != crate::rbac::OwnerConstraint::Any)
+                    }),
+                    artifact_visibility: target.resource() == Resource::Artifacts
+                        && (!explicit || scope.is_some_and(|scope| scope.visibility.is_some())),
+                }
+            })
     }
 
     pub fn manages_permissions(&self) -> bool {

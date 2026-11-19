@@ -322,9 +322,10 @@ fn check_parameter_origins<'a>(
         if provenance.origins.is_empty() {
             return Err(denied());
         }
-        let ownership = if authorities
-            .iter()
-            .any(DelegationAuthority::needs_key_ownership)
+        let ownership = if recorded_execution.is_none()
+            && authorities
+                .iter()
+                .any(DelegationAuthority::needs_key_ownership)
         {
             let ids = provenance
                 .origins
@@ -338,7 +339,8 @@ fn check_parameter_origins<'a>(
                 .collect::<Vec<_>>();
             let mut ownership = VerifiedKeyOrigins::default();
             for batch in ids.chunks(64) {
-                ownership.extend(VerifiedKeyOrigins::load(&mut *connection, batch).await?);
+                ownership
+                    .extend(VerifiedKeyOrigins::load_for_input(&mut *connection, batch).await?);
             }
             ownership
         } else {
@@ -384,7 +386,21 @@ fn check_parameter_origins<'a>(
                         } else {
                             !authorities.is_empty()
                                 && authorities.iter().all(|authority| {
-                                    authority.key_allows_verified(&origin, action, &ownership)
+                                    match authority.key_origin_evidence(&origin, action, &ownership)
+                                    {
+                                        None => false,
+                                        Some(KeyOriginGrantEvidence::RecordedOrigin) => true,
+                                        Some(KeyOriginGrantEvidence::ManagingPack) => {
+                                            if let Some(sources) = ownership.input_sources(&origin)
+                                            {
+                                                *fence =
+                                                    fence.clone().with_input_ownership(sources);
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                    }
                                 })
                         };
                         if !allowed {
@@ -421,9 +437,11 @@ fn check_parameter_origins<'a>(
                     if entity_type == crate::repositories::component_configuration::ENTITY_COMPONENT_CONFIGURATION {
                         let revision = crate::repositories::component_configuration::ComponentConfigurationRepository::find(&mut *connection, entity_id)
                             .await?.ok_or_else(denied)?;
-                        if !crate::repositories::component_configuration::ComponentConfigurationRepository::owner_survives(connection, &revision).await? {
+                        let Some(owner_sources) = crate::repositories::component_configuration::ComponentConfigurationRepository::owner_survives_evidence(connection, &revision).await? else {
                             return Err(denied());
-                        }
+                        };
+                        *fence = fence.clone().with_input_ownership(&owner_sources);
+                        fence.retain_input_dependency(connection,crate::repositories::runtime_authority::InputAuthorityDependency::Configuration(revision.id)).await?;
                         if authorities.is_empty() {
                             return Err(denied());
                         }
@@ -458,6 +476,8 @@ fn check_parameter_origins<'a>(
                         let (generation, _, _, _) = crate::repositories::sensor_schema::SensorSchemaRepository::find_delivery_owner(&mut *connection, entity_id)
                             .await?.ok_or_else(denied)?;
                         crate::repositories::sensor_schema::SensorSchemaRepository::find_by_binding_id(&mut *connection, generation).await?.ok_or_else(denied)?;
+                        fence.retain_input_dependency(connection,crate::repositories::runtime_authority::InputAuthorityDependency::SensorDelivery(entity_id)).await?;
+                        fence.retain_input_dependency(connection,crate::repositories::runtime_authority::InputAuthorityDependency::SensorBinding(generation)).await?;
                     }
                     if matches!(entity_type.as_str(),
                         crate::repositories::sensor_schema::ENTITY_SENSOR_GENERATION_CONFIG
@@ -483,11 +503,22 @@ fn check_parameter_origins<'a>(
                         if !binding.matches_owner(&owner) {
                             return Err(denied());
                         }
+                        fence.retain_input_dependency(connection,crate::repositories::runtime_authority::InputAuthorityDependency::EventSchema(entity_id)).await?;
+                        let source =
+                            crate::repositories::runtime_target::InputOwnershipDependency::Event(
+                                owner.id,
+                                owner.created,
+                            );
+                        *fence = fence
+                            .clone()
+                            .with_input_ownership(&std::collections::BTreeSet::from([source]));
                     }
                     let parent = parents
                         .iter()
                         .find(|parent| parent.json_path == path)
                         .ok_or_else(denied)?;
+                    let source = crate::repositories::execution_input::ExecutionInputRepository::retain_origin_buffer(connection,&entity_type,entity_id,parent).await?;
+                    *fence = fence.clone().with_input_dependency(source);
                     check_parameter_origins(
                         &mut *connection,
                         authorities,
@@ -510,7 +541,8 @@ fn check_parameter_origins<'a>(
                             return Err(denied());
                         }
                         for authority in authorities {
-                            if !crate::repositories::delegated_execution::DelegatedExecutionRepository::output_allowed(connection,source_ref.as_deref(),authority).await? {return Err(denied());}
+                            let Some(source) = crate::repositories::delegated_execution::DelegatedExecutionRepository::output_input_evidence(connection,source_ref.as_deref(),authority).await? else { return Err(denied()); };
+                            *fence = fence.clone().with_input_dependency(source);
                         }
                         continue;
                     }

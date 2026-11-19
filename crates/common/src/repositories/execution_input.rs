@@ -1,6 +1,9 @@
 //! Selected execution input is restored only after its recorded origins have
 //! been admitted. The borrowed transaction retains those source locks through
 //! later operation waits; receipt deadlines must be rechecked at the effect.
+mod frontier;
+pub(crate) use frontier::{origin_epoch, retain_dependency, FrozenInputFrontier};
+
 use super::{
     execution::ExecutionRepository, execution_secret_value::ExecutionSecretValueRepository,
     immutable_input_origin, inherited_input::ReceiptContext, schema_type::SchemaTypeRepository,
@@ -193,6 +196,16 @@ pub struct InputExpiryFence {
     origin_fence: super::runtime_authority::ApprovalEffectFence,
 }
 impl InputExpiryFence {
+    pub(crate) fn frozen_frontier(&self) -> Result<FrozenInputFrontier> {
+        self.ensure_fresh()?;
+        let mut fence = self.origin_fence.clone();
+        for receipt in &self.receipts {
+            fence = fence.intersect(receipt.input_effect_fence());
+        }
+        let frontier = FrozenInputFrontier::from_held(&fence);
+        frontier.ensure_complete()?;
+        Ok(frontier)
+    }
     pub async fn ensure_fresh_on(&self, connection: &mut sqlx::PgConnection) -> Result<()> {
         self.origin_fence.ensure_fresh_on(connection).await?;
         for receipt in &self.receipts {
@@ -211,6 +224,42 @@ impl InputExpiryFence {
 
 pub struct ExecutionInputRepository;
 impl ExecutionInputRepository {
+    pub(crate) async fn retain_provenance_buffer(
+        connection: &mut sqlx::PgConnection,
+        expected: &super::execution_secret_value::SecretProvenanceRow,
+    ) -> Result<super::runtime_authority::InputAuthorityDependency> {
+        let id:Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM execution_secret_value WHERE entity_type=$1 AND entity_id=$2 AND json_path=$3 \
+             AND source_kind=$4 AND source_ref IS NOT DISTINCT FROM $5 FOR SHARE"
+        ).bind(&expected.entity_type).bind(expected.entity_id).bind(&expected.json_path)
+            .bind(&expected.source_kind).bind(&expected.source_ref).fetch_optional(connection).await?;
+        Ok(
+            super::runtime_authority::InputAuthorityDependency::ProvenanceBuffer(
+                id.ok_or_else(denied)?,
+            ),
+        )
+    }
+
+    pub(crate) async fn retain_origin_buffer(
+        connection: &mut sqlx::PgConnection,
+        kind: &str,
+        entity: i64,
+        expected: &StoredSecretValue,
+    ) -> Result<super::runtime_authority::InputAuthorityDependency> {
+        let id: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM execution_secret_value WHERE entity_type=$1 AND entity_id=$2 AND json_path=$3 \
+             AND source_kind=$4 AND source_ref IS NOT DISTINCT FROM $5 AND encrypted_value=$6 \
+             AND encryption_key_hash IS NOT DISTINCT FROM $7 FOR SHARE"
+        ).bind(kind).bind(entity).bind(&expected.json_path).bind(&expected.source_kind)
+            .bind(&expected.source_ref).bind(&expected.encrypted_value).bind(&expected.encryption_key_hash)
+            .fetch_optional(connection).await?;
+        Ok(
+            super::runtime_authority::InputAuthorityDependency::SecretBuffer(
+                id.ok_or_else(denied)?,
+            ),
+        )
+    }
+
     /// Call before target/operation locks. Existing canonical receipt and
     /// ordinary-origin consumers preserve captured input grants, contributor
     /// separation and external approval revocation; no current-IAM substitute.

@@ -556,9 +556,9 @@ impl DeclaredInputRepository {
             RuntimeAuthorityRepository::retained_admission_fence(connection, destination.id)
                 .await?;
         let value = serde_json::to_value(origin)?;
-        let rows:Vec<(Id,Id,Id,Value,String)> = sqlx::query_as("SELECT receipt.declaration,receipt.source_admission,binding.policy_revision,binding.declaration,binding.declaration_digest FROM runtime_declared_input_receipt receipt JOIN runtime_declared_input_binding binding ON binding.id = receipt.declaration WHERE receipt.execution = $1 AND receipt.destination_path = $2 AND receipt.origin_digest = $3 AND receipt.origin = $4 FOR SHARE OF receipt,binding")
+        let rows:Vec<(Id,Id,Id,Id,Value,String)> = sqlx::query_as("SELECT receipt.id,receipt.declaration,receipt.source_admission,binding.policy_revision,binding.declaration,binding.declaration_digest FROM runtime_declared_input_receipt receipt JOIN runtime_declared_input_binding binding ON binding.id = receipt.declaration WHERE receipt.execution = $1 AND receipt.destination_path = $2 AND receipt.origin_digest = $3 AND receipt.origin = $4 FOR SHARE OF receipt,binding")
             .bind(execution).bind(destination_path).bind(hash(&value)?).bind(value).fetch_all(&mut *connection).await?;
-        for (binding_id, source_id, policy_id, value, expected) in rows {
+        for (receipt_id, binding_id, source_id, policy_id, value, expected) in rows {
             if hash(&value)? != expected {
                 return Err(denied());
             }
@@ -604,8 +604,26 @@ impl DeclaredInputRepository {
                     .await?
                     .ok_or_else(denied)?;
                 if crate::key_access::key_origin(&actual) == *key {
-                    permit.effect_fence.ensure_fresh_on(connection).await?;
-                    return Ok(Some(permit.effect_fence));
+                    let sources = target
+                        .input_sources()
+                        .iter()
+                        .cloned()
+                        .chain([
+                            super::runtime_target::InputOwnershipDependency::KeyClassification(
+                                key.key_id,
+                            ),
+                        ])
+                        .collect();
+                    let fence = permit
+                        .effect_fence
+                        .with_input_ownership(&sources)
+                        .with_input_dependency(
+                            super::runtime_authority::InputAuthorityDependency::DeclaredReceipt(
+                                receipt_id,
+                            ),
+                        );
+                    fence.ensure_fresh_on(connection).await?;
+                    return Ok(Some(fence));
                 }
             } else if let SecretOrigin::Entity {
                 entity_type,
@@ -626,11 +644,15 @@ impl DeclaredInputRepository {
                     )
                     .await?
                     .ok_or_else(denied)?;
-                if revision.owner_kind == "pack" && revision.owner_id == permit.declaration.pack
-                    && super::component_configuration::ComponentConfigurationRepository::owner_survives(connection,&revision).await? {
-                        permit.effect_fence.ensure_fresh_on(connection).await?;
-                        return Ok(Some(permit.effect_fence));
+                if revision.owner_kind == "pack" && revision.owner_id == permit.declaration.pack {
+                    if let Some(sources) = super::component_configuration::ComponentConfigurationRepository::owner_survives_evidence(connection,&revision).await? {
+                        let mut fence = permit.effect_fence.with_input_ownership(&sources)
+                            .with_input_dependency(super::runtime_authority::InputAuthorityDependency::DeclaredReceipt(receipt_id));
+                        fence.retain_input_dependency(connection,super::runtime_authority::InputAuthorityDependency::Configuration(revision.id)).await?;
+                        fence.ensure_fresh_on(connection).await?;
+                        return Ok(Some(fence));
                     }
+                }
             }
         }
         Ok(None)

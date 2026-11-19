@@ -582,6 +582,10 @@ impl PreparedInputSource {
     }
 }
 impl ReceiptContext {
+    pub(crate) fn input_effect_fence(&self) -> &ApprovalEffectFence {
+        &self.fence
+    }
+
     /// Read-only observation of the complete fence captured by this receipt.
     /// It is not a credential or a replacement for transaction freshness checks.
     pub fn approval_deadline(&self) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -4307,6 +4311,14 @@ impl InheritedInputRepository {
                     root_value = Some(value);
                 }
             }
+            fence
+                .as_mut()
+                .ok_or_else(denied)?
+                .retain_input_dependency(
+                    conn,
+                    super::runtime_authority::InputAuthorityDependency::Receipt(id),
+                )
+                .await?;
         }
         let fence = fence.ok_or_else(denied)?;
         fence.ensure_fresh_on(conn).await?;

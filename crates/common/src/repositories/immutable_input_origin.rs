@@ -1045,18 +1045,35 @@ async fn target(
     authorities: &[DelegationAuthority],
     target: RuntimeTarget,
     actions: &[Action],
+    evidence: &mut super::runtime_authority::ApprovalEffectFence,
 ) -> Result<super::runtime_target::ResolvedRuntimeTarget> {
     let principal = authorities.first().ok_or_else(denied)?.identity_id;
     let resolved = RuntimeTargetRepository::resolve(conn, target, principal)
         .await?
         .ok_or_else(denied)?;
-    if authorities.iter().any(|authority| {
-        actions
-            .iter()
-            .any(|action| !authority.allows_input_origin_target(&resolved, *action))
-    }) {
-        return Err(denied());
+    for authority in authorities {
+        for action in actions {
+            let Some(grant_evidence) = authority.input_origin_grant_evidence(&resolved, *action)
+            else {
+                return Err(denied());
+            };
+            if grant_evidence.current_pack_owner {
+                let pack = resolved.pack_id().ok_or_else(denied)?;
+                *evidence = evidence.clone().with_input_ownership(&BTreeSet::from([
+                    super::runtime_target::InputOwnershipDependency::PackPrimaryOwner(pack),
+                ]));
+            }
+            if grant_evidence.artifact_visibility {
+                let artifact = resolved.context().target_id.ok_or_else(denied)?;
+                *evidence = evidence.clone().with_input_ownership(&BTreeSet::from([
+                    super::runtime_target::InputOwnershipDependency::ArtifactVisibility(artifact),
+                ]));
+            }
+        }
     }
+    *evidence = evidence
+        .clone()
+        .with_input_ownership(resolved.input_sources());
     Ok(resolved)
 }
 
@@ -1064,12 +1081,14 @@ async fn execution(
     conn: &mut PgConnection,
     authorities: &[DelegationAuthority],
     id: Id,
+    evidence: &mut super::runtime_authority::ApprovalEffectFence,
 ) -> Result<()> {
     target(
         conn,
         authorities,
         RuntimeTarget::Execution(id),
         &[Action::Read, Action::Decrypt],
+        evidence,
     )
     .await?;
     super::schema_contract::SchemaContractRepository::find(
@@ -1080,6 +1099,12 @@ async fn execution(
     .await?
     .ok_or_else(denied)?
     .validate()?;
+    evidence
+        .retain_input_dependency(
+            conn,
+            super::runtime_authority::InputAuthorityDependency::ExecutionSchema(id),
+        )
+        .await?;
     Ok(())
 }
 
@@ -1107,6 +1132,7 @@ async fn original_configuration_parent(
     connection: &mut PgConnection,
     revision: &super::component_configuration::ConfigurationRevision,
     path: &str,
+    evidence: &mut super::runtime_authority::ApprovalEffectFence,
 ) -> Result<SecretProvenance> {
     let contract = revision.contract()?;
     let compiled = crate::value_schema::CompiledContract::new(&contract).map_err(|_| denied())?;
@@ -1140,6 +1166,14 @@ async fn original_configuration_parent(
     {
         return Err(denied());
     }
+    let source = super::execution_input::ExecutionInputRepository::retain_origin_buffer(
+        connection,
+        super::component_configuration::ENTITY_COMPONENT_CONFIGURATION,
+        revision.id,
+        &field,
+    )
+    .await?;
+    *evidence = evidence.clone().with_input_dependency(source);
     let reference = field.source_ref.as_deref().ok_or_else(denied)?;
     if reference.len() > 1024 * 1024 {
         return Err(denied());
@@ -1173,8 +1207,35 @@ impl ImmutableInputOriginRepository {
         authorities: &[DelegationAuthority],
         origins: &[SecretOrigin],
     ) -> Result<(usize, usize, usize)> {
+        Ok(Self::require_counted_evidence(conn, authorities, origins)
+            .await?
+            .0)
+    }
+
+    pub(crate) async fn require_with_evidence(
+        conn: &mut PgConnection,
+        authorities: &[DelegationAuthority],
+        origins: &[SecretOrigin],
+    ) -> Result<super::runtime_authority::ApprovalEffectFence> {
+        Ok(Self::require_counted_evidence(conn, authorities, origins)
+            .await?
+            .1)
+    }
+
+    async fn require_counted_evidence(
+        conn: &mut PgConnection,
+        authorities: &[DelegationAuthority],
+        origins: &[SecretOrigin],
+    ) -> Result<(
+        (usize, usize, usize),
+        super::runtime_authority::ApprovalEffectFence,
+    )> {
+        use super::runtime_authority::{
+            ApprovalEffectFence, InputAuthorityDependency as Dependency,
+        };
+        let mut evidence = ApprovalEffectFence::from_input_approval(None)?;
         if origins.is_empty() {
-            return Ok((0, 0, 0));
+            return Ok(((0, 0, 0), evidence));
         }
         if authorities.is_empty() || origins.len() > 256 {
             return Err(denied());
@@ -1231,9 +1292,9 @@ impl ImmutableInputOriginRepository {
                                 .into_iter()
                                 .chain(key.encrypted.then_some(Action::Decrypt))
                             {
-                                if !super::recorded_input_authority::RecordedInputAuthorityRepository::key_origin_allowed(conn,authority,&key,action).await? {
-                                    return Err(denied());
-                                }
+                                if let Some(sources) = super::recorded_input_authority::RecordedInputAuthorityRepository::key_origin_evidence(conn,authority,&key,action).await? {
+                                    evidence = evidence.with_input_ownership(&sources);
+                                } else { return Err(denied()); }
                             }
                         }
                     }
@@ -1249,6 +1310,7 @@ impl ImmutableInputOriginRepository {
                             authorities,
                             RuntimeTarget::QueueItem(item_id),
                             &[Action::Read, Action::Decrypt],
+                            &mut evidence,
                         )
                         .await?;
                         let queue = target(
@@ -1256,6 +1318,7 @@ impl ImmutableInputOriginRepository {
                             authorities,
                             RuntimeTarget::Component(ComponentTarget::Queue, queue_id),
                             &[Action::Read, Action::Decrypt],
+                            &mut evidence,
                         )
                         .await?;
                         if item.context().target_ref.as_deref() != Some(queue_ref.as_str())
@@ -1287,6 +1350,9 @@ impl ImmutableInputOriginRepository {
                                 return Err(denied());
                             }
                             let read = RuntimeReadRepository::find(&mut *conn, entity_id).await?;
+                            evidence
+                                .retain_input_dependency(conn, Dependency::RuntimeRead(entity_id))
+                                .await?;
                             let mut bound = schema_bound;
                             bytes = bytes
                                 .checked_add(serde_json::to_vec(&read)?.len())
@@ -1304,11 +1370,12 @@ impl ImmutableInputOriginRepository {
                                         authorities,
                                         RuntimeTarget::Execution(id),
                                         &[Action::Read],
+                                        &mut evidence,
                                     )
                                     .await?;
                                 }
                                 RuntimeReadTarget::Execution { execution: id } => {
-                                    execution(conn, authorities, id).await?;
+                                    execution(conn, authorities, id, &mut evidence).await?;
                                     bound = true;
                                 }
                                 RuntimeReadTarget::LiveLog {
@@ -1318,13 +1385,14 @@ impl ImmutableInputOriginRepository {
                                     stream,
                                     owner,
                                 } => {
-                                    execution(conn, authorities, source).await?;
+                                    execution(conn, authorities, source, &mut evidence).await?;
                                     bound = true;
                                     let scope = target(
                                         conn,
                                         authorities,
                                         RuntimeTarget::Artifact(artifact),
                                         &[Action::Read, Action::Decrypt],
+                                        &mut evidence,
                                     )
                                     .await?;
                                     if RuntimeReadOwner::of(&scope) != owner {
@@ -1345,7 +1413,7 @@ impl ImmutableInputOriginRepository {
                                         return Err(denied());
                                     }
                                     for id in executions {
-                                        execution(conn, authorities, id).await?;
+                                        execution(conn, authorities, id, &mut evidence).await?;
                                         bound = true;
                                     }
                                     let scope = target(
@@ -1353,6 +1421,7 @@ impl ImmutableInputOriginRepository {
                                         authorities,
                                         RuntimeTarget::Artifact(artifact),
                                         &[Action::Read],
+                                        &mut evidence,
                                     )
                                     .await?;
                                     if RuntimeReadOwner::of(&scope) != owner {
@@ -1367,7 +1436,7 @@ impl ImmutableInputOriginRepository {
                                     encrypted_manifest,
                                 } => {
                                     if let Some(id) = source {
-                                        execution(conn, authorities, id).await?;
+                                        execution(conn, authorities, id, &mut evidence).await?;
                                         bound = true;
                                     }
                                     let scope = target(
@@ -1375,6 +1444,7 @@ impl ImmutableInputOriginRepository {
                                         authorities,
                                         RuntimeTarget::Artifact(artifact),
                                         &[Action::Read, Action::Decrypt],
+                                        &mut evidence,
                                     )
                                     .await?;
                                     if RuntimeReadOwner::of(&scope) != owner {
@@ -1383,6 +1453,12 @@ impl ImmutableInputOriginRepository {
                                     let row = super::artifact::ArtifactVersionRepository::find_pinned_for_share(conn,version).await?.ok_or_else(denied)?;
                                     if row.artifact != artifact || row.execution != source || matches!(row.body_state,
                                         Some(crate::models::ArtifactBodyState::Pending | crate::models::ArtifactBodyState::Deleting | crate::models::ArtifactBodyState::CleanupClaimed)) { return Err(denied()); }
+                                    evidence
+                                        .retain_input_dependency(
+                                            conn,
+                                            Dependency::ArtifactVersion(version),
+                                        )
+                                        .await?;
                                     let actual_manifest = row
                                         .meta
                                         .as_ref()
@@ -1435,12 +1511,15 @@ impl ImmutableInputOriginRepository {
                             entity_type.as_str(),
                             EVENT_SOURCE_PAYLOAD | EVENT_SOURCE_CONFIG
                         ) {
-                            let evidence =
+                            let event_evidence =
                                 EventOriginRepository::evidence(&mut *conn, entity_id).await?;
+                            evidence
+                                .retain_input_dependency(conn, Dependency::EventOrigin(entity_id))
+                                .await?;
                             let event = super::event::EventRepository::find_by_identity(
                                 &mut *conn,
-                                evidence.event,
-                                evidence.created,
+                                event_evidence.event,
+                                event_evidence.created,
                             )
                             .await?
                             .ok_or_else(denied)?;
@@ -1448,28 +1527,36 @@ impl ImmutableInputOriginRepository {
                                 conn,
                                 authorities,
                                 RuntimeTarget::Event {
-                                    id: evidence.event,
-                                    created: evidence.created,
+                                    id: event_evidence.event,
+                                    created: event_evidence.created,
                                 },
                                 &[Action::Read, Action::Decrypt],
+                                &mut evidence,
                             )
                             .await?;
-                            if !evidence.matches(&event)
-                                || scope.pack_id() != evidence.managing_pack
+                            if !event_evidence.matches(&event)
+                                || scope.pack_id() != event_evidence.managing_pack
                             {
                                 return Err(denied());
                             }
-                            evidence.parent(&entity_type, &path)?.clone()
+                            event_evidence.parent(&entity_type, &path)?.clone()
                         } else {
                             match entity_type.as_str() {
                                 crate::secret_values::ENTITY_EXECUTION_CONFIG
                                 | crate::secret_values::ENTITY_EXECUTION_RESULT => {
-                                    execution(conn, authorities, entity_id).await?;
+                                    execution(conn, authorities, entity_id, &mut evidence).await?;
                                     bound = true;
                                 }
                                 super::component_configuration::ENTITY_COMPONENT_CONFIGURATION => {
                                     let revision = super::component_configuration::ComponentConfigurationRepository::find(&mut *conn,entity_id).await?.ok_or_else(denied)?;
-                                    if !super::component_configuration::ComponentConfigurationRepository::owner_survives(conn,&revision).await? { return Err(denied()); }
+                                    let Some(owner_sources) = super::component_configuration::ComponentConfigurationRepository::owner_survives_evidence(conn,&revision).await? else { return Err(denied()); };
+                                    evidence = evidence.with_input_ownership(&owner_sources);
+                                    evidence
+                                        .retain_input_dependency(
+                                            conn,
+                                            Dependency::Configuration(revision.id),
+                                        )
+                                        .await?;
                                     let (kind, read) = match revision.owner_kind.as_str() {
                                         "pack" => {
                                             (RuntimeTarget::Pack(revision.owner_id), Action::Read)
@@ -1483,9 +1570,14 @@ impl ImmutableInputOriginRepository {
                                         ),
                                         _ => return Err(denied()),
                                     };
-                                    let scope =
-                                        target(conn, authorities, kind, &[read, Action::Decrypt])
-                                            .await?;
+                                    let scope = target(
+                                        conn,
+                                        authorities,
+                                        kind,
+                                        &[read, Action::Decrypt],
+                                        &mut evidence,
+                                    )
+                                    .await?;
                                     if scope.context().target_ref.as_deref()
                                         != Some(revision.owner_ref.as_str())
                                     {
@@ -1493,8 +1585,13 @@ impl ImmutableInputOriginRepository {
                                     }
                                     if parents.is_none() {
                                         original_parent = Some(
-                                            original_configuration_parent(conn, &revision, &path)
-                                                .await?,
+                                            original_configuration_parent(
+                                                conn,
+                                                &revision,
+                                                &path,
+                                                &mut evidence,
+                                            )
+                                            .await?,
                                         );
                                         bound = true;
                                     }
@@ -1515,8 +1612,24 @@ impl ImmutableInputOriginRepository {
                                         } else {
                                             (entity_id, None)
                                         };
-                                    let binding =
-                                        sensor_frontier.validated_binding(conn, generation).await?;
+                                    let (binding, sensor_evidence) = sensor_frontier
+                                        .validated_binding_evidence(conn, generation)
+                                        .await?;
+                                    evidence = evidence.intersect(&sensor_evidence);
+                                    evidence
+                                        .retain_input_dependency(
+                                            conn,
+                                            Dependency::SensorBinding(generation),
+                                        )
+                                        .await?;
+                                    if entity_type == ENTITY_SENSOR_RULE_DELIVERY_CONFIG {
+                                        evidence
+                                            .retain_input_dependency(
+                                                conn,
+                                                Dependency::SensorDelivery(entity_id),
+                                            )
+                                            .await?;
+                                    }
                                     let sensor = &binding.executable.sensor;
                                     let scope = target(
                                         conn,
@@ -1526,6 +1639,7 @@ impl ImmutableInputOriginRepository {
                                             sensor.id,
                                         ),
                                         &[Action::Update, Action::Decrypt],
+                                        &mut evidence,
                                     )
                                     .await?;
                                     if scope.pack_id() != sensor.pack
@@ -1554,6 +1668,7 @@ impl ImmutableInputOriginRepository {
                                             authorities,
                                             RuntimeTarget::Component(ComponentTarget::Rule, id),
                                             &[Action::Read, Action::Decrypt],
+                                            &mut evidence,
                                         )
                                         .await?;
                                         if !sensor_frontier.rule_owner_matches(
@@ -1577,6 +1692,7 @@ impl ImmutableInputOriginRepository {
                                         authorities,
                                         RuntimeTarget::Inquiry(entity_id),
                                         &[Action::Read, Action::Decrypt],
+                                        &mut evidence,
                                     )
                                     .await?;
                                     let inquiry = super::inquiry::InquiryRepository::find_by_id(
@@ -1590,7 +1706,18 @@ impl ImmutableInputOriginRepository {
                                         )
                                         .await?
                                         .ok_or_else(denied)?;
-                                    execution(conn, authorities, inquiry.created_by_execution)
+                                    execution(
+                                        conn,
+                                        authorities,
+                                        inquiry.created_by_execution,
+                                        &mut evidence,
+                                    )
+                                    .await?;
+                                    evidence
+                                        .retain_input_dependency(
+                                            conn,
+                                            Dependency::InquirySchema(entity_id),
+                                        )
                                         .await?;
                                     let creator =
                                         super::execution::ExecutionRepository::find_by_id(
@@ -1622,11 +1749,14 @@ impl ImmutableInputOriginRepository {
             }
         }
         Ok((
-            nodes,
-            bytes
-                .checked_add(sensor_frontier.retained_bytes())
-                .ok_or_else(denied)?,
-            deepest,
+            (
+                nodes,
+                bytes
+                    .checked_add(sensor_frontier.retained_bytes())
+                    .ok_or_else(denied)?,
+                deepest,
+            ),
+            evidence,
         ))
     }
 }
@@ -1672,8 +1802,13 @@ impl ExecutionAdmissionRepository {
             admission.id,
         )
         .await?;
-        ImmutableInputOriginRepository::require(conn, &authorities, std::slice::from_ref(origin))
-            .await?;
+        let origin_fence = ImmutableInputOriginRepository::require_with_evidence(
+            conn,
+            &authorities,
+            std::slice::from_ref(origin),
+        )
+        .await?;
+        let fence = fence.intersect(&origin_fence);
         fence.ensure_fresh_on(conn).await?;
         Ok(Some(fence))
     }

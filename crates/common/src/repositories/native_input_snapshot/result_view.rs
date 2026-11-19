@@ -656,6 +656,19 @@ async fn field_sources_available(
     sources: &[SecretOrigin],
     check_grants: bool,
 ) -> Result<bool> {
+    Ok(field_sources_evidence(conn, child, sources, check_grants)
+        .await?
+        .is_some())
+}
+
+async fn field_sources_evidence(
+    conn: &mut PgConnection,
+    child: Id,
+    sources: &[SecretOrigin],
+    check_grants: bool,
+) -> Result<Option<ApprovalEffectFence>> {
+    use super::super::runtime_authority::InputAuthorityDependency as Dependency;
+    let mut evidence = ApprovalEffectFence::from_input_approval(None)?;
     let mut pending = sources.to_vec();
     let mut receipts = BTreeSet::new();
     let mut work = 0usize;
@@ -675,8 +688,11 @@ async fn field_sources_available(
             .fetch_one(&mut *conn)
             .await?;
             if !exists {
-                return Ok(false);
+                return Ok(None);
             }
+            evidence
+                .retain_input_dependency(conn, Dependency::Receipt(*entity_id))
+                .await?;
             if !receipts.insert(*entity_id) {
                 continue;
             }
@@ -691,13 +707,22 @@ async fn field_sources_available(
                         || expires.is_some_and(|deadline| deadline <= chrono::Utc::now())
                 })
             {
-                return Ok(false);
+                return Ok(None);
+            }
+            for (id, _, expiry) in &approvals {
+                evidence = evidence.intersect(
+                    &ApprovalEffectFence::from_input_approval(*expiry)?
+                        .with_input_dependency(Dependency::Approval(*id)),
+                );
             }
             let admissions:Vec<(Id,Option<chrono::DateTime<chrono::Utc>>)>=sqlx::query_as("SELECT id,revoked_at FROM runtime_authority_admission WHERE id=ANY($1) ORDER BY id FOR SHARE").bind(inventory.admissions()).fetch_all(&mut *conn).await?;
             if admissions.len() != inventory.admissions().len()
                 || admissions.iter().any(|(_, revoked)| revoked.is_some())
             {
-                return Ok(false);
+                return Ok(None);
+            }
+            for (id, _) in &admissions {
+                evidence = evidence.with_input_dependency(Dependency::Admission(*id));
             }
             for parent in inventory.receipts() {
                 let exists: bool = sqlx::query_scalar(
@@ -707,7 +732,7 @@ async fn field_sources_available(
                 .fetch_one(&mut *conn)
                 .await?;
                 if !exists {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 // Parent IDs are authenticated by the inventory, while site
                 // descriptors are loaded and checked by the original reader.
@@ -718,6 +743,9 @@ async fn field_sources_available(
                         .await?;
                 let site: InputSite =
                     serde_json::from_value(row.get("site").cloned().ok_or_else(denied)?)?;
+                evidence
+                    .retain_input_dependency(conn, Dependency::Receipt(*parent))
+                    .await?;
                 pending.push(SecretOrigin::Entity {
                     entity_type: site.kind.origin_kind(site.purpose),
                     entity_id: *parent,
@@ -742,7 +770,7 @@ async fn field_sources_available(
                 .fetch_optional(&mut *conn)
                 .await?;
                 let Some(admission) = admission else {
-                    return Ok(false);
+                    return Ok(None);
                 };
                 // Validate the immutable origin before treating its source's
                 // explicit revocation as field unavailability.
@@ -756,8 +784,11 @@ async fn field_sources_available(
                 .fetch_optional(&mut *conn)
                 .await?;
                 if !matches!(state, Some(None)) {
-                    return Ok(false);
+                    return Ok(None);
                 }
+                evidence = evidence
+                    .with_input_dependency(Dependency::RuntimeRead(*entity_id))
+                    .with_input_dependency(Dependency::Admission(admission));
                 pending.extend(
                     read.provenance
                         .into_iter()
@@ -786,8 +817,18 @@ async fn field_sources_available(
                         .await?
                 };
                 if !owner_exists {
-                    return Ok(false);
+                    return Ok(None);
                 }
+                evidence
+                    .retain_input_dependency(
+                        conn,
+                        if entity_type == "workflow_variables" {
+                            Dependency::WorkflowPresence(*entity_id)
+                        } else {
+                            Dependency::ExecutionPresence(*entity_id)
+                        },
+                    )
+                    .await?;
                 let fields=super::super::execution_secret_value::ExecutionSecretValueRepository::find_bounded_provenance(&mut *conn,&[entity_type.as_str()],&[*entity_id]).await?;
                 if fields.len() > 256 {
                     return Err(denied());
@@ -795,6 +836,8 @@ async fn field_sources_available(
                 for field in fields.into_iter().filter(|field| {
                     covers(&field.json_path, path) || covers(path, &field.json_path)
                 }) {
+                    let source = super::super::execution_input::ExecutionInputRepository::retain_provenance_buffer(conn,&field).await?;
+                    evidence = evidence.with_input_dependency(source);
                     let provenance = if field.source_kind == "provenance" {
                         serde_json::from_str::<crate::secret_provenance::SecretProvenance>(
                             field.source_ref.as_deref().ok_or_else(denied)?,
@@ -821,20 +864,22 @@ async fn field_sources_available(
                 .fetch_one(&mut *conn)
                 .await?;
             if !exists {
-                return Ok(false);
+                return Ok(None);
             }
             if !check_grants {
                 let record = RuntimeAuthorityRepository::execution_admission(conn, child)
                     .await?
                     .ok_or_else(denied)?;
                 let mut ownership = super::super::iam_ownership::VerifiedKeyOrigins::default();
-                if ownership
+                let Some(target) = ownership
                     .retain_recorded(conn, record.authority.owner.sponsor_identity_id, &key)
                     .await?
-                    .is_none()
-                {
-                    return Ok(false);
-                }
+                else {
+                    return Ok(None);
+                };
+                evidence = evidence
+                    .with_input_ownership(target.input_sources())
+                    .with_input_dependency(Dependency::Admission(record.id));
                 continue;
             }
             let (authorities, _) =
@@ -847,12 +892,14 @@ async fn field_sources_available(
                     .into_iter()
                     .chain(key.encrypted.then_some(crate::rbac::Action::Decrypt))
                 {
-                    if !super::super::recorded_input_authority::RecordedInputAuthorityRepository::key_origin_allowed(conn,authority,&key,action).await? {return Ok(false);}
+                    let Some(sources) = super::super::recorded_input_authority::RecordedInputAuthorityRepository::key_origin_evidence(conn,authority,&key,action).await? else { return Ok(None); };
+                    evidence = evidence.with_input_ownership(&sources);
                 }
             }
         }
     }
-    Ok(true)
+    evidence.ensure_fresh_on(conn).await?;
+    Ok(Some(evidence))
 }
 
 pub(super) fn validate_storage(source: &ResultViewSource) -> Result<()> {
@@ -1369,9 +1416,10 @@ pub(super) async fn selection_evidence(
         .iter()
         .filter(|field| covers(&field.path, &actual) || covers(&actual, &field.path))
     {
-        if !field_sources_available(conn, source.execution, &field.origins, false).await? {
-            return Err(denied());
-        }
+        let actual = field_sources_evidence(conn, source.execution, &field.origins, false)
+            .await?
+            .ok_or_else(denied)?;
+        fence = fence.intersect(&actual);
         fence = fence.intersect(&ApprovalEffectFence::from_input_approval(field.deadline)?);
         for (receipt, site) in &field.parents {
             let origin = SecretOrigin::Entity {

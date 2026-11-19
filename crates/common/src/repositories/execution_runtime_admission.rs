@@ -526,29 +526,36 @@ impl ExecutionAdmissionRepository {
         Option<ApprovalEffectFence>,
     )> {
         if Self::is_recorded(connection, execution).await? {
-            let (_, fence) =
+            let (_, mut fence) =
                 Self::require_with_fence(connection, RuntimeOwner::Execution(execution)).await?;
             Self::require_input_liveness(connection, execution).await?;
             let authorities = match super::recorded_input_authority::RecordedInputAuthorityRepository::queue_authorities(connection, execution).await? {
                 Some(authorities) => authorities,
-                None => Self::load_recorded_input_authority(connection, execution)
-                    .await?
-                    .into_iter()
-                    .collect(),
+                None => {
+                    let (authority,source_fence) = Self::load_recorded_input_authority_evidence(connection,execution).await?;
+                    fence = fence.intersect(&source_fence);
+                    authority.into_iter().collect()
+                },
             };
             // Input metadata may wait behind an editor. Keep the already-held
             // source locks, but check expiry again after that wait. The reuse is
             // limited to this call: later calls revalidate even on the same tx.
+            fence = fence.with_input_dependency(
+                super::runtime_authority::InputAuthorityDependency::InputContributors(execution),
+            );
             fence.ensure_fresh_on(connection).await?;
             return Ok((authorities, Some(fence)));
         }
-        Ok((
-            Self::input_authority(connection, execution, identity)
-                .await?
-                .into_iter()
-                .collect(),
-            None,
-        ))
+        let (authority, fence) =
+            super::rule_authority::RuleAuthorityRepository::execution_input_authority_evidence(
+                connection, execution, identity,
+            )
+            .await?;
+        let fence = fence.with_input_dependency(
+            super::runtime_authority::InputAuthorityDependency::InputContributors(execution),
+        );
+        fence.ensure_fresh_on(connection).await?;
+        Ok((authority.into_iter().collect(), Some(fence)))
     }
 
     /// Called in the enqueue transaction after the item's immutable executable
@@ -874,6 +881,20 @@ impl ExecutionAdmissionRepository {
         connection: &mut PgConnection,
         execution: Id,
     ) -> Result<Option<crate::delegation::DelegationAuthority>> {
+        Ok(
+            Self::load_recorded_input_authority_evidence(connection, execution)
+                .await?
+                .0,
+        )
+    }
+
+    async fn load_recorded_input_authority_evidence(
+        connection: &mut PgConnection,
+        execution: Id,
+    ) -> Result<(
+        Option<crate::delegation::DelegationAuthority>,
+        ApprovalEffectFence,
+    )> {
         if let Some(authority) =
             super::recorded_input_authority::RecordedInputAuthorityRepository::load(
                 connection,
@@ -882,7 +903,10 @@ impl ExecutionAdmissionRepository {
             )
             .await?
         {
-            return Ok(Some(authority));
+            return Ok((
+                Some(authority),
+                ApprovalEffectFence::from_input_approval(None)?,
+            ));
         }
         match super::rule_authority::RuleAuthorityRepository::runtime(
             connection,
@@ -891,8 +915,11 @@ impl ExecutionAdmissionRepository {
         )
         .await?
         {
-            Some(snapshot) => Ok(Some(snapshot.input_authority(connection).await?)),
-            None => Ok(None),
+            Some(snapshot) => {
+                let (authority, fence) = snapshot.input_authority_evidence(connection).await?;
+                Ok((Some(authority), fence))
+            }
+            None => Ok((None, ApprovalEffectFence::from_input_approval(None)?)),
         }
     }
 

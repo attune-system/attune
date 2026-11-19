@@ -74,8 +74,13 @@ pub enum RuntimeTarget {
 #[serde(deny_unknown_fields)]
 pub(crate) enum InputOwnershipDependency {
     Pack(Id),
+    PackPrimaryOwner(Id),
+    ArtifactVisibility(Id),
     Component(ComponentTarget, Id),
     Key(Id),
+    KeyClassification(Id),
+    IdentityRef(Id),
+    SensorLive(Id),
     Execution(Id),
     Enforcement(Id),
     QueueItem(Id),
@@ -85,6 +90,75 @@ pub(crate) enum InputOwnershipDependency {
     RuntimeVersion(Id),
     Release(Id),
     Event(Id, DateTime<Utc>),
+}
+
+impl InputOwnershipDependency {
+    /// Projection of the canonical selector capture's already-held identities.
+    /// No ref resolution, permission check or source discovery happens here.
+    pub(crate) fn from_bindings(
+        bindings: &crate::runtime_authority::GrantTargetBindings,
+    ) -> Result<BTreeSet<Self>> {
+        fn owner(kind: &str, id: Id) -> Result<Option<InputOwnershipDependency>> {
+            Ok(match kind {
+                "pack" => Some(InputOwnershipDependency::Pack(id)),
+                "action" => Some(InputOwnershipDependency::Component(
+                    ComponentTarget::Action,
+                    id,
+                )),
+                "sensor" => Some(InputOwnershipDependency::Component(
+                    ComponentTarget::Sensor,
+                    id,
+                )),
+                "identity" => Some(InputOwnershipDependency::IdentityRef(id)),
+                "system" => None,
+                _ => {
+                    return Err(Error::PermissionDenied(
+                        "Input owner identity unavailable".into(),
+                    ))
+                }
+            })
+        }
+        let mut sources = BTreeSet::new();
+        for target in bindings.targets.iter().flatten() {
+            let source = match target.kind.as_str() {
+                "pack" => Self::Pack(target.id),
+                "key" => Self::Key(target.id),
+                "cache_namespace" => Self::CacheNamespace(target.id),
+                "artifact" => Self::Artifact(target.id),
+                "action" => Self::Component(ComponentTarget::Action, target.id),
+                "sensor" => Self::Component(ComponentTarget::Sensor, target.id),
+                "rule" => Self::Component(ComponentTarget::Rule, target.id),
+                "trigger" => Self::Component(ComponentTarget::Trigger, target.id),
+                "work_queue" => Self::Component(ComponentTarget::Queue, target.id),
+                _ => {
+                    return Err(Error::PermissionDenied(
+                        "Input target identity unavailable".into(),
+                    ))
+                }
+            };
+            sources.insert(source);
+            if let Some(pack) = target.pack_id {
+                sources.insert(Self::Pack(pack));
+            }
+            if let (Some(kind), Some(id)) = (target.owner_type.as_deref(), target.owner_id) {
+                if let Some(source) = owner(kind, id)? {
+                    sources.insert(source);
+                }
+            }
+        }
+        for (kind, id, pack) in bindings.owners.iter().flatten() {
+            if let Some(source) = owner(kind, *id)? {
+                sources.insert(source);
+            }
+            if let Some(pack) = pack {
+                sources.insert(Self::Pack(*pack));
+            }
+        }
+        for pack in bindings.packs.iter().flatten() {
+            sources.insert(Self::Pack(*pack));
+        }
+        Ok(sources)
+    }
 }
 
 impl RuntimeTarget {

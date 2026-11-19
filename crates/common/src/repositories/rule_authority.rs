@@ -2,8 +2,7 @@
 use super::{
     action::ActionRepository,
     identity::{
-        CreatePermissionAssignmentInput, IdentityRepository, PermissionAssignmentRepository,
-        PermissionSetRepository,
+        CreatePermissionAssignmentInput, PermissionAssignmentRepository, PermissionSetRepository,
     },
     pack::PackRepository,
     rule::RuleRepository,
@@ -38,6 +37,16 @@ impl RuleInputAuthority {
         &self,
         connection: &mut PgConnection,
     ) -> Result<DelegationAuthority> {
+        Ok(self.input_authority_evidence(connection).await?.0)
+    }
+
+    pub(crate) async fn input_authority_evidence(
+        &self,
+        connection: &mut PgConnection,
+    ) -> Result<(
+        DelegationAuthority,
+        super::runtime_authority::ApprovalEffectFence,
+    )> {
         if self.input_grants.iter().any(|grant| {
             !matches!(grant.resource, Resource::Keys | Resource::Packs)
                 || grant.actions.is_empty()
@@ -48,34 +57,23 @@ impl RuleInputAuthority {
         }) {
             return Err(Error::validation("Invalid deployment input authority"));
         }
-        let identity = IdentityRepository::find_by_id(&mut *connection, self.identity_id)
-            .await?
-            .filter(|identity| !identity.frozen)
-            .ok_or_else(|| {
-                Error::PermissionDenied("Pack runtime identity is unavailable".into())
-            })?;
-        let owner: Option<i64> =
-            sqlx::query_scalar("SELECT identity FROM pack_runtime_identity WHERE pack = $1")
-                .bind(self.pack_id)
-                .fetch_optional(&mut *connection)
-                .await?;
-        if owner != Some(identity.id)
-            || PackRepository::find_by_id(&mut *connection, self.pack_id)
-                .await?
-                .is_none_or(|pack| pack.r#ref != self.pack_ref)
-        {
-            return Err(Error::PermissionDenied(
-                "Pack input authority owner is unavailable".into(),
+        let owner = crate::runtime_authority::PackAuthorityOwner {
+            pack_id: self.pack_id,
+            pack_ref: self.pack_ref.clone(),
+            sponsor_identity_id: self.identity_id,
+        };
+        super::runtime_authority::lock_sponsor(connection, &owner).await?;
+        let fence = super::runtime_authority::ApprovalEffectFence::from_input_approval(None)?
+            .with_input_dependency(super::runtime_authority::InputAuthorityDependency::Sponsor(
+                self.pack_id,
             ));
-        }
         let attributes = std::collections::HashMap::from([
             ("type".into(), json!("pack")),
             ("pack_ref".into(), json!(self.pack_ref)),
         ]);
-        Ok(DelegationAuthority::new(
-            identity.id,
-            attributes,
-            self.input_grants.clone(),
+        Ok((
+            DelegationAuthority::new(self.identity_id, attributes, self.input_grants.clone()),
+            fence,
         ))
     }
 }
@@ -174,14 +172,33 @@ impl RuleAuthorityRepository {
         execution: i64,
         identity: Option<i64>,
     ) -> Result<Option<DelegationAuthority>> {
+        Ok(
+            Self::execution_input_authority_evidence(connection, execution, identity)
+                .await?
+                .0,
+        )
+    }
+
+    pub(crate) async fn execution_input_authority_evidence(
+        connection: &mut PgConnection,
+        execution: i64,
+        identity: Option<i64>,
+    ) -> Result<(
+        Option<DelegationAuthority>,
+        super::runtime_authority::ApprovalEffectFence,
+    )> {
         if let Some(snapshot) = Self::runtime(connection, "execution", execution).await? {
             if identity != Some(snapshot.identity_id) {
                 return Err(Error::validation("Input authority identity mismatch"));
             }
-            return Ok(Some(snapshot.input_authority(connection).await?));
+            let (authority, fence) = snapshot.input_authority_evidence(connection).await?;
+            return Ok((Some(authority), fence));
         }
         let Some(identity) = identity else {
-            return Ok(None);
+            return Ok((
+                None,
+                super::runtime_authority::ApprovalEffectFence::from_input_approval(None)?,
+            ));
         };
         let system_owned: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM pack_runtime_identity WHERE identity = $1)",
@@ -194,8 +211,9 @@ impl RuleAuthorityRepository {
                 "Pack execution input authority is unavailable".into(),
             ));
         }
-        Ok(Some(
-            DelegationAuthority::load_for_share(connection, identity).await?,
+        Ok((
+            Some(DelegationAuthority::load_for_share(connection, identity).await?),
+            super::runtime_authority::ApprovalEffectFence::from_input_approval(None)?,
         ))
     }
     pub async fn attach_runtime(
@@ -252,7 +270,7 @@ impl RuleAuthorityRepository {
         kind: &str,
         id: i64,
     ) -> Result<Option<RuleInputAuthority>> {
-        let row: Option<(serde_json::Value,String)> = sqlx::query_as("SELECT authority,authority_digest FROM runtime_input_authority WHERE owner_kind = $1 AND owner_id = $2")
+        let row: Option<(serde_json::Value,String)> = sqlx::query_as("SELECT authority,authority_digest FROM runtime_input_authority WHERE owner_kind = $1 AND owner_id = $2 FOR SHARE")
             .bind(kind).bind(id).fetch_optional(&mut *connection).await?;
         let Some((body, hash)) = row else {
             return Ok(None);

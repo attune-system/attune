@@ -685,16 +685,32 @@ impl DelegatedExecutionRepository {
         reference: Option<&str>,
         authority: &DelegationAuthority,
     ) -> Result<bool> {
+        Ok(Self::output_input_evidence(conn, reference, authority)
+            .await?
+            .is_some())
+    }
+
+    pub(crate) async fn output_input_evidence(
+        conn: &mut PgConnection,
+        reference: Option<&str>,
+        authority: &DelegationAuthority,
+    ) -> Result<Option<super::runtime_authority::InputAuthorityDependency>> {
         let binding: OutputDisclosureBinding = serde_json::from_str(reference.ok_or_else(denied)?)?;
         let selected = Self::find(conn, binding.execution).await?;
         if selected.mode != "delegated" || !selected.explicit {
-            return Ok(false);
+            return Ok(None);
         }
         let grants = selected.output_grants.ok_or_else(denied)?;
         if digest(&grants).map_err(|_| denied())? != binding.digest {
-            return Ok(false);
+            return Ok(None);
         }
-        Ok(authority.covers(&serde_json::from_value::<Vec<crate::rbac::Grant>>(grants)?))
+        Ok(authority
+            .covers(&serde_json::from_value::<Vec<crate::rbac::Grant>>(grants)?)
+            .then_some(
+                super::runtime_authority::InputAuthorityDependency::DelegatedOutput(
+                    binding.execution,
+                ),
+            ))
     }
     /// Staged close source protection. Caller enters shared graph admission first.
     /// Workflow precedes execution/attempt, matching cancellation and outbox writers.

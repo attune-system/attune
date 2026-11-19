@@ -463,6 +463,23 @@ impl ManagedSensorMetadataRepository {
         metadata: &mut SensorMetadata,
         previous: &BTreeMap<String, GrantTargetBindings>,
     ) -> Result<()> {
+        Self::pin_input_evidence(connection, metadata, previous)
+            .await
+            .map(|_| ())
+    }
+
+    async fn pin_input_evidence(
+        connection: &mut PgConnection,
+        metadata: &mut SensorMetadata,
+        previous: &BTreeMap<String, GrantTargetBindings>,
+    ) -> Result<super::runtime_authority::ApprovalEffectFence> {
+        use super::runtime_authority::{
+            ApprovalEffectFence, InputAuthorityDependency as Dependency,
+        };
+        let mut evidence = ApprovalEffectFence::from_input_approval(None)?;
+        if !previous.is_empty() {
+            evidence = evidence.with_input_dependency(Dependency::Incomplete);
+        }
         let grants = metadata
             .purposes
             .values()
@@ -491,6 +508,12 @@ impl ManagedSensorMetadataRepository {
         metadata.concrete_targets =
             runtime_target_binding::capture_grants(connection, &metadata.owner, &grants, previous)
                 .await?;
+        for binding in metadata.concrete_targets.values() {
+            match super::runtime_target::InputOwnershipDependency::from_bindings(binding) {
+                Ok(sources) => evidence = evidence.with_input_ownership(&sources),
+                Err(_) => evidence = evidence.with_input_dependency(Dependency::Incomplete),
+            }
+        }
         // Target resolution can wait on concurrent mutations. Check expiry only
         // after acquiring those locks, not against a pre-wait timestamp.
         let now = sqlx::query_scalar::<_, chrono::DateTime<Utc>>("SELECT clock_timestamp()")
@@ -508,6 +531,10 @@ impl ManagedSensorMetadataRepository {
                         Error::PermissionDenied("Sensor approval is unavailable".into())
                     })?;
                 require_approval(&approval, &metadata.owner, requested, now)?;
+                evidence = evidence.intersect(
+                    &ApprovalEffectFence::from_input_approval(approval.expires_at)?
+                        .with_input_dependency(Dependency::Approval(approval.id)),
+                );
                 if !runtime_target_binding::approval_covers_binding(
                     connection,
                     &approval,
@@ -523,7 +550,8 @@ impl ManagedSensorMetadataRepository {
                 }
             }
         }
-        Ok(())
+        evidence.ensure_fresh_on(connection).await?;
+        Ok(evidence)
     }
 
     fn projected(metadata: &SensorMetadata, purpose: &str) -> Result<Vec<Grant>> {
@@ -914,7 +942,18 @@ impl ManagedSensorMetadataRepository {
         workload: Id,
         generation: i64,
     ) -> Result<()> {
-        Self::validate_admission(connection, workload, generation).await?;
+        Self::validate_generation_input_evidence(connection, workload, generation)
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn validate_generation_input_evidence(
+        connection: &mut PgConnection,
+        workload: Id,
+        generation: i64,
+    ) -> Result<super::runtime_authority::ApprovalEffectFence> {
+        let evidence =
+            Self::validate_admission_input_evidence(connection, workload, generation).await?;
         if let Some(metadata) = Self::for_generation(connection, workload, generation).await? {
             let (_, binding, _) = super::sensor_schema::SensorSchemaRepository::find(
                 &mut *connection,
@@ -950,7 +989,8 @@ impl ManagedSensorMetadataRepository {
                 ));
             }
         }
-        Ok(())
+        evidence.ensure_fresh_on(connection).await?;
+        Ok(evidence)
     }
 
     pub(super) async fn validate_admission(
@@ -958,6 +998,16 @@ impl ManagedSensorMetadataRepository {
         workload: Id,
         generation: i64,
     ) -> Result<()> {
+        Self::validate_admission_input_evidence(connection, workload, generation)
+            .await
+            .map(|_| ())
+    }
+
+    async fn validate_admission_input_evidence(
+        connection: &mut PgConnection,
+        workload: Id,
+        generation: i64,
+    ) -> Result<super::runtime_authority::ApprovalEffectFence> {
         let revoked: Option<bool> = sqlx::query_scalar("SELECT r.revoked_at IS NOT NULL FROM managed_sensor_runtime_state r JOIN sensor_workload w ON w.sensor=r.sensor WHERE w.id=$1 FOR SHARE OF r")
             .bind(workload).fetch_optional(&mut *connection).await?;
         if revoked == Some(true) {
@@ -966,16 +1016,25 @@ impl ManagedSensorMetadataRepository {
             ));
         }
         if let Some(metadata) = Self::for_generation(connection, workload, generation).await? {
-            Self::validate(connection, &metadata).await?;
+            return Self::validate_input_evidence(connection, &metadata).await;
         } else if revoked.is_some() {
             return Err(Error::PermissionDenied(
                 "Sensor generation has no recorded metadata admission".into(),
             ));
         }
-        Ok(())
+        super::runtime_authority::ApprovalEffectFence::from_input_approval(None)
     }
 
     async fn validate(connection: &mut PgConnection, metadata: &SensorMetadata) -> Result<()> {
+        Self::validate_input_evidence(connection, metadata)
+            .await
+            .map(|_| ())
+    }
+
+    async fn validate_input_evidence(
+        connection: &mut PgConnection,
+        metadata: &SensorMetadata,
+    ) -> Result<super::runtime_authority::ApprovalEffectFence> {
         Self::validate_purposes(metadata)?;
         let owner: Option<(Id,String,Option<Id>,bool)> = sqlx::query_as("SELECT s.id,s.ref,s.pack,i.frozen FROM sensor s JOIN pack pk ON pk.id=s.pack AND pk.ref=s.pack_ref JOIN pack_runtime_identity p ON p.pack=s.pack JOIN identity i ON i.id=p.identity WHERE s.id=$1 AND s.pack=$2 AND p.identity=$3 AND pk.ref=$4 AND s.retired_at IS NULL FOR SHARE OF s,pk,p,i")
             .bind(metadata.executable.sensor.id).bind(metadata.owner.pack_id).bind(metadata.owner.sponsor_identity_id).bind(&metadata.owner.pack_ref).fetch_optional(&mut *connection).await?;
@@ -992,13 +1051,32 @@ impl ManagedSensorMetadataRepository {
         let mut checked = metadata.clone();
         // Re-resolve concrete names only to detect replacement. Never install the
         // new identities into the retained policy or grant an old token access.
-        Self::pin(connection, &mut checked, &BTreeMap::new()).await?;
+        let evidence = Self::pin_input_evidence(connection, &mut checked, &BTreeMap::new()).await?;
         if checked.concrete_targets != metadata.concrete_targets {
             return Err(Error::PermissionDenied(
                 "Sensor concrete target identity changed".into(),
             ));
         }
-        Ok(())
+        let evidence = evidence
+            .with_input_ownership(&std::collections::BTreeSet::from([
+                super::runtime_target::InputOwnershipDependency::Component(
+                    super::runtime_target::ComponentTarget::Sensor,
+                    metadata.executable.sensor.id,
+                ),
+                super::runtime_target::InputOwnershipDependency::SensorLive(
+                    metadata.executable.sensor.id,
+                ),
+            ]))
+            .with_input_dependency(super::runtime_authority::InputAuthorityDependency::Sponsor(
+                metadata.owner.pack_id,
+            ))
+            .with_input_dependency(
+                super::runtime_authority::InputAuthorityDependency::SensorRuntime(
+                    metadata.executable.sensor.id,
+                ),
+            );
+        evidence.ensure_fresh_on(connection).await?;
+        Ok(evidence)
     }
 
     pub async fn revoke(

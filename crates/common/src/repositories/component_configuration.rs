@@ -208,23 +208,44 @@ impl ComponentConfigurationRepository {
         connection: &mut PgConnection,
         revision: &ConfigurationRevision,
     ) -> Result<bool> {
-        use super::FindById;
-        revision.contract()?;
-        match revision.owner_kind.as_str() {
-            "pack" => Ok(
-                super::pack::PackRepository::find_by_id(connection, revision.owner_id)
-                    .await?
-                    .is_some_and(|owner| owner.r#ref == revision.owner_ref),
-            ),
-            "sensor" => Ok(super::trigger::SensorRepository::find_by_id(
-                connection,
-                revision.owner_id,
-            )
+        Ok(Self::owner_survives_evidence(connection, revision)
             .await?
-            .is_some_and(|owner| owner.r#ref == revision.owner_ref)),
-            _ => Ok(false),
-        }
+            .is_some())
     }
+
+    pub(crate) async fn owner_survives_evidence(
+        connection: &mut PgConnection,
+        revision: &ConfigurationRevision,
+    ) -> Result<Option<std::collections::BTreeSet<super::runtime_target::InputOwnershipDependency>>>
+    {
+        use super::runtime_target::{ComponentTarget, InputOwnershipDependency as Source};
+        revision.contract()?;
+        let (query, source) = match revision.owner_kind.as_str() {
+            "pack" => (
+                "SELECT ref FROM pack WHERE id=$1 FOR SHARE",
+                Source::Pack(revision.owner_id),
+            ),
+            "sensor" => (
+                "SELECT ref FROM sensor WHERE id=$1 AND retired_at IS NULL FOR SHARE",
+                Source::Component(ComponentTarget::Sensor, revision.owner_id),
+            ),
+            _ => return Ok(None),
+        };
+        let reference: Option<String> = sqlx::query_scalar(query)
+            .bind(revision.owner_id)
+            .fetch_optional(connection)
+            .await?;
+        Ok(
+            (reference.as_deref() == Some(revision.owner_ref.as_str())).then(|| {
+                let mut sources = std::collections::BTreeSet::from([source]);
+                if revision.owner_kind == "sensor" {
+                    sources.insert(Source::SensorLive(revision.owner_id));
+                }
+                sources
+            }),
+        )
+    }
+
     pub async fn pack_template_values(
         connection: &mut PgConnection,
         pack: &crate::models::Pack,

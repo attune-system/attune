@@ -17,7 +17,8 @@ pub struct SensorOriginFrontier {
     bindings: BTreeMap<Id, Option<super::managed_sensor_metadata::PreparedSensorGenerationBinding>>,
     initial: BTreeMap<Id, Option<serde_json::Value>>,
     deliveries: BTreeMap<Id, Option<super::sensor_schema::SensorDeliveryDisclosureRow>>,
-    live_checked: BTreeSet<Id>,
+    live_checked: BTreeMap<Id, super::runtime_authority::ApprovalEffectFence>,
+    evidence_transaction: Option<String>,
     retained_bytes: usize,
 }
 
@@ -225,6 +226,31 @@ impl SensorOriginFrontier {
         connection: &mut PgConnection,
         generation: Id,
     ) -> Result<SensorGenerationBinding> {
+        Ok(self
+            .validated_binding_evidence(connection, generation)
+            .await?
+            .0)
+    }
+
+    pub(crate) async fn validated_binding_evidence(
+        &mut self,
+        connection: &mut PgConnection,
+        generation: Id,
+    ) -> Result<(
+        SensorGenerationBinding,
+        super::runtime_authority::ApprovalEffectFence,
+    )> {
+        let transaction: String = sqlx::query_scalar("SELECT pg_current_xact_id()::text")
+            .fetch_one(&mut *connection)
+            .await?;
+        if self
+            .evidence_transaction
+            .as_ref()
+            .is_some_and(|expected| expected != &transaction)
+        {
+            return Err(unavailable());
+        }
+        self.evidence_transaction = Some(transaction);
         let binding = self
             .bindings
             .get(&generation)
@@ -234,11 +260,18 @@ impl SensorOriginFrontier {
             .clone();
         // Preparation is immutable evidence, not a live source permit. Preserve
         // the existing metadata-admission checks, once per actual generation.
-        if !self.live_checked.contains(&generation) {
-            validate_generation_binding(connection, generation, &binding).await?;
-            self.live_checked.insert(generation);
+        if !self.live_checked.contains_key(&generation) {
+            let fence =
+                validate_generation_binding_evidence(connection, generation, &binding).await?;
+            self.live_checked.insert(generation, fence);
         }
-        Ok(binding)
+        let evidence = self
+            .live_checked
+            .get(&generation)
+            .ok_or_else(unavailable)?
+            .clone();
+        evidence.ensure_fresh_on(connection).await?;
+        Ok((binding, evidence))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -286,7 +319,18 @@ pub async fn validate_generation_binding(
     id: Id,
     binding: &SensorGenerationBinding,
 ) -> Result<()> {
+    validate_generation_binding_evidence(connection, id, binding)
+        .await
+        .map(|_| ())
+}
+
+async fn validate_generation_binding_evidence(
+    connection: &mut PgConnection,
+    id: Id,
+    binding: &SensorGenerationBinding,
+) -> Result<super::runtime_authority::ApprovalEffectFence> {
     binding.validate()?;
+    let mut fence = super::runtime_authority::ApprovalEffectFence::from_input_approval(None)?;
     if let Some(revision) = binding.metadata_revision {
         let (workload, generation, hash): (Id, i64, String) = sqlx::query_as(
             "SELECT workload,generation,binding_digest FROM sensor_generation_schema_binding WHERE id=$1 FOR SHARE",
@@ -300,9 +344,17 @@ pub async fn validate_generation_binding(
                 "Sensor source metadata link is unavailable".into(),
             ));
         }
-        Metadata::validate_generation(connection, workload, generation).await?;
+        fence =
+            Metadata::validate_generation_input_evidence(connection, workload, generation).await?;
+        fence
+            .retain_input_dependency(
+                connection,
+                super::runtime_authority::InputAuthorityDependency::SensorMetadata(revision),
+            )
+            .await?;
     }
-    Ok(())
+    fence.ensure_fresh_on(connection).await?;
+    Ok(fence)
 }
 
 /// The target must come from actual rows. This proof never grants Read/Decrypt;

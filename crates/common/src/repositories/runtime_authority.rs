@@ -155,6 +155,26 @@ pub(crate) enum InputAuthorityDependency {
     Admission(Id),
     Approval(Id),
     Ownership(super::runtime_target::InputOwnershipDependency),
+    Receipt(Id),
+    DeclaredReceipt(Id),
+    RuntimeRead(Id),
+    Configuration(Id),
+    SensorBinding(Id),
+    SensorDelivery(Id),
+    SensorMetadata(Id),
+    SensorRuntime(Id),
+    EventOrigin(Id),
+    EventSchema(Id),
+    InputContributors(Id),
+    ExecutionSchema(Id),
+    InquirySchema(Id),
+    SecretBuffer(Id),
+    ProvenanceBuffer(Id),
+    ExecutionPresence(Id),
+    WorkflowPresence(Id),
+    ArtifactVersion(Id),
+    DelegatedOutput(Id),
+    Incomplete,
 }
 
 /// Approval rows remain locked by the source-validation transaction. Row locks
@@ -191,6 +211,18 @@ impl ApprovalEffectFence {
                 .map(InputAuthorityDependency::Ownership),
         );
         self
+    }
+    pub(crate) fn input_dependencies(&self) -> &BTreeSet<InputAuthorityDependency> {
+        &self.input_dependencies
+    }
+    pub(crate) async fn retain_input_dependency(
+        &mut self,
+        connection: &mut PgConnection,
+        source: InputAuthorityDependency,
+    ) -> Result<()> {
+        super::execution_input::retain_dependency(connection, &source).await?;
+        self.input_dependencies.insert(source);
+        Ok(())
     }
     pub fn approval_deadline(&self) -> Option<DateTime<Utc>> {
         self.earliest_expiry

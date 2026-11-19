@@ -393,6 +393,7 @@ impl VerifiedKeyOrigins {
             };
             let mut sources = BTreeSet::from([
                 InputOwnershipDependency::Key(row.id),
+                InputOwnershipDependency::KeyClassification(row.id),
                 InputOwnershipDependency::Pack(pack),
             ]);
             match (origin.owner_type, row.owner_action, row.owner_sensor) {

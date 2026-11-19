@@ -1,7 +1,9 @@
 //! Durable native-effect evidence, not a second execution scheduler. Existing
 //! admission/origin policy is rechecked before the one-shot stdin commit.
 use super::{
-    execution_input::{ExecutionInputRepository, FrozenInputSnapshot, SelectedExecutionInput},
+    execution_input::{
+        ExecutionInputRepository, FrozenInputFrontier, FrozenInputSnapshot, SelectedExecutionInput,
+    },
     workload_source::{self, SourceEpoch},
 };
 use crate::{
@@ -48,6 +50,7 @@ struct FrozenProcess {
     timeout_ms: Option<u64>,
     invocation: LaunchInvocation,
     input: FrozenInputSnapshot,
+    input_frontier: FrozenInputFrontier,
     stdin: String,
 }
 impl FrozenProcess {
@@ -65,6 +68,7 @@ impl FrozenProcess {
             timeout_ms: spec.timeout_ms,
             invocation: spec.invocation.clone(),
             input: FrozenInputSnapshot::from(&input.snapshot),
+            input_frontier: FrozenInputFrontier::empty(),
             stdin: input.stdin_json.clone(),
         }
     }
@@ -123,6 +127,7 @@ impl Record {
 pub struct NativeFilePublication {
     snapshot: RuntimeFence,
     worker_deadline: DateTime<Utc>,
+    input_fence: super::runtime_authority::ApprovalEffectFence,
 }
 impl NativeFilePublication {
     pub async fn retain(
@@ -148,8 +153,11 @@ impl NativeFilePublication {
             return Err(denied());
         }
         fresh_on(connection, Some(self.worker_deadline)).await?;
-        super::runtime_authority::ApprovalEffectFence::from_input_approval(Some(
-            self.worker_deadline,
+        self.input_fence.ensure_fresh_on(connection).await?;
+        Ok(self.input_fence.intersect(
+            &super::runtime_authority::ApprovalEffectFence::from_input_approval(Some(
+                self.worker_deadline,
+            ))?,
         ))
     }
 }
@@ -157,6 +165,13 @@ impl NativeFilePublication {
 struct SourceProof {
     sources: Vec<(&'static str, i64)>,
     deadline: Option<DateTime<Utc>>,
+}
+
+impl SourceProof {
+    fn include_input(&mut self, frontier: &FrozenInputFrontier) {
+        self.sources.extend(frontier.epoch_sources());
+        self.deadline = self.deadline.into_iter().chain(frontier.deadline()).min();
+    }
 }
 
 pub struct ExecutionProcessRepository;
@@ -276,6 +291,7 @@ impl ExecutionProcessRepository {
         version: i64,
         execution: i64,
         attempt: Uuid,
+        master: Option<&str>,
     ) -> Result<Option<NativeFilePublication>> {
         let ordinary: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM artifact_version v JOIN artifact a ON a.id=v.artifact \
@@ -284,14 +300,17 @@ impl ExecutionProcessRepository {
         if !ordinary {
             return Ok(None);
         }
-        let snapshot: Option<RuntimeFence> = sqlx::query_as(
-        "SELECT intent,target,source_epochs FROM execution_process_effect \
+        let snapshot: Option<Record> = sqlx::query_as(&format!(
+        "SELECT {COLUMNS} FROM execution_process_effect \
          WHERE purpose='action' AND target->>'kind'='execution' AND (target->>'execution')::BIGINT=$1 AND target->>'attempt'=$2"
-    ).bind(execution).bind(attempt.to_string()).fetch_optional(&mut *connection).await?;
+    )).bind(execution).bind(attempt.to_string()).fetch_optional(&mut *connection).await?;
         let Some(snapshot) = snapshot else {
             Self::deny_inspection_only(connection, execution, attempt).await?;
             return Ok(None);
         };
+        // Legacy/public publications above require no encryption configuration.
+        // A native effect must positively retain its own encrypted input proof.
+        let context = snapshot.context(master.ok_or_else(denied)?)?;
         let LaunchTarget::Execution {
             worker,
             worker_instance,
@@ -301,9 +320,16 @@ impl ExecutionProcessRepository {
             return Err(denied());
         };
         let worker_deadline = Self::worker_deadline(connection, worker, worker_instance).await?;
+        let input_fence = context.input_frontier.retain(connection).await?;
+        fresh_on(connection, Some(worker_deadline)).await?;
         Ok(Some(NativeFilePublication {
-            snapshot,
+            snapshot: RuntimeFence {
+                intent: snapshot.intent,
+                target: snapshot.target,
+                source_epochs: snapshot.source_epochs,
+            },
             worker_deadline,
+            input_fence,
         }))
     }
 
@@ -385,10 +411,17 @@ impl ExecutionProcessRepository {
         let sources = snapshot
             .source_epochs
             .iter()
+            .filter(|epoch| !super::execution_input::origin_epoch(&epoch.kind))
             .map(|epoch| (epoch.kind.as_str(), epoch.subject))
             .collect();
         let current = workload_source::snapshot(connection, sources).await?;
-        if current != snapshot.source_epochs.0 {
+        let expected: Vec<_> = snapshot
+            .source_epochs
+            .iter()
+            .filter(|epoch| !super::execution_input::origin_epoch(&epoch.kind))
+            .cloned()
+            .collect();
+        if current != expected {
             return Err(denied());
         }
         let open: bool = sqlx::query_scalar(
@@ -435,6 +468,7 @@ impl ExecutionProcessRepository {
             || action.stage.is_some()
             || probe.stdin != action.stdin
             || probe.input != action.input
+            || probe.input_frontier != action.input_frontier
         {
             return Err(denied());
         }
@@ -450,6 +484,7 @@ impl ExecutionProcessRepository {
         {
             return Err(denied());
         }
+        probe.input_frontier.retain(connection).await?;
         let sources = snapshot
             .source_epochs
             .iter()
@@ -476,6 +511,7 @@ impl ExecutionProcessRepository {
         {
             return Err(denied());
         }
+        fresh_on(connection, probe.input_frontier.deadline()).await?;
         Ok(())
     }
 
@@ -510,7 +546,7 @@ impl ExecutionProcessRepository {
         else {
             return Err(denied());
         };
-        let proof = Self::source(&mut tx, &context.target, context.owner).await?;
+        let mut proof = Self::source(&mut tx, &context.target, context.owner).await?;
         let expected = context.input.public_snapshot()?;
         let mut input =
             ExecutionInputRepository::restore(&mut tx, execution, Some(master), Some(&expected))
@@ -522,6 +558,10 @@ impl ExecutionProcessRepository {
         }
         input.ensure_fresh().await?;
         let (_, _, _, expiry) = input.into_parts();
+        if expiry.frozen_frontier()? != context.input_frontier {
+            return Err(denied());
+        }
+        proof.include_input(&context.input_frontier);
         Self::action_stdin(&mut tx, &context, master).await?;
         let execution_record = ExecutionRepository::find_by_id(&mut *tx, execution)
             .await?
@@ -624,7 +664,7 @@ impl ExecutionProcessRepository {
         .fetch_one(&mut *tx)
         .await?;
         let probe = record.context(master)?;
-        let proof = Self::source(&mut tx, &probe.target, probe.owner).await?;
+        let mut proof = Self::source(&mut tx, &probe.target, probe.owner).await?;
         let expected = probe.input.public_snapshot()?;
         let mut input =
             ExecutionInputRepository::restore(&mut tx, execution, Some(master), Some(&expected))
@@ -635,6 +675,10 @@ impl ExecutionProcessRepository {
         }
         input.ensure_fresh().await?;
         let (_, _, _, expiry) = input.into_parts();
+        if expiry.frozen_frontier()? != probe.input_frontier {
+            return Err(denied());
+        }
+        proof.include_input(&probe.input_frontier);
         let action_context = FrozenProcess {
             purpose: LaunchPurpose::Action,
             intent: action.intent,
@@ -796,15 +840,13 @@ impl ExecutionProcessRepository {
         {
             return Err(denied());
         }
-        let context = FrozenProcess::new(spec, owner, selected);
+        let mut context = FrozenProcess::new(spec, owner, selected);
         // The first owned vertical is the public-input case. Do not create a
         // provider resource for unsupported origin projections while migration
         // of the complete existing secret/CLI paths is still in progress.
         context.input.public_snapshot()?;
-        let serialized = serde_json::to_string(&context).map_err(|_| denied())?;
-        let encrypted = crypto::encrypt(&serialized, master).map_err(|_| denied())?;
         let mut tx = pool.begin().await?;
-        let proof = Self::source(&mut tx, &spec.target, owner).await?;
+        let mut proof = Self::source(&mut tx, &spec.target, owner).await?;
         let mut input = ExecutionInputRepository::restore(
             &mut tx,
             selected.snapshot.execution(),
@@ -819,7 +861,11 @@ impl ExecutionProcessRepository {
         }
         input.ensure_fresh().await?;
         let (_, _, _, expiry) = input.into_parts();
+        context.input_frontier = expiry.frozen_frontier()?;
+        proof.include_input(&context.input_frontier);
         Self::action_stdin(&mut tx, &context, master).await?;
+        let serialized = serde_json::to_string(&context).map_err(|_| denied())?;
+        let encrypted = crypto::encrypt(&serialized, master).map_err(|_| denied())?;
         let epochs = workload_source::snapshot(&mut tx, proof.sources).await?;
         sqlx::query("INSERT INTO execution_process_effect(intent,target,purpose,encrypted_context,source_epochs) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING")
             .bind(spec.intent).bind(Json(&spec.target)).bind(purpose_name(spec.purpose)?).bind(encrypted).bind(Json(&epochs))
@@ -867,7 +913,9 @@ impl ExecutionProcessRepository {
             return Ok(ProcessCreateDisposition::ReconcileOnly);
         }
         let context = snapshot.context(master)?;
-        let proof = Self::source(&mut tx, &context.target, context.owner).await?;
+        let mut proof = Self::source(&mut tx, &context.target, context.owner).await?;
+        context.input_frontier.retain(&mut tx).await?;
+        proof.include_input(&context.input_frontier);
         let epochs = workload_source::snapshot(&mut tx, proof.sources).await?;
         let record: Record = sqlx::query_as(&format!(
             "SELECT {COLUMNS} FROM execution_process_effect WHERE intent=$1 FOR UPDATE"
@@ -939,7 +987,7 @@ impl ExecutionProcessRepository {
         .await?
         .ok_or_else(denied)?;
         let context = snapshot.context(master)?;
-        let proof = Self::source(&mut tx, &context.target, context.owner).await?;
+        let mut proof = Self::source(&mut tx, &context.target, context.owner).await?;
         let expected = context.input.public_snapshot()?;
         let mut input = ExecutionInputRepository::restore(
             &mut tx,
@@ -955,6 +1003,10 @@ impl ExecutionProcessRepository {
         }
         input.ensure_fresh().await?;
         let (_, _, _, expiry) = input.into_parts();
+        if expiry.frozen_frontier()? != context.input_frontier {
+            return Err(denied());
+        }
+        proof.include_input(&context.input_frontier);
         let payload = Self::action_stdin(&mut tx, &context, master).await?;
         let epochs = workload_source::snapshot(&mut tx, proof.sources).await?;
         let record: Record = sqlx::query_as(&format!(
@@ -1111,6 +1163,8 @@ impl ExecutionProcessRepository {
             }));
         }
         let mut proof = Self::source_for(tx, &context.target, context.owner, true).await?;
+        context.input_frontier.retain(tx).await?;
+        proof.include_input(&context.input_frontier);
         // Take the mutable execution source lock BEFORE epoch/operation locks.
         // Input callers can finish without waiting behind an operation whose
         // owner is itself waiting to upgrade their shared execution lock.

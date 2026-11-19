@@ -53,15 +53,31 @@ impl RecordedInputAuthorityRepository {
         origin: &crate::secret_provenance::KeyOrigin,
         action: Action,
     ) -> Result<bool> {
+        Ok(
+            Self::key_origin_evidence(connection, authority, origin, action)
+                .await?
+                .is_some(),
+        )
+    }
+
+    pub(crate) async fn key_origin_evidence(
+        connection: &mut PgConnection,
+        authority: &DelegationAuthority,
+        origin: &crate::secret_provenance::KeyOrigin,
+        action: Action,
+    ) -> Result<Option<std::collections::BTreeSet<super::runtime_target::InputOwnershipDependency>>>
+    {
         let mut ownership = super::iam_ownership::VerifiedKeyOrigins::default();
-        if ownership
+        let Some(target) = ownership
             .retain_recorded(connection, authority.identity_id, origin)
             .await?
-            .is_none()
-        {
-            return Ok(false);
+        else {
+            return Ok(None);
+        };
+        if !authority.key_allows_verified(origin, action, &ownership) {
+            return Ok(None);
         }
-        Ok(authority.key_allows_verified(origin, action, &ownership))
+        Ok(Some(target.input_sources().clone()))
     }
     /// Editing selectors must not borrow an earlier requester's accepted input
     /// capabilities. This is a proof only; the immutable snapshot is unchanged.
