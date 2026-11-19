@@ -301,10 +301,10 @@ impl RuntimeProbeProcessRepository {
         let (deadline, epochs) = source_check(&mut tx, &c).await?;
         let encrypted =
             crypto::encrypt(&serde_json::to_string(&c)?, master).map_err(|_| denied())?;
-        sqlx::query("INSERT INTO execution_process_effect(intent,target,purpose,encrypted_context,source_epochs) VALUES($1,$2,'runtime_probe',$3,$4) ON CONFLICT(target) DO NOTHING")
+        sqlx::query("INSERT INTO execution_process_effect(intent,target,purpose,encrypted_context,source_epochs) VALUES($1,$2,'runtime_probe',$3,$4) ON CONFLICT(target,purpose) DO NOTHING")
             .bind(c.intent).bind(Json(&c.target)).bind(encrypted).bind(Json(&epochs)).execute(&mut *tx).await?;
         let old: Record = sqlx::query_as(&format!(
-            "SELECT {COLUMNS} FROM execution_process_effect WHERE target=$1 FOR UPDATE"
+            "SELECT {COLUMNS} FROM execution_process_effect WHERE target=$1 AND purpose='runtime_probe' FOR UPDATE"
         ))
         .bind(Json(&c.target))
         .fetch_one(&mut *tx)
