@@ -2,12 +2,17 @@
 //! randomized encrypted context, never a plaintext input/plan digest. Payloads
 //! travel solely over the authenticated controller-to-CP channel, not audit,
 //! tracing, URL parameters or general resource DTOs.
-use crate::{workload_launch::LaunchHandle, Error, Result};
+use crate::{
+    workload_launch::{LaunchHandle, LaunchPurpose},
+    Error, Result,
+};
 use base64::Engine;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use utoipa::ToSchema;
 
 pub const MAX_PRIVATE_STDIN_BYTES: usize = 8 * 1024 * 1024;
+/// Existing sensor bootstrap ceiling. This is not a general/API body limit.
+pub const MAX_SENSOR_BOOTSTRAP_BYTES: usize = 32 * 1024 * 1024;
 /// Padded Base64 plus the fixed handle envelope; other control bodies retain
 /// their smaller limits. Admission must precede reading/decoding this body.
 pub const MAX_PRIVATE_STDIN_REQUEST_BYTES: usize = 12 * 1024 * 1024;
@@ -18,28 +23,64 @@ fn invalid() -> Error {
 
 #[derive(Clone, ToSchema)]
 #[schema(value_type=String)]
-pub struct LaunchStdinPayload(Vec<u8>);
+pub struct LaunchStdinPayload {
+    bytes: Vec<u8>,
+    sensor_bootstrap: bool,
+}
 impl LaunchStdinPayload {
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
         if bytes.len() > MAX_PRIVATE_STDIN_BYTES {
             return Err(invalid());
         }
-        Ok(Self(bytes))
+        Ok(Self {
+            bytes,
+            sensor_bootstrap: false,
+        })
+    }
+    /// Trusted sensor producers use this only after generation/source admission.
+    /// Native controls check the purpose before writing any invocation or input.
+    pub fn for_sensor_bootstrap(bytes: Vec<u8>) -> Result<Self> {
+        if bytes.len() > MAX_SENSOR_BOOTSTRAP_BYTES {
+            return Err(invalid());
+        }
+        Ok(Self {
+            bytes,
+            sensor_bootstrap: true,
+        })
+    }
+    pub fn validate_for(&self, purpose: LaunchPurpose) -> Result<()> {
+        let limit = if self.sensor_bootstrap {
+            if purpose != LaunchPurpose::Sensor {
+                return Err(invalid());
+            }
+            MAX_SENSOR_BOOTSTRAP_BYTES
+        } else {
+            MAX_PRIVATE_STDIN_BYTES
+        };
+        if self.bytes.len() > limit {
+            return Err(invalid());
+        }
+        Ok(())
     }
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        &self.bytes
     }
 }
 impl std::fmt::Debug for LaunchStdinPayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LaunchStdinPayload")
-            .field("bytes", &self.0.len())
+            .field("bytes", &self.bytes.len())
             .finish_non_exhaustive()
     }
 }
 impl Serialize for LaunchStdinPayload {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(&self.0))
+        if self.sensor_bootstrap {
+            return Err(serde::ser::Error::custom(
+                "Sensor bootstrap cannot use the general stdin API",
+            ));
+        }
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(&self.bytes))
     }
 }
 impl<'de> Deserialize<'de> for LaunchStdinPayload {
@@ -57,7 +98,7 @@ impl<'de> Deserialize<'de> for LaunchStdinPayload {
         {
             return Err(fail());
         }
-        Ok(Self(bytes))
+        Self::from_bytes(bytes).map_err(|_| fail())
     }
 }
 
@@ -112,6 +153,30 @@ mod tests {
         assert!(LaunchStdinPayload::from_bytes(vec![0; MAX_PRIVATE_STDIN_BYTES + 1]).is_err());
         let oversized = format!("\"{}\"", "A".repeat(MAX_ENCODED_BYTES + 4));
         assert!(serde_json::from_str::<LaunchStdinPayload>(&oversized).is_err());
+    }
+    #[test]
+    fn sensor_bootstrap_limit_is_purpose_bound_and_does_not_widen_wire_payloads() {
+        let payload =
+            LaunchStdinPayload::for_sensor_bootstrap(vec![7; MAX_SENSOR_BOOTSTRAP_BYTES]).unwrap();
+        assert!(payload.validate_for(LaunchPurpose::Sensor).is_ok());
+        for purpose in [
+            LaunchPurpose::Action,
+            LaunchPurpose::Setup,
+            LaunchPurpose::RuntimeProbe,
+            LaunchPurpose::CandidateTest,
+        ] {
+            assert!(payload.validate_for(purpose).is_err());
+        }
+        assert!(serde_json::to_vec(&payload).is_err());
+        assert!(
+            LaunchStdinPayload::for_sensor_bootstrap(vec![0; MAX_SENSOR_BOOTSTRAP_BYTES + 1])
+                .is_err()
+        );
+        assert!(LaunchStdinPayload::from_bytes(vec![0; MAX_PRIVATE_STDIN_BYTES + 1]).is_err());
+        let small =
+            LaunchStdinPayload::for_sensor_bootstrap(b"owned-private-bootstrap".to_vec()).unwrap();
+        assert!(serde_json::to_vec(&small).is_err());
+        assert!(!format!("{small:?}").contains("owned-private"));
     }
     #[test]
     fn request_shape_failures_do_not_echo_untrusted_private_fields() {

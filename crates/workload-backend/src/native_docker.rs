@@ -736,17 +736,18 @@ struct DockerControl {
 #[async_trait]
 impl ProcessControl for DockerControl {
     async fn write_stdin_once(&self, payload: LaunchStdinPayload) -> attune_common::Result<()> {
-        let (_, state) = self
-            .launcher
-            .exact(&self.spec, &self.resource)
-            .await
-            .map_err(common_error)?;
         let mut writer = self
             .writer
             .lock()
             .await
             .take()
             .ok_or_else(|| common_error(EngineError::Transport))?;
+        payload.validate_for(self.spec.purpose)?;
+        let (_, state) = self
+            .launcher
+            .exact(&self.spec, &self.resource)
+            .await
+            .map_err(common_error)?;
         if state != "running" {
             return Err(common_error(EngineError::Transport));
         }
