@@ -767,6 +767,12 @@ async fn mixed_queue_case(direct_key: bool, split_ceilings: bool, transferred: b
     )
     .await
     .unwrap();
+    if transferred {
+        assert!(
+            execution.permission_set_refs.is_empty(),
+            "input credentials do not enable target runtime API access"
+        );
+    }
     let record = selected
         .attach(&mut tx, RuntimeOwner::Execution(execution.id))
         .await
@@ -1385,6 +1391,10 @@ async fn mixed_queue_case(direct_key: bool, split_ceilings: bool, transferred: b
     revoked.rollback().await.unwrap();
     tx.commit().await.unwrap();
     queue_manifest_conversion_boundary(&db, retry_record.id).await;
+    if transferred {
+        transfer::corrupt_owning_transfer(&db, fixed.id(), &sources[1]).await;
+        transfer::reclaim_after_last_reference(&db, retry.id, &sources).await;
+    }
     db.cleanup().await.unwrap();
 }
 

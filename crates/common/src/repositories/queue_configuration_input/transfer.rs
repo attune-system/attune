@@ -280,6 +280,7 @@ impl TransferProof {
             || self.item != binding.item
             || self.queue != binding.queue
             || self.contributor_digests != binding.contributor_digests
+            || binding.source_execution != Some(self.source_execution)
             || self.receipt <= 0
             || self.site.execution != self.source_execution
             || self.site.purpose != InputSitePurpose::Value
@@ -293,6 +294,14 @@ impl TransferProof {
             || source.owner_id != self.source_execution
             || source.authority_digest != self.source_digest
         {
+            return Err(denied());
+        }
+        // History belongs to the immutable admission and survives execution
+        // cleanup. Verify issuance's actual attempt without requiring it to
+        // remain the current/running attempt after durable acceptance.
+        let attempt:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM runtime_authority_execution_attempt WHERE execution=$1 AND admission=$2 AND attempt=$3)")
+            .bind(self.source_execution).bind(self.source_admission).bind(self.source_attempt).fetch_one(&mut *conn).await?;
+        if !attempt {
             return Err(denied());
         }
         let (receipt, site) = Inputs::receipt_source_site(conn, &self.origin).await?;
