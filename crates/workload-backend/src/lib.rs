@@ -7,6 +7,7 @@ pub mod configuration;
 pub mod engine;
 pub mod kubernetes;
 mod kubernetes_io;
+pub mod pack_input;
 pub mod planning;
 mod probe_capture;
 mod process_policy;
