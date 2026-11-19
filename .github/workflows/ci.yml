@@ -34,6 +34,10 @@ on:
         description: "Run: Web Blocking Checks"
         type: boolean
         default: true
+      run_web_image:
+        description: "Run: Web image smoke test"
+        type: boolean
+        default: true
       run_web_advisory:
         description: "Run: Web Advisory Checks"
         type: boolean
@@ -67,6 +71,7 @@ jobs:
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       web: ${{ steps.filter.outputs.web }}
+      web_image: ${{ steps.filter.outputs.web_image }}
       release: ${{ steps.filter.outputs.release }}
       smoke: ${{ steps.filter.outputs.smoke }}
     steps:
@@ -87,12 +92,12 @@ jobs:
             base="${{ github.event.before }}"
             head="${{ github.sha }}"
             if [ "$base" = "0000000000000000000000000000000000000000" ]; then
-              printf 'rust=true\nweb=true\nrelease=true\nsmoke=true\n' >> "$GITHUB_OUTPUT"
+              printf 'rust=true\nweb=true\nweb_image=true\nrelease=true\nsmoke=true\n' >> "$GITHUB_OUTPUT"
               exit 0
             fi
           else
             # workflow_dispatch: path detection not applicable; jobs check their own input flags
-            printf 'rust=false\nweb=false\nrelease=false\nsmoke=false\n' >> "$GITHUB_OUTPUT"
+            printf 'rust=false\nweb=false\nweb_image=false\nrelease=false\nsmoke=false\n' >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -582,6 +587,57 @@ jobs:
       - name: Build
         run: npm run build
 
+  web-image:
+    name: Web image smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: changes
+    if: |
+      (github.event_name == 'workflow_dispatch' && inputs.run_web_image) ||
+      (github.event_name != 'workflow_dispatch' && needs.changes.outputs.web_image == 'true')
+    env:
+      WEB_SMOKE_IMAGE: attune-web-smoke:${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust for OpenAPI export
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Export the OpenAPI spec for the web build
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: cargo run --locked -p attune-api --bin export-openapi -- web/openapi.json
+
+      - name: Build the web image
+        run: docker build --file docker/Dockerfile.web --tag "$WEB_SMOKE_IMAGE" .
+
+      - name: Check NGINX configuration and health endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm "$WEB_SMOKE_IMAGE" nginx -t
+          container=$(docker run --detach "$WEB_SMOKE_IMAGE")
+          cleanup() {
+            if [[ "$1" != 0 ]]; then
+              docker logs "$container" || true
+            fi
+            docker rm --force "$container" >/dev/null
+          }
+          trap 'cleanup "$?"' EXIT
+
+          deadline=$((SECONDS + 30))
+          until [[ "$(docker exec "$container" wget -T 2 -qO- http://127.0.0.1/health)" == OK ]]; do
+            if (( SECONDS >= deadline )); then
+              echo 'NGINX /health did not return OK within 30 seconds' >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          echo 'NGINX /health returned OK'
+
   security-blocking:
     name: Security Blocking Checks
     runs-on: ubuntu-24.04
@@ -705,6 +761,7 @@ jobs:
       - rust-audit
       - release-checks
       - web-blocking
+      - web-image
       - security-blocking
       - web-advisory
       - security-advisory

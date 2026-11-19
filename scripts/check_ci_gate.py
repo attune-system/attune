@@ -14,13 +14,14 @@ JOBS = {
     "e2e-smoke": ("smoke", "run_e2e_smoke"),
     "rust-audit": ("rust", "run_rust_audit"),
     "web-blocking": ("web", "run_web_blocking"),
+    "web-image": ("web_image", "run_web_image"),
     "web-advisory": ("web", "run_web_advisory"),
     "security-blocking": (None, "run_security_blocking"),
     "security-advisory": (None, "run_security_advisory"),
     "release-checks": ("release", None),
 }
 ADVISORY = {"web-advisory", "security-advisory"}
-PATH_FLAGS = {"rust", "web", "release", "smoke"}
+PATH_FLAGS = {"rust", "web", "web_image", "release", "smoke"}
 
 
 def evaluate(needs, event, inputs):
@@ -40,7 +41,7 @@ def evaluate(needs, event, inputs):
     if not isinstance(flags, dict) or any(
         flags.get(key) not in {"true", "false"} for key in PATH_FLAGS
     ):
-        raise ValueError("Path detection must supply all four true/false flags")
+        raise ValueError("Path detection must supply all required true/false flags")
     if event == "workflow_dispatch":
         keys = {key for _, key in JOBS.values() if key is not None}
         if set(inputs) != keys or any(type(value) is not bool for value in inputs.values()):

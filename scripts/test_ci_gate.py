@@ -68,6 +68,34 @@ def results(event="pull_request", flags=None, inputs=None):
 
 
 class CiGateTests(unittest.TestCase):
+    def test_web_runtime_paths_select_the_image_smoke_job(self):
+        web_runtime = {"web_image"}
+        rust_infrastructure = {"rust", "release", "smoke"}
+        for paths, enabled in (
+            (("docker/README.md",), set()),
+            (("docker/Dockerfile.web", "docker/README.md"), web_runtime),
+            (("docker/nginx.conf",), web_runtime),
+            (("docker/inject-env.sh",), web_runtime),
+            ((".dockerignore",), web_runtime | {"release", "smoke"}),
+            (("docker/Dockerfile.rust-tests",), rust_infrastructure),
+            (("docker/Dockerfile.rust-tests", "docker/Dockerfile.web"),
+             web_runtime | rust_infrastructure),
+        ):
+            with self.subTest(paths=paths):
+                completed = subprocess.run(
+                    ["bash", str(ROOT / "scripts/ci-changed-paths.sh")],
+                    input="\n".join(paths) + "\n", capture_output=True, text=True,
+                    check=True, timeout=10,
+                )
+                flags = dict(line.split("=", 1) for line in completed.stdout.splitlines())
+                self.assertEqual(flags, {key: str(key in enabled).lower() for key in PATH_FLAGS})
+                needs = results(flags=flags)
+                self.assertEqual(evaluate(needs, "pull_request", {}), ([], []))
+                self.assertEqual(needs["web-image"]["result"],
+                                 "success" if "web_image" in enabled else "skipped")
+                self.assertEqual(needs["rust-test"]["result"],
+                                 "success" if "rust" in enabled else "skipped")
+
     def test_every_path_combination_matches_the_real_push_and_pr_conditions(self):
         for event in ("pull_request", "push"):
             for values in itertools.product(("true", "false"), repeat=len(PATH_FLAGS)):
@@ -136,6 +164,7 @@ class CiGateTests(unittest.TestCase):
             evaluate(results(), "workflow_dispatch", inputs)
 
     def test_gate_waits_for_all_jobs_and_manual_runs_use_a_distinct_check(self):
+        self.assertEqual(set(WORKFLOW["jobs"]["changes"]["outputs"]), PATH_FLAGS)
         gate = WORKFLOW["jobs"]["ci-gate"]
         self.assertEqual(set(gate["needs"]), set(WORKFLOW["jobs"]) - {"ci-gate"})
         self.assertEqual(set(gate["needs"]), set(JOBS) | {"changes"})
