@@ -57,19 +57,35 @@ impl FrozenInputSnapshot {
             .collect()
     }
 
-    /// The origin dependency frontier must be captured before remote delivery
-    /// of inherited/ordinary secrets is enabled. Until then, the executable
-    /// consumer admits only the source-complete public-input case.
+    /// Exact private evidence only, never disclosure or launch authority. The
+    /// native consumer must restore this snapshot through the canonical issuer
+    /// and compare its retained frontier before admitting an effect.
+    pub(crate) fn retained_snapshot(&self) -> ExecutionInputSnapshot {
+        ExecutionInputSnapshot {
+            execution: self.execution,
+            executor: self.executor,
+            config: self.config.clone(),
+            secrets: self
+                .secrets
+                .iter()
+                .map(|secret| StoredSecretValue {
+                    json_path: secret.json_path.clone(),
+                    encrypted_value: secret.encrypted_value.clone(),
+                    encryption_key_hash: secret.encryption_key_hash.clone(),
+                    source_kind: secret.source_kind.clone(),
+                    source_ref: secret.source_ref.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// The separate workload-launch consumer remains public-only until its own
+    /// complete origin-frontier migration is implemented and validated.
     pub(crate) fn public_snapshot(&self) -> Result<ExecutionInputSnapshot> {
         if !self.secrets.is_empty() {
             return Err(denied());
         }
-        Ok(ExecutionInputSnapshot {
-            execution: self.execution,
-            executor: self.executor,
-            config: self.config.clone(),
-            secrets: Vec::new(),
-        })
+        Ok(self.retained_snapshot())
     }
 }
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -424,6 +440,44 @@ mod tests {
             .is_err());
         assert_eq!(input.secret_paths(), vec!["/token"]);
         assert!(input.public_snapshot().is_err());
+    }
+
+    #[test]
+    fn input_evidence_frozen_projection_preserves_exact_private_snapshot() {
+        let original = ExecutionInputSnapshot {
+            execution: 17,
+            executor: Some(29),
+            config: serde_json::json!({"token": "redacted", "public": [true, 3]}),
+            secrets: vec![
+                StoredSecretValue {
+                    json_path: "/token".into(),
+                    encrypted_value: serde_json::json!({"ciphertext": "opaque-private-envelope"}),
+                    encryption_key_hash: Some("private-key-hash".into()),
+                    source_kind: "provenance".into(),
+                    source_ref: Some("exact-retained-origin".into()),
+                },
+                StoredSecretValue {
+                    json_path: "/nested/0".into(),
+                    encrypted_value: Value::String("second-envelope".into()),
+                    encryption_key_hash: None,
+                    source_kind: "unattributed".into(),
+                    source_ref: None,
+                },
+            ],
+        };
+        let stored = serde_json::to_vec(&FrozenInputSnapshot::from(&original)).unwrap();
+        let frozen: FrozenInputSnapshot = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(frozen.retained_snapshot(), original);
+        assert!(frozen.public_snapshot().is_err());
+        let mut changed = frozen.clone();
+        changed.secrets[0].encryption_key_hash = None;
+        assert_ne!(changed.retained_snapshot(), original);
+        changed = frozen.clone();
+        changed.secrets[0].source_kind = "unattributed".into();
+        assert_ne!(changed.retained_snapshot(), original);
+        changed = frozen;
+        changed.secrets[0].json_path = "/other".into();
+        assert_ne!(changed.retained_snapshot(), original);
     }
 
     #[test]

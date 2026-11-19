@@ -547,7 +547,7 @@ impl ExecutionProcessRepository {
             return Err(denied());
         };
         let mut proof = Self::source(&mut tx, &context.target, context.owner).await?;
-        let expected = context.input.public_snapshot()?;
+        let expected = context.input.retained_snapshot();
         let mut input =
             ExecutionInputRepository::restore(&mut tx, execution, Some(master), Some(&expected))
                 .await?;
@@ -665,7 +665,7 @@ impl ExecutionProcessRepository {
         .await?;
         let probe = record.context(master)?;
         let mut proof = Self::source(&mut tx, &probe.target, probe.owner).await?;
-        let expected = probe.input.public_snapshot()?;
+        let expected = probe.input.retained_snapshot();
         let mut input =
             ExecutionInputRepository::restore(&mut tx, execution, Some(master), Some(&expected))
                 .await?;
@@ -841,17 +841,14 @@ impl ExecutionProcessRepository {
             return Err(denied());
         }
         let mut context = FrozenProcess::new(spec, owner, selected);
-        // The first owned vertical is the public-input case. Do not create a
-        // provider resource for unsupported origin projections while migration
-        // of the complete existing secret/CLI paths is still in progress.
-        context.input.public_snapshot()?;
+        let expected = context.input.retained_snapshot();
         let mut tx = pool.begin().await?;
         let mut proof = Self::source(&mut tx, &spec.target, owner).await?;
         let mut input = ExecutionInputRepository::restore(
             &mut tx,
-            selected.snapshot.execution(),
+            expected.execution(),
             Some(master),
-            Some(&selected.snapshot),
+            Some(&expected),
         )
         .await?;
         let provided: serde_json::Value =
@@ -988,7 +985,7 @@ impl ExecutionProcessRepository {
         .ok_or_else(denied)?;
         let context = snapshot.context(master)?;
         let mut proof = Self::source(&mut tx, &context.target, context.owner).await?;
-        let expected = context.input.public_snapshot()?;
+        let expected = context.input.retained_snapshot();
         let mut input = ExecutionInputRepository::restore(
             &mut tx,
             expected.execution(),

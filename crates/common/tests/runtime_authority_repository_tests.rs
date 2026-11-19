@@ -2575,6 +2575,15 @@ async fn fixture_with_approval_lifetime(
     content_path: Option<String>,
     lifetime: Option<Duration>,
 ) -> (TestDatabase, Fixture) {
+    fixture_with_launch(defaults, content_path, lifetime, None).await
+}
+
+async fn fixture_with_launch(
+    defaults: Option<serde_json::Value>,
+    content_path: Option<String>,
+    lifetime: Option<Duration>,
+    launch: Option<attune_common::pack_format::LaunchSpec>,
+) -> (TestDatabase, Fixture) {
     let db = create_test_pool().await.unwrap();
     let shared = PackFixture::new("shared").create(&db).await.unwrap();
     let shared_trigger =
@@ -2590,6 +2599,28 @@ async fn fixture_with_approval_lifetime(
         .create(&db)
         .await
         .unwrap();
+    let mut runtimes = Vec::new();
+    if let Some(launch) = launch {
+        let mut runtime =
+            helpers::RuntimeFixture::new(Some(pack.id), Some(pack.r#ref.clone()), "native");
+        runtime.execution_config = json!({});
+        let runtime = runtime.create(&db).await.unwrap();
+        runtimes.push(runtime.id);
+        attune_common::repositories::action::ActionRepository::update(
+            &db,
+            action.id,
+            attune_common::repositories::action::UpdateActionInput {
+                entrypoint: Some(attune_common::repositories::Patch::Clear),
+                launch: Some(attune_common::repositories::Patch::Set(launch)),
+                runtime: Some(runtime.id),
+                parameter_delivery: Some("stdin".into()),
+                parameter_format: Some("json".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
     if let Some(schema) = defaults {
         attune_common::repositories::action::ActionRepository::update(
             &db,
@@ -2653,6 +2684,7 @@ async fn fixture_with_approval_lifetime(
         release.id,
         &PackProjectionIds {
             actions: vec![action.id],
+            runtimes,
             ..Default::default()
         },
     )
