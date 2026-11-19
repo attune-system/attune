@@ -279,6 +279,27 @@ impl PackInstallRepository {
         test_result: Option<serde_json::Value>,
         error_message: Option<String>,
     ) -> Result<Option<PackInstall>> {
+        let mut connection = self.pool.acquire().await?;
+        Self::finish_running_on(
+            &mut connection,
+            id,
+            status,
+            test_execution_id,
+            test_result,
+            error_message,
+        )
+        .await
+    }
+    /// Preserve the ordinary running-only finish contract while borrowing the
+    /// source-fenced publication transaction instead of taking another session.
+    pub async fn finish_running_on(
+        connection: &mut PgConnection,
+        id: Id,
+        status: PackInstallStatus,
+        test_execution_id: Option<Id>,
+        test_result: Option<serde_json::Value>,
+        error_message: Option<String>,
+    ) -> Result<Option<PackInstall>> {
         let sql = format!(
             "UPDATE pack_install \
              SET status = $2, \
@@ -297,7 +318,7 @@ impl PackInstallRepository {
             .bind(test_execution_id)
             .bind(test_result)
             .bind(error_message)
-            .fetch_optional(&self.pool)
+            .fetch_optional(connection)
             .await?)
     }
 

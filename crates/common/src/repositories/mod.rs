@@ -541,3 +541,5 @@ pub(crate) mod workload_source;
 pub mod pack_environment_process;
 
 pub mod runtime_probe_process;
+
+pub mod candidate_process;

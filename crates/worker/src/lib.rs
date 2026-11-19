@@ -13,6 +13,8 @@ pub mod heartbeat;
 pub mod log_delivery;
 #[cfg(unix)]
 pub mod log_delivery_spool;
+#[cfg(unix)]
+pub mod native_candidate;
 pub mod recorded_credentials;
 pub mod registration;
 pub mod runtime;

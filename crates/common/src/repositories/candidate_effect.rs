@@ -144,21 +144,27 @@ impl CandidateEffectRepository {
 
     pub async fn close(pool: &PgPool, id: Uuid) -> Result<()> {
         let mut tx = pool.begin().await?;
+        Self::close_on(&mut tx, id).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    /// Borrow the caller's transaction/session; this never opens another pool
+    /// transaction. Install/context lock order and purge semantics are unchanged.
+    pub async fn close_on(connection: &mut sqlx::PgConnection, id: Uuid) -> Result<()> {
         sqlx::query("SELECT id FROM pack_install WHERE id = (SELECT install_id FROM pack_candidate_context WHERE lease = $1) FOR UPDATE")
-            .bind(id).execute(&mut *tx).await?;
+            .bind(id).execute(&mut *connection).await?;
         sqlx::query("UPDATE pack_candidate_context SET revoked = TRUE WHERE lease = $1")
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut *connection)
             .await?;
         sqlx::query("DELETE FROM pack_candidate_resource WHERE context = $1")
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut *connection)
             .await?;
         sqlx::query("DELETE FROM pack_candidate_event WHERE context = $1")
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut *connection)
             .await?;
-        tx.commit().await?;
         Ok(())
     }
 

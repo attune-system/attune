@@ -16,6 +16,9 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{debug, error, info, warn};
 
 const MAX_TEST_OUTPUT_BYTES: usize = 1024 * 1024;
+/// Lossy UTF-8 can replace each retained raw byte with three text bytes. The
+/// raw retention/drain policy remains exactly the existing one-MiB prefix.
+pub const MAX_TEST_CAPTURE_TEXT_BYTES: usize = 3 * MAX_TEST_OUTPUT_BYTES;
 
 /// Test configuration from pack.yaml
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +148,7 @@ pub struct TestExecutor {
     processes: TestProcessOwner,
     cancellation: CancellationToken,
     workload_sandbox: Option<crate::workload_sandbox::WorkloadSandbox>,
+    process_effect: Option<std::sync::Arc<dyn TestProcessEffect>>,
 }
 
 /// Owns subprocess supervisors independently of the future consuming their output.
@@ -169,6 +173,46 @@ pub struct CandidateTestEnvironment {
     pub token: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum SuiteExecutionError {
+    #[error(transparent)]
+    Effect(Error),
+    #[error(transparent)]
+    Suite(Error),
+}
+impl From<Error> for SuiteExecutionError {
+    fn from(error: Error) -> Self {
+        Self::Suite(error)
+    }
+}
+
+/// Typed owning-loop evidence; never guessed from a guest exit number.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TestProcessInterruption {
+    TimedOut,
+    Cancelled,
+    SourceRevoked,
+    InputUncertain,
+    ProviderFailure,
+    OutOfMemory,
+}
+
+/// An owning native manager may replace only the process effect. Discovery,
+/// entrypoint validation, result parsing and pass/failure policy stay here.
+/// Errors mean incomplete effects/capture and must not become publishable results.
+#[async_trait::async_trait]
+pub trait TestProcessEffect: Send + Sync {
+    async fn run(&self, request: TestProcessRequest) -> Result<CommandOutput>;
+}
+pub struct TestProcessRequest {
+    pub suite: String,
+    pub runner: RunnerConfig,
+    pub entry_point: PathBuf,
+    pub candidate_effects: Option<CandidateTestEnvironment>,
+    pub cancellation: CancellationToken,
+}
+
 impl TestExecutor {
     /// Create a new test executor
     pub fn new(pack_base_dir: PathBuf) -> Self {
@@ -180,6 +224,7 @@ impl TestExecutor {
             processes: TestProcessOwner::default(),
             cancellation: CancellationToken::new(),
             workload_sandbox: None,
+            process_effect: None,
         }
     }
 
@@ -189,6 +234,11 @@ impl TestExecutor {
     ) -> Self {
         self.workload_sandbox = Some(sandbox);
         self.lifecycle_environment = self.lifecycle_environment.with_workload_sandbox(sandbox);
+        self
+    }
+
+    pub fn with_process_effect(mut self, effect: std::sync::Arc<dyn TestProcessEffect>) -> Self {
+        self.process_effect = Some(effect);
         self
     }
 
@@ -289,6 +339,14 @@ impl TestExecutor {
         // Execute tests for each runner
         for (runner_name, runner_config) in &test_config.runners {
             if self.cancellation.is_cancelled() {
+                if self.process_effect.is_some() {
+                    test_suites.push(Self::failed_suite(
+                        runner_name,
+                        runner_config,
+                        "Pack tests cancelled before runner start",
+                    ));
+                    continue;
+                }
                 return Err(Error::Internal("Pack tests cancelled".into()));
             }
             info!(
@@ -307,33 +365,22 @@ impl TestExecutor {
                     );
                     test_suites.push(suite_result);
                 }
-                Err(e) => {
+                Err(SuiteExecutionError::Effect(e)) => return Err(e),
+                Err(SuiteExecutionError::Suite(e)) => {
                     error!("Test suite '{}' failed to execute: {}", runner_name, e);
                     // Create a failed suite result
-                    test_suites.push(TestSuiteResult {
-                        name: runner_name.clone(),
-                        runner_type: runner_config.r#type.clone(),
-                        total: 1,
-                        passed: 0,
-                        failed: 1,
-                        skipped: 0,
-                        duration_ms: 0,
-                        test_cases: vec![TestCaseResult {
-                            name: format!("{}_execution", runner_name),
-                            status: TestStatus::Error,
-                            duration_ms: 0,
-                            error_message: Some(e.to_string()),
-                            stdout: None,
-                            stderr: None,
-                        }],
-                    });
+                    test_suites.push(Self::failed_suite(
+                        runner_name,
+                        runner_config,
+                        &e.to_string(),
+                    ));
                 }
             }
         }
 
         // Cancellation is an interrupted attempt, even when the pack's failure
         // policy would otherwise permit failed/error suites to be published.
-        if self.cancellation.is_cancelled() {
+        if self.cancellation.is_cancelled() && self.process_effect.is_none() {
             return Err(Error::Internal("Pack tests cancelled".into()));
         }
 
@@ -383,6 +430,30 @@ impl TestExecutor {
         })
     }
 
+    fn failed_suite(
+        runner_name: &str,
+        runner_config: &RunnerConfig,
+        error: &str,
+    ) -> TestSuiteResult {
+        TestSuiteResult {
+            name: runner_name.into(),
+            runner_type: runner_config.r#type.clone(),
+            total: 1,
+            passed: 0,
+            failed: 1,
+            skipped: 0,
+            duration_ms: 0,
+            test_cases: vec![TestCaseResult {
+                name: format!("{runner_name}_execution"),
+                status: TestStatus::Error,
+                duration_ms: 0,
+                error_message: Some(error.into()),
+                stdout: None,
+                stderr: None,
+            }],
+        }
+    }
+
     /// Execute a single test suite
     async fn execute_test_suite(
         &self,
@@ -390,7 +461,7 @@ impl TestExecutor {
         runner_name: &str,
         runner_config: &RunnerConfig,
         python_interpreter: Option<&Path>,
-    ) -> Result<TestSuiteResult> {
+    ) -> std::result::Result<TestSuiteResult, SuiteExecutionError> {
         let start_time = Instant::now();
         let suite_deadline =
             tokio::time::Instant::now() + Duration::from_secs(runner_config.timeout.unwrap_or(300));
@@ -408,6 +479,52 @@ impl TestExecutor {
             })?;
         // Absolute canonical paths also prevent a leading '-' from becoming an option.
         let relative_entry_point = entry_point.to_string_lossy().into_owned();
+
+        if !matches!(
+            runner_config.r#type.as_str(),
+            "script" | "unittest" | "pytest" | "runtime"
+        ) {
+            return Err(Error::validation(format!(
+                "Unsupported runner type: {}",
+                runner_config.r#type
+            ))
+            .into());
+        }
+        if let Some(effect) = &self.process_effect {
+            let entry_point = entry_point
+                .strip_prefix(pack_dir)
+                .map_err(|_| Error::validation("Candidate entrypoint escaped verified root"))?
+                .to_path_buf();
+            let request = TestProcessRequest {
+                suite: runner_name.into(),
+                runner: runner_config.clone(),
+                entry_point,
+                candidate_effects: self.candidate_effects.as_ref().map(|e| {
+                    CandidateTestEnvironment {
+                        url: e.url.clone(),
+                        token: e.token.clone(),
+                    }
+                }),
+                cancellation: self.cancellation.clone(),
+            };
+            let effect = effect.clone();
+            // This task outlives an aborted consumer. The ordinary handler must
+            // await process_owner.shutdown before touching leases or roots.
+            let output = self
+                .processes
+                .tasks
+                .spawn(async move { effect.run(request).await })
+                .await
+                .map_err(|_| {
+                    SuiteExecutionError::Effect(Error::validation(
+                        "Native test effect owner failed",
+                    ))
+                })?
+                .map_err(SuiteExecutionError::Effect)?;
+            return self
+                .parse_suite_output(&output, runner_name, runner_config, start_time)
+                .map_err(Into::into);
+        }
 
         let target = if let Some(recipe) = &runner_config.lifecycle {
             self.lifecycle_environment
@@ -437,7 +554,7 @@ impl TestExecutor {
             Some(tokio::select! {
                 result = preparation => result.map_err(|_| Error::Timeout("Runtime test preparation exceeded runner timeout".into()))?
                     .map_err(|error| Error::validation(error.to_string()))?,
-                _ = self.cancellation.cancelled() => return Err(Error::validation("Runtime test preparation cancelled")),
+                _ = self.cancellation.cancelled() => return Err(Error::validation("Runtime test preparation cancelled").into()),
             })
         } else {
             None
@@ -492,7 +609,8 @@ impl TestExecutor {
                 return Err(Error::Validation(format!(
                     "Unsupported runner type: {}",
                     runner_config.r#type
-                )));
+                ))
+                .into());
             }
         };
 
@@ -535,20 +653,30 @@ impl TestExecutor {
         }
         let output = outcome?;
 
-        let duration_ms = start_time.elapsed().as_millis() as i64;
+        self.parse_suite_output(&output, runner_name, runner_config, start_time)
+            .map_err(Into::into)
+    }
 
+    fn parse_suite_output(
+        &self,
+        output: &CommandOutput,
+        runner_name: &str,
+        runner_config: &RunnerConfig,
+        start_time: Instant,
+    ) -> Result<TestSuiteResult> {
+        let duration_ms = start_time.elapsed().as_millis() as i64;
         // Parse output based on result format
         let result_format = runner_config.result_format.as_deref().unwrap_or("simple");
 
         let mut suite_result = match result_format {
-            "simple" => self.parse_simple_output(&output, runner_name, &runner_config.r#type)?,
+            "simple" => self.parse_simple_output(output, runner_name, &runner_config.r#type)?,
             "json" => self.parse_json_output(&output.stdout, runner_name)?,
             _ => {
                 warn!(
                     "Unknown result format '{}', falling back to simple",
                     result_format
                 );
-                self.parse_simple_output(&output, runner_name, &runner_config.r#type)?
+                self.parse_simple_output(output, runner_name, &runner_config.r#type)?
             }
         };
 
@@ -791,6 +919,7 @@ impl TestExecutor {
         }
         let status = result?;
         Ok(CommandOutput {
+            interruption: None,
             exit_code: status.code().unwrap_or(-1),
             stdout: stdout?,
             stderr: stderr?,
@@ -799,7 +928,7 @@ impl TestExecutor {
     }
 
     /// Read from an async stream
-    async fn read_stream(mut stream: impl tokio::io::AsyncRead + Unpin) -> Result<String> {
+    pub async fn read_stream(mut stream: impl tokio::io::AsyncRead + Unpin) -> Result<String> {
         let mut output = Vec::with_capacity(MAX_TEST_OUTPUT_BYTES);
         let mut chunk = [0_u8; 8192];
         loop {
@@ -850,7 +979,7 @@ impl TestExecutor {
         let mut passed = passed.max(0);
         let mut failed = failed.max(0);
         let skipped = skipped.max(0);
-        if output.exit_code != 0 && failed == 0 {
+        if (output.exit_code != 0 || output.interruption.is_some()) && failed == 0 {
             failed = 1;
             total = total.max(failed + skipped);
             passed = passed.min(total.saturating_sub(failed + skipped));
@@ -859,13 +988,20 @@ impl TestExecutor {
         // Create a single test case representing the entire suite
         let test_case = TestCaseResult {
             name: format!("{}_suite", runner_name),
-            status: if output.exit_code == 0 {
+            status: if output.interruption.is_some() {
+                TestStatus::Error
+            } else if output.exit_code == 0 {
                 TestStatus::Passed
             } else {
                 TestStatus::Failed
             },
             duration_ms: output.duration_ms as i64,
-            error_message: if output.exit_code != 0 {
+            error_message: if let Some(reason) = output.interruption {
+                Some(format!(
+                    "{reason:?}; observed exit code: {}",
+                    output.exit_code
+                ))
+            } else if output.exit_code != 0 {
                 Some(format!("Exit code: {}", output.exit_code))
             } else {
                 None
@@ -920,11 +1056,12 @@ impl TestExecutor {
 
 /// Command execution output
 #[derive(Debug)]
-struct CommandOutput {
-    exit_code: i32,
-    stdout: String,
-    stderr: String,
-    duration_ms: u64,
+pub struct CommandOutput {
+    pub interruption: Option<TestProcessInterruption>,
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration_ms: u64,
 }
 
 /// Resolve only ordinary relative file paths inside the owned pack tree.
@@ -1284,6 +1421,7 @@ mod tests {
         let executor = TestExecutor::new(PathBuf::from("/tmp"));
 
         let output = CommandOutput {
+            interruption: None,
             exit_code: 0,
             stdout: "Total Tests: 36\nPassed: 36\nFailed: 0\n".to_string(),
             stderr: String::new(),
@@ -1306,6 +1444,7 @@ mod tests {
         let executor = TestExecutor::new(PathBuf::from("/tmp"));
 
         let output = CommandOutput {
+            interruption: None,
             exit_code: 1,
             stdout: "Total Tests: 10\nPassed: 8\nFailed: 2\n".to_string(),
             stderr: "Some tests failed\n".to_string(),
@@ -1327,6 +1466,7 @@ mod tests {
     fn test_nonzero_exit_cannot_report_all_tests_passed() {
         let executor = TestExecutor::new(PathBuf::from("/tmp"));
         let output = CommandOutput {
+            interruption: None,
             exit_code: 1,
             stdout: "Total Tests: 1\nPassed: 1\nFailed: 0\n".to_string(),
             stderr: String::new(),
@@ -1633,5 +1773,218 @@ mod tests {
             0,
             "pack test inherited a service secret"
         );
+    }
+}
+
+#[cfg(test)]
+mod native_effect_tests {
+    use super::*;
+    use std::sync::Arc;
+    struct OutputEffect {
+        fail: bool,
+    }
+    #[async_trait::async_trait]
+    impl TestProcessEffect for OutputEffect {
+        async fn run(&self, request: TestProcessRequest) -> Result<CommandOutput> {
+            assert_eq!(request.entry_point, Path::new("run.sh"));
+            assert!(request.candidate_effects.is_none());
+            if self.fail {
+                return Err(Error::validation("unknown provider settlement"));
+            }
+            Ok(CommandOutput {
+                interruption: None,
+                exit_code: 1,
+                stdout: "Total Tests: 4\nPassed: 3\nFailed: 1\n".into(),
+                stderr: "separate error stream".into(),
+                duration_ms: 17,
+            })
+        }
+    }
+    fn config() -> TestConfig {
+        TestConfig {
+            enabled: true,
+            candidate_api_effects: false,
+            discovery: DiscoveryConfig {
+                method: "directory".into(),
+                path: Some(".".into()),
+            },
+            runners: HashMap::from([(
+                "native".into(),
+                RunnerConfig {
+                    lifecycle: None,
+                    r#type: "script".into(),
+                    entry_point: "run.sh".into(),
+                    timeout: Some(5),
+                    result_format: None,
+                },
+            )]),
+            result_format: None,
+            result_path: None,
+            min_pass_rate: Some(0.75),
+            on_failure: Some("ignore".into()),
+        }
+    }
+    #[tokio::test]
+    async fn native_effect_reuses_parser_and_policy_without_local_launch() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("run.sh"), "never run locally").unwrap();
+        let executor = TestExecutor::new(root.path().into())
+            .with_workload_sandbox(crate::workload_sandbox::WorkloadSandbox::NativeEffectsRequired)
+            .with_process_effect(Arc::new(OutputEffect { fail: false }));
+        let cfg = config();
+        let result = executor
+            .execute_pack_tests_at(root.path(), "fixture", "1", &cfg)
+            .await
+            .unwrap();
+        executor.process_owner().shutdown().await;
+        assert_eq!(
+            (result.total_tests, result.passed, result.failed),
+            (4, 3, 1)
+        );
+        assert!(cfg.accepts_result(&result));
+        assert_eq!(
+            result.test_suites[0].test_cases[0].stderr.as_deref(),
+            Some("separate error stream")
+        );
+        root.close().unwrap();
+    }
+    #[tokio::test]
+    async fn native_effect_uncertainty_cannot_be_ignored_by_failure_policy() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("run.sh"), "never run locally").unwrap();
+        let executor = TestExecutor::new(root.path().into())
+            .with_process_effect(Arc::new(OutputEffect { fail: true }));
+        let result = executor
+            .execute_pack_tests_at(root.path(), "fixture", "1", &config())
+            .await;
+        executor.process_owner().shutdown().await;
+        assert!(result.is_err());
+        root.close().unwrap();
+    }
+    #[tokio::test]
+    async fn native_effect_settled_parser_errors_keep_existing_suite_policy() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("run.sh"), "never run locally").unwrap();
+        let executor = TestExecutor::new(root.path().into())
+            .with_process_effect(Arc::new(OutputEffect { fail: false }));
+        let mut cfg = config();
+        cfg.runners.get_mut("native").unwrap().result_format = Some("json".into());
+        let result = executor
+            .execute_pack_tests_at(root.path(), "fixture", "1", &cfg)
+            .await
+            .unwrap();
+        executor.process_owner().shutdown().await;
+        assert_eq!(result.failed, 1);
+        assert!(cfg.accepts_result(&result));
+        root.close().unwrap();
+    }
+    struct RecordedTimeout;
+    #[async_trait::async_trait]
+    impl TestProcessEffect for RecordedTimeout {
+        async fn run(&self, _: TestProcessRequest) -> Result<CommandOutput> {
+            Ok(CommandOutput {
+                interruption: Some(TestProcessInterruption::TimedOut),
+                exit_code: 0,
+                stdout: "Total Tests: 1\nPassed: 1\nFailed: 0\n".into(),
+                stderr: "exact stopped stream".into(),
+                duration_ms: 1,
+            })
+        }
+    }
+    #[tokio::test]
+    async fn native_effect_observed_timeout_keeps_exit_status_and_failure_policy() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("run.sh"), "never run locally").unwrap();
+        let executor =
+            TestExecutor::new(root.path().into()).with_process_effect(Arc::new(RecordedTimeout));
+        let cfg = config();
+        let result = executor
+            .execute_pack_tests_at(root.path(), "fixture", "1", &cfg)
+            .await
+            .unwrap();
+        executor.process_owner().shutdown().await;
+        assert_eq!(result.failed, 1);
+        assert_eq!(result.passed, 0);
+        assert!(cfg.accepts_result(&result));
+        assert!(result.test_suites[0].test_cases[0]
+            .error_message
+            .as_deref()
+            .unwrap()
+            .contains("observed exit code: 0"));
+        root.close().unwrap();
+    }
+    struct PendingEffect {
+        started: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: tokio::sync::Notify,
+        done: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl TestProcessEffect for PendingEffect {
+        async fn run(&self, _: TestProcessRequest) -> Result<CommandOutput> {
+            self.started.lock().await.take().unwrap().send(()).unwrap();
+            self.release.notified().await;
+            self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(CommandOutput {
+                interruption: None,
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                duration_ms: 0,
+            })
+        }
+    }
+    #[tokio::test]
+    async fn native_effect_owner_joins_after_consumer_abort_before_root_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("run.sh"), "never run locally").unwrap();
+        let (signal, started) = tokio::sync::oneshot::channel();
+        let effect = Arc::new(PendingEffect {
+            started: tokio::sync::Mutex::new(Some(signal)),
+            release: tokio::sync::Notify::new(),
+            done: Default::default(),
+        });
+        let executor = TestExecutor::new(root.path().into()).with_process_effect(effect.clone());
+        let owner = executor.process_owner();
+        let path = root.path().to_path_buf();
+        let consumer = tokio::spawn(async move {
+            executor
+                .execute_pack_tests_at(&path, "fixture", "1", &config())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), started)
+            .await
+            .unwrap()
+            .unwrap();
+        consumer.abort();
+        assert!(consumer.await.is_err());
+        assert!(!effect.done.load(std::sync::atomic::Ordering::SeqCst));
+        effect.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), owner.shutdown())
+            .await
+            .unwrap();
+        assert!(effect.done.load(std::sync::atomic::Ordering::SeqCst));
+        root.close().unwrap();
+    }
+    #[tokio::test]
+    async fn native_effect_unsupported_metadata_keeps_existing_failure_policy() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("run.sh"), "never run locally").unwrap();
+        let executor = TestExecutor::new(root.path().into())
+            .with_process_effect(Arc::new(OutputEffect { fail: true }));
+        let mut cfg = config();
+        cfg.runners.get_mut("native").unwrap().r#type = "unsupported".into();
+        let result = executor
+            .execute_pack_tests_at(root.path(), "fixture", "1", &cfg)
+            .await
+            .unwrap();
+        executor.process_owner().shutdown().await;
+        assert_eq!(result.failed, 1);
+        assert!(cfg.accepts_result(&result));
+        assert!(result.test_suites[0].test_cases[0]
+            .error_message
+            .as_deref()
+            .unwrap()
+            .contains("Unsupported runner type"));
+        root.close().unwrap();
     }
 }

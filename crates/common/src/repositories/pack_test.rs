@@ -4,7 +4,7 @@
 
 use crate::error::Result;
 use crate::models::{Id, PackLatestTest, PackTestExecution, PackTestResult, PackTestStats};
-use sqlx::{PgPool, Row};
+use sqlx::{PgConnection, PgPool, Row};
 
 /// Repository for pack test operations
 pub struct PackTestRepository {
@@ -20,6 +20,24 @@ impl PackTestRepository {
     /// Create a new pack test execution record
     pub async fn create(
         &self,
+        pack_id: Id,
+        pack_version: &str,
+        trigger_reason: &str,
+        result: &PackTestResult,
+    ) -> Result<PackTestExecution> {
+        let mut connection = self.pool.acquire().await?;
+        Self::create_on(
+            &mut connection,
+            pack_id,
+            pack_version,
+            trigger_reason,
+            result,
+        )
+        .await
+    }
+    /// Persist inside the caller-owned source/result transaction.
+    pub async fn create_on(
+        connection: &mut PgConnection,
         pack_id: Id,
         pack_version: &str,
         trigger_reason: &str,
@@ -48,7 +66,7 @@ impl PackTestRepository {
         .bind(result.pass_rate)
         .bind(result.duration_ms)
         .bind(result_json)
-        .fetch_one(&self.pool)
+        .fetch_one(connection)
         .await?;
 
         Ok(record)
