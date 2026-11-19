@@ -805,6 +805,7 @@ async fn inspect_installed_command_without_manager_discovery(f: &Fixture) -> Tes
     let mut execution = f.spec(Vec::new())?;
     execution.inputs = runner_inputs;
     execution.inputs.push(pack);
+    execution.invocation.working_root = LaunchRoot::Pack;
     execution.invocation.argv = attune_workload_backend::planning::runtime_recipe_argv(
         execution.platform,
         &recipe,
@@ -823,7 +824,10 @@ async fn inspect_installed_command_without_manager_discovery(f: &Fixture) -> Tes
         || !err.is_empty()
         || out != [b"recipe:".as_slice(), runtime_recipe::STDIN].concat()
     {
-        return Err("private recipe preparation/invocation failed".into());
+        return Err(format!(
+            "private recipe preparation/invocation failed (exit={}, oom={}, stdout_bytes={}, stderr_bytes={})",
+            exit.exit_code, exit.oom_killed, out.len(), err.len()
+        ).into());
     }
     execution.intent = Uuid::new_v4();
     execution.target = f.spec(Vec::new())?.target;
