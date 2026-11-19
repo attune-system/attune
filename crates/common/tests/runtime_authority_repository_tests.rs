@@ -2584,6 +2584,7 @@ async fn fixture_with_launch(
     lifetime: Option<Duration>,
     launch: Option<attune_common::pack_format::LaunchSpec>,
 ) -> (TestDatabase, Fixture) {
+    let typed_launch = launch.is_some();
     let db = create_test_pool().await.unwrap();
     let shared = PackFixture::new("shared").create(&db).await.unwrap();
     let shared_trigger =
@@ -2782,6 +2783,17 @@ async fn fixture_with_launch(
     )
     .await
     .unwrap();
+    if typed_launch {
+        use attune_common::repositories::schema_contract::{
+            BindingOwner, SchemaContractRepository,
+        };
+        let contract = SchemaContractRepository::materialize_action_pair(&mut tx, &snapshot)
+            .await
+            .unwrap();
+        SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, execution.id, &contract)
+            .await
+            .unwrap();
+    }
     let admission = RuntimeAuthorityRepository::record_admission(
         &mut tx,
         RuntimeOwner::Execution(execution.id),

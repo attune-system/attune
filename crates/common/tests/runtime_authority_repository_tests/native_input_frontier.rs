@@ -669,8 +669,10 @@ async fn native_input_command_inspection_gets_empty_stdin_no_token_and_exact_cap
 #[tokio::test]
 async fn native_input_secret_origin_path_cannot_be_bound_into_argv() -> anyhow::Result<()> {
     use attune_common::{
-        action_cli::SelectedProgram, pack_format::LaunchSpec,
+        action_cli::{ArgumentLimits, ArgumentPlan, InputDelivery, SelectedProgram},
+        pack_format::LaunchSpec,
         repositories::execution_program::ExecutionProgramRepository,
+        repositories::schema_contract::{BindingOwner, SchemaContractRepository},
     };
     let (db, source) = seed_with_launch(
         true,
@@ -709,16 +711,55 @@ async fn native_input_secret_origin_path_cannot_be_bound_into_argv() -> anyhow::
             &program,
         )
         .await?;
+        let mut tx = db.begin().await?;
+        let restored = Input::restore(&mut tx, execution, Some(MASTER), None).await?;
+        let (parameters, paths, snapshot, expiry) = restored.into_parts();
+        anyhow::ensure!(paths == vec!["/token"]);
+        let binding = SchemaContractRepository::find(&mut tx, BindingOwner::Execution, execution)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("native CLI fixture has no bound input contract"))?;
+        let action = &row.executable_snapshot.as_ref().unwrap().executable.action;
+        let launch = action.launch.as_ref().unwrap();
+        let plan = ArgumentPlan::from_bound_contract(
+            action.param_schema.as_ref().unwrap(),
+            launch.action_arguments()?,
+            binding.input,
+        )?;
+        // The admitted schema/CLI metadata is public. It genuinely materializes
+        // this argv until the canonical recorded secret paths are supplied.
+        let public = plan.materialize(
+            program.argument_budget_program()?,
+            &parameters,
+            &[],
+            InputDelivery::Stdin,
+            ArgumentLimits::default(),
+        )?;
+        anyhow::ensure!(public.argv() == ["--token", PRIVATE]);
+        anyhow::ensure!(plan
+            .materialize(
+                program.argument_budget_program()?,
+                &parameters,
+                &paths,
+                InputDelivery::Stdin,
+                ArgumentLimits::default()
+            )
+            .is_err());
         source.spec.invocation.argv = vec![
             format!("{RUNNER_ROOT}/linux-amd64"),
             "exec".into(),
-            program.sha256,
+            program.sha256.clone(),
             program.path.to_str().unwrap().into(),
-            program.invocation_name,
-            "--token".into(),
-            PRIVATE.into(),
+            program.invocation_name.clone(),
         ];
-        let input = selected(&db, &source).await?;
+        source
+            .spec
+            .invocation
+            .argv
+            .extend(public.argv().iter().cloned());
+        expiry.ensure_fresh_on(&mut tx).await?;
+        tx.commit().await?;
+        expiry.ensure_fresh()?;
+        let input = SelectedExecutionInput::new(parameters, snapshot)?;
         anyhow::ensure!(matches!(
             Effects::reserve(
                 db.pool(),
