@@ -84,11 +84,11 @@ pub async fn run_sensor_service(
 
     info!("Shutting down gracefully...");
 
-    if let Err(e) = service.stop().await {
+    let stopped = service.stop().await;
+    if let Err(e) = &stopped {
         error!("Error during shutdown: {}", e);
     }
-
-    Ok(())
+    stopped
 }
 
 /// Mask sensitive parts of connection strings for logging.
