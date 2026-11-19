@@ -282,13 +282,6 @@ impl SensorManager {
             .encryption_key
             .as_deref()
             .ok_or_else(|| anyhow!("Native sensor encryption unavailable"))?;
-        // The shared private-generation producer must integrate before recipes
-        // and environment setup can be admitted. Never run their local effects.
-        if config.lifecycle.is_none() && attune_workload_backend::planning::needs_runtime(config) {
-            return Err(anyhow!(
-                "Sensor runtime requires the native private-generation producer"
-            ));
-        }
         let (binding_id, binding, _) =
             attune_common::repositories::sensor_schema::SensorSchemaRepository::find(
                 &self.inner.db,
@@ -318,6 +311,49 @@ impl SensorManager {
             return Err(anyhow!("Sensor release pin changed"));
         }
         let pack = self.prepare_native_pack(release).await?;
+        let mut inputs = vec![pack, native.runner.clone()];
+        let has_runtime =
+            config.lifecycle.is_none() && attune_workload_backend::planning::needs_runtime(config);
+        if has_runtime {
+            let version = selected_version
+                .map(|selected| {
+                    binding
+                        .executable
+                        .runtime_versions
+                        .iter()
+                        .find(|v| v.version == selected)
+                        .ok_or_else(|| anyhow!("Pinned sensor runtime version unavailable"))
+                })
+                .transpose()?;
+            let (pin, _) = attune_worker::native_environment::NativeEnvironmentInstaller::new(
+                &self.inner.db,
+                workload.worker_id,
+                workload.worker_instance,
+                operator,
+                native,
+                master,
+            )?
+            .install(
+                attune_common::pack_environment::UpsertCoordinatedEnvironmentInput {
+                    pack_id: sensor.pack.ok_or_else(|| anyhow!("Missing sensor pack"))?,
+                    pack_ref: sensor
+                        .pack_ref
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("Missing sensor pack ref"))?,
+                    runtime_id: runtime.id,
+                    runtime_ref: &runtime.r#ref,
+                    runtime_version: version,
+                    env_path: std::path::Path::new(RUNTIME_ROOT),
+                    manifest_checksum: Some(&pack_revision.digest),
+                },
+                config,
+                inputs.clone(),
+                None,
+                None,
+            )
+            .await?;
+            inputs.push(pin);
+        }
         let entry = format!("sensors/{}", sensor.entrypoint);
         let argv = if let Some(recipe) = &config.lifecycle {
             recipe.validate()?;
@@ -364,7 +400,7 @@ impl SensorManager {
             attune_workload_backend::planning::interpreted_argv(
                 config,
                 &entry,
-                false,
+                has_runtime,
                 PackAccess::ReadOnly,
             )?
         };
@@ -414,7 +450,7 @@ impl SensorManager {
                 config,
                 &selected,
                 &entry,
-                false,
+                has_runtime,
                 PackAccess::ReadOnly,
             )?
         };
@@ -431,11 +467,15 @@ impl SensorManager {
             },
             image: operator.image.clone(),
             platform: operator.platform,
-            inputs: vec![pack, native.runner.clone()],
+            inputs,
             invocation: LaunchInvocation {
                 argv,
                 env: environment,
-                working_root: LaunchRoot::Pack,
+                working_root: if has_runtime {
+                    LaunchRoot::Runtime
+                } else {
+                    LaunchRoot::Pack
+                },
             },
         };
         Ledger::reserve_native_effect(

@@ -15,6 +15,7 @@ pub mod log_delivery;
 pub mod log_delivery_spool;
 #[cfg(unix)]
 pub mod native_candidate;
+pub mod native_environment;
 pub mod native_runtime_probe;
 pub mod recorded_credentials;
 pub mod registration;

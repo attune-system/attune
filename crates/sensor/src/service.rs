@@ -4,9 +4,9 @@
 //! and rule lifecycle listening.
 //!
 //! Shutdown follows the same pattern as the worker service:
-//! 1. Deregister worker (mark inactive, stop receiving new work)
-//! 2. Stop heartbeat
-//! 3. Stop sensor processes with configurable timeout
+//! 1. Cordon placement and stop sensor processes while heartbeat remains live
+//! 2. Join heartbeat and metrics, then deregister the exact incarnation
+//! 3. Clear only this shutdown's owned cordon
 //! 4. Close MQ and DB connections
 
 use crate::rule_lifecycle_listener::RuleLifecycleListener;
@@ -408,7 +408,7 @@ impl SensorService {
             warn!("Failed to sync initial sensor worker metrics: {}", e);
         }
 
-        // Start heartbeat loop
+        // Start metrics separately from the independently owned heartbeat.
         let sensor_manager = self.inner.sensor_manager.clone();
         let registration = self.inner.sensor_worker_registration.clone();
         let heartbeat_interval = self.inner.heartbeat_interval;
@@ -452,7 +452,7 @@ impl SensorService {
                 }
             }
 
-            info!("Heartbeat loop stopped");
+            info!("Sensor metrics loop stopped");
         });
         *self.inner.metrics_task.lock().await = Some(HeartbeatTask {
             cancellation,
@@ -467,27 +467,17 @@ impl SensorService {
     /// Stop the sensor service gracefully
     ///
     /// Shutdown order (mirrors worker service pattern):
-    /// 1. Deregister worker (mark inactive to stop being scheduled for new work)
-    /// 2. Stop heartbeat
-    /// 3. Stop sensor processes with timeout
-    /// 4. Stop rule lifecycle listener
-    /// 5. Close MQ and DB connections
+    /// Cordon placement and drain sensors without expiring finalization authority.
+    /// Join maintenance, deregister this incarnation, clear its owned cordon,
+    /// and close shared connections.
     pub async fn stop(&self) -> Result<()> {
         info!("Stopping Sensor Service - initiating graceful shutdown");
 
-        // Cordon scheduling while the original live source can still finalize
-        // its stopped files. Do not expire/mint its retained lease or epochs.
         let registration = self.inner.sensor_worker_registration.read().await;
-        if let Some(worker) = registration.worker_id() {
-            attune_common::repositories::runtime::WorkerRepository::cordon_for_shutdown(
-                &self.inner.db,
-                worker,
-                registration.incarnation(),
-                "Sensor service shutdown",
-            )
-            .await?;
-        }
+        let shutdown_worker = registration.worker_id();
+        let incarnation = registration.incarnation();
         drop(registration);
+        let cordon_reason = format!("Sensor shutdown {}", uuid::Uuid::new_v4());
         // 3. Stop sensor processes with timeout
         let shutdown_timeout = self
             .inner
@@ -504,7 +494,34 @@ impl SensorService {
 
         let sensor_manager = self.inner.sensor_manager.clone();
         let timeout_duration = Duration::from_secs(shutdown_timeout);
-        match tokio::time::timeout(timeout_duration, sensor_manager.stop()).await {
+        // A registration-row lock cannot postpone physical stop. Both owners
+        // remain joined; a timed-out fence never grants successful settlement.
+        let cordon = async {
+            if let Some(worker) = shutdown_worker {
+                tokio::time::timeout(
+                    timeout_duration,
+                    attune_common::repositories::runtime::WorkerRepository::cordon_for_shutdown(
+                        &self.inner.db,
+                        worker,
+                        incarnation,
+                        &cordon_reason,
+                    ),
+                )
+                .await
+                .map_err(anyhow::Error::from)?
+                .map_err(anyhow::Error::from)?;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let (cordoned, stopped) = tokio::join!(
+            cordon,
+            tokio::time::timeout(timeout_duration, sensor_manager.stop())
+        );
+        if let Err(error) = cordoned {
+            warn!(%error, "Sensor shutdown cordon was not acknowledged");
+        }
+        match stopped {
+
             Ok(Ok(_)) => info!("All sensor processes stopped"),
             Ok(Err(e)) => error!("Error stopping sensor processes: {}", e),
             Err(_) => warn!(
@@ -527,12 +544,24 @@ impl SensorService {
         if let Some(task) = self.inner.heartbeat_task.lock().await.take() {
             stop_heartbeat_task(task, HEARTBEAT_STOP_TIMEOUT).await;
         }
-        self.inner
+        let deregistered = self
+            .inner
             .sensor_worker_registration
             .read()
             .await
             .deregister()
-            .await?;
+            .await;
+        let cleared = if let Some(worker) = shutdown_worker {
+            attune_common::repositories::runtime::WorkerRepository::clear_shutdown_cordon(
+                &self.inner.db,
+                worker,
+                incarnation,
+                &cordon_reason,
+            )
+            .await
+        } else {
+            Ok(())
+        };
         // 5. Close message queue connection
         info!("Closing message queue connection...");
         if let Err(e) = self.inner.mq.close().await {
@@ -543,6 +572,8 @@ impl SensorService {
         info!("Closing database connection...");
         self.inner.db.close().await;
 
+        deregistered?;
+        cleared?;
         info!("Sensor Service stopped successfully");
 
         Ok(())

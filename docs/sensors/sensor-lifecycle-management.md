@@ -630,6 +630,8 @@ the common pinned input converter. Only verified guest names, versions and recip
 digests enter worker capabilities; global runtime availability is unchanged.
 Managed recipes use the captured operator digest admission, selected caller
 snapshot and fixed private recipe invocation, with a read-only Pack and no shared
-Runtime input or Stage. Legacy dependency setup remains denied until the existing
-coordinated native installer is wired. Native agent detect-only remains explicitly
+Runtime input or Stage. Legacy environment/dependency setup uses the same
+coordinated NativeEnvironmentInstaller as action workers, retaining claims, source
+fences and exact stopped-stage publication/removal. Its published Runtime input is
+read-only and unpacked separately for each sensor attempt; recipes bypass it. Native agent detect-only remains explicitly
 denied; ordinary native agent startup uses registered guest discovery.

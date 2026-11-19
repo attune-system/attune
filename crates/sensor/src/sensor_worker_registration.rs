@@ -309,6 +309,11 @@ impl SensorWorkerRegistration {
             self.incarnation,
         )
         .await?;
+        if worker.worker_role != WorkerRole::Sensor {
+            return Err(attune_common::Error::PermissionDenied(
+                "Sensor registration role mismatch".into(),
+            ));
+        }
         let worker_id = worker.id;
         self.worker_id = Some(worker_id);
         Ok(worker_id)
@@ -1062,6 +1067,15 @@ mod tests {
             .with_child_environment(environment.clone());
         old.add_capability(RUNTIME_VERSIONS_CAPABILITY_KEY.into(), json!({}));
         let worker = old.register(&config).await.unwrap();
+        let admitted = WorkerRepository::find_by_id(&pool, worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(admitted.worker_role, WorkerRole::Sensor);
+        assert_eq!(
+            admitted.meta.as_ref().unwrap()["registration_incarnation"],
+            tokens.instance_id().to_string()
+        );
         let replacement_instance = uuid::Uuid::new_v4();
         let mut replacement = SensorWorkerRegistration::new(pool.clone(), &config)
             .with_incarnation(replacement_instance)
