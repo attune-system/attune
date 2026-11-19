@@ -145,7 +145,15 @@ impl NativeStartupStage {
                             "Native sensor startup closed before accepting operation result"
                         ))
                     }
-                    Some(result) => result,
+                    Some(result) => {
+                        // A producer can close its own child token/deadline
+                        // while this stage remains open. Retain its uncertainty
+                        // before task completion can outlive the caller.
+                        if result.is_err() {
+                            interrupted_failed.store(true, Ordering::Release);
+                        }
+                        result
+                    }
                     None => {
                         cancel.cancel();
                         // Durable DB fencing may still be pending. Keep the
@@ -2068,7 +2076,12 @@ mod nested_startup_ownership_tests {
 
     #[tokio::test]
     async fn manager_stop_preserves_joined_nested_failure_after_caller_disappears() {
-        for failure in ["stop", "capture", "completed-then-closed"] {
+        for failure in [
+            "stop",
+            "capture",
+            "completed-then-closed",
+            "nested-deadline",
+        ] {
             let (manager, pool) = super::startup_ownership_tests::lazy_manager();
             let stage = NativeStartupStage::new(
                 manager.inner.native_startup_tasks.clone(),
@@ -2077,16 +2090,23 @@ mod nested_startup_ownership_tests {
                 tokio::time::Instant::now() + Duration::from_secs(60),
                 manager.inner.native_cleanup_failed.clone(),
             );
-            if failure == "completed-then-closed" {
+            if matches!(failure, "completed-then-closed" | "nested-deadline") {
                 assert!(stage
-                    .run(|cancel| async move {
-                        cancel.cancel();
-                        Err::<(), _>(anyhow!(
-                            "controlled uncertain result observed while closing"
-                        ))
+                    .run(move |cancel| async move {
+                        if failure == "completed-then-closed" {
+                            cancel.cancel();
+                        } else {
+                            // A probe's own deadline cancels its child, not the
+                            // outer stage. Its uncertain Stop must still survive.
+                            let producer_cancel = cancel.child_token();
+                            producer_cancel.cancel();
+                            assert!(!cancel.is_cancelled());
+                        }
+                        Err::<(), _>(anyhow!("controlled uncertain nested result"))
                     })
                     .await
                     .is_err());
+                assert!(!stage.stopping.is_cancelled());
                 stage.tasks.close();
                 stage.attempt.close();
                 stage.tasks.wait().await;
