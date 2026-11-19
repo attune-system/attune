@@ -42,7 +42,12 @@ elif args[:2] == ['volume','inspect']:
 elif args[:2] == ['network','inspect']:
     print(json.dumps([{'Name':args[2],'Driver':'bridge','Containers':{},'Labels':{'io.attune.test.owner':os.environ['ATTUNE_E2E_RUN_ID']}}]))
 elif args[:2] == ['image','inspect']:
-    print(json.dumps([{'Id':args[2],'Os':'linux','Architecture':'amd64'}]))
+    if args[2:4] == ['--format', '{{.Id}}']:
+        expected = 'explicit-e2e:fixture' if os.environ['CLEANUP_STATUS'] == '9' else os.environ['COMPOSE_PROJECT_NAME'] + '-e2e-tests'
+        if args[4:] != [expected]: sys.exit(94)
+        print('sha256:' + 'e' * 64)
+    else:
+        print(json.dumps([{'Id':args[2],'Os':'linux','Architecture':'amd64'}]))
 elif args[0] in ('ps','volume','network'):
     pass
 elif args[0] == 'inspect':
@@ -51,7 +56,20 @@ elif args[0] == 'compose':
     args = args[1:]
     while args and args[0] in ('--project-directory','--project-name','-f'):
         args = args[2:]
-    if args[:2] == ['ps','-q']: print('owned-fixture-container')
+    if args[:5] == ['config','--format','json','--no-env-resolution','e2e-tests']:
+        service = {'image':'explicit-e2e:fixture'} if os.environ['CLEANUP_STATUS'] == '9' else {}
+        print(json.dumps({'name':os.environ['COMPOSE_PROJECT_NAME'], 'services':{'e2e-tests':service}}))
+    elif args[0] == 'run':
+        if '--no-build' in args or '--build' in args: sys.exit(93)
+        if args[1:3] != ['--pull','never']: sys.exit(92)
+        raw = sys.argv[1:]
+        override = pathlib.Path(raw[max(i for i,a in enumerate(raw) if a == '-f') + 1])
+        expected = 'services:\n  e2e-tests:\n    image: "sha256:' + 'e' * 64 + '"\n    build: !reset null\n'
+        if override.read_text() != expected: sys.exit(91)
+        if '/app/tests/e2e/configure_bootstrap.py' in args and 'issue' in args:
+            volume = args[args.index('--volume') + 1]
+            pathlib.Path(volume.split(':')[0], 'token').write_text('synthetic-not-a-token\n')
+    elif args[:2] == ['ps','-q']: print('owned-fixture-container')
     elif args[0] == 'exec': print('1')
     elif args[0] == 'down': sys.exit(int(os.environ['CLEANUP_STATUS']))
     elif args[0] not in ('ps','up','wait','run'): sys.exit(97)
@@ -74,10 +92,9 @@ else:
                            PROBE=str(root / 'probe'), CLEANUP_STATUS=str(cleanup_status),
                            ATTUNE_E2E_RUN_ID=owner, ATTUNE_TEST_RUN_ID='native-render',
                            ATTUNE_E2E_DOCKER_SOCKET=str(root / 'engine.sock'),
-                           ATTUNE_BOOTSTRAP_TOKEN='synthetic-not-a-token',
                            ATTUNE_E2E_RETENTION_PROFILE='default', DOCKER_CONTEXT='must-not-be-used',
                            DOCKER_HOST='unix:///must-not-be-used')
-                for name in ('ATTUNE_E2E_PROJECT_NAME', 'ATTUNE_E2E_COMPOSE_OVERRIDE', 'ATTUNE_DOCKER_CONFIG_PATH'):
+                for name in ('ATTUNE_E2E_PROJECT_NAME', 'ATTUNE_E2E_COMPOSE_OVERRIDE', 'ATTUNE_DOCKER_CONFIG_PATH', 'ATTUNE_BOOTSTRAP_TOKEN'):
                     env.pop(name, None)
                 native_root = None
                 try:
@@ -108,7 +125,15 @@ else:
                     tests = next(c for c in compose_calls if 'original-selection' in c)
                     self.assertEqual(tests[-6:], ['--tier', '1', '-k', 'original-selection', '-m', 'not performance'])
                     self.assertTrue(all('--no-build' in c and c[c.index('--pull') + 1] == 'never'
-                                        for c in compose_calls if 'up' in c or 'run' in c))
+                                        for c in compose_calls if 'up' in c))
+                    runs = [c for c in compose_calls if 'run' in c]
+                    self.assertTrue(all('--no-build' not in c and c[c.index('--pull') + 1] == 'never' for c in runs))
+                    issue = next(c for c in runs if 'issue' in c)
+                    revoke = next(c for c in runs if 'revoke' in c)
+                    self.assertLess(compose_calls.index(issue), compose_calls.index(revoke))
+                    self.assertLess(compose_calls.index(revoke), compose_calls.index(tests))
+                    bootstrap_root = Path(issue[issue.index('--volume') + 1].split(':')[0])
+                    self.assertFalse(bootstrap_root.exists())
                     self.assertFalse(any(c['args'][0] in ('create','rm','stop') or 'build' in c['args'] for c in calls))
                     self.assertTrue(native_root.exists())
                     down = next(c for c in compose_calls if 'down' in c)

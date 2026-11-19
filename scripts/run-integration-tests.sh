@@ -72,6 +72,7 @@ DO_RUNTIME_LIFECYCLE=false
 NATIVE_PROFILES=""
 NATIVE_CI_ADMISSION=""
 NATIVE_ROOT=""
+NATIVE_E2E_RUN_OVERRIDE=""
 COMPOSE_LOCATION=()
 TEST_ARGS=()
 
@@ -262,13 +263,38 @@ log_error()   { echo -e "${RED}✗${NC}  $1"; }
 log_header()  { echo -e "${CYAN}═══${NC} $1"; }
 
 compose() {
-  if [[ -n "$NATIVE_PROFILES" && ( "$1" == up || "$1" == run ) ]]; then
-    local operation="$1"
+  if [[ -n "$NATIVE_PROFILES" && "$1" == up ]]; then
     shift
-    docker compose "${COMPOSE_LOCATION[@]}" --project-name "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILES[@]}" "$operation" --no-build --pull never "$@"
+    docker compose "${COMPOSE_LOCATION[@]}" --project-name "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILES[@]}" up --no-build --pull never "$@"
+  elif [[ -n "$NATIVE_PROFILES" && "$1" == run ]]; then
+    shift
+    [[ -n "$NATIVE_E2E_RUN_OVERRIDE" ]] || { log_error "Native one-off image has not been pinned"; return 1; }
+    # Compose run has no --no-build flag. Removing the build definition prevents
+    # an implicit build if the previously observed image disappears.
+    docker compose "${COMPOSE_LOCATION[@]}" --project-name "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILES[@]}" -f "$NATIVE_E2E_RUN_OVERRIDE" run --pull never "$@"
   else
     docker compose "${COMPOSE_LOCATION[@]}" --project-name "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILES[@]}" "$@"
   fi
+}
+
+prepare_native_e2e_image() {
+  local reference image_id
+  reference="$(compose config --format json --no-env-resolution e2e-tests | python3 -c '
+import json, sys
+model = json.load(sys.stdin)
+service = model["services"]["e2e-tests"]
+# Compose names an untagged build PROJECT-SERVICE. Preserve explicit overrides.
+print(service.get("image") or model["name"] + "-e2e-tests")
+')"
+  if [[ ! "$reference" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.:/@-]{0,511}$ ]]; then
+    log_error "Expected one resolved E2E image reference"; return 1
+  fi
+  image_id="$(docker image inspect --format '{{.Id}}' "$reference")"
+  if [[ ! "$image_id" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+    log_error "Expected the existing E2E image's immutable ID"; return 1
+  fi
+  NATIVE_E2E_RUN_OVERRIDE="$NATIVE_ROOT/e2e-run.yaml"
+  printf 'services:\n  e2e-tests:\n    image: "%s"\n    build: !reset null\n' "$image_id" > "$NATIVE_E2E_RUN_OVERRIDE"
 }
 
 initial_build_with_diagnostics() {
@@ -512,6 +538,9 @@ if [[ -n "$NATIVE_CI_ADMISSION" ]]; then
     --root "$NATIVE_ROOT" --socket "$ATTUNE_E2E_DOCKER_SOCKET"
   NATIVE_PROFILES="$NATIVE_ROOT/profiles.json"
   prepare_native_profiles
+fi
+if [[ -n "$NATIVE_PROFILES" ]]; then
+  prepare_native_e2e_image
 fi
 
 # ── Step 2: Start stack ───────────────────────────────────────────────────

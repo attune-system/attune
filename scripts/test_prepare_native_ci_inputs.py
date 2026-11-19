@@ -282,7 +282,7 @@ class Runner(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
 
     def test_one_captured_build_then_native_inputs_before_any_start_and_failure_retention(self):
-        for fault in ('none', 'build', 'dependency-pull', 'create-unknown'):
+        for fault in ('none', 'build', 'dependency-pull', 'create-unknown', 'e2e-image-missing', 'e2e-image-invalid'):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 supplied = root / 'admission.json'
@@ -314,6 +314,18 @@ if args[0] == 'compose':
     elif args[0] in ('up','run'):
         # A fresh endpoint has no implicit infrastructure image cache.
         if not record.with_suffix('.acquired').exists(): sys.exit(95)
+        if args[0] == 'run':
+            if '--no-build' in args or '--build' in args: sys.exit(94)
+            if args[1:3] != ['--pull','never']: sys.exit(93)
+            raw = sys.argv[1:]
+            override = pathlib.Path(raw[max(i for i,a in enumerate(raw) if a == '-f') + 1])
+            expected = 'services:\n  e2e-tests:\n    image: "sha256:' + 'e' * 64 + '"\n    build: !reset null\n'
+            if override.read_text() != expected: sys.exit(92)
+            if '/app/tests/e2e/configure_bootstrap.py' in args and 'issue' in args:
+                volume = args[args.index('--volume') + 1]
+                pathlib.Path(volume.split(':')[0], 'token').write_text('synthetic-not-a-token\n')
+    elif args[:5] == ['config','--format','json','--no-env-resolution','e2e-tests']:
+        print(json.dumps({'name':os.environ['COMPOSE_PROJECT_NAME'], 'services':{'e2e-tests':{}}}))
     elif args[:2] == ['ps','-q']: print('owned-fixture-container')
     elif args[0] == 'exec': print('1')
     elif args[0] not in ('ps','up','wait','run','down'): sys.exit(97)
@@ -324,7 +336,12 @@ elif args[:2] == ['volume','inspect']:
 elif args[:2] == ['network','inspect']:
     print(json.dumps([{'Name':args[2],'Driver':'bridge','Containers':{},'Labels':{'io.attune.test.owner':os.environ['ATTUNE_E2E_RUN_ID']}}]))
 elif args[:2] == ['image','inspect']:
-    print(json.dumps([{'Id':args[2],'Os':'linux','Architecture':'amd64'}]))
+    if args[2:4] == ['--format', '{{.Id}}']:
+        if args[4:] != [os.environ['COMPOSE_PROJECT_NAME'] + '-e2e-tests']: sys.exit(91)
+        if os.environ['FAULT'] == 'e2e-image-missing': sys.exit(6)
+        print('invalid-image-id' if os.environ['FAULT'] == 'e2e-image-invalid' else 'sha256:' + 'e' * 64)
+    else:
+        print(json.dumps([{'Id':args[2],'Os':'linux','Architecture':'amd64'}]))
 elif args[0] == 'inspect': print('healthy')
 elif args[0] not in ('ps','volume','network'): sys.exit(98)
 ''')
@@ -354,11 +371,10 @@ os.execv(sys.executable, [sys.executable, script, *args])
                            CI_ROOT_RECORD=str(record), PROBE=str(root / 'probe'), FAULT=fault,
                            ATTUNE_E2E_RUN_ID=OWNER, ATTUNE_TEST_RUN_ID='native-ci-pure',
                            ATTUNE_E2E_DOCKER_SOCKET=str(root / 'inert.sock'),
-                           ATTUNE_BOOTSTRAP_TOKEN='synthetic-not-a-token',
                            ATTUNE_E2E_RETENTION_PROFILE='default', DOCKER_CONTEXT='must-not-select',
                            DOCKER_HOST='unix:///must-not-select')
                 for name in ('ATTUNE_E2E_PROJECT_NAME', 'ATTUNE_E2E_COMPOSE_OVERRIDE',
-                             'ATTUNE_DOCKER_CONFIG_PATH', 'ATTUNE_E2E_SERIAL_BUILD'):
+                             'ATTUNE_DOCKER_CONFIG_PATH', 'ATTUNE_E2E_SERIAL_BUILD', 'ATTUNE_BOOTSTRAP_TOKEN'):
                     env.pop(name, None)
                 diagnostics = ROOT / '.scratch/e2e-diagnostics'
                 before = set(diagnostics.glob(OWNER + '.*')) if diagnostics.exists() else set()
@@ -391,7 +407,12 @@ os.execv(sys.executable, [sys.executable, script, *args])
                             self.assertEqual(result.returncode, 9)
                             self.assertFalse(any(c.get('phase') == 'prepare' for c in calls))
                         self.assertFalse(any('up' in c['args'] for c in cli))
-                        self.assertFalse((inputs / 'profiles.json').exists())
+                        self.assertFalse(any('run' in c['args'] for c in cli))
+                        if fault.startswith('e2e-image-'):
+                            self.assertTrue((inputs / 'profiles.json').exists())
+                            self.assertFalse((inputs / 'e2e-run.yaml').exists())
+                        else:
+                            self.assertFalse((inputs / 'profiles.json').exists())
                         self.assertIn('retained', result.stdout)
                         continue
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -407,7 +428,15 @@ os.execv(sys.executable, [sys.executable, script, *args])
                     self.assertEqual(files[0], str(inputs / 'config/compose.yaml'))
                     self.assertEqual(files[-2], str(inputs / 'launch-images.json'))
                     self.assertTrue(files[-1].endswith('/fixtures/compose.yaml'))
-                    self.assertTrue(all('--no-build' in c['args'] and '--pull' in c['args'] for c in cli if 'up' in c['args'] or 'run' in c['args']))
+                    self.assertTrue(all('--no-build' in c['args'] and c['args'][c['args'].index('--pull')+1] == 'never'
+                                        for c in cli if 'up' in c['args']))
+                    runs = [c['args'] for c in cli if 'run' in c['args']]
+                    self.assertTrue(all('--no-build' not in c and c[c.index('--pull')+1] == 'never' for c in runs))
+                    issue = next(c for c in runs if 'issue' in c)
+                    revoke = next(c for c in runs if 'revoke' in c)
+                    bootstrap_root = Path(issue[issue.index('--volume')+1].split(':')[0])
+                    self.assertFalse(bootstrap_root.exists())
+                    self.assertLess(runs.index(issue), runs.index(revoke))
                     down = next(c['args'] for c in cli if 'down' in c['args'])
                     self.assertNotIn('--volumes', down)
                     selected = next(c['args'] for c in cli if 'original-selection' in c['args'])
