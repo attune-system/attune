@@ -122,7 +122,23 @@ fn resource() -> ResourceIdentity {
 #[tokio::test]
 async fn candidate_create_and_stdin_are_one_shot_after_unknown_ack() -> Result<()> {
     let (db, source, spec) = fixture().await?;
+    assert!(Ledger::retained(db.pool(), &source, &spec.target, MASTER)
+        .await?
+        .is_none());
     let spec = Ledger::reserve(db.pool(), &source, &spec, MASTER).await?;
+    let retained = Ledger::retained(db.pool(), &source, &spec.target, MASTER)
+        .await?
+        .unwrap();
+    assert_eq!(retained.intent, spec.intent);
+    assert_eq!(retained.purpose, spec.purpose);
+    assert_eq!(retained.target, spec.target);
+    assert_eq!(retained.image, spec.image);
+    assert_eq!(retained.platform, spec.platform);
+    assert_eq!(retained.inputs, spec.inputs);
+    assert_eq!(retained.pack_access, spec.pack_access);
+    assert!(retained.stage.is_none());
+    assert_eq!(retained.timeout_ms, spec.timeout_ms);
+    assert_eq!(retained.invocation, spec.invocation);
     assert_eq!(
         Ledger::begin_create(db.pool(), spec.intent, MASTER).await?,
         ProcessCreateDisposition::CreateOnce
@@ -173,6 +189,9 @@ async fn worker_restore_cannot_readmit_or_replace_an_unsettled_candidate() -> Re
         .execute(&*db)
         .await?;
     assert!(Ledger::validate(db.pool(), spec.intent, MASTER)
+        .await
+        .is_err());
+    assert!(Ledger::retained(db.pool(), &source, &spec.target, MASTER)
         .await
         .is_err());
     assert!(Ledger::admit(

@@ -21,6 +21,7 @@ use attune_common::{
     Error, Result,
 };
 use attune_workload_backend::configuration::{ConfiguredBackend, NativeBackend};
+use attune_workload_backend::recipe_timeout::{self, RecipeTimeoutChallenge};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
@@ -259,13 +260,8 @@ impl NativeCandidateTests {
             .ok_or_else(denied)? as i64
             + 1;
         let mut source = self.source.clone();
-        let mut env = BTreeMap::from([
-            ("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()),
-            ("HOME".into(), PACK_ROOT.into()),
-            ("LANG".into(), "C.UTF-8".into()),
-            ("LC_ALL".into(), "C.UTF-8".into()),
-        ]);
-        if let Some(effect) = request.candidate_effects {
+        let candidate_effects = request.candidate_effects;
+        if let Some(effect) = &candidate_effects {
             let prefix = format!("{}/api/v1/candidates/", self.api_url);
             let lease = effect
                 .url
@@ -277,6 +273,24 @@ impl NativeCandidateTests {
                 lease,
                 token_hash: attune_common::auth::hash_integration_token(&effect.token),
             });
+        }
+        let target = LaunchTarget::CandidateTest {
+            install: source.install,
+            test_job: suite,
+            attempt: source.instance,
+        };
+        let retained = Ledger::retained(&self.pool, &source, &target, &self.master).await?;
+        // Recover from the exact old spec before ordinary environment planning
+        // replaces it. Never mint new evidence for an existing older intent.
+        let challenge =
+            retained_recipe_challenge(retained.as_ref(), request.runner.lifecycle.is_some())?;
+        let mut env = BTreeMap::from([
+            ("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()),
+            ("HOME".into(), PACK_ROOT.into()),
+            ("LANG".into(), "C.UTF-8".into()),
+            ("LC_ALL".into(), "C.UTF-8".into()),
+        ]);
+        if let Some(effect) = candidate_effects {
             env.insert("ATTUNE_CANDIDATE_EFFECTS_URL".into(), effect.url);
             env.insert("ATTUNE_CANDIDATE_EFFECTS_TOKEN".into(), effect.token);
         }
@@ -328,11 +342,15 @@ impl NativeCandidateTests {
                     guest,
                 ],
                 "unittest" | "pytest" => {
-                    let program = if let Some(runtime) = &self.runtime {
-                        runtime.interpreter.clone()
-                    } else {
-                        "python3".into()
-                    };
+                    // Legacy Python tests require their private dependency
+                    // environment. An image interpreter cannot substitute for
+                    // the owning setup producer's selected immutable input.
+                    let program = self
+                        .runtime
+                        .as_ref()
+                        .ok_or_else(denied)?
+                        .interpreter
+                        .clone();
                     let mut args = vec![program, "-m".into(), request.runner.r#type.clone(), guest];
                     if request.runner.r#type == "pytest" {
                         args.push("-v".into())
@@ -343,14 +361,12 @@ impl NativeCandidateTests {
             }
         };
         let timeout = request.runner.timeout.unwrap_or(300);
-        let spec = ProcessSpec {
-            intent: Uuid::new_v4(),
+        let mut spec = ProcessSpec {
+            intent: retained
+                .as_ref()
+                .map_or_else(Uuid::new_v4, |old| old.intent),
             purpose: LaunchPurpose::CandidateTest,
-            target: LaunchTarget::CandidateTest {
-                install: source.install,
-                test_job: suite,
-                attempt: source.instance,
-            },
+            target,
             image: self.config.image.clone(),
             platform: self.config.platform,
             inputs,
@@ -368,6 +384,9 @@ impl NativeCandidateTests {
                 working_root: LaunchRoot::Pack,
             },
         };
+        // Recipe environment validation above excludes the reserved proof env;
+        // only the fixed helper receives this private intent-bound challenge.
+        recipe_timeout::bind_challenge(&mut spec, challenge)?;
         let spec = Ledger::reserve(&self.pool, &source, &spec, &self.master).await?;
         if let Some(c) = Ledger::captured(&self.pool, spec.intent, &self.master).await? {
             return command_output(c);
@@ -433,7 +452,7 @@ impl NativeCandidateTests {
                 _=tokio::time::sleep_until(deadline)=>Err(Interrupted::TimedOut),
             }
         };
-        let (fenced, exit, interruption) = match outcome {
+        let (fenced, exit, mut interruption) = match outcome {
             Ok(exit) => (
                 Ok(()),
                 Ok(exit),
@@ -471,6 +490,9 @@ impl NativeCandidateTests {
         let stdout = out?;
         let stderr = err?;
         Effects::request_stop(&self.pool, spec.intent).await?;
+        if recipe_timeout::observed_timeout(&self.backend, &spec, &resource).await? {
+            interruption = Some(Interrupted::TimedOut);
+        }
         self.backend.remove_stopped(&spec, &resource).await?;
         Ledger::acknowledge_removed(&self.pool, spec.intent, &resource).await?;
         let capture = CandidateCapture {
@@ -487,6 +509,21 @@ impl NativeCandidateTests {
         Ledger::capture(&self.pool, spec.intent, &resource, &capture, &self.master).await?;
         command_output(capture)
     }
+}
+fn retained_recipe_challenge(
+    retained: Option<&ProcessSpec>,
+    recipe: bool,
+) -> Result<Option<RecipeTimeoutChallenge>> {
+    let challenge = retained
+        .map(recipe_timeout::retained_challenge)
+        .transpose()?
+        .flatten();
+    if recipe && retained.is_some() && challenge.is_none() {
+        // Older retained intents may still need physical cleanup, but cannot
+        // acquire new timeout evidence or restart by being reconstructed here.
+        return Err(denied());
+    }
+    Ok(challenge)
 }
 #[async_trait::async_trait]
 impl TestProcessEffect for NativeCandidateTests {
@@ -741,6 +778,64 @@ impl Seek for BudgetWriter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn candidate_recipe_recovery_retains_proof_and_denies_prechallenge_intents() {
+        let mut spec = ProcessSpec {
+            intent: Uuid::new_v4(),
+            purpose: LaunchPurpose::CandidateTest,
+            target: LaunchTarget::CandidateTest {
+                install: 1,
+                test_job: 1,
+                attempt: Uuid::new_v4(),
+            },
+            image: PinnedImage {
+                reference: format!("fixture.invalid/candidate@sha256:{}", "a".repeat(64)),
+                sha256: Sha256Digest::parse("a".repeat(64)).unwrap(),
+            },
+            platform: LaunchPlatform::LinuxAmd64,
+            inputs: [(1, LaunchInputKind::Pack), (2, LaunchInputKind::Runner)]
+                .into_iter()
+                .map(|(id, kind)| PinnedLaunchInput {
+                    pin_id: id,
+                    kind,
+                    object_id: id,
+                    object_version: "owned-pure-proof-fixture".into(),
+                    size_bytes: 1,
+                    sha256: Sha256Digest::of_bytes(b"owned"),
+                    max_expanded_bytes: 1,
+                    max_files: 1,
+                })
+                .collect(),
+            pack_access: PackAccess::CandidateCopy,
+            stage: None,
+            timeout_ms: Some(1000),
+            invocation: LaunchInvocation {
+                argv: vec![
+                    format!("{RUNNER_ROOT}/linux-amd64"),
+                    "run-candidate-runtime-recipe".into(),
+                ],
+                env: BTreeMap::new(),
+                working_root: LaunchRoot::Pack,
+            },
+        };
+        assert!(retained_recipe_challenge(Some(&spec), true).is_err());
+        let fresh = retained_recipe_challenge(None, true).unwrap();
+        recipe_timeout::bind_challenge(&mut spec, fresh).unwrap();
+        let old = spec.clone();
+        let proof = retained_recipe_challenge(Some(&old), true).unwrap();
+        spec.invocation.env.clear();
+        recipe_timeout::bind_challenge(&mut spec, proof).unwrap();
+        assert_eq!(spec.intent, old.intent);
+        assert_eq!(spec.invocation, old.invocation);
+        let proof = retained_recipe_challenge(Some(&old), true).unwrap();
+        spec.intent = Uuid::new_v4();
+        spec.invocation.env.clear();
+        assert!(recipe_timeout::bind_challenge(&mut spec, proof).is_err());
+        spec.invocation.argv = vec!["/bin/sh".into(), format!("{PACK_ROOT}/tests/run.sh")];
+        assert!(retained_recipe_challenge(Some(&spec), false)
+            .unwrap()
+            .is_none());
+    }
     fn archive(root: &Path, link: bool) -> tempfile::NamedTempFile {
         let file = tempfile::NamedTempFile::new_in(root).unwrap();
         let encoder =

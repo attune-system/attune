@@ -209,6 +209,47 @@ impl CandidateProcessRepository {
         }
         Ok(())
     }
+    /// Recover the exact encrypted intent before rebuilding its environment.
+    /// This read grants no new effects; reserve still compares the entire
+    /// reconstructed context under the same live source and permanent epochs.
+    pub async fn retained(
+        pool: &PgPool,
+        s: &CandidateSource,
+        target: &LaunchTarget,
+        master: &str,
+    ) -> Result<Option<ProcessSpec>> {
+        if !matches!(target, LaunchTarget::CandidateTest { install, test_job, attempt }
+            if *install == s.install && *test_job > 0 && *attempt == s.instance)
+        {
+            return Err(denied());
+        }
+        let mut tx = pool.begin().await?;
+        let deadline = source(&mut tx, s).await?;
+        let current = epochs(&mut tx, s).await?;
+        let old: Option<Record> = sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM execution_process_effect WHERE target=$1 AND purpose='candidate_test'"
+        ))
+        .bind(Json(target))
+        .fetch_optional(&mut *tx)
+        .await?;
+        let spec = if let Some(old) = old {
+            let context = old.context(master)?;
+            if old.source_epochs.0 != current
+                || serde_json::to_value(&context.source)? != serde_json::to_value(s)?
+            {
+                return Err(denied());
+            }
+            Some(context.spec())
+        } else {
+            None
+        };
+        fresh(&mut tx, deadline).await?;
+        tx.commit().await?;
+        if Utc::now() >= deadline {
+            return Err(denied());
+        }
+        Ok(spec)
+    }
     pub async fn reserve(
         pool: &PgPool,
         s: &CandidateSource,
