@@ -104,6 +104,10 @@ class FakeDocker:
             self.container['State']['Status'] = 'exited'
             return 'c' * 64
         if args[0] == 'wait':
+            if self.fault == 'wait-unknown':
+                return '0\n0'
+            if self.fault == 'wait-overflow':
+                return '2147483648'
             return '9' if self.fault == 'negative-exit' else '0'
         if args[0] == 'rm':
             assert self.container['State']['Status'] == 'exited'
@@ -123,6 +127,20 @@ def modeled_owners(function):
 
 
 class Preparation(unittest.TestCase):
+    def test_volume_empty_check_handles_hidden_newline_and_dangling_entries(self):
+        for entry in [None, 'ordinary', '.hidden', '..hidden', '\n', 'dangling']:
+            with self.subTest(entry=entry), tempfile.TemporaryDirectory() as directory:
+                volume = Path(directory) / 'owned volume;literal'
+                volume.mkdir()
+                if entry == 'dangling':
+                    (volume / entry).symlink_to('absent-target')
+                elif entry is not None:
+                    (volume / entry).write_text('owned fixture')
+                result = subprocess.run(['/bin/sh', '-ec', module.empty_volume_check(str(volume))],
+                                        env={'PATH': os.environ['PATH']}, capture_output=True,
+                                        text=True, timeout=5)
+                self.assertEqual(result.returncode, 0 if entry is None else 1)
+
     def planned(self, root):
         supplied = root / 'operator.json'
         supplied.write_text(json.dumps(NAMESPACE))
@@ -177,16 +195,20 @@ class Preparation(unittest.TestCase):
             self.assertIn('chown 1000:1000', create[-1])
             self.assertIn('chmod 0700', create[-1])
             self.assertIn('chown 0:0 /ci-input/runner.zip', create[-1])
+            subprocess.run(['/bin/sh', '-n', '-c', create[-1]], check=True,
+                           env={'PATH': os.environ['PATH']}, capture_output=True, text=True)
             self.assertEqual(docker.calls[-1], ('rm', 'c' * 64))
             state = json.loads((root / 'observations.json').read_text())
             self.assertTrue(state['initializer_removed'])
+            self.assertEqual(state['initializer_wait_exit_code'], 0)
             self.assertEqual(state['namespace'], NAMESPACE)
             self.assertFalse(any(a[0] in ('build', 'pull', 'exec') for a in docker.calls))
 
     def test_unknowns_and_negative_facts_retain_evidence_without_cleanup_or_profiles(self):
         for fault in ('image-platform', 'listing-unknown', 'network-unknown', 'volume-options',
                       'volume-user', 'create-unknown', 'command-substitution', 'negative-exit',
-                      'state-unknown', 'missing-capture', 'removal-unknown'):
+                      'wait-unknown', 'wait-overflow', 'state-unknown', 'missing-capture',
+                      'removal-unknown'):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 self.planned(root)
@@ -196,6 +218,11 @@ class Preparation(unittest.TestCase):
                 self.assertTrue((root / 'observations.json').exists())
                 self.assertTrue((root / 'admission.json').exists())
                 self.assertFalse((root / 'profiles.json').exists())
+                state = json.loads((root / 'observations.json').read_text())
+                if fault == 'negative-exit':
+                    self.assertEqual(state['initializer_wait_exit_code'], 9)
+                elif fault in ('wait-unknown', 'wait-overflow'):
+                    self.assertNotIn('initializer_wait_exit_code', state)
                 self.assertFalse(any(a[0] in ('stop', 'kill') or (a[0] in ('volume', 'network') and a[1] == 'rm') for a in docker.calls))
                 if fault != 'removal-unknown':
                     self.assertFalse(any(a[0] == 'rm' for a in docker.calls))

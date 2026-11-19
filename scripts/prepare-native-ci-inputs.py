@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import stat
 import subprocess
 import uuid
@@ -128,6 +129,14 @@ def one(observed):
     return observed[0]
 
 
+def empty_volume_check(target):
+    path = shlex.quote(target)
+    # BusyBox ash supports these POSIX globs/tests. Never parse ls output:
+    # newline-only names and dangling symlinks must also reject initialization.
+    return (f'for entry in {path}/* {path}/.[!.]* {path}/..?*; do '
+            'if test -e "$entry" || test -L "$entry"; then exit 1; fi; done')
+
+
 def prepare(root, socket, docker=None):
     intent = json.loads((root / 'plan.json').read_text())
     owner, nonce = intent['owner'], intent['nonce']
@@ -203,7 +212,7 @@ def prepare(root, socket, docker=None):
         for kind, volume in vs.items():
             target = '/native/' + service + '-' + kind
             mounts += ['--mount', f'type=volume,src={volume},dst={target}']
-            checks.append(f'entries=$(ls -Aq {target}) && test -z "$entries"')
+            checks.append(empty_volume_check(target))
             initialize += [f'chown 1000:1000 {target}', f'chmod 0700 {target}']
     fixed = ' && '.join([*checks, *initialize, 'test ! -e /ci-input/runner.zip',
                          'test ! -L /ci-input/runner.zip',
@@ -241,8 +250,13 @@ def prepare(root, socket, docker=None):
             or actual_mounts != expected_mounts):
         raise ValueError('initializer exact image/ownership/mount evidence differs')
     docker.run('start', container)
-    if docker.run('wait', container) != '0':
-        raise ValueError('initializer exit not positively successful')
+    exit_code = docker.run('wait', container)
+    if not re.fullmatch(r'0|[1-9][0-9]{0,9}', exit_code) or int(exit_code) > 2**31 - 1:
+        raise ValueError('initializer wait did not return a canonical numeric exit; evidence retained')
+    state['initializer_wait_exit_code'] = int(exit_code)
+    save()
+    if exit_code != '0':
+        raise ValueError(f'initializer exit not positively successful (observed {exit_code})')
     stopped = one(docker.json('inspect', container))
     if (stopped.get('Id') != container or stopped.get('State', {}).get('Running') is not False
             or stopped['State'].get('Status') != 'exited' or stopped['State'].get('ExitCode') != 0
