@@ -23,6 +23,9 @@ on:
       - 'crates/worker/Cargo.toml'
       - 'crates/worker/tests/isolated_docker_action_provider_tests.rs'
       - 'crates/worker/tests/support/owning_worker.rs'
+      - 'crates/worker/tests/support/native_candidate_provider.rs'
+      - 'crates/worker/src/service/native_candidate.rs'
+      - 'crates/worker/src/native_candidate.rs'
       - 'crates/core-actions/**'
       - 'crates/workload-backend/**'
       - 'crates/common/src/isolated_process.rs'
@@ -219,6 +222,8 @@ jobs:
         run: cargo zigbuild --locked --profile test --manifest-path crates/core-actions/Cargo.toml --target ${{ matrix.target }} --tests --message-format=json > "$RUNNER_TEMP/native-http-artifacts.jsonl"
       - name: Build owning worker executable once against the shared domain fixture
         run: cargo zigbuild --locked --profile test --target ${{ matrix.target }} -p attune-worker --test isolated_docker_action_provider_tests --message-format=json > "$RUNNER_TEMP/owning-worker-artifacts.jsonl"
+      - name: Build owning candidate-handler library executable once with the same API/domain fixtures
+        run: cargo zigbuild --locked --profile test --target ${{ matrix.target }} -p attune-worker --lib --tests --message-format=json > "$RUNNER_TEMP/owning-candidate-artifacts.jsonl"
       - name: Build owning sensor library executable once against the same API/domain fixtures
         run: cargo zigbuild --locked --profile test --target ${{ matrix.target }} -p attune-sensor --lib --tests --message-format=json > "$RUNNER_TEMP/owning-sensor-artifacts.jsonl"
       - name: Run owned UID1000 manager and concrete Docker adapter effects
@@ -248,5 +253,8 @@ jobs:
           artifacts = [json.loads(line) for line in (Path(os.environ['RUNNER_TEMP']) / 'owning-sensor-artifacts.jsonl').read_text().splitlines() if line.startswith('{')]
           sensor = [item['executable'] for item in artifacts if item.get('reason') == 'compiler-artifact' and item['target']['name'] == 'attune_sensor' and item['profile'].get('test') and item.get('executable')]
           assert len(sensor) == 1, 'missing/ambiguous once-built owning sensor executable'
-          subprocess.run(['python3', 'scripts/test-launch-controller-container.py', '--test-binary', tests[0], '--runner-binary', helpers[0], '--native-http-binary', native[0], '--native-http-tests', native_tests[0], '--provider-tests', providers[0], '--native-echo-binary', echo[0], '--owning-worker-tests', owning[0], '--owning-sensor-tests', sensor[0]], check=True)
+          artifacts = [json.loads(line) for line in (Path(os.environ['RUNNER_TEMP']) / 'owning-candidate-artifacts.jsonl').read_text().splitlines() if line.startswith('{')]
+          candidate = [item['executable'] for item in artifacts if item.get('reason') == 'compiler-artifact' and item['target']['name'] == 'attune_worker' and item['profile'].get('test') and item.get('executable')]
+          assert len(candidate) == 1, 'missing/ambiguous once-built owning candidate handler executable'
+          subprocess.run(['python3', 'scripts/test-launch-controller-container.py', '--test-binary', tests[0], '--runner-binary', helpers[0], '--native-http-binary', native[0], '--native-http-tests', native_tests[0], '--provider-tests', providers[0], '--native-echo-binary', echo[0], '--owning-worker-tests', owning[0], '--owning-sensor-tests', sensor[0], '--owning-candidate-tests', candidate[0]], check=True)
           PY

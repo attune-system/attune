@@ -179,3 +179,7 @@ pub(super) async fn handle(
     );
     Ok(())
 }
+
+#[cfg(all(test, unix))]
+#[path = "../../tests/support/native_candidate_provider.rs"]
+mod provider_tests;

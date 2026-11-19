@@ -42,10 +42,13 @@ def main():
                         help="once-built real owning-worker test executable; requires owned PG URL in environment")
     parser.add_argument("--owning-sensor-tests", type=Path,
                         help="once-built actual SensorManager library tests; uses the same owned images and PG lane")
+    parser.add_argument("--owning-candidate-tests", type=Path,
+                        help="once-built actual candidate-handler library tests; uses the same owned API/network/PG lane")
     args = parser.parse_args()
     owning = args.owning_worker_tests.resolve(strict=True) if args.owning_worker_tests else None
     sensor = args.owning_sensor_tests.resolve(strict=True) if args.owning_sensor_tests else None
-    if (owning or sensor) and not os.environ.get("ATTUNE_OWNING_WORKER_DATABASE_URL"):
+    candidate = args.owning_candidate_tests.resolve(strict=True) if args.owning_candidate_tests else None
+    if (owning or sensor or candidate) and not os.environ.get("ATTUNE_OWNING_WORKER_DATABASE_URL"):
         raise SystemExit("owning-worker acceptance requires explicit owned PostgreSQL URL")
     if os.environ.get("TEST_ARCH") not in ("amd64", "arm64"):
         raise SystemExit("owned Docker test requires TEST_ARCH=amd64 or arm64")
@@ -56,7 +59,7 @@ def main():
     native_http = args.native_http_binary.resolve(strict=True)
     native_tests = args.native_http_tests.resolve(strict=True)
     native_script = Path(__file__).resolve().with_name("test_native_http_action.py").resolve(strict=True)
-    for executable in (binary, helper, native_http, native_tests, provider_tests, echo, *((owning,) if owning else ()), *((sensor,) if sensor else ())):
+    for executable in (binary, helper, native_http, native_tests, provider_tests, echo, *((owning,) if owning else ()), *((sensor,) if sensor else ()), *((candidate,) if candidate else ())):
         dynamic = subprocess.run(["readelf", "-d", str(executable)], check=True, capture_output=True, text=True)
         if "(NEEDED)" in dynamic.stdout:
             raise SystemExit("all candidate controller/helper/native executables must be statically linked (musl)")
@@ -71,6 +74,11 @@ def main():
         listed = subprocess.check_output([str(sensor), "sensor_manager::native::provider_tests::docker_native_sensor", "--list", "--format", "terse"], text=True)
         if [line for line in listed.splitlines() if line.endswith(": test")] != ["sensor_manager::native::provider_tests::docker_native_sensor: test"]:
             raise SystemExit("missing/ambiguous owning sensor acceptance case")
+    if candidate:
+        name = "service::native_candidate::provider_tests::docker_native_candidate"
+        listed = subprocess.check_output([str(candidate), name, "--list", "--format", "terse"], text=True)
+        if [line for line in listed.splitlines() if line.endswith(": test")] != [name + ": test"]:
+            raise SystemExit("missing/ambiguous owning candidate handler acceptance case")
     owner = uuid.uuid4().hex
     volume = f"attune-controller-cache-test-{owner}"
     container = f"attune-controller-test-{owner}"
@@ -125,13 +133,16 @@ def main():
             (context / "native-provider-tests").chmod(0o755)
             (context / "attune-workload-runner").chmod(0o755)
             owning_copy = ""
-            if owning or sensor:
+            if owning or sensor or candidate:
                 if owning:
                     shutil.copyfile(owning, context / "owning-worker-tests")
                     (context / "owning-worker-tests").chmod(0o555)
                 if sensor:
                     shutil.copyfile(sensor, context / "owning-sensor-tests")
                     (context / "owning-sensor-tests").chmod(0o555)
+                if candidate:
+                    shutil.copyfile(candidate, context / "owning-candidate-tests")
+                    (context / "owning-candidate-tests").chmod(0o555)
                 shutil.copyfile(echo, context / "native-echo")
                 (context / "native-echo").chmod(0o555)
                 source_root = Path(__file__).resolve().parents[1]
@@ -140,11 +151,11 @@ def main():
                 # TestDatabase hashes/reads migrations at its compile-time source
                 # location. Package those public candidate inputs at that exact
                 # location, never mount a developer source tree into guests.
-                test_inputs = ["native-echo", *(("owning-worker-tests",) if owning else ()), *(("owning-sensor-tests",) if sensor else ())]
+                test_inputs = ["native-echo", *(("owning-worker-tests",) if owning else ()), *(("owning-sensor-tests",) if sensor else ()), *(("owning-candidate-tests",) if candidate else ())]
                 owning_copy = ("COPY " + " ".join(test_inputs) + " /usr/local/bin/\n"
                                + "COPY " + json.dumps(["config.test.yaml", str(source_root / "config.test.yaml")]) + "\n"
                                + "COPY " + json.dumps(["migrations", str(source_root / "migrations")]) + "\n"
-                               + "RUN " + json.dumps(["mkdir", "-p", str(source_root / "crates/worker"), str(source_root / "crates/sensor")]) + "\n")
+                               + "RUN " + json.dumps(["mkdir", "-p", str(source_root / "crates/worker"), str(source_root / "crates/sensor"), str(source_root / "crates/common")]) + "\n")
             (context / "Dockerfile").write_text(
                 f"FROM {PYTHON} AS public-roots\nFROM {BASE}\n"
                 "COPY --from=public-roots /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt\n"
@@ -256,6 +267,30 @@ def main():
             print(json.dumps({"owner": owner, "owning_sensor_tests_sha256": hashlib.sha256(sensor.read_bytes()).hexdigest(),
                               "owning_sensor_run_id": run_id}), flush=True)
             subprocess.run(command, env=child_env, check=True)
+        if candidate:
+            candidate_base = base.copy()
+            candidate_base[candidate_base.index("--name") + 1] = container + "-candidate"
+            candidate_base[candidate_base.index("--network") + 1] = network
+            database_url = os.environ["ATTUNE_OWNING_WORKER_DATABASE_URL"]
+            database_env = ["ATTUNE__DATABASE__URL", "TEST_DB_URL", "DATABASE_URL"]
+            child_env = dict(os.environ, **{key: database_url for key in database_env})
+            run_id = "cand-" + owner[:12]
+            command = ["docker", "--host", "unix:///var/run/docker.sock", *candidate_base,
+                       "--add-host", "host.docker.internal:host-gateway",
+                       "--tmpfs", "/var/lib/attune/owning:rw,nosuid,nodev,mode=0700,uid=1000,gid=1000,size=536870912",
+                       "-e", "TMPDIR=/var/lib/attune/owning",
+                       "-e", "ATTUNE_CANDIDATE_TEST_TMP_ROOT=/var/lib/attune/owning",
+                       "-e", "CARGO_MANIFEST_DIR=" + str(Path(__file__).resolve().parents[1] / "crates/worker"),
+                       "-e", "ATTUNE_ISOLATION_TEST_ECHO_PATH=/usr/local/bin/native-echo",
+                       "-e", "ATTUNE_CANDIDATE_TEST_API_HOST=" + container + "-candidate",
+                       "-e", "ATTUNE_TEST_RUN_ID=" + run_id,
+                       *[arg for key in database_env for arg in ("-e", key)],
+                       "--entrypoint", "/usr/local/bin/owning-candidate-tests", image,
+                       "service::native_candidate::provider_tests::docker_native_candidate",
+                       "--exact", "--include-ignored", "--nocapture", "--test-threads=4"]
+            print(json.dumps({"owner": owner, "owning_candidate_tests_sha256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
+                              "owning_candidate_run_id": run_id}), flush=True)
+            subprocess.run(command, env=child_env, check=True)
         if dummy.poll() is not None:
             raise RuntimeError("workload signaled the owned dummy credential process")
         tests_succeeded = True
@@ -264,7 +299,7 @@ def main():
             if dummy.poll() is None:
                 dummy.terminate()
             dummy.wait(timeout=10)
-        for owned_container in (container, container + "-native", container + "-init", container + "-worker", container + "-sensor"):
+        for owned_container in (container, container + "-native", container + "-init", container + "-worker", container + "-sensor", container + "-candidate"):
             found = docker("inspect", owned_container, capture=True, check=False)
             if found.returncode == 0:
                 observed = json.loads(found.stdout)[0]

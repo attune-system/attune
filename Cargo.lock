@@ -738,6 +738,7 @@ version = "0.11.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "attune-api",
  "attune-common",
  "attune-workload-backend",
  "axum",
@@ -765,6 +766,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "uuid",
