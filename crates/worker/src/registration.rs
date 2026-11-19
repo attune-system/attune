@@ -25,6 +25,10 @@ const ATTUNE_AGENT_BINARY_VERSION_ENV: &str = "ATTUNE_AGENT_BINARY_VERSION";
 
 /// Worker registration manager
 pub struct WorkerRegistration {
+    native_runtime_discovery: Option<(
+        std::sync::Arc<crate::executor::ActionExecutor>,
+        std::collections::BTreeSet<String>,
+    )>,
     child_environment: attune_common::child_process_environment::ChildProcessEnvironment,
     pool: PgPool,
     worker_id: Option<i64>,
@@ -39,6 +43,143 @@ pub struct WorkerRegistration {
 }
 
 impl WorkerRegistration {
+    /// Install only after active registration and the executor custody lease.
+    /// Digests are the operator policy captured at startup, never pack input.
+    pub fn with_native_runtime_discovery(
+        mut self,
+        executor: std::sync::Arc<crate::executor::ActionExecutor>,
+        admitted: std::collections::BTreeSet<String>,
+    ) -> Self {
+        self.native_runtime_discovery = Some((executor, admitted));
+        self
+    }
+
+    async fn detect_native_recipe_capabilities(&mut self, config: &Config) -> Result<()> {
+        use attune_common::repositories::{
+            runtime_version::RuntimeVersionRepository, List, RuntimeRepository,
+        };
+        let (executor, admitted) = self
+            .native_runtime_discovery
+            .as_ref()
+            .ok_or_else(|| Error::Internal("Missing native runtime discovery".into()))?;
+        let filter = std::env::var("ATTUNE_WORKER_RUNTIMES")
+            .ok()
+            .map(|names| {
+                names
+                    .split(',')
+                    .map(|n| n.trim().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .or_else(|| {
+                config
+                    .worker
+                    .as_ref()?
+                    .capabilities
+                    .as_ref()?
+                    .get("runtimes")?
+                    .as_array()
+                    .map(|names| {
+                        names
+                            .iter()
+                            .filter_map(|n| n.as_str().map(str::to_owned))
+                            .collect()
+                    })
+            });
+        let versions = RuntimeVersionRepository::list(&self.pool).await?;
+        let mut instances = serde_json::Map::new();
+        let mut names = std::collections::BTreeSet::from(["native".to_owned()]);
+        for runtime in RuntimeRepository::list(&self.pool).await? {
+            if filter.as_ref().is_some_and(|filter| {
+                !attune_common::runtime_detection::runtime_aliases_match_filter(
+                    &runtime.aliases,
+                    filter,
+                ) && !attune_common::runtime_detection::runtime_aliases_match_filter(
+                    std::slice::from_ref(&runtime.name),
+                    filter,
+                )
+            }) {
+                continue;
+            }
+            let Some(raw) = runtime.execution_config.get("lifecycle") else {
+                continue;
+            };
+            let Ok(recipe) = serde_json::from_value::<
+                attune_common::runtime_lifecycle::RuntimeRecipe,
+            >(raw.clone()) else {
+                continue;
+            };
+            let Ok(digest) = recipe.digest() else {
+                continue;
+            };
+            if !admitted.contains(&digest) {
+                continue;
+            }
+            let tools = executor
+                .probe_registered_native_recipe(&runtime, None, admitted)
+                .await
+                .ok();
+            let mut available = Vec::new();
+            for version in versions.iter().filter(|v| v.runtime == runtime.id) {
+                if let Ok(tools) = executor
+                    .probe_registered_native_recipe(&runtime, Some(version), admitted)
+                    .await
+                {
+                    if let Some(primary) = recipe
+                        .tools
+                        .iter()
+                        .find(|t| t.primary)
+                        .and_then(|t| tools.get(&t.name))
+                    {
+                        if primary.version == version.version
+                            || attune_common::version_matching::matches_constraint(
+                                &primary.version,
+                                &format!("={}", version.version),
+                            )
+                            .unwrap_or(false)
+                        {
+                            available.push(version.version.clone());
+                        }
+                    }
+                }
+            }
+            if tools.is_none() && available.is_empty() {
+                continue;
+            }
+            if !versions.iter().any(|v| v.runtime == runtime.id) {
+                if let Some(primary) = recipe
+                    .tools
+                    .iter()
+                    .find(|t| t.primary)
+                    .and_then(|t| tools.as_ref()?.get(&t.name))
+                {
+                    available.push(primary.version.clone());
+                }
+            }
+            let aliases = runtime
+                .aliases
+                .iter()
+                .chain(std::iter::once(&runtime.name))
+                .map(|n| normalize_runtime_name(n))
+                .collect::<Vec<_>>();
+            names.extend(aliases.clone());
+            instances.insert(
+                runtime.r#ref,
+                json!({"digest":digest,"tools":tools,"versions":available,"names":aliases}),
+            );
+        }
+        self.capabilities.insert("runtimes".into(), json!(names));
+        self.capabilities
+            .insert("runtime_toolchains".into(), json!(instances));
+        self.capabilities
+            .insert("runtime_recipe_digests".into(), json!(admitted));
+        self.capabilities
+            .insert(RUNTIME_VERSIONS_CAPABILITY_KEY.into(), json!({}));
+        self.capabilities.insert(
+            attune_common::execution_authority::DELEGATED_EXECUTION_CAPABILITY.into(),
+            json!(config.security.encryption_key.is_some()),
+        );
+        Ok(())
+    }
     pub fn with_child_environment(
         mut self,
         environment: attune_common::child_process_environment::ChildProcessEnvironment,
@@ -185,6 +326,7 @@ impl WorkerRegistration {
         capabilities.insert("runtimes".to_string(), json!(Vec::<String>::new()));
 
         Self {
+            native_runtime_discovery: None,
             child_environment: Default::default(),
             pool,
             worker_id: None,
@@ -273,6 +415,9 @@ impl WorkerRegistration {
     /// Detect available runtimes using the unified runtime detector
     pub async fn detect_capabilities(&mut self, config: &Config) -> Result<()> {
         info!("Detecting worker capabilities...");
+        if self.native_runtime_discovery.is_some() {
+            return self.detect_native_recipe_capabilities(config).await;
+        }
 
         let detector = RuntimeDetector::new(self.pool.clone())
             .with_child_environment(self.child_environment.clone());

@@ -153,6 +153,58 @@ pub fn runtime_tool_probe_argv(
 /// Private CP-selected envelope, never a public Runner body or caller plan.
 /// Selection/provenance must already be bound to the admitted immutable image
 /// or native input. This function never probes the CP host filesystem/PATH.
+/// Fixed guest lifecycle invocation. The definition and source are private
+/// context, never provider metadata. Source is relative to the pinned release;
+/// inline source admission remains an owning-loop decision.
+pub fn runtime_recipe_argv(
+    platform: LaunchPlatform,
+    recipe: &attune_common::runtime_lifecycle::RuntimeRecipe,
+    guest_path: &str,
+    source: &str,
+    inline: bool,
+    selected_version: Option<&str>,
+) -> Result<Vec<String>> {
+    if !inline {
+        pack_path(source)?;
+    }
+    if source.contains('\0') || selected_version.is_some_and(|v| v.is_empty() || v.contains('\0')) {
+        return Err(PlanningError::Configuration);
+    }
+    let mut argv = runtime_tool_probe_argv(platform, recipe, guest_path)?;
+    argv[1] = "run-runtime-recipe".into();
+    argv.insert(2, if inline { "inline" } else { "file" }.into());
+    // Source may exceed Linux's per-argument limit as well.
+    let source_json = serde_json::to_string(source).map_err(|_| PlanningError::Configuration)?;
+    // Split on UTF-8 boundaries using the same bounded encoder as recipes.
+    let mut parts = Vec::new();
+    let mut rest = source_json.as_str();
+    while !rest.is_empty() {
+        let mut end = rest.len().min(RUNTIME_RECIPE_CHUNK_BYTES);
+        while !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        parts.push(rest[..end].to_owned());
+        rest = &rest[end..];
+    }
+    let count = parts.len();
+    argv.insert(3, parts.len().to_string());
+    argv.splice(4..4, parts);
+    argv.insert(4 + count, selected_version.unwrap_or("").into());
+    if argv.iter().map(String::len).sum::<usize>() > crate::runner_protocol::MAX_START_CONTEXT {
+        return Err(PlanningError::Bounds);
+    }
+    Ok(argv)
+}
+
+/// The owning loop has already selected allowed caller overrides and API scope.
+/// Keep the invocation context out of preparation, and reject CP variables.
+pub fn runtime_recipe_environment(
+    selected: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
+    validate_environment(selected, true)?;
+    Ok(selected.clone())
+}
+
 pub fn cli_exec_argv(
     platform: LaunchPlatform,
     selected: &attune_common::action_cli::SelectedProgram,
@@ -924,4 +976,109 @@ mod tests {
         selected.invocation_name.clear();
         assert!(cli_exec_argv(LaunchPlatform::LinuxAmd64, &selected, &[]).is_err());
     }
+    #[test]
+    fn runtime_release_metadata_must_match_exact_retained_recipe_and_version() {
+        use std::io::Write;
+        let config = serde_json::json!({"lifecycle":{"owned":"public"}});
+        let make = |duplicates: bool| {
+            let mut file = tempfile::tempfile().unwrap();
+            {
+                let mut zip = zip::ZipWriter::new(&mut file);
+                for name in if duplicates {
+                    vec!["runtimes/owned.yaml", "runtimes/duplicate.yaml"]
+                } else {
+                    vec!["runtimes/owned.yaml"]
+                } {
+                    zip.start_file(name, zip::write::SimpleFileOptions::default())
+                        .unwrap();
+                    zip.write_all(serde_json::to_string(&serde_json::json!({"ref":"owned.tool","execution_config":config,"versions":[{"version":"1","execution_config":config}]})).unwrap().as_bytes()).unwrap();
+                }
+                zip.finish().unwrap();
+            }
+            file
+        };
+        assert!(validate_runtime_release_archive(
+            make(false),
+            "owned.tool",
+            &config,
+            Some(("1", &config))
+        )
+        .is_ok());
+        assert!(
+            validate_runtime_release_archive(make(false), "other.tool", &config, None).is_err()
+        );
+        assert!(validate_runtime_release_archive(
+            make(false),
+            "owned.tool",
+            &serde_json::json!({}),
+            None
+        )
+        .is_err());
+        assert!(validate_runtime_release_archive(
+            make(false),
+            "owned.tool",
+            &config,
+            Some(("2", &config))
+        )
+        .is_err());
+        assert!(validate_runtime_release_archive(make(true), "owned.tool", &config, None).is_err());
+    }
+}
+
+/// Verify mutable DB runtime projections against the exact retained provider
+/// release archive before native startup discovery. Never read a mutable tree.
+pub fn validate_runtime_release_archive(
+    archive: std::fs::File,
+    runtime_ref: &str,
+    runtime_config: &serde_json::Value,
+    version: Option<(&str, &serde_json::Value)>,
+) -> Result<()> {
+    let mut archive = zip::ZipArchive::new(archive).map_err(|_| PlanningError::Configuration)?;
+    let mut matched = false;
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|_| PlanningError::Configuration)?;
+        let path = entry.name().map_err(|_| PlanningError::Configuration)?;
+        if !path.starts_with("runtimes/") || !(path.ends_with(".yaml") || path.ends_with(".yml")) {
+            continue;
+        }
+        if entry.size() > 1024 * 1024 {
+            return Err(PlanningError::Configuration);
+        }
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        entry
+            .read_to_end(&mut bytes)
+            .map_err(|_| PlanningError::Configuration)?;
+        let metadata: serde_json::Value =
+            attune_common::runtime_lifecycle::parse_release_metadata(&bytes)
+                .map_err(|_| PlanningError::Configuration)?;
+        if metadata.get("ref").and_then(|r| r.as_str()) != Some(runtime_ref) {
+            continue;
+        }
+        if matched || metadata.get("execution_config") != Some(runtime_config) {
+            return Err(PlanningError::Configuration);
+        }
+        if let Some((version, version_config)) = version {
+            let declared = metadata
+                .get("versions")
+                .and_then(|v| v.as_array())
+                .and_then(|versions| {
+                    versions
+                        .iter()
+                        .find(|v| v.get("version").and_then(|v| v.as_str()) == Some(version))
+                })
+                .ok_or(PlanningError::Configuration)?;
+            if declared.get("execution_config") != Some(version_config) {
+                return Err(PlanningError::Configuration);
+            }
+        }
+        matched = true;
+    }
+    if !matched {
+        return Err(PlanningError::Configuration);
+    }
+
+    Ok(())
 }

@@ -421,8 +421,29 @@ impl RuntimeRecipe {
         generation_root: &Path,
         environment: &ChildProcessEnvironment,
     ) -> Result<PreparedTarget> {
+        self.prepare_with_tool_validation(
+            pack_dir,
+            source,
+            generation_root,
+            environment,
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    /// Native guests require read-only image/input tool identities before any
+    /// preparation command. The caller's check cannot grant recipe admission.
+    pub async fn prepare_with_tool_validation(
+        &self,
+        pack_dir: &Path,
+        source: RuntimeSource<'_>,
+        generation_root: &Path,
+        environment: &ChildProcessEnvironment,
+        validate_tools: impl FnOnce(&BTreeMap<String, VerifiedTool>) -> Result<()>,
+    ) -> Result<PreparedTarget> {
         let recipe_digest = self.require_admission(environment)?;
         let tools = self.discover(environment).await?;
+        validate_tools(&tools)?;
         let primary_version = self
             .tools
             .iter()
@@ -838,4 +859,10 @@ impl Drop for ProcessGroup {
     fn drop(&mut self) {
         let _ = self.kill();
     }
+}
+
+/// Bounded native release readers parse ordinary runtime YAML without granting
+/// recipe admission or performing any executable effect.
+pub fn parse_release_metadata(bytes: &[u8]) -> Result<serde_json::Value> {
+    serde_yaml_ng::from_slice(bytes).map_err(|_| invalid("Invalid retained runtime metadata"))
 }

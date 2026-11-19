@@ -794,6 +794,37 @@ async fn inspect_installed_command_without_manager_discovery(f: &Fixture) -> Tes
             );
         }
     }
+    // Sequential lifecycle preparation and execution in the same private Pod.
+    // No additional concurrency or provider limits are introduced.
+    let recipe = runtime_recipe::executable_recipe();
+    let mut pack = f.input(
+        LaunchInputKind::Pack,
+        vec![("actions/owned.py", runtime_recipe::SOURCE.to_vec(), false)],
+    )?;
+    pack.pin_id = 2;
+    let mut execution = f.spec(Vec::new())?;
+    execution.inputs = runner_inputs;
+    execution.inputs.push(pack);
+    execution.invocation.argv = attune_workload_backend::planning::runtime_recipe_argv(
+        execution.platform,
+        &recipe,
+        "/usr/bin:/bin",
+        "actions/owned.py",
+        false,
+        None,
+    )?;
+    execution.invocation.env = BTreeMap::from([
+        ("ATTUNE_API_TOKEN".into(), "owned-invocation-only".into()),
+        ("SELECTED".into(), "owned-caller-only".into()),
+    ]);
+    let (exit, out, err) = f.run(&execution, runtime_recipe::STDIN.to_vec()).await?;
+    if exit.exit_code != 0
+        || exit.oom_killed
+        || !err.is_empty()
+        || out != [b"recipe:".as_slice(), runtime_recipe::STDIN].concat()
+    {
+        return Err("private recipe preparation/invocation failed".into());
+    }
     Ok(())
 }
 #[tokio::test]

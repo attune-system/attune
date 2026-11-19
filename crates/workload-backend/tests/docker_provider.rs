@@ -484,6 +484,53 @@ async fn runtime_recipe_discovery(f: &Fixture) -> TestResult {
             );
         }
     }
+    let recipe = runtime_recipe::executable_recipe();
+    let mut archive = tempfile::tempfile()?;
+    {
+        let mut zip = zip::ZipWriter::new(&mut archive);
+        zip.start_file(
+            "actions/owned.py",
+            zip::write::SimpleFileOptions::default().unix_permissions(0o644),
+        )?;
+        zip.write_all(runtime_recipe::SOURCE)?;
+        zip.finish()?;
+    }
+    let pack = f.input(LaunchInputKind::Pack, &mut archive)?;
+    let mut spec = f.spec(attune_workload_backend::planning::runtime_recipe_argv(
+        f.platform,
+        &recipe,
+        "/usr/bin:/bin",
+        "actions/owned.py",
+        false,
+        None,
+    )?);
+    spec.inputs = vec![pack, f.runner.clone()];
+    spec.invocation.working_root = LaunchRoot::Pack;
+    spec.invocation.env = BTreeMap::from([
+        ("ATTUNE_API_TOKEN".into(), "owned-invocation-only".into()),
+        ("SELECTED".into(), "owned-caller-only".into()),
+    ]);
+    let resource = f
+        .launcher
+        .prepare(&spec, ProcessCreateDisposition::CreateOnce)
+        .await?;
+    let result = async {
+        run(
+            f.launcher.start(&spec, &resource).await?,
+            runtime_recipe::STDIN.to_vec(),
+        )
+        .await
+    }
+    .await;
+    f.launcher.remove_stopped(&spec, &resource).await?;
+    let (exit, out, err) = result?;
+    if exit.exit_code != 0
+        || exit.oom_killed
+        || !err.is_empty()
+        || out != [b"recipe:".as_slice(), runtime_recipe::STDIN].concat()
+    {
+        return Err("Docker private recipe preparation/invocation failed".into());
+    }
     Ok(())
 }
 

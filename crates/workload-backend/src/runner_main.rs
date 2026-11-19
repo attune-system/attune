@@ -19,7 +19,7 @@ use std::{
 fn main() {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     if arguments.len() == 1 && (arguments[0] == "--help" || arguments[0] == "-h") {
-        println!("attune-workload-runner setup|exec|inspect-command-program|inspect-runtime-tools: admitted OCI effects");
+        println!("attune-workload-runner setup|exec|inspect-command-program|inspect-runtime-tools|run-runtime-recipe: admitted OCI effects");
         return;
     }
     let result = match arguments.first().and_then(|value| value.to_str()) {
@@ -71,6 +71,8 @@ fn main() {
         Some("inspect-command-program") => inspect_command_program(&arguments[1..]),
         #[cfg(unix)]
         Some("inspect-runtime-tools") => recipe_probe::inspect(&arguments[1..]),
+        #[cfg(unix)]
+        Some("run-runtime-recipe") => recipe_probe::run(&arguments[1..]),
         _ => Err(invalid()),
     };
     if result.is_err() {

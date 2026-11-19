@@ -13,16 +13,33 @@ in [workload isolation](workload-isolation.md) and
 code. It does not implement hostile-pack admission, network egress enforcement,
 cross-host output distribution, or reusable prepared-target caching.
 
-Managers configured to require isolated workload effects reject these local recipes,
-even when the digest is listed. The same applies to the legacy Bubblewrap profile:
-recipe discovery and preparation do not yet use that launcher. They remain
-available only in the explicit trusted local profile. Native recipe producers
-must be connected and validated before the isolated deployment defaults activate.
-The native Runner now supplies a fixed `inspect-runtime-tools` guest effect
-using the same recipe discovery engine, explicit guest PATH and read-only tool
-identities. This effect is not manager admission or startup integration, and it
-does not prepare or launch recipe targets. Private-generation invocation remains
-required before lifecycle recipes are supported by the native managers.
+Managers requiring native effects still deny local recipe discovery/preparation,
+regardless of digest admission. Their separate native registration producer uses
+`RuntimeProbeProcessRepository`: a retained runtime-only admission binds the
+active worker incarnation, runtime/version configuration, active immutable
+provider release, selected image/platform and public Runner pins. It verifies
+runtime YAML in the retained release ZIP before running the fixed
+`inspect-runtime-tools` guest effect. Captured tools are committed only after
+both streams complete and the exact resource has a successful non-OOM exit.
+Revocation epochs, expiration, one-shot empty stdin, uncertain create recovery
+and positive exact removal are independent of action completion authority.
+
+`run-runtime-recipe` uses the shared recipe engine inside one native attempt.
+Its helper protects its own process before invoking any tool, gives preparation
+only explicit public environment and null stdin, and leaves original action
+stdin unread until invocation. Preparation cannot inspect the held invocation
+environment or stdin through the helper's `/proc` files. Tools must have read-only
+image/input identities before preparation starts. Each attempt creates its own
+private generation in its native `/tmp`; preparation and launch retain those
+physical paths. No shared Ready marker, runtime publication or reuse is involved.
+The owning worker retains output policy, capture, custody, source fencing and
+positive stopped-writer cleanup; provider timeout/cancellation covers all phases.
+
+The constructor/registration wiring, native digest policy helper, legacy
+verification-command discovery, candidate/sensor producers, and actual provider
+acceptance remain activation requirements. The source milestone does not enable
+deployment defaults or relax existing public-input origin restrictions. Local
+trusted and legacy reusable-environment contracts remain unchanged.
 
 ## Admission and discovery
 
