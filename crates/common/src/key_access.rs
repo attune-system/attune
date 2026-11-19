@@ -164,6 +164,17 @@ pub async fn authorize_execution_parameter_key_origins_with_conn(
     identity: Option<Id>,
     secrets: &[crate::secret_values::StoredSecretValue],
 ) -> Result<()> {
+    authorize_execution_parameter_origins_with_evidence(connection, execution, identity, secrets)
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn authorize_execution_parameter_origins_with_evidence(
+    connection: &mut sqlx::PgConnection,
+    execution: Id,
+    identity: Option<Id>,
+    secrets: &[crate::secret_values::StoredSecretValue],
+) -> Result<crate::repositories::runtime_authority::ApprovalEffectFence> {
     use crate::repositories::{
         execution_admission::ExecutionAdmissionRepository, runtime_authority::RuntimeOwner,
     };
@@ -171,12 +182,15 @@ pub async fn authorize_execution_parameter_key_origins_with_conn(
         ExecutionAdmissionRepository::find(connection, RuntimeOwner::Execution(execution))
             .await?
             .is_some();
-    let authorities = ExecutionAdmissionRepository::input_authorities(
+    let (authorities, fence) = ExecutionAdmissionRepository::input_authorities_with_fence(
         connection,
         execution,
         if recorded { None } else { identity },
     )
     .await?;
+    let mut fence = fence.unwrap_or(
+        crate::repositories::runtime_authority::ApprovalEffectFence::from_input_approval(None)?,
+    );
     let mut visited = std::collections::BTreeSet::new();
     for secret in secrets {
         check_parameter_origins(
@@ -186,11 +200,13 @@ pub async fn authorize_execution_parameter_key_origins_with_conn(
             &secret.json_path,
             secret,
             &mut visited,
+            &mut fence,
             0,
         )
         .await?;
     }
-    Ok(())
+    fence.ensure_fresh_on(connection).await?;
+    Ok(fence)
 }
 
 /// Validate private native acknowledgement origins using only the producer's
@@ -211,6 +227,9 @@ pub(crate) async fn authorize_execution_control_origins(
             &secret.json_path,
             secret,
             &mut std::collections::BTreeSet::new(),
+            &mut crate::repositories::runtime_authority::ApprovalEffectFence::from_input_approval(
+                None,
+            )?,
             0,
         )
         .await?;
@@ -237,6 +256,9 @@ pub async fn authorize_parameter_key_origins_with_conn(
             &secret.json_path,
             secret,
             &mut std::collections::BTreeSet::new(),
+            &mut crate::repositories::runtime_authority::ApprovalEffectFence::from_input_approval(
+                None,
+            )?,
             0,
         )
         .await?;
@@ -251,6 +273,7 @@ fn check_parameter_origins<'a>(
     destination_path: &'a str,
     secret: &'a crate::secret_values::StoredSecretValue,
     visited: &'a mut std::collections::BTreeSet<(String, Id, String)>,
+    fence: &'a mut crate::repositories::runtime_authority::ApprovalEffectFence,
     depth: usize,
 ) -> futures::future::BoxFuture<'a, Result<()>> {
     Box::pin(async move {
@@ -292,20 +315,25 @@ fn check_parameter_origins<'a>(
         };
         for origin in provenance.origins {
             if let Some(execution) = recorded_execution {
-                if crate::repositories::declared_input::DeclaredInputRepository::delivery_allowed(
-                    connection,
-                    execution,
-                    destination_path,
-                    &origin,
-                )
-                .await?
+                if let Some(issued) =
+                    crate::repositories::declared_input::DeclaredInputRepository::delivery_evidence(
+                        connection,
+                        execution,
+                        destination_path,
+                        &origin,
+                    )
+                    .await?
                 {
+                    *fence = fence.intersect(&issued);
                     continue;
                 }
                 if crate::repositories::immutable_input_origin::is_immutable_origin(&origin) {
-                    if crate::repositories::execution_admission::ExecutionAdmissionRepository::input_runtime_origin_allowed(
+                    if let Some(issued) = crate::repositories::execution_admission::ExecutionAdmissionRepository::input_runtime_origin_evidence(
                         connection, execution, &origin,
-                    ).await? { continue; }
+                    ).await? {
+                        *fence = fence.intersect(&issued);
+                        continue;
+                    }
                     return Err(denied());
                 }
             }
@@ -316,9 +344,12 @@ fn check_parameter_origins<'a>(
                         .chain(origin.encrypted.then_some(Action::Decrypt))
                     {
                         let allowed = if let Some(execution) = recorded_execution {
-                            crate::repositories::execution_admission::ExecutionAdmissionRepository::input_key_origin_allowed(
+                            if let Some(issued) = crate::repositories::execution_admission::ExecutionAdmissionRepository::input_key_origin_evidence(
                                 connection, execution, &origin, action,
-                            ).await?
+                            ).await? {
+                                *fence = fence.intersect(&issued);
+                                true
+                            } else { false }
                         } else {
                             !authorities.is_empty()
                                 && authorities.iter().all(|authority| {
@@ -433,6 +464,7 @@ fn check_parameter_origins<'a>(
                         destination_path,
                         parent,
                         visited,
+                        fence,
                         depth + 1,
                     )
                     .await?;

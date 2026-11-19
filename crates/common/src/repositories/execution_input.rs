@@ -137,6 +137,7 @@ pub struct AuthorizedExecutionInput<'tx, 'connection> {
     value: Value,
     snapshot: ExecutionInputSnapshot,
     receipts: Vec<ReceiptContext>,
+    origin_fence: super::runtime_authority::ApprovalEffectFence,
 }
 impl AuthorizedExecutionInput<'_, '_> {
     pub fn value(&self) -> &Value {
@@ -158,6 +159,7 @@ impl AuthorizedExecutionInput<'_, '_> {
     /// Recheck after every later lock wait and immediately before disclosure or
     /// an acknowledged effect. Each receipt is bound to this same transaction.
     pub async fn ensure_fresh(&mut self) -> Result<()> {
+        self.origin_fence.ensure_fresh_on(self.transaction).await?;
         for receipt in &self.receipts {
             receipt.ensure_fresh_on(self.transaction).await?;
         }
@@ -171,21 +173,29 @@ impl AuthorizedExecutionInput<'_, '_> {
             self.value,
             paths,
             self.snapshot,
-            InputExpiryFence(self.receipts),
+            InputExpiryFence {
+                receipts: self.receipts,
+                origin_fence: self.origin_fence,
+            },
         )
     }
 }
 /// Post-COMMIT expiry check only; this is never a new authorization grant.
-pub struct InputExpiryFence(Vec<ReceiptContext>);
+pub struct InputExpiryFence {
+    receipts: Vec<ReceiptContext>,
+    origin_fence: super::runtime_authority::ApprovalEffectFence,
+}
 impl InputExpiryFence {
     pub async fn ensure_fresh_on(&self, connection: &mut sqlx::PgConnection) -> Result<()> {
-        for receipt in &self.0 {
+        self.origin_fence.ensure_fresh_on(connection).await?;
+        for receipt in &self.receipts {
             receipt.ensure_fresh_on(connection).await?;
         }
         Ok(())
     }
     pub fn ensure_fresh(&self) -> Result<()> {
-        for receipt in &self.0 {
+        self.origin_fence.ensure_fresh()?;
+        for receipt in &self.receipts {
             receipt.ensure_fresh()?;
         }
         Ok(())
@@ -239,7 +249,7 @@ impl ExecutionInputRepository {
         };
         // This also validates the recorded input contributor/liveness contract
         // when the value happens to have no protected fields.
-        crate::key_access::authorize_execution_parameter_key_origins_with_conn(
+        let origin_fence = crate::key_access::authorize_execution_parameter_origins_with_evidence(
             transaction,
             execution,
             row.executor,
@@ -294,6 +304,7 @@ impl ExecutionInputRepository {
             value,
             snapshot,
             receipts,
+            origin_fence,
         };
         input.ensure_fresh().await?;
         Ok(input)

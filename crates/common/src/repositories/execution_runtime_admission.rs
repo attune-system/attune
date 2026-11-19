@@ -463,16 +463,36 @@ impl ExecutionAdmissionRepository {
         origin: &crate::secret_provenance::KeyOrigin,
         action: crate::rbac::Action,
     ) -> Result<bool> {
-        let authorities = Self::input_authorities(connection, execution, None).await?;
+        Ok(
+            Self::input_key_origin_evidence(connection, execution, origin, action)
+                .await?
+                .is_some(),
+        )
+    }
+
+    pub(crate) async fn input_key_origin_evidence(
+        connection: &mut PgConnection,
+        execution: Id,
+        origin: &crate::secret_provenance::KeyOrigin,
+        action: crate::rbac::Action,
+    ) -> Result<Option<ApprovalEffectFence>> {
+        let (authorities, fence) =
+            Self::input_authorities_with_fence(connection, execution, None).await?;
         if authorities.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
         let ownership =
             super::iam_ownership::VerifiedKeyOrigins::load(&mut *connection, &[origin.key_id])
                 .await?;
-        Ok(authorities
+        if authorities
             .iter()
-            .all(|authority| authority.key_allows_verified(origin, action, &ownership)))
+            .all(|authority| authority.key_allows_verified(origin, action, &ownership))
+        {
+            return Ok(Some(
+                fence.unwrap_or(ApprovalEffectFence::from_input_approval(None)?),
+            ));
+        }
+        Ok(None)
     }
 
     /// Every captured contributor must permit a delivered value. Callers must
@@ -482,6 +502,21 @@ impl ExecutionAdmissionRepository {
         execution: Id,
         identity: Option<Id>,
     ) -> Result<Vec<crate::delegation::DelegationAuthority>> {
+        Ok(
+            Self::input_authorities_with_fence(connection, execution, identity)
+                .await?
+                .0,
+        )
+    }
+
+    pub(crate) async fn input_authorities_with_fence(
+        connection: &mut PgConnection,
+        execution: Id,
+        identity: Option<Id>,
+    ) -> Result<(
+        Vec<crate::delegation::DelegationAuthority>,
+        Option<ApprovalEffectFence>,
+    )> {
         if Self::is_recorded(connection, execution).await? {
             let (_, fence) =
                 Self::require_with_fence(connection, RuntimeOwner::Execution(execution)).await?;
@@ -497,12 +532,15 @@ impl ExecutionAdmissionRepository {
             // source locks, but check expiry again after that wait. The reuse is
             // limited to this call: later calls revalidate even on the same tx.
             fence.ensure_fresh_on(connection).await?;
-            return Ok(authorities);
+            return Ok((authorities, Some(fence)));
         }
-        Ok(Self::input_authority(connection, execution, identity)
-            .await?
-            .into_iter()
-            .collect())
+        Ok((
+            Self::input_authority(connection, execution, identity)
+                .await?
+                .into_iter()
+                .collect(),
+            None,
+        ))
     }
 
     /// Called in the enqueue transaction after the item's immutable executable

@@ -5531,9 +5531,11 @@ async fn input_approval(
     if target.resource() != crate::rbac::Resource::Keys || key <= 0 {
         return Err(denied());
     }
-    Ok(Some(ApprovalEffectFence::from_input_approval(
-        approval.expires_at,
-    )?))
+    Ok(Some(
+        ApprovalEffectFence::from_input_approval(approval.expires_at)?.with_input_dependency(
+            super::runtime_authority::InputAuthorityDependency::Approval(approval.id),
+        ),
+    ))
 }
 
 async fn retained_input_approval(
@@ -5552,7 +5554,11 @@ async fn retained_input_approval(
     if saved_origin != body || saved_target != serde_json::to_value(target)? {
         return Err(denied());
     }
-    ApprovalEffectFence::from_input_approval(approval.expires_at)
+    Ok(
+        ApprovalEffectFence::from_input_approval(approval.expires_at)?.with_input_dependency(
+            super::runtime_authority::InputAuthorityDependency::Approval(approval.id),
+        ),
+    )
 }
 
 #[cfg(test)]

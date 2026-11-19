@@ -1639,16 +1639,28 @@ impl ExecutionAdmissionRepository {
         destination: Id,
         origin: &SecretOrigin,
     ) -> Result<bool> {
+        Ok(
+            Self::input_runtime_origin_evidence(conn, destination, origin)
+                .await?
+                .is_some(),
+        )
+    }
+
+    pub(crate) async fn input_runtime_origin_evidence(
+        conn: &mut PgConnection,
+        destination: Id,
+        origin: &SecretOrigin,
+    ) -> Result<Option<super::runtime_authority::ApprovalEffectFence>> {
         // Exact-site preparation is required for typed purpose receipts.
         if is_input_receipt(origin) {
-            return Ok(false);
+            return Ok(None);
         }
         if !is_immutable_origin(origin) {
-            return Ok(false);
+            return Ok(None);
         }
         let authorities = Self::input_authorities(conn, destination, None).await?;
         if authorities.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
         let admission = Self::require(
             conn,
@@ -1663,7 +1675,7 @@ impl ExecutionAdmissionRepository {
         ImmutableInputOriginRepository::require(conn, &authorities, std::slice::from_ref(origin))
             .await?;
         fence.ensure_fresh_on(conn).await?;
-        Ok(true)
+        Ok(Some(fence))
     }
 }
 

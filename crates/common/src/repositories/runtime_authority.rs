@@ -145,22 +145,39 @@ pub struct ValidatedRuntimeAuthority {
     effect_fence: ApprovalEffectFence,
 }
 
+/// Identities issued by the successful retained-authority walk. These are
+/// private source evidence, never permission grants or a caller supplied DTO.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) enum InputAuthorityDependency {
+    Sponsor(Id),
+    Policy(Id),
+    Admission(Id),
+    Approval(Id),
+}
+
 /// Approval rows remain locked by the source-validation transaction. Row locks
 /// fence revocation, but cannot stop wall-clock expiry while waiting on a target.
 /// Carry this opaque deadline through every target/version/capture wait and check
 /// it immediately before the effect or disclosure. Reacquire per transaction.
 #[derive(Debug, Clone)]
 pub struct ApprovalEffectFence {
+    input_dependencies: BTreeSet<InputAuthorityDependency>,
     earliest_expiry: Option<DateTime<Utc>>,
 }
 
 impl ApprovalEffectFence {
     pub(crate) fn from_input_approval(expiry: Option<DateTime<Utc>>) -> Result<Self> {
         let fence = Self {
+            input_dependencies: BTreeSet::new(),
             earliest_expiry: expiry,
         };
         fence.ensure_fresh()?;
         Ok(fence)
+    }
+    pub(crate) fn with_input_dependency(mut self, source: InputAuthorityDependency) -> Self {
+        self.input_dependencies.insert(source);
+        self
     }
     pub fn approval_deadline(&self) -> Option<DateTime<Utc>> {
         self.earliest_expiry
@@ -181,6 +198,11 @@ impl ApprovalEffectFence {
 
     pub fn intersect(&self, other: &Self) -> Self {
         Self {
+            input_dependencies: self
+                .input_dependencies
+                .union(&other.input_dependencies)
+                .cloned()
+                .collect(),
             earliest_expiry: self
                 .earliest_expiry
                 .into_iter()
@@ -1329,7 +1351,8 @@ impl RuntimeAuthorityRepository {
         let dependencies = validate_admission_dependencies(connection, &record).await?;
         let fence = policy_fence
             .intersect(&approvals.fence)
-            .intersect(&dependencies);
+            .intersect(&dependencies)
+            .with_input_dependency(InputAuthorityDependency::Admission(record.id));
         fence.ensure_fresh_on(connection).await?;
         Ok((record, fence))
     }
@@ -2003,6 +2026,7 @@ async fn lock_policy_with_deadline(
 ) -> Result<(RuntimePolicyRevision, ApprovalEffectFence)> {
     let root = lock_policy_one(connection, id).await?;
     let mut fence = ApprovalEffectFence {
+        input_dependencies: BTreeSet::new(),
         earliest_expiry: None,
     };
     let mut pending = vec![root.clone()];
@@ -2016,6 +2040,11 @@ async fn lock_policy_with_deadline(
                 "Workflow policy dependency graph exceeds admission bound".into(),
             ));
         }
+        fence = fence
+            .with_input_dependency(InputAuthorityDependency::Sponsor(
+                record.policy.owner.pack_id,
+            ))
+            .with_input_dependency(InputAuthorityDependency::Policy(record.id));
         let expected = record
             .policy
             .invocations
@@ -2093,6 +2122,7 @@ async fn validate_admission_dependencies_inner(
     staged_record: Option<Id>,
 ) -> Result<ApprovalEffectFence> {
     let mut fence = ApprovalEffectFence {
+        input_dependencies: BTreeSet::new(),
         earliest_expiry: None,
     };
     let mut pending = vec![root.clone()];
@@ -2199,7 +2229,9 @@ async fn validate_admission_dependencies_inner(
                 &dependency.authority.grants.iter().collect::<Vec<_>>(),
             )
             .await?;
-            fence = fence.intersect(&approvals.fence);
+            fence = fence
+                .intersect(&approvals.fence)
+                .with_input_dependency(InputAuthorityDependency::Admission(dependency.id));
             pending.push(dependency);
         }
     }
@@ -2307,6 +2339,7 @@ async fn validate_approvals(
         return Ok(ValidatedApprovals {
             ids,
             fence: ApprovalEffectFence {
+                input_dependencies: BTreeSet::new(),
                 earliest_expiry: None,
             },
         });
@@ -2352,7 +2385,14 @@ async fn validate_approvals(
             }
         }
     }
-    let fence = ApprovalEffectFence { earliest_expiry };
+    let fence = ApprovalEffectFence {
+        input_dependencies: ids
+            .iter()
+            .copied()
+            .map(InputAuthorityDependency::Approval)
+            .collect(),
+        earliest_expiry,
+    };
     fence.ensure_fresh()?;
     Ok(ValidatedApprovals { ids, fence })
 }
@@ -2375,15 +2415,45 @@ mod expiry_fence_tests {
     use super::*;
 
     #[test]
+    fn successful_fences_keep_only_their_issued_sources() {
+        let selected = ApprovalEffectFence::from_input_approval(None)
+            .unwrap()
+            .with_input_dependency(InputAuthorityDependency::Admission(11))
+            .with_input_dependency(InputAuthorityDependency::Sponsor(12));
+        let approved = ApprovalEffectFence::from_input_approval(None)
+            .unwrap()
+            .with_input_dependency(InputAuthorityDependency::Approval(13));
+        let failed_alternative = ApprovalEffectFence::from_input_approval(None)
+            .unwrap()
+            .with_input_dependency(InputAuthorityDependency::Approval(14));
+        let retained = selected.intersect(&approved).intersect(&approved);
+        assert_eq!(
+            retained.input_dependencies,
+            BTreeSet::from([
+                InputAuthorityDependency::Admission(11),
+                InputAuthorityDependency::Sponsor(12),
+                InputAuthorityDependency::Approval(13),
+            ])
+        );
+        assert!(!retained
+            .input_dependencies
+            .contains(&InputAuthorityDependency::Approval(14)));
+        assert_eq!(failed_alternative.input_dependencies.len(), 1);
+    }
+
+    #[test]
     fn deadline_intersection_keeps_earliest_selected_or_dependency_expiry() {
         let now = Utc::now();
         let direct = ApprovalEffectFence {
+            input_dependencies: BTreeSet::new(),
             earliest_expiry: Some(now + chrono::Duration::seconds(30)),
         };
         let graph = ApprovalEffectFence {
+            input_dependencies: BTreeSet::new(),
             earliest_expiry: Some(now + chrono::Duration::seconds(10)),
         };
         let parent = ApprovalEffectFence {
+            input_dependencies: BTreeSet::new(),
             earliest_expiry: Some(now + chrono::Duration::seconds(20)),
         };
         let combined = direct.intersect(&graph).intersect(&parent);
@@ -2402,9 +2472,11 @@ mod expiry_fence_tests {
     #[test]
     fn no_expiry_never_discards_another_fences_deadline() {
         let unbounded = ApprovalEffectFence {
+            input_dependencies: BTreeSet::new(),
             earliest_expiry: None,
         };
         let expired = ApprovalEffectFence {
+            input_dependencies: BTreeSet::new(),
             earliest_expiry: Some(Utc::now() - chrono::Duration::seconds(1)),
         };
         assert!(unbounded.ensure_fresh().is_ok());

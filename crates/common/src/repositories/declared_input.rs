@@ -538,6 +538,19 @@ impl DeclaredInputRepository {
         destination_path: &str,
         origin: &SecretOrigin,
     ) -> Result<bool> {
+        Ok(
+            Self::delivery_evidence(connection, execution, destination_path, origin)
+                .await?
+                .is_some(),
+        )
+    }
+
+    pub(crate) async fn delivery_evidence(
+        connection: &mut PgConnection,
+        execution: Id,
+        destination_path: &str,
+        origin: &SecretOrigin,
+    ) -> Result<Option<ApprovalEffectFence>> {
         let destination = Self::require_source(connection, execution).await?;
         let destination_fence =
             RuntimeAuthorityRepository::retained_admission_fence(connection, destination.id)
@@ -592,7 +605,7 @@ impl DeclaredInputRepository {
                     .ok_or_else(denied)?;
                 if crate::key_access::key_origin(&actual) == *key {
                     permit.effect_fence.ensure_fresh_on(connection).await?;
-                    return Ok(true);
+                    return Ok(Some(permit.effect_fence));
                 }
             } else if let SecretOrigin::Entity {
                 entity_type,
@@ -616,11 +629,11 @@ impl DeclaredInputRepository {
                 if revision.owner_kind == "pack" && revision.owner_id == permit.declaration.pack
                     && super::component_configuration::ComponentConfigurationRepository::owner_survives(connection,&revision).await? {
                         permit.effect_fence.ensure_fresh_on(connection).await?;
-                        return Ok(true);
+                        return Ok(Some(permit.effect_fence));
                     }
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// B copies receipts with identical-input retries in the creation transaction.

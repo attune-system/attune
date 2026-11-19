@@ -65,6 +65,7 @@ fn matcher_authority(
         standard_owners: BTreeSet::new(),
         concrete_targets,
         effect_fence: ApprovalEffectFence {
+            input_dependencies: Default::default(),
             earliest_expiry: None,
         },
     }
