@@ -39,15 +39,180 @@ pub(super) fn inspect(arguments: &[OsString]) -> io::Result<()> {
     std::io::stdout().lock().write_all(&result)
 }
 
+/// Legacy metadata commands retain their priority, expected exit and patterns.
+/// Success is an empty captured map: no language version or tool identity is
+/// invented for metadata-only availability declarations.
+pub(super) fn inspect_legacy(arguments: &[OsString]) -> io::Result<()> {
+    use attune_common::runtime_detection::NativeRuntimeVerification;
+    super::boundary_guard(true)?;
+    attune_common::parent_process_protection::protect_service_parent()
+        .map_err(|_| super::invalid())?;
+    if std::env::var_os("ATTUNE_API_TOKEN").is_some()
+        || arguments.len() < 2
+        || arguments.len() > 4096
+    {
+        return Err(super::invalid());
+    }
+    let path = arguments[0].to_str().ok_or_else(super::invalid)?;
+    let mut json = String::new();
+    for part in &arguments[1..] {
+        let part = part.to_str().ok_or_else(super::invalid)?;
+        if part.len() > RUNTIME_RECIPE_CHUNK_BYTES || part.is_empty() {
+            return Err(super::invalid());
+        }
+        json.push_str(part);
+        if json.len() > MAX_START_CONTEXT {
+            return Err(super::invalid());
+        }
+    }
+    let definition: NativeRuntimeVerification =
+        serde_json::from_str(&json).map_err(|_| super::invalid())?;
+    if definition.execution_config.get("lifecycle").is_some() {
+        return Err(super::invalid());
+    }
+    let environment = ChildProcessEnvironment::from_parent(
+        [
+            ("PATH".into(), path.into()),
+            ("HOME".into(), "/tmp".into()),
+            ("TMPDIR".into(), "/tmp".into()),
+            ("LANG".into(), "C.UTF-8".into()),
+        ],
+        &[],
+    )
+    .map_err(|_| super::invalid())?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async { verify_legacy(&definition, &environment).await })?;
+    std::io::stdout().lock().write_all(b"{}")
+}
+async fn verify_legacy(
+    definition: &attune_common::runtime_detection::NativeRuntimeVerification,
+    environment: &ChildProcessEnvironment,
+) -> io::Result<()> {
+    let verification = definition.distributions.get("verification");
+    if !definition.registered_version
+        && verification.is_some_and(|v| {
+            v.get("always_available").and_then(|v| v.as_bool()) == Some(true)
+                || v.get("check_required").and_then(|v| v.as_bool()) == Some(false)
+        })
+    {
+        return Ok(());
+    }
+    let mut commands = verification
+        .and_then(|v| v.get("commands"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    commands.sort_by_key(|c| {
+        c.get("priority")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(if definition.registered_version {
+                100
+            } else {
+                999
+            })
+    });
+    if commands.is_empty() {
+        if !definition.registered_version {
+            return Err(super::invalid());
+        }
+        let config: attune_common::models::runtime::RuntimeExecutionConfig =
+            serde_json::from_value(definition.execution_config.clone())
+                .map_err(|_| super::invalid())?;
+        if config.interpreter.binary.is_empty() {
+            return Ok(());
+        }
+        commands.push(serde_json::json!({"binary":config.interpreter.binary,"args":["--version"],"exit_code":0}));
+    }
+    for command in commands {
+        let Some(binary) = command.get("binary").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Ok(executable) =
+            attune_common::runtime_lifecycle::resolve_executable(binary, environment)
+        else {
+            continue;
+        };
+        if super::readonly_path(&executable, true).is_err()
+            || super::readonly_path(&executable.canonicalize()?, true).is_err()
+        {
+            return Err(super::invalid());
+        }
+        let args = command
+            .get("args")
+            .and_then(|v| v.as_array())
+            .map(|args| args.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let expected = command
+            .get("exit_code")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let Ok(expected) = i32::try_from(expected) else {
+            continue;
+        };
+        let mut process = tokio::process::Command::new(executable);
+        environment.apply(process.as_std_mut());
+        process.args(args).current_dir("/tmp");
+        let Ok(output) = attune_common::runtime_lifecycle::collect_runtime_verification(
+            process,
+            std::time::Duration::from_secs(10),
+            expected,
+            environment,
+        )
+        .await
+        else {
+            continue;
+        };
+        if let Some(pattern) = command.get("pattern").and_then(|v| v.as_str()) {
+            if !legacy_pattern_matches(pattern, &output) {
+                continue;
+            }
+        }
+        return Ok(());
+    }
+    Err(super::invalid())
+}
+fn legacy_pattern_matches(pattern: &str, output: &str) -> bool {
+    // Keep regex compilation in common's existing verifier module/dependency.
+    attune_common::runtime_detection::verification_pattern_matches(pattern, output)
+}
+
 /// Discovery/preparation run before the helper touches action stdin. Its parent
 /// protection prevents pack subprocesses from inspecting the held invocation
 /// environment or stdin FD. Each subprocess gets null stdin and public env only.
 /// The provider owns the whole deadline, cancellation, capture and stopped-writer
 /// cleanup; no generation is archived, published, reused or shared with siblings.
 pub(super) fn run(arguments: &[OsString]) -> io::Result<()> {
+    run_with_pack_access(arguments, false)
+}
+pub(super) fn run_candidate(arguments: &[OsString]) -> io::Result<()> {
+    run_with_pack_access(arguments, true)
+}
+fn run_with_pack_access(arguments: &[OsString], candidate_copy: bool) -> io::Result<()> {
     use attune_common::{runtime_lifecycle::RuntimeSource, workload_launch::PACK_ROOT};
     use std::{path::Path, process::Stdio};
-    super::boundary_guard(true)?;
+    if candidate_copy {
+        super::boundary_guard_basic()?;
+        for (path, readonly) in [
+            (PACK_ROOT, false),
+            (attune_common::workload_launch::RUNNER_ROOT, true),
+        ] {
+            if !Path::new(path).is_dir() {
+                return Err(super::invalid());
+            }
+            super::readonly_path(Path::new(path), readonly)?;
+        }
+        // Recipes never consume a shared/prepared Runtime mount. All writable
+        // generations belong to this same candidate attempt's private scratch.
+        if Path::new(attune_common::workload_launch::RUNTIME_ROOT).exists()
+            || std::env::current_dir()?.canonicalize()? != Path::new(PACK_ROOT).canonicalize()?
+        {
+            return Err(super::invalid());
+        }
+    } else {
+        super::boundary_guard(true)?;
+    }
     attune_common::parent_process_protection::protect_service_parent()
         .map_err(|_| super::invalid())?;
     let (recipe, path, source, inline, expected) = decode_run(arguments)?;
@@ -284,6 +449,76 @@ mod tests {
         }))
         .unwrap()
     }
+    #[tokio::test]
+    async fn public_verification_collector_still_denies_native_manager_local_launches() {
+        let environment = ChildProcessEnvironment::from_parent([], &[])
+            .unwrap()
+            .with_workload_sandbox(
+                attune_common::workload_sandbox::WorkloadSandbox::NativeEffectsRequired,
+            );
+        assert!(
+            attune_common::runtime_lifecycle::collect_runtime_verification(
+                tokio::process::Command::new("/owned-native-denied-must-never-run"),
+                std::time::Duration::from_secs(1),
+                0,
+                &environment,
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_metadata_only_availability_preserves_base_and_version_modes() {
+        let environment = ChildProcessEnvironment::from_parent([], &[]).unwrap();
+        let mut definition = attune_common::runtime_detection::NativeRuntimeVerification {
+            registered_version: false,
+            execution_config: serde_json::json!({}),
+            distributions: serde_json::json!({"verification":{"always_available":true}}),
+        };
+        assert!(verify_legacy(&definition, &environment).await.is_ok());
+        definition.distributions = serde_json::json!({"verification":{"check_required":false}});
+        assert!(verify_legacy(&definition, &environment).await.is_ok());
+        definition.distributions = serde_json::json!({});
+        assert!(verify_legacy(&definition, &environment).await.is_err());
+        definition.registered_version = true;
+        assert!(verify_legacy(&definition, &environment).await.is_ok());
+        assert!(legacy_pattern_matches("^owned$", "owned"));
+        assert!(!legacy_pattern_matches("[", "owned"));
+    }
+
+    #[test]
+    fn legacy_definition_is_exact_bounded_public_context_and_never_a_recipe() {
+        let definition = attune_common::runtime_detection::NativeRuntimeVerification {
+            registered_version: true,
+            execution_config: serde_json::json!({"interpreter":{"binary":"owned"}}),
+            distributions: serde_json::json!({"verification":{"commands":[{"binary":"owned","exit_code":7,"pattern":"^owned$"}]}}),
+        };
+        let argv = attune_workload_backend::planning::runtime_verification_argv(
+            LaunchPlatform::LinuxArm64,
+            &definition,
+            "/guest/bin",
+        )
+        .unwrap();
+        assert_eq!(argv[1], "inspect-runtime-verification");
+        let decoded: attune_common::runtime_detection::NativeRuntimeVerification =
+            serde_json::from_str(&argv[3..].concat()).unwrap();
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            serde_json::to_value(&definition).unwrap()
+        );
+        let mut invalid = definition;
+        invalid.execution_config = serde_json::json!({"lifecycle":{}});
+        assert!(
+            attune_workload_backend::planning::runtime_verification_argv(
+                LaunchPlatform::LinuxAmd64,
+                &invalid,
+                "/guest/bin"
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn definition_fragments_round_trip_with_only_explicit_guest_admission() {
         let mut recipe = recipe();

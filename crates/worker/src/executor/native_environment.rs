@@ -127,9 +127,13 @@ impl ActionExecutor {
             .as_ref()
             .ok_or_else(denied)?;
         let recipe = config.lifecycle.as_ref().ok_or_else(denied)?;
-        recipe
-            .require_admission(&self.child_environment)
-            .map_err(|_| denied())?;
+        recipe.validate().map_err(|_| denied())?;
+        if !self
+            .child_environment
+            .admits_native_runtime_recipe(&recipe.digest().map_err(|_| denied())?)
+        {
+            return Err(denied());
+        }
         let snapshot = execution.executable_snapshot.as_ref().ok_or_else(denied)?;
         let action = &snapshot.executable.action;
         if action.launch.is_some()
@@ -185,7 +189,7 @@ impl ActionExecutor {
 
     /// Startup's existing registration loop owns the operator-admitted digest
     /// set. This performs one real source-fenced guest probe, never host lookup.
-    pub(crate) async fn probe_registered_native_recipe(
+    pub(crate) async fn probe_registered_native_runtime(
         &self,
         runtime: &attune_common::models::Runtime,
         version: Option<&attune_common::models::RuntimeVersion>,
@@ -236,12 +240,28 @@ impl ActionExecutor {
             )
             .map_err(|_| denied())?;
         }
-        let recipe: attune_common::runtime_lifecycle::RuntimeRecipe =
-            serde_json::from_value(config.get("lifecycle").cloned().ok_or_else(denied)?)
-                .map_err(|_| denied())?;
-        if !admitted.contains(&recipe.digest().map_err(|_| denied())?) {
-            return Err(denied());
+        let recipe = config
+            .get("lifecycle")
+            .cloned()
+            .map(serde_json::from_value::<attune_common::runtime_lifecycle::RuntimeRecipe>)
+            .transpose()
+            .map_err(|_| denied())?;
+        if let Some(recipe) = &recipe {
+            let digest = recipe.digest().map_err(|_| denied())?;
+            if !admitted.contains(&digest)
+                || !self.child_environment.admits_native_runtime_recipe(&digest)
+            {
+                return Err(denied());
+            }
         }
+        let definition = attune_common::runtime_detection::NativeRuntimeVerification {
+            registered_version: version.is_some(),
+            execution_config: config.clone(),
+            distributions: version
+                .map(|v| &v.distributions)
+                .unwrap_or(&runtime.distributions)
+                .clone(),
+        };
         let pack = attune_common::repositories::pack::PackRepository::find_by_id(
             &self.pool,
             runtime.pack.ok_or_else(denied)?,
@@ -265,6 +285,8 @@ impl ActionExecutor {
             release_digest: release.digest.clone(),
             runtime_config: runtime.execution_config.clone(),
             version_config: version.map(|v| v.execution_config.clone()),
+            runtime_distributions: runtime.distributions.clone(),
+            version_distributions: version.map(|v| v.distributions.clone()),
         };
         let pack_pin = self.prepare_native_pack(release).await?;
         // A mutable runtime row cannot borrow an unrelated active release. Read
@@ -273,11 +295,12 @@ impl ActionExecutor {
             .cache
             .open_input_archive(&pack_pin)
             .map_err(|_| denied())?;
-        crate::runtime::launch_planning::validate_runtime_release_archive(
+        crate::runtime::launch_planning::validate_runtime_release_metadata(
             archive,
             &runtime.r#ref,
             &runtime.execution_config,
             version.map(|v| (v.version.as_str(), &v.execution_config)),
+            Some((&runtime.distributions, version.map(|v| &v.distributions))),
         )
         .map_err(|_| denied())?;
         let attempt = uuid::Uuid::new_v4();
@@ -296,11 +319,18 @@ impl ActionExecutor {
             stage: None,
             timeout_ms: Some(120000),
             invocation: LaunchInvocation {
-                argv: crate::runtime::launch_planning::runtime_tool_probe_argv(
-                    native.config.platform,
-                    &recipe,
-                    "/usr/local/bin:/usr/bin:/bin",
-                )
+                argv: match &recipe {
+                    Some(recipe) => crate::runtime::launch_planning::runtime_tool_probe_argv(
+                        native.config.platform,
+                        recipe,
+                        "/usr/local/bin:/usr/bin:/bin",
+                    ),
+                    None => crate::runtime::launch_planning::runtime_verification_argv(
+                        native.config.platform,
+                        &definition,
+                        "/usr/local/bin:/usr/bin:/bin",
+                    ),
+                }
                 .map_err(|_| denied())?,
                 env: Default::default(),
                 working_root: LaunchRoot::Pack,

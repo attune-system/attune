@@ -531,6 +531,65 @@ async fn runtime_recipe_discovery(f: &Fixture) -> TestResult {
     {
         return Err("Docker private recipe preparation/invocation failed".into());
     }
+    spec.intent = Uuid::new_v4();
+    spec.target = f.spec(Vec::new()).target;
+    spec.invocation.argv = attune_workload_backend::planning::runtime_recipe_argv(
+        f.platform,
+        &recipe,
+        "/usr/bin:/bin",
+        "actions/owned.py",
+        false,
+        Some("999.0.0"),
+    )?;
+    let resource = f
+        .launcher
+        .prepare(&spec, ProcessCreateDisposition::CreateOnce)
+        .await?;
+    let result = async {
+        run(
+            f.launcher.start(&spec, &resource).await?,
+            runtime_recipe::STDIN.to_vec(),
+        )
+        .await
+    }
+    .await;
+    f.launcher.remove_stopped(&spec, &resource).await?;
+    let (exit, out, err) = result?;
+    if exit.exit_code == 0 || exit.oom_killed || !out.is_empty() || err.len() > 1024 {
+        return Err(
+            "Docker recipe version drift did not fail before preparation/invocation".into(),
+        );
+    }
+    for matches in [true, false] {
+        spec.intent = Uuid::new_v4();
+        spec.purpose = LaunchPurpose::RuntimeProbe;
+        spec.target = LaunchTarget::RuntimeProbe {
+            admission: 1,
+            attempt: Uuid::new_v4(),
+        };
+        spec.invocation.env = BTreeMap::from([("SELECTED".into(), "must-not-reach-probe".into())]);
+        spec.invocation.argv = attune_workload_backend::planning::runtime_verification_argv(
+            f.platform,
+            &runtime_recipe::legacy_definition(matches),
+            "/usr/bin:/bin",
+        )?;
+        let resource = f
+            .launcher
+            .prepare(&spec, ProcessCreateDisposition::CreateOnce)
+            .await?;
+        let result =
+            async { run(f.launcher.start(&spec, &resource).await?, Vec::new()).await }.await;
+        f.launcher.remove_stopped(&spec, &resource).await?;
+        let (exit, out, err) = result?;
+        if exit.oom_killed
+            || (matches && (exit.exit_code != 0 || out != b"{}" || !err.is_empty()))
+            || (!matches && (exit.exit_code == 0 || !out.is_empty() || err.len() > 1024))
+        {
+            return Err(
+                "Docker legacy native verification expected-exit/pattern control failed".into(),
+            );
+        }
+    }
     Ok(())
 }
 

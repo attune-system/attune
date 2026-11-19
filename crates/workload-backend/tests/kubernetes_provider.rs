@@ -825,6 +825,44 @@ async fn inspect_installed_command_without_manager_discovery(f: &Fixture) -> Tes
     {
         return Err("private recipe preparation/invocation failed".into());
     }
+    execution.intent = Uuid::new_v4();
+    execution.target = f.spec(Vec::new())?.target;
+    execution.invocation.argv = attune_workload_backend::planning::runtime_recipe_argv(
+        execution.platform,
+        &recipe,
+        "/usr/bin:/bin",
+        "actions/owned.py",
+        false,
+        Some("999.0.0"),
+    )?;
+    let (exit, out, err) = f.run(&execution, runtime_recipe::STDIN.to_vec()).await?;
+    if exit.exit_code == 0 || exit.oom_killed || !out.is_empty() || err.len() > 1024 {
+        return Err("recipe version drift did not fail before preparation/invocation".into());
+    }
+    for matches in [true, false] {
+        execution.intent = Uuid::new_v4();
+        execution.purpose = LaunchPurpose::RuntimeProbe;
+        execution.target = LaunchTarget::RuntimeProbe {
+            admission: 1,
+            attempt: Uuid::new_v4(),
+        };
+        execution.invocation.env =
+            BTreeMap::from([("SELECTED".into(), "must-not-reach-probe".into())]);
+        execution.invocation.argv = attune_workload_backend::planning::runtime_verification_argv(
+            execution.platform,
+            &runtime_recipe::legacy_definition(matches),
+            "/usr/bin:/bin",
+        )?;
+        let (exit, out, err) = f.run(&execution, Vec::new()).await?;
+        if exit.oom_killed
+            || (matches && (exit.exit_code != 0 || out != b"{}" || !err.is_empty()))
+            || (!matches && (exit.exit_code == 0 || !out.is_empty() || err.len() > 1024))
+        {
+            return Err(
+                "legacy native verification priority/expected-exit/pattern control failed".into(),
+            );
+        }
+    }
     Ok(())
 }
 #[tokio::test]

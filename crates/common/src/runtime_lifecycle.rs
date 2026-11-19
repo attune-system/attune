@@ -767,7 +767,29 @@ fn copy_workspace(source: &Path, destination: &Path) -> Result<()> {
 
 /// Bounded setup/probe capture. Failure diagnostics deliberately exclude child
 /// output, which can contain dependency credentials or arbitrary pack content.
-async fn collect(mut command: Command, deadline: Duration) -> Result<String> {
+async fn collect(command: Command, deadline: Duration) -> Result<String> {
+    collect_with_exit(command, deadline, 0, "\n").await
+}
+
+/// Shared bounded guest verification supervision; stdin is always null. The
+/// native caller has already selected public environment and read-only binary.
+pub async fn collect_runtime_verification(
+    command: Command,
+    deadline: Duration,
+    expected_exit: i32,
+    environment: &ChildProcessEnvironment,
+) -> Result<String> {
+    // A native manager's captured policy never authorizes this local adapter.
+    let command = environment.sandbox_probe(command.into_std())?;
+    collect_with_exit(Command::from(command), deadline, expected_exit, "").await
+}
+
+async fn collect_with_exit(
+    mut command: Command,
+    deadline: Duration,
+    expected_exit: i32,
+    separator: &str,
+) -> Result<String> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -803,11 +825,11 @@ async fn collect(mut command: Command, deadline: Duration) -> Result<String> {
             Some(value) => value,
             None => readers.await?,
         };
-        if !status.success() {
+        if status.code().unwrap_or(-1) != expected_exit {
             return Err(invalid("Runtime command failed"));
         }
         Ok(format!(
-            "{}\n{}",
+            "{}{separator}{}",
             String::from_utf8_lossy(&out),
             String::from_utf8_lossy(&err)
         ))
@@ -864,5 +886,8 @@ impl Drop for ProcessGroup {
 /// Bounded native release readers parse ordinary runtime YAML without granting
 /// recipe admission or performing any executable effect.
 pub fn parse_release_metadata(bytes: &[u8]) -> Result<serde_json::Value> {
+    if bytes.len() > 1024 * 1024 {
+        return Err(invalid("Retained runtime metadata exceeds bounds"));
+    }
     serde_yaml_ng::from_slice(bytes).map_err(|_| invalid("Invalid retained runtime metadata"))
 }

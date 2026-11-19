@@ -141,6 +141,8 @@ async fn fixture() -> (
         release_digest: release.digest,
         runtime_config: config,
         version_config: None,
+        runtime_distributions: json!({}),
+        version_distributions: None,
     };
     (db, source, spec)
 }
@@ -313,5 +315,77 @@ async fn captured_map_and_exact_removal_receipts_survive_idempotent_retry() {
         serde_json::to_value(Probe::tools(&db, spec.intent, MASTER).await.unwrap()).unwrap(),
         serde_json::to_value(tools()).unwrap()
     );
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_verification_has_no_invented_tools_and_distribution_restore_revokes() {
+    let (db, mut source, mut spec) = fixture().await;
+    source.runtime_config = json!({"interpreter":{"binary":"/usr/bin/owned"}});
+    source.runtime_distributions = json!({"verification":{"commands":[{"binary":"/usr/bin/owned","exit_code":7,"pattern":"owned"}]}});
+    sqlx::query("UPDATE runtime SET execution_config=$2,distributions=$3 WHERE id=$1")
+        .bind(source.runtime)
+        .bind(&source.runtime_config)
+        .bind(&source.runtime_distributions)
+        .execute(&*db)
+        .await
+        .unwrap();
+    let definition = attune_common::runtime_detection::NativeRuntimeVerification {
+        registered_version: false,
+        execution_config: source.runtime_config.clone(),
+        distributions: source.runtime_distributions.clone(),
+    };
+    spec.invocation.argv = vec![
+        format!("{RUNNER_ROOT}/linux-amd64"),
+        "inspect-runtime-verification".into(),
+        "/usr/bin:/bin".into(),
+        serde_json::to_string(&definition).unwrap(),
+    ];
+    let spec = Probe::reserve(&db, Uuid::new_v4(), source.clone(), spec, MASTER)
+        .await
+        .unwrap();
+    Probe::begin_create(&db, spec.intent, MASTER).await.unwrap();
+    let resource = resource();
+    Probe::record_resource(&db, spec.intent, &resource)
+        .await
+        .unwrap();
+    Probe::consume_stdin(&db, spec.intent, &resource, MASTER)
+        .await
+        .unwrap();
+    Probe::record_exit(
+        &db,
+        spec.intent,
+        &resource,
+        LaunchExitOutcome {
+            exit_code: 0,
+            oom_killed: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        Probe::complete(&db, spec.intent, &resource, &tools(), MASTER)
+            .await
+            .is_err()
+    );
+    Probe::complete(&db, spec.intent, &resource, &VerifiedToolMap::new(), MASTER)
+        .await
+        .unwrap();
+    assert!(Probe::tools(&db, spec.intent, MASTER)
+        .await
+        .unwrap()
+        .is_empty());
+    sqlx::query("UPDATE runtime SET distributions='{}' WHERE id=$1")
+        .bind(source.runtime)
+        .execute(&*db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE runtime SET distributions=$2 WHERE id=$1")
+        .bind(source.runtime)
+        .bind(&source.runtime_distributions)
+        .execute(&*db)
+        .await
+        .unwrap();
+    assert!(Probe::tools(&db, spec.intent, MASTER).await.is_err());
     db.cleanup().await.unwrap();
 }

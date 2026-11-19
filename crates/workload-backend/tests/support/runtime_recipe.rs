@@ -39,3 +39,15 @@ pub fn executable_recipe() -> RuntimeRecipe {
 }
 pub const SOURCE: &[u8] = b"import os,sys\nassert os.environ['ATTUNE_API_TOKEN']=='owned-invocation-only'\nassert os.environ['SELECTED']=='owned-caller-only'\nsys.stdout.buffer.write(b'recipe:'+sys.stdin.buffer.read())\n";
 pub const STDIN: &[u8] = b"{\"exact\": [1, true]} \n";
+
+pub fn legacy_definition(
+    matches: bool,
+) -> attune_common::runtime_detection::NativeRuntimeVerification {
+    attune_common::runtime_detection::NativeRuntimeVerification {
+        registered_version: false,
+        execution_config: serde_json::json!({"interpreter":{"binary":"/bin/sh"}}),
+        distributions: serde_json::json!({"verification":{"commands":[
+            {"binary":"/bin/sh","args":["-c",r#"test -z "${ATTUNE_API_TOKEN+x}" && test -z "${SELECTED+x}" && printf legacy; exit 7"#],"exit_code":7,"pattern":if matches {"^legacy$"}else{"must-not-match"},"priority":1}
+        ]}}),
+    }
+}

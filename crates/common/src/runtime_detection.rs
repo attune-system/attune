@@ -616,3 +616,17 @@ mod tests {
         let _ = RuntimeDetector::try_verification_command(&cmd, "Shell", &Default::default()).await;
     }
 }
+
+/// Public immutable legacy verification metadata selected from a retained
+/// runtime release. This is a guest-only effect input, not local admission.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeRuntimeVerification {
+    pub registered_version: bool,
+    pub execution_config: serde_json::Value,
+    pub distributions: serde_json::Value,
+}
+
+pub fn verification_pattern_matches(pattern: &str, output: &str) -> bool {
+    regex::Regex::new(pattern).is_ok_and(|pattern| pattern.is_match(output))
+}

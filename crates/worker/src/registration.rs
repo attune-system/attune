@@ -86,6 +86,7 @@ impl WorkerRegistration {
                     })
             });
         let versions = RuntimeVersionRepository::list(&self.pool).await?;
+        let mut legacy_versions = Vec::new();
         let mut instances = serde_json::Map::new();
         let mut names = std::collections::BTreeSet::from(["native".to_owned()]);
         for runtime in RuntimeRepository::list(&self.pool).await? {
@@ -101,6 +102,31 @@ impl WorkerRegistration {
                 continue;
             }
             let Some(raw) = runtime.execution_config.get("lifecycle") else {
+                let mut available = executor
+                    .probe_registered_native_runtime(&runtime, None, admitted)
+                    .await
+                    .is_ok();
+                for version in versions.iter().filter(|v| v.runtime == runtime.id) {
+                    if crate::version_verify::verify_native_runtime_version(
+                        executor, &runtime, version, admitted,
+                    )
+                    .await
+                    {
+                        let mut version = version.clone();
+                        version.available = true;
+                        legacy_versions.push(version);
+                        available = true;
+                    }
+                }
+                if available {
+                    names.extend(
+                        runtime
+                            .aliases
+                            .iter()
+                            .chain(std::iter::once(&runtime.name))
+                            .map(|n| normalize_runtime_name(n)),
+                    );
+                }
                 continue;
             };
             let Ok(recipe) = serde_json::from_value::<
@@ -115,28 +141,34 @@ impl WorkerRegistration {
                 continue;
             }
             let tools = executor
-                .probe_registered_native_recipe(&runtime, None, admitted)
+                .probe_registered_native_runtime(&runtime, None, admitted)
                 .await
                 .ok();
             let mut available = Vec::new();
             for version in versions.iter().filter(|v| v.runtime == runtime.id) {
                 if let Ok(tools) = executor
-                    .probe_registered_native_recipe(&runtime, Some(version), admitted)
+                    .probe_registered_native_runtime(&runtime, Some(version), admitted)
                     .await
                 {
-                    if let Some(primary) = recipe
-                        .tools
-                        .iter()
-                        .find(|t| t.primary)
+                    let selected_recipe = version
+                        .execution_config
+                        .get("lifecycle")
+                        .cloned()
+                        .and_then(|value| {
+                            serde_json::from_value::<
+                                    attune_common::runtime_lifecycle::RuntimeRecipe,
+                                >(value)
+                                .ok()
+                        });
+                    if let Some(primary) = selected_recipe
+                        .as_ref()
+                        .and_then(|recipe| recipe.tools.iter().find(|t| t.primary))
                         .and_then(|t| tools.get(&t.name))
                     {
-                        if primary.version == version.version
-                            || attune_common::version_matching::matches_constraint(
-                                &primary.version,
-                                &format!("={}", version.version),
-                            )
-                            .unwrap_or(false)
-                        {
+                        if attune_common::version_matching::runtime_version_matches_worker(
+                            version,
+                            &primary.version,
+                        ) {
                             available.push(version.version.clone());
                         }
                     }
@@ -172,8 +204,13 @@ impl WorkerRegistration {
             .insert("runtime_toolchains".into(), json!(instances));
         self.capabilities
             .insert("runtime_recipe_digests".into(), json!(admitted));
-        self.capabilities
-            .insert(RUNTIME_VERSIONS_CAPABILITY_KEY.into(), json!({}));
+        self.capabilities.insert(
+            RUNTIME_VERSIONS_CAPABILITY_KEY.into(),
+            crate::version_verify::build_runtime_versions_capability(
+                &legacy_versions,
+                filter.as_deref(),
+            ),
+        );
         self.capabilities.insert(
             attune_common::execution_authority::DELEGATED_EXECUTION_CAPABILITY.into(),
             json!(config.security.encryption_key.is_some()),

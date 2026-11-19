@@ -154,6 +154,26 @@ pub async fn verify_all_runtime_versions(
     result
 }
 
+/// Native startup verifies the exact retained runtime release through the
+/// existing executor effects. No shared runtime_version availability is written.
+pub(crate) async fn verify_native_runtime_version(
+    executor: &crate::executor::ActionExecutor,
+    runtime: &attune_common::models::Runtime,
+    version: &RuntimeVersion,
+    admitted: &std::collections::BTreeSet<String>,
+) -> bool {
+    version.runtime == runtime.id
+        && attune_common::runtime_lifecycle::validate_version_mode(
+            &runtime.execution_config,
+            &version.execution_config,
+        )
+        .is_ok()
+        && executor
+            .probe_registered_native_runtime(runtime, Some(version), admitted)
+            .await
+            .is_ok()
+}
+
 /// Build the worker capability payload describing which verified runtime
 /// versions are currently available on this worker.
 ///

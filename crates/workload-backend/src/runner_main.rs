@@ -72,7 +72,11 @@ fn main() {
         #[cfg(unix)]
         Some("inspect-runtime-tools") => recipe_probe::inspect(&arguments[1..]),
         #[cfg(unix)]
+        Some("inspect-runtime-verification") => recipe_probe::inspect_legacy(&arguments[1..]),
+        #[cfg(unix)]
         Some("run-runtime-recipe") => recipe_probe::run(&arguments[1..]),
+        #[cfg(unix)]
+        Some("run-candidate-runtime-recipe") => recipe_probe::run_candidate(&arguments[1..]),
         _ => Err(invalid()),
     };
     if result.is_err() {

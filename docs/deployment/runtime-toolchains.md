@@ -35,9 +35,16 @@ physical paths. No shared Ready marker, runtime publication or reuse is involved
 The owning worker retains output policy, capture, custody, source fencing and
 positive stopped-writer cleanup; provider timeout/cancellation covers all phases.
 
-The constructor/registration wiring, native digest policy helper, legacy
-verification-command discovery, candidate/sensor producers, and actual provider
-acceptance remain activation requirements. The source milestone does not enable
+Legacy verification uses the fixed `inspect-runtime-verification` effect with
+exact source-fenced configuration and distribution metadata. It preserves command
+priority, expected exits and patterns, version interpreter fallback and base
+metadata-only availability. Success records an empty captured tool map rather
+than inventing tool identities; per-worker version capabilities do not mutate
+global availability. Distribution edits and restores invalidate old receipts.
+
+The constructor/heartbeat/registration wiring, candidate/sensor producers,
+helper launch-timeout status propagation, and actual provider acceptance remain
+activation requirements. The source milestone does not enable
 deployment defaults or relax existing public-input origin restrictions. Local
 trusted and legacy reusable-environment contracts remain unchanged.
 

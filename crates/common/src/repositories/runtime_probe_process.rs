@@ -29,6 +29,8 @@ pub struct RuntimeProbeSource {
     pub release_digest: String,
     pub runtime_config: serde_json::Value,
     pub version_config: Option<serde_json::Value>,
+    pub runtime_distributions: serde_json::Value,
+    pub version_distributions: Option<serde_json::Value>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,6 +58,29 @@ impl Context {
             pack_access: PackAccess::ReadOnly,
             stage: None,
         }
+    }
+    fn legacy(&self) -> Result<crate::runtime_detection::NativeRuntimeVerification> {
+        let execution_config = self
+            .source
+            .version_config
+            .as_ref()
+            .unwrap_or(&self.source.runtime_config)
+            .clone();
+        if execution_config.get("lifecycle").is_some()
+            || self.source.runtime_config.get("lifecycle").is_some()
+        {
+            return Err(denied());
+        }
+        Ok(crate::runtime_detection::NativeRuntimeVerification {
+            registered_version: self.source.runtime_version.is_some(),
+            execution_config,
+            distributions: self
+                .source
+                .version_distributions
+                .as_ref()
+                .unwrap_or(&self.source.runtime_distributions)
+                .clone(),
+        })
     }
     fn recipe(&self) -> Result<RuntimeRecipe> {
         let config = self
@@ -146,18 +171,21 @@ async fn source(
     .bind(&s.release_digest)
     .fetch_one(&mut **tx)
     .await?;
-    let runtime:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM runtime WHERE id=$1 AND pack=$2 AND execution_config=$3 AND retired_at IS NULL FOR SHARE)")
-        .bind(s.runtime).bind(s.provider_pack).bind(&s.runtime_config).fetch_one(&mut **tx).await?;
+    let runtime:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM runtime WHERE id=$1 AND pack=$2 AND execution_config=$3 AND distributions=$4 AND retired_at IS NULL FOR SHARE)")
+        .bind(s.runtime).bind(s.provider_pack).bind(&s.runtime_config).bind(&s.runtime_distributions).fetch_one(&mut **tx).await?;
     if !release || !runtime {
         return Err(denied());
     }
     if let Some(version) = s.runtime_version {
-        let ok:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM runtime_version WHERE id=$1 AND runtime=$2 AND execution_config=$3 AND version=$4 AND retired_at IS NULL FOR SHARE)")
-            .bind(version).bind(s.runtime).bind(s.version_config.as_ref().ok_or_else(denied)?).bind(s.runtime_version_string.as_ref().ok_or_else(denied)?).fetch_one(&mut **tx).await?;
+        let ok:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM runtime_version WHERE id=$1 AND runtime=$2 AND execution_config=$3 AND version=$4 AND distributions=$5 AND retired_at IS NULL FOR SHARE)")
+            .bind(version).bind(s.runtime).bind(s.version_config.as_ref().ok_or_else(denied)?).bind(s.runtime_version_string.as_ref().ok_or_else(denied)?).bind(s.version_distributions.as_ref().ok_or_else(denied)?).fetch_one(&mut **tx).await?;
         if !ok {
             return Err(denied());
         }
-    } else if s.version_config.is_some() || s.runtime_version_string.is_some() {
+    } else if s.version_config.is_some()
+        || s.runtime_version_string.is_some()
+        || s.version_distributions.is_some()
+    {
         return Err(denied());
     }
     let expiry:DateTime<Utc>=sqlx::query_scalar("SELECT expires_at FROM runtime_probe_admission WHERE id=$1 AND attempt=$2 AND worker=$3 AND incarnation=$4 AND runtime=$5 AND runtime_version IS NOT DISTINCT FROM $6 AND provider_pack=$7 AND release=$8 AND revoked_at IS NULL FOR SHARE")
@@ -250,15 +278,23 @@ impl RuntimeProbeProcessRepository {
             timeout_ms: spec.timeout_ms,
             invocation: spec.invocation.clone(),
         };
-        let recipe = c.recipe()?;
+        let definition =
+            if c.invocation.argv.get(1).map(String::as_str) == Some("inspect-runtime-tools") {
+                serde_json::to_value(c.recipe()?)?
+            } else if c.invocation.argv.get(1).map(String::as_str)
+                == Some("inspect-runtime-verification")
+            {
+                serde_json::to_value(c.legacy()?)?
+            } else {
+                return Err(denied());
+            };
         if c.invocation.argv.len() < 4
             || c.invocation.argv[0] != format!("{RUNNER_ROOT}/linux-{}", c.platform.native_arch())
-            || c.invocation.argv[1] != "inspect-runtime-tools"
             || c.invocation.argv.iter().any(|a| a.contains('\0'))
             || c.invocation.argv.iter().map(String::len).sum::<usize>() > 1024 * 1024
             || serde_json::from_str::<serde_json::Value>(&c.invocation.argv[3..].concat())
                 .map_err(|_| denied())?
-                != serde_json::to_value(recipe)?
+                != definition
         {
             return Err(denied());
         }
@@ -469,19 +505,36 @@ impl RuntimeProbeProcessRepository {
     ) -> Result<()> {
         let mut tx = pool.begin().await?;
         let (old, c, deadline) = checked(&mut tx, intent, master).await?;
-        let recipe = c.recipe()?;
+        let recipe = if c.invocation.argv.get(1).map(String::as_str)
+            == Some("inspect-runtime-verification")
+        {
+            c.legacy()?;
+            None
+        } else {
+            Some(c.recipe()?)
+        };
+        if serde_json::to_vec(tools)?.len() > 4 * 1024 * 1024 {
+            return Err(denied());
+        }
         if !old.stdin_consumed
             || old.resource.as_ref().map(|r| &r.0) != Some(resource)
             || !old
                 .exit_outcome
                 .as_ref()
                 .is_some_and(|e| e.0.exit_code == 0 && !e.0.oom_killed)
-            || tools.len() != recipe.tools.len()
-            || recipe.tools.iter().any(|t| {
-                !tools.get(&t.name).is_some_and(|v| {
-                    v.executable.is_absolute() && v.identity.is_absolute() && !v.version.is_empty()
-                })
-            })
+            || match &recipe {
+                Some(recipe) => {
+                    tools.len() != recipe.tools.len()
+                        || recipe.tools.iter().any(|t| {
+                            !tools.get(&t.name).is_some_and(|v| {
+                                v.executable.is_absolute()
+                                    && v.identity.is_absolute()
+                                    && !v.version.is_empty()
+                            })
+                        })
+                }
+                None => !tools.is_empty(),
+            }
             || old.runtime_probe_tools.as_ref().is_some_and(|old| {
                 serde_json::to_value(&old.0).ok() != serde_json::to_value(tools).ok()
             })

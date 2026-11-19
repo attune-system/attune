@@ -153,6 +153,40 @@ pub fn runtime_tool_probe_argv(
 /// Private CP-selected envelope, never a public Runner body or caller plan.
 /// Selection/provenance must already be bound to the admitted immutable image
 /// or native input. This function never probes the CP host filesystem/PATH.
+/// Legacy version/availability probes use their exact public release metadata,
+/// separately from operator-admitted lifecycle recipes. No invocation context.
+pub fn runtime_verification_argv(
+    platform: LaunchPlatform,
+    definition: &attune_common::runtime_detection::NativeRuntimeVerification,
+    guest_path: &str,
+) -> Result<Vec<String>> {
+    if definition.execution_config.get("lifecycle").is_some() || guest_path.contains('\0') {
+        return Err(PlanningError::Configuration);
+    }
+    let json = serde_json::to_string(definition).map_err(|_| PlanningError::Configuration)?;
+    let mut argv = vec![
+        runner_program(platform),
+        "inspect-runtime-verification".into(),
+        guest_path.into(),
+    ];
+    let mut rest = json.as_str();
+    while !rest.is_empty() {
+        let mut end = rest.len().min(RUNTIME_RECIPE_CHUNK_BYTES);
+        while !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        argv.push(rest[..end].into());
+        rest = &rest[end..];
+    }
+    crate::runner_protocol::encode_start(&attune_common::workload_launch::LaunchInvocation {
+        argv: argv.clone(),
+        env: BTreeMap::new(),
+        working_root: attune_common::workload_launch::LaunchRoot::Pack,
+    })
+    .map_err(|_| PlanningError::Bounds)?;
+    Ok(argv)
+}
+
 /// Fixed guest lifecycle invocation. The definition and source are private
 /// context, never provider metadata. Source is relative to the pinned release;
 /// inline source admission remains an owning-loop decision.
@@ -193,6 +227,28 @@ pub fn runtime_recipe_argv(
     if argv.iter().map(String::len).sum::<usize>() > crate::runner_protocol::MAX_START_CONTEXT {
         return Err(PlanningError::Bounds);
     }
+    Ok(argv)
+}
+
+/// Candidate tests retain their existing private writable Pack source. The
+/// closed adapter must admit CandidateCopy; the fixed guest checks that mount.
+pub fn candidate_runtime_recipe_argv(
+    platform: LaunchPlatform,
+    recipe: &attune_common::runtime_lifecycle::RuntimeRecipe,
+    guest_path: &str,
+    source: &str,
+    inline: bool,
+    selected_version: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut argv = runtime_recipe_argv(
+        platform,
+        recipe,
+        guest_path,
+        source,
+        inline,
+        selected_version,
+    )?;
+    argv[1] = "run-candidate-runtime-recipe".into();
     Ok(argv)
 }
 
@@ -1033,10 +1089,19 @@ pub fn validate_runtime_release_archive(
     runtime_config: &serde_json::Value,
     version: Option<(&str, &serde_json::Value)>,
 ) -> Result<()> {
+    validate_runtime_release_metadata(archive, runtime_ref, runtime_config, version, None)
+}
+pub fn validate_runtime_release_metadata(
+    archive: std::fs::File,
+    runtime_ref: &str,
+    runtime_config: &serde_json::Value,
+    version: Option<(&str, &serde_json::Value)>,
+    distributions: Option<(&serde_json::Value, Option<&serde_json::Value>)>,
+) -> Result<()> {
     let mut archive = zip::ZipArchive::new(archive).map_err(|_| PlanningError::Configuration)?;
     let mut matched = false;
     for index in 0..archive.len() {
-        let mut entry = archive
+        let entry = archive
             .by_index(index)
             .map_err(|_| PlanningError::Configuration)?;
         let path = entry.name().map_err(|_| PlanningError::Configuration)?;
@@ -1049,6 +1114,7 @@ pub fn validate_runtime_release_archive(
         use std::io::Read;
         let mut bytes = Vec::new();
         entry
+            .take(1024 * 1024 + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| PlanningError::Configuration)?;
         let metadata: serde_json::Value =
@@ -1056,6 +1122,12 @@ pub fn validate_runtime_release_archive(
                 .map_err(|_| PlanningError::Configuration)?;
         if metadata.get("ref").and_then(|r| r.as_str()) != Some(runtime_ref) {
             continue;
+        }
+        let empty = serde_json::json!({});
+        if distributions
+            .is_some_and(|(base, _)| metadata.get("distributions").unwrap_or(&empty) != base)
+        {
+            return Err(PlanningError::Configuration);
         }
         if matched || metadata.get("execution_config") != Some(runtime_config) {
             return Err(PlanningError::Configuration);
@@ -1070,6 +1142,12 @@ pub fn validate_runtime_release_archive(
                         .find(|v| v.get("version").and_then(|v| v.as_str()) == Some(version))
                 })
                 .ok_or(PlanningError::Configuration)?;
+            if distributions
+                .and_then(|(_, version)| version)
+                .is_some_and(|expected| declared.get("distributions").unwrap_or(&empty) != expected)
+            {
+                return Err(PlanningError::Configuration);
+            }
             if declared.get("execution_config") != Some(version_config) {
                 return Err(PlanningError::Configuration);
             }
