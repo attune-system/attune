@@ -56,21 +56,6 @@ pub(super) async fn handle(
         tx.commit().await?;
         return Ok(());
     }
-    let has_python = testing.runners.values().any(|runner| {
-        runner.lifecycle.is_none() && matches!(runner.r#type.as_str(), "unittest" | "pytest")
-    });
-    if has_python
-        && testing
-            .runners
-            .values()
-            .any(|runner| runner.lifecycle.is_some())
-    {
-        // Combined preparation is enabled only after its fixed helper and
-        // retained challenge admission are integrated together.
-        return Err(Error::validation(
-            "Native candidate recipe and Python composition is not yet available",
-        ));
-    }
     let mut tests =
         native.attach(TestExecutor::new(packs_base_dir.to_owned()).with_cancellation(cancellation));
     let lease = if testing.candidate_api_effects {

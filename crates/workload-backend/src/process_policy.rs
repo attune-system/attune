@@ -212,4 +212,78 @@ mod tests {
             assert!(crate::runner_protocol::encode_start(&spec.invocation).is_err());
         }
     }
+
+    fn combined_candidate(platform: LaunchPlatform) -> ProcessSpec {
+        let mut spec = candidate(platform);
+        let runtime: serde_json::Value =
+            serde_yaml_ng::from_str(include_str!("../../../packs/core/runtimes/python.yaml"))
+                .unwrap();
+        let plan = crate::planning::CandidatePythonPlan {
+            version: 1,
+            config: serde_json::from_value(runtime["execution_config"].clone()).unwrap(),
+            runner: "runtime".into(),
+            entry: "tests/owned.py".into(),
+            timeout_ms: 30_000,
+            recipe: Some(serde_json::from_value(serde_json::json!({
+                "tools":[{"name":"tool","binaries":["tool"],"version_pattern":"(?<version>1)","primary":true}],
+                "launch":{"command":["{tool_tool}","{source_file}"]}
+            })).unwrap()),
+        };
+        spec.invocation.argv = crate::planning::candidate_python_argv(platform, &plan).unwrap();
+        spec
+    }
+
+    #[test]
+    fn combined_candidate_controls_roundtrip_exact_frame_and_application_input() {
+        for platform in [LaunchPlatform::LinuxAmd64, LaunchPlatform::LinuxArm64] {
+            let mut spec = combined_candidate(platform);
+            let public = public_digest(&spec).unwrap();
+            crate::candidate_prep::bind_challenge(&mut spec, None).unwrap();
+            crate::recipe_timeout::bind_challenge(&mut spec, None).unwrap();
+            validate_invocation(&spec).unwrap();
+            assert_eq!(public_digest(&spec).unwrap(), public);
+            for input in [b"".as_slice(), br#"{"owned":"exact original input"}"#] {
+                let mut frame = crate::runner_protocol::encode_start(&spec.invocation).unwrap();
+                frame.extend_from_slice(input);
+                let mut cursor = Cursor::new(frame);
+                assert_eq!(
+                    crate::runner_protocol::read_start(&mut cursor).unwrap(),
+                    spec.invocation
+                );
+                let mut remaining = Vec::new();
+                cursor.read_to_end(&mut remaining).unwrap();
+                assert_eq!(remaining, input);
+            }
+        }
+    }
+
+    #[test]
+    fn combined_candidate_timeout_control_requires_exact_plan_and_process_policy() {
+        for mutation in 0..7 {
+            let mut spec = combined_candidate(LaunchPlatform::LinuxAmd64);
+            crate::candidate_prep::bind_challenge(&mut spec, None).unwrap();
+            crate::recipe_timeout::bind_challenge(&mut spec, None).unwrap();
+            match mutation {
+                0 => {
+                    let mut plan = crate::planning::CandidatePythonPlan::from_arguments(
+                        &spec.invocation.argv[2..],
+                    )
+                    .unwrap();
+                    plan.runner = "pytest".into();
+                    plan.recipe = None;
+                    spec.invocation.argv =
+                        crate::planning::candidate_python_argv(spec.platform, &plan).unwrap();
+                }
+                1 => spec.invocation.argv.truncate(2),
+                2 => spec.purpose = LaunchPurpose::Action,
+                3 => spec.pack_access = PackAccess::ReadOnly,
+                4 => {
+                    spec.inputs.pop().unwrap();
+                }
+                5 => spec.invocation.argv[0] = "/opt/attune/pack/forged-helper".into(),
+                _ => spec.invocation.working_root = LaunchRoot::Scratch,
+            }
+            assert!(validate_invocation(&spec).is_err());
+        }
+    }
 }

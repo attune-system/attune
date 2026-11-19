@@ -87,7 +87,11 @@ fn private_helper_challenge(invocation: &LaunchInvocation, name: &str, value: &s
             if matches!(
                 mode,
                 Some("run-runtime-recipe" | "run-candidate-runtime-recipe")
-            ) =>
+            ) || (mode == Some("run-candidate-python")
+                && matches!(
+                    crate::planning::candidate_python_recipe_invocation(&invocation.argv),
+                    Ok(true)
+                )) =>
         {
             RUNTIME_RECIPE_TIMEOUT_CHALLENGE_BYTES
         }
