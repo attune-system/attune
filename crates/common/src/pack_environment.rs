@@ -80,6 +80,7 @@ pub struct CoordinatedPackEnvironment {
     pub runtime_version: Option<i64>,
     pub runtime_version_text: Option<String>,
     pub env_key: String,
+    pub native_binding: Option<String>,
     pub env_path: String,
     pub status: PackEnvironmentStatus,
     pub manifest_checksum: Option<String>,
@@ -143,6 +144,7 @@ impl PackEnvironmentManager {
             runtime_version: row.try_get("runtime_version")?,
             runtime_version_text: row.try_get("runtime_version_text")?,
             env_key: row.try_get("env_key")?,
+            native_binding: row.try_get("native_binding")?,
             env_path: row.try_get("env_path")?,
             status: row.try_get("status")?,
             manifest_checksum: row.try_get("manifest_checksum")?,
@@ -168,7 +170,7 @@ impl PackEnvironmentManager {
             SELECT id, pack, pack_ref, runtime, runtime_ref, env_path, status,
                    installed_at, last_verified, install_log, install_error, metadata
             FROM pack_environment
-            WHERE pack = $1 AND runtime = $2 AND runtime_version IS NULL
+            WHERE pack = $1 AND runtime = $2 AND runtime_version IS NULL AND native_binding IS NULL
             "#,
         )
         .bind(pack_id)
@@ -300,7 +302,7 @@ impl PackEnvironmentManager {
                    installed_at, last_verified, install_log, install_error, metadata
             FROM pack_environment
             WHERE pack = $1
-            AND runtime_version IS NULL
+            AND runtime_version IS NULL AND native_binding IS NULL
             ORDER BY runtime_ref
             "#,
         )
@@ -324,7 +326,7 @@ impl PackEnvironmentManager {
             r#"
             SELECT DISTINCT owned.env_path
             FROM pack_environment owned
-            WHERE owned.pack = $1
+            WHERE owned.pack = $1 AND owned.native_binding IS NULL
               AND NOT EXISTS (
                   SELECT 1
                   FROM pack_environment shared
@@ -386,6 +388,22 @@ impl PackEnvironmentManager {
         &self,
         input: UpsertCoordinatedEnvironmentInput<'_>,
     ) -> Result<CoordinatedPackEnvironment> {
+        self.upsert_environment(input, None).await
+    }
+
+    pub async fn upsert_native_environment(
+        &self,
+        input: UpsertCoordinatedEnvironmentInput<'_>,
+        binding: &crate::workload_launch::Sha256Digest,
+    ) -> Result<CoordinatedPackEnvironment> {
+        self.upsert_environment(input, Some(binding.as_str())).await
+    }
+
+    async fn upsert_environment(
+        &self,
+        input: UpsertCoordinatedEnvironmentInput<'_>,
+        native_binding: Option<&str>,
+    ) -> Result<CoordinatedPackEnvironment> {
         let env_path_str = input.env_path.to_string_lossy().to_string();
         let runtime_version_id = input.runtime_version.map(|version| version.id);
         let runtime_version_text = input
@@ -396,9 +414,9 @@ impl PackEnvironmentManager {
             r#"
             INSERT INTO pack_environment (
                 pack, pack_ref, runtime, runtime_ref, runtime_version, runtime_version_text,
-                env_path, status, manifest_checksum
+                env_path, status, manifest_checksum, native_binding
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9)
             ON CONFLICT (env_key)
             DO UPDATE SET
                 pack_ref = EXCLUDED.pack_ref,
@@ -435,7 +453,7 @@ impl PackEnvironmentManager {
                 END,
                 updated = NOW()
             RETURNING id, pack, pack_ref, runtime, runtime_ref, runtime_version, runtime_version_text,
-                      env_key, env_path, status, manifest_checksum, claimed_by_worker, claim_id,
+                      env_key, native_binding, env_path, status, manifest_checksum, claimed_by_worker, claim_id,
                       claim_expires_at, installed_at, last_verified, install_log, install_error,
                       metadata
             "#,
@@ -448,6 +466,7 @@ impl PackEnvironmentManager {
         .bind(runtime_version_text)
         .bind(&env_path_str)
         .bind(input.manifest_checksum)
+        .bind(native_binding)
         .fetch_one(&self.pool)
         .await?;
 
@@ -461,7 +480,7 @@ impl PackEnvironmentManager {
         let row = sqlx::query(
             r#"
             SELECT id, pack, pack_ref, runtime, runtime_ref, runtime_version, runtime_version_text,
-                   env_key, env_path, status, manifest_checksum, claimed_by_worker, claim_id,
+                   env_key, native_binding, env_path, status, manifest_checksum, claimed_by_worker, claim_id,
                    claim_expires_at, installed_at, last_verified, install_log, install_error,
                    metadata
             FROM pack_environment
@@ -526,7 +545,7 @@ impl PackEnvironmentManager {
                   OR (status = 'installing' AND (claimed_by_worker IS NULL OR claim_expires_at IS NULL OR claim_expires_at <= clock_timestamp()))
               )
             RETURNING id, pack, pack_ref, runtime, runtime_ref, runtime_version, runtime_version_text,
-                      env_key, env_path, status, manifest_checksum, claimed_by_worker, claim_id,
+                      env_key, native_binding, env_path, status, manifest_checksum, claimed_by_worker, claim_id,
                       claim_expires_at, installed_at, last_verified, install_log, install_error,
                       metadata
             "#,
@@ -591,6 +610,25 @@ impl PackEnvironmentManager {
         let mut transaction = self
             .lock_coordinated_environment(env_key, worker_id)
             .await?;
+        let changed = Self::mark_coordinated_environment_ready_on(
+            &mut transaction,
+            env_key,
+            worker_id,
+            claim_id,
+            manifest_checksum,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(changed)
+    }
+
+    pub(crate) async fn mark_coordinated_environment_ready_on(
+        connection: &mut sqlx::PgConnection,
+        env_key: &str,
+        worker_id: i64,
+        claim_id: Uuid,
+        manifest_checksum: Option<&str>,
+    ) -> Result<bool> {
         let updated = sqlx::query(
             r#"
             UPDATE pack_environment
@@ -614,10 +652,8 @@ impl PackEnvironmentManager {
         .bind(worker_id)
         .bind(claim_id)
         .bind(manifest_checksum)
-        .execute(&mut *transaction)
+        .execute(connection)
         .await?;
-        transaction.commit().await?;
-
         Ok(updated.rows_affected() > 0)
     }
 

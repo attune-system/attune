@@ -546,3 +546,373 @@ async fn deleting_a_worker_retains_no_authority_and_does_not_block_a_new_claim()
         .await
         .expect("owned deleted-worker fixture cleanup");
 }
+
+async fn native_setup_fixture() -> (
+    attune_common::test_database::TestDatabase,
+    attune_common::pack_environment::CoordinatedPackEnvironment,
+    attune_common::models::Worker,
+    uuid::Uuid,
+    attune_common::isolated_process::ProcessSpec,
+) {
+    use attune_common::workload_launch::*;
+    let (pool, _temp, pack, runtime, _, worker, _) = setup_runtime_fixture().await;
+    let instance = uuid::Uuid::new_v4();
+    sqlx::query("UPDATE worker SET meta=jsonb_build_object('registration_incarnation',$2::TEXT), last_heartbeat=clock_timestamp() WHERE id=$1")
+        .bind(worker.id).bind(instance.to_string()).execute(&*pool).await.unwrap();
+    let manager = PackEnvironmentManager::new(pool.clone());
+    let expected = manager
+        .upsert_native_environment(
+            UpsertCoordinatedEnvironmentInput {
+                pack_id: pack.id,
+                pack_ref: &pack.r#ref,
+                runtime_id: runtime.id,
+                runtime_ref: &runtime.r#ref,
+                runtime_version: None,
+                env_path: std::path::Path::new(RUNTIME_ROOT),
+                manifest_checksum: Some("retained-primary-release"),
+            },
+            &Sha256Digest::parse("a".repeat(64)).unwrap(),
+        )
+        .await
+        .unwrap();
+    let claim = manager
+        .claim_coordinated_environment(&expected, worker.id, 300)
+        .await
+        .unwrap()
+        .unwrap();
+    let input = |pin_id, kind| PinnedLaunchInput {
+        pin_id,
+        kind,
+        object_id: pack.id,
+        object_version: "retained".into(),
+        size_bytes: 10,
+        sha256: Sha256Digest::parse("b".repeat(64)).unwrap(),
+        max_expanded_bytes: 10,
+        max_files: 1,
+    };
+    let spec = attune_common::isolated_process::ProcessSpec {
+        intent: uuid::Uuid::new_v4(),
+        purpose: LaunchPurpose::Setup,
+        target: LaunchTarget::Setup {
+            admission: claim.id,
+            attempt: claim.claim_id.unwrap(),
+        },
+        image: PinnedImage {
+            reference: format!("fixture.invalid/runtime@sha256:{}", "c".repeat(64)),
+            sha256: Sha256Digest::parse("c".repeat(64)).unwrap(),
+        },
+        platform: LaunchPlatform::LinuxAmd64,
+        inputs: vec![
+            input(1, LaunchInputKind::Pack),
+            input(2, LaunchInputKind::Runner),
+        ],
+        pack_access: PackAccess::ReadOnly,
+        stage: Some(PrivateStage {
+            cache_key: "a".repeat(64),
+            quota_bytes: 1024,
+            quota_files: 10,
+        }),
+        timeout_ms: Some(1000),
+        invocation: LaunchInvocation {
+            argv: vec![format!("{RUNNER_ROOT}/linux-amd64"), "setup".into()],
+            env: Default::default(),
+            working_root: LaunchRoot::Pack,
+        },
+    };
+    (pool, claim, worker, instance, spec)
+}
+const NATIVE_SETUP_PLAN: &str = r#"{"version":1,"environment":{},"steps":[]}"#;
+const NATIVE_SETUP_MASTER: &str = "native-setup-test-master-key-at-least-32-bytes";
+
+#[tokio::test]
+async fn native_setup_exact_claim_one_shot_and_atomic_ready_receipt() {
+    use attune_common::{
+        isolated_process::*,
+        repositories::{
+            execution_process::ExecutionProcessRepository as Effects,
+            pack_environment_process::PackEnvironmentProcessRepository as Setup,
+        },
+        workload_launch::*,
+    };
+    let (pool, claim, worker, instance, spec) = native_setup_fixture().await;
+    let retained = Setup::reserve(
+        &pool,
+        &claim,
+        worker.id,
+        instance,
+        &spec,
+        NATIVE_SETUP_PLAN,
+        NATIVE_SETUP_MASTER,
+    )
+    .await
+    .unwrap();
+    let mut retry = spec.clone();
+    retry.intent = uuid::Uuid::new_v4();
+    assert_eq!(
+        Setup::reserve(
+            &pool,
+            &claim,
+            worker.id,
+            instance,
+            &retry,
+            NATIVE_SETUP_PLAN,
+            NATIVE_SETUP_MASTER
+        )
+        .await
+        .unwrap()
+        .intent,
+        retained.intent
+    );
+    let mut changed = spec.clone();
+    changed.image.sha256 = Sha256Digest::parse("d".repeat(64)).unwrap();
+    assert!(Setup::reserve(
+        &pool,
+        &claim,
+        worker.id,
+        instance,
+        &changed,
+        NATIVE_SETUP_PLAN,
+        NATIVE_SETUP_MASTER
+    )
+    .await
+    .is_err());
+    assert_eq!(
+        Setup::begin_create(&pool, spec.intent, NATIVE_SETUP_MASTER)
+            .await
+            .unwrap(),
+        ProcessCreateDisposition::CreateOnce
+    );
+    assert_eq!(
+        Setup::begin_create(&pool, spec.intent, NATIVE_SETUP_MASTER)
+            .await
+            .unwrap(),
+        ProcessCreateDisposition::ReconcileOnly
+    );
+    let resource = ResourceIdentity::Kubernetes {
+        cluster: "owned".into(),
+        namespace: "owned".into(),
+        pod_name: "setup".into(),
+        pod_uid: uuid::Uuid::new_v4().to_string(),
+    };
+    Effects::record_resource(&pool, spec.intent, &resource)
+        .await
+        .unwrap();
+    let input = Setup::consume_stdin(&pool, spec.intent, &resource, NATIVE_SETUP_MASTER)
+        .await
+        .unwrap();
+    assert_eq!(input.as_bytes(), NATIVE_SETUP_PLAN.as_bytes());
+    assert!(
+        Setup::consume_stdin(&pool, spec.intent, &resource, NATIVE_SETUP_MASTER)
+            .await
+            .is_err()
+    );
+    let pin = PinnedLaunchInput {
+        pin_id: 3,
+        kind: LaunchInputKind::Runtime,
+        object_id: claim.id,
+        object_version: spec.intent.to_string(),
+        size_bytes: 10,
+        sha256: Sha256Digest::parse("e".repeat(64)).unwrap(),
+        max_expanded_bytes: 10,
+        max_files: 1,
+    };
+    assert!(
+        Setup::publish(&pool, spec.intent, &resource, &pin, NATIVE_SETUP_MASTER)
+            .await
+            .is_err()
+    );
+    Effects::record_exit(
+        &pool,
+        spec.intent,
+        &resource,
+        LaunchExitOutcome {
+            exit_code: 0,
+            oom_killed: false,
+        },
+    )
+    .await
+    .unwrap();
+    Setup::publish(&pool, spec.intent, &resource, &pin, NATIVE_SETUP_MASTER)
+        .await
+        .unwrap();
+    let mut action_tx = pool.begin().await.unwrap();
+    assert!(
+        Effects::lock_completion(&mut action_tx, spec.intent, NATIVE_SETUP_MASTER)
+            .await
+            .is_err()
+    );
+    action_tx.rollback().await.unwrap();
+
+    let manager = PackEnvironmentManager::new(pool.clone());
+    assert_eq!(
+        manager
+            .get_coordinated_environment(&claim.env_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        PackEnvironmentStatus::Ready
+    );
+    assert_eq!(
+        Setup::published(&pool, claim.native_binding.as_deref().unwrap())
+            .await
+            .unwrap(),
+        Some(pin.clone())
+    );
+    // Historical acknowledgement is not a renewed claim or another publication.
+    Setup::publish(&pool, spec.intent, &resource, &pin, NATIVE_SETUP_MASTER)
+        .await
+        .unwrap();
+    let ciphertext: String = sqlx::query_scalar(
+        "SELECT encrypted_context FROM execution_process_effect WHERE intent=$1",
+    )
+    .bind(spec.intent)
+    .fetch_one(&*pool)
+    .await
+    .unwrap();
+    assert!(!ciphertext.contains(NATIVE_SETUP_PLAN));
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_setup_takeover_never_restores_old_stdin_or_publication() {
+    use attune_common::{
+        isolated_process::*,
+        repositories::{
+            execution_process::ExecutionProcessRepository as Effects,
+            pack_environment_process::PackEnvironmentProcessRepository as Setup,
+        },
+    };
+    let (pool, claim, worker, instance, spec) = native_setup_fixture().await;
+    Setup::reserve(
+        &pool,
+        &claim,
+        worker.id,
+        instance,
+        &spec,
+        NATIVE_SETUP_PLAN,
+        NATIVE_SETUP_MASTER,
+    )
+    .await
+    .unwrap();
+    Setup::begin_create(&pool, spec.intent, NATIVE_SETUP_MASTER)
+        .await
+        .unwrap();
+    let resource = ResourceIdentity::Kubernetes {
+        cluster: "owned".into(),
+        namespace: "owned".into(),
+        pod_name: "old-setup".into(),
+        pod_uid: uuid::Uuid::new_v4().to_string(),
+    };
+    Effects::record_resource(&pool, spec.intent, &resource)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE pack_environment SET claim_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1").bind(claim.id).execute(&*pool).await.unwrap();
+    let manager = PackEnvironmentManager::new(pool.clone());
+    let replacement = manager
+        .claim_coordinated_environment(&claim, worker.id, 300)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(replacement.claim_id, claim.claim_id);
+    assert!(
+        Setup::consume_stdin(&pool, spec.intent, &resource, NATIVE_SETUP_MASTER)
+            .await
+            .is_err()
+    );
+    assert!(
+        Setup::validate_source(&pool, spec.intent, NATIVE_SETUP_MASTER)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        Setup::begin_create(&pool, spec.intent, NATIVE_SETUP_MASTER)
+            .await
+            .unwrap(),
+        ProcessCreateDisposition::ReconcileOnly
+    );
+    // Restoration of the former source checksum does not restore its nonce.
+    assert!(Setup::reserve(
+        &pool,
+        &claim,
+        worker.id,
+        instance,
+        &spec,
+        NATIVE_SETUP_PLAN,
+        NATIVE_SETUP_MASTER
+    )
+    .await
+    .is_err());
+    assert!(Effects::retained_resource(&pool, spec.intent)
+        .await
+        .unwrap()
+        .is_some());
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_setup_worker_revoke_restore_never_restores_reservation() {
+    use attune_common::repositories::pack_environment_process::PackEnvironmentProcessRepository as Setup;
+    let (pool, claim, worker, instance, spec) = native_setup_fixture().await;
+    Setup::reserve(
+        &pool,
+        &claim,
+        worker.id,
+        instance,
+        &spec,
+        NATIVE_SETUP_PLAN,
+        NATIVE_SETUP_MASTER,
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE worker SET status='inactive' WHERE id=$1")
+        .bind(worker.id)
+        .execute(&*pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE worker SET status='active' WHERE id=$1")
+        .bind(worker.id)
+        .execute(&*pool)
+        .await
+        .unwrap();
+    assert!(Setup::begin_create(&pool, spec.intent, NATIVE_SETUP_MASTER)
+        .await
+        .is_err());
+    assert!(
+        Setup::validate_source(&pool, spec.intent, NATIVE_SETUP_MASTER)
+            .await
+            .is_err()
+    );
+    sqlx::query("UPDATE pack_environment SET claim_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1").bind(claim.id).execute(&*pool).await.unwrap();
+    let manager = PackEnvironmentManager::new(pool.clone());
+    let current = manager
+        .claim_coordinated_environment(&claim, worker.id, 300)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut authorized = spec.clone();
+    authorized.intent = uuid::Uuid::new_v4();
+    authorized.target = attune_common::workload_launch::LaunchTarget::Setup {
+        admission: claim.id,
+        attempt: current.claim_id.unwrap(),
+    };
+    Setup::reserve(
+        &pool,
+        &current,
+        worker.id,
+        instance,
+        &authorized,
+        NATIVE_SETUP_PLAN,
+        NATIVE_SETUP_MASTER,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        Setup::begin_create(&pool, authorized.intent, NATIVE_SETUP_MASTER)
+            .await
+            .unwrap(),
+        attune_common::isolated_process::ProcessCreateDisposition::CreateOnce
+    );
+    drop(manager);
+    pool.cleanup().await.unwrap();
+}

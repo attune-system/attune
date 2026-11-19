@@ -537,3 +537,5 @@ pub mod work_queue_output;
 
 pub mod workload_launch;
 pub(crate) mod workload_source;
+
+pub mod pack_environment_process;

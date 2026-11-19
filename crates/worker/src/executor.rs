@@ -13,6 +13,8 @@
 //! so the `ProcessRuntime` uses version-specific interpreter binaries,
 //! environment commands, etc.
 
+mod native_environment;
+
 use attune_common::artifact_transport::{
     resolve_checked_path, sync_local_file_to_transport, ArtifactFileTransport,
     ValidatedRelativePath,
@@ -2635,9 +2637,26 @@ impl ActionExecutor {
             .as_ref()
             .ok_or_else(unavailable)?;
         if spec.purpose != attune_common::workload_launch::LaunchPurpose::Action
-            || spec.inputs.len() != 2
-            || !matches!(config.interpreter.binary.as_str(), "" | "native" | "none")
-            || crate::runtime::launch_planning::needs_runtime(config)
+            || !(2..=3).contains(&spec.inputs.len())
+            || spec
+                .inputs
+                .iter()
+                .filter(|p| p.kind == LaunchInputKind::Pack)
+                .count()
+                != 1
+            || spec
+                .inputs
+                .iter()
+                .filter(|p| p.kind == LaunchInputKind::Runner)
+                .count()
+                != 1
+            || spec
+                .inputs
+                .iter()
+                .filter(|p| p.kind == LaunchInputKind::Runtime)
+                .count()
+                > 1
+            || config.lifecycle.is_some()
             || spec.stage.is_some()
             || spec.pack_access != PackAccess::ReadOnly
         {
@@ -2670,6 +2689,11 @@ impl ActionExecutor {
             || manifest.version != release.version
         {
             return Err(unavailable());
+        }
+        if !matches!(config.interpreter.binary.as_str(), "" | "native" | "none") {
+            return self
+                .prepare_isolated_interpreted(context, spec, &execution)
+                .await;
         }
         let selected = if let Some(launch) = &action.launch {
             launch.validate_action_source(
