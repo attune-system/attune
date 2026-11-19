@@ -758,7 +758,7 @@ impl ExecutionProcessRepository {
             .materialize(
                 selected.argument_budget_program()?,
                 &parameters,
-                &[],
+                &context.input.secret_paths(),
                 delivery,
                 ArgumentLimits::default(),
             )

@@ -154,6 +154,7 @@ pub(crate) enum InputAuthorityDependency {
     Policy(Id),
     Admission(Id),
     Approval(Id),
+    Ownership(super::runtime_target::InputOwnershipDependency),
 }
 
 /// Approval rows remain locked by the source-validation transaction. Row locks
@@ -177,6 +178,18 @@ impl ApprovalEffectFence {
     }
     pub(crate) fn with_input_dependency(mut self, source: InputAuthorityDependency) -> Self {
         self.input_dependencies.insert(source);
+        self
+    }
+    pub(crate) fn with_input_ownership(
+        mut self,
+        sources: &BTreeSet<super::runtime_target::InputOwnershipDependency>,
+    ) -> Self {
+        self.input_dependencies.extend(
+            sources
+                .iter()
+                .cloned()
+                .map(InputAuthorityDependency::Ownership),
+        );
         self
     }
     pub fn approval_deadline(&self) -> Option<DateTime<Utc>> {

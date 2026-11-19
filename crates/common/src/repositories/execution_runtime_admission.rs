@@ -481,18 +481,26 @@ impl ExecutionAdmissionRepository {
         if authorities.is_empty() {
             return Ok(None);
         }
-        let ownership =
-            super::iam_ownership::VerifiedKeyOrigins::load(&mut *connection, &[origin.key_id])
-                .await?;
-        if authorities
-            .iter()
-            .all(|authority| authority.key_allows_verified(origin, action, &ownership))
-        {
-            return Ok(Some(
-                fence.unwrap_or(ApprovalEffectFence::from_input_approval(None)?),
-            ));
+        let ownership = super::iam_ownership::VerifiedKeyOrigins::load_for_input(
+            &mut *connection,
+            &[origin.key_id],
+        )
+        .await?;
+        let mut fence = fence.unwrap_or(ApprovalEffectFence::from_input_approval(None)?);
+        for authority in &authorities {
+            match authority.key_origin_evidence(origin, action, &ownership) {
+                None => return Ok(None),
+                Some(crate::key_access::KeyOriginGrantEvidence::RecordedOrigin) => {}
+                Some(crate::key_access::KeyOriginGrantEvidence::ManagingPack) => {
+                    let sources = ownership.input_sources(origin).ok_or_else(|| {
+                        Error::PermissionDenied("Input Key ownership unavailable".into())
+                    })?;
+                    fence = fence.with_input_ownership(sources);
+                }
+            }
         }
-        Ok(None)
+        fence.ensure_fresh_on(connection).await?;
+        Ok(Some(fence))
     }
 
     /// Every captured contributor must permit a delivered value. Callers must

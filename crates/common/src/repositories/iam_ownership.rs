@@ -4,11 +4,11 @@
 //! proofs aligned with `RuntimeTargetRepository`; association and ref prefixes
 //! are not managing ownership.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::{models::Id, Result};
 
-use super::runtime_target::ComponentTarget;
+use super::runtime_target::{ComponentTarget, InputOwnershipDependency};
 
 /// Columns supplied by the owning repository, never by a request. Missing
 /// dimensions have the same meaning as an unpopulated AuthorizationContext.
@@ -187,9 +187,17 @@ pub fn push_iam_grants(
 #[derive(Default)]
 pub struct VerifiedKeyOrigins {
     packs: HashMap<crate::secret_provenance::KeyOrigin, Id>,
+    input_sources: HashMap<crate::secret_provenance::KeyOrigin, BTreeSet<InputOwnershipDependency>>,
 }
 
 impl VerifiedKeyOrigins {
+    pub(crate) fn input_sources(
+        &self,
+        origin: &crate::secret_provenance::KeyOrigin,
+    ) -> Option<&BTreeSet<InputOwnershipDependency>> {
+        self.input_sources.get(origin)
+    }
+
     /// Verify and hold the actual Key and owner, then key the ownership proof by
     /// the ORIGINAL authenticated origin. Classification edits are not source
     /// revocation and never replace the original Decrypt requirement.
@@ -202,6 +210,7 @@ impl VerifiedKeyOrigins {
         use super::runtime_target::{RuntimeTarget, RuntimeTargetRepository};
         use crate::models::OwnerType;
         self.packs.remove(original);
+        self.input_sources.remove(original);
         let Some(current) =
             RuntimeTargetRepository::resolve(conn, RuntimeTarget::Key(original.key_id), principal)
                 .await?
@@ -272,6 +281,8 @@ impl VerifiedKeyOrigins {
                 }
             }
         }
+        self.input_sources
+            .insert(original.clone(), target.input_sources().clone());
         Ok(Some(target))
     }
 
@@ -321,9 +332,23 @@ impl VerifiedKeyOrigins {
 
     pub fn extend(&mut self, other: Self) {
         self.packs.extend(other.packs);
+        self.input_sources.extend(other.input_sources);
+    }
+
+    /// Same ownership query, retaining exactly the Key and structural parents
+    /// until the input consumer finishes its source phase. No IAM is reloaded.
+    pub(crate) async fn load_for_input(conn: &mut sqlx::PgConnection, ids: &[Id]) -> Result<Self> {
+        Self::load_inner(conn, ids, true).await
     }
 
     pub async fn load<'e, E>(executor: E, ids: &[Id]) -> Result<Self>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        Self::load_inner(executor, ids, false).await
+    }
+
+    async fn load_inner<'e, E>(executor: E, ids: &[Id], retain: bool) -> Result<Self>
     where
         E: sqlx::Executor<'e, Database = sqlx::Postgres>,
     {
@@ -339,34 +364,58 @@ impl VerifiedKeyOrigins {
             owner_ref: Option<String>,
             encrypted: bool,
             managing_pack: Option<Id>,
+            owner_action: Option<Id>,
+            owner_sensor: Option<Id>,
         }
         let rows: Vec<Row> = sqlx::query_as(&format!(
             "SELECT k.id, k.ref AS reference, k.owner_type, k.owner_identity, \
              CASE k.owner_type WHEN 'pack' THEN k.owner_pack_ref WHEN 'action' THEN k.owner_action_ref \
              WHEN 'sensor' THEN k.owner_sensor_ref WHEN 'identity' THEN k.owner ELSE NULL END AS owner_ref, \
-             k.encrypted, {} AS managing_pack FROM key k WHERE k.id = ANY($1)",
-            data_pack("k", "owner_type")
+             k.encrypted, k.owner_action, k.owner_sensor, {} AS managing_pack FROM key k WHERE k.id = ANY($1){}",
+            data_pack_expression("k", "owner_type", retain),
+            if retain { " FOR SHARE OF k" } else { "" }
         ))
         .bind(ids)
         .fetch_all(executor)
         .await?;
-        let packs = rows
-            .into_iter()
-            .filter_map(|row| {
-                Some((
-                    crate::secret_provenance::KeyOrigin {
-                        key_id: row.id,
-                        key_ref: row.reference,
-                        owner_type: row.owner_type,
-                        owner_identity: row.owner_identity,
-                        owner_ref: row.owner_ref,
-                        encrypted: row.encrypted,
-                    },
-                    row.managing_pack?,
-                ))
-            })
-            .collect();
-        Ok(Self { packs })
+        let mut result = Self::default();
+        for row in rows {
+            let Some(pack) = row.managing_pack else {
+                continue;
+            };
+            let origin = crate::secret_provenance::KeyOrigin {
+                key_id: row.id,
+                key_ref: row.reference,
+                owner_type: row.owner_type,
+                owner_identity: row.owner_identity,
+                owner_ref: row.owner_ref,
+                encrypted: row.encrypted,
+            };
+            let mut sources = BTreeSet::from([
+                InputOwnershipDependency::Key(row.id),
+                InputOwnershipDependency::Pack(pack),
+            ]);
+            match (origin.owner_type, row.owner_action, row.owner_sensor) {
+                (crate::models::OwnerType::Action, Some(id), _) => {
+                    sources.insert(InputOwnershipDependency::Component(
+                        ComponentTarget::Action,
+                        id,
+                    ));
+                }
+                (crate::models::OwnerType::Sensor, _, Some(id)) => {
+                    sources.insert(InputOwnershipDependency::Component(
+                        ComponentTarget::Sensor,
+                        id,
+                    ));
+                }
+                _ => {}
+            }
+            if retain {
+                result.input_sources.insert(origin.clone(), sources);
+            }
+            result.packs.insert(origin, pack);
+        }
+        Ok(result)
     }
 }
 
@@ -770,15 +819,81 @@ pub fn artifact_pack(alias: &str) -> String {
 }
 
 pub fn data_pack(alias: &str, owner_type_column: &str) -> String {
+    data_pack_expression(alias, owner_type_column, false)
+}
+
+fn data_pack_expression(alias: &str, owner_type_column: &str, retain: bool) -> String {
+    let pack_lock = if retain { " FOR SHARE OF p" } else { "" };
+    let action_lock = if retain { " FOR SHARE OF a,p" } else { "" };
+    let sensor_lock = if retain { " FOR SHARE OF s,p" } else { "" };
     format!("CASE {alias}.{owner_type_column} \
-        WHEN 'pack' THEN (SELECT p.id FROM pack p WHERE p.id = {alias}.owner_pack AND p.ref = {alias}.owner_pack_ref) \
-        WHEN 'action' THEN (SELECT a.pack FROM action a JOIN pack p ON p.id = a.pack WHERE a.id = {alias}.owner_action AND a.ref = {alias}.owner_action_ref AND a.management_origin = 'pack') \
-        WHEN 'sensor' THEN (SELECT s.pack FROM sensor s JOIN pack p ON p.id = s.pack WHERE s.id = {alias}.owner_sensor AND s.ref = {alias}.owner_sensor_ref AND s.management_origin = 'pack') END")
+        WHEN 'pack' THEN (SELECT p.id FROM pack p WHERE p.id = {alias}.owner_pack AND p.ref = {alias}.owner_pack_ref{pack_lock}) \
+        WHEN 'action' THEN (SELECT a.pack FROM action a JOIN pack p ON p.id = a.pack WHERE a.id = {alias}.owner_action AND a.ref = {alias}.owner_action_ref AND a.management_origin = 'pack'{action_lock}) \
+        WHEN 'sensor' THEN (SELECT s.pack FROM sensor s JOIN pack p ON p.id = s.pack WHERE s.id = {alias}.owner_sensor AND s.ref = {alias}.owner_sensor_ref AND s.management_origin = 'pack'{sensor_lock}) END")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_evidence_preserves_first_successful_grant_and_exact_origin() {
+        use crate::{
+            key_access::KeyOriginGrantEvidence,
+            rbac::{Action, Grant},
+            secret_provenance::KeyOrigin,
+        };
+        let origin = KeyOrigin {
+            key_id: 41,
+            key_ref: "owned.token".into(),
+            owner_type: crate::models::OwnerType::Pack,
+            owner_identity: None,
+            owner_ref: Some("owned".into()),
+            encrypted: true,
+        };
+        let sources = BTreeSet::from([
+            InputOwnershipDependency::Key(41),
+            InputOwnershipDependency::Pack(17),
+        ]);
+        let ownership = VerifiedKeyOrigins {
+            packs: HashMap::from([(origin.clone(), 17)]),
+            input_sources: HashMap::from([(origin.clone(), sources.clone())]),
+        };
+        let global: Grant = serde_json::from_value(
+            serde_json::json!({"resource":"keys","actions":["read","decrypt"]}),
+        )
+        .unwrap();
+        let scoped: Grant = serde_json::from_value(serde_json::json!({"resource":"keys","actions":["read","decrypt"],"constraints":{"managing_pack_id":17}})).unwrap();
+        let first = crate::delegation::DelegationAuthority::new(
+            7,
+            Default::default(),
+            vec![global.clone(), scoped.clone()],
+        );
+        let reverse = crate::delegation::DelegationAuthority::new(
+            7,
+            Default::default(),
+            vec![scoped.clone(), global],
+        );
+        assert_eq!(
+            first.key_origin_evidence(&origin, Action::Read, &ownership),
+            Some(KeyOriginGrantEvidence::RecordedOrigin)
+        );
+        assert_eq!(
+            reverse.key_origin_evidence(&origin, Action::Read, &ownership),
+            Some(KeyOriginGrantEvidence::ManagingPack)
+        );
+        assert!(first.key_allows_verified(&origin, Action::Read, &ownership));
+        assert!(reverse.key_allows_verified(&origin, Action::Read, &ownership));
+        assert_eq!(ownership.input_sources(&origin), Some(&sources));
+        let mut substituted = origin.clone();
+        substituted.owner_ref = Some("replacement".into());
+        assert!(ownership.input_sources(&substituted).is_none());
+        let only_scoped =
+            crate::delegation::DelegationAuthority::new(7, Default::default(), vec![scoped]);
+        assert!(only_scoped
+            .key_origin_evidence(&substituted, Action::Read, &ownership)
+            .is_none());
+    }
 
     #[test]
     fn pack_owner_narrowing_keeps_selectors_and_matches_canonical_evaluation() {

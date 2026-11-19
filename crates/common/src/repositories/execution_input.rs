@@ -47,6 +47,13 @@ pub(crate) struct FrozenInputSnapshot {
     secrets: Vec<FrozenSecret>,
 }
 impl FrozenInputSnapshot {
+    pub(crate) fn secret_paths(&self) -> Vec<String> {
+        self.secrets
+            .iter()
+            .map(|secret| secret.json_path.clone())
+            .collect()
+    }
+
     /// The origin dependency frontier must be captured before remote delivery
     /// of inherited/ordinary secrets is enabled. Until then, the executable
     /// consumer admits only the source-complete public-input case.
@@ -314,6 +321,62 @@ impl ExecutionInputRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn input_evidence_frozen_secret_paths_deny_cli_binding() {
+        use crate::{
+            action_cli::{ArgumentLimits, ArgumentPlan, InputDelivery},
+            value_schema::{Limits, RegistryView, SourceIdentity},
+        };
+        let input = FrozenInputSnapshot::from(&ExecutionInputSnapshot {
+            execution: 1,
+            executor: None,
+            config: serde_json::json!({"token":"redacted"}),
+            secrets: vec![StoredSecretValue {
+                json_path: "/token".into(),
+                encrypted_value: Value::String("ciphertext".into()),
+                encryption_key_hash: Some("key-hash".into()),
+                source_kind: "provenance".into(),
+                source_ref: Some("retained-origin".into()),
+            }],
+        });
+        let schema = serde_json::json!({"token":{"type":"string","cli":{"kind":"option","name":"--token","order":1}}});
+        let plan = ArgumentPlan::compile(
+            SourceIdentity::Released {
+                component_ref: "owned.cli".into(),
+                release_id: 1,
+                release_digest: "a".repeat(64),
+            },
+            &schema,
+            &[],
+            &RegistryView::new(),
+            Limits::default(),
+        )
+        .unwrap();
+        let parameters = serde_json::json!({"token":"private-test-value"});
+        // An undeclared binding remains protected by the actual frozen origin
+        // paths, even when authoring metadata classifies the field as public.
+        assert!(plan
+            .materialize(
+                "/bin/tool",
+                &parameters,
+                &[],
+                InputDelivery::Stdin,
+                ArgumentLimits::default()
+            )
+            .is_ok());
+        assert!(plan
+            .materialize(
+                "/bin/tool",
+                &parameters,
+                &input.secret_paths(),
+                InputDelivery::Stdin,
+                ArgumentLimits::default()
+            )
+            .is_err());
+        assert_eq!(input.secret_paths(), vec!["/token"]);
+        assert!(input.public_snapshot().is_err());
+    }
+
     #[test]
     fn snapshots_bind_origins_and_ciphertext_without_exposing_them() {
         let original = ExecutionInputSnapshot {

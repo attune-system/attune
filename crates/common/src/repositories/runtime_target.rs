@@ -6,6 +6,7 @@
 
 use chrono::{DateTime, Utc};
 use sqlx::PgConnection;
+use std::collections::BTreeSet;
 mod native_wait;
 
 use crate::{
@@ -15,7 +16,9 @@ use crate::{
     Error, Result,
 };
 
-#[derive(Debug, Clone, Copy)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum ComponentTarget {
     Action,
     Policy,
@@ -65,9 +68,51 @@ pub enum RuntimeTarget {
     EventTrigger(Id),
 }
 
+/// Private identities actually read by the structural ownership resolver.
+/// They contain no current IAM state or authority from another contributor.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) enum InputOwnershipDependency {
+    Pack(Id),
+    Component(ComponentTarget, Id),
+    Key(Id),
+    Execution(Id),
+    Enforcement(Id),
+    QueueItem(Id),
+    Inquiry(Id),
+    Artifact(Id),
+    CacheNamespace(Id),
+    RuntimeVersion(Id),
+    Release(Id),
+    Event(Id, DateTime<Utc>),
+}
+
+impl RuntimeTarget {
+    fn input_identity(self) -> InputOwnershipDependency {
+        match self {
+            Self::Pack(id) => InputOwnershipDependency::Pack(id),
+            Self::Component(kind, id) => InputOwnershipDependency::Component(kind, id),
+            Self::Key(id) => InputOwnershipDependency::Key(id),
+            Self::Execution(id) => InputOwnershipDependency::Execution(id),
+            Self::Enforcement(id) => InputOwnershipDependency::Enforcement(id),
+            Self::QueueItem(id) => InputOwnershipDependency::QueueItem(id),
+            Self::QueueItems(id) => InputOwnershipDependency::Component(ComponentTarget::Queue, id),
+            Self::Inquiry(id) => InputOwnershipDependency::Inquiry(id),
+            Self::Artifact(id) => InputOwnershipDependency::Artifact(id),
+            Self::CacheNamespace(id) => InputOwnershipDependency::CacheNamespace(id),
+            Self::RuntimeVersion(id) => InputOwnershipDependency::RuntimeVersion(id),
+            Self::Event { id, created } => InputOwnershipDependency::Event(id, created),
+            Self::EventTrigger(id) => {
+                InputOwnershipDependency::Component(ComponentTarget::Trigger, id)
+            }
+        }
+    }
+}
+
 /// Constructed only by repository resolution. Callers cannot supply a pack ID
 /// inferred from user-controlled refs and claim it is a resolved owner.
 pub struct ResolvedRuntimeTarget {
+    input_sources: BTreeSet<InputOwnershipDependency>,
     kind: &'static str,
     resource: Resource,
     pack_id: Option<Id>,
@@ -77,6 +122,10 @@ pub struct ResolvedRuntimeTarget {
 }
 
 impl ResolvedRuntimeTarget {
+    pub(crate) fn input_sources(&self) -> &BTreeSet<InputOwnershipDependency> {
+        &self.input_sources
+    }
+
     pub fn identity_kind(&self) -> &'static str {
         self.kind
     }
@@ -180,6 +229,7 @@ impl RuntimeTargetRepository {
         // with a pack is not management_origin='pack' ownership. Creation
         // therefore needs an external approval, just like later operations.
         Ok(Some(ResolvedRuntimeTarget {
+            input_sources: BTreeSet::new(),
             kind: "work_queue",
             resource: Resource::Queues,
             pack_id: None,
@@ -389,6 +439,7 @@ impl RuntimeTargetRepository {
         };
         context.managing_pack_id = pack_id;
         Ok(Some(ResolvedRuntimeTarget {
+            input_sources: BTreeSet::new(),
             kind: if resource == Resource::Keys {
                 "key"
             } else {
@@ -423,24 +474,30 @@ impl RuntimeTargetRepository {
         super::schema_type::SchemaTypeRepository::lock_selection(&mut *connection).await?;
         let mut context = AuthorizationContext::new(sponsor_identity);
         let mut owner_id = None;
+        let mut input_sources = BTreeSet::new();
         let (resource, id, pack_id, available) = match target {
             RuntimeTarget::Pack(id) => {
                 positive_id(id)?;
-                let Some(reference) = pack_ref(connection, id).await? else {
+                let Some(reference) = input_pack_ref(connection, id, &mut input_sources).await?
+                else {
                     return Ok(None);
                 };
                 context.target_ref = Some(reference);
                 (Resource::Packs, id, Some(id), true)
             }
             RuntimeTarget::Component(kind, id) => {
-                let Some(component) = component(connection, kind, id).await? else {
+                let Some(component) =
+                    input_component(connection, kind, id, &mut input_sources).await?
+                else {
                     return Ok(None);
                 };
                 context.target_ref = Some(component.reference);
                 (kind.metadata().1, id, component.pack, component.available)
             }
             RuntimeTarget::EventTrigger(id) => {
-                let Some(component) = component(connection, ComponentTarget::Trigger, id).await?
+                let Some(component) =
+                    input_component(connection, ComponentTarget::Trigger, id, &mut input_sources)
+                        .await?
                 else {
                     return Ok(None);
                 };
@@ -459,7 +516,7 @@ impl RuntimeTargetRepository {
                 (
                     Resource::Executions,
                     id,
-                    release_owner(connection, release, digest).await?,
+                    input_release_owner(connection, release, digest, &mut input_sources).await?,
                     true,
                 )
             }
@@ -476,9 +533,11 @@ impl RuntimeTargetRepository {
                 };
                 context.target_ref = Some(reference);
                 let parent = match rule {
-                    Some(rule) => component(connection, ComponentTarget::Rule, rule)
-                        .await?
-                        .and_then(|parent| parent.pack),
+                    Some(rule) => {
+                        input_component(connection, ComponentTarget::Rule, rule, &mut input_sources)
+                            .await?
+                            .and_then(|parent| parent.pack)
+                    }
                     None => None,
                 };
                 (Resource::Enforcements, id, parent, true)
@@ -495,13 +554,21 @@ impl RuntimeTargetRepository {
                     return Ok(None);
                 };
                 context.target_ref = Some(reference);
-                let parent = component(connection, ComponentTarget::Queue, queue)
-                    .await?
-                    .and_then(|parent| parent.pack);
+                let parent = input_component(
+                    connection,
+                    ComponentTarget::Queue,
+                    queue,
+                    &mut input_sources,
+                )
+                .await?
+                .and_then(|parent| parent.pack);
                 (Resource::QueueItems, id, parent, true)
             }
             RuntimeTarget::QueueItems(id) => {
-                let Some(parent) = component(connection, ComponentTarget::Queue, id).await? else {
+                let Some(parent) =
+                    input_component(connection, ComponentTarget::Queue, id, &mut input_sources)
+                        .await?
+                else {
                     return Ok(None);
                 };
                 context.target_ref = Some(parent.reference);
@@ -525,7 +592,10 @@ impl RuntimeTargetRepository {
                         ).bind(execution).fetch_optional(&mut *connection).await?;
                         match row {
                             Some((release, digest)) => {
-                                release_owner(connection, release, digest).await?
+                                input_sources
+                                    .insert(InputOwnershipDependency::Execution(execution));
+                                input_release_owner(connection, release, digest, &mut input_sources)
+                                    .await?
                             }
                             None => None,
                         }
@@ -568,6 +638,7 @@ impl RuntimeTargetRepository {
                     row.owner_pack,
                     row.owner_action,
                     row.owner_sensor,
+                    &mut input_sources,
                 )
                 .await?;
                 (Resource::Keys, id, parent, true)
@@ -598,6 +669,7 @@ impl RuntimeTargetRepository {
                     row.owner.owner_pack,
                     row.owner.owner_action,
                     row.owner.owner_sensor,
+                    &mut input_sources,
                 )
                 .await?;
                 // Management of a definition is not ownership of its data. Both
@@ -640,7 +712,7 @@ impl RuntimeTargetRepository {
                 let (parent, available) = match scope {
                     OwnerType::Pack => {
                         let current = match bound_owner {
-                            Some(id) => pack_ref(connection, id).await?,
+                            Some(id) => input_pack_ref(connection, id, &mut input_sources).await?,
                             None => None,
                         };
                         let available = current.as_deref() == Some(owner.as_str());
@@ -653,7 +725,9 @@ impl RuntimeTargetRepository {
                             ComponentTarget::Sensor
                         };
                         let current = match bound_owner {
-                            Some(id) => component(connection, kind, id).await?,
+                            Some(id) => {
+                                input_component(connection, kind, id, &mut input_sources).await?
+                            }
                             None => None,
                         };
                         match current {
@@ -683,7 +757,13 @@ impl RuntimeTargetRepository {
                 let Some((runtime, available)) = row else {
                     return Ok(None);
                 };
-                let parent = component(connection, ComponentTarget::Runtime, runtime).await?;
+                let parent = input_component(
+                    connection,
+                    ComponentTarget::Runtime,
+                    runtime,
+                    &mut input_sources,
+                )
+                .await?;
                 if let Some(parent) = &parent {
                     context.target_ref = Some(parent.reference.clone());
                 }
@@ -705,9 +785,14 @@ impl RuntimeTargetRepository {
                 };
                 context.target_ref = Some(reference);
                 let parent = match trigger {
-                    Some(trigger) => component(connection, ComponentTarget::Trigger, trigger)
-                        .await?
-                        .and_then(|parent| parent.pack),
+                    Some(trigger) => input_component(
+                        connection,
+                        ComponentTarget::Trigger,
+                        trigger,
+                        &mut input_sources,
+                    )
+                    .await?
+                    .and_then(|parent| parent.pack),
                     None => None,
                 };
                 (Resource::Events, id, parent, true)
@@ -719,7 +804,7 @@ impl RuntimeTargetRepository {
             Some(id)
         };
         let pack_id = match pack_id {
-            Some(id) => match pack_ref(connection, id).await? {
+            Some(id) => match input_pack_ref(connection, id, &mut input_sources).await? {
                 Some(reference) => {
                     context.pack_ref = Some(reference);
                     Some(id)
@@ -728,6 +813,7 @@ impl RuntimeTargetRepository {
             },
             None => None,
         };
+        input_sources.insert(target.input_identity());
         context.managing_pack_id = pack_id;
         super::iam_ownership::IamOwnershipRepository::populate_pack_owner(
             &mut *connection,
@@ -744,6 +830,7 @@ impl RuntimeTargetRepository {
             context.owner_identity_id = owner.flatten();
         }
         Ok(Some(ResolvedRuntimeTarget {
+            input_sources,
             kind: match target {
                 RuntimeTarget::Pack(_) => "pack",
                 RuntimeTarget::Component(component, _) => component.metadata().0,
@@ -773,6 +860,44 @@ struct ComponentRow {
     pack: Option<Id>,
     available: bool,
     owner_available: bool,
+}
+
+async fn input_component(
+    connection: &mut PgConnection,
+    kind: ComponentTarget,
+    id: Id,
+    sources: &mut BTreeSet<InputOwnershipDependency>,
+) -> Result<Option<ComponentRow>> {
+    let row = component(connection, kind, id).await?;
+    if row.is_some() {
+        sources.insert(InputOwnershipDependency::Component(kind, id));
+    }
+    Ok(row)
+}
+
+async fn input_pack_ref(
+    connection: &mut PgConnection,
+    id: Id,
+    sources: &mut BTreeSet<InputOwnershipDependency>,
+) -> Result<Option<String>> {
+    let row = pack_ref(connection, id).await?;
+    if row.is_some() {
+        sources.insert(InputOwnershipDependency::Pack(id));
+    }
+    Ok(row)
+}
+
+async fn input_release_owner(
+    connection: &mut PgConnection,
+    release: Option<Id>,
+    digest: Option<String>,
+    sources: &mut BTreeSet<InputOwnershipDependency>,
+) -> Result<Option<Id>> {
+    let row = release_owner(connection, release, digest).await?;
+    if let Some(id) = release.filter(|_| row.is_some()) {
+        sources.insert(InputOwnershipDependency::Release(id));
+    }
+    Ok(row)
 }
 
 async fn component(
@@ -870,19 +995,24 @@ async fn owner_pack(
     pack: Option<Id>,
     action: Option<Id>,
     sensor: Option<Id>,
+    sources: &mut BTreeSet<InputOwnershipDependency>,
 ) -> Result<Option<Id>> {
     match kind {
         OwnerType::Pack => Ok(pack),
         OwnerType::Action => match action {
-            Some(id) => Ok(component(connection, ComponentTarget::Action, id)
-                .await?
-                .and_then(|parent| parent.pack)),
+            Some(id) => Ok(
+                input_component(connection, ComponentTarget::Action, id, sources)
+                    .await?
+                    .and_then(|parent| parent.pack),
+            ),
             None => Ok(None),
         },
         OwnerType::Sensor => match sensor {
-            Some(id) => Ok(component(connection, ComponentTarget::Sensor, id)
-                .await?
-                .and_then(|parent| parent.pack)),
+            Some(id) => Ok(
+                input_component(connection, ComponentTarget::Sensor, id, sources)
+                    .await?
+                    .and_then(|parent| parent.pack),
+            ),
             None => Ok(None),
         },
         OwnerType::System | OwnerType::Identity => Ok(None),
@@ -916,6 +1046,7 @@ async fn archived_execution(
     context.pack_ref = Some(current_pack);
     context.managing_pack_id = Some(release.pack);
     let resolved = ResolvedRuntimeTarget {
+        input_sources: BTreeSet::new(),
         kind: "execution",
         resource: Resource::Executions,
         pack_id: Some(release.pack),

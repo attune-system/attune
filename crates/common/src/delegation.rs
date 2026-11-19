@@ -157,7 +157,17 @@ impl DelegationAuthority {
         action: Action,
         ownership: &crate::repositories::iam_ownership::VerifiedKeyOrigins,
     ) -> bool {
-        crate::key_access::origin_action_allowed_verified(
+        self.key_origin_evidence(origin, action, ownership)
+            .is_some()
+    }
+
+    pub(crate) fn key_origin_evidence(
+        &self,
+        origin: &crate::secret_provenance::KeyOrigin,
+        action: Action,
+        ownership: &crate::repositories::iam_ownership::VerifiedKeyOrigins,
+    ) -> Option<crate::key_access::KeyOriginGrantEvidence> {
+        crate::key_access::origin_action_evidence(
             &self.grants,
             &self.context,
             origin,

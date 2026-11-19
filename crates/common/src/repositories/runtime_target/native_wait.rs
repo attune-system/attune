@@ -39,6 +39,7 @@ impl RuntimeTargetRepository {
             context.pack_ref = Some(pack_ref(conn, pack).await?.ok_or_else(denied)?);
         }
         let resolved = ResolvedRuntimeTarget {
+            input_sources: BTreeSet::new(),
             kind,
             resource,
             pack_id: binding.pack_id,

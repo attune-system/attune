@@ -53,29 +53,60 @@ pub fn origin_action_allowed_verified(
     caller: &AuthorizationContext,
     origin: &KeyOrigin,
     action: Action,
-    ownership: &crate::repositories::iam_ownership::VerifiedKeyOrigins,
+    ownership: &VerifiedKeyOrigins,
 ) -> bool {
+    origin_action_evidence(grants, caller, origin, action, ownership).is_some()
+}
+
+/// Which source dimension the FIRST successful canonical grant actually used.
+/// This contains no grants and cannot widen another contributor's authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyOriginGrantEvidence {
+    RecordedOrigin,
+    ManagingPack,
+}
+
+pub(crate) fn origin_action_evidence(
+    grants: &[Grant],
+    caller: &AuthorizationContext,
+    origin: &KeyOrigin,
+    action: Action,
+    ownership: &crate::repositories::iam_ownership::VerifiedKeyOrigins,
+) -> Option<KeyOriginGrantEvidence> {
     let mut context = origin_context(caller.identity_id, origin);
     context.managing_pack_id = ownership.managing_pack(origin);
     context.identity_attributes = caller.identity_attributes.clone();
-    grants.iter().any(|grant| {
-        if origin.owner_type == OwnerType::Identity
-            && origin.owner_identity != Some(caller.identity_id)
-        {
-            let Some(scope) = &grant.constraints else {
-                return false;
-            };
-            if scope.owner.is_none()
-                && scope.owner_types.is_none()
-                && scope.owner_refs.is_none()
-                && scope.refs.is_none()
-                && scope.ids.is_none()
+    grants
+        .iter()
+        .find(|grant| {
+            if origin.owner_type == OwnerType::Identity
+                && origin.owner_identity != Some(caller.identity_id)
             {
-                return false;
+                let Some(scope) = &grant.constraints else {
+                    return false;
+                };
+                if scope.owner.is_none()
+                    && scope.owner_types.is_none()
+                    && scope.owner_refs.is_none()
+                    && scope.refs.is_none()
+                    && scope.ids.is_none()
+                {
+                    return false;
+                }
             }
-        }
-        grant.allows(Resource::Keys, action, &context)
-    })
+            grant.allows(Resource::Keys, action, &context)
+        })
+        .map(|grant| {
+            if grant
+                .constraints
+                .as_ref()
+                .is_some_and(|scope| scope.managing_pack_id.is_some())
+            {
+                KeyOriginGrantEvidence::ManagingPack
+            } else {
+                KeyOriginGrantEvidence::RecordedOrigin
+            }
+        })
 }
 
 pub struct ResolvedKey {
