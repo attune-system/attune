@@ -661,7 +661,7 @@ test "$(cat /opt/attune/pack/source.txt)" = 'immutable source'
 "#
         .into(),
     ]);
-    reuse.inputs = vec![pack, runtime, f.runner.clone()];
+    reuse.inputs = vec![pack.clone(), runtime.clone(), f.runner.clone()];
     reuse.invocation.working_root = LaunchRoot::Runtime;
     let resource = f
         .launcher
@@ -678,6 +678,178 @@ test "$(cat /opt/attune/pack/source.txt)" = 'immutable source'
         return Err(
             "Docker runtime reuse lost console script/link/project or read-only mount".into(),
         );
+    }
+    sibling_setup_stage_isolation(f, &setup, &pack, &runtime).await?;
+    Ok(())
+}
+
+async fn sibling_setup_stage_isolation(
+    f: &Fixture,
+    original: &ProcessSpec,
+    pack: &PinnedLaunchInput,
+    runtime: &PinnedLaunchInput,
+) -> TestResult {
+    use attune_workload_backend::planning::{SetupPlan, SetupStep};
+    let mut archive = f.cache.open_input_archive(runtime)?;
+    let published = f.cache.install_input(runtime, &mut archive)?;
+    let mut archive = f.cache.open_input_archive(pack)?;
+    let source = f.cache.install_input(pack, &mut archive)?;
+    let fresh = || {
+        let mut spec = original.clone();
+        spec.intent = Uuid::new_v4();
+        spec.target = LaunchTarget::Setup {
+            admission: 1,
+            attempt: Uuid::new_v4(),
+        };
+        spec
+    };
+    let a = fresh();
+    let marker = PathBuf::from("/var/lib/attune/launch/private")
+        .join(a.intent.simple().to_string())
+        .join("runtime/owned-setup-marker");
+    let published_path = published.join("project/source.txt");
+    let plan = |program: &str, arguments: Vec<String>, credential: bool| {
+        let mut environment =
+            BTreeMap::from([("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into())]);
+        if credential {
+            environment.insert(
+                "OWNED_DUMMY_SETUP_CREDENTIAL".into(),
+                "owned-setup-a-secret".into(),
+            );
+        }
+        let mut argv = vec!["/usr/bin/python3".into(), "-c".into(), program.into()];
+        argv.extend(arguments);
+        SetupPlan {
+            version: 1,
+            environment,
+            steps: vec![SetupStep {
+                argv,
+                if_pack_file: None,
+            }],
+        }
+    };
+    let a_plan = plan(
+        r#"import os,sys,time
+from pathlib import Path
+assert not Path(sys.argv[1]).exists()
+assert not Path('/var/lib/attune/launch').exists()
+Path('/opt/attune/runtime/owned-setup-marker').write_text(os.environ['OWNED_DUMMY_SETUP_CREDENTIAL'])
+while True: time.sleep(1)
+"#,
+        vec![published_path
+            .to_str()
+            .ok_or("invalid owned cache path")?
+            .into()],
+        true,
+    );
+    let payload = serde_json::to_vec(&a_plan)?;
+    let resource = f
+        .launcher
+        .prepare(&a, ProcessCreateDisposition::CreateOnce)
+        .await?;
+    let io = match f.launcher.start(&a, &resource).await {
+        Ok(io) => io,
+        Err(error) => {
+            // A failed start is not publication evidence; the enclosing owned
+            // harness also reconciles any uncertain live container on failure.
+            f.launcher.remove_stopped(&a, &resource).await?;
+            return Err(error.into());
+        }
+    };
+    let control = io.control.clone();
+    let running = tokio::spawn(run(io, payload));
+    let result: TestResult = async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            match std::fs::read(&marker) {
+                Ok(bytes) if bytes == b"owned-setup-a-secret" => break,
+                Ok(_) => return Err("owned setup marker changed".into()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            if running.is_finished() || tokio::time::Instant::now() >= deadline {
+                return Err("sibling setup did not become live".into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let b = fresh();
+        // Same logical runtime/cache key, distinct attempt-owned staging.
+        let b_plan = plan(
+            r#"import errno,os,sys
+from pathlib import Path
+assert Path.cwd() == Path('/opt/attune/runtime/project')
+assert not Path(sys.argv[1]).exists()
+assert not Path(sys.argv[2]).exists()
+assert not Path('/var/lib/attune/launch').exists()
+assert 'OWNED_DUMMY_SETUP_CREDENTIAL' not in os.environ
+assert os.statvfs('/opt/attune/pack').f_flag & os.ST_RDONLY
+assert Path('/opt/attune/pack/source.txt').read_text() == 'immutable source'
+try: Path('/opt/attune/pack/source.txt').write_text('poisoned source')
+except OSError as error: assert error.errno in (errno.EROFS, errno.EACCES)
+else: raise AssertionError('admitted Pack was writable')
+Path('/opt/attune/runtime/owned-setup-marker').write_text('owned-b-private')
+print('owned-sibling-stage-boundary', end='')
+"#,
+            vec![
+                marker.to_str().ok_or("invalid owned stage path")?.into(),
+                published_path
+                    .to_str()
+                    .ok_or("invalid owned cache path")?
+                    .into(),
+            ],
+            false,
+        );
+        let b_resource = f
+            .launcher
+            .prepare(&b, ProcessCreateDisposition::CreateOnce)
+            .await?;
+        let b_result: TestResult = async {
+            let (exit, out, err) = run(
+                f.launcher.start(&b, &b_resource).await?,
+                serde_json::to_vec(&b_plan)?,
+            )
+            .await?;
+            if exit.exit_code != 0
+                || exit.oom_killed
+                || out != b"owned-sibling-stage-boundary"
+                || !err.is_empty()
+            {
+                return Err("sibling setup boundary failed".into());
+            }
+            let archive = f.launcher.archive_stopped_stage(&b, &b_resource).await?;
+            let mut zip = zip::ZipArchive::new(archive)?;
+            let mut own = Vec::new();
+            zip.by_name("owned-setup-marker")?.read_to_end(&mut own)?;
+            if own != b"owned-b-private" {
+                return Err("setup archive included sibling bytes".into());
+            }
+            Ok(())
+        }
+        .await;
+        // Only local fixture byte acceptance; no domain Ready receipt modeled.
+        f.launcher.remove_stopped(&b, &b_resource).await?;
+        b_result?;
+        if running.is_finished()
+            || std::fs::read(&marker)? != b"owned-setup-a-secret"
+            || std::fs::read(&published_path)? != b"private project"
+            || std::fs::read(source.join("source.txt"))? != b"immutable source"
+        {
+            return Err("setup/cleanup changed a live sibling or published input".into());
+        }
+        Ok(())
+    }
+    .await;
+    // Stop and join the live capture/process before reclaiming its own stage,
+    // including after any failed sibling assertion or provider effect.
+    let stopped = control.stop(LaunchStopReason::Cancelled).await;
+    let joined = running.await;
+    let removed = f.launcher.remove_stopped(&a, &resource).await;
+    stopped?;
+    let (exit, _, _) = joined??;
+    removed?;
+    result?;
+    if exit.exit_code == 0 || exit.oom_killed || marker.exists() {
+        return Err("live setup cancellation/owned stage cleanup was not acknowledged".into());
     }
     Ok(())
 }

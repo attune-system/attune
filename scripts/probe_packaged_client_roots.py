@@ -91,6 +91,13 @@ class McpHttpProbe:
         self.identifier = None
         self.verified = False
         self.submitted = False
+        self.cleanup_facts = {
+            'cleanup_failed_step': None,
+            'cleanup_failure_reason': None,
+            'cleanup_wait_exit': None,
+            'cleanup_observed_exit': None,
+            'cleanup_running': None,
+        }
 
     def docker(self, *args, timeout=10):
         return checked(self.run, ['docker', *args], timeout)
@@ -184,38 +191,54 @@ class McpHttpProbe:
         # Same owning-fixture order: exact identity -> Stop -> Wait -> stopped
         # inspection -> nonforced Remove ACK. Never infer removal from 404.
         acknowledged = True
+        def fail(step, reason):
+            nonlocal acknowledged
+            acknowledged = False
+            if self.cleanup_facts['cleanup_failed_step'] is None:
+                self.cleanup_facts['cleanup_failed_step'] = step
+                self.cleanup_facts['cleanup_failure_reason'] = reason
+
         try:
             self.inspect_owned()
         except ProbeFailure as failure:
+            fail('inspect_before_stop', str(failure))
             if not self.verified or str(failure) == 'resource_ownership':
                 return False
             # A start timeout may leave a running daemon. Its already verified
             # immutable ID still permits Stop/Wait/Remove after a read failure;
             # the unknown inspection ACK remains a failed probe.
-            acknowledged = False
         waited = None
         try:
-            acknowledged &= self.docker('stop', '--time', '5', self.identifier).strip() == self.identifier.encode()
-        except ProbeFailure:
-            acknowledged = False
+            if self.docker('stop', '--time', '5', self.identifier).strip() != self.identifier.encode():
+                fail('stop', 'ack_mismatch')
+        except ProbeFailure as failure:
+            fail('stop', str(failure))
         try:
             raw = self.docker('wait', self.identifier).strip()
             waited = int(raw) if re.fullmatch(rb'[0-9]{1,3}', raw) else None
-            acknowledged &= waited is not None
-        except ProbeFailure:
-            acknowledged = False
+            self.cleanup_facts['cleanup_wait_exit'] = waited
+            if waited is None:
+                fail('wait', 'ack_mismatch')
+        except ProbeFailure as failure:
+            fail('wait', str(failure))
         try:
             state = self.inspect_owned()['State']
-            acknowledged &= (state.get('Running') is False and state.get('Restarting') is False
-                             and waited is not None and state.get('ExitCode') == waited)
-        except (ProbeFailure, KeyError, TypeError):
-            acknowledged = False
+            self.cleanup_facts['cleanup_observed_exit'] = state.get('ExitCode')
+            self.cleanup_facts['cleanup_running'] = state.get('Running')
+            if not (state.get('Running') is False and state.get('Restarting') is False
+                    and waited is not None and state.get('ExitCode') == waited):
+                fail('inspect_after_wait', 'state_mismatch')
+        except ProbeFailure as failure:
+            fail('inspect_after_wait', str(failure))
+        except (KeyError, TypeError):
+            fail('inspect_after_wait', 'state_mismatch')
         try:
             # Still attempt nonforced removal after uncertain Stop/Wait: it
             # cannot delete a running container. The uncertain case stays FAIL.
-            acknowledged &= self.docker('rm', self.identifier).strip() == self.identifier.encode()
-        except ProbeFailure:
-            acknowledged = False
+            if self.docker('rm', self.identifier).strip() != self.identifier.encode():
+                fail('remove', 'ack_mismatch')
+        except ProbeFailure as failure:
+            fail('remove', str(failure))
         return bool(acknowledged)
 
     def probe(self, empty_roots):
@@ -232,7 +255,8 @@ class McpHttpProbe:
         return {'probe': 'packaged_client_roots', 'binary': 'attune-mcp',
                 'check': 'empty_caller_roots_denied' if empty_roots else 'http_caller_initialized',
                 'passed': passed and cleanup, 'exit': code, 'http': status,
-                'cleanup_ack': cleanup, 'error': error if cleanup else 'cleanup_unknown'}
+                'cleanup_ack': cleanup, 'error': error if cleanup else 'cleanup_unknown',
+                **self.cleanup_facts}
 
 
 def probe(compose, run=subprocess.run, now=time.monotonic, pause=time.sleep):
