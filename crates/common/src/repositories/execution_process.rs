@@ -240,7 +240,7 @@ impl ExecutionProcessRepository {
                             return Err(denied());
                         }
                         if !allow_canceling {
-                            RuntimeAuthorityRepository::validate_execution_source(
+                            RuntimeAuthorityRepository::validate_native_execution_source(
                                 tx,
                                 &RuntimeCredentialBinding {
                                     execution_id: *execution,
@@ -484,7 +484,7 @@ impl ExecutionProcessRepository {
         {
             return Err(denied());
         }
-        probe.input_frontier.retain(connection).await?;
+        let input_fence = probe.input_frontier.retain(connection).await?;
         let sources = snapshot
             .source_epochs
             .iter()
@@ -511,7 +511,7 @@ impl ExecutionProcessRepository {
         {
             return Err(denied());
         }
-        fresh_on(connection, probe.input_frontier.deadline()).await?;
+        input_fence.ensure_fresh_on(connection).await?;
         Ok(())
     }
 

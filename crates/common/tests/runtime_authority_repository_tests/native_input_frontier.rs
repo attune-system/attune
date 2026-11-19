@@ -565,6 +565,7 @@ async fn native_input_command_inspection_gets_empty_stdin_no_token_and_exact_cap
     .await;
     let result = async {
         let mut source = source?;
+        anyhow::ensure!(source.fixture.approval.expires_at.is_none());
         let action = source.spec.clone();
         source.spec.intent = uuid::Uuid::new_v4();
         source.spec.purpose = LaunchPurpose::RuntimeProbe;
@@ -815,6 +816,30 @@ async fn native_input_observed_operation_wait_rechecks_input_only_approval_expir
     let (db, source) = seed_input_only_receipt().await;
     let result = async {
         let (source, expiry) = source?;
+        // This is a genuine current credential binding except that API access
+        // was never selected. Input-only consent must not turn either public
+        // credential path into an API grant.
+        let credential = &source.fixture.credential;
+        let admission = &source.fixture.admission;
+        anyhow::ensure!(!admission.authority.has_api_access());
+        anyhow::ensure!(admission.id == credential.admission_id);
+        anyhow::ensure!(admission.authority.owner.sponsor_identity_id == credential.sponsor_identity_id);
+        anyhow::ensure!(admission.authority.binding.action_ref() == credential.action_ref);
+        anyhow::ensure!(admission.authority.attempt == credential.attempt);
+        let LaunchTarget::Execution {execution,worker,attempt,..} = source.spec.target else {unreachable!()};
+        anyhow::ensure!(execution == credential.execution_id && attempt == credential.attempt);
+        let actual = RuntimeAuthorityRepository::current_worker_attempt(db.pool().acquire().await?.as_mut(),execution,worker).await?;
+        anyhow::ensure!(actual == credential.attempt);
+        let mut tx = db.begin().await?;
+        let denied = matches!(RuntimeAuthorityRepository::validate_execution_credential(&mut tx,credential).await,
+            Err(attune_common::Error::PermissionDenied(message)) if message == "Execution credential does not match admitted authority");
+        tx.rollback().await?;
+        anyhow::ensure!(denied);
+        let mut tx = db.begin().await?;
+        let denied = matches!(RuntimeAuthorityRepository::begin_execution_attempt(&mut tx,execution,worker,attempt).await,
+            Err(attune_common::Error::PermissionDenied(message)) if message == "Execution has no active runtime API admission");
+        tx.rollback().await?;
+        anyhow::ensure!(denied);
         observed_wait_expiry(&db, &source, expiry).await
     }
     .await;

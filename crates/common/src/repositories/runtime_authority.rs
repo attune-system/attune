@@ -1879,6 +1879,24 @@ impl RuntimeAuthorityRepository {
         connection: &mut PgConnection,
         credential: &RuntimeCredentialBinding,
     ) -> Result<ValidatedRuntimeAuthority> {
+        Self::validate_execution_source_for(connection, credential, true).await
+    }
+
+    /// Native effects retain the same source/attempt policy without granting
+    /// API access. API credentials and the legacy launch consumer keep their
+    /// existing explicit opt-in requirement through the wrapper above.
+    pub(crate) async fn validate_native_execution_source(
+        connection: &mut PgConnection,
+        credential: &RuntimeCredentialBinding,
+    ) -> Result<ValidatedRuntimeAuthority> {
+        Self::validate_execution_source_for(connection, credential, false).await
+    }
+
+    async fn validate_execution_source_for(
+        connection: &mut PgConnection,
+        credential: &RuntimeCredentialBinding,
+        require_api: bool,
+    ) -> Result<ValidatedRuntimeAuthority> {
         positive_id(credential.execution_id)?;
         positive_id(credential.admission_id)?;
         SchemaTypeRepository::lock_selection(&mut *connection).await?;
@@ -1923,7 +1941,7 @@ impl RuntimeAuthorityRepository {
         if record.revoked_at.is_some()
             || record.authority.owner.sponsor_identity_id != credential.sponsor_identity_id
             || record.authority.binding.action_ref() != credential.action_ref
-            || !record.authority.has_api_access()
+            || (require_api && !record.authority.has_api_access())
         {
             return Err(Error::PermissionDenied(
                 "Execution credential does not match admitted authority".into(),
