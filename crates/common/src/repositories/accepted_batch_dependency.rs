@@ -250,9 +250,11 @@ impl AcceptedBatchDependencyRepository {
         let mut expected = source.authority.0.clone();
         expected.attempt = target.authority.attempt;
         if source.id >= target.id || expected != target.authority.0 {
-            return Err(denied());
+            return Err(Error::PermissionDenied(
+                "Retry accepted batch authority differs from its retained source".into(),
+            ));
         }
-        let original:bool=sqlx::query_scalar("SELECT xmin::text::numeric=mod(pg_current_xact_id()::text::numeric,4294967296) FROM runtime_authority_admission WHERE id=$1")
+        let original:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM runtime_authority_admission a JOIN execution e ON a.owner_kind='execution' AND e.id=a.owner_id JOIN execution_authority_selection s ON s.execution=e.id AND s.admission=a.id WHERE a.id=$1 AND s.mode='recorded' AND NOT s.explicit AND e.initial_input_transaction=pg_current_xact_id() AND s.selection_transaction=pg_current_xact_id())")
             .bind(target.id).fetch_one(&mut *conn).await?;
         let present: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM runtime_accepted_batch_manifest WHERE admission=$1)",
@@ -261,20 +263,35 @@ impl AcceptedBatchDependencyRepository {
         .fetch_one(&mut *conn)
         .await?;
         if !original && !present {
-            return Err(denied());
+            return Err(Error::PermissionDenied(
+                "Retry accepted batch target was not originally staged or already sealed".into(),
+            ));
         }
-        Self::validate(conn, source).await?;
+        if !original {
+            // A later idempotent call validates a complete existing seal; it
+            // cannot repair a historical partial manifest or add missing proof.
+            Self::validate(conn, target)
+                .await
+                .map_err(|error| retry_denial(error, "existing target"))?;
+        }
+        Self::validate(conn, source)
+            .await
+            .map_err(|error| retry_denial(error, "source"))?;
         sqlx::query("INSERT INTO runtime_accepted_batch_manifest(admission,item_ids) SELECT $2,item_ids FROM runtime_accepted_batch_manifest WHERE admission=$1 ON CONFLICT DO NOTHING")
             .bind(source.id).bind(target.id).execute(&mut *conn).await?;
         sqlx::query("INSERT INTO runtime_accepted_batch_item(admission,item,source_admission,target_policy,proof,proof_digest,configuration_input) SELECT $2,item,source_admission,target_policy,proof,proof_digest,configuration_input FROM runtime_accepted_batch_item WHERE admission=$1 ON CONFLICT DO NOTHING")
             .bind(source.id).bind(target.id).execute(&mut *conn).await?;
         sqlx::query("INSERT INTO runtime_admission_dependency(admission,dependency,dependency_kind) SELECT $2,dependency,'accepted_item' FROM runtime_admission_dependency WHERE admission=$1 AND dependency_kind='accepted_item' ON CONFLICT DO NOTHING")
             .bind(source.id).bind(target.id).execute(&mut *conn).await?;
-        Self::validate(conn, target).await?;
+        Self::validate(conn, target)
+            .await
+            .map_err(|error| retry_denial(error, "target"))?;
         let exact:bool=sqlx::query_scalar("SELECT NOT EXISTS((SELECT item,source_admission,target_policy,proof,proof_digest,configuration_input FROM runtime_accepted_batch_item WHERE admission=$1 EXCEPT SELECT item,source_admission,target_policy,proof,proof_digest,configuration_input FROM runtime_accepted_batch_item WHERE admission=$2) UNION ALL (SELECT item,source_admission,target_policy,proof,proof_digest,configuration_input FROM runtime_accepted_batch_item WHERE admission=$2 EXCEPT SELECT item,source_admission,target_policy,proof,proof_digest,configuration_input FROM runtime_accepted_batch_item WHERE admission=$1))")
             .bind(source.id).bind(target.id).fetch_one(conn).await?;
         if !exact {
-            return Err(denied());
+            return Err(Error::PermissionDenied(
+                "Retry accepted batch does not preserve exact source proof bytes".into(),
+            ));
         }
         Ok(())
     }
@@ -540,6 +557,14 @@ async fn check_item(
         return Err(denied());
     }
     Ok(())
+}
+fn retry_denial(error: Error, site: &str) -> Error {
+    match error {
+        Error::PermissionDenied(reason) => {
+            Error::PermissionDenied(format!("Retry accepted batch {site}: {reason}"))
+        }
+        other => other,
+    }
 }
 fn canonical_ids(ids: &[Id]) -> Result<Vec<Id>> {
     let canonical = ids

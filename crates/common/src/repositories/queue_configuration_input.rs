@@ -452,8 +452,7 @@ impl QueueConfigurationInputRepository {
         }
         let original: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM work_queue_item i JOIN work_queue_item_runtime_admission a ON a.item=i.id \
-             WHERE i.id=$1 AND i.xmin::text::numeric=mod(pg_current_xact_id()::text::numeric,4294967296) \
-             AND a.xmin::text::numeric=mod(pg_current_xact_id()::text::numeric,4294967296))",
+             WHERE i.id=$1 AND i.input_creation_transaction=pg_current_xact_id())",
         ).bind(item.id).fetch_one(&mut *conn).await?;
         if !original {
             return Err(denied());

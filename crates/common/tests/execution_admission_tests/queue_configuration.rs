@@ -359,7 +359,7 @@ async fn queue_fixed_inputs_seal_credentials_without_contributor_key_rights() {
 
 pub(super) const QUEUE_KEY: &str = "queue-input-contract-test-encryption-key";
 
-async fn accepted_record(
+async fn stage_record(
     conn: &mut sqlx::PgConnection,
     queue: &attune_common::models::WorkQueue,
     snapshot: &ExecutionExecutableSnapshot,
@@ -369,7 +369,6 @@ async fn accepted_record(
     use attune_common::{
         models::WorkQueueItemStatus,
         repositories::{
-            queue_configuration_input::QueueConfigurationInputRepository as Fixed,
             recorded_input_authority::RecordedInputAuthorityRepository,
             schema_contract::SchemaContractRepository,
             work_queue::{CreateWorkQueueItemInput, WorkQueueItemRepository},
@@ -449,9 +448,17 @@ async fn accepted_record(
     RecordedInputAuthorityRepository::capture_human(conn, "queue_item", item.id, actor)
         .await
         .unwrap();
-    Fixed::capture(conn, queue, &item, snapshot, QUEUE_KEY)
-        .await
-        .unwrap();
+    item
+}
+async fn accepted_record(
+    conn: &mut sqlx::PgConnection,
+    queue: &attune_common::models::WorkQueue,
+    snapshot: &ExecutionExecutableSnapshot,
+    actor: i64,
+    payload: serde_json::Value,
+) -> attune_common::models::WorkQueueItem {
+    let item = stage_record(conn, queue, snapshot, actor, payload).await;
+    attune_common::repositories::queue_configuration_input::QueueConfigurationInputRepository::capture(conn,queue,&item,snapshot,QUEUE_KEY).await.unwrap();
     item
 }
 
@@ -1043,5 +1050,192 @@ async fn mixed_queue_receipts_bind_each_contributor_and_structured_secret_after_
     );
     revoked.rollback().await.unwrap();
     tx.commit().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn queue_input_creation_markers_survive_nested_savepoint_release_and_rollback() {
+    use attune_common::repositories::queue_configuration_input::QueueConfigurationInputRepository as Fixed;
+    let (db, snapshot, policy, human) = fixture().await;
+    let mut tx = db.begin().await.unwrap();
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await
+        .unwrap();
+    let queue =
+        WorkQueueRepository::find_by_ref(&mut *tx, &format!("{}.inbox", policy.owner.pack_ref))
+            .await
+            .unwrap()
+            .unwrap();
+    let mut nested = sqlx::Connection::begin(&mut *tx).await.unwrap();
+    let released = stage_record(
+        &mut nested,
+        &queue,
+        &snapshot,
+        human,
+        json!({"message":"nested"}),
+    )
+    .await;
+    nested.commit().await.unwrap();
+    Fixed::capture(&mut tx, &queue, &released, &snapshot, QUEUE_KEY)
+        .await
+        .unwrap();
+    let mut rolled_back = sqlx::Connection::begin(&mut *tx).await.unwrap();
+    let discarded = stage_record(
+        &mut rolled_back,
+        &queue,
+        &snapshot,
+        human,
+        json!({"message":"discarded"}),
+    )
+    .await;
+    rolled_back.rollback().await.unwrap();
+    assert!(
+        attune_common::repositories::work_queue::WorkQueueItemRepository::find_by_id(
+            &mut *tx,
+            discarded.id
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    let current = accepted_record(
+        &mut tx,
+        &queue,
+        &snapshot,
+        human,
+        json!({"message":"after rollback-to"}),
+    )
+    .await;
+    tx.commit().await.unwrap();
+    let mut tx = db.begin().await.unwrap();
+    for item in [released, current] {
+        let first = Fixed::load(&mut tx, &queue, &item, &snapshot, QUEUE_KEY)
+            .await
+            .unwrap();
+        let second = Fixed::capture(&mut tx, &queue, &item, &snapshot, QUEUE_KEY)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.id(),
+            second.id(),
+            "a sealed load is idempotent after commit"
+        );
+    }
+    tx.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn queue_input_creation_marker_never_backfills_history_or_accepts_updated_old_rows() {
+    use attune_common::repositories::{
+        queue_configuration_input::QueueConfigurationInputRepository as Fixed,
+        work_queue::{UpdateWorkQueueItemInput, WorkQueueItemRepository},
+    };
+    helpers::init_test_env();
+    let config = attune_common::config::Config::load_from_file(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../config.test.yaml"
+    ))
+    .unwrap();
+    let db = TestDatabase::create_before(
+        &config.database,
+        "20261119000003_queue_input_creation_transaction.sql",
+    )
+    .await
+    .unwrap()
+    .with_cleanup_on_drop();
+    let (db, snapshot, policy, human) =
+        fixture_with_queue_shape(db, false, false, None, false, false).await;
+    let mut tx = db.begin().await.unwrap();
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await
+        .unwrap();
+    let queue =
+        WorkQueueRepository::find_by_ref(&mut *tx, &format!("{}.inbox", policy.owner.pack_ref))
+            .await
+            .unwrap()
+            .unwrap();
+    let historical = stage_record(
+        &mut tx,
+        &queue,
+        &snapshot,
+        human,
+        json!({"message":"historical"}),
+    )
+    .await;
+    tx.commit().await.unwrap();
+    sqlx::raw_sql(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../migrations/20261119000003_queue_input_creation_transaction.sql"
+    )))
+    .execute(&*db)
+    .await
+    .unwrap();
+    let mut tx = db.begin().await.unwrap();
+    let root_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    let _: String = sqlx::query_scalar("SELECT pg_current_xact_id()::TEXT")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    let mut foreign = db.begin().await.unwrap();
+    let foreign_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *foreign)
+        .await
+        .unwrap();
+    assert_ne!(root_pid, foreign_pid);
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut foreign)
+        .await
+        .unwrap();
+    let foreign_item = stage_record(
+        &mut foreign,
+        &queue,
+        &snapshot,
+        human,
+        json!({"message":"foreign committed"}),
+    )
+    .await;
+    foreign.commit().await.unwrap();
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await
+        .unwrap();
+    let absent: bool = sqlx::query_scalar(
+        "SELECT input_creation_transaction IS NULL FROM work_queue_item WHERE id=$1",
+    )
+    .bind(historical.id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert!(
+        absent,
+        "forward migration must not invent historical creation evidence"
+    );
+    for item in [historical, foreign_item] {
+        assert!(Fixed::capture(&mut tx, &queue, &item, &snapshot, QUEUE_KEY)
+            .await
+            .is_err());
+        let updated = WorkQueueItemRepository::update(
+            &mut *tx,
+            item.id,
+            UpdateWorkQueueItemInput {
+                metadata: Some(json!({"updated":true})),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            Fixed::capture(&mut tx, &queue, &updated, &snapshot, QUEUE_KEY)
+                .await
+                .is_err(),
+            "UPDATE cannot turn an old item into original creation"
+        );
+        let mut overwrite = sqlx::Connection::begin(&mut *tx).await.unwrap();
+        assert!(sqlx::query("UPDATE work_queue_item SET input_creation_transaction=pg_current_xact_id() WHERE id=$1").bind(item.id).execute(&mut *overwrite).await.is_err());
+        overwrite.rollback().await.unwrap();
+    }
+    tx.rollback().await.unwrap();
     db.cleanup().await.unwrap();
 }

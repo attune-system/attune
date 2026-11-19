@@ -95,7 +95,7 @@ pub(super) async fn capture(
     {
         return RuntimeAuthorityRepository::retained_admission_fence(conn, destination).await;
     }
-    let original:bool = sqlx::query_scalar("SELECT xmin::text::numeric=mod(pg_current_xact_id()::text::numeric,4294967296) FROM runtime_authority_admission WHERE id=$1")
+    let original:bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM runtime_authority_admission a JOIN execution e ON a.owner_kind='execution' AND e.id=a.owner_id JOIN execution_authority_selection s ON s.execution=e.id AND s.admission=a.id WHERE a.id=$1 AND s.mode='recorded' AND NOT s.explicit AND e.initial_input_transaction=pg_current_xact_id() AND s.selection_transaction=pg_current_xact_id())")
         .bind(destination).fetch_one(&mut *conn).await?;
     if !original {
         return Err(denied());
