@@ -74,8 +74,8 @@ impl SensorWorkloadRepository {
             )
             .await?
             .ok_or_else(denied)?;
-        let worker: Option<i64> = sqlx::query_scalar("SELECT id FROM worker WHERE id=$1 AND status IN ('active','busy') AND last_heartbeat>clock_timestamp()-interval '90 seconds' FOR SHARE")
-            .bind(fence.worker_id).fetch_optional(&mut **tx).await?;
+        let worker: Option<i64> = sqlx::query_scalar("SELECT id FROM worker WHERE id=$1 AND meta->>'registration_incarnation'=$2 AND status IN ('active','busy') AND last_heartbeat>clock_timestamp()-interval '90 seconds' FOR SHARE")
+            .bind(fence.worker_id).bind(fence.worker_instance.to_string()).fetch_optional(&mut **tx).await?;
         if worker != Some(fence.worker_id) {
             return Err(denied());
         }

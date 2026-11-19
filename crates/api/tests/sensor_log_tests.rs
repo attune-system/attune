@@ -125,26 +125,34 @@ async fn sensor_log_fixture_with_native_metadata(
         ManagedSensorMetadataRepository::readmit(&mut tx, &current, identity, key).await?;
         tx.commit().await?;
     }
-    let worker = WorkerRepository::create(
-        &ctx.pool,
-        CreateWorkerInput {
-            name: "c-sensor-tail-worker".into(),
-            worker_type: attune_common::models::WorkerType::Local,
-            runtime: None,
-            host: None,
-            port: None,
-            status: Some(attune_common::models::WorkerStatus::Active),
-            capabilities: Some(json!({})),
-            meta: None,
-        },
-    )
-    .await?;
+    let instance = uuid::Uuid::new_v4();
+    let input = CreateWorkerInput {
+        name: "c-sensor-tail-worker".into(),
+        worker_type: attune_common::models::WorkerType::Local,
+        runtime: None,
+        host: None,
+        port: None,
+        status: Some(attune_common::models::WorkerStatus::Active),
+        capabilities: Some(json!({})),
+        meta: None,
+    };
+    let worker = if native {
+        WorkerRepository::register_incarnation(
+            &ctx.pool,
+            input,
+            attune_common::models::WorkerRole::Sensor,
+            instance,
+        )
+        .await?
+    } else {
+        WorkerRepository::create(&ctx.pool, input).await?
+    };
     let lease = match SensorWorkloadRepository::acquire_or_renew(
         &ctx.pool,
         AcquireSensorWorkloadInput {
             sensor_id: sensor.id,
             worker_id: worker.id,
-            worker_instance: uuid::Uuid::new_v4(),
+            worker_instance: instance,
             lease_seconds: 300,
         },
     )

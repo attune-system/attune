@@ -3073,6 +3073,121 @@ async fn admit_native_sensor_metadata(pool: &PgPool, sensor: &Sensor) {
     tx.commit().await.unwrap();
 }
 
+async fn register_native_sensor_worker(pool: &PgPool, worker: &Worker, instance: Uuid) {
+    let registered = WorkerRepository::register_incarnation(
+        pool,
+        CreateWorkerInput {
+            name: worker.name.clone(),
+            worker_type: worker.worker_type,
+            runtime: worker.runtime,
+            host: worker.host.clone(),
+            port: worker.port,
+            status: None,
+            capabilities: worker.capabilities.clone(),
+            meta: None,
+        },
+        attune_common::models::WorkerRole::Sensor,
+        instance,
+    )
+    .await
+    .unwrap();
+    assert_eq!(registered.id, worker.id);
+    assert_eq!(
+        registered.meta.unwrap()["registration_incarnation"],
+        instance.to_string()
+    );
+}
+
+#[tokio::test]
+async fn native_sensor_fresh_admission_rejects_replaced_registration() {
+    let (pool, sensor, worker, _) = setup_fixture().await;
+    create_active_rule(&pool, &sensor).await;
+    admit_native_sensor_metadata(&pool, &sensor).await;
+    let master = "0123456789abcdef0123456789abcdef";
+    let original = Uuid::new_v4();
+    register_native_sensor_worker(&pool, &worker, original).await;
+    let AcquireEligibleSensorWorkloadOutcome::Acquired(old) =
+        SensorWorkloadAdmissionRepository::acquire_with_encryption_key(
+            &pool,
+            acquire_input(sensor.id, worker.id, original),
+            Some(master),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("original admission")
+    };
+    let replacement = Uuid::new_v4();
+    register_native_sensor_worker(&pool, &worker, replacement).await;
+    assert!(
+        SensorWorkloadRepository::is_current_fence(&pool, old.fence())
+            .await
+            .unwrap(),
+        "the original assignment is still live; metadata must independently fence fresh effects"
+    );
+    assert!(matches!(
+        SensorWorkloadRepository::reserve_native_effect(
+            &pool,
+            sensor.id,
+            old.fence(),
+            Uuid::new_v4(),
+            "private original context",
+            master,
+        )
+        .await,
+        Err(attune_common::Error::PermissionDenied(_))
+    ));
+    assert!(
+        SensorWorkloadRepository::native_effect(&pool, old.workload_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "stale manager cannot recapture current source epochs"
+    );
+    SensorWorkloadRepository::release(&pool, old.fence())
+        .await
+        .unwrap();
+    let AcquireEligibleSensorWorkloadOutcome::Acquired(current) =
+        SensorWorkloadAdmissionRepository::acquire_with_encryption_key(
+            &pool,
+            acquire_input(sensor.id, worker.id, replacement),
+            Some(master),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("replacement admission")
+    };
+    assert!(current.generation > old.generation);
+    let intent = Uuid::new_v4();
+    SensorWorkloadRepository::reserve_native_effect(
+        &pool,
+        sensor.id,
+        current.fence(),
+        intent,
+        "private replacement context",
+        master,
+    )
+    .await
+    .unwrap();
+    SensorWorkloadRepository::consume_native_effect(
+        &pool,
+        sensor.id,
+        current.fence(),
+        intent,
+        false,
+    )
+    .await
+    .unwrap();
+    let effect = SensorWorkloadRepository::native_effect(&pool, current.workload_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(effect.worker_instance, replacement);
+    assert!(effect.create_submitted);
+    pool.cleanup().await.unwrap();
+}
+
 #[tokio::test]
 async fn native_sensor_effect_fences_stale_generation_replay_and_restart() {
     use attune_common::isolated_process::ResourceIdentity;
@@ -3082,6 +3197,7 @@ async fn native_sensor_effect_fences_stale_generation_replay_and_restart() {
     admit_native_sensor_metadata(&pool, &sensor).await;
     let master = "0123456789abcdef0123456789abcdef";
     let incarnation = Uuid::new_v4();
+    register_native_sensor_worker(&pool, &worker, incarnation).await;
     let outcome = SensorWorkloadAdmissionRepository::acquire_with_encryption_key(
         &pool,
         acquire_input(sensor.id, worker.id, incarnation),
@@ -3293,6 +3409,7 @@ async fn native_sensor_file_case(deadline_wait: bool, stop_wait: bool) {
     .await
     .unwrap();
     let instance = Uuid::new_v4();
+    register_native_sensor_worker(&pool, &worker, instance).await;
     let outcome = SensorWorkloadAdmissionRepository::acquire_with_encryption_key(
         &pool,
         acquire_input(sensor.id, worker.id, instance),
