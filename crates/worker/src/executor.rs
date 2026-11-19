@@ -128,6 +128,19 @@ struct RecordingProcessControl {
     intent: uuid::Uuid,
     resource: attune_common::isolated_process::ResourceIdentity,
 }
+pub(crate) fn recording_process_control(
+    inner: Arc<dyn attune_common::isolated_process::ProcessControl>,
+    pool: PgPool,
+    intent: uuid::Uuid,
+    resource: attune_common::isolated_process::ResourceIdentity,
+) -> Arc<dyn attune_common::isolated_process::ProcessControl> {
+    Arc::new(RecordingProcessControl {
+        inner,
+        pool,
+        intent,
+        resource,
+    })
+}
 #[async_trait::async_trait]
 impl attune_common::isolated_process::ProcessControl for RecordingProcessControl {
     async fn write_stdin_once(
