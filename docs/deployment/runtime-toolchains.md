@@ -18,6 +18,11 @@ even when the digest is listed. The same applies to the legacy Bubblewrap profil
 recipe discovery and preparation do not yet use that launcher. They remain
 available only in the explicit trusted local profile. Native recipe producers
 must be connected and validated before the isolated deployment defaults activate.
+The native Runner now supplies a fixed `inspect-runtime-tools` guest effect
+using the same recipe discovery engine, explicit guest PATH and read-only tool
+identities. This effect is not manager admission or startup integration, and it
+does not prepare or launch recipe targets. Private-generation invocation remains
+required before lifecycle recipes are supported by the native managers.
 
 ## Admission and discovery
 

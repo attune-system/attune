@@ -11,6 +11,9 @@ use std::{collections::BTreeMap, fmt};
 use thiserror::Error;
 
 pub const SETUP_STDIN_LIMIT: usize = 1024 * 1024;
+/// Keep every private JSON fragment below Linux's per-argument byte limit.
+pub const RUNTIME_RECIPE_CHUNK_BYTES: usize = 32 * 1024;
+pub const RUNTIME_TOOL_RESULT_BYTES: usize = 4 * 1024 * 1024;
 /// Setup-owned source/project output retained with the published runtime.
 pub const PROJECT_ROOT: &str = "/opt/attune/runtime/project";
 /// Runtime invocations use their frozen setup project. Candidate Pack working
@@ -103,6 +106,49 @@ impl SetupPlan {
 }
 pub fn runner_program(platform: LaunchPlatform) -> String {
     format!("{RUNNER_ROOT}/linux-{}", platform.native_arch())
+}
+/// Probe an already-admitted definition in the selected guest image. This is
+/// private invocation context, never Pod metadata or a public Runner archive.
+/// The caller selects the guest PATH explicitly; manager PATH is not consulted.
+/// This runs only tool probes, not preparation or the recipe launch command.
+pub fn runtime_tool_probe_argv(
+    platform: LaunchPlatform,
+    recipe: &attune_common::runtime_lifecycle::RuntimeRecipe,
+    selected_guest_path: &str,
+) -> Result<Vec<String>> {
+    recipe
+        .validate()
+        .map_err(|_| PlanningError::Configuration)?;
+    if selected_guest_path.contains('\0') {
+        return Err(PlanningError::Environment);
+    }
+    let definition = serde_json::to_string(recipe).map_err(|_| PlanningError::Configuration)?;
+    if definition.len() > crate::runner_protocol::MAX_START_CONTEXT {
+        return Err(PlanningError::Bounds);
+    }
+    let mut argv = vec![
+        runner_program(platform),
+        "inspect-runtime-tools".into(),
+        selected_guest_path.into(),
+    ];
+    let mut offset = 0;
+    while offset < definition.len() {
+        let mut end = (offset + RUNTIME_RECIPE_CHUNK_BYTES).min(definition.len());
+        while !definition.is_char_boundary(end) {
+            end -= 1;
+        }
+        argv.push(definition[offset..end].into());
+        offset = end;
+    }
+    // Account for the existing private framing/JSON encoding budget as well
+    // as the definition itself; do not introduce another transport or format.
+    crate::runner_protocol::encode_start(&attune_common::workload_launch::LaunchInvocation {
+        argv: argv.clone(),
+        env: BTreeMap::new(),
+        working_root: attune_common::workload_launch::LaunchRoot::Pack,
+    })
+    .map_err(|_| PlanningError::Bounds)?;
+    Ok(argv)
 }
 /// Private CP-selected envelope, never a public Runner body or caller plan.
 /// Selection/provenance must already be bound to the admitted immutable image
