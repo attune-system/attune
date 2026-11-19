@@ -21,12 +21,19 @@ fn invalid() -> Error {
     Error::validation("Invalid private launch stdin payload")
 }
 
-#[derive(Clone, ToSchema)]
-#[schema(value_type=String)]
+#[derive(Clone)]
 pub struct LaunchStdinPayload {
     bytes: Vec<u8>,
     sensor_bootstrap: bool,
 }
+// The purpose marker is private manager state; the general wire format remains
+// a single Base64 string, never an object exposing transport policy.
+impl utoipa::PartialSchema for LaunchStdinPayload {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        <String as utoipa::PartialSchema>::schema()
+    }
+}
+impl ToSchema for LaunchStdinPayload {}
 impl LaunchStdinPayload {
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
         if bytes.len() > MAX_PRIVATE_STDIN_BYTES {
@@ -131,6 +138,13 @@ impl<'de> Deserialize<'de> for AuthorizeLaunchStdinRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn public_schema_remains_a_string() {
+        assert_eq!(
+            serde_json::to_value(<LaunchStdinPayload as utoipa::PartialSchema>::schema()).unwrap(),
+            serde_json::to_value(<String as utoipa::PartialSchema>::schema()).unwrap()
+        );
+    }
     #[test]
     fn private_payload_roundtrip_is_exact_and_debug_and_errors_are_redacted() {
         let bytes = b"{\"selected\":\"owned-private-stdin-fixture\"}".to_vec();

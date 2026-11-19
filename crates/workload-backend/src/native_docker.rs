@@ -329,6 +329,15 @@ impl DockerLauncher {
                 .into(),
         ))
     }
+    /// Read durable evidence of an already acknowledged exact removal. This
+    /// never stops/removes a container and never treats provider absence as ACK.
+    pub async fn removal_recorded(
+        &self,
+        spec: &ProcessSpec,
+        resource: &ResourceIdentity,
+    ) -> attune_common::Result<bool> {
+        Ok(self.cached_removal(spec, resource).await?.is_some())
+    }
     async fn cached_removal(
         &self,
         spec: &ProcessSpec,
