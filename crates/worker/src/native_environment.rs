@@ -61,30 +61,30 @@ impl<'a> NativeEnvironmentInstaller<'a> {
         spec: &ProcessSpec,
         resource: &attune_common::isolated_process::ResourceIdentity,
     ) -> Result<()> {
-        if Setup::removal_recorded(&self.pool, spec.intent, resource).await? {
+        if Setup::removal_recorded(self.pool, spec.intent, resource).await? {
             return Ok(());
         }
-        Effects::request_stop(&self.pool, spec.intent).await?;
+        Effects::request_stop(self.pool, spec.intent).await?;
         self.configured
             .backend
             .remove_stopped(spec, resource)
             .await?;
-        Setup::acknowledge_removed(&self.pool, spec.intent, Some(resource)).await
+        Setup::acknowledge_removed(self.pool, spec.intent, Some(resource)).await
     }
 
     async fn settle_old_native_setups(&self, environment: i64, master: &str) -> Result<()> {
         let backend = &self.configured.backend;
         loop {
             let debt =
-                Setup::unsettled_with_resources(&self.pool, environment, None, master).await?;
+                Setup::unsettled_with_resources(self.pool, environment, None, master).await?;
             if debt.is_empty() {
                 return Ok(());
             }
             for (spec, submitted, retained) in debt {
                 if !submitted {
-                    Effects::request_stop(&self.pool, spec.intent).await?;
+                    Effects::request_stop(self.pool, spec.intent).await?;
                     // The repository rechecks the create latch under its lock.
-                    Setup::acknowledge_removed(&self.pool, spec.intent, None).await?;
+                    Setup::acknowledge_removed(self.pool, spec.intent, None).await?;
                     continue;
                 }
                 let newly_observed = retained.is_none();
@@ -94,9 +94,9 @@ impl<'a> NativeEnvironmentInstaller<'a> {
                 };
                 let fence = async {
                     if newly_observed {
-                        Effects::record_resource(&self.pool, spec.intent, &resource).await?;
+                        Effects::record_resource(self.pool, spec.intent, &resource).await?;
                     }
-                    Effects::request_stop(&self.pool, spec.intent).await
+                    Effects::request_stop(self.pool, spec.intent).await
                 };
                 let (fenced, stopped) = tokio::join!(
                     fence,
@@ -104,9 +104,9 @@ impl<'a> NativeEnvironmentInstaller<'a> {
                 );
                 fenced?;
                 let exit = stopped?;
-                Effects::record_exit(&self.pool, spec.intent, &resource, exit).await?;
+                Effects::record_exit(self.pool, spec.intent, &resource, exit).await?;
                 backend.remove_stopped(&spec, &resource).await?;
-                Setup::acknowledge_removed(&self.pool, spec.intent, Some(&resource)).await?;
+                Setup::acknowledge_removed(self.pool, spec.intent, Some(&resource)).await?;
             }
         }
     }
@@ -144,9 +144,9 @@ impl<'a> NativeEnvironmentInstaller<'a> {
         public_binding.sort_all_objects();
         let binding =
             attune_common::runtime_cache::sha256_bytes(&serde_json::to_vec(&public_binding)?);
-        if let Some(pin) = Setup::published(&self.pool, &binding).await? {
+        if let Some(pin) = Setup::published(self.pool, &binding).await? {
             if native.cache.open_input_archive(&pin).is_ok() {
-                let (spec, resource) = Setup::retained_output(&self.pool, &pin, master).await?;
+                let (spec, resource) = Setup::retained_output(self.pool, &pin, master).await?;
                 self.finish_native_setup_removal(&spec, &resource).await?;
                 return Ok((pin, false));
             }
@@ -179,9 +179,9 @@ impl<'a> NativeEnvironmentInstaller<'a> {
             if cancel.is_some_and(|t| t.is_cancelled()) {
                 return Err(denied());
             }
-            if let Some(pin) = Setup::published(&self.pool, &binding).await? {
+            if let Some(pin) = Setup::published(self.pool, &binding).await? {
                 if native.cache.open_input_archive(&pin).is_ok() {
-                    let (spec, resource) = Setup::retained_output(&self.pool, &pin, master).await?;
+                    let (spec, resource) = Setup::retained_output(self.pool, &pin, master).await?;
                     self.finish_native_setup_removal(&spec, &resource).await?;
                     return Ok((pin, false));
                 }
@@ -235,14 +235,12 @@ impl<'a> NativeEnvironmentInstaller<'a> {
         setup.timeout_ms = timeout
             .map(|s| s.checked_mul(1000).ok_or_else(denied))
             .transpose()?;
-        let setup = Setup::reserve(
-            &self.pool, &claimed, worker, instance, &setup, &plan, master,
-        )
-        .await?;
+        let setup =
+            Setup::reserve(self.pool, &claimed, worker, instance, &setup, &plan, master).await?;
         let launcher = backend.launcher();
-        let create = Setup::begin_create(&self.pool, setup.intent, master).await?;
+        let create = Setup::begin_create(self.pool, setup.intent, master).await?;
         let resource = launcher.prepare(&setup, create).await?;
-        Effects::record_resource(&self.pool, setup.intent, &resource).await?;
+        Effects::record_resource(self.pool, setup.intent, &resource).await?;
         let mut process = launcher.start(&setup, &resource).await?;
         if process.resource != resource {
             process
@@ -257,8 +255,7 @@ impl<'a> NativeEnvironmentInstaller<'a> {
             setup.intent,
             resource.clone(),
         );
-        let payload = match Setup::consume_stdin(&self.pool, setup.intent, &resource, master).await
-        {
+        let payload = match Setup::consume_stdin(self.pool, setup.intent, &resource, master).await {
             Ok(value) => value,
             Err(error) => {
                 process
@@ -291,7 +288,7 @@ impl<'a> NativeEnvironmentInstaller<'a> {
                 result=&mut future=>break result.map_err(|_|denied())?,
                 _=renew.tick()=>{
                     if !manager.renew_coordinated_environment_claim(&claimed.env_key,worker,claim,300).await.unwrap_or(false)
-                        || Setup::validate_source(&self.pool,setup.intent,master).await.is_err() {
+                        || Setup::validate_source(self.pool,setup.intent,master).await.is_err() {
                         cancel.cancel();let _=(&mut future).await;return Err(denied());
                     }
                 }
@@ -370,7 +367,7 @@ impl<'a> NativeEnvironmentInstaller<'a> {
         })
         .await
         .map_err(|_| denied())??;
-        Setup::publish(&self.pool, setup.intent, &resource, &pin, master).await?;
+        Setup::publish(self.pool, setup.intent, &resource, &pin, master).await?;
         self.finish_native_setup_removal(&setup, &resource).await?;
         Ok((pin, true))
     }
