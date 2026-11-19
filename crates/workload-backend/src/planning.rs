@@ -563,6 +563,26 @@ pub fn action_environment(
     validate_environment(&output, true)?;
     Ok(output)
 }
+/// Inline source has no declared action file. Keep unknown template tokens
+/// literal as the legacy inline renderer does, with the same selected-context
+/// precedence and authority validation as ordinary action environments.
+pub fn inline_action_environment(
+    config: &RuntimeExecutionConfig,
+    selected: &BTreeMap<String, String>,
+    has_runtime: bool,
+) -> Result<BTreeMap<String, String>> {
+    require_legacy_configuration(config)?;
+    if needs_runtime(config) && !has_runtime {
+        return Err(PlanningError::Configuration);
+    }
+    validate_environment(selected, true)?;
+    let vars = variables(config, None, has_runtime, PackAccess::ReadOnly)?;
+    let mut output = BTreeMap::from([("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into())]);
+    apply_runtime_environment(config, &mut output, &vars);
+    output.extend(selected.clone());
+    validate_environment(&output, true)?;
+    Ok(output)
+}
 /// Recipe discovery, per-step cwd/deadline and retained launch targets cannot be
 /// represented by the legacy environment/dependency plan. Never ignore recipe
 /// metadata even when an interpreter or an existing runtime is also present.
@@ -1206,6 +1226,31 @@ mod tests {
             "actions/tool.py",
             true,
             PackAccess::ReadOnly,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn inline_environment_does_not_invent_an_action_file_or_runtime_authority() {
+        let mut config = python();
+        config.env_vars.insert(
+            "SOURCE_NAME".into(),
+            RuntimeEnvVarConfig::Value("{action_file}".into()),
+        );
+        config.env_vars.insert(
+            "ATTUNE_API_TOKEN".into(),
+            RuntimeEnvVarConfig::Value("must-not-mint-authority".into()),
+        );
+        let selected = BTreeMap::from([("SELECTED".into(), "owned-caller".into())]);
+        let environment = inline_action_environment(&config, &selected, true).unwrap();
+        assert_eq!(environment["SOURCE_NAME"], "{action_file}");
+        assert_eq!(environment["SELECTED"], "owned-caller");
+        assert!(!environment.contains_key("ATTUNE_API_TOKEN"));
+        assert!(inline_action_environment(&config, &selected, false).is_err());
+        assert!(inline_action_environment(
+            &config,
+            &BTreeMap::from([("DATABASE_URL".into(), "forbidden".into())]),
+            true,
         )
         .is_err());
     }
