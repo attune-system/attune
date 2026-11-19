@@ -144,6 +144,7 @@ pub async fn scan_and_setup_all_environments(
     packs_base_dir: &Path,
     runtime_envs_dir: &Path,
     child_environment: &ChildProcessEnvironment,
+    native_executor: Option<&crate::ActionExecutor>,
 ) -> StartupScanResult {
     info!("Starting runtime environment scan for all registered packs");
 
@@ -232,6 +233,7 @@ pub async fn scan_and_setup_all_environments(
             &runtime_map,
             &version_map,
             child_environment,
+            native_executor,
         )
         .await;
 
@@ -264,8 +266,11 @@ pub async fn setup_environments_for_registered_pack(
     runtime_filter: Option<&[String]>,
     packs_base_dir: &Path,
     runtime_envs_dir: &Path,
-    child_environment: &ChildProcessEnvironment,
+    preparation: (&ChildProcessEnvironment, Option<&crate::ActionExecutor>),
 ) -> PackEnvSetupResult {
+    // Keep captured policy and its native owner together; neither is resolved
+    // from ambient environment at the registration event boundary.
+    let (child_environment, native_executor) = preparation;
     info!(
         "Setting up environments for newly registered pack '{}' (version {})",
         event.pack_ref, event.version
@@ -320,7 +325,7 @@ pub async fn setup_environments_for_registered_pack(
             return pack_result;
         }
     };
-    if !pack_dir.exists() {
+    if native_executor.is_none() && !pack_dir.exists() {
         let msg = format!(
             "Pack directory does not exist: {}. Skipping environment setup.",
             pack_dir.display()
@@ -397,6 +402,7 @@ pub async fn setup_environments_for_registered_pack(
         &runtime_map,
         &version_map,
         child_environment,
+        native_executor,
     )
     .await
 }
@@ -518,6 +524,7 @@ async fn setup_environments_for_pack(
     runtime_map: &HashMap<i64, attune_common::models::Runtime>,
     version_map: &HashMap<i64, Vec<RuntimeVersion>>,
     child_environment: &ChildProcessEnvironment,
+    native_executor: Option<&crate::ActionExecutor>,
 ) -> PackEnvSetupResult {
     let mut pack_result = PackEnvSetupResult {
         pack_ref: pack_ref.to_string(),
@@ -529,7 +536,7 @@ async fn setup_environments_for_pack(
     let pack_dir = pack_dir_override
         .map(Path::to_path_buf)
         .unwrap_or_else(|| packs_base_dir.join(pack_ref));
-    if !pack_dir.exists() {
+    if native_executor.is_none() && !pack_dir.exists() {
         debug!(
             "Pack directory '{}' does not exist on disk, skipping",
             pack_dir.display()
@@ -580,6 +587,7 @@ async fn setup_environments_for_pack(
                             runtime_envs_dir,
                             &mut pack_result,
                             child_environment,
+                            native_executor,
                         )
                         .await;
                         // Also set up version-specific environments
@@ -602,6 +610,7 @@ async fn setup_environments_for_pack(
                             runtime_envs_dir,
                             &mut pack_result,
                             child_environment,
+                            native_executor,
                         )
                         .await;
                         continue;
@@ -633,6 +642,7 @@ async fn setup_environments_for_pack(
             runtime_envs_dir,
             &mut pack_result,
             child_environment,
+            native_executor,
         )
         .await;
 
@@ -653,6 +663,7 @@ async fn setup_environments_for_pack(
                 runtime_envs_dir,
                 &mut pack_result,
                 child_environment,
+                native_executor,
             )
             .await;
         }
@@ -684,8 +695,55 @@ async fn process_runtime_for_pack(
     runtime_envs_dir: &Path,
     pack_result: &mut PackEnvSetupResult,
     child_environment: &ChildProcessEnvironment,
+    native_executor: Option<&crate::ActionExecutor>,
 ) {
     let exec_config = rt.parsed_execution_config();
+
+    if let Some(executor) = native_executor {
+        if !crate::runtime::launch_planning::needs_runtime(&exec_config) {
+            pack_result.environments_skipped.push(rt_name.to_string());
+            return;
+        }
+        let supported = runtime_filter
+            .map(|filter| runtime_aliases_match_filter(&rt.aliases, filter))
+            .unwrap_or(true);
+        if !supported || worker.is_none() {
+            pack_result.environments_skipped.push(rt_name.to_string());
+            return;
+        }
+        let result = match release_digest {
+            Some(digest) => {
+                executor
+                    .prepare_registered_native_environment(
+                        UpsertCoordinatedEnvironmentInput {
+                            pack_id,
+                            pack_ref,
+                            runtime_id: rt.id,
+                            runtime_ref: &rt.r#ref,
+                            runtime_version: None,
+                            env_path: std::path::Path::new(
+                                attune_common::workload_launch::RUNTIME_ROOT,
+                            ),
+                            manifest_checksum: Some(digest),
+                        },
+                        &exec_config,
+                        digest,
+                    )
+                    .await
+            }
+            None => Err(attune_common::Error::PermissionDenied(
+                "Pinned native release unavailable".into(),
+            )),
+        };
+        match result {
+            Ok(true) => pack_result.environments_created.push(rt_name.to_string()),
+            Ok(false) => pack_result.environments_skipped.push(rt_name.to_string()),
+            Err(_) => pack_result
+                .errors
+                .push(format!("Native environment setup failed for {rt_name}")),
+        }
+        return;
+    }
 
     // Check if this runtime actually needs an environment
     if exec_config.environment.is_none() && !exec_config.has_dependencies(pack_dir) {
@@ -770,6 +828,7 @@ async fn setup_version_environments_from_list(
     runtime_envs_dir: &Path,
     pack_result: &mut PackEnvSetupResult,
     child_environment: &ChildProcessEnvironment,
+    native_executor: Option<&crate::ActionExecutor>,
 ) {
     let qualifying_versions: Vec<RuntimeVersion> = versions
         .iter()
@@ -786,6 +845,47 @@ async fn setup_version_environments_from_list(
 
     for version in &qualifying_versions {
         let version_exec_config = version.parsed_execution_config();
+        if let Some(executor) = native_executor {
+            let label = format!("{}-{}", rt_name, version.version);
+            let can_claim = !advertised_versions.is_empty()
+                && version_matches_worker(version, &advertised_versions);
+            if !can_claim || worker.is_none() {
+                pack_result.environments_skipped.push(label);
+                continue;
+            }
+            let result = match release_digest {
+                Some(digest) => {
+                    executor
+                        .prepare_registered_native_environment(
+                            UpsertCoordinatedEnvironmentInput {
+                                pack_id,
+                                pack_ref,
+                                runtime_id: runtime.id,
+                                runtime_ref: &runtime.r#ref,
+                                runtime_version: Some(version),
+                                env_path: std::path::Path::new(
+                                    attune_common::workload_launch::RUNTIME_ROOT,
+                                ),
+                                manifest_checksum: Some(digest),
+                            },
+                            &version_exec_config,
+                            digest,
+                        )
+                        .await
+                }
+                None => Err(attune_common::Error::PermissionDenied(
+                    "Pinned native release unavailable".into(),
+                )),
+            };
+            match result {
+                Ok(true) => pack_result.environments_created.push(label),
+                Ok(false) => pack_result.environments_skipped.push(label),
+                Err(_) => pack_result
+                    .errors
+                    .push(format!("Native environment setup failed for {label}")),
+            }
+            continue;
+        }
 
         if version_exec_config.environment.is_none()
             && !version_exec_config.has_dependencies(pack_dir)

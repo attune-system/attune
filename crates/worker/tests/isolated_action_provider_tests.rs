@@ -656,6 +656,16 @@ sys.stdout.write(json.load(sys.stdin)['message'])
     let result = async {
         executor.acquire_log_custody(&delivery, worker.id).await?;
         executor.start_log_delivery(delivery.clone()).await?;
+        if interpreted {
+            let setup=attune_worker::env_setup::scan_and_setup_all_environments(
+                database.pool(),worker.id,None,&publication_root,&root.path().join("runtimes"),
+                &attune_common::child_process_environment::ChildProcessEnvironment::from_parent(std::iter::empty::<(std::ffi::OsString,std::ffi::OsString)>(), &[])?.with_workload_sandbox(attune_common::workload_sandbox::WorkloadSandbox::NativeEffectsRequired),
+                Some(&executor),
+            ).await;
+            ensure!(setup.errors.is_empty(),"native startup scan failed");
+            ensure!(setup.environments_created==1,"startup did not create exactly one native environment");
+        }
+
         let outcome = tokio::time::timeout(Duration::from_secs(240), async {
             if real_provider {
                 executor

@@ -2217,77 +2217,22 @@ impl ActionExecutor {
         })
     }
 
-    async fn prepare_native_process(
+    async fn prepare_native_pack(
         &self,
-        execution: &Execution,
-    ) -> Result<attune_common::isolated_process::ProcessSpec> {
+        release: attune_common::models::PackRelease,
+    ) -> Result<attune_common::workload_launch::PinnedLaunchInput> {
         use attune_common::{
-            isolated_process::ProcessSpec,
             pack_registry::storage::PackReleaseManifest,
-            repositories::{
-                delegated_execution::DelegatedExecutionRepository,
-                execution_runtime_admission::{
-                    ExecutionAdmissionRepository, ExistingExecutionAuthority,
-                },
-                pack_release::PackReleaseRepository,
-                runtime_authority::RuntimeAuthorityRepository,
-            },
             workload_archive::ArchivePolicy,
-            workload_launch::{
-                LaunchInputKind, LaunchInvocation, LaunchPurpose, LaunchRoot, LaunchTarget,
-                PackAccess, PinnedLaunchInput, Sha256Digest,
-            },
+            workload_launch::{LaunchInputKind, PinnedLaunchInput, Sha256Digest},
             workload_pack_input::{release_zip, ReleaseInputPin},
         };
-        let denied = || Error::PermissionDenied("Native action preparation unavailable".into());
+        let denied = || Error::PermissionDenied("Native pack input unavailable".into());
         let native = self.native_preparation.as_ref().ok_or_else(denied)?;
-        let worker = self.worker_id.load(Ordering::Acquire);
-        let incarnation = *self.process_incarnation.get().ok_or_else(denied)?;
-        if worker <= 0
-            || execution.worker != Some(worker)
-            || execution.status != ExecutionStatus::Running
-        {
-            return Err(denied());
-        }
-        let snapshot = execution.executable_snapshot.as_ref().ok_or_else(denied)?;
-        if execution.pack_release != Some(snapshot.release.id)
-            || execution.pack_release_digest.as_deref() != Some(snapshot.release.digest.as_str())
-        {
-            return Err(denied());
-        }
-        let release = PackReleaseRepository::find_by_id(&self.pool, snapshot.release.id)
-            .await?
-            .filter(|release| {
-                release.digest == snapshot.release.digest
-                    && release.pack_ref == snapshot.executable.action.pack_ref
-            })
-            .ok_or_else(denied)?;
         let manifest: PackReleaseManifest =
             serde_json::from_value(release.manifest).map_err(|_| denied())?;
         if manifest.version != release.version || manifest.pack_ref != release.pack_ref {
             return Err(denied());
-        }
-        let mut tx = self.pool.begin().await?;
-        let attempt = match ExecutionAdmissionRepository::selected_authority(&mut tx, execution.id)
-            .await?
-        {
-            ExistingExecutionAuthority::Delegated => {
-                DelegatedExecutionRepository::current_attempt(&mut tx, execution.id).await?
-            }
-            ExistingExecutionAuthority::Recorded => {
-                self.recorded_readiness.require_ready()?;
-                RuntimeAuthorityRepository::current_worker_attempt(&mut tx, execution.id, worker)
-                    .await?
-            }
-        };
-        tx.commit().await?;
-        let master = self.secret_manager.encryption_key().ok_or_else(denied)?;
-        if let Some(retained) = attune_common::repositories::execution_process::ExecutionProcessRepository::retained_for_attempt(
-            &self.pool, execution.id, attempt, master,
-        ).await? {
-            // A replaced incarnation is rejected by the existing target check.
-            // Never mint another effect ID after an unknown create/commit.
-            return Ok(retained);
         }
         // Existing pack transport materializes this primary immutable archive
         // for both volume and API managers. Never repack an unpacked tree.
@@ -2367,6 +2312,73 @@ impl ActionExecutor {
         })
         .await
         .map_err(|_| Error::invalid_state("Native release preparation did not complete"))??;
+        Ok(pack)
+    }
+
+    async fn prepare_native_process(
+        &self,
+        execution: &Execution,
+    ) -> Result<attune_common::isolated_process::ProcessSpec> {
+        use attune_common::{
+            isolated_process::ProcessSpec,
+            repositories::{
+                delegated_execution::DelegatedExecutionRepository,
+                execution_runtime_admission::{
+                    ExecutionAdmissionRepository, ExistingExecutionAuthority,
+                },
+                pack_release::PackReleaseRepository,
+                runtime_authority::RuntimeAuthorityRepository,
+            },
+            workload_launch::{
+                LaunchInvocation, LaunchPurpose, LaunchRoot, LaunchTarget, PackAccess,
+            },
+        };
+        let denied = || Error::PermissionDenied("Native action preparation unavailable".into());
+        let native = self.native_preparation.as_ref().ok_or_else(denied)?;
+        let worker = self.worker_id.load(Ordering::Acquire);
+        let incarnation = *self.process_incarnation.get().ok_or_else(denied)?;
+        if worker <= 0
+            || execution.worker != Some(worker)
+            || execution.status != ExecutionStatus::Running
+        {
+            return Err(denied());
+        }
+        let snapshot = execution.executable_snapshot.as_ref().ok_or_else(denied)?;
+        if execution.pack_release != Some(snapshot.release.id)
+            || execution.pack_release_digest.as_deref() != Some(snapshot.release.digest.as_str())
+        {
+            return Err(denied());
+        }
+        let release = PackReleaseRepository::find_by_id(&self.pool, snapshot.release.id)
+            .await?
+            .filter(|release| {
+                release.digest == snapshot.release.digest
+                    && release.pack_ref == snapshot.executable.action.pack_ref
+            })
+            .ok_or_else(denied)?;
+        let mut tx = self.pool.begin().await?;
+        let attempt = match ExecutionAdmissionRepository::selected_authority(&mut tx, execution.id)
+            .await?
+        {
+            ExistingExecutionAuthority::Delegated => {
+                DelegatedExecutionRepository::current_attempt(&mut tx, execution.id).await?
+            }
+            ExistingExecutionAuthority::Recorded => {
+                self.recorded_readiness.require_ready()?;
+                RuntimeAuthorityRepository::current_worker_attempt(&mut tx, execution.id, worker)
+                    .await?
+            }
+        };
+        tx.commit().await?;
+        let master = self.secret_manager.encryption_key().ok_or_else(denied)?;
+        if let Some(retained) = attune_common::repositories::execution_process::ExecutionProcessRepository::retained_for_attempt(
+            &self.pool, execution.id, attempt, master,
+        ).await? {
+            // A replaced incarnation is rejected by the existing target check.
+            // Never mint another effect ID after an unknown create/commit.
+            return Ok(retained);
+        }
+        let pack = self.prepare_native_pack(release).await?;
         Ok(ProcessSpec {
             intent: uuid::Uuid::new_v4(),
             purpose: LaunchPurpose::Action,

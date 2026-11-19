@@ -169,39 +169,115 @@ impl ActionExecutor {
         execution: &Execution,
     ) -> Result<PinnedLaunchInput> {
         let native = self.native_preparation.as_ref().ok_or_else(denied)?;
-        let backend = self.native_backend.as_ref().ok_or_else(denied)?;
-        let master = self.secret_manager.encryption_key().ok_or_else(denied)?;
+        if action_spec.image != native.config.image
+            || action_spec.platform != native.config.platform
+        {
+            return Err(denied());
+        }
         let snapshot = execution.executable_snapshot.as_ref().ok_or_else(denied)?;
         let runtime = snapshot.executable.runtime.as_ref().ok_or_else(denied)?;
         let config = context
             .runtime_config_override
             .as_ref()
             .ok_or_else(denied)?;
-        if config.lifecycle.is_some() {
-            return Err(denied());
-        }
         let version = match context.selected_runtime_version.as_deref() {
-            Some(v) => Some(
+            Some(version) => Some(
                 snapshot
                     .executable
                     .runtime_versions
                     .iter()
-                    .find(|r| r.version == v)
+                    .find(|v| v.version == version)
                     .ok_or_else(denied)?,
             ),
             None => None,
         };
-        let pack = action_spec
-            .inputs
-            .iter()
-            .find(|p| p.kind == LaunchInputKind::Pack)
-            .ok_or_else(denied)?;
-        let pack_row = attune_common::repositories::pack::PackRepository::find_by_ref(
+        let pack = attune_common::repositories::pack::PackRepository::find_by_ref(
             &self.pool,
             &snapshot.executable.action.pack_ref,
         )
         .await?
         .ok_or_else(denied)?;
+        self.install_native_environment(
+            UpsertCoordinatedEnvironmentInput {
+                pack_id: pack.id,
+                pack_ref: &pack.r#ref,
+                runtime_id: runtime.id,
+                runtime_ref: &runtime.r#ref,
+                runtime_version: version,
+                env_path: std::path::Path::new(RUNTIME_ROOT),
+                manifest_checksum: Some(&snapshot.release.digest),
+            },
+            config,
+            action_spec
+                .inputs
+                .iter()
+                .filter(|p| p.kind != LaunchInputKind::Runtime)
+                .cloned()
+                .collect(),
+            context.timeout,
+            context.cancel_token.as_ref(),
+        )
+        .await
+        .map(|(pin, _)| pin)
+    }
+
+    /// Existing startup/registration loops select the runtime/version and source.
+    /// This shares the on-demand installer; it never probes manager executables.
+    pub(crate) async fn prepare_registered_native_environment(
+        &self,
+        input: UpsertCoordinatedEnvironmentInput<'_>,
+        config: &RuntimeExecutionConfig,
+        release_digest: &str,
+    ) -> Result<bool> {
+        let native = self.native_preparation.as_ref().ok_or_else(denied)?;
+        let pack = attune_common::repositories::pack::PackRepository::find_by_id(
+            &self.pool,
+            input.pack_id,
+        )
+        .await?
+        .filter(|p| p.r#ref == input.pack_ref)
+        .ok_or_else(denied)?;
+        let release = attune_common::repositories::PackReleaseRepository::find_by_id(
+            &self.pool,
+            pack.active_release.ok_or_else(denied)?,
+        )
+        .await?
+        .filter(|r| r.pack == pack.id && r.pack_ref == input.pack_ref && r.digest == release_digest)
+        .ok_or_else(denied)?;
+        let pack_pin = self.prepare_native_pack(release).await?;
+        self.install_native_environment(
+            UpsertCoordinatedEnvironmentInput {
+                env_path: std::path::Path::new(RUNTIME_ROOT),
+                manifest_checksum: Some(release_digest),
+                ..input
+            },
+            config,
+            vec![pack_pin, native.runner.clone()],
+            None,
+            None,
+        )
+        .await
+        .map(|(_, installed)| installed)
+    }
+
+    async fn install_native_environment(
+        &self,
+        input: UpsertCoordinatedEnvironmentInput<'_>,
+        config: &RuntimeExecutionConfig,
+        inputs: Vec<PinnedLaunchInput>,
+        timeout: Option<u64>,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(PinnedLaunchInput, bool)> {
+        if config.lifecycle.is_some() {
+            return Err(denied());
+        }
+        let native = self.native_preparation.as_ref().ok_or_else(denied)?;
+        let backend = self.native_backend.as_ref().ok_or_else(denied)?;
+        let master = self.secret_manager.encryption_key().ok_or_else(denied)?;
+        let pack = inputs
+            .iter()
+            .find(|p| p.kind == LaunchInputKind::Pack)
+            .ok_or_else(denied)?;
         // Only published configuration and immutable public build inputs. Never
         // hash rendered private environment, parameters or a SetupPlan.
         let engine = match &native.config.backend {
@@ -210,33 +286,23 @@ impl ActionExecutor {
             }
             attune_common::workload_config::WorkloadBackendConfig::Kubernetes { .. } => None,
         };
-        let binding = attune_common::runtime_cache::sha256_bytes(&serde_json::to_vec(
-            &serde_json::json!({
-                "image":action_spec.image,"platform":action_spec.platform,"engine":engine,"pack":pack,
-                "runner":native.runner,"runtime":runtime.id,"version":version.map(|v|v.id),"config":config,
-            }),
-        )?);
+        let mut public_binding = serde_json::json!({
+            "image":native.config.image,"platform":native.config.platform,"engine":engine,"pack":pack,
+            "runner":native.runner,"runtime":input.runtime_id,"version":input.runtime_version.map(|v|v.id),"config":config,
+        });
+        public_binding.sort_all_objects();
+        let binding =
+            attune_common::runtime_cache::sha256_bytes(&serde_json::to_vec(&public_binding)?);
         if let Some(pin) = Setup::published(&self.pool, &binding).await? {
             if native.cache.open_input_archive(&pin).is_ok() {
                 let (spec, resource) = Setup::retained_output(&self.pool, &pin, master).await?;
                 self.finish_native_setup_removal(&spec, &resource).await?;
-                return Ok(pin);
+                return Ok((pin, false));
             }
         }
         let manager = PackEnvironmentManager::new(self.pool.clone());
         let expected = manager
-            .upsert_native_environment(
-                UpsertCoordinatedEnvironmentInput {
-                    pack_id: pack_row.id,
-                    pack_ref: &pack_row.r#ref,
-                    runtime_id: runtime.id,
-                    runtime_ref: &runtime.r#ref,
-                    runtime_version: version,
-                    env_path: std::path::Path::new(RUNTIME_ROOT),
-                    manifest_checksum: Some(&snapshot.release.digest),
-                },
-                &Sha256Digest::parse(&binding)?,
-            )
+            .upsert_native_environment(input, &Sha256Digest::parse(&binding)?)
             .await?;
         if expected.status == PackEnvironmentStatus::Ready {
             manager
@@ -247,7 +313,7 @@ impl ActionExecutor {
         let instance = *self.process_incarnation.get().ok_or_else(denied)?;
         let claim_wait = std::time::Instant::now();
         let claimed = loop {
-            if claim_wait.elapsed().as_secs() >= context.timeout.unwrap_or(300) {
+            if timeout.is_some_and(|seconds| claim_wait.elapsed().as_secs() >= seconds) {
                 return Err(denied());
             }
             let current = manager
@@ -259,18 +325,14 @@ impl ActionExecutor {
             {
                 return Err(denied());
             }
-            if context
-                .cancel_token
-                .as_ref()
-                .is_some_and(|t| t.is_cancelled())
-            {
+            if cancel.is_some_and(|t| t.is_cancelled()) {
                 return Err(denied());
             }
             if let Some(pin) = Setup::published(&self.pool, &binding).await? {
                 if native.cache.open_input_archive(&pin).is_ok() {
                     let (spec, resource) = Setup::retained_output(&self.pool, &pin, master).await?;
                     self.finish_native_setup_removal(&spec, &resource).await?;
-                    return Ok(pin);
+                    return Ok((pin, false));
                 }
             }
             if let Some(claim) = manager
@@ -288,18 +350,29 @@ impl ActionExecutor {
         let plan = crate::runtime::launch_planning::setup_plan(config, &Default::default(), &[])
             .map_err(|_| denied())?;
         let plan = serde_json::to_string(&plan)?;
-        let mut setup = action_spec.clone();
-        setup.intent = uuid::Uuid::new_v4();
-        setup.purpose = LaunchPurpose::Setup;
-        setup.target = LaunchTarget::Setup {
-            admission: claimed.id,
-            attempt: claim,
+        let mut setup = ProcessSpec {
+            intent: uuid::Uuid::new_v4(),
+            purpose: LaunchPurpose::Setup,
+            target: LaunchTarget::Setup {
+                admission: claimed.id,
+                attempt: claim,
+            },
+            image: native.config.image.clone(),
+            platform: native.config.platform,
+            inputs,
+            pack_access: PackAccess::ReadOnly,
+            stage: Some(PrivateStage {
+                cache_key: binding,
+                quota_bytes: native.config.storage.expanded_bytes,
+                quota_files: native.config.storage.entries,
+            }),
+            timeout_ms: None,
+            invocation: LaunchInvocation {
+                argv: Vec::new(),
+                env: Default::default(),
+                working_root: LaunchRoot::Pack,
+            },
         };
-        setup.stage = Some(PrivateStage {
-            cache_key: binding,
-            quota_bytes: native.config.storage.expanded_bytes,
-            quota_files: native.config.storage.entries,
-        });
         setup.invocation = LaunchInvocation {
             argv: vec![
                 crate::runtime::launch_planning::runner_program(setup.platform),
@@ -308,8 +381,7 @@ impl ActionExecutor {
             env: Default::default(),
             working_root: LaunchRoot::Pack,
         };
-        setup.timeout_ms = context
-            .timeout
+        setup.timeout_ms = timeout
             .map(|s| s.checked_mul(1000).ok_or_else(denied))
             .transpose()?;
         let setup = Setup::reserve(
@@ -345,16 +417,12 @@ impl ActionExecutor {
                 return Err(error);
             }
         };
-        let cancel = context
-            .cancel_token
-            .clone()
-            .unwrap_or_default()
-            .child_token();
+        let cancel = cancel.cloned().unwrap_or_default().child_token();
         let future = crate::runtime::process_executor::execute_isolated_cancellable(
             process,
             payload,
             crate::runtime::process_executor::IsolatedCaptureOptions {
-                timeout_secs: context.timeout,
+                timeout_secs: timeout,
                 max_stdout_bytes: 16 * 1024,
                 max_stderr_bytes: 16 * 1024,
                 output_format: attune_common::models::OutputFormat::Text,
@@ -453,6 +521,6 @@ impl ActionExecutor {
         .map_err(|_| denied())??;
         Setup::publish(&self.pool, setup.intent, &resource, &pin, master).await?;
         self.finish_native_setup_removal(&setup, &resource).await?;
-        Ok(pin)
+        Ok((pin, true))
     }
 }

@@ -973,6 +973,10 @@ impl WorkerService {
             &self.packs_base_dir,
             &self.runtime_envs_dir,
             &self.child_environment,
+            self.config
+                .workload
+                .as_ref()
+                .map(|_| self.executor.as_ref()),
         )
         .await;
 
@@ -1027,6 +1031,7 @@ impl WorkerService {
         let registration = self.registration.clone();
         let child_environment = self.child_environment.clone();
         let pack_transport = self.pack_transport.clone();
+        let native_executor = self.config.workload.as_ref().map(|_| self.executor.clone());
 
         let handle = tokio::spawn(async move {
             info!(
@@ -1042,6 +1047,7 @@ impl WorkerService {
                     let registration = registration.clone();
                     let child_environment = child_environment.clone();
                     let pack_transport = pack_transport.clone();
+                    let native_executor=native_executor.clone();
 
                     async move {
                         match envelope.message_type {
@@ -1125,8 +1131,8 @@ impl WorkerService {
                                         filter_ref,
                                         &packs_base_dir,
                                         &runtime_envs_dir,
-                                        &child_environment,
-                                    )
+                                        (&child_environment,native_executor.as_deref()),
+)
                                     .await;
 
                                 if !pack_result.errors.is_empty() {
