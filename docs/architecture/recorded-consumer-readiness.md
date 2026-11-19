@@ -54,6 +54,19 @@ wiring must preserve that release contract, reject unsupported workers, and
 validate the actual owning consumer paths. Neither configuration booleans nor
 process-hygiene and executable-sink inventories certify these seven consumers.
 
+The current catalog cannot identify an expected service rollout.
+`platform_catalog_state` stores only `singleton`, `compatibility_epoch` and
+`revision`; pack-release and publication descriptors identify pack content, not
+API/notifier/executor replicas or their expected boots/generation. Worker rows
+cover Action/Sensor hosts only. Production aggregate readiness therefore remains
+unresolved until an authoritative rollout-membership source is separately agreed.
+
+The pure `execution_authority::consumer_contract` protocol models role-local
+descriptors and validates them against an explicit expected membership. It has
+no production caller, transport, advertisement, readiness conversion or membership
+repository. Its checked snapshot is not authority evidence. One health response,
+an empty expected set, or support claimed by another role cannot satisfy it.
+
 Actions and sensors are trusted, inspected, approved cooperative workloads.
 Hostile sibling-process containment and candidate process isolation are not
 prerequisites for recorded authority or queue operation. Environment clearing,

@@ -2,6 +2,8 @@
 
 use crate::{Error, Result};
 
+pub mod consumer_contract;
+
 /// Advertised by compatible worker startup; never authored by a pack.
 pub const DELEGATED_EXECUTION_CAPABILITY: &str = "delegated_execution_authority_v1";
 
