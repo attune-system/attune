@@ -72,7 +72,7 @@ pub(super) async fn changes(
             let values;
             match table {
                 "runtime_accepted_batch_item" => {
-                    report.fields_already_current+=crate::repositories::accepted_batch_dependency::AcceptedBatchDependencyRepository::authenticate_manifest(&row,master)?;
+                    report.fields_already_current+=crate::repositories::accepted_batch_dependency::AcceptedBatchDependencyRepository::authenticate_manifest(conn,&row,master).await?;
                     continue;
                 }
                 "work_queue_item_configuration_input" => {

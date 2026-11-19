@@ -295,20 +295,34 @@ impl AcceptedBatchDependencyRepository {
         }
         Ok(())
     }
-    pub(in crate::repositories) fn authenticate_manifest(
+    pub(in crate::repositories) async fn authenticate_manifest(
+        conn: &mut PgConnection,
         row: &Value,
         master: &str,
     ) -> Result<usize> {
         let body = row.get("proof").ok_or_else(denied)?;
-        if row.get("proof_digest").and_then(Value::as_str) != Some(hash(body)?.as_str()) {
-            return Err(denied());
-        }
         let proof: ItemProof = serde_json::from_value(body.clone())?;
-        if let Some(payload) = proof.queue_payload {
+        if let Some(payload) = &proof.queue_payload {
+            queue::authenticate(
+                &proof,
+                row.get("item").and_then(Value::as_i64).ok_or_else(denied)?,
+                master,
+            )?;
+            queue::validate_origin(
+                conn,
+                row.get("admission")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(denied)?,
+                &proof,
+            )
+            .await?;
             if !matches!(proof.authority.binding, InvocationBinding::Queue { .. })
                 || row.get("configuration_input").and_then(Value::as_i64)
                     != Some(payload.fixed_input)
             {
+                return Err(denied());
+            }
+            if row.get("proof_digest").and_then(Value::as_str) != Some(hash(body)?.as_str()) {
                 return Err(denied());
             }
             for (_, body, digest) in &proof.contributors {
@@ -319,6 +333,7 @@ impl AcceptedBatchDependencyRepository {
             payload.restore(master)?;
             Ok(payload.field_count())
         } else if matches!(proof.authority.binding, InvocationBinding::Action { .. })
+            && row.get("proof_digest").and_then(Value::as_str) == Some(hash(body)?.as_str())
             && row.get("configuration_input").is_none_or(Value::is_null)
         {
             Ok(0)
@@ -372,6 +387,17 @@ impl AcceptedBatchDependencyRepository {
         master: &str,
     ) -> Result<ApprovalEffectFence> {
         queue::capture(conn, destination, queue, items, dispatch, master).await
+    }
+    pub(in crate::repositories) async fn authenticate_queue_member(
+        conn: &mut PgConnection,
+        admission: Id,
+        item: Id,
+        body: &Value,
+        master: &str,
+    ) -> Result<()> {
+        let proof: ItemProof = serde_json::from_value(body.clone())?;
+        queue::authenticate(&proof, item, master)?;
+        queue::validate_origin(conn, admission, &proof).await
     }
     pub(in crate::repositories) async fn contributor_source(
         conn: &mut PgConnection,

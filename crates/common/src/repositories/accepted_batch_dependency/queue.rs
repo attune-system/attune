@@ -16,7 +16,20 @@ use serde_json::json;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct Attestation {
+    purpose: String,
+    item: Id,
+    original_admission: Id,
+    nonce: [u8; 12],
+    ciphertext: Vec<u8>,
+    encryption_key_hash: String,
+}
+const PURPOSE: &str = "attune.queue.accepted-input";
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct QueuePayload {
+    attestation: Attestation,
     pub(super) fixed_input: Id,
     pub(super) ordinal: usize,
     queue: Id,
@@ -30,7 +43,7 @@ pub(super) struct QueuePayload {
 }
 impl QueuePayload {
     pub(super) fn field_count(&self) -> usize {
-        self.fields.len()
+        self.fields.len() + 1
     }
     pub(super) fn restore(&self, master: &str) -> Result<Value> {
         self.schema
@@ -164,6 +177,14 @@ pub(super) async fn capture(
         })
         .collect::<Result<Vec<_>>>()?;
         let payload = QueuePayload {
+            attestation: Attestation {
+                purpose: PURPOSE.into(),
+                item: item.id,
+                original_admission: record.id,
+                nonce: [0; 12],
+                ciphertext: Vec::new(),
+                encryption_key_hash: crate::crypto::hash_encryption_key(master),
+            },
             fixed_input: fixed.id(),
             ordinal,
             queue: queue.id,
@@ -179,7 +200,7 @@ pub(super) async fn capture(
             dispatch,
         };
         payload.restore(master)?;
-        let proof = ItemProof {
+        let mut proof = ItemProof {
             source_admission: None,
             authority,
             executable: snapshot.clone(),
@@ -188,6 +209,7 @@ pub(super) async fn capture(
             contributors,
             queue_payload: Some(payload),
         };
+        seal(&mut proof, master)?;
         check_item(conn, &record, item.id, &proof, &queue.r#ref).await?;
         bytes = bytes
             .checked_add(serde_json::to_vec(&proof)?.len())
@@ -396,16 +418,18 @@ pub(super) async fn source(
     item: Id,
     master: &str,
 ) -> Result<QueueContributorSource> {
+    let (body,expected,fixed):(Value,String,Option<Id>)=sqlx::query_as("SELECT proof,proof_digest,configuration_input FROM runtime_accepted_batch_item WHERE admission=$1 AND item=$2 FOR SHARE")
+        .bind(renderer.id).bind(item).fetch_optional(&mut *conn).await?.ok_or_else(denied)?;
+    let proof: ItemProof = serde_json::from_value(body)?;
+    authenticate(&proof, item, master)?;
+    if hash(&serde_json::to_value(&proof)?)? != expected {
+        return Err(denied());
+    }
     let current = RuntimeAuthorityRepository::require_retained_admission(conn, renderer.id).await?;
     if current.authority != renderer.authority || current.owner_kind != "execution" {
         return Err(denied());
     }
-    let (body,expected,fixed):(Value,String,Option<Id>)=sqlx::query_as("SELECT proof,proof_digest,configuration_input FROM runtime_accepted_batch_item WHERE admission=$1 AND item=$2 FOR SHARE")
-        .bind(renderer.id).bind(item).fetch_optional(&mut *conn).await?.ok_or_else(denied)?;
-    if hash(&body)? != expected {
-        return Err(denied());
-    }
-    let proof: ItemProof = serde_json::from_value(body)?;
+    validate_origin(conn, renderer.id, &proof).await?;
     let payload = proof.queue_payload.clone().ok_or_else(denied)?;
     if fixed != Some(payload.fixed_input) {
         return Err(denied());
@@ -426,4 +450,110 @@ pub(super) async fn source(
         template: serde_json::from_value(proof.template)?,
         fence,
     })
+}
+
+fn attestation_key(master: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"attune:queue-input-attestation:key\0");
+    hash.update(master.as_bytes());
+    hash.finalize().into()
+}
+fn canonical_json(mut value: Value) -> Result<Vec<u8>> {
+    // Preserve exact i64/u64 values. RFC8785/JCS float coercion is unsuitable
+    // for authenticated BIGINT identity or exact admitted record values.
+    value.sort_all_objects();
+    Ok(serde_json::to_vec(&value)?)
+}
+fn associated_data(attestation: &Attestation) -> Result<Vec<u8>> {
+    canonical_json(
+        json!({"purpose":attestation.purpose,"item":attestation.item,"original_admission":attestation.original_admission}),
+    )
+}
+fn attested_digest(proof: &ItemProof) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut body = serde_json::to_value(proof)?;
+    body.get_mut("queue_payload")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(denied)?
+        .remove("attestation");
+    Ok(Sha256::digest(canonical_json(body)?)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn seal(proof: &mut ItemProof, master: &str) -> Result<()> {
+    let digest = attested_digest(proof)?;
+    let attestation = &mut proof.queue_payload.as_mut().ok_or_else(denied)?.attestation;
+    let encrypted = crate::crypto::encrypt_authenticated(
+        digest.as_bytes(),
+        &attestation_key(master),
+        &associated_data(attestation)?,
+    )?;
+    attestation.nonce = encrypted.nonce;
+    attestation.ciphertext = encrypted.ciphertext;
+    Ok(())
+}
+pub(super) fn authenticate(proof: &ItemProof, item: Id, master: &str) -> Result<()> {
+    let payload = proof.queue_payload.as_ref().ok_or_else(denied)?;
+    let attestation = &payload.attestation;
+    if attestation.purpose != PURPOSE
+        || attestation.item != item
+        || item <= 0
+        || attestation.original_admission <= 0
+        || attestation.encryption_key_hash != crate::crypto::hash_encryption_key(master)
+    {
+        return Err(denied());
+    }
+    // Authenticate before interpreting source fields or trusting a public hash.
+    let digest = crate::crypto::decrypt_authenticated(
+        &attestation.ciphertext,
+        &attestation.nonce,
+        &attestation_key(master),
+        &associated_data(attestation)?,
+    )?;
+    if digest != attested_digest(proof)?.as_bytes() {
+        return Err(denied());
+    }
+    Ok(())
+}
+pub(super) async fn validate_origin(
+    conn: &mut PgConnection,
+    admission: Id,
+    proof: &ItemProof,
+) -> Result<()> {
+    let original = proof
+        .queue_payload
+        .as_ref()
+        .ok_or_else(denied)?
+        .attestation
+        .original_admission;
+    let related:bool=sqlx::query_scalar("WITH RECURSIVE lineage(id) AS (SELECT $1::BIGINT UNION SELECT edge.dependency FROM lineage JOIN runtime_admission_dependency edge ON edge.admission=lineage.id AND edge.dependency_kind='retry' WHERE edge.dependency<lineage.id) SELECT count(*)<=256 AND COALESCE(bool_or(id=$2),false) FROM (SELECT id FROM lineage LIMIT 257) bounded")
+        .bind(admission).bind(original).fetch_one(conn).await?;
+    if !related {
+        return Err(denied());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod attestation_tests {
+    use super::*;
+    #[test]
+    fn authenticated_encoding_preserves_full_bigint_identity_and_values() {
+        let first = 9_007_199_254_740_992_i64;
+        assert_ne!(
+            canonical_json(json!({"item":first})).unwrap(),
+            canonical_json(json!({"item":first+1})).unwrap()
+        );
+        assert_ne!(
+            canonical_json(json!({"payload":{"value":first}})).unwrap(),
+            canonical_json(json!({"payload":{"value":first+1}})).unwrap()
+        );
+        assert_eq!(
+            canonical_json(json!({"a":1,"b":2})).unwrap(),
+            canonical_json(serde_json::from_str(r#"{"b":2,"a":1}"#).unwrap()).unwrap()
+        );
+    }
 }

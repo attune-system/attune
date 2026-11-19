@@ -548,6 +548,16 @@ async fn mixed_queue_receipts_bind_each_contributor_and_structured_secret_after_
         json!({"message":"second"}),
     )
     .await;
+    WorkQueueItemRepository::update(
+        &mut *tx,
+        first.id,
+        attune_common::repositories::work_queue::UpdateWorkQueueItemInput {
+            metadata: Some(json!({"exact_integer":9_007_199_254_740_992_i64})),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     let lease = uuid::Uuid::new_v4();
     let items = WorkQueueItemRepository::lease_next_batch(
         &mut *tx,
@@ -685,6 +695,64 @@ async fn mixed_queue_receipts_bind_each_contributor_and_structured_secret_after_
         .iter()
         .find(|site| site.source_path == "/queue/action_params/value")
         .unwrap();
+    let original: serde_json::Value = sqlx::query_scalar(
+        "SELECT proof FROM runtime_accepted_batch_item WHERE admission=$1 AND item=$2",
+    )
+    .bind(record.id)
+    .bind(first.id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    let other_proof: serde_json::Value = sqlx::query_scalar(
+        "SELECT proof FROM runtime_accepted_batch_item WHERE admission=$1 AND item=$2",
+    )
+    .bind(record.id)
+    .bind(second.id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    let mut tampered = Vec::new();
+    let mut swapped = original.clone();
+    for field in ["nonce", "ciphertext"] {
+        swapped["queue_payload"]["attestation"][field] =
+            other_proof["queue_payload"]["attestation"][field].clone();
+    }
+    tampered.push(swapped);
+    let mut purpose = original.clone();
+    purpose["queue_payload"]["attestation"]["purpose"] = json!("other-purpose");
+    tampered.push(purpose);
+    let mut admission = original.clone();
+    admission["queue_payload"]["attestation"]["original_admission"] = json!(record.id + 1);
+    tampered.push(admission);
+    let mut payload = original.clone();
+    payload["queue_payload"]["payload"]["message"] = json!("rebound-payload");
+    tampered.push(payload);
+    let mut schema = original.clone();
+    schema["queue_payload"]["schema"]["authored_schema"]["message"]["description"] =
+        json!("rebound-schema");
+    tampered.push(schema);
+    let mut number = original.clone();
+    number["queue_payload"]["context"]["metadata"]["exact_integer"] =
+        json!(9_007_199_254_740_993_i64);
+    tampered.push(number);
+    let mut omitted = original.clone();
+    omitted["queue_payload"]
+        .as_object_mut()
+        .unwrap()
+        .remove("attestation");
+    tampered.push(omitted);
+    for body in tampered {
+        reject_queue_manifest(
+            &mut tx,
+            execution.id,
+            record.id,
+            first.id,
+            fixed.id(),
+            value_site,
+            &body,
+        )
+        .await;
+    }
     let mut session = Inputs::begin_render(
         &mut tx,
         execution.id,
@@ -1546,4 +1614,56 @@ async fn queue_key_versions_are_durable_non_value_cohorts_with_independent_bindi
     );
     tx.rollback().await.unwrap();
     db.cleanup().await.unwrap();
+}
+
+// Corruption fixture on this test's exclusively owned database only. Recompute
+// public metadata hashes to require the authenticated boundary to be decisive.
+async fn reject_queue_manifest(
+    conn: &mut sqlx::PgConnection,
+    execution: i64,
+    admission: i64,
+    item: i64,
+    input: i64,
+    site: &attune_common::repositories::declared_input::DeclaredInputBinding,
+    body: &serde_json::Value,
+) {
+    use attune_common::repositories::inherited_input::{
+        InheritedInputRepository as Inputs, InputSitePurpose,
+    };
+    let mut tx = sqlx::Connection::begin(conn).await.unwrap();
+    sqlx::query(
+        "ALTER TABLE runtime_accepted_batch_item DISABLE TRIGGER guard_runtime_accepted_batch_item",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE runtime_accepted_batch_item SET proof=$3,proof_digest=$4 WHERE admission=$1 AND item=$2").bind(admission).bind(item).bind(body).bind(fixture_digest(body)).execute(&mut *tx).await.unwrap();
+    sqlx::query(
+        "ALTER TABLE runtime_accepted_batch_item ENABLE TRIGGER guard_runtime_accepted_batch_item",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    let denied = match Inputs::begin_render(
+        &mut tx,
+        execution,
+        &site.declaration_revision,
+        &site.source_path,
+        &site.expression,
+        InputSitePurpose::Value,
+    )
+    .await
+    {
+        Ok(mut session) => {
+            Inputs::bind_queue_configuration(&mut tx, &mut session, input, QUEUE_KEY)
+                .await
+                .is_err()
+        }
+        Err(_) => true,
+    };
+    assert!(
+        denied,
+        "swapped or incomplete Queue attestation cannot authorize fixed inputs"
+    );
+    tx.rollback().await.unwrap();
 }

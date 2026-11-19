@@ -352,6 +352,7 @@ impl QueueConfigurationInputRepository {
             serde_json::from_value(crypto::decrypt_json(&row["encrypted_context"], master)?)?;
         let (accepted_body,accepted_hash,fixed):(Value,String,Option<Id>)=sqlx::query_as("SELECT proof,proof_digest,configuration_input FROM runtime_accepted_batch_item WHERE admission=$1 AND item=$2 FOR SHARE")
             .bind(source.id).bind(sealed.binding.item).fetch_optional(&mut *conn).await?.ok_or_else(denied)?;
+        super::accepted_batch_dependency::AcceptedBatchDependencyRepository::authenticate_queue_member(conn,source.id,sealed.binding.item,&accepted_body,master).await?;
         if hash(&accepted_body)? != accepted_hash
             || fixed != Some(input)
             || accepted_body.get("authority")
