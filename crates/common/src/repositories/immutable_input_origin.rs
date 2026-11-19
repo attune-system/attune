@@ -1788,7 +1788,8 @@ impl ExecutionAdmissionRepository {
         if !is_immutable_origin(origin) {
             return Ok(None);
         }
-        let authorities = Self::input_authorities(conn, destination, None).await?;
+        let (authorities, contributor_fence) =
+            Self::input_authorities_with_fence(conn, destination, None).await?;
         if authorities.is_empty() {
             return Ok(None);
         }
@@ -1808,7 +1809,10 @@ impl ExecutionAdmissionRepository {
             std::slice::from_ref(origin),
         )
         .await?;
-        let fence = fence.intersect(&origin_fence);
+        let mut fence = fence.intersect(&origin_fence);
+        if let Some(contributor_fence) = contributor_fence {
+            fence = fence.intersect(&contributor_fence);
+        }
         fence.ensure_fresh_on(conn).await?;
         Ok(Some(fence))
     }
