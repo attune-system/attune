@@ -3099,6 +3099,123 @@ async fn register_native_sensor_worker(pool: &PgPool, worker: &Worker, instance:
 }
 
 #[tokio::test]
+async fn native_sensor_unsubmitted_cleanup_closes_run_but_never_resolves_unknown_create() {
+    let (pool, sensor, worker, _) = setup_fixture().await;
+    create_active_rule(&pool, &sensor).await;
+    admit_native_sensor_metadata(&pool, &sensor).await;
+    let master = "0123456789abcdef0123456789abcdef";
+    let original = Uuid::new_v4();
+    register_native_sensor_worker(&pool, &worker, original).await;
+    let AcquireEligibleSensorWorkloadOutcome::Acquired(first) =
+        SensorWorkloadAdmissionRepository::acquire_with_encryption_key(
+            &pool,
+            acquire_input(sensor.id, worker.id, original),
+            Some(master),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("original admission")
+    };
+    let intent = Uuid::new_v4();
+    SensorWorkloadRepository::reserve_native_effect(
+        &pool,
+        sensor.id,
+        first.fence(),
+        intent,
+        "owned-private-context-before-create",
+        master,
+    )
+    .await
+    .unwrap();
+    assert!(SensorWorkloadRepository::settle_unsubmitted_native_effect(
+        &pool,
+        first.workload_id,
+        intent,
+    )
+    .await
+    .is_err());
+    SensorWorkloadRepository::stop_native_effect(&pool, first.workload_id, intent)
+        .await
+        .unwrap();
+    assert!(SensorWorkloadRepository::settle_unsubmitted_native_effect(
+        &pool,
+        first.workload_id,
+        Uuid::new_v4(),
+    )
+    .await
+    .is_err());
+    SensorWorkloadRepository::settle_unsubmitted_native_effect(&pool, first.workload_id, intent)
+        .await
+        .unwrap();
+    assert!(
+        SensorWorkloadRepository::native_effect(&pool, first.workload_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !SensorWorkloadRepository::is_current_fence(&pool, first.fence())
+            .await
+            .unwrap()
+    );
+
+    let replacement = Uuid::new_v4();
+    register_native_sensor_worker(&pool, &worker, replacement).await;
+    let AcquireEligibleSensorWorkloadOutcome::Acquired(next) =
+        SensorWorkloadAdmissionRepository::acquire_with_encryption_key(
+            &pool,
+            acquire_input(sensor.id, worker.id, replacement),
+            Some(master),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("fresh admission after proven never-submitted cleanup")
+    };
+    assert!(next.generation > first.generation);
+    let submitted = Uuid::new_v4();
+    SensorWorkloadRepository::reserve_native_effect(
+        &pool,
+        sensor.id,
+        next.fence(),
+        submitted,
+        "owned-private-context-with-lost-create-ack",
+        master,
+    )
+    .await
+    .unwrap();
+    SensorWorkloadRepository::consume_native_effect(
+        &pool,
+        sensor.id,
+        next.fence(),
+        submitted,
+        false,
+    )
+    .await
+    .unwrap();
+    SensorWorkloadRepository::stop_native_effect(&pool, next.workload_id, submitted)
+        .await
+        .unwrap();
+    // No resource was recorded: this is the lost-create-ACK state. Neither
+    // an empty inventory nor an absent provider lookup can turn it into no-create.
+    assert!(SensorWorkloadRepository::settle_unsubmitted_native_effect(
+        &pool,
+        next.workload_id,
+        submitted,
+    )
+    .await
+    .is_err());
+    let retained = SensorWorkloadRepository::native_effect(&pool, next.workload_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(retained.create_submitted && retained.resource.is_none());
+    assert!(retained.exit.is_none() && !retained.capture_complete());
+    pool.cleanup().await.unwrap();
+}
+
+#[tokio::test]
 async fn native_sensor_fresh_admission_rejects_replaced_registration() {
     let (pool, sensor, worker, _) = setup_fixture().await;
     create_active_rule(&pool, &sensor).await;

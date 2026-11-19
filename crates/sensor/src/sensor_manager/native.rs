@@ -113,6 +113,19 @@ impl SensorManager {
         else {
             return Ok(());
         };
+        if !effect.create_submitted {
+            // Cleanup needs no private invocation when the durable latch proves
+            // no provider call was permitted. The repository rechecks it under
+            // the operation lock; a concurrent/lost create ACK stays unresolved.
+            Ledger::stop_native_effect(&self.inner.db, workload, effect.intent).await?;
+            return Ledger::settle_unsubmitted_native_effect(
+                &self.inner.db,
+                workload,
+                effect.intent,
+            )
+            .await
+            .map_err(Into::into);
+        }
         let native = self
             .inner
             .native
@@ -146,9 +159,6 @@ impl SensorManager {
             }
             None => {
                 Ledger::stop_native_effect(&self.inner.db, workload, spec.intent).await?;
-                if !effect.create_submitted {
-                    return Err(anyhow!("Sensor intent retained before create; capture/publication settlement required"));
-                }
                 let resource = native
                     .backend
                     .launcher()

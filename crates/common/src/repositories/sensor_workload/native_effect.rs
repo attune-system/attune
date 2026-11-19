@@ -231,6 +231,45 @@ impl SensorWorkloadRepository {
         tx.commit().await?;
         Ok(())
     }
+    /// Positive never-submitted settlement, independent of current Run authority.
+    /// The same operation lock serializes this with the durable create latch.
+    /// This never synthesizes an exit, capture, file receipt or provider absence.
+    pub async fn settle_unsubmitted_native_effect(
+        pool: &PgPool,
+        workload: Id,
+        intent: Uuid,
+    ) -> Result<()> {
+        let mut tx = pool.begin().await?;
+        let effect = Self::locked_native(&mut tx, workload, intent).await?;
+        if !effect.files_bound
+            || !effect.stop_requested
+            || effect.create_submitted
+            || effect.stdin_consumed
+            || effect.resource.is_some()
+            || effect.exit.is_some()
+            || effect.stdout_complete
+            || effect.stderr_complete
+        {
+            return Err(denied());
+        }
+        let allocated: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM artifact_version WHERE sensor_workload=$1 AND sensor_generation=$2 AND sensor_native_intent=$3)",
+        )
+        .bind(workload)
+        .bind(effect.generation)
+        .bind(intent)
+        .fetch_one(&mut *tx)
+        .await?;
+        if allocated {
+            return Err(denied());
+        }
+        // There are no provider/file obligations to carry the old lease. Keep
+        // its closed-generation frontier so the original Run cannot revive.
+        sqlx::query("UPDATE sensor_workload_assignment SET native_effect=NULL,worker=NULL,worker_instance=NULL,lease_expires_at=NULL,assigned_at=NULL,renewed_at=NULL,native_closed_generation=GREATEST(native_closed_generation,generation) WHERE workload=$1")
+            .bind(workload).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
     pub async fn record_native_exit(
         pool: &PgPool,
         workload: Id,
