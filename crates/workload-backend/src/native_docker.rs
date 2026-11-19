@@ -1172,10 +1172,7 @@ mod tests {
             .unwrap();
         assert!(launcher.removal_recorded(&spec, &resource).await.unwrap());
         let mut changed = spec.clone();
-        changed
-            .invocation
-            .argv
-            .push("different-private-invocation".into());
+        changed.timeout_ms = Some(2000);
         assert!(launcher
             .removal_recorded(&changed, &resource)
             .await

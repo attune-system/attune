@@ -338,7 +338,6 @@ impl WorkerService {
         let registration_state = WorkerRegistration::new(pool.clone(), &config)
             .with_child_environment(child_environment.clone());
         let worker_name = registration_state.worker_name().to_string();
-        let registration = Arc::new(RwLock::new(registration_state));
 
         // Initialize artifact manager for execution stdout/stderr/result storage.
         // This must use the shared artifacts_dir so the API log streaming endpoints
@@ -630,6 +629,18 @@ impl WorkerService {
             executor
         };
         let executor = Arc::new(executor);
+        let registration_state = if config.workload.is_some() {
+            registration_state.with_native_runtime_discovery(
+                executor.clone(),
+                child_environment
+                    .native_runtime_recipe_digests()
+                    .map(str::to_owned)
+                    .collect(),
+            )
+        } else {
+            registration_state
+        };
+        let registration = Arc::new(RwLock::new(registration_state));
 
         // Initialize heartbeat manager
         let heartbeat_interval = config
@@ -720,7 +731,15 @@ impl WorkerService {
         // Exclusive custody is acquired before replacing a live incarnation.
         let worker_id = {
             let mut reg = self.registration.write().await;
-            reg.detect_capabilities(&self.config).await?;
+            if self.config.workload.is_some() {
+                // Probes require the acknowledged incarnation and custody.
+                // Advertise no interpreter/tool claims before they complete.
+                reg.add_capability("runtimes".into(), serde_json::json!([]));
+                reg.add_capability("runtime_toolchains".into(), serde_json::json!({}));
+                reg.add_capability("runtime_recipe_digests".into(), serde_json::json!([]));
+            } else {
+                reg.detect_capabilities(&self.config).await?;
+            }
             reg.add_capability(
                 attune_common::action_cli::WORKER_CAPABILITY.into(),
                 serde_json::json!(cfg!(target_os = "linux")),
@@ -781,13 +800,27 @@ impl WorkerService {
         // This must run before environment setup so that pack directories
         // (and their dependency manifests) are available locally.
         self.sync_all_packs_on_startup().await;
+        if self.config.workload.is_some() {
+            let discovery = async {
+                let mut registration = self.registration.write().await;
+                registration.detect_capabilities(&self.config).await?;
+                registration.update_capabilities().await
+            }
+            .await;
+            if let Err(error) = discovery {
+                self.heartbeat.stop().await;
+                return Err(error);
+            }
+        }
 
         match &self.startup_mode {
             StartupMode::Worker => {
                 // Verify which runtime versions are available on this system.
                 // This updates the `available` flag in the database so that
                 // `select_best_version()` only considers genuinely present versions.
-                self.verify_runtime_versions().await;
+                if self.config.workload.is_none() {
+                    self.verify_runtime_versions().await;
+                }
 
                 // Proactively set up runtime environments for all registered packs.
                 // This runs before we start consuming execution messages so that
@@ -834,6 +867,9 @@ impl WorkerService {
     /// `select_best_version()` only considers versions whose interpreters
     /// are genuinely present.
     async fn verify_runtime_versions(&self) {
+        if self.config.workload.is_some() {
+            return;
+        }
         let filter_refs: Option<Vec<String>> = self.runtime_filter.clone();
         let filter_slice: Option<&[String]> = filter_refs.as_deref();
 
@@ -1032,6 +1068,7 @@ impl WorkerService {
         let child_environment = self.child_environment.clone();
         let pack_transport = self.pack_transport.clone();
         let native_executor = self.config.workload.as_ref().map(|_| self.executor.clone());
+        let native_config = self.config.workload.as_ref().map(|_| self.config.clone());
 
         let handle = tokio::spawn(async move {
             info!(
@@ -1048,6 +1085,7 @@ impl WorkerService {
                     let child_environment = child_environment.clone();
                     let pack_transport = pack_transport.clone();
                     let native_executor=native_executor.clone();
+                    let native_config=native_config.clone();
 
                     async move {
                         match envelope.message_type {
@@ -1096,7 +1134,11 @@ impl WorkerService {
                                     filter_ref,
                                 );
 
-                                if !filtered_runtime_names.is_empty() {
+                                if let Some(config) = native_config.as_ref() {
+                                    let mut current = registration.write().await;
+                                    current.detect_capabilities(config).await?;
+                                    current.update_capabilities().await?;
+                                } else if !filtered_runtime_names.is_empty() {
                                     let verify_result =
                                         version_verify::verify_all_runtime_versions(
                                             &db_pool,

@@ -2668,7 +2668,6 @@ impl ActionExecutor {
                 .filter(|p| p.kind == LaunchInputKind::Runtime)
                 .count()
                 > 1
-            || config.lifecycle.is_some()
             || spec.stage.is_some()
             || spec.pack_access != PackAccess::ReadOnly
         {
@@ -2701,6 +2700,9 @@ impl ActionExecutor {
             || manifest.version != release.version
         {
             return Err(unavailable());
+        }
+        if config.lifecycle.is_some() {
+            return self.prepare_isolated_recipe(context, spec, &execution);
         }
         if !matches!(config.interpreter.binary.as_str(), "" | "native" | "none") {
             return self
