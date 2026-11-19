@@ -792,7 +792,7 @@ async fn native_secret_input_file_publication_rejects_replaced_and_restored_ciph
         let permission = PermissionSetRepository::create(
             &ctx.pool,
             CreatePermissionSetInput {
-                r#ref: format!("native_file_input_{}", Uuid::new_v4().simple()),
+                r#ref: format!("core.native_file_input_{}", Uuid::new_v4().simple()),
                 pack: None,
                 pack_ref: None,
                 label: None,
