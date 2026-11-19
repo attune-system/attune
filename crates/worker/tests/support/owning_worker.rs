@@ -205,7 +205,8 @@ pub async fn run_interpreted_suite(fixture: NativeOwningFixture) -> Result<()> {
                 Some((delivery, format)),
                 Some(case),
             )
-            .await?;
+            .await
+            .with_context(|| format!("owning inline scenario {case:?}/{delivery}/{format}"))?;
         }
         Ok::<_, anyhow::Error>(())
     }
@@ -264,6 +265,7 @@ fn inline_config(case: InlineCase) -> serde_json::Value {
         }
     }
 }
+const INLINE_INPUT_READER_PATH: &str = "/opt/attune/pack/actions/inline-input-reader.py";
 const INLINE_INPUT_READER: &str = r#"import json,os,sys,stat,shlex
 from pathlib import Path
 assert Path('/usr/local/libexec/attune/echo').is_file()
@@ -296,7 +298,7 @@ sys.stdout.write(message)
 fn inline_source(case: InlineCase) -> String {
     match case {
         InlineCase::ShellFile => "inline-probe.sh".into(),
-        InlineCase::Direct => format!("exec /usr/bin/python3 -c '{}'",INLINE_INPUT_READER.replace('\'',"'\\''")),
+        InlineCase::Direct => format!("exec /usr/bin/python3 '{INLINE_INPUT_READER_PATH}'"),
         InlineCase::TempFile => r#"[[ "$0" == /tmp/attune-inline-*/source-*.sh ]]
 [[ $(stat -c %a "$0") == 600 ]]
 [[ "$PARAM_MESSAGE" == "$message" ]]
@@ -310,7 +312,7 @@ if [[ "$ATTUNE_PARAMETER_DELIVERY" == file ]]; then
 fi
 printf '%s' "$message"
 "#.into(),
-        InlineCase::Recipe => format!("from pathlib import Path\nassert Path(__file__).is_relative_to('/tmp/attune-lifecycle-generations')\nassert Path('recipe-private-marker').read_text()=='private'\n{INLINE_INPUT_READER}"),
+        InlineCase::Recipe => format!("from pathlib import Path\nfrom runpy import run_path\nassert Path(__file__).is_relative_to('/tmp/attune-lifecycle-generations')\nassert Path('recipe-private-marker').read_text()=='private'\nrun_path('{INLINE_INPUT_READER_PATH}', run_name='__main__')"),
     }
 }
 
@@ -674,6 +676,14 @@ async fn owning_case(
                 "ref":runtime.r#ref,"name":runtime.name,"aliases":runtime.aliases,
                 "execution_config":runtime.execution_config,"distributions":runtime.distributions
             }))?,
+        )?;
+    }
+    if matches!(inline, Some(InlineCase::Direct | InlineCase::Recipe)) {
+        // Keep the authored literal within the repository's existing source
+        // bound; the larger assertions remain in the same immutable Pack pin.
+        std::fs::write(
+            source.join("actions/inline-input-reader.py"),
+            INLINE_INPUT_READER,
         )?;
     }
     if inline == Some(InlineCase::ShellFile) {
