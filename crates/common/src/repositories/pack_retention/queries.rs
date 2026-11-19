@@ -61,6 +61,7 @@ impl Phase {
                 AND ((a.owner_kind='execution' AND NOT EXISTS(SELECT 1 FROM execution e WHERE e.id=a.owner_id))
                   OR (a.owner_kind='enforcement' AND NOT EXISTS(SELECT 1 FROM enforcement e WHERE e.id=a.owner_id)))",
             Self::PolicyRevisions => "NOT file_evidence_pinned('pack_runtime_policy_revision',p.id)
+                AND NOT EXISTS(SELECT 1 FROM work_queue_item_configuration_input fixed_input WHERE fixed_input.policy_revision=p.id)
                 AND NOT EXISTS(SELECT 1 FROM runtime_native_input_snapshot snapshot WHERE snapshot.policy_revision=p.id)
                 AND NOT EXISTS(SELECT 1 FROM pack_runtime_policy_current c WHERE c.revision=p.id)
                 AND NOT EXISTS(SELECT 1 FROM runtime_authority_admission a WHERE a.policy_revision=p.id)

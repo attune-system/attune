@@ -106,6 +106,10 @@ async fn convert_locked(
     sqlx::query("SELECT encryption_conversion_lock()")
         .execute(&mut *conn)
         .await?;
+    // Forward-added owning store; follows the existing conversion-wide lock.
+    sqlx::query("LOCK TABLE work_queue_item_configuration_input IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *conn)
+        .await?;
     let before = integrity::validate(conn).await?;
     let (changes, mut report) = graph::changes(conn, master).await?;
     if !apply {

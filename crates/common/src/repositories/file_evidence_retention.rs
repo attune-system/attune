@@ -2238,6 +2238,7 @@ impl FileEvidenceRetentionRepository {
             "pack_runtime_policy_revision"=>"jsonb_build_object('pack',r.pack,'release',jsonb_build_object('id',r.release),'policy',r.policy)",
             "pack_release"=>"jsonb_build_object('pack',r.pack)",
             "runtime_external_approval"=>"jsonb_build_object('pack',r.subject_pack)",
+            "work_queue_item_configuration_input"=>"jsonb_build_object('policy_revision',r.policy_revision,'configuration_revision',r.configuration_revision,'binding',r.binding,'binding_digest',r.binding_digest)",
             "runtime_declared_input_binding"=>"jsonb_build_object('policy_revision',r.policy_revision,'declaration',r.declaration,'declaration_digest',r.declaration_digest)",
             "schema_type_revision"=>"jsonb_build_object('release_id',r.release)",
             "managed_executable_metadata_revision"=>"jsonb_build_object('pack',r.pack,'action',r.action,'release',jsonb_build_object('id',r.release),'snapshot',r.snapshot)",
@@ -2260,6 +2261,29 @@ impl FileEvidenceRetentionRepository {
             .flatten();
         let body = body.ok_or_else(denied)?;
         c.charge(&body)?;
+        if node.kind == "work_queue_item_configuration_input" {
+            let binding = body.get("binding").ok_or_else(denied)?;
+            if crate::value_schema::digest(binding)
+                .map_err(|_| denied())?
+                .as_str()
+                != body
+                    .get("binding_digest")
+                    .and_then(Value::as_str)
+                    .ok_or_else(denied)?
+            {
+                return Err(denied());
+            }
+            c.push(
+                "pack_runtime_policy_revision",
+                body.get("policy_revision")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(denied)?,
+                depth + 1,
+            )?;
+            if let Some(revision) = body.get("configuration_revision").and_then(Value::as_i64) {
+                c.push("component_configuration_revision", revision, depth + 1)?;
+            }
+        }
         if node.kind == "runtime_declared_input_binding" {
             let proof = body.get("declaration").ok_or_else(denied)?;
             let digest = crate::value_schema::digest(proof).map_err(|_| denied())?;
@@ -2465,8 +2489,12 @@ impl FileEvidenceRetentionRepository {
                 origins,
                 target,
                 input_authority,
+                queue_input,
             } = selection.source
             {
+                if let Some(input) = queue_input {
+                    c.push("work_queue_item_configuration_input", input, depth + 1)?;
+                }
                 if let Some(target) = target {
                     c.proof(&serde_json::to_value(target)?, 0)?;
                 }
@@ -2486,6 +2514,13 @@ impl FileEvidenceRetentionRepository {
                     }
                 }
             }
+        }
+        let fixed:Vec<i64>=sqlx::query_scalar("SELECT input FROM runtime_input_queue_configuration_reference WHERE receipt=$1 ORDER BY input LIMIT 257")
+            .bind(id).fetch_all(&mut *conn).await?;
+        c.rows(fixed.len())?;
+        c.charge(&serde_json::to_value(&fixed)?)?;
+        for input in fixed {
+            c.push("work_queue_item_configuration_input", input, depth + 1)?;
         }
         let configurations:Vec<i64>=sqlx::query_scalar("SELECT revision FROM runtime_input_configuration_reference WHERE receipt=$1 ORDER BY revision LIMIT 257")
             .bind(id).fetch_all(&mut *conn).await?;

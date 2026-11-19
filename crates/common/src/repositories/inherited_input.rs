@@ -125,6 +125,8 @@ pub enum SelectionSource {
         origins: Vec<SecretOrigin>,
         target: Option<crate::runtime_authority::BoundRuntimeTarget>,
         input_authority: Option<Id>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queue_input: Option<Id>,
     },
     Inherited {
         receipt: Id,
@@ -1978,6 +1980,16 @@ impl InheritedInputRepository {
         encryption_key: &str,
     ) -> Result<()> {
         require_transaction(conn, &session.transaction).await?;
+        if session
+            .permit
+            .declaration
+            .source_path
+            .starts_with("/queue/")
+        {
+            return Err(Error::PermissionDenied(
+                "Queue-authored inputs require their accepted queue_input binding".into(),
+            ));
+        }
         if !session.permit.declaration.uses_keystore() {
             return Err(denied());
         }
@@ -2073,8 +2085,57 @@ impl InheritedInputRepository {
                 origins: vec![SecretOrigin::Key(origin)],
                 target: Some(target),
                 input_authority,
+                queue_input: None,
             },
         )
+    }
+
+    /// Bind accepted fixed queue values without consulting current Keys/config.
+    /// Contributor values retain their independent accepted-input proof.
+    pub async fn bind_queue_configuration(
+        conn: &mut PgConnection,
+        session: &mut RenderSession,
+        input: Id,
+        master: &str,
+    ) -> Result<()> {
+        require_transaction(conn, &session.transaction).await?;
+        let proof =
+            super::queue_configuration_input::QueueConfigurationInputRepository::for_renderer(
+                conn,
+                input,
+                &session.permit.source,
+                &session.permit.declaration,
+                master,
+            )
+            .await?;
+        session.fence = session.fence.intersect(proof.fence());
+        let mut paths = Vec::new();
+        if session.permit.declaration.uses_pack_configuration() {
+            paths.extend(["/config".to_owned(), "/pack/config".to_owned()]);
+        }
+        if session.permit.declaration.uses_keystore() {
+            paths.extend(
+                proof
+                    .resolved_keys()
+                    .keys()
+                    .map(|reference| format!("/keystore/{}", escape(reference))),
+            );
+        }
+        for path in paths {
+            let (value, origins, target) = proof.selection(&path)?;
+            insert(
+                session,
+                path,
+                value,
+                SelectionSource::Authored {
+                    origins,
+                    target: Some(target),
+                    input_authority: None,
+                    queue_input: Some(input),
+                },
+            )?;
+        }
+        Ok(())
     }
 
     /// Captures the actual immutable configuration revision at read time. Both
@@ -2085,6 +2146,16 @@ impl InheritedInputRepository {
         encryption_key: &str,
     ) -> Result<Id> {
         require_transaction(conn, &session.transaction).await?;
+        if session
+            .permit
+            .declaration
+            .source_path
+            .starts_with("/queue/")
+        {
+            return Err(Error::PermissionDenied(
+                "Queue-authored inputs require their accepted queue_input binding".into(),
+            ));
+        }
         let (value, revision) = DeclaredInputRepository::pack_configuration(
             conn,
             &session.permit,
@@ -2106,6 +2177,7 @@ impl InheritedInputRepository {
                 owner_id: None,
             }),
             input_authority: None,
+            queue_input: None,
         };
         insert(session, "/config".into(), value.clone(), source.clone())?;
         insert(session, "/pack/config".into(), value, source)?;
@@ -3146,7 +3218,35 @@ impl InheritedInputRepository {
                         path: String::new(),
                     }]
                 }
-                SelectionSource::Authored { origins, .. } => origins.clone(),
+                SelectionSource::Authored {
+                    origins,
+                    target,
+                    input_authority,
+                    queue_input,
+                } => {
+                    let site = authored_declaration(conn, &rendered.renderer, rendered.declaration)
+                        .await?;
+                    require_queue_input_id(&site, *queue_input)?;
+                    if let Some(input) = queue_input {
+                        if input_authority.is_some() {
+                            return Err(denied());
+                        }
+                        let (proof, expected, expected_target) = queue_input_selection(
+                            conn,
+                            &rendered.renderer,
+                            rendered.declaration,
+                            *input,
+                            &selected.context_path,
+                            encryption_key,
+                        )
+                        .await?;
+                        if &expected != origins || target.as_ref() != Some(&expected_target) {
+                            return Err(denied());
+                        }
+                        fence = fence.intersect(proof.fence());
+                    }
+                    origins.clone()
+                }
                 SelectionSource::Inherited { receipt, site }
                 | SelectionSource::Control { receipt, site }
                 | SelectionSource::PublicControl { receipt, site, .. }
@@ -3472,6 +3572,16 @@ impl InheritedInputRepository {
                 }
                 sqlx::query("INSERT INTO runtime_input_receipt_source(receipt,source_receipt) VALUES ($1,$2) ON CONFLICT DO NOTHING")
                     .bind(id).bind(receipt).execute(&mut *conn).await?;
+            }
+        }
+        for source in &rendered.selections {
+            if let SelectionSource::Authored {
+                queue_input: Some(input),
+                ..
+            } = &source.source
+            {
+                sqlx::query("INSERT INTO runtime_input_queue_configuration_reference(receipt,input) VALUES($1,$2) ON CONFLICT DO NOTHING")
+                    .bind(id).bind(input).execute(&mut *conn).await?;
             }
         }
         for origin in &prepared.origins {
@@ -3879,6 +3989,7 @@ impl InheritedInputRepository {
                 expected_sources.insert(source);
                 pending.push((source, Some(site)));
             }
+            let mut expected_queue_inputs = BTreeSet::new();
             let mut expected_admissions = BTreeSet::new();
             let mut expected_snapshots = BTreeSet::new();
             for selected in proof.selections {
@@ -4124,7 +4235,31 @@ impl InheritedInputRepository {
                         origins: actual,
                         target,
                         input_authority,
+                        queue_input,
                     } => {
+                        require_queue_input_id(
+                            declaration.as_ref().ok_or_else(denied)?,
+                            queue_input,
+                        )?;
+                        if let Some(input) = queue_input {
+                            if input_authority.is_some() {
+                                return Err(denied());
+                            }
+                            let (accepted, expected, expected_target) = queue_input_selection(
+                                conn,
+                                &renderer_record,
+                                proof.declaration,
+                                input,
+                                &selected.context_path,
+                                encryption_key,
+                            )
+                            .await?;
+                            if expected != actual || target.as_ref() != Some(&expected_target) {
+                                return Err(denied());
+                            }
+                            fence = Some(fence.ok_or_else(denied)?.intersect(accepted.fence()));
+                            expected_queue_inputs.insert(input);
+                        }
                         for origin in actual {
                             let declaration = declaration.as_ref().ok_or_else(denied)?;
                             let target = target.as_ref().ok_or_else(denied)?;
@@ -4291,6 +4426,11 @@ impl InheritedInputRepository {
             }
             let actual_sources:Vec<Id> = sqlx::query_scalar("SELECT source_receipt FROM runtime_input_receipt_source WHERE receipt = $1 ORDER BY source_receipt")
                 .bind(id).fetch_all(&mut *conn).await?;
+            let actual_queue_inputs:Vec<Id> = sqlx::query_scalar("SELECT input FROM runtime_input_queue_configuration_reference WHERE receipt=$1 ORDER BY input")
+                .bind(id).fetch_all(&mut *conn).await?;
+            if actual_queue_inputs.into_iter().collect::<BTreeSet<_>>() != expected_queue_inputs {
+                return Err(denied());
+            }
             if actual_sources.into_iter().collect::<BTreeSet<_>>() != expected_sources {
                 return Err(denied());
             }
@@ -4924,6 +5064,62 @@ fn insert(
     });
     Ok(())
 }
+fn require_queue_input_id(
+    declaration: &super::declared_input::DeclaredInputBinding,
+    input: Option<Id>,
+) -> Result<()> {
+    if declaration.source_path.starts_with("/queue/") {
+        if input.is_none_or(|id| id <= 0) {
+            return Err(Error::PermissionDenied(
+                "Queue-authored inputs require their accepted queue_input binding".into(),
+            ));
+        }
+    } else if input.is_some() {
+        return Err(Error::PermissionDenied(
+            "A queue_input binding cannot authorize a nonqueue declaration".into(),
+        ));
+    }
+    Ok(())
+}
+async fn authored_declaration(
+    conn: &mut PgConnection,
+    renderer: &RuntimeAdmissionRecord,
+    declaration: Option<Id>,
+) -> Result<super::declared_input::DeclaredInputBinding> {
+    let (body,expected):(Value,String) = sqlx::query_as("SELECT declaration,declaration_digest FROM runtime_declared_input_binding WHERE id=$1 AND policy_revision=$2 AND invocation_digest=$3 FOR SHARE")
+        .bind(declaration.ok_or_else(denied)?).bind(renderer.policy_revision)
+        .bind(hash(&serde_json::to_value(&renderer.authority.binding)?)?).fetch_optional(&mut *conn).await?.ok_or_else(denied)?;
+    if hash(&body)? != expected {
+        return Err(denied());
+    }
+    serde_json::from_value(body).map_err(Into::into)
+}
+async fn queue_input_selection(
+    conn: &mut PgConnection,
+    renderer: &RuntimeAdmissionRecord,
+    declaration: Option<Id>,
+    input: Id,
+    path: &str,
+    master: &str,
+) -> Result<(
+    super::queue_configuration_input::QueueConfigurationInput,
+    Vec<SecretOrigin>,
+    crate::runtime_authority::BoundRuntimeTarget,
+)> {
+    let declaration = authored_declaration(conn, renderer, declaration).await?;
+    require_queue_input_id(&declaration, Some(input))?;
+    let proof = super::queue_configuration_input::QueueConfigurationInputRepository::for_renderer(
+        conn,
+        input,
+        renderer,
+        &declaration,
+        master,
+    )
+    .await?;
+    let (_, origins, target) = proof.selection(path)?;
+    Ok((proof, origins, target))
+}
+
 fn validate_authored_origin(
     declaration: &super::declared_input::DeclaredInputBinding,
     origin: &SecretOrigin,
@@ -5557,6 +5753,26 @@ async fn retained_input_approval(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn queue_input_id_never_downgrades_to_ordinary_authored_authority() {
+        let mut site = super::super::declared_input::DeclaredInputBinding {
+            action: 1,
+            pack: 2,
+            release: 3,
+            metadata_revision: None,
+            declaration_revision: "a".repeat(64),
+            source_path: "/queue/action_params/token".into(),
+            expression: "{{ keystore['business.token'] }}".into(),
+        };
+        for missing in [None, Some(0), Some(-1)] {
+            assert!(super::require_queue_input_id(&site, missing).is_err());
+        }
+        assert!(super::require_queue_input_id(&site, Some(41)).is_ok());
+        site.source_path = "/param_schema/token/default".into();
+        assert!(super::require_queue_input_id(&site, None).is_ok());
+        assert!(super::require_queue_input_id(&site, Some(41)).is_err());
+    }
 
     #[test]
     fn recorded_frame_controls_reject_foreign_and_reopened_receipts() {

@@ -24,11 +24,13 @@ use std::collections::BTreeMap;
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Binding {
+    id: Id,
     item: Id,
     queue: Id,
     queue_ref: String,
     policy: Id,
     authority_digest: String,
+    authority: crate::runtime_authority::SelectedRuntimeAuthority,
     executable_digest: String,
     item_schema_digest: String,
     template_digest: String,
@@ -37,6 +39,7 @@ struct Binding {
     configuration_digest: Option<String>,
     declarations: Vec<DeclaredInputBinding>,
     keys: BTreeMap<String, KeyOrigin>,
+    key_targets: BTreeMap<String, crate::runtime_authority::BoundRuntimeTarget>,
     schema: ActionSchemaBinding,
 }
 #[derive(Serialize, Deserialize)]
@@ -51,8 +54,12 @@ struct Sealed {
 /// fences. No serialized caller body can assert this proof.
 pub struct QueueConfigurationInput {
     sealed: Sealed,
+    fence: super::runtime_authority::ApprovalEffectFence,
 }
 impl QueueConfigurationInput {
+    pub fn id(&self) -> Id {
+        self.sealed.binding.id
+    }
     pub fn configuration(&self) -> &Value {
         &self.sealed.configuration
     }
@@ -64,6 +71,67 @@ impl QueueConfigurationInput {
     }
     pub fn declarations(&self) -> &[DeclaredInputBinding] {
         &self.sealed.binding.declarations
+    }
+    pub(in crate::repositories) fn fence(&self) -> &super::runtime_authority::ApprovalEffectFence {
+        &self.fence
+    }
+    pub(in crate::repositories) fn selection(
+        &self,
+        path: &str,
+    ) -> Result<(
+        Value,
+        Vec<crate::secret_provenance::SecretOrigin>,
+        crate::runtime_authority::BoundRuntimeTarget,
+    )> {
+        use crate::secret_provenance::SecretOrigin;
+        for (reference, origin) in &self.sealed.binding.keys {
+            let root = format!(
+                "/keystore/{}",
+                reference.replace('~', "~0").replace('/', "~1")
+            );
+            if let Some(suffix) = crate::secret_values::pointer_suffix(&root, path) {
+                let value = self.sealed.keys[reference]
+                    .pointer(&suffix)
+                    .cloned()
+                    .ok_or_else(denied)?;
+                return Ok((
+                    value,
+                    vec![SecretOrigin::Key(origin.clone())],
+                    self.sealed
+                        .binding
+                        .key_targets
+                        .get(reference)
+                        .cloned()
+                        .ok_or_else(denied)?,
+                ));
+            }
+        }
+        for root in ["/config", "/pack/config"] {
+            if let Some(suffix) = crate::secret_values::pointer_suffix(root, path) {
+                let value = self
+                    .sealed
+                    .configuration
+                    .pointer(&suffix)
+                    .cloned()
+                    .ok_or_else(denied)?;
+                return Ok((
+                    value,
+                    vec![SecretOrigin::Entity {
+                        entity_type: "component_configuration".into(),
+                        entity_id: self.sealed.binding.configuration.ok_or_else(denied)?,
+                        path: suffix,
+                    }],
+                    crate::runtime_authority::BoundRuntimeTarget {
+                        kind: "pack".into(),
+                        id: self.sealed.binding.pack,
+                        pack_id: Some(self.sealed.binding.pack),
+                        owner_type: None,
+                        owner_id: None,
+                    },
+                ));
+            }
+        }
+        Err(denied())
     }
     pub fn resolved_keys(&self) -> BTreeMap<String, crate::key_access::ResolvedKey> {
         self.sealed
@@ -85,6 +153,116 @@ impl QueueConfigurationInput {
 
 pub struct QueueConfigurationInputRepository;
 impl QueueConfigurationInputRepository {
+    /// Exclusive graph admission must precede any source locks. The graph gate
+    /// serializes receipt attachment against reclamation; the FK independently
+    /// protects every retained receipt, including receipts for deleted items.
+    pub async fn reclaim_with_conn(conn: &mut PgConnection, limit: u32) -> Result<usize> {
+        let held: bool = sqlx::query_scalar("SELECT file_evidence_graph_held(true)")
+            .fetch_one(&mut *conn)
+            .await?;
+        if !held {
+            return Err(denied());
+        }
+        let removed: Vec<Id> = sqlx::query_scalar(
+            "WITH candidates AS (SELECT q.id FROM work_queue_item_configuration_input q \
+             WHERE NOT EXISTS(SELECT 1 FROM work_queue_item i WHERE i.id=q.item) \
+               AND NOT EXISTS(SELECT 1 FROM runtime_input_queue_configuration_reference r WHERE r.input=q.id) \
+               AND NOT file_evidence_pinned('work_queue_item_configuration_input',q.id) \
+             ORDER BY q.id LIMIT $1 FOR UPDATE SKIP LOCKED) \
+             DELETE FROM work_queue_item_configuration_input q USING candidates c WHERE q.id=c.id RETURNING q.id",
+        ).bind(i64::from(limit.min(1000))).fetch_all(conn).await?;
+        Ok(removed.len())
+    }
+
+    /// Retained receipt validation never requires the source item to survive.
+    /// Its actual renderer admission and exact authored declaration remain the
+    /// authority boundary; record IDs and FKs alone authorize nothing.
+    pub(in crate::repositories) async fn for_renderer(
+        conn: &mut PgConnection,
+        input: Id,
+        source: &super::runtime_authority::RuntimeAdmissionRecord,
+        declaration: &DeclaredInputBinding,
+        master: &str,
+    ) -> Result<QueueConfigurationInput> {
+        use super::runtime_authority::RuntimeAuthorityRepository as Authority;
+        let current = Authority::require_retained_admission(conn, source.id).await?;
+        if current.owner_kind != "execution" || current.authority != source.authority {
+            return Err(denied());
+        }
+        let fence = Authority::retained_admission_fence(conn, source.id).await?;
+        let row:Value = sqlx::query_scalar("SELECT jsonb_build_object('id',id,'item',item,'policy_revision',policy_revision,'configuration_revision',configuration_revision,'binding',binding,'binding_digest',binding_digest,'encrypted_context',encrypted_context,'encryption_key_hash',encryption_key_hash) FROM work_queue_item_configuration_input WHERE id=$1 FOR SHARE")
+            .bind(input).fetch_optional(&mut *conn).await?.ok_or_else(denied)?;
+        authenticate_stored(&row, master)?;
+        let sealed: Sealed =
+            serde_json::from_value(crypto::decrypt_json(&row["encrypted_context"], master)?)?;
+        let accepted = &sealed.binding.authority;
+        let renderer = &source.authority;
+        if sealed.binding.id != input
+            || accepted.policy_id != sealed.binding.policy
+            || renderer.policy_id != accepted.policy_id
+            || renderer.owner != accepted.owner
+            || renderer.binding != accepted.binding
+            || renderer.selected_refs != accepted.selected_refs
+            || renderer.grants != accepted.grants
+            || !sealed.binding.declarations.contains(declaration)
+        {
+            return Err(denied());
+        }
+        match &renderer.attribution {
+            crate::runtime_authority::RequestAttribution::QueueBatch { queue_ref, items }
+                if queue_ref == &sealed.binding.queue_ref
+                    && items.contains_key(&sealed.binding.item) =>
+            {
+                ()
+            }
+            _ => return Err(denied()),
+        }
+        let policy = Authority::require_policy(conn, sealed.binding.policy).await?;
+        let invocation = policy
+            .policy
+            .invocations
+            .iter()
+            .find(|entry| entry.binding == accepted.binding)
+            .ok_or_else(denied)?;
+        if invocation.source_id != Some(sealed.binding.queue)
+            || invocation.dispatch_template_digest.as_deref()
+                != Some(sealed.binding.template_digest.as_str())
+        {
+            return Err(denied());
+        }
+        let executable =
+            super::managed_executable::ManagedExecutableRepository::resolve_invocation(
+                conn,
+                &policy.policy,
+                &accepted.binding,
+            )
+            .await?;
+        if hash(&serde_json::to_value(&executable)?)? != sealed.binding.executable_digest
+            || SchemaContractRepository::materialize_action_pair(conn, &executable).await?
+                != sealed.binding.schema
+        {
+            return Err(denied());
+        }
+        DeclaredInputRepository::validate_declaration(conn, source, declaration).await?;
+        if let Some(id) = sealed.binding.configuration {
+            let revision = Configuration::find(&mut *conn, id)
+                .await?
+                .ok_or_else(denied)?;
+            if revision.owner_kind != "pack"
+                || revision.owner_id != sealed.binding.pack
+                || !Configuration::owner_survives(conn, &revision).await?
+                || sealed.binding.configuration_digest
+                    != Some(hash(
+                        &json!({"contract":revision.contract,"config":revision.config}),
+                    )?)
+            {
+                return Err(denied());
+            }
+        }
+        fence.ensure_fresh_on(conn).await?;
+        Ok(QueueConfigurationInput { sealed, fence })
+    }
+
     /// Capture only during ORIGINAL item/admission creation. Repeating this call
     /// reads the accepted ciphertext, never today's Key/configuration value.
     pub async fn capture(
@@ -115,6 +293,11 @@ impl QueueConfigurationInputRepository {
             Admission::queue_batch(conn, queue, std::slice::from_ref(item), snapshot).await?;
         let (mut binding, metadata) =
             binding(conn, queue, item, snapshot, selected.authority().policy_id).await?;
+        binding.id = sqlx::query_scalar(
+            "SELECT nextval(pg_get_serial_sequence('work_queue_item_configuration_input','id'))",
+        )
+        .fetch_one(&mut *conn)
+        .await?;
         let mut configuration = Value::Null;
         if binding
             .declarations
@@ -150,6 +333,21 @@ impl QueueConfigurationInputRepository {
             if target.pack_id() != Some(binding.pack) {
                 return Err(denied());
             }
+            binding.key_targets.insert(
+                reference.clone(),
+                crate::runtime_authority::BoundRuntimeTarget {
+                    kind: "key".into(),
+                    id: key.id,
+                    pack_id: target.pack_id(),
+                    owner_type: Some(
+                        serde_json::to_value(key.owner_type)?
+                            .as_str()
+                            .ok_or_else(denied)?
+                            .into(),
+                    ),
+                    owner_id: target.owner_id(),
+                },
+            );
             binding
                 .keys
                 .insert(reference.clone(), crate::key_access::key_origin(&key));
@@ -175,11 +373,14 @@ impl QueueConfigurationInputRepository {
         // The authenticated encrypted envelope includes the complete public
         // binding, preventing ciphertext substitution across items or policies.
         let ciphertext = crypto::encrypt_json(&plaintext, encryption_key)?;
-        sqlx::query("INSERT INTO work_queue_item_configuration_input(item,policy_revision,configuration_revision,binding,binding_digest,encrypted_context,encryption_key_hash) VALUES($1,$2,$3,$4,$5,$6,$7)")
+        sqlx::query("INSERT INTO work_queue_item_configuration_input(item,policy_revision,configuration_revision,binding,binding_digest,encrypted_context,encryption_key_hash,id) VALUES($1,$2,$3,$4,$5,$6,$7,$8)")
             .bind(item.id).bind(sealed.binding.policy).bind(sealed.binding.configuration).bind(&body).bind(hash(&body)?)
-            .bind(ciphertext).bind(crypto::hash_encryption_key(encryption_key)).execute(&mut *conn).await?;
+            .bind(ciphertext).bind(crypto::hash_encryption_key(encryption_key)).bind(sealed.binding.id).execute(&mut *conn).await?;
         selected.ensure_fresh_on(conn).await?;
-        Ok(QueueConfigurationInput { sealed })
+        Ok(QueueConfigurationInput {
+            sealed,
+            fence: selected.effect_fence().clone(),
+        })
     }
 
     pub async fn load(
@@ -191,10 +392,10 @@ impl QueueConfigurationInputRepository {
     ) -> Result<QueueConfigurationInput> {
         let selected =
             Admission::queue_batch(conn, queue, std::slice::from_ref(item), snapshot).await?;
-        let row: Option<(Id,Option<Id>,Value,String,Value,String)> = sqlx::query_as(
-            "SELECT policy_revision,configuration_revision,binding,binding_digest,encrypted_context,encryption_key_hash FROM work_queue_item_configuration_input WHERE item=$1 FOR SHARE",
+        let row: Option<(Id,Option<Id>,Value,String,Value,String,Id)> = sqlx::query_as(
+            "SELECT policy_revision,configuration_revision,binding,binding_digest,encrypted_context,encryption_key_hash,id FROM work_queue_item_configuration_input WHERE item=$1 FOR SHARE",
         ).bind(item.id).fetch_optional(&mut *conn).await?;
-        let (policy, configuration, body, expected, encrypted, key_hash) =
+        let (policy, configuration, body, expected, encrypted, key_hash, id) =
             row.ok_or_else(denied)?;
         if hash(&body)? != expected || key_hash != crypto::hash_encryption_key(encryption_key) {
             return Err(denied());
@@ -204,14 +405,17 @@ impl QueueConfigurationInputRepository {
         if serde_json::to_value(&sealed.binding)? != body
             || sealed.binding.policy != policy
             || sealed.binding.configuration != configuration
+            || sealed.binding.id != id
             || policy != selected.authority().policy_id
         {
             return Err(denied());
         }
         let (mut actual, _) = binding(conn, queue, item, snapshot, policy).await?;
+        actual.id = id;
         actual.configuration = sealed.binding.configuration;
         actual.configuration_digest = sealed.binding.configuration_digest.clone();
         actual.keys = sealed.binding.keys.clone();
+        actual.key_targets = sealed.binding.key_targets.clone();
         if actual != sealed.binding || sealed.keys.keys().ne(sealed.binding.keys.keys()) {
             return Err(denied());
         }
@@ -230,7 +434,10 @@ impl QueueConfigurationInputRepository {
             }
         }
         selected.ensure_fresh_on(conn).await?;
-        Ok(QueueConfigurationInput { sealed })
+        Ok(QueueConfigurationInput {
+            sealed,
+            fence: selected.effect_fence().clone(),
+        })
     }
 }
 
@@ -290,23 +497,66 @@ async fn binding(
     let schema = SchemaContractRepository::materialize_action_pair(conn, snapshot).await?;
     Ok((
         Binding {
+            id: 0,
             item: item.id,
             queue: queue.id,
             queue_ref: queue.r#ref.clone(),
             policy,
             authority_digest,
+            authority: admitted,
             executable_digest: hash(&serde_json::to_value(snapshot)?)?,
             item_schema_digest: hash(&item.schema_binding.clone().ok_or_else(denied)?)?,
             template_digest,
-            pack: admitted.owner.pack_id,
+            pack: queue.pack.ok_or_else(denied)?,
             configuration: None,
             configuration_digest: None,
             declarations,
             keys: BTreeMap::new(),
+            key_targets: BTreeMap::new(),
             schema,
         },
         metadata,
     ))
+}
+
+/// Offline maintenance authenticates this new, current-verifier-only store
+/// without reviving a revoked input permit or changing any accepted bytes.
+pub(in crate::repositories) fn authenticate_stored(row: &Value, master: &str) -> Result<()> {
+    let body = row.get("binding").ok_or_else(denied)?;
+    if row.get("binding_digest").and_then(Value::as_str) != Some(hash(body)?.as_str())
+        || row.get("encryption_key_hash").and_then(Value::as_str)
+            != Some(crypto::hash_encryption_key(master).as_str())
+    {
+        return Err(denied());
+    }
+    let sealed: Sealed = serde_json::from_value(crypto::decrypt_json(
+        row.get("encrypted_context").ok_or_else(denied)?,
+        master,
+    )?)?;
+    if serde_json::to_value(&sealed.binding)? != *body
+        || row.get("id").and_then(Value::as_i64) != Some(sealed.binding.id)
+        || row.get("item").and_then(Value::as_i64) != Some(sealed.binding.item)
+        || row.get("policy_revision").and_then(Value::as_i64) != Some(sealed.binding.policy)
+        || row.get("configuration_revision").and_then(Value::as_i64) != sealed.binding.configuration
+        || sealed.keys.keys().ne(sealed.binding.keys.keys())
+    {
+        return Err(denied());
+    }
+    if hash(&serde_json::to_value(&sealed.binding.authority)?)? != sealed.binding.authority_digest
+        || sealed.binding.id <= 0
+        || sealed.binding.item <= 0
+        || sealed.binding.authority.policy_id != sealed.binding.policy
+        || sealed.binding.authority.owner.pack_id != sealed.binding.pack
+        || sealed
+            .binding
+            .keys
+            .keys()
+            .ne(sealed.binding.key_targets.keys())
+    {
+        return Err(denied());
+    }
+    sealed.binding.schema.validate()?;
+    Ok(())
 }
 
 struct FixedContext<'a>(&'a Value);

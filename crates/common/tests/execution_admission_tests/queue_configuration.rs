@@ -141,7 +141,7 @@ async fn queue_fixed_inputs_seal_credentials_without_contributor_key_rights() {
         key.id,
         UpdateKeyInput {
             encrypted: Some(true),
-            encryption_key_hash: Some(crypto::hash_encryption_key(ENC)),
+            encryption_key_hash: Some(crypto::keystore::fingerprint(ENC, key.id).unwrap()),
             value: Some(
                 crypto::keystore::encrypt_json(&json!("accepted-value"), ENC, key.id).unwrap(),
             ),

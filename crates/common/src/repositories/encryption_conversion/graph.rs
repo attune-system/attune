@@ -13,6 +13,7 @@ pub(super) struct Change {
 
 pub(super) const STORES: &[(&str, &str)] = &[
     ("key", "id"),
+    ("work_queue_item_configuration_input", "id"),
     ("execution_secret_value", "id"),
     ("runtime_input_receipt", "id"),
     ("runtime_accepted_input", "id"),
@@ -67,6 +68,16 @@ pub(super) async fn changes(
             };
             let values;
             match table {
+                "work_queue_item_configuration_input" => {
+                    // Introduced after verifier conversion: only current
+                    // verifiers are valid. Authenticate without rewriting the
+                    // owning proof or sealed configuration ciphertext.
+                    crate::repositories::queue_configuration_input::authenticate_stored(
+                        &row, master,
+                    )?;
+                    report.fields_already_current += 1;
+                    continue;
+                }
                 "key" => {
                     let key: Key = serde_json::from_value(row.clone())?;
                     if !key.encrypted {
