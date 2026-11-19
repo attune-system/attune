@@ -149,6 +149,8 @@ jobs:
           python3 scripts/test_load_core_pack.py
           python3 scripts/test_bootstrap_core_pack.py
           python3 scripts/test_core_bootstrap_failure.py
+          python3 scripts/test_prepare_native_compose.py
+          python3 scripts/test_native_compose_runner.py
           python3 scripts/test_workload_startup_diagnostics.py
           python3 scripts/test_capture_build_diagnostics.py
           python3 scripts/test_docker_source_graph.py

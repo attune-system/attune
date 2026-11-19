@@ -331,12 +331,19 @@ JSON map with exactly `worker-shell`, `worker-python`, `worker-node`, `worker-fu
   fixed `cache_root: /var/lib/attune/workloads`,
   `helper_archive: /opt/attune/public/workload-runner.zip`, and Docker backend
   `socket: /var/run/docker.sock`. Image and helper image pins, platform, limits,
-  exact public Runner object pin, observed daemon/engine binding, dedicated
+  exact public Runner object pin, expected daemon/native binding, dedicated
   cache volume and ordinary network are mandatory operator inputs.
 - `runner_source`: absolute path to the real public Runner ZIP from the same
   candidate's existing agent/release packaging. Its bytes must match the pin;
   no second helper build or invented object identity is supplied by this script.
 - `custody_volume`: a distinct persistent manager-private named volume.
+
+The trusted operator configuration is native admission. `binding.engine_id` is
+its stable supplied identity; it is not an enrollment row in the E2E database.
+The native adapter compares the supplied daemon identity and platform with the
+actual endpoint. Replacing a daemon requires explicit operator rebinding. Do not
+allocate an ID from observations, insert legacy engine rows, or use the retired
+controller enrollment path to manufacture authority.
 
 Provision each cache/custody volume explicitly on the admitted daemon, owned by
 UID/GID 1000 with mode 0700. Do not initialize over existing custody or rotate a
@@ -360,6 +367,63 @@ preparation verifies source archive bytes and preserves configured coverage; it
 is not daemon, worker/PG custody, restart, runtime/probe, lifecycle, or smoke
 acceptance. Native managers must keep denying any residual local launch. Do not
 activate production defaults until every consumer and packaged profile passes.
+The owned full-stack runner accepts the same profiles explicitly:
+
+```bash
+# Actual operator inputs and all stack images must already be prepared.
+# Run only after the coordinator grants the full integration lane.
+ATTUNE_E2E_RUN_ID="$OWNED_RUN_ID" \
+ATTUNE_E2E_DOCKER_SOCKET="$OWNED_DAEMON_SOCKET" \
+  bash scripts/run-integration-tests.sh \
+  --native-profiles "$OPERATOR_PROFILES_JSON" --runtime-lifecycle --tier 1 \
+  tests/e2e/api/test_sse_execution_stream.py tests/e2e/api/test_runtime_lifecycle.py -x
+```
+
+`ATTUNE_E2E_DOCKER_SOCKET` is an absolute, existing Unix socket, also used as the
+manager's socket bind source. The runner sets the explicit `DOCKER_HOST` for all
+child diagnostics/probes and clears inherited context/TLS selection. It verifies
+the expected daemon/platform, existing pinned runtime/helper images, fourteen
+distinct ordinary local volumes, and unused bridge networks. Each external
+volume/network must carry `io.attune.test.owner=$ATTUNE_E2E_RUN_ID`; volume mount
+users, shared writable volumes, observation errors and different ownership deny
+startup. This is read-only verification, not provisioning or enrollment. The
+prepared volume permissions above remain an operator prerequisite, and native
+startup's cache binding probe remains authoritative.
+
+Native mode uses prebuilt stack images (`--no-build --pull never` on managed
+Compose startup/run calls). It starts all seven managers and waits for their
+exact configured names to register. Generated Compose is the base; the existing
+E2E name/port/vhost resets and selected lifecycle fixture admission follow it.
+The toolchain worker gets its own E2E name/vhost reset. The API joins the owned
+guest bridges so explicitly authorized guest API clients retain connectivity;
+the database and MQ do not join those bridges. Worker capabilities, sensor
+placement labels, selected tests, marker exclusions and existing deadlines stay
+in force. Native profiles currently require fresh startup; standalone services
+need their own native admission before they can be combined with this mode.
+The ordinary runner path and standalone coverage remain available separately.
+
+Compose owns its project resources. Native teardown stops/removes the Compose
+containers and networks but retains project volumes, including database/object
+recovery evidence. External native volumes and networks, plus the private
+generated configurations/manifest under
+`.scratch/native-e2e-<run-id>.*`, are deliberately retained even after Compose
+teardown. Inspect the retained configuration for their exact names. Do not infer
+native writer settlement from Compose teardown, empty listings, 404s or a test
+exit code. A receipt-aware owner must first establish exact stop/removal and
+custody completion before removing those volumes/inputs; this runner does not
+provide that proof or rotate retained keys. Failed teardown also retains lifecycle
+fixture binds. `--no-teardown` keeps those same inputs for recovery.
+
+Selecting native mode in the checked-in full-stack CI call still requires actual
+operator profiles, Runner object pins/archive bytes, prebuilt images, and
+prepared run-owned endpoint/volumes/networks. The current CI call is unchanged
+and continues selecting the legacy startup path. The repository supplies no genuine operator profile
+for automatic CI creation; it does not replace that input with invented pins or
+binding IDs. Pure mocked runner tests are wired into script validation. They
+prove composition and failure handling, never native provider acceptance. The
+historical b98 smoke failure was legacy sandbox startup failure; this integration
+must pass the real full-stack lane before it can be called fixed or activated.
+
 The existing `init-agent` copies the once-built public Runner ZIP alongside its
 binaries; it does not mint an object pin or assert image compatibility.
 

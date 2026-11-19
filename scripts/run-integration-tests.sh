@@ -69,6 +69,9 @@ DO_TEARDOWN=true
 DO_STARTUP=true
 DO_STANDALONE=false
 DO_RUNTIME_LIFECYCLE=false
+NATIVE_PROFILES=""
+NATIVE_ROOT=""
+COMPOSE_LOCATION=()
 TEST_ARGS=()
 
 # ── Parse args ────────────────────────────────────────────────────────────
@@ -82,6 +85,9 @@ while [[ $# -gt 0 ]]; do
       DO_STARTUP=false; shift ;;
     --standalone)
       DO_STANDALONE=true; shift ;;
+    --native-profiles)
+      [[ $# -ge 2 && -n "$2" ]] || { echo "ERROR: --native-profiles requires an operator JSON file" >&2; exit 2; }
+      NATIVE_PROFILES="$2"; shift 2 ;;
     --runtime-lifecycle)
       DO_RUNTIME_LIFECYCLE=true; shift ;;
     -m)
@@ -105,9 +111,11 @@ while [[ $# -gt 0 ]]; do
       echo "  --no-build        Skip docker compose build step"
       echo "  --no-startup      Skip stack startup (never tears down an existing stack)"
       echo "  --standalone    Include standalone worker/sensor services"
+      echo "  --native-profiles <JSON>  Use all seven explicit native profiles and prebuilt images"
       echo "  --runtime-lifecycle  Admit recipe fixtures only in this fresh owned stack"
       echo ""
       echo "Environment:"
+      echo "  ATTUNE_E2E_DOCKER_SOCKET  Required absolute Unix socket for --native-profiles"
       echo "  ATTUNE_E2E_RUN_ID         Optional unique run identity"
       echo "  ATTUNE_E2E_SERIAL_BUILD   Set to 1 to build one service at a time"
       echo "  ATTUNE_E2E_PROJECT_NAME  Optional Compose project for a pre-started stack"
@@ -143,6 +151,24 @@ fi
 if [[ "$DO_RUNTIME_LIFECYCLE" == true && "$DO_STARTUP" == false ]]; then
   echo "ERROR: --runtime-lifecycle requires a fresh runner-owned stack" >&2
   exit 2
+fi
+
+# Native acceptance never consults a Docker context or rebuilds admitted inputs.
+# The standalone services have no supplied native profiles in this contract.
+if [[ -n "$NATIVE_PROFILES" ]]; then
+  if [[ "$DO_STARTUP" != true || "$DO_STANDALONE" == true ]]; then
+    echo "ERROR: native profiles require fresh startup and do not admit standalone services" >&2
+    exit 2
+  fi
+  if [[ ! -r "$NATIVE_PROFILES" || "${ATTUNE_E2E_DOCKER_SOCKET:-}" != /* || ! -S "${ATTUNE_E2E_DOCKER_SOCKET:-}" ]]; then
+    echo "ERROR: native profiles require readable JSON and ATTUNE_E2E_DOCKER_SOCKET naming an explicit Unix socket" >&2
+    exit 2
+  fi
+  NATIVE_PROFILES="$(realpath "$NATIVE_PROFILES")"
+  export DOCKER_HOST="unix://${ATTUNE_E2E_DOCKER_SOCKET}"
+  unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
+  DO_BUILD=false
+  COMPOSE_LOCATION=(--project-directory "$PROJECT_ROOT")
 fi
 
 # Owned E2E stacks use the tracked configuration, not an ignored developer
@@ -224,7 +250,13 @@ log_error()   { echo -e "${RED}✗${NC}  $1"; }
 log_header()  { echo -e "${CYAN}═══${NC} $1"; }
 
 compose() {
-  docker compose --project-name "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILES[@]}" "$@"
+  if [[ -n "$NATIVE_PROFILES" && ( "$1" == up || "$1" == run ) ]]; then
+    local operation="$1"
+    shift
+    docker compose "${COMPOSE_LOCATION[@]}" --project-name "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILES[@]}" "$operation" --no-build --pull never "$@"
+  else
+    docker compose "${COMPOSE_LOCATION[@]}" --project-name "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILES[@]}" "$@"
+  fi
 }
 
 initial_build_with_diagnostics() {
@@ -237,7 +269,7 @@ initial_build_with_diagnostics() {
   # compiler codes, source locations and the exact build exit status instead.
   python3 "$PROJECT_ROOT/scripts/capture_build_diagnostics.py" \
     --output "$diagnostic_file" --group "$group" -- \
-    docker compose --progress plain --project-name "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILES[@]}" build \
+    docker compose "${COMPOSE_LOCATION[@]}" --progress plain --project-name "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILES[@]}" build \
     --build-arg CARGO_BUILD_JOBS="${ATTUNE_E2E_CARGO_BUILD_JOBS:-2}" "$@"
 }
 
@@ -276,12 +308,16 @@ wait_for_registered_worker() {
   local max_wait="${2:-120}"
   local elapsed=0
   local count=0
+  local name_predicate="name LIKE '%${name_substring}%'"
+  if [[ -n "$NATIVE_PROFILES" ]]; then
+    name_predicate="name = '${name_substring}'"
+  fi
 
   log_info "Waiting for worker containing '${name_substring}' to register..."
   while true; do
     count="$(
       compose exec -T postgres psql -U attune -d attune -tAc \
-        "SELECT COUNT(*) FROM worker WHERE name LIKE '%${name_substring}%' AND status IN ('active', 'busy')" \
+        "SELECT COUNT(*) FROM worker WHERE ${name_predicate} AND status IN ('active', 'busy')" \
         2>/dev/null | tr -d '[:space:]'
     )" || count=0
 
@@ -323,7 +359,13 @@ cleanup() {
   if [[ "$DO_TEARDOWN" == true && "$STACK_STARTED" == true ]]; then
     echo ""
     log_info "Tearing down owned Docker stack '${COMPOSE_PROJECT_NAME}'..."
-    compose down --timeout 15 --volumes || cleanup_code=$?
+    if [[ -n "$NATIVE_PROFILES" ]]; then
+      # Keep the database/object/pack volumes with native custody. Removing
+      # them would destroy recovery evidence without exact attempt settlement.
+      compose down --timeout 15 || cleanup_code=$?
+    else
+      compose down --timeout 15 --volumes || cleanup_code=$?
+    fi
     if [[ $cleanup_code -ne 0 ]]; then
       log_error "Owned stack teardown failed (exit ${cleanup_code})"
       [[ $exit_code -ne 0 ]] || exit_code=$cleanup_code
@@ -346,6 +388,9 @@ cleanup() {
       rm -rf -- "$BOOTSTRAP_ROOT"
     fi
   fi
+  if [[ -n "$NATIVE_ROOT" ]]; then
+    log_warn "Native profiles, project volumes, cache/custody and networks retained for exact receipt-aware cleanup: $NATIVE_ROOT"
+  fi
   rm -rf -- "$RUN_ROOT"
   if [[ -n "$RUNTIME_FIXTURE_ROOT" ]]; then
     if [[ "$cleanup_code" == 0 && ( "$STACK_STARTED" == false || "$DO_TEARDOWN" == true ) ]]; then
@@ -364,6 +409,34 @@ if [[ "$DO_STARTUP" == true ]]; then
   # Compose image tags are project-scoped, so fail closed before a build can
   # alter the next startup behavior of an existing project.
   assert_fresh_project
+fi
+if [[ -n "$NATIVE_PROFILES" ]]; then
+  mkdir -p "$PROJECT_ROOT/.scratch"
+  NATIVE_ROOT="$(mktemp -d "$PROJECT_ROOT/.scratch/native-e2e-${RUN_ID}.XXXXXX")"
+  # Validate all sources before contacting the explicit endpoint. Existing
+  # external resources must carry io.attune.test.owner=$RUN_ID. No creation,
+  # enrollment, pull, or cleanup-by-absence is performed by this materializer.
+  python3 "$PROJECT_ROOT/scripts/prepare-native-compose.py" \
+    --profiles "$NATIVE_PROFILES" --config "$ATTUNE_DOCKER_CONFIG_PATH" \
+    --socket-source "$ATTUNE_E2E_DOCKER_SOCKET" --verify-owned "$RUN_ID" \
+    --output "$NATIVE_ROOT/config"
+  printf 'run_id=%s\ncompose_project=%s\ndocker_host=%s\n' "$RUN_ID" "$COMPOSE_PROJECT_NAME" "$DOCKER_HOST" > "$NATIVE_ROOT/manifest.env"
+  # Full generated base first; E2E name/port/vhost resets and lifecycle
+  # admissions must win. Toolchains was formerly inherited before those resets.
+  COMPOSE_FILES=(-f "$NATIVE_ROOT/config/compose.yaml" -f "$PROJECT_ROOT/docker-compose.e2e.yaml")
+  if [[ -n "${ATTUNE_E2E_COMPOSE_OVERRIDE:-}" ]]; then
+    COMPOSE_FILES+=(-f "$ATTUNE_E2E_COMPOSE_OVERRIDE")
+  fi
+  cat > "$NATIVE_ROOT/toolchains-e2e.yaml" <<'EOF'
+services:
+  worker-toolchains:
+    container_name: !reset null
+    environment:
+      ATTUNE_API_URL: http://api:8080
+      ATTUNE__MESSAGE_QUEUE__URL: amqp://attune:attune@rabbitmq:5672/attune_${ATTUNE_E2E_RUN_ID}
+EOF
+  COMPOSE_FILES+=(-f "$NATIVE_ROOT/toolchains-e2e.yaml")
+  log_info "Explicit native inputs retained at $NATIVE_ROOT"
 fi
 if [[ "$DO_RUNTIME_LIFECYCLE" == true ]]; then
   mkdir -p "$PROJECT_ROOT/.scratch"
@@ -423,7 +496,7 @@ if [[ "$DO_STARTUP" == true ]]; then
     log_error "Core bootstrap failed (exit ${bootstrap_status}); bounded safe diagnostics follow"
     # Read only this project's initializer logs before EXIT revokes credentials
     # and removes containers. Never forward raw logs or dump Compose env/config.
-    timeout 30 docker compose --project-name "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILES[@]}" \
+    timeout 30 docker compose "${COMPOSE_LOCATION[@]}" --project-name "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILES[@]}" \
       logs --no-color --no-log-prefix --tail 80 init-packs init-pack-binaries 2>/dev/null \
       | python3 "$PROJECT_ROOT/scripts/bootstrap_failure_diagnostics.py" || \
       log_error "Bootstrap diagnostic collection unavailable"
@@ -435,6 +508,9 @@ if [[ "$DO_STARTUP" == true ]]; then
     api executor executor-2 worker-shell worker-python worker-node worker-full
     sensor notifier
   )
+  if [[ -n "$NATIVE_PROFILES" ]]; then
+    SERVICES+=(worker-toolchains sensor-secondary)
+  fi
   if [[ "$DO_STANDALONE" == true ]]; then
     SERVICES+=(worker-standalone sensor-standalone)
   fi
@@ -470,7 +546,7 @@ if [[ "$DO_STARTUP" == true ]]; then
   # endpoint. Offline --info --local does not load system trust roots. Reuse the
   # freshly built init-agent image; no extra build, credentials or API mutation.
   python3 "$PROJECT_ROOT/scripts/probe_packaged_client_roots.py" -- \
-    docker compose --project-name "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILES[@]}"
+    docker compose "${COMPOSE_LOCATION[@]}" --project-name "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILES[@]}"
 
   # Configure the ephemeral stack's short cache lifecycle windows through the
   # public API before starting the supervisor. This keeps production defaults
@@ -488,7 +564,13 @@ if [[ "$DO_STARTUP" == true ]]; then
   compose up -d --no-deps supervisor
 
   # Synchronize on persisted worker admission instead of guessing startup time.
-  wait_for_registered_worker "worker-" 180
+  if [[ -n "$NATIVE_PROFILES" ]]; then
+    for manager in worker-shell worker-python worker-node worker-full worker-toolchains sensor-primary sensor-secondary; do
+      wait_for_registered_worker "$manager-01" 180
+    done
+  else
+    wait_for_registered_worker "worker-" 180
+  fi
   if [[ "$DO_STANDALONE" == true ]]; then
     wait_for_registered_worker "standalone" 180
   fi
