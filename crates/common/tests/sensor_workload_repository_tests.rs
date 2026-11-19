@@ -2832,6 +2832,10 @@ async fn staged_log_sensor_fresh_transaction_and_after_wait_expiry() {
         AcquireSensorWorkloadOutcome::Acquired(lease) => lease,
         other => panic!("unexpected {other:?}"),
     };
+    assert_eq!(
+        lease.generation, 0,
+        "legacy acquisition precedes native activation and begin_process"
+    );
     let fence = lease_fence(&lease);
     for _ in 0..2 {
         let mut tx = database.begin().await.unwrap();
@@ -3040,12 +3044,42 @@ async fn staged_sensor_source_checks_lease_after_queued_target_lock() {
     database.cleanup().await.unwrap();
 }
 
+// Native effects require an admitted revision; generic legacy lease fixtures
+// intentionally have no managed metadata revision until explicitly readmitted.
+async fn admit_native_sensor_metadata(pool: &PgPool, sensor: &Sensor) {
+    use attune_common::repositories::{
+        component_configuration::ComponentConfigurationRepository,
+        managed_sensor_metadata::ManagedSensorMetadataRepository, trigger::SensorRepository,
+    };
+    let editor = helpers::IdentityFixture::new_unique("native_sensor_editor")
+        .create(pool)
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    ManagedSensorMetadataRepository::lock_mutation(&mut tx)
+        .await
+        .unwrap();
+    let current = SensorRepository::find_by_id(&mut *tx, sensor.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let key = Some("0123456789abcdef0123456789abcdef");
+    ComponentConfigurationRepository::bind_sensor(&mut tx, &current, current.config.as_ref(), key)
+        .await
+        .unwrap();
+    ManagedSensorMetadataRepository::readmit(&mut tx, &current, editor.id, key)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
+
 #[tokio::test]
 async fn native_sensor_effect_fences_stale_generation_replay_and_restart() {
     use attune_common::isolated_process::ResourceIdentity;
     use attune_common::workload_launch::LaunchExitOutcome;
     let (pool, sensor, worker, _) = setup_fixture().await;
     create_active_rule(&pool, &sensor).await;
+    admit_native_sensor_metadata(&pool, &sensor).await;
     let master = "0123456789abcdef0123456789abcdef";
     let incarnation = Uuid::new_v4();
     let outcome = SensorWorkloadAdmissionRepository::acquire_with_encryption_key(
@@ -3227,6 +3261,7 @@ async fn native_sensor_file_case(deadline_wait: bool, stop_wait: bool) {
     };
     let (pool, sensor, worker, _) = setup_fixture().await;
     create_active_rule(&pool, &sensor).await;
+    admit_native_sensor_metadata(&pool, &sensor).await;
     let artifact = ArtifactRepository::create(
         &*pool,
         CreateArtifactInput {

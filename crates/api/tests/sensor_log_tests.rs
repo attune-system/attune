@@ -31,6 +31,12 @@ struct SensorLogFixture {
 }
 
 async fn sensor_log_fixture() -> helpers::Result<SensorLogFixture> {
+    sensor_log_fixture_with_native_metadata(false).await
+}
+
+async fn sensor_log_fixture_with_native_metadata(
+    native: bool,
+) -> helpers::Result<SensorLogFixture> {
     use attune_common::repositories::{
         component_lifecycle::PackProjectionIds,
         file_evidence_retention::FileEvidenceRetentionRepository,
@@ -98,6 +104,27 @@ async fn sensor_log_fixture() -> helpers::Result<SensorLogFixture> {
         },
     )
     .await?;
+    if native {
+        use attune_common::repositories::{
+            component_configuration::ComponentConfigurationRepository,
+            managed_sensor_metadata::ManagedSensorMetadataRepository, FindById,
+        };
+        let mut tx = ctx.pool.begin().await?;
+        ManagedSensorMetadataRepository::lock_mutation(&mut tx).await?;
+        let current = SensorRepository::find_by_id(&mut *tx, sensor.id)
+            .await?
+            .unwrap();
+        let key = ctx.state.config.security.encryption_key.as_deref();
+        ComponentConfigurationRepository::bind_sensor(
+            &mut tx,
+            &current,
+            current.config.as_ref(),
+            key,
+        )
+        .await?;
+        ManagedSensorMetadataRepository::readmit(&mut tx, &current, identity, key).await?;
+        tx.commit().await?;
+    }
     let worker = WorkerRepository::create(
         &ctx.pool,
         CreateWorkerInput {
@@ -520,7 +547,7 @@ async fn native_sensor_ordinary_files_publish_after_stop_without_run_or_legacy_f
         sensor,
         workload,
         ..
-    } = sensor_log_fixture().await?;
+    } = sensor_log_fixture_with_native_metadata(true).await?;
     WorkerRepository::update_heartbeat(&ctx.pool, workload.worker_id).await?;
     let artifact = ArtifactRepository::create(
         &ctx.pool,

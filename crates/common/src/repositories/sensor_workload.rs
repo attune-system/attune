@@ -259,7 +259,7 @@ impl SensorWorkloadRepository {
                AND assignment.worker = $2 \
                AND assignment.worker_instance = $3 \
                AND assignment.generation = $4 \
-               AND assignment.generation>assignment.native_closed_generation AND NOT COALESCE((assignment.native_effect->>'stop_requested')::BOOLEAN,false) AND assignment.lease_expires_at > clock_timestamp() \
+               AND (NOT assignment.native_effect_seen OR assignment.generation>assignment.native_closed_generation) AND NOT COALESCE((assignment.native_effect->>'stop_requested')::BOOLEAN,false) AND assignment.lease_expires_at > clock_timestamp() \
              RETURNING assignment.workload AS workload_id, workload.sensor AS sensor_id, \
                        assignment.worker AS worker_id, assignment.worker_instance, \
                         assignment.generation, assignment.lease_expires_at, workload.pack_release, \
@@ -314,7 +314,7 @@ impl SensorWorkloadRepository {
             "SELECT EXISTS ( \
                  SELECT 1 FROM sensor_workload_assignment \
                  WHERE workload = $1 AND worker = $2 AND worker_instance = $3 \
-                   AND generation = $4 AND generation>native_closed_generation AND NOT COALESCE((native_effect->>'stop_requested')::BOOLEAN,false) AND lease_expires_at > clock_timestamp() \
+                   AND generation = $4 AND (NOT native_effect_seen OR generation>native_closed_generation) AND NOT COALESCE((native_effect->>'stop_requested')::BOOLEAN,false) AND lease_expires_at > clock_timestamp() \
              )",
         )
         .bind(fence.workload_id)
@@ -353,7 +353,7 @@ impl SensorWorkloadRepository {
                    AND assignment.worker = $2 \
                    AND assignment.worker_instance = $3 \
                    AND assignment.generation = $4 \
-                   AND assignment.generation>assignment.native_closed_generation AND NOT COALESCE((assignment.native_effect->>'stop_requested')::BOOLEAN,false) AND assignment.lease_expires_at > clock_timestamp() \
+                   AND (NOT assignment.native_effect_seen OR assignment.generation>assignment.native_closed_generation) AND NOT COALESCE((assignment.native_effect->>'stop_requested')::BOOLEAN,false) AND assignment.lease_expires_at > clock_timestamp() \
                    AND sensor.ref = $5 \
                    AND sensor.pack_ref = $6 \
                    AND sensor.effective_enabled \
@@ -397,7 +397,7 @@ impl SensorWorkloadRepository {
                AND assignment.worker = $2 \
                AND assignment.worker_instance = $3 \
                AND assignment.generation = $4 \
-               AND assignment.generation>assignment.native_closed_generation AND NOT COALESCE((assignment.native_effect->>'stop_requested')::BOOLEAN,false) AND assignment.lease_expires_at > clock_timestamp()",
+               AND (NOT assignment.native_effect_seen OR assignment.generation>assignment.native_closed_generation) AND NOT COALESCE((assignment.native_effect->>'stop_requested')::BOOLEAN,false) AND assignment.lease_expires_at > clock_timestamp()",
         )
         .bind(fence.workload_id)
         .bind(fence.worker_id)
@@ -443,7 +443,7 @@ impl SensorWorkloadRepository {
                AND assignment.worker = $3 \
                AND assignment.worker_instance = $4 \
                AND assignment.generation = $5 \
-               AND assignment.generation>assignment.native_closed_generation AND NOT COALESCE((assignment.native_effect->>'stop_requested')::BOOLEAN,false) AND assignment.lease_expires_at > clock_timestamp() \
+               AND (NOT assignment.native_effect_seen OR assignment.generation>assignment.native_closed_generation) AND NOT COALESCE((assignment.native_effect->>'stop_requested')::BOOLEAN,false) AND assignment.lease_expires_at > clock_timestamp() \
               FOR NO KEY UPDATE OF assignment"
         ))
         .bind(fence.workload_id)
@@ -492,7 +492,7 @@ impl SensorWorkloadRepository {
         .await?;
         // Sample the lease clock after metadata validation and all its waits.
         let current: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM sensor_workload_assignment a JOIN sensor_workload w ON w.id=a.workload WHERE a.workload=$1 AND w.sensor=$2 AND a.worker=$3 AND a.worker_instance=$4 AND a.generation=$5 AND a.generation>a.native_closed_generation AND NOT COALESCE((a.native_effect->>'stop_requested')::BOOLEAN,false) AND a.lease_expires_at>clock_timestamp())",
+            "SELECT EXISTS(SELECT 1 FROM sensor_workload_assignment a JOIN sensor_workload w ON w.id=a.workload WHERE a.workload=$1 AND w.sensor=$2 AND a.worker=$3 AND a.worker_instance=$4 AND a.generation=$5 AND (NOT a.native_effect_seen OR a.generation>a.native_closed_generation) AND NOT COALESCE((a.native_effect->>'stop_requested')::BOOLEAN,false) AND a.lease_expires_at>clock_timestamp())",
         ).bind(fence.workload_id).bind(sensor_id).bind(fence.worker_id)
             .bind(fence.worker_instance).bind(fence.generation).fetch_one(&mut **tx).await?;
         if !current {
