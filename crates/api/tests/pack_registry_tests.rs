@@ -3856,13 +3856,16 @@ async fn exercise_candidate_archive_contract(
                 pack_transport::build_pack_transport_with_worker_token_provider,
             };
             let root = workers.path().join(mode);
+            let candidates = root.join("runtime");
+            let releases = root.join("packs");
             let mode = if mode == "volume" {
                 TransportMode::Volume
             } else {
                 TransportMode::Api
             };
             let transport = build_pack_transport_with_worker_token_provider(
-                root.to_str().unwrap(),
+                releases.to_str().unwrap(),
+                candidates.to_str().unwrap(),
                 Some(&url),
                 Some(std::sync::Arc::new(WorkerTokenProvider::new(
                     1,
@@ -3878,7 +3881,8 @@ async fn exercise_candidate_archive_contract(
                 fs::read_to_string(candidate.join("actions/echo.py"))?,
                 "print('candidate')\n"
             );
-            assert!(candidate.starts_with(root.join(".pack-test-attempts")));
+            assert!(candidate.starts_with(candidates.join(".pack-test-attempts")));
+            assert!(!releases.exists());
         }
         Ok(())
     }

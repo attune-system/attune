@@ -215,6 +215,11 @@ Workflow details live in:
 ## Runtime / Execution Rules
 
 - Trusted worker/sensor loops retain admission, preparation, credentials, custody and completion. Pack-controlled effects use the narrow in-process `common::isolated_process` adapters; no standalone launch-controller or execution-host relay is required. Native adapters are not activated until all existing executable paths and packaged deployments validate; reachable legacy paths remain fail-closed.
+- Pack-defined toolchains use `execution_config.lifecycle` and the shared common
+  runtime lifecycle module. Before changing recipe admission, preparation, launch,
+  or cleanup, read `docs/deployment/runtime-toolchains.md`; the initial profile
+  requires exact operator-admitted digests and private nonreused generations.
+
 - Core ships only native `echo`, `sleep`, `noop`, and `http_request` actions. Native directory entrypoints contain regular executable `linux-amd64`/`linux-arm64` variants selected directly by the worker; see `packs/core/README.md` and `docs/packs/native-core-rollout.md`.
 - Worker runtimes come from DB-backed runtime definitions; native runtimes are represented by empty interpreter config.
 - Candidate pack tests always download version-pinned archives from the API's configured object backend, including shared-volume workers. See `docs/deployment/pack-candidate-distribution.md`.

@@ -1472,6 +1472,22 @@ async fn dispatch_and_track_pack_tests(
     }
 
     let required_runtimes = required_runtimes_for_test_config(&test_config);
+    let required_recipe_digests = match test_config.required_recipe_digests() {
+        Ok(digests) => digests,
+        Err(error) => {
+            return record_pack_test_preflight_failure(
+                state,
+                requested_by,
+                pack_id,
+                pack_ref,
+                pack_version,
+                trigger_type,
+                absent_metadata_policy,
+                error.to_string(),
+            )
+            .await
+        }
+    };
     let trigger_reason = trigger_type.to_string();
 
     // Create the install tracking record (survives a rollback of a new pack).
@@ -1588,6 +1604,7 @@ async fn dispatch_and_track_pack_tests(
         candidate_access_token: None,
         trigger_reason,
         required_runtimes,
+        required_recipe_digests,
         worker_selector,
         worker_tolerations,
         worker_affinity,

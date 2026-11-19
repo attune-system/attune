@@ -207,18 +207,14 @@ impl PackTestProcessor {
             tolerations: parse_worker_tolerations(&payload.worker_tolerations)?,
             affinity: parse_worker_affinity(&payload.worker_affinity)?,
         };
-        if !payload.required_runtimes.is_empty() {
-            return ExecutionScheduler::select_worker_for_pack_test(
-                pool,
-                &payload.required_runtimes,
-                placement,
-                counter,
-            )
-            .await;
-        }
-
-        // Fall back to any active action worker.
-        ExecutionScheduler::select_worker_for_pack_test(pool, &[], placement, counter).await
+        ExecutionScheduler::select_worker_for_pack_test(
+            pool,
+            &payload.required_runtimes,
+            &payload.required_recipe_digests,
+            placement,
+            counter,
+        )
+        .await
     }
 
     /// Mark the pack install record as failed when no worker is available.

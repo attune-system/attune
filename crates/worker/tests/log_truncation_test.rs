@@ -14,6 +14,7 @@ use tempfile::TempDir;
 
 fn make_python_process_runtime(packs_base_dir: PathBuf) -> ProcessRuntime {
     let config = RuntimeExecutionConfig {
+        lifecycle: None,
         interpreter: InterpreterConfig {
             binary: "python3".to_string(),
             args: vec!["-u".to_string()],
@@ -34,6 +35,7 @@ fn make_python_process_runtime(packs_base_dir: PathBuf) -> ProcessRuntime {
 
 fn make_shell_process_runtime(packs_base_dir: PathBuf) -> ProcessRuntime {
     let config = RuntimeExecutionConfig {
+        lifecycle: None,
         interpreter: InterpreterConfig {
             binary: "/bin/bash".to_string(),
             args: vec![],
@@ -309,6 +311,7 @@ async fn test_shell_process_runtime_truncation() {
     let tmp = TempDir::new().unwrap();
 
     let config = RuntimeExecutionConfig {
+        lifecycle: None,
         interpreter: InterpreterConfig {
             binary: "/bin/bash".to_string(),
             args: vec![],

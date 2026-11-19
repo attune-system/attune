@@ -89,6 +89,7 @@ fn api_transports_without_system_roots() {
             .unwrap();
             build_pack_transport_with_worker_token_provider(
                 "/packs",
+                "/runtime-envs",
                 Some("http://127.0.0.1:9"),
                 Some(provider.clone()),
                 &mode,

@@ -34,7 +34,11 @@ tests/node_modules/
 .gitignore
 
 # Documentation and work summaries
-docs/
+docs/*
+!docs/examples/
+docs/examples/*
+!docs/examples/runtime-gradle.yaml
+!docs/examples/runtime-native-image.yaml
 work-summary/
 reference/
 PROBLEM.md

@@ -1,0 +1,23 @@
+ref: core.deno
+pack_ref: core
+name: Deno
+aliases: [deno]
+description: Opt-in trusted JavaScript and TypeScript with a prepared module graph
+distributions: {}
+execution_config:
+  lifecycle:
+    tools:
+      - name: deno
+        binaries: [deno]
+        args: [--version]
+        version_pattern: 'deno (?<version>\d+\.\d+\.\d+)'
+        primary: true
+    extensions: [ts, js, tsx, jsx, mjs]
+    workspace: true
+    prepare:
+      - command: ['{tool_deno}', install, --entrypoint, --frozen-lockfile, '{source_file}']
+    launch:
+      command: ['{tool_deno}', run, --cached-only, --frozen-lockfile, --no-prompt, '{source_file}']
+      cwd: '{workspace_dir}'
+    env:
+      DENO_DIR: '{env_dir}/deno'

@@ -1,0 +1,56 @@
+{
+  "ref": "core.lifecycle_fixture",
+  "pack_ref": "core",
+  "name": "LifecycleFixture",
+  "aliases": [
+    "lifecyclefixture"
+  ],
+  "description": "Owned E2E fixture only",
+  "distributions": {},
+  "execution_config": {
+    "lifecycle": {
+      "tools": [
+        {
+          "name": "fixture",
+          "binaries": [
+            "python3"
+          ],
+          "args": [
+            "-c",
+            "import os; assert not any(k in os.environ for k in ('ATTUNE_API_TOKEN','ATTUNE__DATABASE__URL','ATTUNE_CANDIDATE_EFFECTS_TOKEN')); print('ServiceFixture 7.3.1')"
+          ],
+          "version_pattern": "ServiceFixture (?<version>[0-9.]+)",
+          "primary": true
+        }
+      ],
+      "extensions": [
+        "py"
+      ],
+      "workspace": true,
+      "prepare": [
+        {
+          "command": [
+            "{tool_fixture}",
+            "-c",
+            "import os; assert not any(k in os.environ for k in ('ATTUNE_API_TOKEN','ATTUNE__DATABASE__URL','ATTUNE_CANDIDATE_EFFECTS_TOKEN'))"
+          ],
+          "cwd": null,
+          "when_file_exists": null,
+          "timeout_seconds": 300
+        }
+      ],
+      "launch": {
+        "command": [
+          "{tool_fixture}",
+          "-u",
+          "{source_file}"
+        ],
+        "cwd": "{workspace_dir}",
+        "when_file_exists": null,
+        "timeout_seconds": 300
+      },
+      "env": {},
+      "permitted_caller_env": []
+    }
+  }
+}

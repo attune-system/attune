@@ -122,7 +122,17 @@ pub fn validate_caller_env_name(name: &str) -> crate::Result<()> {
 
 /// Exact names, no wildcards or duplicates; omission denies all caller overrides.
 pub fn permitted_caller_env(config: &serde_json::Value) -> crate::Result<Vec<String>> {
-    let Some(value) = config.get("permitted_caller_env") else {
+    let declaration = if let Some(recipe) = config.get("lifecycle") {
+        if config.get("permitted_caller_env").is_some() {
+            return Err(crate::Error::validation(
+                "Lifecycle caller environment declarations belong inside the admitted recipe",
+            ));
+        }
+        recipe.get("permitted_caller_env")
+    } else {
+        config.get("permitted_caller_env")
+    };
+    let Some(value) = declaration else {
         return Ok(vec![]);
     };
     let names: Vec<String> = serde_json::from_value(value.clone()).map_err(|_| {
@@ -283,6 +293,31 @@ fn inspect_runtime_config(
     errors: &mut Vec<String>,
 ) {
     if let Some(config) = config {
+        if let Some(recipe) = config.get("lifecycle") {
+            match serde_json::from_value::<crate::runtime_lifecycle::RuntimeRecipe>(recipe.clone())
+            {
+                Ok(recipe) => {
+                    if let Err(error) = recipe.validate() {
+                        errors.push(format!("{path}.lifecycle: {error}"));
+                    }
+                    if [
+                        "interpreter",
+                        "environment",
+                        "dependencies",
+                        "env_vars",
+                        "inline_execution",
+                    ]
+                    .iter()
+                    .any(|key| config.get(key).is_some())
+                    {
+                        errors.push(format!("{path}: lifecycle replaces interpreter/environment/dependency configuration"));
+                    }
+                }
+                Err(_) => errors.push(format!(
+                    "{path}.lifecycle has invalid runtime recipe fields"
+                )),
+            }
+        }
         if let Err(error) = permitted_caller_env(config) {
             errors.push(format!("{path}: {error}"));
         }

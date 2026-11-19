@@ -10,7 +10,7 @@
 //! are genuinely present on this particular host/container.
 
 use attune_common::child_process_environment::ChildProcessEnvironment;
-use attune_common::repositories::List;
+use attune_common::repositories::{FindById, List, RuntimeRepository};
 use serde_json::{json, Value as JsonValue};
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -113,7 +113,7 @@ pub async fn verify_all_runtime_versions(
 
         result.total_checked += 1;
 
-        let is_available = verify_single_version(version, child_environment).await;
+        let is_available = verify_version_with_parent(pool, version, child_environment).await;
 
         // Update the database
         match RuntimeVersionRepository::set_availability(pool, version.id, is_available).await {
@@ -168,7 +168,10 @@ pub fn build_runtime_versions_capability(
 ) -> JsonValue {
     let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
 
-    for version in versions.iter().filter(|version| version.available) {
+    for version in versions
+        .iter()
+        .filter(|version| version.available && version.execution_config.get("lifecycle").is_none())
+    {
         let runtime_name = normalize_runtime_name(
             version
                 .runtime_ref
@@ -238,7 +241,7 @@ pub async fn collect_runtime_versions_capability(
                     }
                 }
 
-                if verify_single_version(&version, child_environment).await {
+                if verify_version_with_parent(pool, &version, child_environment).await {
                     let mut verified_version = version.clone();
                     verified_version.available = true;
                     local_versions.push(verified_version);
@@ -260,10 +263,36 @@ pub async fn collect_runtime_versions_capability(
 /// Verify a single runtime version by running its verification commands.
 ///
 /// Returns `true` if at least one verification command succeeds.
+async fn verify_version_with_parent(
+    pool: &PgPool,
+    version: &RuntimeVersion,
+    environment: &ChildProcessEnvironment,
+) -> bool {
+    let Ok(Some(parent)) = RuntimeRepository::find_by_id(pool, version.runtime).await else {
+        return false;
+    };
+    if attune_common::runtime_lifecycle::validate_version_mode(
+        &parent.execution_config,
+        &version.execution_config,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    verify_single_version(version, environment).await
+}
+
 async fn verify_single_version(
     version: &RuntimeVersion,
     child_environment: &ChildProcessEnvironment,
 ) -> bool {
+    if version.execution_config.get("lifecycle").is_some() {
+        return attune_common::runtime_lifecycle::verify_registered_version(
+            version,
+            child_environment,
+        )
+        .await;
+    }
     let commands = extract_verification_commands(&version.distributions);
 
     if commands.is_empty() {

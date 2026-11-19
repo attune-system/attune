@@ -635,6 +635,7 @@ else:
         )
         .unwrap();
         let config = RuntimeExecutionConfig {
+            lifecycle: None,
             interpreter: InterpreterConfig {
                 binary: "python3".to_string(),
                 args: vec![],

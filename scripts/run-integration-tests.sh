@@ -68,6 +68,7 @@ DO_BUILD=true
 DO_TEARDOWN=true
 DO_STARTUP=true
 DO_STANDALONE=false
+DO_RUNTIME_LIFECYCLE=false
 TEST_ARGS=()
 
 # ── Parse args ────────────────────────────────────────────────────────────
@@ -81,6 +82,8 @@ while [[ $# -gt 0 ]]; do
       DO_STARTUP=false; shift ;;
     --standalone)
       DO_STANDALONE=true; shift ;;
+    --runtime-lifecycle)
+      DO_RUNTIME_LIFECYCLE=true; shift ;;
     -m)
       shift
       MARKER_PARTS=()
@@ -102,6 +105,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --no-build        Skip docker compose build step"
       echo "  --no-startup      Skip stack startup (never tears down an existing stack)"
       echo "  --standalone    Include standalone worker/sensor services"
+      echo "  --runtime-lifecycle  Admit recipe fixtures only in this fresh owned stack"
       echo ""
       echo "Environment:"
       echo "  ATTUNE_E2E_RUN_ID         Optional unique run identity"
@@ -136,6 +140,10 @@ if [[ "$DO_STARTUP" == false && "$DO_BUILD" == true ]]; then
   echo "ERROR: --no-startup also requires --no-build so the attached project cannot be mutated" >&2
   exit 2
 fi
+if [[ "$DO_RUNTIME_LIFECYCLE" == true && "$DO_STARTUP" == false ]]; then
+  echo "ERROR: --runtime-lifecycle requires a fresh runner-owned stack" >&2
+  exit 2
+fi
 
 # Owned E2E stacks use the tracked configuration, not an ignored developer
 # file which may be absent from a source snapshot. Never create/overwrite it.
@@ -154,6 +162,7 @@ fi
 RUN_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/attune-e2e-${RUN_ID}.XXXXXX")"
 BOOTSTRAP_OWNED=false
 BOOTSTRAP_ROOT=""
+RUNTIME_FIXTURE_ROOT=""
 export ATTUNE_E2E_RUN_ID="$RUN_ID"
 ATTUNE_TEST_RUN_ID="${ATTUNE_TEST_RUN_ID:-r$(printf '%s' "$RUN_ID" | sha256sum | cut -c1-19)}"
 if [[ ! "$ATTUNE_TEST_RUN_ID" =~ ^[a-z0-9][a-z0-9-]{0,19}$ ]]; then
@@ -338,6 +347,13 @@ cleanup() {
     fi
   fi
   rm -rf -- "$RUN_ROOT"
+  if [[ -n "$RUNTIME_FIXTURE_ROOT" ]]; then
+    if [[ "$cleanup_code" == 0 && ( "$STACK_STARTED" == false || "$DO_TEARDOWN" == true ) ]]; then
+      rm -rf -- "$RUNTIME_FIXTURE_ROOT"
+    else
+      log_warn "Retained recipe fixture inputs at $RUNTIME_FIXTURE_ROOT until owned stack teardown is confirmed."
+    fi
+  fi
   exit $exit_code
 }
 trap cleanup EXIT
@@ -348,6 +364,12 @@ if [[ "$DO_STARTUP" == true ]]; then
   # Compose image tags are project-scoped, so fail closed before a build can
   # alter the next startup behavior of an existing project.
   assert_fresh_project
+fi
+if [[ "$DO_RUNTIME_LIFECYCLE" == true ]]; then
+  mkdir -p "$PROJECT_ROOT/.scratch"
+  RUNTIME_FIXTURE_ROOT="$(mktemp -d "$PROJECT_ROOT/.scratch/runtime-service-${RUN_ID}.XXXXXX")"
+  python3 "$PROJECT_ROOT/scripts/prepare-runtime-service-smoke.py" "$RUNTIME_FIXTURE_ROOT/fixtures"
+  COMPOSE_FILES+=("-f" "$RUNTIME_FIXTURE_ROOT/fixtures/compose.yaml")
 fi
 
 # ── Step 1: Build ─────────────────────────────────────────────────────────

@@ -443,8 +443,9 @@ jobs:
       - name: Run tier 1 and live-API SSE tests
         run: >-
           timeout --signal=TERM --kill-after=120s 110m
-          bash scripts/run-integration-tests.sh --tier 1
-          tests/e2e/api/test_sse_execution_stream.py -x
+          bash scripts/run-integration-tests.sh --runtime-lifecycle --tier 1
+          tests/e2e/api/test_sse_execution_stream.py
+          tests/e2e/api/test_runtime_lifecycle.py -x
 
       - name: Retain sanitized initial build and workload startup diagnostics
         if: always()

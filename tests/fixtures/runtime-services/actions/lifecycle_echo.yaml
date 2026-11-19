@@ -1,0 +1,10 @@
+ref: core.lifecycle_echo
+label: Recipe service echo fixture
+runner_type: core.lifecycle_fixture
+entry_point: lifecycle_echo.py
+parameter_delivery: stdin
+parameter_format: json
+output_format: json
+parameters:
+  message: {type: string, required: true}
+default_execution_permission_set_refs: []

@@ -824,6 +824,10 @@ pub mod runtime {
     /// - `{manifest_path}` — absolute path to the dependency manifest file
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
     pub struct RuntimeExecutionConfig {
+        /// Canonical pack-defined toolchain. Exact digest admission is required.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lifecycle: Option<crate::runtime_lifecycle::RuntimeRecipe>,
+
         /// Interpreter configuration (how to invoke the action script)
         #[serde(default)]
         pub interpreter: InterpreterConfig,

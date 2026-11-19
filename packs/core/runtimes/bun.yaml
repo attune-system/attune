@@ -1,0 +1,24 @@
+ref: core.bun
+pack_ref: core
+name: Bun
+aliases: [bun]
+description: Opt-in trusted JavaScript and TypeScript toolchain
+distributions: {}
+execution_config:
+  lifecycle:
+    tools:
+      - name: bun
+        binaries: [bun]
+        args: [--version]
+        version_pattern: '(?<version>\d+\.\d+\.\d+)'
+        primary: true
+    extensions: [ts, js, tsx, jsx, mjs, cjs]
+    workspace: true
+    prepare:
+      - command: [test, -f, '{workspace_dir}/bun.lock']
+        when_file_exists: package.json
+      - command: ['{tool_bun}', install, --frozen-lockfile, --ignore-scripts, --no-env-file]
+        when_file_exists: package.json
+    launch:
+      command: ['{tool_bun}', --no-install, --no-env-file, '{source_file}']
+      cwd: '{workspace_dir}'

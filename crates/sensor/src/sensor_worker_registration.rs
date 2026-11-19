@@ -448,6 +448,7 @@ impl SensorWorkerRegistration {
             .capabilities
             .contains_key(RUNTIME_VERSIONS_CAPABILITY_KEY)
         {
+            self.discover_recipe_capabilities(config).await?;
             info!(
                 "Sensor capabilities already populated by agent detection; \
                  skipping DB-driven detection"
@@ -477,6 +478,7 @@ impl SensorWorkerRegistration {
         }
         self.set_detected_runtimes(detect_runtimes(&self.child_environment)?);
         self.add_registered_runtime_versions().await?;
+        self.discover_recipe_capabilities(config).await?;
 
         info!(
             "Sensor worker capabilities detected: {:?}",
@@ -484,6 +486,35 @@ impl SensorWorkerRegistration {
         );
 
         Ok(())
+    }
+
+    async fn discover_recipe_capabilities(&mut self, config: &Config) -> Result<()> {
+        let filter = std::env::var("ATTUNE_SENSOR_RUNTIMES")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|name| name.trim().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .or_else(|| {
+                config
+                    .sensor
+                    .as_ref()
+                    .and_then(|sensor| sensor.capabilities.as_ref())
+                    .and_then(|caps| caps.get("runtimes"))
+                    .and_then(|value| value.as_array())
+                    .map(|names| {
+                        names
+                            .iter()
+                            .filter_map(|name| name.as_str().map(str::to_owned))
+                            .collect()
+                    })
+            });
+        RuntimeDetector::new(self.pool.clone())
+            .with_child_environment(self.child_environment.clone())
+            .enrich_recipe_capabilities(&mut self.capabilities, filter.as_deref())
+            .await
     }
 
     async fn add_registered_runtime_versions(&mut self) -> Result<()> {
@@ -515,14 +546,21 @@ impl SensorWorkerRegistration {
                     .map(|alias| normalize_runtime_name(alias))
                     .chain(std::iter::once(runtime_name.clone()))
                     .collect::<std::collections::HashSet<_>>();
-                (runtime.id, (runtime_name, names))
+                (runtime.id, (runtime_name, names, runtime.execution_config))
             })
             .collect::<HashMap<_, _>>();
         for version in RuntimeVersionRepository::list(&self.pool).await? {
-            let Some((runtime_name, runtime_names)) = runtimes.get(&version.runtime) else {
+            let Some((runtime_name, runtime_names, parent_config)) = runtimes.get(&version.runtime)
+            else {
                 continue;
             };
-            if !configured.is_disjoint(runtime_names)
+            if version.execution_config.get("lifecycle").is_none()
+                && attune_common::runtime_lifecycle::validate_version_mode(
+                    parent_config,
+                    &version.execution_config,
+                )
+                .is_ok()
+                && !configured.is_disjoint(runtime_names)
                 && verify_registered_runtime_version(&version, &self.child_environment).await
             {
                 verified
@@ -545,6 +583,13 @@ async fn verify_registered_runtime_version(
     version: &RuntimeVersion,
     child_environment: &ChildProcessEnvironment,
 ) -> bool {
+    if version.execution_config.get("lifecycle").is_some() {
+        return attune_common::runtime_lifecycle::verify_registered_version(
+            version,
+            child_environment,
+        )
+        .await;
+    }
     let commands = version
         .distributions
         .get("verification")

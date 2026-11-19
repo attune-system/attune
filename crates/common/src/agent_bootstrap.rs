@@ -78,8 +78,10 @@ pub fn bootstrap_runtime_env(
             }
 
             let runtime_csv = format_as_env_value(&detected);
-            info!("Setting {}={}", env_var_name, runtime_csv);
-            std::env::set_var(env_var_name, &runtime_csv);
+            info!(
+                "Bootstrap interpreters: {}. Registered definitions are verified after connecting.",
+                runtime_csv
+            );
             detected_runtimes = Some(detected);
         }
     }

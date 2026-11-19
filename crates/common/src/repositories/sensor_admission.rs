@@ -597,6 +597,12 @@ fn worker_supports_runtime(
     runtime_versions: &[RuntimeVersion],
     sensor: &Sensor,
 ) -> bool {
+    let is_recipe = runtime.execution_config.get("lifecycle").is_some();
+    if is_recipe
+        && crate::runtime_lifecycle::capability_for(worker.capabilities.as_ref(), runtime).is_none()
+    {
+        return false;
+    }
     let Some(capabilities) = worker
         .capabilities
         .as_ref()
@@ -641,7 +647,11 @@ fn worker_supports_runtime(
         .filter_map(|value| value.as_str())
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
-    if advertised_versions.is_empty() {
+    if is_recipe {
+        advertised_versions =
+            crate::runtime_lifecycle::available_versions(worker.capabilities.as_ref(), runtime);
+    }
+    if advertised_versions.is_empty() && !is_recipe {
         advertised_versions.extend(
             capabilities
                 .get("detected_interpreters")
@@ -663,6 +673,13 @@ fn worker_supports_runtime(
     }
     let local_versions = runtime_versions
         .iter()
+        .filter(|version| {
+            crate::runtime_lifecycle::validate_version_mode(
+                &runtime.execution_config,
+                &version.execution_config,
+            )
+            .is_ok()
+        })
         .filter(|version| {
             advertised_versions
                 .iter()

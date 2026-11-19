@@ -1,0 +1,11 @@
+ref: core.lifecycle_timeout
+label: Recipe preparation timeout fixture
+runner_type: core.lifecycle_slow_fixture
+entry_point: lifecycle_echo.py
+parameter_delivery: stdin
+parameter_format: json
+output_format: json
+timeout_seconds: 1
+parameters:
+  message: {type: string, required: true}
+default_execution_permission_set_refs: []

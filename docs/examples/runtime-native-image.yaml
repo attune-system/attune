@@ -1,0 +1,22 @@
+# Example: inputs/dependencies must already be provisioned; this is not cross-build support.
+ref: example.native_image
+pack_ref: example
+name: NativeImage
+aliases: [nativeimage]
+description: Trusted same-worker GraalVM compilation and native launch
+distributions: {}
+execution_config:
+  lifecycle:
+    tools:
+      - name: native_image
+        binaries: [native-image]
+        args: [--version]
+        version_pattern: '(?<version>\d+\.\d+\.\d+)'
+        primary: true
+    extensions: [jar]
+    prepare:
+      - command: ['{tool_native_image}', '-J-Djava.io.tmpdir={scratch_dir}', -jar, '{source_file}', '{output_dir}/application']
+        timeout_seconds: 3600
+    launch:
+      command: ['{output_dir}/application']
+      cwd: '{pack_dir}'
