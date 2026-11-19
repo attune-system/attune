@@ -32,6 +32,17 @@ pub struct CandidateSource {
     pub archive_size: i64,
     pub archive_token_hash: String,
     pub effects: Option<CandidateEffectsSource>,
+    pub python: Option<CandidatePythonSource>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidatePythonSource {
+    pub runtime: i64,
+    pub provider_pack: i64,
+    pub release: i64,
+    pub release_digest: String,
+    pub runtime_config: serde_json::Value,
+    pub distributions: serde_json::Value,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -111,6 +122,23 @@ async fn fresh(tx: &mut Transaction<'_, Postgres>, deadline: DateTime<Utc>) -> R
 }
 async fn source(tx: &mut Transaction<'_, Postgres>, s: &CandidateSource) -> Result<DateTime<Utc>> {
     let worker:DateTime<Utc>=sqlx::query_scalar("SELECT last_heartbeat+interval '90 seconds' FROM worker WHERE id=$1 AND meta->>'registration_incarnation'=$2 AND status IN ('active','busy') FOR SHARE").bind(s.worker).bind(s.instance.to_string()).fetch_optional(&mut **tx).await?.ok_or_else(denied)?;
+    // Match runtime-provider source lock order before taking the install row.
+    if let Some(p) = &s.python {
+        let pack: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pack WHERE id=$1 AND active_release=$2 FOR SHARE)",
+        )
+        .bind(p.provider_pack)
+        .bind(p.release)
+        .fetch_one(&mut **tx)
+        .await?;
+        let release: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pack_release WHERE id=$1 AND pack=$2 AND digest=$3 FOR SHARE)")
+            .bind(p.release).bind(p.provider_pack).bind(&p.release_digest).fetch_one(&mut **tx).await?;
+        let runtime: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM runtime WHERE id=$1 AND ref='core.python' AND pack=$2 AND execution_config=$3 AND distributions=$4 AND retired_at IS NULL FOR SHARE)")
+            .bind(p.runtime).bind(p.provider_pack).bind(&p.runtime_config).bind(&p.distributions).fetch_one(&mut **tx).await?;
+        if !pack || !release || !runtime {
+            return Err(denied());
+        }
+    }
     let install:DateTime<Utc>=sqlx::query_scalar("SELECT started_at+interval '7 hours' FROM pack_install WHERE id=$1 AND assigned_worker_id=$2 AND status='running' AND pack_ref=$3 AND pack_version=$4 AND candidate_object_key=$5 AND candidate_provider_version=$6 AND candidate_digest=$7 AND candidate_archive_size=$8 AND candidate_access_token_hash=$9 AND pack_id IS NOT DISTINCT FROM $10 FOR UPDATE").bind(s.install).bind(s.worker).bind(&s.pack_ref).bind(&s.pack_version).bind(&s.archive_key).bind(&s.archive_version).bind(&s.archive_digest).bind(s.archive_size).bind(&s.archive_token_hash).bind(s.pack_id).fetch_optional(&mut **tx).await?.ok_or_else(denied)?;
     let mut deadline = worker.min(install);
     if let Some(e) = &s.effects {
@@ -124,12 +152,19 @@ async fn epochs(
     tx: &mut Transaction<'_, Postgres>,
     s: &CandidateSource,
 ) -> Result<Vec<SourceEpoch>> {
-    let current =
-        workload_source::snapshot(tx, vec![("worker", s.worker), ("install", s.install)]).await?;
+    let current = workload_source::snapshot(tx, subjects(s)).await?;
     if current != s.epochs {
         return Err(denied());
     }
     Ok(current)
+}
+fn subjects(s: &CandidateSource) -> Vec<(&'static str, i64)> {
+    let mut subjects = vec![("worker", s.worker), ("install", s.install)];
+    if let Some(p) = &s.python {
+        subjects.push(("runtime_definition", p.runtime));
+        subjects.push(("runtime_provider", p.provider_pack));
+    }
+    subjects
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CandidateCapture {
@@ -180,14 +215,66 @@ impl CandidateProcessRepository {
             archive_size: record.candidate_archive_size.ok_or_else(denied)?,
             archive_token_hash: token_hash,
             effects: None,
+            python: None,
         };
         let mut tx = pool.begin().await?;
         let deadline = source(&mut tx, &s).await?;
         s.epochs =
             workload_source::snapshot(&mut tx, vec![("worker", worker), ("install", install)])
                 .await?;
-        let rebound:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM execution_process_effect WHERE purpose='candidate_test' AND (target->>'install')::BIGINT=$1 AND (target->>'attempt'<>$2 OR source_epochs<>$3))")
+        // Python selection follows authenticated archive metadata. At this
+        // first admission require the original worker/install epochs, including
+        // when a recovered record also retains provider/definition epochs.
+        let rebound:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM execution_process_effect WHERE purpose='candidate_test' AND (target->>'install')::BIGINT=$1 AND (target->>'attempt'<>$2 OR NOT (source_epochs @> $3)))")
             .bind(install).bind(instance.to_string()).bind(Json(&s.epochs)).fetch_one(&mut *tx).await?;
+        if rebound {
+            return Err(denied());
+        }
+        fresh(&mut tx, deadline).await?;
+        tx.commit().await?;
+        if Utc::now() >= deadline {
+            return Err(denied());
+        }
+        Ok(s)
+    }
+    /// Bind the same base definition used by legacy candidate preparation.
+    /// No registered-version/highest-version selection or new admission table.
+    pub async fn admit_python(pool: &PgPool, mut s: CandidateSource) -> Result<CandidateSource> {
+        use super::{FindById, FindByRef};
+        if s.python.is_some() {
+            return Err(denied());
+        }
+        let runtime = super::runtime::RuntimeRepository::find_by_ref(pool, "core.python")
+            .await?
+            .ok_or_else(denied)?;
+        let provider_pack = runtime.pack.ok_or_else(denied)?;
+        let pack = super::PackRepository::find_by_id(pool, provider_pack)
+            .await?
+            .ok_or_else(denied)?;
+        let release =
+            super::PackReleaseRepository::find_by_id(pool, pack.active_release.ok_or_else(denied)?)
+                .await?
+                .ok_or_else(denied)?;
+        if release.pack != provider_pack {
+            return Err(denied());
+        }
+        s.python = Some(CandidatePythonSource {
+            runtime: runtime.id,
+            provider_pack,
+            release: release.id,
+            release_digest: release.digest,
+            runtime_config: runtime.execution_config,
+            distributions: runtime.distributions,
+        });
+        let mut tx = pool.begin().await?;
+        let deadline = source(&mut tx, &s).await?;
+        let current = workload_source::snapshot(&mut tx, subjects(&s)).await?;
+        if !s.epochs.iter().all(|old| current.contains(old)) {
+            return Err(denied());
+        }
+        s.epochs = current;
+        let rebound:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM execution_process_effect WHERE purpose='candidate_test' AND (target->>'install')::BIGINT=$1 AND (target->>'attempt'<>$2 OR source_epochs<>$3))")
+            .bind(s.install).bind(s.instance.to_string()).bind(Json(&s.epochs)).fetch_one(&mut *tx).await?;
         if rebound {
             return Err(denied());
         }
@@ -279,7 +366,7 @@ impl CandidateProcessRepository {
         let mut tx = pool.begin().await?;
         let deadline = source(&mut tx, s).await?;
         let ep = epochs(&mut tx, s).await?;
-        let blocked:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM execution_process_effect WHERE purpose='candidate_test' AND (target->>'install')::BIGINT=$1 AND (target->>'attempt'<>$3 OR (target<>$2 AND (NOT resource_removed OR (create_submitted AND candidate_capture IS NULL)))))").bind(s.install).bind(Json(&spec.target)).bind(s.instance.to_string()).fetch_one(&mut *tx).await?;
+        let blocked:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM execution_process_effect WHERE purpose='candidate_test' AND (target->>'install')::BIGINT=$1 AND (target->>'attempt'<>$3 OR source_epochs<>$4 OR (target<>$2 AND (NOT resource_removed OR (create_submitted AND candidate_capture IS NULL)))))").bind(s.install).bind(Json(&spec.target)).bind(s.instance.to_string()).bind(Json(&ep)).fetch_one(&mut *tx).await?;
         if blocked {
             return Err(denied());
         }

@@ -20,7 +20,9 @@ pub const RUNTIME_RECIPE_TIMEOUT_CHALLENGE_ENV: &str = "ATTUNE_LAUNCH_RECIPE_TIM
 pub const RUNTIME_RECIPE_TIMEOUT_CHALLENGE_BYTES: usize = 64;
 /// Fixed relative leaf under the native attempt's existing artifact root.
 pub const RUNTIME_RECIPE_TIMEOUT_RECEIPT: &str = ".attune-recipe-timeout";
-
+pub const CANDIDATE_PYTHON_PREP_CHALLENGE_ENV: &str = "ATTUNE_LAUNCH_CANDIDATE_PREP_CHALLENGE";
+pub const CANDIDATE_PYTHON_PREP_RECEIPT: &str = ".attune-candidate-python-prepared";
+pub const CANDIDATE_PYTHON_PREP_CHALLENGE_BYTES: usize = 64;
 /// Setup-owned source/project output retained with the published runtime.
 pub const PROJECT_ROOT: &str = "/opt/attune/runtime/project";
 /// Runtime invocations use their frozen setup project. Candidate Pack working
@@ -60,6 +62,54 @@ pub struct SetupStep {
     /// Canonical relative path under the private setup project, not a host path.
     /// Missing manifests skip only their dependency step, never environment creation.
     pub if_pack_file: Option<String>,
+}
+/// Private invocation, never a public Runner input or a release manifest.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidatePythonPlan {
+    pub version: u8,
+    pub config: RuntimeExecutionConfig,
+    pub runner: String,
+    pub entry: String,
+    pub timeout_ms: u64,
+}
+impl CandidatePythonPlan {
+    pub fn validate(&self) -> Result<()> {
+        if self.version != 1
+            || !matches!(self.runner.as_str(), "unittest" | "pytest")
+            || !(1..=3_600_000).contains(&self.timeout_ms)
+        {
+            return Err(PlanningError::Configuration);
+        }
+        pack_path(&self.entry)?;
+        candidate_python_setup(&self.config, "/tmp/attune-candidate-python-validation/env")?;
+        if serde_json::to_vec(self)
+            .map_err(|_| PlanningError::Bounds)?
+            .len()
+            > SETUP_STDIN_LIMIT
+        {
+            return Err(PlanningError::Bounds);
+        }
+        Ok(())
+    }
+}
+pub fn candidate_python_argv(
+    platform: LaunchPlatform,
+    plan: &CandidatePythonPlan,
+) -> Result<Vec<String>> {
+    plan.validate()?;
+    let json = serde_json::to_string(plan).map_err(|_| PlanningError::Bounds)?;
+    let mut argv = vec![runner_program(platform), "run-candidate-python".into()];
+    let mut start = 0;
+    while start < json.len() {
+        let mut end = (start + RUNTIME_RECIPE_CHUNK_BYTES).min(json.len());
+        while !json.is_char_boundary(end) {
+            end -= 1;
+        }
+        argv.push(json[start..end].into());
+        start = end;
+    }
+    Ok(argv)
 }
 impl fmt::Debug for SetupPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -341,7 +391,15 @@ pub fn setup_plan(
 ) -> Result<SetupPlan> {
     require_legacy_configuration(config)?;
     let vars = variables(config, None, true, PackAccess::ReadOnly)?;
-    let mut environment = runtime_environment(config, selected, &vars)?;
+    setup_plan_with_variables(config, selected, hooks, &vars)
+}
+fn setup_plan_with_variables(
+    config: &RuntimeExecutionConfig,
+    selected: &BTreeMap<String, String>,
+    hooks: &[Vec<String>],
+    vars: &BTreeMap<&str, String>,
+) -> Result<SetupPlan> {
+    let mut environment = runtime_environment(config, selected, vars)?;
     for (key, value) in [
         ("HOME", "/tmp"),
         ("TMPDIR", "/tmp"),
@@ -362,7 +420,7 @@ pub fn setup_plan(
             return Err(PlanningError::Configuration);
         }
         steps.push(SetupStep {
-            argv: render_command(&config.create_command, &vars),
+            argv: render_command(&config.create_command, vars),
             if_pack_file: None,
         });
     }
@@ -372,13 +430,13 @@ pub fn setup_plan(
             return Err(PlanningError::Configuration);
         }
         steps.push(SetupStep {
-            argv: render_command(&dependency.install_command, &vars),
+            argv: render_command(&dependency.install_command, vars),
             if_pack_file: Some(dependency.manifest_file.clone()),
         });
     }
     for hook in hooks {
         steps.push(SetupStep {
-            argv: render_command(hook, &vars),
+            argv: render_command(hook, vars),
             if_pack_file: None,
         });
     }
@@ -389,6 +447,50 @@ pub fn setup_plan(
     };
     plan.validate()?;
     Ok(plan)
+}
+/// Legacy candidate Python setup uses the candidate cwd and one actual private
+/// guest generation. No filesystem/PATH lookup or shared Runtime publication.
+pub fn candidate_python_setup(
+    config: &RuntimeExecutionConfig,
+    env_dir: &str,
+) -> Result<(SetupPlan, String)> {
+    require_legacy_configuration(config)?;
+    let relative = env_dir.strip_prefix("/tmp/").ok_or(PlanningError::Path)?;
+    attune_common::artifact_transport::ValidatedRelativePath::new(relative)
+        .map_err(|_| PlanningError::Path)?;
+    let environment = config
+        .environment
+        .as_ref()
+        .filter(|e| e.env_type != "none" && !e.create_command.is_empty())
+        .ok_or(PlanningError::Configuration)?;
+    let template = environment
+        .interpreter_path
+        .as_deref()
+        .filter(|path| !path.is_empty())
+        .ok_or(PlanningError::Configuration)?;
+    if config.interpreter.binary.is_empty() {
+        return Err(PlanningError::Configuration);
+    }
+    let mut vars = BTreeMap::from([("pack_dir", PACK_ROOT.into()), ("env_dir", env_dir.into())]);
+    let interpreter = render(template, &vars);
+    let suffix = interpreter
+        .strip_prefix(&format!("{env_dir}/"))
+        .ok_or(PlanningError::Path)?;
+    attune_common::artifact_transport::ValidatedRelativePath::new(suffix)
+        .map_err(|_| PlanningError::Path)?;
+    vars.insert("interpreter", interpreter.clone());
+    if let Some(dependency) = &config.dependencies {
+        vars.insert("manifest_path", pack_path(&dependency.manifest_file)?);
+    }
+    let plan = setup_plan_with_variables(config, &BTreeMap::new(), &[], &vars)?;
+    if plan
+        .environment
+        .keys()
+        .any(|key| key.to_ascii_uppercase().starts_with("ATTUNE_CANDIDATE_"))
+    {
+        return Err(PlanningError::Environment);
+    }
+    Ok((plan, interpreter))
 }
 /// The CP must supply an actual runtime-object build proof before selecting
 /// `has_runtime`. Missing setup never falls back to a CP host interpreter.
@@ -828,6 +930,73 @@ mod tests {
             serde_yaml_ng::from_str(include_str!("../../../packs/core/runtimes/python.yaml"))
                 .unwrap();
         serde_json::from_value(pack["execution_config"].clone()).unwrap()
+    }
+    #[test]
+    fn candidate_python_keeps_candidate_cwd_and_stable_private_interpreter() {
+        let (plan, interpreter) =
+            candidate_python_setup(&python(), "/tmp/owned-candidate/env").unwrap();
+        assert_eq!(
+            plan.steps[0].argv,
+            [
+                "python3",
+                "-m",
+                "venv",
+                "--copies",
+                "/tmp/owned-candidate/env"
+            ]
+        );
+        assert_eq!(interpreter, "/tmp/owned-candidate/env/bin/python3");
+        assert_eq!(plan.steps[1].argv[0], interpreter);
+        assert_eq!(
+            plan.steps[1].argv.last().unwrap(),
+            &format!("{PACK_ROOT}/requirements.txt")
+        );
+        assert_eq!(
+            plan.steps[1].if_pack_file.as_deref(),
+            Some("requirements.txt")
+        );
+        assert_eq!(plan.environment["PYTHONPATH"], format!("{PACK_ROOT}/lib"));
+        assert_eq!(plan.environment["PATH"], "/usr/local/bin:/usr/bin:/bin");
+        assert!(!serde_json::to_string(&plan).unwrap().contains(RUNTIME_ROOT));
+    }
+    #[test]
+    fn candidate_python_has_no_missing_definition_or_interpreter_fallback() {
+        assert!(candidate_python_setup(&Default::default(), "/tmp/owned/env").is_err());
+        let mut config = python();
+        config.environment.as_mut().unwrap().interpreter_path = None;
+        assert!(candidate_python_setup(&config, "/tmp/owned/env").is_err());
+        config.environment.as_mut().unwrap().interpreter_path = Some("/usr/bin/python3".into());
+        assert!(candidate_python_setup(&config, "/tmp/owned/env").is_err());
+        assert!(candidate_python_setup(&python(), "/opt/attune/runtime").is_err());
+        assert!(candidate_python_setup(&python(), "/tmp/owned/../shared").is_err());
+        let mut config = python();
+        config
+            .dependencies
+            .as_mut()
+            .unwrap()
+            .install_command
+            .clear();
+        assert!(candidate_python_setup(&config, "/tmp/owned/env").is_err());
+    }
+    #[test]
+    fn candidate_python_preparation_cannot_receive_invocation_authority() {
+        let mut config = python();
+        config.env_vars.insert(
+            "ATTUNE_CANDIDATE_EFFECTS_TOKEN".into(),
+            RuntimeEnvVarConfig::Value("forbidden".into()),
+        );
+        let (plan, _) = candidate_python_setup(&config, "/tmp/owned/env").unwrap();
+        assert!(!plan
+            .environment
+            .contains_key("ATTUNE_CANDIDATE_EFFECTS_TOKEN"));
+        let mut config = python();
+        config.env_vars.insert(
+            "ATTUNE_API_TOKEN".into(),
+            RuntimeEnvVarConfig::Value("forbidden".into()),
+        );
+        // Reserved execution defaults are ignored by the shared renderer.
+        let (plan, _) = candidate_python_setup(&config, "/tmp/owned/env").unwrap();
+        assert!(!plan.environment.contains_key("ATTUNE_API_TOKEN"));
     }
     #[test]
     fn python_setup_and_action_keep_stable_paths_without_host_fallback() {

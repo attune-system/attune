@@ -3,6 +3,7 @@
 //! This library is not a controller service or an HTTP control plane.
 mod artifact_file;
 pub mod cache;
+pub mod candidate_prep;
 pub mod configuration;
 pub mod engine;
 pub mod kubernetes;

@@ -1,3 +1,5 @@
+#[cfg(unix)]
+mod candidate_python;
 #[cfg(target_os = "linux")]
 mod gated_runner;
 #[cfg(unix)]
@@ -79,6 +81,11 @@ fn main() {
         Some("run-runtime-recipe") => recipe_probe::run(&arguments[1..]),
         #[cfg(unix)]
         Some("run-candidate-runtime-recipe") => recipe_probe::run_candidate(&arguments[1..]),
+        #[cfg(unix)]
+        Some("run-candidate-python") => match candidate_python::run(&arguments[1..]) {
+            Ok(code) => std::process::exit(code),
+            Err(error) => Err(error),
+        },
         _ => Err(invalid()),
     };
     if result.is_err() {

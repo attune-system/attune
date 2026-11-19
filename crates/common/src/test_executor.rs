@@ -190,6 +190,7 @@ impl From<Error> for SuiteExecutionError {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TestProcessInterruption {
+    PreparationUnverified,
     TimedOut,
     Cancelled,
     SourceRevoked,

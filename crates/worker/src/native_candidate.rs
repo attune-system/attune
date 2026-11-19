@@ -20,6 +20,7 @@ use attune_common::{
     workload_launch::*,
     Error, Result,
 };
+use attune_workload_backend::candidate_prep::{self, CandidatePrepChallenge};
 use attune_workload_backend::configuration::{ConfiguredBackend, NativeBackend};
 use attune_workload_backend::recipe_timeout::{self, RecipeTimeoutChallenge};
 use std::{
@@ -34,19 +35,13 @@ use uuid::Uuid;
 fn denied() -> Error {
     Error::validation("Native candidate process unavailable or incomplete")
 }
-/// Selected immutable dependency input. The owning manager admits this exact
-/// published runtime; tests receive only its read-only guest mount.
-pub struct CandidateRuntime {
-    pub pin: PinnedLaunchInput,
-    pub interpreter: String,
-}
 pub struct NativeCandidateTests {
     pool: sqlx::PgPool,
     source: CandidateSource,
     config: WorkloadConfig,
     backend: NativeBackend,
     pack: PinnedLaunchInput,
-    runtime: Option<CandidateRuntime>,
+    python: Option<attune_common::models::runtime::RuntimeExecutionConfig>,
     testing: TestConfig,
     environment: ChildProcessEnvironment,
     master: String,
@@ -70,13 +65,13 @@ impl NativeCandidateTests {
         api_url: &str,
         master: String,
         environment: ChildProcessEnvironment,
-        runtime: Option<CandidateRuntime>,
+        packs_base_dir: PathBuf,
     ) -> Result<Arc<Self>> {
         config.validate()?;
         if configured.runner != config.helper {
             return Err(denied());
         }
-        let source = Ledger::admit(&pool, install, worker, instance, archive_token).await?;
+        let mut source = Ledger::admit(&pool, install, worker, instance, archive_token).await?;
         let maximum = config.storage.compressed_bytes;
         let expected = u64::try_from(source.archive_size).map_err(|_| denied())?;
         if expected == 0 || expected > maximum {
@@ -137,14 +132,7 @@ impl NativeCandidateTests {
         let directory = root.path().join("files");
         let id = source.install;
         let version = source.archive_digest.clone();
-        let used = [
-            config.helper.pin_id,
-            runtime.as_ref().map(|r| r.pin.pin_id).unwrap_or(0),
-        ];
-        if used[0] == used[1] {
-            return Err(denied());
-        }
-        let pack_pin_id = (1..=3).find(|id| !used.contains(id)).ok_or_else(denied)?;
+        let pack_pin_id = if config.helper.pin_id == 1 { 2 } else { 1 };
         let identity = CandidateInputIdentity {
             install: id,
             pin_id: pack_pin_id,
@@ -166,23 +154,68 @@ impl NativeCandidateTests {
             serde_yaml_ng::from_value(metadata.get("testing").cloned().ok_or_else(denied)?)
                 .map_err(|_| denied())?;
         testing.validate_policy()?;
-        if let Some(runtime) = &runtime {
-            if runtime.pin.kind != LaunchInputKind::Runtime
-                || !runtime.interpreter.starts_with(&format!("{RUNTIME_ROOT}/"))
-            {
+        let python = if testing.enabled
+            && testing
+                .runners
+                .values()
+                .any(|runner| matches!(runner.r#type.as_str(), "unittest" | "pytest"))
+        {
+            use attune_common::pack_transport::{ApiPackTransport, PackFileTransport};
+            source = Ledger::admit_python(&pool, source).await?;
+            let pinned = source.python.as_ref().ok_or_else(denied)?;
+            let definition: attune_common::models::runtime::RuntimeExecutionConfig =
+                serde_json::from_value(pinned.runtime_config.clone()).map_err(|_| denied())?;
+            attune_workload_backend::planning::candidate_python_setup(
+                &definition,
+                "/tmp/attune-candidate-python-validation/env",
+            )
+            .map_err(|_| denied())?;
+            let release = attune_common::repositories::PackReleaseRepository::find_by_id(
+                &pool,
+                pinned.release,
+            )
+            .await?
+            .ok_or_else(denied)?;
+            if release.pack != pinned.provider_pack || release.digest != pinned.release_digest {
                 return Err(denied());
             }
-            attune_common::artifact_transport::ValidatedRelativePath::new(
-                runtime
-                    .interpreter
-                    .strip_prefix(&format!("{RUNTIME_ROOT}/"))
-                    .ok_or_else(denied)?,
+            let transport = ApiPackTransport::new_with_worker_token_provider(
+                api_url,
+                tokens,
+                packs_base_dir.to_str().ok_or_else(denied)?,
             )?;
-            configured
-                .cache
-                .open_input_archive(&runtime.pin)
-                .map_err(|_| denied())?;
-        }
+            transport
+                .sync_release(&release.pack_ref, release.id, &release.digest)
+                .await?;
+            let cache = configured.cache.clone();
+            let limits = config.storage;
+            let pin_id = if config.helper.pin_id == 1 { 2 } else { 1 };
+            let runtime_config = pinned.runtime_config.clone();
+            let distributions = pinned.distributions.clone();
+            tokio::task::spawn_blocking(move || {
+                let provider = attune_workload_backend::pack_input::install_release(
+                    &cache,
+                    release,
+                    &packs_base_dir,
+                    limits,
+                    pin_id,
+                )?;
+                let archive = cache.open_input_archive(&provider).map_err(|_| denied())?;
+                attune_workload_backend::planning::validate_runtime_release_metadata(
+                    archive,
+                    "core.python",
+                    &runtime_config,
+                    None,
+                    Some((&distributions, None)),
+                )
+                .map_err(|_| denied())
+            })
+            .await
+            .map_err(|_| denied())??;
+            Some(definition)
+        } else {
+            None
+        };
         Ledger::validate_source(&pool, &source).await?;
         Ok(Arc::new(Self {
             pool,
@@ -190,7 +223,7 @@ impl NativeCandidateTests {
             config,
             backend: configured.backend,
             pack,
-            runtime,
+            python,
             testing,
             environment,
             master,
@@ -284,6 +317,8 @@ impl NativeCandidateTests {
         // replaces it. Never mint new evidence for an existing older intent.
         let challenge =
             retained_recipe_challenge(retained.as_ref(), request.runner.lifecycle.is_some())?;
+        let python = matches!(request.runner.r#type.as_str(), "unittest" | "pytest");
+        let prep_challenge = retained_python_challenge(retained.as_ref(), python)?;
         let mut env = BTreeMap::from([
             ("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()),
             ("HOME".into(), PACK_ROOT.into()),
@@ -295,17 +330,7 @@ impl NativeCandidateTests {
             env.insert("ATTUNE_CANDIDATE_EFFECTS_TOKEN".into(), effect.token);
         }
         let guest = format!("{PACK_ROOT}/{entry}");
-        let mut inputs = vec![self.pack.clone(), self.config.helper.clone()];
-        if request.runner.lifecycle.is_none() {
-            if let Some(runtime) = &self.runtime {
-                inputs.push(runtime.pin.clone());
-                let bin = Path::new(&runtime.interpreter)
-                    .parent()
-                    .and_then(Path::to_str)
-                    .ok_or_else(denied)?;
-                env.insert("PATH".into(), format!("{bin}:/usr/local/bin:/usr/bin:/bin"));
-            }
-        }
+        let inputs = vec![self.pack.clone(), self.config.helper.clone()];
         let argv = if let Some(recipe) = &request.runner.lifecycle {
             if !self
                 .environment
@@ -342,25 +367,30 @@ impl NativeCandidateTests {
                     guest,
                 ],
                 "unittest" | "pytest" => {
-                    // Legacy Python tests require their private dependency
-                    // environment. An image interpreter cannot substitute for
-                    // the owning setup producer's selected immutable input.
-                    let program = self
-                        .runtime
-                        .as_ref()
-                        .ok_or_else(denied)?
-                        .interpreter
-                        .clone();
-                    let mut args = vec![program, "-m".into(), request.runner.r#type.clone(), guest];
-                    if request.runner.r#type == "pytest" {
-                        args.push("-v".into())
-                    }
-                    args
+                    let plan = attune_workload_backend::planning::CandidatePythonPlan {
+                        version: 1,
+                        config: self.python.as_ref().ok_or_else(denied)?.clone(),
+                        runner: request.runner.r#type.clone(),
+                        entry: entry.into(),
+                        timeout_ms: request
+                            .runner
+                            .timeout
+                            .unwrap_or(300)
+                            .checked_mul(1000)
+                            .ok_or_else(denied)?,
+                    };
+                    attune_workload_backend::planning::candidate_python_argv(
+                        self.config.platform,
+                        &plan,
+                    )
+                    .map_err(|_| denied())?
                 }
                 _ => return Err(denied()),
             }
         };
         let timeout = request.runner.timeout.unwrap_or(300);
+        env = attune_workload_backend::planning::runtime_recipe_environment(&env)
+            .map_err(|_| denied())?;
         let mut spec = ProcessSpec {
             intent: retained
                 .as_ref()
@@ -387,6 +417,7 @@ impl NativeCandidateTests {
         // Recipe environment validation above excludes the reserved proof env;
         // only the fixed helper receives this private intent-bound challenge.
         recipe_timeout::bind_challenge(&mut spec, challenge)?;
+        candidate_prep::bind_challenge(&mut spec, prep_challenge)?;
         let spec = Ledger::reserve(&self.pool, &source, &spec, &self.master).await?;
         if let Some(c) = Ledger::captured(&self.pool, spec.intent, &self.master).await? {
             return command_output(c);
@@ -493,6 +524,9 @@ impl NativeCandidateTests {
         if recipe_timeout::observed_timeout(&self.backend, &spec, &resource).await? {
             interruption = Some(Interrupted::TimedOut);
         }
+        if python && !candidate_prep::observed_prepared(&self.backend, &spec, &resource).await? {
+            interruption = Some(Interrupted::PreparationUnverified);
+        }
         self.backend.remove_stopped(&spec, &resource).await?;
         Ledger::acknowledge_removed(&self.pool, spec.intent, &resource).await?;
         let capture = CandidateCapture {
@@ -525,6 +559,19 @@ fn retained_recipe_challenge(
     }
     Ok(challenge)
 }
+fn retained_python_challenge(
+    retained: Option<&ProcessSpec>,
+    python: bool,
+) -> Result<Option<CandidatePrepChallenge>> {
+    let challenge = retained
+        .map(candidate_prep::retained_challenge)
+        .transpose()?
+        .flatten();
+    if python && retained.is_some() && challenge.is_none() {
+        return Err(denied());
+    }
+    Ok(challenge)
+}
 #[async_trait::async_trait]
 impl TestProcessEffect for NativeCandidateTests {
     async fn run(&self, request: TestProcessRequest) -> Result<CommandOutput> {
@@ -532,6 +579,11 @@ impl TestProcessEffect for NativeCandidateTests {
     }
 }
 fn command_output(c: CandidateCapture) -> Result<CommandOutput> {
+    if c.interruption == Some(TestProcessInterruption::PreparationUnverified) {
+        return Err(Error::validation(
+            "Candidate Python preparation was not verified",
+        ));
+    }
     Ok(CommandOutput {
         interruption: c.interruption,
         exit_code: c.exit_code,
@@ -778,9 +830,8 @@ impl Seek for BudgetWriter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn candidate_recipe_recovery_retains_proof_and_denies_prechallenge_intents() {
-        let mut spec = ProcessSpec {
+    fn fixed_candidate_recipe() -> ProcessSpec {
+        ProcessSpec {
             intent: Uuid::new_v4(),
             purpose: LaunchPurpose::CandidateTest,
             target: LaunchTarget::CandidateTest {
@@ -817,7 +868,11 @@ mod tests {
                 env: BTreeMap::new(),
                 working_root: LaunchRoot::Pack,
             },
-        };
+        }
+    }
+    #[test]
+    fn candidate_recipe_recovery_retains_proof_and_denies_prechallenge_intents() {
+        let mut spec = fixed_candidate_recipe();
         assert!(retained_recipe_challenge(Some(&spec), true).is_err());
         let fresh = retained_recipe_challenge(None, true).unwrap();
         recipe_timeout::bind_challenge(&mut spec, fresh).unwrap();
@@ -835,6 +890,51 @@ mod tests {
         assert!(retained_recipe_challenge(Some(&spec), false)
             .unwrap()
             .is_none());
+    }
+    #[test]
+    fn candidate_python_proof_is_retained_and_restricted_to_one_exact_intent() {
+        let mut spec = fixed_candidate_recipe();
+        spec.invocation.argv[1] = "run-candidate-python".into();
+        assert!(retained_python_challenge(Some(&spec), true).is_err());
+        candidate_prep::bind_challenge(&mut spec, retained_python_challenge(None, true).unwrap())
+            .unwrap();
+        let retained = spec.clone();
+        let proof = retained_python_challenge(Some(&retained), true).unwrap();
+        spec.invocation.env.clear();
+        candidate_prep::bind_challenge(&mut spec, proof).unwrap();
+        assert_eq!(spec.invocation, retained.invocation);
+        assert_eq!(spec.intent, retained.intent);
+        let proof = retained_python_challenge(Some(&retained), true).unwrap();
+        spec.invocation.env.clear();
+        spec.intent = Uuid::new_v4();
+        assert!(candidate_prep::bind_challenge(&mut spec, proof).is_err());
+        spec.purpose = LaunchPurpose::Action;
+        assert!(candidate_prep::bind_challenge(&mut spec, None).is_err());
+    }
+    #[test]
+    fn unverified_preparation_is_a_hard_error_for_fresh_and_cached_capture() {
+        for exit_code in [0, 1, 124] {
+            let capture = CandidateCapture {
+                interruption: Some(TestProcessInterruption::PreparationUnverified),
+                exit_code,
+                stdout: "Total Tests: 1\nPassed: 1\nFailed: 0".into(),
+                stderr: String::new(),
+                duration_ms: 0,
+            };
+            let stored = serde_json::to_string(&capture).unwrap();
+            assert!(command_output(capture).is_err());
+            assert!(command_output(serde_json::from_str(&stored).unwrap()).is_err());
+            let ordinary = command_output(CandidateCapture {
+                interruption: None,
+                exit_code,
+                stdout: String::new(),
+                stderr: String::new(),
+                duration_ms: 0,
+            })
+            .unwrap();
+            assert_eq!(ordinary.exit_code, exit_code);
+            assert!(ordinary.interruption.is_none());
+        }
     }
     fn archive(root: &Path, link: bool) -> tempfile::NamedTempFile {
         let file = tempfile::NamedTempFile::new_in(root).unwrap();

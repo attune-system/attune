@@ -570,3 +570,209 @@ async fn committed_result_survives_lost_caller_ack_without_reexecuting_or_refini
     db.cleanup().await?;
     Ok(())
 }
+
+// Each fixture owns a separate database; `core.python` is the actual fixed
+// business key being selected, not a process-global test configuration.
+async fn python_fixture() -> Result<(
+    attune_common::test_database::TestDatabase,
+    CandidateSource,
+    ProcessSpec,
+)> {
+    use attune_common::repositories::{
+        pack_release::{CreatePackReleaseInput, PackReleaseRepository},
+        runtime::{CreateRuntimeInput, RuntimeRepository},
+        runtime_version::{CreateRuntimeVersionInput, RuntimeVersionRepository},
+    };
+    let (db, source, spec) = fixture().await?;
+    let pack = helpers::PackFixture::new("core").create(&db).await?;
+    let metadata: serde_json::Value =
+        serde_yaml_ng::from_str(include_str!("../../../packs/core/runtimes/python.yaml"))?;
+    let config = metadata["execution_config"].clone();
+    let runtime = RuntimeRepository::create(
+        db.pool(),
+        CreateRuntimeInput {
+            r#ref: "core.python".into(),
+            pack: Some(pack.id),
+            pack_ref: Some("core".into()),
+            description: None,
+            name: "Python".into(),
+            aliases: vec![],
+            distributions: metadata["distributions"].clone(),
+            installation: None,
+            execution_config: config.clone(),
+            auto_detected: false,
+            detection_config: serde_json::json!({}),
+        },
+    )
+    .await?;
+    // A newer registered version must not replace the base configuration used
+    // by prepare_python_candidate_test_runtime.
+    RuntimeVersionRepository::create(db.pool(), CreateRuntimeVersionInput {
+        runtime: runtime.id, runtime_ref: "core.python".into(), version: "99.0.0".into(),
+        version_major: Some(99), version_minor: Some(0), version_patch: Some(0),
+        execution_config: serde_json::json!({"interpreter":{"binary":"forbidden-highest-version"}}),
+        distributions: serde_json::json!({}), is_default: true, available: true, meta: serde_json::json!({}),
+    }).await?;
+    let mut tx = db.begin().await?;
+    let release = PackReleaseRepository::create_or_get(
+        &mut tx,
+        CreatePackReleaseInput {
+            pack: pack.id,
+            pack_ref: "core".into(),
+            version: "1.0.0".into(),
+            digest: "d".repeat(64),
+            object_key: "owned-provider-source".into(),
+            provider_version: "owned-version".into(),
+            content_path: "/owned/not-read-by-repository-test".into(),
+            archive_size: 1,
+            manifest: serde_json::json!({}),
+        },
+    )
+    .await?;
+    PackReleaseRepository::activate(&mut tx, pack.id, release.id).await?;
+    tx.commit().await?;
+    let source = Ledger::admit_python(db.pool(), source).await?;
+    assert_eq!(source.python.as_ref().unwrap().runtime_config, config);
+    assert_eq!(source.python.as_ref().unwrap().release, release.id);
+    Ok((db, source, spec))
+}
+
+#[tokio::test]
+async fn python_base_admission_recovers_exact_epochs_and_cannot_be_downgraded() -> Result<()> {
+    let (db, source, spec) = python_fixture().await?;
+    let spec = Ledger::reserve(db.pool(), &source, &spec, MASTER).await?;
+    let base = Ledger::admit(
+        db.pool(),
+        source.install,
+        source.worker,
+        source.instance,
+        TOKEN,
+    )
+    .await?;
+    let recovered = Ledger::admit_python(db.pool(), base.clone()).await?;
+    let retained = Ledger::retained(db.pool(), &recovered, &spec.target, MASTER)
+        .await?
+        .unwrap();
+    assert_eq!(retained.intent, spec.intent);
+    Ledger::settle_unsubmitted(db.pool(), &source).await?;
+    let mut next = spec.clone();
+    next.intent = Uuid::new_v4();
+    if let LaunchTarget::CandidateTest { test_job, .. } = &mut next.target {
+        *test_job = 2;
+    }
+    assert!(Ledger::reserve(db.pool(), &base, &next, MASTER)
+        .await
+        .is_err());
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn python_definition_restore_never_restores_candidate_effect_authority() -> Result<()> {
+    let (db, source, spec) = python_fixture().await?;
+    Ledger::reserve(db.pool(), &source, &spec, MASTER).await?;
+    let proof = source.python.as_ref().unwrap();
+    sqlx::query("UPDATE runtime SET execution_config=$2 WHERE id=$1")
+        .bind(proof.runtime)
+        .bind(serde_json::json!({"interpreter":{"binary":"changed"}}))
+        .execute(db.pool())
+        .await?;
+    sqlx::query("UPDATE runtime SET execution_config=$2 WHERE id=$1")
+        .bind(proof.runtime)
+        .bind(&proof.runtime_config)
+        .execute(db.pool())
+        .await?;
+    assert!(Ledger::validate_source(db.pool(), &source).await.is_err());
+    let base = Ledger::admit(
+        db.pool(),
+        source.install,
+        source.worker,
+        source.instance,
+        TOKEN,
+    )
+    .await?;
+    assert!(Ledger::admit_python(db.pool(), base).await.is_err());
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn python_provider_release_restore_never_restores_candidate_effect_authority() -> Result<()> {
+    let (db, source, spec) = python_fixture().await?;
+    Ledger::reserve(db.pool(), &source, &spec, MASTER).await?;
+    let proof = source.python.as_ref().unwrap();
+    sqlx::query("UPDATE pack SET active_release=NULL WHERE id=$1")
+        .bind(proof.provider_pack)
+        .execute(db.pool())
+        .await?;
+    sqlx::query("UPDATE pack SET active_release=$2 WHERE id=$1")
+        .bind(proof.provider_pack)
+        .bind(proof.release)
+        .execute(db.pool())
+        .await?;
+    assert!(Ledger::validate_source(db.pool(), &source).await.is_err());
+    assert!(Ledger::retained(db.pool(), &source, &spec.target, MASTER)
+        .await
+        .is_err());
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unverified_preparation_capture_settles_cleanup_but_never_fabricates_test_history(
+) -> Result<()> {
+    let (db, source, spec) = fixture().await?;
+    let spec = Ledger::reserve(db.pool(), &source, &spec, MASTER).await?;
+    let resource = resource();
+    Ledger::begin_create(db.pool(), spec.intent, MASTER).await?;
+    Effects::record_resource(db.pool(), spec.intent, &resource).await?;
+    Ledger::consume_stdin(db.pool(), spec.intent, &resource, MASTER).await?;
+    Effects::record_exit(
+        db.pool(),
+        spec.intent,
+        &resource,
+        LaunchExitOutcome {
+            exit_code: 1,
+            oom_killed: false,
+        },
+    )
+    .await?;
+    Effects::request_stop(db.pool(), spec.intent).await?;
+    Ledger::acknowledge_removed(db.pool(), spec.intent, &resource).await?;
+    Ledger::capture(
+        db.pool(),
+        spec.intent,
+        &resource,
+        &CandidateCapture {
+            interruption: Some(
+                attune_common::test_executor::TestProcessInterruption::PreparationUnverified,
+            ),
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "static helper failure".into(),
+            duration_ms: 1,
+        },
+        MASTER,
+    )
+    .await?;
+    let captured = Ledger::captured(db.pool(), spec.intent, MASTER)
+        .await?
+        .unwrap();
+    assert_eq!(
+        captured.interruption,
+        Some(attune_common::test_executor::TestProcessInterruption::PreparationUnverified)
+    );
+    assert!(Ledger::settled(db.pool(), &source, MASTER).await?);
+    let mut tx = db.begin().await?;
+    let fence = Ledger::lock_result(&mut tx, &source, MASTER).await?;
+    fence.ensure_fresh(&mut tx).await?;
+    let history: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM pack_test_execution WHERE pack_id=$1")
+            .bind(source.pack_id.unwrap())
+            .fetch_one(&mut *tx)
+            .await?;
+    assert_eq!(history, 0);
+    tx.rollback().await?;
+    db.cleanup().await?;
+    Ok(())
+}
