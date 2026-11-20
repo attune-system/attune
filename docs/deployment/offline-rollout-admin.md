@@ -5,7 +5,8 @@ binary in the Linux service bundle/API image. It does not link API startup,
 load service configuration, use an API profile/token, listen on a socket or spawn
 helpers. The API image's default CMD remains unchanged. Run this executable only
 as an explicitly invoked offline deployment process/Job; this work does not
-create such a Job or deploy a caller. Possessing the binary grants no database
+deploy a caller. Explicit opt-in provisioning and Job assets are described in
+[the deployment lane](../../deployment/rollout-admin/README.md); they do not change defaults. Possessing the binary grants no database
 authority. All seven recorded-consumer gates remain false.
 
 ## Deployment-owned inputs
@@ -103,7 +104,9 @@ an idempotent success or mutates the prior revision from local observations.
 
 ## DBA/IaC provisioning contract
 
-No migration or caller creates logins, grants membership or fixes ACLs. The DBA
+No migration or attune-rollout-admin invocation creates logins, grants membership
+or fixes ACLs. The separately invoked explicit DBA asset can configure only the
+rollout grants for externally owned existing roles. The DBA
 must establish an installation-owned role inventory in IaC state (including exact
 role OIDs/names and ownership). Creation requires cluster-wide absence. On repeat
 provisioning, validate the exact owned role and every attribute, membership and

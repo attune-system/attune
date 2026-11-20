@@ -208,6 +208,7 @@ async fn cases_inner(f: &mut Fixture, root: &Path) {
     )
     .await; // shared owner is not production proof
     provision(f).await;
+    provisioning_assets(f).await;
     let status = run(&["status", "--credentials", text(&creds)], true).await;
     assert_eq!(status["prior"], json!({"row_id":null,"revision":0}));
     run(
@@ -963,4 +964,140 @@ async fn cross_database(
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }
+}
+
+// Execute the shipped DBA SQL in the same transaction/temporary-input contract.
+async fn apply_provisioning(f: &Fixture, inventory: &Value) -> sqlx::Result<()> {
+    let mut tx = f.db.begin().await?;
+    sqlx::query("CREATE TEMP TABLE rollout_provision_input(document JSONB) ON COMMIT DROP")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO rollout_provision_input VALUES ($1)")
+        .bind(inventory)
+        .execute(&mut *tx)
+        .await?;
+    let sql = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deployment/rollout-admin/provision.sql"
+    ))
+    .unwrap();
+    sqlx::raw_sql(&sql).execute(&mut *tx).await?;
+    tx.commit().await
+}
+async fn provisioning_assets(f: &mut Fixture) {
+    let owner = f.roles[4].clone();
+    let mut extra = Vec::new();
+    for login in [true, false, true] {
+        let role = format!("ws2_rollout_asset_{}", Uuid::new_v4().simple());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM pg_roles WHERE rolname=$1")
+                .bind(&role)
+                .fetch_one(&*f.db)
+                .await
+                .unwrap(),
+            0
+        );
+        sqlx::query(&format!(
+            "CREATE ROLE {role} {}",
+            if login { "LOGIN" } else { "NOLOGIN" }
+        ))
+        .execute(&*f.db)
+        .await
+        .unwrap();
+        f.roles.push(role.clone());
+        std::fs::write(&f.manifest, serde_json::to_vec(&f.roles).unwrap()).unwrap();
+        extra.push(role);
+    }
+    sqlx::query(&format!(
+        "GRANT {owner} TO {} WITH INHERIT FALSE, SET TRUE",
+        extra[0]
+    ))
+    .execute(&*f.db)
+    .await
+    .unwrap();
+    let mut ids = Vec::new();
+    for name in [
+        &owner,
+        &extra[0],
+        &extra[1],
+        &f.roles[1],
+        &f.roles[0],
+        &f.roles[2],
+        &extra[2],
+    ] {
+        let oid: i64 = sqlx::query_scalar("SELECT oid::BIGINT FROM pg_roles WHERE rolname=$1")
+            .bind(name)
+            .fetch_one(&*f.db)
+            .await
+            .unwrap();
+        ids.push(json!({"name":name,"oid":oid}));
+    }
+    let identity: Value = sqlx::query_scalar("SELECT recorded_rollout_installation()")
+        .fetch_one(&*f.db)
+        .await
+        .unwrap();
+    let mut inventory = json!({"version":1,"operation":"configure","schema":f.db.schema(),"installation":identity["uuid"],"owner":ids[0],"migrator":ids[1],"cache_owner":ids[2],"operator":ids[3],"capability":ids[4],"runtimes":[ids[5]],"previous_operator":null});
+    // Existing broad inherited membership is refused, never silently repaired.
+    assert!(apply_provisioning(f, &inventory).await.is_err());
+    sqlx::raw_sql(&format!(
+        "REVOKE {} FROM {}; GRANT {} TO {} WITH INHERIT FALSE, SET FALSE",
+        f.roles[0], f.roles[1], f.roles[0], f.roles[1]
+    ))
+    .execute(&*f.db)
+    .await
+    .unwrap();
+    apply_provisioning(f, &inventory).await.unwrap();
+    apply_provisioning(f, &inventory).await.unwrap();
+    let mut wrong = inventory.clone();
+    wrong["operator"]["oid"] = json!(0);
+    assert!(apply_provisioning(f, &wrong).await.is_err());
+    sqlx::query(&format!(
+        "GRANT CREATE ON SCHEMA \"{}\" TO {}",
+        f.db.schema(),
+        f.roles[2]
+    ))
+    .execute(&*f.db)
+    .await
+    .unwrap();
+    assert!(apply_provisioning(f, &inventory).await.is_err());
+    sqlx::query(&format!(
+        "REVOKE CREATE ON SCHEMA \"{}\" FROM {}",
+        f.db.schema(),
+        f.roles[2]
+    ))
+    .execute(&*f.db)
+    .await
+    .unwrap();
+    sqlx::query(&format!("GRANT {} TO {}", extra[1], f.roles[2]))
+        .execute(&*f.db)
+        .await
+        .unwrap();
+    assert!(apply_provisioning(f, &inventory).await.is_err());
+    sqlx::query(&format!("REVOKE {} FROM {}", extra[1], f.roles[2]))
+        .execute(&*f.db)
+        .await
+        .unwrap();
+    // Old operator pools must be closed and joined before the transaction rotates.
+    inventory["operation"] = json!("rotate");
+    inventory["previous_operator"] = ids[3].clone();
+    inventory["operator"] = ids[6].clone();
+    assert!(apply_provisioning(f, &inventory).await.is_err());
+    f.pools[0].close().await;
+    let (first, second) = tokio::join!(
+        apply_provisioning(f, &inventory),
+        apply_provisioning(f, &inventory)
+    );
+    assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+    assert!(
+        !sqlx::query_scalar::<_, bool>("SELECT pg_has_role($1,$2,'MEMBER')")
+            .bind(&f.roles[1])
+            .bind(&f.roles[0])
+            .fetch_one(&*f.db)
+            .await
+            .unwrap()
+    );
+    // Restore via a deliberate reverse rotation for the subsequent one-shot suite.
+    inventory["previous_operator"] = ids[6].clone();
+    inventory["operator"] = ids[3].clone();
+    apply_provisioning(f, &inventory).await.unwrap();
 }
