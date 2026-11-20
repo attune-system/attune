@@ -6,7 +6,6 @@ use attune_common::{
     repositories::{
         runtime::{CreateWorkerInput, WorkerRepository},
         worker_delivery::WorkerDeliveryRepository,
-        FindById,
     },
 };
 use attune_worker::completion::{allocate_log, register, CompletionTransport};
@@ -200,11 +199,13 @@ async fn recorded_shared_volume_completion_is_bounded_and_revalidates_terminal_s
 #[tokio::test]
 async fn empty_selection_still_registers_a_purpose_specific_worker_delivery_permit() {
     attune_common::auth::crypto_provider::install();
-    use attune_common::models::ExecutionExecutableSnapshot;
     use attune_worker::recorded_credentials::{
         mint_recorded_execution_token, RecordedConsumerReadiness,
     };
-    let fixture = fixture(true).await;
+    let fixture = match build_fixture(true, vec![]).await {
+        Ok(fixture) => fixture,
+        Err(_) => panic!("empty API selection still admits separately authorized inputs"),
+    };
     let worker = WorkerRepository::create(
         &fixture.db,
         CreateWorkerInput {
@@ -220,47 +221,17 @@ async fn empty_selection_still_registers_a_purpose_specific_worker_delivery_perm
     )
     .await
     .unwrap();
-    let original = ExecutionRepository::find_by_id(&fixture.db, fixture.execution)
-        .await
-        .unwrap()
-        .unwrap();
-    let snapshot: ExecutionExecutableSnapshot = original.executable_snapshot.clone().unwrap();
-    let mut tx = fixture.db.begin().await.unwrap();
-    let source = Admission::require(&mut tx, RuntimeOwner::Execution(fixture.execution))
-        .await
-        .unwrap();
-    let policy = Authority::find_policy(&mut tx, source.policy_revision)
-        .await
-        .unwrap()
-        .unwrap();
-    let selected = policy
-        .policy
-        .select(
-            policy.id,
-            &source.authority.binding,
-            &[],
-            source.authority.attribution.clone(),
-        )
-        .unwrap();
-    let execution = ExecutionRepository::create_pinned(
-        &mut *tx,
-        CreateExecutionInput {
-            action: original.action,
-            action_ref: original.action_ref.clone(),
-            executor: original.executor,
+    let execution = ExecutionRepository::update(
+        &fixture.db,
+        fixture.execution,
+        UpdateExecutionInput {
             worker: Some(worker.id),
-            status: ExecutionStatus::Running,
-            permission_set_refs: vec![],
             ..Default::default()
         },
-        &snapshot,
     )
     .await
     .unwrap();
-    Authority::record_admission(&mut tx, RuntimeOwner::Execution(execution.id), &selected)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
+    assert!(execution.permission_set_refs.is_empty());
     let config = JwtConfig::default();
     assert!(mint_recorded_execution_token(
         fixture.db.pool(),
