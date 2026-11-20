@@ -520,6 +520,41 @@ async fn work_queue_item_repository_leases_releases_and_reclaims_items() {
 
     let lease_token = Uuid::new_v4();
     let lease_expires_at = Utc::now() + Duration::minutes(5);
+    let mut held = pool.begin().await.expect("lock first dispatch item");
+    let original = WorkQueueItemRepository::lock_next_dispatch_item(&mut held, queue.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.id, high.id);
+    let mut alternate = pool.begin().await.expect("lock another dispatch item");
+    let anchor = WorkQueueItemRepository::lock_next_dispatch_item(&mut alternate, queue.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(anchor.id, retry.id);
+    let selected = WorkQueueItemRepository::lease_batch_from_dispatch_item(
+        &mut alternate,
+        LeaseWorkQueueItemsInput {
+            separate_requesters: false,
+            queue: queue.id,
+            ready_statuses: vec![WorkQueueItemStatus::Queued, WorkQueueItemStatus::Retry],
+            limit: 1,
+            batch_coalescing: None,
+            leased_execution: None,
+            lease_token,
+            lease_expires_at,
+        },
+        anchor.id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        selected.iter().map(|item| item.id).collect::<Vec<_>>(),
+        [retry.id]
+    );
+    alternate.rollback().await.unwrap();
+    held.rollback().await.unwrap();
+
     let leased = WorkQueueItemRepository::lease_next_batch(
         &pool,
         LeaseWorkQueueItemsInput {

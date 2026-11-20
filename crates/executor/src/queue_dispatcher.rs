@@ -327,21 +327,22 @@ impl WorkQueueDispatcher {
     }
 
     async fn dispatch_ready_batches_for_queue(&self, queue: &WorkQueue) -> Result<()> {
-        let encryption_key = self.encryption_key.as_deref();
-        let context = if queue.is_adhoc {
-            let mut connection = self.pool.acquire().await?;
-            Self::resolve_queue_context(&mut connection, encryption_key, queue).await?
-        } else {
-            let Some(identity) = &self.recorded_identity else {
+        if !queue.is_adhoc {
+            if self.recorded_identity.is_none() {
                 return Ok(());
-            };
-            let mut tx = self.pool.begin().await?;
-            identity
-                .require_current(&mut tx, ConsumerRole::Executor)
-                .await?;
-            let context = Self::resolve_queue_context(&mut tx, encryption_key, queue).await?;
-            tx.commit().await?;
-            context
+            }
+            for _ in 0..MAX_LEASED_DISPATCHES_PER_POLL {
+                let Some(dispatch) = self.prepare_next_dispatch(queue, None).await? else {
+                    break;
+                };
+                self.publish_dispatch(dispatch).await?;
+            }
+            return Ok(());
+        }
+        let context = {
+            let mut connection = self.pool.acquire().await?;
+            Self::resolve_queue_context(&mut connection, self.encryption_key.as_deref(), queue)
+                .await?
         };
         let active_dispatches =
             WorkQueueDispatchRepository::count_active_for_queue(&self.pool, queue.id).await?;
@@ -376,7 +377,7 @@ impl WorkQueueDispatcher {
 
         let open_slots = context.concurrency - active_dispatches;
         for _ in 0..open_slots {
-            let Some(dispatch) = self.prepare_next_dispatch(queue, &context).await? else {
+            let Some(dispatch) = self.prepare_next_dispatch(queue, Some(&context)).await? else {
                 break;
             };
 
@@ -565,18 +566,77 @@ impl WorkQueueDispatcher {
         })
     }
 
+    async fn prepare_managed_dispatch_context(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        queue_id: i64,
+        identity: &RecordedConsumerIdentity,
+        encryption_key: Option<&str>,
+    ) -> Result<Option<(WorkQueue, ResolvedQueueContext, i64)>> {
+        // Serialize capacity checks and lease creation for this queue. The
+        // same queue lock precedes rollout evidence in API admission.
+        let Some(queue) = WorkQueueRepository::find_by_id_for_update(tx, queue_id).await? else {
+            return Ok(None);
+        };
+        if queue.is_adhoc || !queue.enabled {
+            return Ok(None);
+        }
+        identity.require_current(tx, ConsumerRole::Executor).await?;
+        let Some(anchor) = WorkQueueItemRepository::lock_next_dispatch_item(tx, queue_id).await?
+        else {
+            return Ok(None);
+        };
+        let snapshot =
+            serde_json::from_value(anchor.executable_snapshot.clone().ok_or_else(|| {
+                anyhow!("Managed queue dispatch item has no accepted executable snapshot")
+            })?)?;
+        let input = attune_common::repositories::queue_configuration_input::QueueConfigurationInputRepository::load(
+            tx, &queue, &anchor, &snapshot, encryption_key.ok_or_else(|| {
+                anyhow!("Managed queue fixed-input encryption is unavailable")
+            })?,
+        ).await?;
+        let tuning = input.dispatch_tuning()?;
+        if WorkQueueDispatchRepository::count_active_for_queue(&mut **tx, queue_id).await?
+            >= u64::from(tuning.concurrency)
+        {
+            return Ok(None);
+        }
+        let queue = input.accepted_template(&queue)?;
+        let parsed_config: WorkQueueConfig = serde_json::from_value(queue.config.clone())?;
+        let delay = parsed_config
+            .dispatch
+            .as_ref()
+            .and_then(|dispatch| dispatch.inter_execution_delay_seconds)
+            .unwrap_or_default();
+        if tuning.concurrency == 1
+            && delay > 0
+            && Self::sequential_delay_until(
+                WorkQueueDispatchRepository::latest_terminal_for_queue(&mut **tx, queue_id)
+                    .await?
+                    .as_ref(),
+                tuning.concurrency,
+                delay,
+            )
+            .is_some_and(|until| until > Utc::now())
+        {
+            return Ok(None);
+        }
+        let context = ResolvedQueueContext {
+            parsed_config,
+            pack_config: JsonValue::Null,
+            pack_ref: queue.pack_ref.clone(),
+            concurrency: tuning.concurrency,
+            batch_size: tuning.batch_size,
+            inter_execution_delay_seconds: delay,
+        };
+        Ok(Some((queue, context, anchor.id)))
+    }
+
     async fn prepare_next_dispatch(
         &self,
         queue: &WorkQueue,
-        context: &ResolvedQueueContext,
+        ad_hoc_context: Option<&ResolvedQueueContext>,
     ) -> Result<Option<PreparedDispatch>> {
         let encryption_key = self.encryption_key.as_deref();
-        let batch_limit = if queue.batch_mode == attune_common::models::WorkQueueBatchMode::Single {
-            1
-        } else {
-            context.batch_size.max(1)
-        };
-
         let lease_token = Uuid::new_v4();
         let lease_expires_at = Utc::now()
             + chrono::Duration::from_std(self.config.lease_duration)
@@ -588,36 +648,59 @@ impl WorkQueueDispatcher {
         let managed_identity = if queue.is_adhoc {
             None
         } else {
-            let identity = self.recorded_identity.as_ref().ok_or_else(|| {
+            self.recorded_identity.as_deref()
+        };
+        let managed_context = if queue.is_adhoc {
+            None
+        } else {
+            let identity = managed_identity.ok_or_else(|| {
                 anyhow!("Recorded queue dispatch requires coordinated runtime readiness")
             })?;
-            identity
-                .require_current(&mut tx, ConsumerRole::Executor)
-                .await?;
-            Some(identity)
+            let Some(context) =
+                Self::prepare_managed_dispatch_context(&mut tx, queue.id, identity, encryption_key)
+                    .await?
+            else {
+                tx.commit().await?;
+                return Ok(None);
+            };
+            Some(context)
         };
-        let mut items = WorkQueueItemRepository::lease_next_batch(
-            &mut *tx,
-            LeaseWorkQueueItemsInput {
-                separate_requesters: context
-                    .parsed_config
-                    .dispatch
-                    .as_ref()
-                    .is_some_and(|dispatch| dispatch.separate_requesters),
-                queue: queue.id,
-                ready_statuses: vec![WorkQueueItemStatus::Queued, WorkQueueItemStatus::Retry],
-                limit: i64::from(batch_limit),
-                batch_coalescing: context
-                    .parsed_config
-                    .dispatch
-                    .as_ref()
-                    .and_then(|dispatch| dispatch.coalescing.clone()),
-                leased_execution: None,
-                lease_token,
-                lease_expires_at,
-            },
-        )
-        .await?;
+        let (queue, context) = if let Some((queue, context, _)) = &managed_context {
+            (queue, context)
+        } else {
+            (
+                queue,
+                ad_hoc_context.ok_or_else(|| anyhow!("Ad hoc dispatch context unavailable"))?,
+            )
+        };
+        let batch_limit = if queue.batch_mode == attune_common::models::WorkQueueBatchMode::Single {
+            1
+        } else {
+            context.batch_size.max(1)
+        };
+        let lease = LeaseWorkQueueItemsInput {
+            separate_requesters: context
+                .parsed_config
+                .dispatch
+                .as_ref()
+                .is_some_and(|dispatch| dispatch.separate_requesters),
+            queue: queue.id,
+            ready_statuses: vec![WorkQueueItemStatus::Queued, WorkQueueItemStatus::Retry],
+            limit: i64::from(batch_limit),
+            batch_coalescing: context
+                .parsed_config
+                .dispatch
+                .as_ref()
+                .and_then(|dispatch| dispatch.coalescing.clone()),
+            leased_execution: None,
+            lease_token,
+            lease_expires_at,
+        };
+        let mut items = if let Some((_, _, anchor)) = managed_context.as_ref() {
+            WorkQueueItemRepository::lease_batch_from_dispatch_item(&mut tx, lease, *anchor).await?
+        } else {
+            WorkQueueItemRepository::lease_next_batch(&mut *tx, lease).await?
+        };
 
         if items.is_empty() {
             tx.commit().await?;
@@ -723,25 +806,6 @@ impl WorkQueueDispatcher {
                 ));
             }
         }
-        let fixed_template = fixed_inputs
-            .first()
-            .map(|input| input.accepted_template(queue))
-            .transpose()?;
-        let queue = fixed_template.as_ref().unwrap_or(queue);
-        let fixed_context = fixed_template
-            .as_ref()
-            .map(|template| -> Result<ResolvedQueueContext> {
-                Ok(ResolvedQueueContext {
-                    parsed_config: serde_json::from_value(template.config.clone())?,
-                    pack_config: JsonValue::Null,
-                    pack_ref: template.pack_ref.clone(),
-                    concurrency: context.concurrency,
-                    batch_size: context.batch_size,
-                    inter_execution_delay_seconds: context.inter_execution_delay_seconds,
-                })
-            })
-            .transpose()?;
-        let context = fixed_context.as_ref().unwrap_or(context);
         let permission_set_refs = if let Some(admission) = &admission {
             admission.authority().selected_refs.clone()
         } else {

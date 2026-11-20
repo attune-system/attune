@@ -152,6 +152,15 @@ async fn queue_fixed_inputs_seal_credentials_without_contributor_key_rights() {
     )
     .await
     .unwrap();
+    let tuning_key = helpers::KeyFixture::new_pack(
+        policy.owner.pack_id,
+        &policy.owner.pack_ref,
+        "dispatch_concurrency",
+        "3",
+    )
+    .create(&db)
+    .await
+    .unwrap();
     let mut tx = db.begin().await.unwrap();
     attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
         .await
@@ -161,6 +170,18 @@ async fn queue_fixed_inputs_seal_credentials_without_contributor_key_rights() {
         .await
         .unwrap()
         .unwrap();
+    let pack = PackRepository::find_by_id(&mut *tx, policy.owner.pack_id)
+        .await
+        .unwrap()
+        .unwrap();
+    Configuration::bind_pack(
+        &mut tx,
+        &pack,
+        Some(&json!({"default_value":"child-default-value","selector":"4"})),
+        Some(ENC),
+    )
+    .await
+    .unwrap();
     let queue = WorkQueueRepository::update(
         &mut *tx,
         queue.id,
@@ -169,6 +190,10 @@ async fn queue_fixed_inputs_seal_credentials_without_contributor_key_rights() {
                 json!({"token":format!("{{{{ keystore['{}'] }}}}", key.r#ref),
             "endpoint":"{{ config.default_value }}","record":"{{ item.message }}"}),
             ),
+            config: Some(json!({"dispatch":{
+                "concurrency":{"source":"keystore","key_ref":tuning_key.r#ref},
+                "batch_size":{"source":"pack_config","path":"selector","fallback":2}
+            }})),
             ..Default::default()
         },
     )
@@ -263,6 +288,9 @@ async fn queue_fixed_inputs_seal_credentials_without_contributor_key_rights() {
             json!("accepted-value")
         );
         assert!(captured.resolved_keys()[&key.r#ref].origin.encrypted);
+        assert!(!captured.resolved_keys().contains_key(&tuning_key.r#ref));
+        let tuning = captured.dispatch_tuning().unwrap();
+        assert_eq!((tuning.concurrency, tuning.batch_size), (3, 4));
         assert_eq!(
             captured.configuration()["default_value"],
             "child-default-value"
@@ -280,6 +308,16 @@ async fn queue_fixed_inputs_seal_credentials_without_contributor_key_rights() {
             value: Some(
                 crypto::keystore::encrypt_json(&json!("later-key-value"), ENC, key.id).unwrap(),
             ),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    KeyRepository::update(
+        &db,
+        tuning_key.id,
+        UpdateKeyInput {
+            value: Some(json!("9")),
             ..Default::default()
         },
     )
@@ -328,6 +366,9 @@ async fn queue_fixed_inputs_seal_credentials_without_contributor_key_rights() {
             retained.configuration()["default_value"],
             "child-default-value"
         );
+        let tuning = retained.dispatch_tuning().unwrap();
+        assert_eq!((tuning.concurrency, tuning.batch_size), (3, 4));
+        assert!(!retained.resolved_keys().contains_key(&tuning_key.r#ref));
         let mut forged = item.clone();
         forged.queue_ref = "unrelated.queue".into();
         assert!(Fixed::load(&mut tx, &queue, &forged, &snapshot, ENC)

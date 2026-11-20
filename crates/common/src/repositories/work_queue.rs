@@ -1956,6 +1956,41 @@ impl WorkQueueItemRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        Self::lease_batch(executor, input, None).await
+    }
+
+    /// Select a managed queue's next item before resolving its admitted
+    /// dispatch settings. The caller holds this lock through the lease.
+    pub async fn lock_next_dispatch_item(
+        connection: &mut sqlx::PgConnection,
+        queue: Id,
+    ) -> Result<Option<WorkQueueItem>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT {WORK_QUEUE_ITEM_SELECT_COLUMNS} FROM work_queue_item \
+             WHERE queue = $1 AND status IN ('queued', 'retry') \
+             ORDER BY priority DESC, created ASC, id ASC LIMIT 1 FOR UPDATE SKIP LOCKED"
+        ))
+        .bind(queue)
+        .fetch_optional(connection)
+        .await?)
+    }
+
+    pub async fn lease_batch_from_dispatch_item(
+        connection: &mut sqlx::PgConnection,
+        input: LeaseWorkQueueItemsInput,
+        anchor: Id,
+    ) -> Result<Vec<WorkQueueItem>> {
+        Self::lease_batch(connection, input, Some(anchor)).await
+    }
+
+    async fn lease_batch<'e, E>(
+        executor: E,
+        input: LeaseWorkQueueItemsInput,
+        anchor: Option<Id>,
+    ) -> Result<Vec<WorkQueueItem>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
         if input.limit <= 0 {
             return Ok(Vec::new());
         }
@@ -1997,6 +2032,7 @@ impl WorkQueueItemRepository {
                 FROM work_queue_item
                 WHERE queue = $1
                   AND status = ANY($2::work_queue_item_status_enum[])
+                  AND ($11::BIGINT IS NULL OR id = $11)
                 ORDER BY priority DESC, created ASC, id ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
@@ -2073,6 +2109,7 @@ impl WorkQueueItemRepository {
             .bind(coalescing_enabled)
             .bind(across_priorities)
             .bind(input.separate_requesters)
+            .bind(anchor)
             .fetch_all(executor)
             .await
             .map_err(Into::into)

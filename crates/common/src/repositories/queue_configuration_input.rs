@@ -21,8 +21,11 @@ use serde_json::{json, Value};
 use sqlx::PgConnection;
 use std::collections::BTreeMap;
 mod transfer;
+mod tuning;
 pub use transfer::QueueInputTransfer;
 pub(in crate::repositories) use transfer::QueueReceiptParent;
+pub use tuning::QueueDispatchTuning;
+use tuning::QueueTuningInputs;
 
 pub(in crate::repositories) struct QueueItemBinding<'a> {
     pub item: Id,
@@ -81,6 +84,7 @@ pub struct QueueConfigurationInput {
     sealed: Sealed,
     fence: super::runtime_authority::ApprovalEffectFence,
     metadata: Value,
+    render_keys: Vec<String>,
     acceptance_sources: Vec<transfer::LiveTransferSource>,
 }
 impl QueueConfigurationInput {
@@ -177,6 +181,10 @@ impl QueueConfigurationInput {
     pub fn schema(&self) -> &ActionSchemaBinding {
         &self.sealed.binding.schema
     }
+    pub fn dispatch_tuning(&self) -> Result<QueueDispatchTuning> {
+        Ok(QueueTuningInputs::from_metadata(&self.metadata)?
+            .resolve(&self.sealed.configuration, &self.sealed.keys))
+    }
     pub fn declarations(&self) -> &[DeclaredInputBinding] {
         &self.sealed.binding.declarations
     }
@@ -205,7 +213,7 @@ impl QueueConfigurationInput {
                 },
             ));
         }
-        for (reference, origin) in &self.sealed.binding.keys {
+        for reference in &self.render_keys {
             let root = format!(
                 "/keystore/{}",
                 reference.replace('~', "~0").replace('/', "~1")
@@ -217,7 +225,9 @@ impl QueueConfigurationInput {
                     .ok_or_else(denied)?;
                 return Ok((
                     value,
-                    vec![SecretOrigin::Key(origin.clone())],
+                    vec![SecretOrigin::Key(
+                        self.sealed.binding.keys[reference].clone(),
+                    )],
                     self.sealed
                         .binding
                         .key_targets
@@ -255,15 +265,13 @@ impl QueueConfigurationInput {
         Err(denied())
     }
     pub fn resolved_keys(&self) -> BTreeMap<String, crate::key_access::ResolvedKey> {
-        self.sealed
-            .binding
-            .keys
+        self.render_keys
             .iter()
-            .map(|(reference, origin)| {
+            .map(|reference| {
                 (
                     reference.clone(),
                     crate::key_access::ResolvedKey {
-                        origin: origin.clone(),
+                        origin: self.sealed.binding.keys[reference].clone(),
                         value: self.sealed.keys[reference].clone(),
                     },
                 )
@@ -500,10 +508,12 @@ impl QueueConfigurationInputRepository {
         if hash(&metadata)? != sealed.binding.template_digest {
             return Err(denied());
         }
+        let render_keys = validate_selector_partition(&sealed, &metadata)?;
         Ok(QueueConfigurationInput {
             sealed,
             fence,
             metadata,
+            render_keys,
             acceptance_sources: Vec::new(),
         })
     }
@@ -590,11 +600,13 @@ impl QueueConfigurationInputRepository {
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
+        let tuning = QueueTuningInputs::from_metadata(&metadata)?;
         let mut configuration = Value::Null;
-        if binding
-            .declarations
-            .iter()
-            .any(|site| site.uses_pack_configuration())
+        if tuning.uses_pack_configuration()
+            || binding
+                .declarations
+                .iter()
+                .any(|site| site.uses_pack_configuration())
         {
             let revision = Configuration::current(&mut *conn, "pack", binding.pack)
                 .await?
@@ -609,7 +621,10 @@ impl QueueConfigurationInputRepository {
             )?);
         }
         let mut values = BTreeMap::new();
-        for reference in fixed_key_references(&metadata["action_params"], &configuration)? {
+        let render_keys = fixed_key_references(&metadata["action_params"], &configuration)?;
+        let input_keys = bound_input_keys(&render_keys, &tuning)?;
+        for reference in input_keys {
+            let reference = reference.to_owned();
             let key = KeyRepository::find_by_ref_for_share(conn, &reference)
                 .await?
                 .ok_or_else(denied)?;
@@ -688,6 +703,7 @@ impl QueueConfigurationInputRepository {
             sealed,
             fence,
             metadata,
+            render_keys,
             acceptance_sources: transfers
                 .iter()
                 .map(QueueInputTransfer::live_source)
@@ -738,6 +754,7 @@ impl QueueConfigurationInputRepository {
         if actual != sealed.binding || sealed.keys.keys().ne(sealed.binding.keys.keys()) {
             return Err(denied());
         }
+        let render_keys = validate_selector_partition(&sealed, &metadata)?;
         if let Some(id) = configuration {
             let revision = Configuration::find(&mut *conn, id)
                 .await?
@@ -762,9 +779,38 @@ impl QueueConfigurationInputRepository {
             sealed,
             fence,
             metadata,
+            render_keys,
             acceptance_sources: Vec::new(),
         })
     }
+}
+
+fn bound_input_keys<'a>(
+    render_keys: &'a [String],
+    tuning: &'a QueueTuningInputs,
+) -> Result<std::collections::BTreeSet<&'a str>> {
+    let keys: std::collections::BTreeSet<_> = render_keys
+        .iter()
+        .map(String::as_str)
+        .chain(tuning.key_refs())
+        .collect();
+    if keys.len() > 256 {
+        return Err(denied());
+    }
+    Ok(keys)
+}
+
+fn validate_selector_partition(sealed: &Sealed, metadata: &Value) -> Result<Vec<String>> {
+    let tuning = QueueTuningInputs::from_metadata(metadata)?;
+    let render_keys = fixed_key_references(&metadata["action_params"], &sealed.configuration)?;
+    if tuning.uses_pack_configuration() && sealed.binding.configuration.is_none()
+        || bound_input_keys(&render_keys, &tuning)?
+            .into_iter()
+            .ne(sealed.binding.keys.keys().map(String::as_str))
+    {
+        return Err(denied());
+    }
+    Ok(render_keys)
 }
 
 async fn binding(
