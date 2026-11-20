@@ -407,6 +407,8 @@ def test_managed_queue_native_workflow_acknowledges_item(client, tmp_path):
         assert settled["ack_summary"]["summary"]["source"] == "native-workflow"
         executions = client.list_executions(action_ref=action, limit=20)
         assert len(executions) == 1 and executions[0]["status"] == "completed"
-        assert executions[0]["worker"] is None
+        execution = client.get_execution(executions[0]["id"])
+        assert execution["worker"] is None
+        assert execution["result"]["queue_ack"]["items"][0]["id"] == identifier
     finally:
         client.put(base, json={"enabled": False, "accepting_new_items": False}).raise_for_status()
