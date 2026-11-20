@@ -235,8 +235,6 @@ and storage configuration.
 
 ### Login disclosure and branding
 
-Set these values before installing or upgrading Attune:
-
 ```yaml
 security:
   loginDisclosure: |-
@@ -249,11 +247,11 @@ branding:
   workflowWatermarkUrl: /branding/workflow-watermark.svg
 ```
 
-The chart writes these optional settings to the application ConfigMap. The
-API reads them at startup. The disclosure is public plain text. The web app
-shows it above the sign-in controls, and `attune auth login`, `sso-login`, and
-`token-login` write it to stderr before authentication. The notice is
-informational.
+On install and upgrade, the chart writes these optional settings to the
+application ConfigMap. The API reads them at startup. The disclosure is public
+plain text. The web app shows it above the sign-in controls, and
+`attune auth login`, `sso-login`, and `token-login` write it to stderr before
+authentication. The notice is informational.
 
 Serve branding images at public HTTPS URLs or absolute paths on the Attune web
 origin. The logo appears on the sign-in page and expanded sidebar. The compact
