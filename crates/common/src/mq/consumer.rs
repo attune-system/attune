@@ -19,8 +19,8 @@ use lapin::{
 use rand::Rng;
 use std::{
     sync::atomic::{AtomicBool, Ordering},
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use tracing::{debug, error, info, warn};
 
@@ -45,6 +45,60 @@ pub struct Consumer {
     stop_notify: Arc<tokio::sync::Notify>,
     /// Consumer configuration
     config: ConsumerConfig,
+    subscription: Option<SubscriptionObservation>,
+}
+
+const SUBSCRIPTION_POLL_INTERVAL: Duration = Duration::from_secs(4);
+const SUBSCRIPTION_FRESHNESS: Duration = Duration::from_secs(12);
+
+/// Local liveness of an actual broker-acknowledged consumer, including its
+/// recovered session. Creating a channel or starting a task cannot set it.
+#[derive(Clone, Default)]
+pub struct SubscriptionObservation(Arc<Mutex<Option<ActiveSubscription>>>);
+
+struct ActiveSubscription {
+    channel: Channel,
+    session: uuid::Uuid,
+    progress: Instant,
+}
+
+impl SubscriptionObservation {
+    pub fn is_current(&self) -> bool {
+        self.0.lock().is_ok_and(|active| {
+            active.as_ref().is_some_and(|session| {
+                session.channel.status().connected()
+                    && session.progress.elapsed() < SUBSCRIPTION_FRESHNESS
+            })
+        })
+    }
+}
+
+struct ObservedSession<'a> {
+    observation: &'a SubscriptionObservation,
+    id: uuid::Uuid,
+}
+
+impl ObservedSession<'_> {
+    fn progressed(&self) {
+        if let Ok(mut state) = self.observation.0.lock() {
+            if let Some(active) = state.as_mut().filter(|active| active.session == self.id) {
+                active.progress = Instant::now();
+            }
+        }
+    }
+}
+
+impl Drop for ObservedSession<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.observation.0.lock() {
+            if active
+                .as_ref()
+                .is_some_and(|session| session.session == self.id)
+            {
+                *active = None;
+            }
+        }
+    }
 }
 
 impl Consumer {
@@ -69,7 +123,16 @@ impl Consumer {
             stopped: Arc::new(AtomicBool::new(false)),
             stop_notify: Arc::new(tokio::sync::Notify::new()),
             config,
+            subscription: None,
         })
+    }
+
+    /// Opt in before starting the loop. Unobserved consumers retain their
+    /// existing event-driven idle behavior.
+    pub fn with_subscription_observation(mut self) -> (Self, SubscriptionObservation) {
+        let observation = SubscriptionObservation::default();
+        self.subscription = Some(observation.clone());
+        (self, observation)
     }
 
     /// Start consuming messages from the queue
@@ -198,10 +261,50 @@ impl Consumer {
         Fut: std::future::Future<Output = MqResult<()>> + Send,
     {
         let mut consumer = self.start_on(channel).await?;
+        let observed = self.subscription.as_ref().and_then(|observation| {
+            let mut state = observation.0.lock().ok()?;
+            if self.stopped.load(Ordering::Acquire) {
+                return None;
+            }
+            let id = uuid::Uuid::new_v4();
+            *state = Some(ActiveSubscription {
+                channel: channel.clone(),
+                session: id,
+                progress: Instant::now(),
+            });
+            Some(ObservedSession { observation, id })
+        });
 
         info!("Consuming messages from queue '{}'", self.config.queue);
 
-        while let Some(delivery) = consumer.next().await {
+        loop {
+            let next = if let Some(session) = &observed {
+                // A recovered subscription may be using a different channel
+                // from stop()'s original one. Stop the actual stream as well.
+                let stopped = self.stop_notify.notified();
+                if self.stopped.load(Ordering::Acquire) {
+                    break;
+                }
+                let next = tokio::select! {
+                    _ = stopped => break,
+                    next = tokio::time::timeout(SUBSCRIPTION_POLL_INTERVAL, consumer.next()) => next,
+                };
+                match next {
+                    Ok(delivery) => delivery,
+                    Err(_) => {
+                        session.progressed();
+                        continue;
+                    }
+                }
+            } else {
+                consumer.next().await
+            };
+            let Some(delivery) = next else {
+                break;
+            };
+            if let Some(session) = &observed {
+                session.progressed();
+            }
             match delivery {
                 Ok(delivery) => {
                     let delivery_tag = delivery.delivery_tag;
@@ -315,6 +418,12 @@ impl Consumer {
         self.stopped.store(true, Ordering::Release);
         self.stop_notify.notify_waiters();
 
+        if let Some(observation) = &self.subscription {
+            if let Ok(mut active) = observation.0.lock() {
+                *active = None;
+            }
+        }
+
         let status = self.channel.status();
         if status.connected() {
             match self
@@ -389,6 +498,77 @@ fn jittered_recovery_delay(cap: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires an owned RabbitMQ broker"]
+    async fn observation_requires_an_acknowledged_live_subscription() {
+        let url = std::env::var("ATTUNE_TEST_RABBITMQ_URL").expect("owned RabbitMQ fixture URL");
+        let connection = Connection::connect(&url).await.expect("fixture broker");
+        let result = std::panic::AssertUnwindSafe(async {
+            let channel = connection.create_channel().await.unwrap();
+            let queue = format!("subscription.{}", uuid::Uuid::new_v4().simple());
+            channel
+                .queue_declare(
+                    queue.as_str().into(),
+                    lapin::options::QueueDeclareOptions {
+                        exclusive: true,
+                        auto_delete: true,
+                        ..Default::default()
+                    },
+                    FieldTable::default(),
+                )
+                .await
+                .unwrap();
+            let (consumer, observation) = Consumer::new(
+                &connection,
+                ConsumerConfig {
+                    queue,
+                    tag: "subscription-boundary".into(),
+                    prefetch_count: 1,
+                    auto_ack: false,
+                    exclusive: false,
+                },
+            )
+            .await
+            .unwrap()
+            .with_subscription_observation();
+            let consumer = Arc::new(consumer);
+            assert!(!observation.is_current());
+            let mut task = {
+                let consumer = consumer.clone();
+                tokio::spawn(async move {
+                    consumer
+                        .consume_once_with_handler(|_: MessageEnvelope<String>| async { Ok(()) })
+                        .await
+                })
+            };
+            let ready = tokio::time::timeout(Duration::from_secs(8), async {
+                while !observation.is_current() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            let stopped = consumer.stop().await;
+            let joined = tokio::time::timeout(Duration::from_secs(5), &mut task).await;
+            if joined.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
+            assert!(
+                ready.is_ok(),
+                "broker subscription did not become observable"
+            );
+            stopped.unwrap();
+            joined.unwrap().unwrap().unwrap();
+            assert!(!observation.is_current());
+        });
+        use futures::FutureExt;
+        let result = result.catch_unwind().await;
+        connection.close().await.unwrap();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
 
     #[test]
     fn test_consumer_config() {

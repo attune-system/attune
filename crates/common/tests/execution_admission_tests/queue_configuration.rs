@@ -1,5 +1,7 @@
 //! Exact queue declaration metadata, independently of runtime readiness activation.
 use super::*;
+#[path = "queue_configuration/completion.rs"]
+mod completion;
 #[path = "queue_configuration/transfer.rs"]
 mod transfer;
 use attune_common::repositories::{
@@ -570,7 +572,7 @@ async fn mixed_queue_case(direct_key: bool, split_ceilings: bool, transferred: b
     };
     let database = create_test_pool().await.unwrap();
     let (db, snapshot, mut policy, human) =
-        fixture_with_queue_shape(database, true, false, None, false, true).await;
+        fixture_with_queue_shape(database, true, false, None, false, true, None).await;
     let other = IdentityFixture::new_unique("second_contributor")
         .create(&db)
         .await
@@ -1684,7 +1686,7 @@ async fn queue_input_creation_marker_never_backfills_history_or_accepts_updated_
     .unwrap()
     .with_cleanup_on_drop();
     let (db, snapshot, policy, human) =
-        fixture_with_queue_shape(db, false, false, None, false, false).await;
+        fixture_with_queue_shape(db, false, false, None, false, false, None).await;
     let mut tx = db.begin().await.unwrap();
     attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
         .await

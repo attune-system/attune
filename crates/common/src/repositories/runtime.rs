@@ -756,8 +756,8 @@ impl WorkerRepository {
 
     /// Atomically replace registration ownership while preserving operator metadata
     /// and cordons. This marker fences worker-row maintenance, not delivery grants.
-    pub async fn register_incarnation(
-        pool: &sqlx::PgPool,
+    pub async fn register_incarnation<'e>(
+        executor: impl sqlx::Executor<'e, Database = Postgres>,
         input: CreateWorkerInput,
         role: crate::models::WorkerRole,
         incarnation: uuid::Uuid,
@@ -772,7 +772,7 @@ impl WorkerRepository {
         ))
         .bind(input.name).bind(input.worker_type).bind(role).bind(input.runtime)
         .bind(input.host).bind(input.port).bind(input.capabilities).bind(incarnation.to_string())
-        .fetch_one(pool).await?)
+        .fetch_one(executor).await?)
     }
 
     pub async fn deregister_incarnation(

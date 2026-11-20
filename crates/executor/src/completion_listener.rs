@@ -26,11 +26,12 @@ use attune_common::{
             UpdateWorkQueueDispatchInput, UpdateWorkQueueItemInput, WorkQueueDispatchRepository,
             WorkQueueItemRepository, WorkQueueItemSearchFilters, WorkQueueRepository,
         },
+        work_queue_output::{AcceptedQueueCompletion, WorkQueueOutputRepository as QueueOutput},
         FindById, Patch, Update,
     },
 };
 use serde_json::{json, Value as JsonValue};
-use sqlx::{PgConnection, PgPool};
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -62,6 +63,7 @@ pub struct CompletionListener {
 }
 
 struct QueueDispatchCompletionFailure {
+    recorded: Option<AcceptedQueueCompletion>,
     retry_limit: u32,
     error_code: &'static str,
     error_message: String,
@@ -406,21 +408,37 @@ impl CompletionListener {
         .await?
         .rows;
 
-        let queue = WorkQueueRepository::find_by_id(pool, dispatch.queue).await?;
-        let expected_ack_version = queue
-            .as_ref()
-            .map(|queue| Self::expected_ack_version_from_queue_config(&queue.config))
-            .unwrap_or_else(|| {
+        let mut tx = pool.begin().await?;
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
+            .await?;
+        let queue = WorkQueueRepository::find_by_id_for_share(&mut tx, dispatch.queue).await?;
+        Self::lock_queue_completion_items(&mut tx, execution.id, &leased_items).await?;
+        let recorded = attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut tx, execution.id).await?;
+        let accepted_completion = if recorded {
+            let queue = queue
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Recorded queue completion is missing its queue"))?;
+            Some(
+                QueueOutput::accepted_completion_config(&mut tx, queue, execution, &leased_items)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let (expected_ack_version, retry_limit) = match (&accepted_completion, queue.as_ref()) {
+            (Some(binding), _) => (binding.ack_version(), binding.retry_limit()),
+            (None, Some(queue)) => (
+                Self::expected_ack_version_from_queue_config(&queue.config),
+                Self::retry_limit_from_queue_config(&queue.config),
+            ),
+            (None, None) => {
                 warn!(
-                    "Queue dispatch {} references missing queue {}, defaulting queue_ack version to 1",
+                    "Queue dispatch {} references missing queue {}",
                     dispatch.id, dispatch.queue
                 );
-                1
-            });
-        let retry_limit = queue
-            .as_ref()
-            .map(|queue| Self::retry_limit_from_queue_config(&queue.config))
-            .unwrap_or(0);
+                (1, 0)
+            }
+        };
 
         if let Err(message) = Self::validate_execution_queue_metadata(
             execution,
@@ -429,11 +447,13 @@ impl CompletionListener {
             expected_ack_version,
         ) {
             return Self::fail_queue_dispatch_completion(
+                tx,
                 pool,
                 execution,
                 &dispatch,
                 &leased_items,
                 QueueDispatchCompletionFailure {
+                    recorded: accepted_completion,
                     retry_limit,
                     error_code: "queue_dispatch_metadata_mismatch",
                     error_message: message,
@@ -445,11 +465,13 @@ impl CompletionListener {
 
         if leased_items.is_empty() {
             return Self::fail_queue_dispatch_completion(
+                tx,
                 pool,
                 execution,
                 &dispatch,
                 &leased_items,
                 QueueDispatchCompletionFailure {
+                    recorded: accepted_completion,
                     retry_limit,
                     error_code: "queue_dispatch_items_missing",
                     error_message: format!(
@@ -463,26 +485,42 @@ impl CompletionListener {
         }
 
         let expected_item_ids: Vec<_> = leased_items.iter().map(|item| item.id).collect();
-        let mut tx = pool.begin().await?;
-        Self::lock_queue_completion_items(&mut tx, execution.id, &leased_items).await?;
-        let queue_ack = match Self::queue_ack_for_completion(
-            &mut tx,
-            execution,
-            &expected_item_ids,
-            expected_ack_version,
-            encryption_key,
-        )
-        .await?
-        {
+        let (validation, recorded_origins) = if let Some(accepted) = &accepted_completion {
+            use attune_common::repositories::delegated_execution::ProtectedQueueAck;
+            let (ack, origins) =
+                QueueOutput::recorded_ack_controls(&mut tx, accepted, encryption_key).await?;
+            let validation = match ack {
+                ProtectedQueueAck::Controls(ack) => Ok(ack),
+                _ => Err((
+                    "queue_ack_invalid",
+                    "Recorded queue acknowledgement is missing or invalid".into(),
+                )),
+            };
+            (validation, Some(origins))
+        } else {
+            (
+                Self::queue_ack_for_completion(
+                    &mut tx,
+                    execution,
+                    &expected_item_ids,
+                    expected_ack_version,
+                    encryption_key,
+                )
+                .await?,
+                None,
+            )
+        };
+        let queue_ack = match validation {
             Ok(queue_ack) => queue_ack,
             Err((error_code, message)) => {
-                tx.rollback().await?;
                 return Self::fail_queue_dispatch_completion(
+                    tx,
                     pool,
                     execution,
                     &dispatch,
                     &leased_items,
                     QueueDispatchCompletionFailure {
+                        recorded: accepted_completion,
                         retry_limit,
                         error_code,
                         error_message: message,
@@ -553,6 +591,12 @@ impl CompletionListener {
             },
         )
         .await?;
+        if let Some(accepted) = &accepted_completion {
+            accepted.ensure_fresh_on(&mut tx).await?;
+        }
+        if let Some(origins) = &recorded_origins {
+            origins.ensure_fresh_on(&mut tx).await?;
+        }
         tx.commit().await?;
 
         for item in &leased_items {
@@ -601,6 +645,7 @@ impl CompletionListener {
     }
 
     async fn fail_queue_dispatch_completion(
+        mut tx: Transaction<'_, Postgres>,
         pool: &PgPool,
         execution: &Execution,
         dispatch: &WorkQueueDispatch,
@@ -608,9 +653,11 @@ impl CompletionListener {
         failure: QueueDispatchCompletionFailure,
         publisher: &Publisher,
     ) -> Result<Execution> {
-        let mut tx = pool.begin().await?;
-        Self::lock_queue_completion_items(&mut tx, execution.id, leased_items).await?;
-        attune_common::repositories::delegated_execution::DelegatedExecutionRepository::require_closed_output(&mut tx, execution.id).await?;
+        if let Some(accepted) = &failure.recorded {
+            QueueOutput::require_closed_recorded_producer(&mut tx, accepted).await?;
+        } else {
+            attune_common::repositories::delegated_execution::DelegatedExecutionRepository::require_closed_output(&mut tx, execution.id).await?;
+        }
         let retry_error = json!({
             "code": failure.error_code,
             "message": failure.error_message,
@@ -684,6 +731,9 @@ impl CompletionListener {
             execution.clone()
         };
 
+        if let Some(accepted) = &failure.recorded {
+            accepted.ensure_fresh_on(&mut tx).await?;
+        }
         tx.commit().await?;
 
         warn!(

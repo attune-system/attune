@@ -111,7 +111,8 @@ END $bind$;
 -- prove the same process-local claim, even after the observation is withdrawn
 -- or expires. A replacement process needs a new staged boot and reporter.
 CREATE FUNCTION report_recorded_consumer(
-    snapshot JSONB, member_id UUID, boot_id UUID, claim UUID, mask INTEGER, target_worker BIGINT
+    snapshot JSONB, member_id UUID, boot_id UUID, claim UUID, mask INTEGER,
+    target_worker BIGINT, reserve_worker BOOLEAN DEFAULT FALSE
 ) RETURNS VOID
 LANGUAGE plpgsql SECURITY DEFINER AS $report$
 DECLARE
@@ -130,11 +131,35 @@ BEGIN
         );
 
     IF NOT FOUND OR claim IS NULL OR claim = '00000000-0000-0000-0000-000000000000'
+        OR reserve_worker IS NULL
         OR (mask IS NOT NULL AND mask <> binding.required_mask) THEN
         RAISE EXCEPTION 'Consumer observation not authorized' USING ERRCODE = '42501';
     END IF;
 
+    -- The worker needs its registration and queue ID before it can subscribe.
+    -- Reserve the assigned boot without advertising support in the same
+    -- transaction as registration. An already claimed boot cannot replace it.
+    IF reserve_worker THEN
+        IF binding.role <> 'worker' OR mask IS NOT NULL OR target_worker IS NOT NULL THEN
+            RAISE EXCEPTION 'Only a worker can reserve its registration boot' USING ERRCODE = '42501';
+        END IF;
+        INSERT INTO recorded_consumer_observation (rollout, instance, process_claim)
+        VALUES (binding.rollout, binding.instance, claim)
+        ON CONFLICT (rollout, instance) DO NOTHING;
+        IF NOT FOUND AND NOT EXISTS (
+            SELECT 1 FROM recorded_consumer_observation
+            WHERE rollout = binding.rollout AND instance = binding.instance AND process_claim = claim
+        ) THEN
+            RAISE EXCEPTION 'Consumer observation belongs to another process' USING ERRCODE = '42501';
+        END IF;
+        RETURN;
+    END IF;
+
     IF (mask IS NOT NULL AND binding.role = 'worker') <> (target_worker IS NOT NULL)
+        OR (target_worker IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM recorded_consumer_observation
+            WHERE rollout = binding.rollout AND instance = binding.instance AND process_claim = claim
+        ))
         OR (target_worker IS NOT NULL AND NOT EXISTS (
             SELECT 1 FROM worker AS registration
             WHERE registration.id = target_worker
@@ -230,7 +255,7 @@ BEGIN
 END $read$;
 
 REVOKE ALL ON FUNCTION bind_recorded_consumer(UUID, UUID, UUID, NAME),
-    report_recorded_consumer(JSONB, UUID, UUID, UUID, INTEGER, BIGINT), current_recorded_consumer_evidence(UUID),
+    report_recorded_consumer(JSONB, UUID, UUID, UUID, INTEGER, BIGINT, BOOLEAN), current_recorded_consumer_evidence(UUID),
     recorded_worker_registration_matches(worker, JSONB, UUID, UUID, TIMESTAMPTZ) FROM PUBLIC;
 
 DO $path$
@@ -238,7 +263,7 @@ DECLARE signature TEXT;
 BEGIN
     FOREACH signature IN ARRAY ARRAY[
         'bind_recorded_consumer(UUID, UUID, UUID, NAME)',
-        'report_recorded_consumer(JSONB, UUID, UUID, UUID, INTEGER, BIGINT)',
+        'report_recorded_consumer(JSONB, UUID, UUID, UUID, INTEGER, BIGINT, BOOLEAN)',
         'recorded_worker_registration_matches(worker, JSONB, UUID, UUID, TIMESTAMPTZ)',
         'current_recorded_consumer_evidence(UUID)'
     ] LOOP
@@ -262,7 +287,7 @@ BEGIN
         CROSS JOIN LATERAL aclexplode(COALESCE(procedure.proacl, acldefault('f', procedure.proowner))) AS acl
         WHERE procedure.oid IN (
             'bind_recorded_consumer(UUID, UUID, UUID, NAME)'::REGPROCEDURE,
-            'report_recorded_consumer(JSONB, UUID, UUID, UUID, INTEGER, BIGINT)'::REGPROCEDURE,
+            'report_recorded_consumer(JSONB, UUID, UUID, UUID, INTEGER, BIGINT, BOOLEAN)'::REGPROCEDURE,
             'recorded_worker_registration_matches(worker, JSONB, UUID, UUID, TIMESTAMPTZ)'::REGPROCEDURE,
             'current_recorded_consumer_evidence(UUID)'::REGPROCEDURE
         ) AND acl.grantee <> procedure.proowner

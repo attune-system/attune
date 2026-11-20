@@ -98,7 +98,7 @@ pub struct ActionExecutor {
     runtime_envs_dir: PathBuf,
     api_url: String,
     jwt_config: JwtConfig,
-    recorded_readiness: crate::recorded_credentials::RecordedConsumerReadiness,
+    recorded_boot: OnceLock<uuid::Uuid>,
     /// Transport abstraction for artifact file content.
     transport: Arc<dyn ArtifactFileTransport>,
     action_cache_by_id: Arc<MetadataCache<String, Action>>,
@@ -299,6 +299,7 @@ impl ExecutionLogArtifactStream {
 struct ExecutionPreparation {
     binding: ActionSchemaBinding,
     parameter_secret_paths: Option<Vec<String>>,
+    recorded_delivery: OnceLock<attune_common::repositories::worker_delivery::DeliveryContext>,
     stdout_path: Arc<OnceLock<PathBuf>>,
     stderr_path: Arc<OnceLock<PathBuf>>,
 }
@@ -339,15 +340,35 @@ fn inline_action_source(
 }
 
 impl ActionExecutor {
-    /// Integration startup must prove all consumers are ready before enabling
-    /// recorded issuance. No production caller enables this yet.
-    pub fn with_recorded_readiness(
-        mut self,
-        readiness: crate::recorded_credentials::RecordedConsumerReadiness,
-    ) -> Result<Self> {
-        readiness.require_ready()?;
-        self.recorded_readiness = readiness;
-        Ok(self)
+    pub(crate) fn validate_recorded_installation(&self) -> Result<()> {
+        let encryption_key = self.secret_manager.encryption_key();
+        if !encryption_key.is_some_and(|key| key.trim().len() >= 32)
+            || self.jwt_config.secret.trim().len() < 32
+            || self.jwt_config.secret == JwtConfig::default().secret
+            || !self.runtime_registry.list_runtimes().contains(&"native")
+        {
+            return Err(Error::validation(
+                "Recorded worker requires configured cryptography and the native runner",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Called by the worker service after its exact DB member registration and
+    /// broker subscriptions are installed. The boot stays bound for retained
+    /// executions even when the service can no longer advertise new work.
+    pub(crate) fn record_installed_boot(&self, boot: uuid::Uuid) -> Result<()> {
+        if *self.recorded_boot.get_or_init(|| boot) != boot {
+            return Err(Error::invalid_state("Recorded worker boot changed"));
+        }
+        Ok(())
+    }
+
+    fn installed_recorded_boot(&self) -> Result<uuid::Uuid> {
+        self.recorded_boot
+            .get()
+            .copied()
+            .ok_or_else(|| Error::PermissionDenied("Recorded worker support is unavailable".into()))
     }
 
     pub fn with_child_environment(
@@ -407,7 +428,7 @@ impl ActionExecutor {
             runtime_envs_dir,
             api_url,
             jwt_config,
-            recorded_readiness: Default::default(),
+            recorded_boot: OnceLock::new(),
             transport,
             action_cache_by_id: Arc::new(MetadataCache::new(
                 ACTION_CACHE_TTL,
@@ -580,8 +601,8 @@ impl ActionExecutor {
         let mut tx = self.pool.begin().await?;
         let authority = attune_common::repositories::execution_runtime_admission::ExecutionAdmissionRepository::existing_authority(&mut tx, execution_id).await?;
         if authority == attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Recorded {
-            self.recorded_readiness.require_ready()?;
-            let assignment = recorded_assignment.filter(|assignment| assignment.worker_id == worker)
+            let installed = self.installed_recorded_boot()?;
+            let assignment = recorded_assignment.filter(|assignment| assignment.worker_id == worker && assignment.boot == installed)
                 .ok_or_else(|| Error::PermissionDenied("Recorded worker assignment is unavailable".into()))?;
             let execution = ExecutionRepository::find_by_id_for_update(&mut tx, execution_id).await?
                 .ok_or_else(|| Error::PermissionDenied("Execution unavailable".into()))?;
@@ -664,6 +685,7 @@ impl ActionExecutor {
                 }
             },
             parameter_secret_paths: None,
+            recorded_delivery: OnceLock::new(),
             stdout_path: Arc::new(OnceLock::new()),
             stderr_path: Arc::new(OnceLock::new()),
         };
@@ -836,12 +858,28 @@ impl ActionExecutor {
         execution_id: i64,
         message: &'static str,
     ) -> Result<ExecutionTransition> {
+        let result = serde_json::json!({"succeeded":false,"error":message});
+        let worker = self.worker_id.load(Ordering::Acquire);
+        if self.recorded_boot.get().is_some() {
+            if let Some(delivery) = crate::completion::register_execution(
+                &self.pool,
+                execution_id,
+                worker,
+                self.worker_instance,
+            )
+            .await?
+            {
+                return self
+                    .complete_recorded_execution(&delivery, ExecutionStatus::Failed, result)
+                    .await;
+            }
+        }
         ExecutionRepository::transition_worker(
             &self.pool,
             execution_id,
-            Some(self.worker_id.load(Ordering::Acquire)).filter(|id| *id > 0),
+            Some(worker).filter(|id| *id > 0),
             ExecutionStatus::Failed,
-            Some(serde_json::json!({"succeeded":false,"error":message})),
+            Some(result),
         )
         .await
     }
@@ -1061,7 +1099,7 @@ impl ActionExecutor {
         ).await?;
         drop(authority_connection);
         if authority == attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Recorded {
-            self.recorded_readiness.require_ready()?;
+            self.installed_recorded_boot()?;
         }
 
         // Extract parameters from execution config.
@@ -1164,14 +1202,13 @@ impl ActionExecutor {
             ).await? == attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Recorded;
             admission_tx.commit().await?;
             if recorded {
-                let token = crate::recorded_credentials::mint_recorded_execution_token(
+                let token = crate::recorded_credentials::mint_for_claimed_worker(
                     &self.pool,
                     execution,
                     self.worker_id.load(Ordering::SeqCst),
                     uuid::Uuid::new_v4(),
                     execution_timeout as i64,
                     &self.jwt_config,
-                    self.recorded_readiness,
                 )
                 .await?
                 .ok_or_else(|| {
@@ -1905,6 +1942,16 @@ impl ActionExecutor {
             self.worker_instance,
         )
         .await?;
+        if let Some(delivery) = &delivery {
+            preparation
+                .recorded_delivery
+                .set(delivery.clone())
+                .map_err(|_| {
+                    Error::PermissionDenied(
+                        "Recorded worker launch already has a delivery context".into(),
+                    )
+                })?;
+        }
         let mut connection = self.pool.acquire().await?;
         let protected_delegation =
             attune_common::repositories::delegated_execution::DelegatedExecutionRepository::find(
@@ -2484,6 +2531,11 @@ impl ActionExecutor {
         }
 
         record_runtime_log_capture(&mut result_data, result, Some(preparation.log_allocation()));
+        if let Some(delivery) = preparation.recorded_delivery.get() {
+            return self
+                .complete_recorded_execution(delivery, ExecutionStatus::Completed, result_data)
+                .await;
+        }
         result_data = self
             .redact_execution_result_data(execution_id, action, result_data, Some(preparation))
             .await?;
@@ -2514,6 +2566,32 @@ impl ActionExecutor {
         {
             result_data["queue_ack"] = queue_ack.clone();
         }
+    }
+
+    async fn complete_recorded_execution(
+        &self,
+        delivery: &attune_common::repositories::worker_delivery::DeliveryContext,
+        status: ExecutionStatus,
+        result: JsonValue,
+    ) -> Result<ExecutionTransition> {
+        use attune_common::repositories::worker_delivery::WorkerDeliveryRepository;
+
+        if delivery.worker != self.worker_id.load(Ordering::Acquire)
+            || delivery.worker_instance != self.worker_instance
+        {
+            return Err(Error::PermissionDenied(
+                "Recorded worker result has the wrong producer".into(),
+            ));
+        }
+        let key = self.secret_manager.encryption_key().ok_or_else(|| {
+            Error::PermissionDenied("Recorded worker result encryption is unavailable".into())
+        })?;
+        let mut tx = self.pool.begin().await?;
+        let terminal =
+            WorkerDeliveryRepository::complete_result(&mut tx, delivery, status, result, key)
+                .await?;
+        tx.commit().await?;
+        Ok(terminal)
     }
 
     async fn redact_execution_result_data(
@@ -2765,6 +2843,29 @@ impl ActionExecutor {
                 preparation.map(ExecutionPreparation::log_allocation),
             );
         }
+        if let Some(delivery) = preparation.and_then(|source| source.recorded_delivery.get()) {
+            return self
+                .complete_recorded_execution(delivery, ExecutionStatus::Failed, result_data)
+                .await;
+        }
+        if self.recorded_boot.get().is_some() {
+            let worker = self.worker_id.load(Ordering::Acquire);
+            if let Some(delivery) = crate::completion::register_execution(
+                &self.pool,
+                execution_id,
+                worker,
+                self.worker_instance,
+            )
+            .await?
+            {
+                return self
+                    .complete_recorded_execution(
+                        &delivery, ExecutionStatus::Failed,
+                        serde_json::json!({"succeeded":false,"error":"Recorded execution could not start"}),
+                    )
+                    .await;
+            }
+        }
         if let Some(action) = action {
             result_data = self
                 .redact_execution_result_data(execution_id, action, result_data, preparation)
@@ -2830,6 +2931,12 @@ impl ActionExecutor {
         }
 
         record_runtime_log_capture(&mut result_data, result, Some(preparation.log_allocation()));
+
+        if let Some(delivery) = preparation.recorded_delivery.get() {
+            return self
+                .complete_recorded_execution(delivery, ExecutionStatus::Cancelled, result_data)
+                .await;
+        }
 
         result_data = self
             .redact_execution_result_data(execution_id, action, result_data, Some(preparation))
@@ -2899,6 +3006,12 @@ impl ActionExecutor {
         }
 
         record_runtime_log_capture(&mut result_data, result, Some(preparation.log_allocation()));
+
+        if let Some(delivery) = preparation.recorded_delivery.get() {
+            return self
+                .complete_recorded_execution(delivery, ExecutionStatus::Timeout, result_data)
+                .await;
+        }
 
         result_data = self
             .redact_execution_result_data(execution_id, action, result_data, Some(preparation))

@@ -28,13 +28,22 @@ pub async fn register(
     worker: i64,
     instance: Uuid,
 ) -> Result<Option<DeliveryContext>> {
+    register_execution(pool, execution.id, worker, instance).await
+}
+
+pub(crate) async fn register_execution(
+    pool: &PgPool,
+    id: i64,
+    worker: i64,
+    instance: Uuid,
+) -> Result<Option<DeliveryContext>> {
     let mut tx = pool.begin().await?;
-    if ExecutionAdmissionRepository::existing_authority(&mut tx, execution.id).await?
+    if ExecutionAdmissionRepository::existing_authority(&mut tx, id).await?
         == attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Delegated
     {
         return Ok(None);
     }
-    let execution = ExecutionRepository::find_by_id(&mut *tx, execution.id)
+    let execution = ExecutionRepository::find_by_id(&mut *tx, id)
         .await?
         .ok_or_else(|| Error::PermissionDenied("Recorded execution unavailable".into()))?;
     let snapshot = pinned_snapshot(&execution)?;

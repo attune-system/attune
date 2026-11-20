@@ -6,6 +6,7 @@
 use attune_common::config::Config;
 use attune_common::error::{Error, Result};
 use attune_common::models::{WorkerRole, WorkerType};
+use attune_common::repositories::recorded_consumer_observations::RecordedConsumerIdentity;
 use attune_common::repositories::runtime::{CreateWorkerInput, WorkerRepository};
 use attune_common::runtime_detection::{normalize_runtime_name, RuntimeDetector};
 use attune_common::scheduling::{
@@ -346,26 +347,49 @@ impl WorkerRegistration {
 
     /// Register the worker in the database
     pub async fn register(&mut self) -> Result<i64> {
+        self.register_with_rollout(None).await
+    }
+
+    pub(crate) async fn register_with_rollout(
+        &mut self,
+        rollout: Option<&RecordedConsumerIdentity>,
+    ) -> Result<i64> {
         info!("Registering worker: {}", self.worker_name);
 
-        // Generate only at registration; heartbeat/capability refreshes retain it.
-        let incarnation = uuid::Uuid::new_v4();
-        let worker = WorkerRepository::register_incarnation(
-            &self.pool,
-            CreateWorkerInput {
-                name: self.worker_name.clone(),
-                worker_type: self.worker_type,
-                runtime: self.runtime_id,
-                host: self.host.clone(),
-                port: self.port,
-                status: None,
-                capabilities: Some(serde_json::to_value(&self.capabilities)?),
-                meta: None,
-            },
-            self.worker_role,
-            incarnation,
-        )
-        .await?;
+        let input = CreateWorkerInput {
+            name: self.worker_name.clone(),
+            worker_type: self.worker_type,
+            runtime: self.runtime_id,
+            host: self.host.clone(),
+            port: self.port,
+            status: None,
+            capabilities: Some(serde_json::to_value(&self.capabilities)?),
+            meta: None,
+        };
+        let (worker, incarnation) = if let Some(rollout) = rollout {
+            if self.worker_role != WorkerRole::Action {
+                return Err(Error::validation(
+                    "Only an Action worker can join a recorded rollout",
+                ));
+            }
+            let (worker, boot) = rollout.register_worker(&self.pool, input).await?;
+            if let Some(capability) = worker.capabilities.as_ref().and_then(|capabilities| {
+                capabilities.get(attune_common::execution_authority::RECORDED_EXECUTION_CAPABILITY)
+            }) {
+                self.capabilities.insert(
+                    attune_common::execution_authority::RECORDED_EXECUTION_CAPABILITY.into(),
+                    capability.clone(),
+                );
+            }
+            (worker, boot)
+        } else {
+            // Heartbeat and capability refreshes retain this incarnation.
+            let boot = uuid::Uuid::new_v4();
+            let worker =
+                WorkerRepository::register_incarnation(&self.pool, input, self.worker_role, boot)
+                    .await?;
+            (worker, boot)
+        };
         self.incarnation = incarnation;
         let worker_id = worker.id;
 

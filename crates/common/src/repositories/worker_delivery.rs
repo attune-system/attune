@@ -105,6 +105,42 @@ impl DeliveryPermit {
 
 pub struct WorkerDeliveryRepository;
 impl WorkerDeliveryRepository {
+    /// Startup preflight for the recorded worker's input, provenance, log,
+    /// and terminal write paths. This does not admit an execution.
+    pub async fn recorded_access_available(connection: &mut PgConnection) -> Result<bool> {
+        sqlx::query_scalar(
+            "SELECT NOT EXISTS (
+                SELECT 1
+                FROM (
+                    VALUES
+                      ('execution_authority_selection', ARRAY['SELECT']),
+                      ('recorded_queue_execution_input', ARRAY['SELECT']),
+                      ('recorded_queue_item_input', ARRAY['SELECT']),
+                      ('runtime_input_receipt', ARRAY['SELECT']),
+                      ('execution_secret_value', ARRAY['SELECT','INSERT','DELETE']),
+                      ('runtime_authority_execution_fence', ARRAY['SELECT','UPDATE']),
+                      ('runtime_authority_execution_attempt', ARRAY['SELECT','INSERT']),
+                      ('worker_delivery_context', ARRAY['SELECT','INSERT']),
+                      ('worker_delivery_permit', ARRAY['SELECT','INSERT']),
+                      ('execution_runtime_read_fence', ARRAY['SELECT','INSERT','UPDATE']),
+                      ('execution_runtime_read_origin', ARRAY['SELECT']),
+                      ('execution_key_read_origin', ARRAY['SELECT']),
+                      ('delegated_execution_attempt', ARRAY['UPDATE']),
+                      ('execution', ARRAY['SELECT','UPDATE']),
+                      ('artifact', ARRAY['SELECT','INSERT','UPDATE']),
+                      ('artifact_version', ARRAY['SELECT','INSERT','UPDATE']),
+                      ('log_stream', ARRAY['SELECT','INSERT','UPDATE'])
+                ) AS required(name, privileges)
+                CROSS JOIN LATERAL unnest(required.privileges) AS privilege(name)
+                WHERE to_regclass(required.name) IS NULL
+                    OR NOT has_table_privilege(current_user, to_regclass(required.name), privilege.name)
+            )",
+        )
+        .fetch_one(connection)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Staged close source identity: server primary IDs, never bearer UUIDs.
     /// Caller already holds admission/execution protection and shared graph.
     pub async fn lock_log_context(
@@ -133,6 +169,111 @@ impl WorkerDeliveryRepository {
         super::runtime_authority::RuntimeAdmissionRecord,
         DeliveryEffectFence,
     )> {
+        Self::require_active_context(connection, context, &["running"]).await
+    }
+
+    /// Worker terminal publication uses the same immutable producer context as
+    /// launch. Cancellation preserves that producer until its result is closed.
+    async fn require_result_context(
+        connection: &mut PgConnection,
+        context: &DeliveryContext,
+    ) -> Result<DeliveryEffectFence> {
+        Ok(
+            Self::require_active_context(connection, context, &["running", "canceling"])
+                .await?
+                .1,
+        )
+    }
+
+    /// Close runtime reads, save classified output, and publish the terminal
+    /// row in the same worker-attempt transaction.
+    pub async fn complete_result(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        context: &DeliveryContext,
+        status: crate::models::ExecutionStatus,
+        result: serde_json::Value,
+        key: &str,
+    ) -> Result<super::execution::ExecutionTransition> {
+        use super::{
+            execution::ExecutionRepository,
+            execution_key_read::ExecutionKeyReadRepository,
+            execution_secret_value::ExecutionSecretValueRepository as Secrets,
+            runtime_read::RuntimeReadRepository,
+            schema_contract::{BindingOwner, SchemaContractRepository},
+        };
+        use crate::{
+            secret_provenance::{SecretOrigin, SecretProvenance},
+            secret_values::{
+                prepare_secret_values, ENTITY_EXECUTION_CONFIG, ENTITY_EXECUTION_RESULT,
+            },
+        };
+        let execution = context.execution;
+        let effect = Self::require_result_context(tx, context).await?;
+        let binding = SchemaContractRepository::find(tx, BindingOwner::Execution, execution)
+            .await?
+            .ok_or_else(denied)?;
+        let mut origins = RuntimeReadRepository::close_execution(tx, execution).await?;
+        let mut key_reads =
+            ExecutionKeyReadRepository::origins_for_executions(&mut **tx, &[execution]).await?;
+        origins.extend(
+            key_reads
+                .remove(&execution)
+                .unwrap_or_default()
+                .into_iter()
+                .map(SecretOrigin::Key),
+        );
+        let fields =
+            Secrets::find_bounded_provenance(&mut **tx, &[ENTITY_EXECUTION_CONFIG], &[execution])
+                .await?;
+        if fields.len() > 256 {
+            return Err(denied());
+        }
+        origins.extend(fields.into_iter().map(|field| SecretOrigin::Entity {
+            entity_type: ENTITY_EXECUTION_CONFIG.into(),
+            entity_id: execution,
+            path: field.json_path,
+        }));
+        let classified = crate::output_classification::classify_action_output(
+            result,
+            binding.output.as_ref(),
+            binding.output_format,
+            binding.output_policy,
+            execution,
+            &SecretProvenance {
+                origins,
+                templates: Vec::new(),
+            },
+        )?;
+        let fields = prepare_secret_values(classified.structured_secrets, key)?;
+        let channels = prepare_secret_values(classified.channel_secrets, key)?;
+        Secrets::replace_entity_with_conn(tx, ENTITY_EXECUTION_RESULT, execution, &fields).await?;
+        Secrets::replace_entity_with_conn(
+            tx,
+            crate::output_classification::ENTITY_EXECUTION_OUTPUT_CHANNEL,
+            execution,
+            &channels,
+        )
+        .await?;
+        let terminal = ExecutionRepository::transition_worker(
+            &mut **tx,
+            execution,
+            Some(context.worker),
+            status,
+            Some(classified.public_result),
+        )
+        .await?;
+        effect.ensure_fresh_on(tx).await?;
+        Ok(terminal)
+    }
+
+    async fn require_active_context(
+        connection: &mut PgConnection,
+        context: &DeliveryContext,
+        allowed_statuses: &[&str],
+    ) -> Result<(
+        super::runtime_authority::RuntimeAdmissionRecord,
+        DeliveryEffectFence,
+    )> {
         let (admission, approval) = ExecutionAdmissionRepository::require_with_fence(
             connection,
             RuntimeOwner::Execution(context.execution),
@@ -152,7 +293,11 @@ impl WorkerDeliveryRepository {
             || persisted.worker_instance != context.worker_instance
             || persisted.deadline != context.deadline
             || persisted.deadline <= Utc::now()
-            || current != Some((Some(persisted.worker), "running".into(), persisted.attempt))
+            || current.is_none_or(|(worker, status, attempt)| {
+                worker != Some(persisted.worker)
+                    || attempt != persisted.attempt
+                    || !allowed_statuses.contains(&status.as_str())
+            })
         {
             return Err(denied());
         }

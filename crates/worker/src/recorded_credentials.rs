@@ -27,6 +27,20 @@ pub async fn mint_recorded_execution_token(
         return Ok(None);
     }
     readiness.require_ready()?;
+    mint_for_claimed_worker(pool, execution, worker_id, attempt, ttl_seconds, config).await
+}
+
+pub(crate) async fn mint_for_claimed_worker(
+    pool: &PgPool,
+    execution: &Execution,
+    worker_id: i64,
+    attempt: Uuid,
+    ttl_seconds: i64,
+    config: &JwtConfig,
+) -> Result<Option<String>> {
+    if execution.permission_set_refs.is_empty() {
+        return Ok(None);
+    }
     if ttl_seconds <= 0 {
         return Err(Error::validation(
             "Execution token lifetime must be positive",

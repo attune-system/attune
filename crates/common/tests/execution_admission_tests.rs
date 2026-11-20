@@ -152,6 +152,7 @@ async fn fixture_on_database_with_output_mismatch(
         staged,
         invalid_output,
         false,
+        None,
     )
     .await
 }
@@ -163,6 +164,7 @@ async fn fixture_with_queue_shape(
     staged: Option<native_staged_completion::Case>,
     invalid_output: bool,
     structured_queue: bool,
+    queue_output: Option<serde_json::Value>,
 ) -> (
     TestDatabase,
     ExecutionExecutableSnapshot,
@@ -198,6 +200,19 @@ async fn fixture_with_queue_shape(
         .create(&db)
         .await
         .unwrap();
+    let worker_queue = queue_output.is_some();
+    if let Some(schema) = queue_output {
+        attune_common::repositories::action::ActionRepository::update(
+            &db,
+            action.id,
+            attune_common::repositories::action::UpdateActionInput {
+                out_schema: Some(schema),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
     if authored_defaults {
         attune_common::repositories::action::ActionRepository::update(
             &db,
@@ -352,9 +367,11 @@ async fn fixture_with_queue_shape(
     )
     .await
     .unwrap();
-    ActionRepository::link_workflow_def(&db, action.id, definition.id)
-        .await
-        .unwrap();
+    if !worker_queue {
+        ActionRepository::link_workflow_def(&db, action.id, definition.id)
+            .await
+            .unwrap();
+    }
     let human = IdentityFixture::new_unique("requester")
         .create(&db)
         .await
@@ -432,7 +449,7 @@ async fn fixture_with_queue_shape(
         owner,
         release_id: release.id,
         release_digest: release.digest,
-        invocations: if empty_workflow {
+        invocations: if empty_workflow || worker_queue {
             vec![invocation, queue, leaf_invocation]
         } else {
             vec![invocation, task, queue, leaf_invocation]

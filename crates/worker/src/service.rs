@@ -19,14 +19,16 @@ use attune_common::db::Database;
 use attune_common::error::{Error, Result};
 use attune_common::models::{pack_install::PackInstallStatus, Execution, ExecutionStatus};
 use attune_common::mq::{
-    config::MessageQueueConfig as MqConfig, routing_keys, ActionChangedPayload, Connection,
-    Consumer, ConsumerConfig, ExecutionCancelRequestedPayload, ExecutionCompletedPayload,
-    ExecutionStatusChangedPayload, MessageEnvelope, MessageType, MqError, PackChangedPayload,
-    PackDeletedPayload, PackRegisteredPayload, PackTestRequestedPayload, Publisher,
-    PublisherConfig, RuntimeChangedPayload,
+    config::MessageQueueConfig as MqConfig, consumer::SubscriptionObservation, routing_keys,
+    ActionChangedPayload, Connection, Consumer, ConsumerConfig, ExecutionCancelRequestedPayload,
+    ExecutionCompletedPayload, ExecutionStatusChangedPayload, MessageEnvelope, MessageType,
+    MqError, PackChangedPayload, PackDeletedPayload, PackRegisteredPayload,
+    PackTestRequestedPayload, Publisher, PublisherConfig, RuntimeChangedPayload,
 };
 use attune_common::repositories::{
     execution::{ExecutionRepository, ExecutionTransition},
+    recorded_consumer_observations::RecordedConsumerIdentity,
+    worker_delivery::WorkerDeliveryRepository,
     FindById, FindByRef, PackInstallRepository, PackRepository, PackTestRepository,
 };
 use attune_common::runtime_cache::purge_pack_runtime_environments;
@@ -231,6 +233,7 @@ pub struct WorkerService {
     publisher: Arc<Publisher>,
     consumer: Option<Arc<Consumer>>,
     consumer_handle: Option<JoinHandle<()>>,
+    recorded_observation: Option<RecordedWorkerObservation>,
     task_reaper_handle: Option<JoinHandle<()>>,
     runtime_tasks: TaskTracker,
     pack_consumer: Option<Arc<Consumer>>,
@@ -268,10 +271,18 @@ pub struct WorkerService {
     startup_mode: StartupMode,
 }
 
+struct RecordedWorkerObservation {
+    identity: Arc<RecordedConsumerIdentity>,
+    execution: Option<SubscriptionObservation>,
+    cancellation: Option<SubscriptionObservation>,
+    renewal: Option<JoinHandle<()>>,
+}
+
 impl WorkerService {
     /// Create a new worker service
     pub async fn new(config: Config) -> Result<Self> {
         info!("Initializing Worker Service");
+        let recorded_identity = RecordedConsumerIdentity::from_environment()?;
         let child_environment =
             attune_common::child_process_environment::ChildProcessEnvironment::capture(
                 config
@@ -653,6 +664,12 @@ impl WorkerService {
             .as_ref()
             .map(|w| w.heartbeat_interval)
             .unwrap_or(30);
+        let heartbeat_interval = if recorded_identity.is_some() {
+            executor.validate_recorded_installation()?;
+            heartbeat_interval.clamp(1, 10)
+        } else {
+            heartbeat_interval
+        };
         let heartbeat = Arc::new(HeartbeatManager::new(
             registration.clone(),
             heartbeat_interval,
@@ -683,6 +700,12 @@ impl WorkerService {
             publisher: Arc::new(publisher),
             consumer: None,
             consumer_handle: None,
+            recorded_observation: recorded_identity.map(|identity| RecordedWorkerObservation {
+                identity: Arc::new(identity),
+                execution: None,
+                cancellation: None,
+                renewal: None,
+            }),
             task_reaper_handle: None,
             runtime_tasks: TaskTracker::new(),
             pack_consumer: None,
@@ -754,7 +777,12 @@ impl WorkerService {
                 "log_delivery_instance".into(),
                 serde_json::json!(self.worker_token_provider.instance_id()),
             );
-            reg.register().await?
+            reg.register_with_rollout(
+                self.recorded_observation
+                    .as_ref()
+                    .map(|proof| proof.identity.as_ref()),
+            )
+            .await?
         };
         self.worker_id = Some(worker_id);
         self.worker_token_provider
@@ -830,9 +858,55 @@ impl WorkerService {
         // Reap completed execution tasks continuously so finished JoinSet
         // entries do not accumulate for the lifetime of a busy worker.
         self.start_task_reaper();
+        self.start_recorded_observation(worker_id).await?;
 
         info!("Worker Service started successfully");
 
+        Ok(())
+    }
+
+    async fn start_recorded_observation(&mut self, worker: i64) -> Result<()> {
+        let Some(recorded) = &mut self.recorded_observation else {
+            return Ok(());
+        };
+        let execution = recorded.execution.clone().ok_or_else(|| {
+            Error::invalid_state("Recorded worker execution subscription is missing")
+        })?;
+        let cancellation = recorded.cancellation.clone().ok_or_else(|| {
+            Error::invalid_state("Recorded worker cancellation subscription is missing")
+        })?;
+        let identity = Arc::clone(&recorded.identity);
+        let pool = self.db_pool.clone();
+        let executor = Arc::clone(&self.executor);
+        let boot = self.registration.read().await.incarnation();
+        recorded.renewal = Some(tokio::spawn(async move {
+            let mut ticks = tokio::time::interval(Duration::from_secs(5));
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticks.tick().await;
+                let result = tokio::time::timeout(Duration::from_secs(3), async {
+                    let mut tx = pool.begin().await?;
+                    if execution.is_current()
+                        && cancellation.is_current()
+                        && WorkerDeliveryRepository::recorded_access_available(&mut tx).await?
+                        && execution.is_current()
+                        && cancellation.is_current()
+                    {
+                        identity.publish_worker(&mut tx, worker).await?;
+                        // The scheduler cannot read the descriptor until commit.
+                        executor.record_installed_boot(boot)?;
+                    } else {
+                        identity.publish(&mut tx, None).await?;
+                    }
+                    tx.commit().await?;
+                    Ok::<(), Error>(())
+                })
+                .await;
+                if !matches!(result, Ok(Ok(()))) {
+                    warn!("Unable to update the recorded worker observation");
+                }
+            }
+        }));
         Ok(())
     }
 
@@ -1397,6 +1471,22 @@ impl WorkerService {
     pub async fn stop(&mut self) -> Result<()> {
         info!("Stopping Worker Service - initiating graceful shutdown");
 
+        if let Some(recorded) = &mut self.recorded_observation {
+            abort_and_join(&mut recorded.renewal).await;
+            if !matches!(
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    recorded
+                        .identity
+                        .publish(&mut *self.db_pool.acquire().await?, None)
+                        .await
+                })
+                .await,
+                Ok(Ok(()))
+            ) {
+                warn!("Unable to withdraw the recorded worker observation");
+            }
+        }
+
         // Stop the only producer of execution tasks before taking ownership of
         // the JoinSet. Awaiting the consumer is the admission barrier, including
         // a handler currently waiting for a concurrency permit.
@@ -1553,20 +1643,25 @@ impl WorkerService {
         );
 
         // Create consumer
-        let consumer = Arc::new(
-            Consumer::new(
-                &self.mq_connection,
-                ConsumerConfig {
-                    queue: queue_name.clone(),
-                    tag: format!("worker-{}", worker_id),
-                    prefetch_count,
-                    auto_ack: false,
-                    exclusive: false,
-                },
-            )
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to create consumer: {}", e)))?,
-        );
+        let consumer = Consumer::new(
+            &self.mq_connection,
+            ConsumerConfig {
+                queue: queue_name.clone(),
+                tag: format!("worker-{}", worker_id),
+                prefetch_count,
+                auto_ack: false,
+                exclusive: false,
+            },
+        )
+        .await
+        .map_err(|e| Error::Internal(format!("Failed to create consumer: {}", e)))?;
+        let consumer = Arc::new(if let Some(recorded) = &mut self.recorded_observation {
+            let (consumer, subscription) = consumer.with_subscription_observation();
+            recorded.execution = Some(subscription);
+            consumer
+        } else {
+            consumer
+        });
 
         info!("Consumer created for queue: {}", queue_name);
 
@@ -1844,20 +1939,25 @@ impl WorkerService {
 
         info!("Starting cancel consumer for queue: {}", queue_name);
 
-        let consumer = Arc::new(
-            Consumer::new(
-                &self.mq_connection,
-                ConsumerConfig {
-                    queue: queue_name.clone(),
-                    tag: format!("worker-{}-cancel", worker_id),
-                    prefetch_count: 10,
-                    auto_ack: false,
-                    exclusive: false,
-                },
-            )
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to create cancel consumer: {}", e)))?,
-        );
+        let consumer = Consumer::new(
+            &self.mq_connection,
+            ConsumerConfig {
+                queue: queue_name.clone(),
+                tag: format!("worker-{}-cancel", worker_id),
+                prefetch_count: 10,
+                auto_ack: false,
+                exclusive: false,
+            },
+        )
+        .await
+        .map_err(|e| Error::Internal(format!("Failed to create cancel consumer: {}", e)))?;
+        let consumer = Arc::new(if let Some(recorded) = &mut self.recorded_observation {
+            let (consumer, subscription) = consumer.with_subscription_observation();
+            recorded.cancellation = Some(subscription);
+            consumer
+        } else {
+            consumer
+        });
 
         let consumer_for_task = consumer.clone();
         let cancel_tokens = self.cancel_tokens.clone();

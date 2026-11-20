@@ -249,6 +249,40 @@ impl ExecutionSecretValueRepository {
             .collect())
     }
 
+    /// The queue completion consumer needs only the control projection. Keep
+    /// unrelated structured outputs and output channels out of this query.
+    pub(super) async fn find_queue_ack_projection(
+        conn: &mut PgConnection,
+        execution: Id,
+    ) -> Result<Vec<StoredSecretValue>> {
+        let rows: Vec<ExecutionSecretValue> = sqlx::query_as(
+            "SELECT id, entity_type, entity_id, json_path, source_kind, source_ref, \
+                    encrypted_value, encryption_key_hash, created \
+             FROM execution_secret_value WHERE entity_type=$1 AND entity_id=$2 \
+                AND (json_path IN ('','/queue_ack') OR json_path LIKE '/queue_ack/%') \
+             ORDER BY json_path LIMIT 257 FOR SHARE",
+        )
+        .bind(crate::secret_values::ENTITY_EXECUTION_RESULT)
+        .bind(execution)
+        .fetch_all(conn)
+        .await?;
+        if rows.len() > 256 {
+            return Err(crate::Error::PermissionDenied(
+                "Queue acknowledgement projection exceeds its bound".into(),
+            ));
+        }
+        Ok(rows
+            .into_iter()
+            .map(|row| StoredSecretValue {
+                json_path: row.json_path,
+                encrypted_value: row.encrypted_value,
+                encryption_key_hash: row.encryption_key_hash,
+                source_kind: row.source_kind,
+                source_ref: row.source_ref,
+            })
+            .collect())
+    }
+
     /// Bind a prepared input buffer to the actual typed source row through
     /// restoration. Call during source preparation, before destination locks.
     pub async fn find_stored_at(

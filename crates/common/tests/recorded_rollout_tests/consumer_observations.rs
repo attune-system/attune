@@ -22,7 +22,7 @@ async fn observer_login(f: &mut Fixture, can_report: bool) -> PgPool {
     f.roles.push(name.clone());
     std::fs::write(&f.manifest, serde_json::to_vec(&f.roles).unwrap()).unwrap();
     let function = if can_report {
-        "report_recorded_consumer(JSONB, UUID, UUID, UUID, INTEGER, BIGINT)"
+        "report_recorded_consumer(JSONB, UUID, UUID, UUID, INTEGER, BIGINT, BOOLEAN)"
     } else {
         "current_recorded_consumer_evidence(UUID)"
     };
@@ -195,6 +195,41 @@ async fn exercise(f: &mut Fixture) {
     assert!(publish_worker(first_login.clone(), worker_id)
         .await
         .is_err());
+    assert!(
+        publish_worker(worker_login.clone(), worker_id)
+            .await
+            .is_err(),
+        "publication requires a prior worker reservation"
+    );
+    let mut tx = first_login.begin().await.unwrap();
+    assert!(first_identity.reserve_worker_boot(&mut tx).await.is_err());
+    tx.rollback().await.unwrap();
+    let mut tx = worker_login.begin().await.unwrap();
+    assert_eq!(
+        worker_identity.reserve_worker_boot(&mut tx).await.unwrap(),
+        worker.boot
+    );
+    tx.rollback().await.unwrap();
+    assert!(
+        publish_worker(worker_login.clone(), worker_id)
+            .await
+            .is_err(),
+        "a rolled-back reservation cannot publish"
+    );
+    let mut tx = worker_login.begin().await.unwrap();
+    worker_identity.reserve_worker_boot(&mut tx).await.unwrap();
+    tx.commit().await.unwrap();
+    assert!(
+        !evidence_ready(&reader).await,
+        "reservation is not readiness"
+    );
+    let replacement_worker = process_identity(&expected.snapshot, worker);
+    let mut tx = worker_login.begin().await.unwrap();
+    assert!(replacement_worker
+        .reserve_worker_boot(&mut tx)
+        .await
+        .is_err());
+    tx.rollback().await.unwrap();
     assert!(publish_worker(worker_login.clone(), i64::MAX)
         .await
         .is_err());

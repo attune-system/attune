@@ -3,7 +3,7 @@
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::Deserialize;
-use sqlx::{PgConnection, Postgres, Transaction};
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
@@ -13,6 +13,8 @@ use crate::execution_authority::consumer_contract::{
     ValidatedConsumerContractSnapshot,
 };
 use crate::{Error, Result};
+
+use super::runtime::{CreateWorkerInput, WorkerRepository};
 
 const OBSERVATION_WINDOW_SECONDS: i64 = 30;
 
@@ -100,6 +102,54 @@ impl RecordedConsumerIdentity {
         ready_role: Option<ConsumerRole>,
     ) -> Result<()> {
         RecordedConsumerObservations::write(connection, self, ready_role, None).await
+    }
+
+    /// Claim the deployment-assigned boot before touching the routing row.
+    /// This stores no readiness and rolls back with unsuccessful registration.
+    pub async fn reserve_worker_boot(&self, tx: &mut Transaction<'_, Postgres>) -> Result<Uuid> {
+        sqlx::query("SELECT report_recorded_consumer($1,$2,$3,$4,NULL,NULL,TRUE)")
+            .bind(serde_json::to_value(&self.snapshot)?)
+            .bind(self.instance)
+            .bind(self.boot)
+            .bind(self.process_claim)
+            .execute(&mut **tx)
+            .await?;
+        Ok(self.boot)
+    }
+
+    /// Register the deployment-assigned Action worker. A process that loses the
+    /// boot claim never writes the existing routing row. Reservation alone
+    /// remains invisible to readiness until real consumers report support.
+    pub async fn register_worker(
+        &self,
+        pool: &PgPool,
+        mut input: CreateWorkerInput,
+    ) -> Result<(crate::models::Worker, Uuid)> {
+        let capabilities = input
+            .capabilities
+            .get_or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or_else(|| Error::validation("Worker capabilities must be an object"))?;
+        capabilities.insert(
+            crate::execution_authority::RECORDED_EXECUTION_CAPABILITY.into(),
+            serde_json::json!({
+            "snapshot": self.snapshot,
+            "instance": self.instance,
+            "boot": self.boot,
+            }),
+        );
+        let mut tx = pool.begin().await?;
+        let boot = self.reserve_worker_boot(&mut tx).await?;
+        let role = crate::models::WorkerRole::Action;
+        let registration =
+            WorkerRepository::register_incarnation(&mut *tx, input, role, boot).await?;
+        if registration.worker_role != role {
+            return Err(Error::PermissionDenied(
+                "Recorded worker registration conflicts with another worker role".into(),
+            ));
+        }
+        tx.commit().await?;
+        Ok((registration, boot))
     }
 
     /// Report installed worker support against this process's own registration.
