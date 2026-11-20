@@ -129,3 +129,12 @@ python3 scripts/render-rollout-job.py --name UNIQUE_ACTIVATE --namespace OWNED_N
 Rendering is not applying. Exact boot IDs/release digest must come from deployment;
 no asset discovers replicas or self-elects boots. SQLx ledger remains mandatory;
 Docker/manual ledger conversion is not attempted.
+
+## Unfrozen cache DDL candidate
+
+The separately requested owner-controlled cache creator is only a
+[candidate investigation](cache-candidate-status.md), outside migrations and not
+operational. PostgreSQL requires the target leaf owner to have schema CREATE;
+the mandated owner-only installation ACL blocks ALTER OWNER. No production grant,
+verifier exception, role adoption or default change has been added to resolve it.
+The test-posture census must be reviewed before any broad harness changes.

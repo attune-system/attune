@@ -2,6 +2,9 @@
 #[cfg(target_os = "linux")]
 #[path = "recorded_rollout_tests/admin_process.rs"]
 mod admin_process;
+#[cfg(target_os = "linux")]
+#[path = "recorded_rollout_tests/cache_boundary.rs"]
+mod cache_boundary;
 #[allow(dead_code)]
 #[path = "../../../tests/sqlx-session/src/commit_relay.rs"]
 mod commit_relay;
@@ -41,6 +44,9 @@ fn membership() -> ExpectedMembership {
         .collect(),
     }
 }
+// Bound this binary's concurrent DROP OWNED/schema cascades to the owned lane lock budget.
+static ROLE_FIXTURE_TEARDOWN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct Fixture {
     db: TestDatabase,
     pools: Vec<PgPool>,
@@ -114,6 +120,7 @@ impl Fixture {
         f
     }
     async fn cleanup(self) {
+        let _teardown = ROLE_FIXTURE_TEARDOWN.lock().await;
         let mut errors = Vec::new();
         for pool in &self.pools {
             pool.close().await;

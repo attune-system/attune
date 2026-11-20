@@ -143,7 +143,7 @@ async fn credential(f: &Fixture, dir: &Path, index: usize) -> std::path::PathBuf
     );
     path
 }
-async fn provision(f: &mut Fixture) {
+pub(super) async fn provision(f: &mut Fixture) {
     let owner = format!("ws2_rollout_owner_{}", Uuid::new_v4().simple());
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM pg_roles WHERE rolname=$1")
@@ -984,7 +984,7 @@ async fn apply_provisioning(f: &Fixture, inventory: &Value) -> sqlx::Result<()> 
     sqlx::raw_sql(&sql).execute(&mut *tx).await?;
     tx.commit().await
 }
-async fn provisioning_assets(f: &mut Fixture) {
+pub(super) async fn provisioning_assets(f: &mut Fixture) {
     let owner = f.roles[4].clone();
     let mut extra = Vec::new();
     for login in [true, false, true] {

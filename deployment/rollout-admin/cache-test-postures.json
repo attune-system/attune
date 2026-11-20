@@ -1,0 +1,1473 @@
+{
+  "scope": "source candidates, includes ignored tests and helper DDL; no assertion that all need runtime creation; CLI has no direct PG identity",
+  "files": [
+    {
+      "path": "crates/api/tests/authz_cache_isolation_tests.rs",
+      "declared_tests": 2,
+      "test_candidates": [
+        {
+          "name": "partial_context_construction_drops_database_owner",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_enabled_equal_identity_ids_remain_app_state_isolated",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        }
+      ],
+      "direct_ddl_lines": [],
+      "maintenance_test_candidates": [],
+      "uses_test_context": true,
+      "uses_owner_pool_fixture": false
+    },
+    {
+      "path": "crates/api/tests/cache_api_tests.rs",
+      "declared_tests": 38,
+      "test_candidates": [
+        {
+          "name": "pack_delete_acquisition_deadline_is_sanitized_503_without_row_or_storage_changes",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "normalized_local_cache_iam_covers_actual_point_effect_and_owner_list_targets",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "live_cache_api_mutates_replays_and_rejects_snapshot_operations",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "live_cache_writes_require_update_permission_and_fail_closed",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "partition_cap_preserves_matching_retry_and_reuse_without_extra_storage",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "partition_lock_timeout_returns_stable_503_and_same_refresh_retry_succeeds",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "partition_creation_failure_rolls_back_metadata_and_retry_contract",
+          "direct_admin_ddl": true,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "pack_delete_handler_waits_for_pin_admission_before_pack_sensor_and_cascade_locks",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "refresh_reuse_is_atomic_and_returns_original_generation_metadata",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "refresh_conflict_exposes_safe_metadata_only_after_cache_authorization",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "namespace_refresh_policy_round_trips_and_keeps_parallel_default",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "execution_refresh_attribution_survives_reuse_and_metadata_reads",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "generation_creation_rejects_client_supplied_execution_attribution",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_clone_delta_api_requires_read_and_preserves_snapshot_publication",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_full_refresh_and_read_lifecycle",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_point_and_multi_lookup_honor_readable_generation_pins",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_reports_not_populated_before_promotion",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "tombstoned_namespace_rejects_refresh_writes_with_specific_code",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_policy_and_page_limits_are_rejected_at_the_api_boundary",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "pack_managed_namespace_metadata_is_read_only_through_the_api",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_namespaces_isolate_external_ids",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_rbac_list_and_read_share_visibility",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_list_without_owner_returns_every_accessible_scope",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_hidden_namespace_is_not_leaked",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_rejects_worker_refresh_and_unsigned_sensor_tokens",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "registered_sensor_tokens_use_exact_signed_read_only_authority",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_chunk_replay_is_idempotent_and_conflicts_on_divergence",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_chunk_route_accepts_bounded_payloads_above_axum_default_limit",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_duplicate_external_id_across_chunks_is_rejected",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_promotion_optimistic_conflict",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_cursor_rejected_across_namespaces",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_quota_rejected_before_promotion",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "successful_chunk_insert_and_replay_emit_redacted_audits",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "aggregate_namespace_quota_returns_stable_api_code",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "api_namespace_recreate_still_conflicts_while_tombstone_drains",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_zero_record_snapshot_is_an_empty_dataset_not_unpopulated",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_metadata_lists_support_filters_and_keyset_cursors",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_rbac_honors_identity_attributes_and_audits_denials",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        }
+      ],
+      "direct_ddl_lines": [
+        {
+          "line": 876,
+          "source": "\"CREATE FUNCTION test_reject_cache_attach() RETURNS event_trigger LANGUAGE plpgsql AS $$ \\"
+        },
+        {
+          "line": 881,
+          "source": "WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION test_reject_cache_attach();\","
+        },
+        {
+          "line": 893,
+          "source": "\"DROP EVENT TRIGGER test_cache_attach_failure; DROP FUNCTION test_reject_cache_attach();\","
+        }
+      ],
+      "maintenance_test_candidates": [],
+      "uses_test_context": true,
+      "uses_owner_pool_fixture": false
+    },
+    {
+      "path": "crates/api/tests/cache_authorization_tests/coverage.rs",
+      "declared_tests": 6,
+      "test_candidates": [
+        {
+          "name": "managed_cache_reads_lists_and_publication_use_exact_declaration_refs",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "canonical_cache_refs_preserve_scope_actions_and_tombstone_fences",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "unmanaged_and_prospective_cache_targets_keep_namespace_authorization",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "recorded_and_delegated_cache_authority_agree_on_canonical_identity",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "worker_process_runtime_can_publish_with_the_unchanged_writer_grant",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "signed_sensor_reader_uses_managed_declaration_refs_without_standard",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        }
+      ],
+      "direct_ddl_lines": [],
+      "maintenance_test_candidates": [],
+      "uses_test_context": true,
+      "uses_owner_pool_fixture": false
+    },
+    {
+      "path": "crates/api/tests/cache_authorization_tests.rs",
+      "declared_tests": 1,
+      "test_candidates": [
+        {
+          "name": "delegated_managed_cache_generation_uses_declaration_ref",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        }
+      ],
+      "direct_ddl_lines": [],
+      "maintenance_test_candidates": [],
+      "uses_test_context": true,
+      "uses_owner_pool_fixture": false
+    },
+    {
+      "path": "crates/api/tests/recorded_execution_events_tests/c_native_cache.rs",
+      "declared_tests": 3,
+      "test_candidates": [
+        {
+          "name": "native_cache_http_default_false_preserves_original_page_after_pointer_rotation",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "native_cache_http_require_fresh_without_deadline_rejects_original_retired_generation",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "native_cache_http_finite_original_deadline_expires_without_pointer_rotation",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        }
+      ],
+      "direct_ddl_lines": [],
+      "maintenance_test_candidates": [],
+      "uses_test_context": false,
+      "uses_owner_pool_fixture": false
+    },
+    {
+      "path": "crates/cli/tests/cache_tests.rs",
+      "declared_tests": 11,
+      "test_candidates": [
+        {
+          "name": "live_namespace_mode_is_sent_when_selected_and_retained_in_metadata",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "live_apply_accepts_complete_record_upserts_from_stdin",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "live_apply_sends_atomic_delta_and_reports_revision",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "live_lookup_accepts_revision_without_exposing_backing_generation",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "generation_show_and_list_display_creator_execution_in_json_and_table",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "clone_begin_and_deletion_only_chunk_send_no_existing_values",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "namespace_policy_is_sent_flat_only_when_explicit_and_retained_in_json",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "invalid_refresh_concurrency_fails_before_http",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "apply_reused_refresh_never_uploads_seals_promotes_or_abandons",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "begin_returns_reused_metadata_and_creator_without_writes",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "apply_same_refresh_id_replay_can_upload_and_publish",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        }
+      ],
+      "direct_ddl_lines": [],
+      "maintenance_test_candidates": [],
+      "uses_test_context": false,
+      "uses_owner_pool_fixture": false
+    },
+    {
+      "path": "crates/common/tests/cache_cascade_repository_tests.rs",
+      "declared_tests": 15,
+      "test_candidates": [
+        {
+          "name": "pack_cleanup_first",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "definition_cleanup_first",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "workflow_cleanup_first",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "pack_delete_first",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "definition_delete_first",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "workflow_delete_first",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "pool_deletes_release_counters_without_reclaiming_storage",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "rollback_restores_cascade_and_active_pin_protection",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "execution_deletion_keeps_workflow_and_active_pin",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "cleanup_rollback_restores_storage_before_waiting_workflow_delete",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "execution_root_deletion_preserves_child_parent_id",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "enforcement_deletion_preserves_execution_enforcement_id",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "ordinary_reads_remain_concurrent_with_pin_mutation",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cascade_parent_protection_precedes_source_rows_after_mutation_admission",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "multi_generation_cascades_wait_before_rows_for_reverse_order_pin_mutation",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        }
+      ],
+      "direct_ddl_lines": [],
+      "maintenance_test_candidates": [
+        "rollback_restores_cascade_and_active_pin_protection",
+        "execution_deletion_keeps_workflow_and_active_pin",
+        "cleanup_rollback_restores_storage_before_waiting_workflow_delete"
+      ],
+      "uses_test_context": false,
+      "uses_owner_pool_fixture": true
+    },
+    {
+      "path": "crates/common/tests/cache_generation_partition_tests/cleanup_acknowledgement.rs",
+      "declared_tests": 5,
+      "test_candidates": [
+        {
+          "name": "deadline_deferral_acknowledges_admission_rollback_before_return",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "delayed_begin_acknowledgement_recovers_real_backend_idle",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "delayed_commit_acknowledgement_preserves_uncertainty_and_durable_drop",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "exhausted_rollback_grace_errors_without_claiming_backend_disposal",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "synthetic_unexpected_sqlstate_during_recovery_fails_closed",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        }
+      ],
+      "direct_ddl_lines": [],
+      "maintenance_test_candidates": [
+        "deadline_deferral_acknowledges_admission_rollback_before_return"
+      ],
+      "uses_test_context": false,
+      "uses_owner_pool_fixture": false
+    },
+    {
+      "path": "crates/common/tests/cache_generation_partition_tests/direct_cleanup_graph_ordering.rs",
+      "declared_tests": 1,
+      "test_candidates": [
+        {
+          "name": "direct_cleanup_cache_wait_allows_shared_graph_admission",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        }
+      ],
+      "direct_ddl_lines": [],
+      "maintenance_test_candidates": [
+        "direct_cleanup_cache_wait_allows_shared_graph_admission"
+      ],
+      "uses_test_context": false,
+      "uses_owner_pool_fixture": false
+    },
+    {
+      "path": "crates/common/tests/cache_generation_partition_tests.rs",
+      "declared_tests": 8,
+      "test_candidates": [
+        {
+          "name": "cleanup_queues_past_ddl_lock_budget_then_reclaims_after_admission",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "cleanup_admission_exhausts_cycle_without_parent_locks_or_waiters",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "cleanup_parent_read_lock_still_uses_ddl_budget",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cleanup_parent_maintenance_lock_still_uses_ddl_budget",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cleanup_parent_exclusive_lock_still_uses_ddl_budget",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "cancelled_cleanup_discards_connection_and_server_waiter_finishes",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "cleanup_clamps_parent_deadline_to_nearly_spent_cycle",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "cleanup_pool_acquisition_is_inside_cycle_budget",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        }
+      ],
+      "direct_ddl_lines": [],
+      "maintenance_test_candidates": [
+        "cleanup_queues_past_ddl_lock_budget_then_reclaims_after_admission",
+        "cleanup_admission_exhausts_cycle_without_parent_locks_or_waiters",
+        "cleanup_parent_exclusive_lock_still_uses_ddl_budget",
+        "cancelled_cleanup_discards_connection_and_server_waiter_finishes",
+        "cleanup_clamps_parent_deadline_to_nearly_spent_cycle",
+        "cleanup_pool_acquisition_is_inside_cycle_budget"
+      ],
+      "uses_test_context": false,
+      "uses_owner_pool_fixture": true
+    },
+    {
+      "path": "crates/common/tests/cache_large_generation_integrity_tests.rs",
+      "declared_tests": 2,
+      "test_candidates": [
+        {
+          "name": "lowercase_hex_preserves_digest_width_and_leading_zeroes",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "million_row_values_metadata_and_usage_survive_protection_and_reclaim_rollback",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        }
+      ],
+      "direct_ddl_lines": [
+        {
+          "line": 352,
+          "source": "\"CREATE FUNCTION fail_large_integrity_drop() RETURNS trigger LANGUAGE plpgsql AS $$"
+        },
+        {
+          "line": 373,
+          "source": "\"CREATE TRIGGER zz_fail_large_integrity_drop AFTER DELETE ON cache_generation"
+        },
+        {
+          "line": 781,
+          "source": "sqlx::raw_sql(\"DROP TRIGGER zz_fail_large_integrity_drop ON cache_generation; DROP FUNCTION fail_large_integrity_drop();\")"
+        }
+      ],
+      "maintenance_test_candidates": [],
+      "uses_test_context": false,
+      "uses_owner_pool_fixture": true
+    },
+    {
+      "path": "crates/common/tests/cache_live_repository_tests.rs",
+      "declared_tests": 9,
+      "test_candidates": [
+        {
+          "name": "live_replaces_and_deletes_in_one_durable_partition_with_exact_accounting",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "live_retries_replay_original_result_and_expired_receipts_cannot_reapply",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "live_overquota_and_invalid_batches_roll_back_records_cursor_and_revision",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "live_rejects_snapshot_lifecycle_scans_and_mode_conversion",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "live_concurrent_writers_with_same_revision_have_one_winner",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "live_receipt_eviction_stays_bounded_and_rejects_stale_requests",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "managed_live_namespace_reload_preserves_contents_and_rejects_mode_changes",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "live_initial_quota_failure_leaves_no_generation_partition_or_retry_receipt",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "live_tombstone_blocks_access_then_partition_cleanup_releases_usage_and_receipts",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        }
+      ],
+      "direct_ddl_lines": [],
+      "maintenance_test_candidates": [
+        "live_tombstone_blocks_access_then_partition_cleanup_releases_usage_and_receipts"
+      ],
+      "uses_test_context": false,
+      "uses_owner_pool_fixture": true
+    },
+    {
+      "path": "crates/common/tests/cache_reclamation_admission_tests.rs",
+      "declared_tests": 16,
+      "test_candidates": [
+        {
+          "name": "cache_busy_preflight_does_not_queue_graph_or_block_later_capture_and_read",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "graph_busy_entry_releases_preflight_and_retries_when_cache_changes_owner",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "blocked_cache_deadline_disposes_exact_backend_before_blocker_release",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "blocked_graph_deadline_disposes_exact_backend_before_blocker_release",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cancelled_cache_wait_disposes_exact_backend_before_blocker_release",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cancelled_graph_wait_disposes_exact_backend_before_blocker_release",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "constructor_first_retains_graph_and_cache_until_caller_rollback",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "successful_entry_restores_original_settings_before_handoff",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "shorter_operator_lock_limit_is_not_extended_or_relabelled_total_deadline",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "shorter_operator_statement_limit_is_not_extended_or_relabelled_total_deadline",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "missing_guard_in_isolated_session_is_a_real_error_not_contention",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "operator_250ms_disconnect_checks_survive_handoff_and_nested_rollback",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "root_commit_and_rollback_preserve_original_disconnect_pool_policy",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "transaction_manager_root_end_restores_disconnect_on_the_same_backend",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cancellation_after_handoff_disposes_owner_and_unblocks_graph_and_cache",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "long_operator_disconnect_interval_does_not_delay_first_handoff_cancellation_check",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        }
+      ],
+      "direct_ddl_lines": [],
+      "maintenance_test_candidates": [],
+      "uses_test_context": false,
+      "uses_owner_pool_fixture": true
+    },
+    {
+      "path": "crates/common/tests/cache_repository_tests.rs",
+      "declared_tests": 63,
+      "test_candidates": [
+        {
+          "name": "cache_clone_delta_lifecycle_keeps_base_immutable_and_accounts_exactly",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_clone_admission_rolls_back_and_zero_delta_clone_can_publish",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_clone_rejects_foreign_or_unpublished_sources_and_stale_promotion",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "cleanup_backlog_age_starts_after_both_readability_and_traversal_expire",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_admission_does_not_collide_with_workflow_bigint_advisory_ids",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_statistics_acknowledges_lifecycle_and_preserves_dry_run",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "cache_statistics_lock_deferral_preserves_pending_revision",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "statistics_acknowledgement_does_not_consume_a_concurrent_lifecycle_request",
+          "direct_admin_ddl": true,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "cache_statistics_statement_cancellation_rolls_back_acknowledgement",
+          "direct_admin_ddl": true,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "cache_generation_chunk_metadata_bound_rejects_before_storage_creation",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "creation_and_cleanup_use_independent_statement_deadlines",
+          "direct_admin_ddl": true,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "partition_cap_allows_retry_and_releases_capacity_only_after_drop",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "matching_refresh_rejects_missing_storage_without_recreating_it",
+          "direct_admin_ddl": true,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "drop_counter_underflow_rolls_back_partition_and_metadata",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "traversal_window_is_rechecked_inside_atomic_reclamation",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "reader_arriving_after_cleanup_waits_before_generation_locks",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "bounded_scan_does_not_join_another_generations_numeric_entry_id",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "refresh_reuse_race_preserves_one_producer_and_upload_contract",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "refresh_conflict_race_returns_original_generation_and_producer",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "refresh_parallel_default_keeps_two_admissions_and_original_quota",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "refresh_same_id_retries_precede_policy_and_never_rewrite_execution",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "refresh_ready_blocks_until_explicit_failure_or_promotion",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "refresh_execution_attribution_accepts_dangling_ids_and_is_db_immutable",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "refresh_policy_switch_selects_oldest_without_abandoning_parallel_candidates",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "refresh_managed_policy_updates_preserve_existing_generations",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "owner_constraints_and_canonical_owner_namespace_uniqueness",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_retention_config_is_persisted_with_runtime_retention",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "bytewise_ordering_and_duplicate_ids_are_enforced",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "chunk_replays_and_seal_write_boundary_are_enforced",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "promotion_is_optimistic_and_pinned_reads_do_not_mix_generations",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "namespace_isolation_and_generation_quota_rejection",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "expiration_tombstone_and_bounded_cleanup_primitives",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "only_nonterminal_workflow_iteration_pins_generation",
+          "direct_admin_ddl": true,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "scan_pinned_distinguishes_expired_from_end_of_generation",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "multi_id_lookup_orders_omits_missing_and_isolates_namespaces",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "source_checksum_is_bounded_and_included_in_storage_accounting",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "namespace_and_generation_metadata_support_keyset_pages",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "failed_generations_release_slots_but_continue_consuming_byte_quotas",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "refresh_failure_streak_is_idempotent_and_resets_on_promotion",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "empty_tombstoned_namespace_cleanup_is_independently_bounded",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "large_reads_are_deduplicated_and_byte_bounded",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "concurrent_chunk_uploads_replay_or_conflict",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "max_staging_generations_quota_is_enforced",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "aggregate_admission_limits_are_atomic_across_racing_writers",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "managed_namespace_admission_is_atomic_and_updates_remain_idempotent",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "aggregate_physical_bytes_include_staging_entries_and_roll_back_rejection",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "retained_generation_and_aggregate_byte_quotas_are_enforced",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "direct_db_state_transition_and_staging_trigger_are_rejected",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "tombstone_races_upload_and_seal_without_deadlock",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cleanup_defers_until_a_reader_pinned_before_expiry_finishes",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "duplicate_external_ids_yield_typed_error",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "scan_pinned_returns_empty_page_for_zero_record_snapshot",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_owner_pack_fixture_passes_authoring_checks",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "late_pack_component_failure_rolls_back_metadata_and_components",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "pack_cache_loader_manages_owners_updates_removal_and_reinstall",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "component_retirement_rolls_back_when_retirement_fails",
+          "direct_admin_ddl": true,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "managed_cache_definition_identity_is_immutable",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "api_namespace_create_still_conflicts_while_tombstone_drains",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "direct_action_and_sensor_deletion_tombstones_owned_caches",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "pack_deletion_tombstones_owned_caches_without_synchronous_drain",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_statistics_not_due_skips_conflicting_parent_maintenance_lock",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "cache_statistics_rechecks_due_revision_after_parent_lock_wait",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "cache_statistics_rejects_effective_nonowner_before_idle_preflight_and_after_wait",
+          "direct_admin_ddl": true,
+          "maintenance_candidate": true
+        }
+      ],
+      "direct_ddl_lines": [
+        {
+          "line": 763,
+          "source": "\"CREATE FUNCTION test_hold_statistics_ack() RETURNS TRIGGER LANGUAGE plpgsql AS $$"
+        },
+        {
+          "line": 770,
+          "source": "CREATE TRIGGER test_hold_statistics_ack BEFORE UPDATE ON cache_entry_statistics_state"
+        },
+        {
+          "line": 876,
+          "source": "\"CREATE FUNCTION test_delay_statistics_ack() RETURNS TRIGGER LANGUAGE plpgsql AS $$"
+        },
+        {
+          "line": 886,
+          "source": "CREATE TRIGGER test_delay_statistics_ack BEFORE UPDATE ON cache_entry_statistics_state"
+        },
+        {
+          "line": 908,
+          "source": "sqlx::query(\"DROP TRIGGER test_delay_statistics_ack ON cache_entry_statistics_state\")"
+        },
+        {
+          "line": 1019,
+          "source": "\"CREATE FUNCTION assert_cleanup_deadline() RETURNS TRIGGER LANGUAGE plpgsql AS $$"
+        },
+        {
+          "line": 1026,
+          "source": "CREATE TRIGGER assert_cleanup_deadline BEFORE DELETE ON cache_generation"
+        },
+        {
+          "line": 1119,
+          "source": "sqlx::query(&format!(\"DROP TABLE cache_entry_g_{}\", generation.id))"
+        },
+        {
+          "line": 2563,
+          "source": "sqlx::query(\"ALTER TABLE execution DISABLE TRIGGER update_execution_updated\")"
+        },
+        {
+          "line": 2572,
+          "source": "sqlx::query(\"ALTER TABLE execution ENABLE TRIGGER update_execution_updated\")"
+        },
+        {
+          "line": 4573,
+          "source": "CREATE FUNCTION reject_action_retirement()"
+        },
+        {
+          "line": 4588,
+          "source": "\"CREATE TRIGGER reject_action_retirement_trigger \\"
+        },
+        {
+          "line": 4619,
+          "source": "sqlx::query(\"DROP TRIGGER reject_action_retirement_trigger ON action\")"
+        },
+        {
+          "line": 4623,
+          "source": "sqlx::query(\"DROP FUNCTION reject_action_retirement()\")"
+        },
+        {
+          "line": 5039,
+          "source": "ALTER TABLE cache_entry OWNER TO {owner};"
+        },
+        {
+          "line": 5094,
+          "source": "sqlx::query(&format!(\"ALTER TABLE cache_entry OWNER TO {original}\"))"
+        },
+        {
+          "line": 5103,
+          "source": "sqlx::raw_sql(&format!(\"ALTER TABLE cache_entry OWNER TO {original}; DROP OWNED BY {runner}; DROP ROLE {runner}; DROP ROLE {owner};\"))"
+        }
+      ],
+      "maintenance_test_candidates": [
+        "cache_clone_rejects_foreign_or_unpublished_sources_and_stale_promotion",
+        "cache_statistics_acknowledges_lifecycle_and_preserves_dry_run",
+        "cache_statistics_lock_deferral_preserves_pending_revision",
+        "statistics_acknowledgement_does_not_consume_a_concurrent_lifecycle_request",
+        "cache_statistics_statement_cancellation_rolls_back_acknowledgement",
+        "creation_and_cleanup_use_independent_statement_deadlines",
+        "traversal_window_is_rechecked_inside_atomic_reclamation",
+        "reader_arriving_after_cleanup_waits_before_generation_locks",
+        "cleanup_defers_until_a_reader_pinned_before_expiry_finishes",
+        "cache_statistics_not_due_skips_conflicting_parent_maintenance_lock",
+        "cache_statistics_rechecks_due_revision_after_parent_lock_wait",
+        "cache_statistics_rejects_effective_nonowner_before_idle_preflight_and_after_wait"
+      ],
+      "uses_test_context": false,
+      "uses_owner_pool_fixture": true
+    },
+    {
+      "path": "crates/common/tests/runtime_authority_repository_tests/cache_selector_composition.rs",
+      "declared_tests": 3,
+      "test_candidates": [
+        {
+          "name": "actual_selector_control_waits_for_prior_value_and_bound_cache_frontier",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "canonical_false_selector_is_control_not_a_failed_transition_condition",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "original_cache_deadline_survives_linked_eof_and_an_actual_target_wait",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        }
+      ],
+      "direct_ddl_lines": [],
+      "maintenance_test_candidates": [],
+      "uses_test_context": false,
+      "uses_owner_pool_fixture": false
+    },
+    {
+      "path": "crates/common/tests/runtime_authority_repository_tests/native_cache_activation.rs",
+      "declared_tests": 7,
+      "test_candidates": [
+        {
+          "name": "same_advance_pending_namespace_activates_two_real_cache_successors_and_refills",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "same_advance_empty_cache_successors_finish_without_synthetic_children",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "cache_prepare_work_public_future_has_bounded_inline_storage",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "same_advance_false_decision_never_resolves_unselected_namespace_keys",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "same_advance_selector_rejects_changed_actual_workflow_variables_before_publication",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "same_advance_value_consent_expires_at_real_workflow_target_wait",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "ordinary_successor_frame_uses_real_predecessor_selected_sites_and_sealed_publications",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        }
+      ],
+      "direct_ddl_lines": [],
+      "maintenance_test_candidates": [],
+      "uses_test_context": false,
+      "uses_owner_pool_fixture": false
+    },
+    {
+      "path": "crates/common/tests/runtime_authority_repository_tests/native_cache_checkpoint/h_projected_completion.rs",
+      "declared_tests": 5,
+      "test_candidates": [
+        {
+          "name": "h_projected_cache_root_uses_all_real_terminal_batches_and_actual_checkpoint_state",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "h_projected_cache_root_failure_is_backed_by_the_actual_failed_latest_attempt",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "h_projected_cache_root_rejects_changed_original_attempt_before_progression",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "h_projected_cache_root_initial_empty_eof_has_no_child_witness",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "h_projected_cache_root_persisted_empty_eof_has_no_child_witness",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        }
+      ],
+      "direct_ddl_lines": [],
+      "maintenance_test_candidates": [],
+      "uses_test_context": false,
+      "uses_owner_pool_fixture": false
+    },
+    {
+      "path": "crates/common/tests/runtime_authority_repository_tests/native_cache_checkpoint.rs",
+      "declared_tests": 9,
+      "test_candidates": [
+        {
+          "name": "native_cache_checkpoint_static_entry_two_successors_eof_and_first_child_seals",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "native_cache_checkpoint_committed_dynamic_selector_refills_and_completes",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "native_cache_checkpoint_empty_eof_creates_no_synthetic_child",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "native_cache_checkpoint_stale_actual_cursor_cannot_publish_reserved_child",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "native_cache_checkpoint_selector_approval_expires_during_actual_target_wait",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "native_cache_completion_source_covers_real_latest_attempts_and_checkpoint_eof",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "native_cache_completion_source_authenticates_failed_batch_without_fabricating_aggregate_value",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "native_cache_completion_changed_attempt_denies_progress_even_when_summary_counts_match",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "native_cache_completion_persisted_empty_eof_has_real_frontier_and_zero_children",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        }
+      ],
+      "direct_ddl_lines": [],
+      "maintenance_test_candidates": [],
+      "uses_test_context": false,
+      "uses_owner_pool_fixture": false
+    },
+    {
+      "path": "crates/common/tests/runtime_authority_repository_tests/requested_cache_publication.rs",
+      "declared_tests": 4,
+      "test_candidates": [
+        {
+          "name": "requested_indexed_cache_child_retains_original_input_and_exact_pins_after_producer_gc",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "requested_cache_child_cannot_fall_back_to_ordinary_task_after_graph_first_cleanup",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "requested_cache_child_needs_its_exact_index_dispatch_and_archived_batch",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "requested_indexed_cache_child_with_constant_input_still_uses_the_real_frontier",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        }
+      ],
+      "direct_ddl_lines": [],
+      "maintenance_test_candidates": [],
+      "uses_test_context": false,
+      "uses_owner_pool_fixture": false
+    },
+    {
+      "path": "crates/executor/tests/cache_partition_ordering/mod.rs",
+      "declared_tests": 19,
+      "test_candidates": [
+        {
+          "name": "live_cache_iteration_fails_before_pins_or_children_are_created",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "workflow_first_commits_scanning_pin_before_cleanup_rechecks_eligibility",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "cleanup_first_blocks_dispatch_before_workflow_and_iteration_row_locks",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "cache_refill_keeps_expired_generation_pinned_until_completion_and_cascade",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "cancelled_cache_child_stops_refill_releases_pin_and_cascades_metadata",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "deleting_root_execution_preserves_dangling_workflow_and_active_cache_pin",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "retained_iteration_cap_allows_replay_rejects_growth_and_releases_deleted_rows",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "concurrent_iteration_admission_has_only_one_winner_at_the_final_slot",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "inverse_generation_pin_initialization_does_not_deadlock",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "repeatable_read_iteration_admission_rejects_stale_counter_and_retries_cleanly",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "workflow_execution_and_definition_deletion_release_retained_iteration_counters",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "workflow_execution_delete_waits_for_cleanup_parent_before_cascade_rows",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "workflow_definition_delete_waits_for_cleanup_parent_before_cascade_rows",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "broker_cache_refill_completion_replay_and_terminal_cascade",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "broker_cache_cancellation_stops_publication_and_releases_terminal_metadata",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "broker_cache_cleanup_first_blocks_real_transaction_entry_before_rows",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "broker_cache_workflow_first_protects_parent_before_blocked_workflow_row",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": true
+        },
+        {
+          "name": "broker_cache_completion_waits_for_cleanup_parent_before_workflow_rows",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        },
+        {
+          "name": "broker_cache_cancellation_waits_for_cleanup_parent_before_workflow_rows",
+          "direct_admin_ddl": false,
+          "maintenance_candidate": false
+        }
+      ],
+      "direct_ddl_lines": [],
+      "maintenance_test_candidates": [
+        "workflow_first_commits_scanning_pin_before_cleanup_rechecks_eligibility",
+        "cleanup_first_blocks_dispatch_before_workflow_and_iteration_row_locks",
+        "cache_refill_keeps_expired_generation_pinned_until_completion_and_cascade",
+        "deleting_root_execution_preserves_dangling_workflow_and_active_cache_pin",
+        "workflow_execution_and_definition_deletion_release_retained_iteration_counters",
+        "broker_cache_cleanup_first_blocks_real_transaction_entry_before_rows",
+        "broker_cache_workflow_first_protects_parent_before_blocked_workflow_row"
+      ],
+      "uses_test_context": false,
+      "uses_owner_pool_fixture": true
+    }
+  ]
+}
