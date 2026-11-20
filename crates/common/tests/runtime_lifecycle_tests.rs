@@ -2,6 +2,8 @@
 
 use attune_common::child_process_environment::ChildProcessEnvironment;
 use attune_common::runtime_lifecycle::{RuntimeRecipe, RuntimeSource};
+#[cfg(target_os = "linux")]
+use attune_common::workload_sandbox::WorkloadSandbox;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -101,6 +103,216 @@ async fn inline_recipe_owns_an_empty_input_root_when_no_pack_exists() {
         .unwrap();
     assert!(output.status.success());
     assert_eq!(output.stdout, b"inline-ok");
+    target.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn retained_build_binds_independent_invocations_and_survives_cleanup() {
+    let (root, mut recipe) = fixture();
+    recipe
+        .env
+        .insert("PYTHONPYCACHEPREFIX".into(), "{scratch_dir}/pycache".into());
+    let environment = environment(&recipe);
+    let pack = root.path().join("pack");
+    let generation_root = root.path().join("generations");
+    let invocation_root = root.path().join("invocations");
+    std::fs::create_dir(&pack).unwrap();
+    std::fs::create_dir(&invocation_root).unwrap();
+    let source = pack.join("action.nova");
+    executable(
+        &source,
+        "#!/bin/sh\nmkdir -p \"$PYTHONPYCACHEPREFIX\"\nprintf runtime-cache > \"$PYTHONPYCACHEPREFIX/fixture\"\n",
+    );
+    let build = recipe
+        .prepare_build(
+            &pack,
+            RuntimeSource::File(&source),
+            &generation_root,
+            &environment,
+        )
+        .await
+        .unwrap();
+    assert!(recipe
+        .bind_prepared_invocation(&build, &pack, &environment)
+        .is_err());
+
+    let first = recipe
+        .bind_prepared_invocation(&build, &invocation_root, &environment)
+        .unwrap();
+    let second = recipe
+        .bind_prepared_invocation(&build, &invocation_root, &environment)
+        .unwrap();
+    assert_eq!(first.command, second.command);
+    assert_eq!(first.generation, second.generation);
+    assert_ne!(first.env["HOME"], second.env["HOME"]);
+    assert_ne!(first.env["TMPDIR"], second.env["TMPDIR"]);
+
+    for target in [&first, &second] {
+        let mut command = tokio::process::Command::new(&target.command[0]);
+        environment.apply(command.as_std_mut());
+        let status = command
+            .envs(&target.env)
+            .current_dir(&target.working_dir)
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+        let cache = Path::new(&target.env["PYTHONPYCACHEPREFIX"]);
+        assert!(cache.starts_with(&invocation_root));
+        assert_eq!(
+            std::fs::read(cache.join("fixture")).unwrap(),
+            b"runtime-cache"
+        );
+    }
+
+    let generation = second.generation.clone();
+    first.cleanup().await.unwrap();
+    assert!(generation.join("output/program").is_file());
+    assert!(Path::new(&second.env["HOME"]).is_dir());
+    second.cleanup().await.unwrap();
+    assert!(generation.join("output/program").is_file());
+    assert_eq!(std::fs::read_dir(invocation_root).unwrap().count(), 0);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires Linux Bubblewrap with unprivileged namespaces"]
+async fn bubblewrap_recipe_enforces_build_and_invocation_paths() {
+    let (root, mut recipe) = fixture();
+    recipe
+        .env
+        .insert("PYTHONPYCACHEPREFIX".into(), "{scratch_dir}/pycache".into());
+    let environment = environment(&recipe).with_workload_sandbox(WorkloadSandbox::Bubblewrap);
+    let pack = root.path().join("pack");
+    std::fs::create_dir(&pack).unwrap();
+    let manager_state = root.path().join("manager-state");
+    std::fs::write(&manager_state, "owned fixture state").unwrap();
+    let published_input = pack.join("immutable-input");
+    std::fs::write(&published_input, "published fixture input").unwrap();
+    let source = pack.join("action.nova");
+    executable(
+        &source,
+        &format!(
+            concat!(
+                "#!/bin/sh\nset -e\n",
+                "if cat '{}' 2>/dev/null; then exit 12; fi\n",
+                "if (printf unexpected >> '{}') 2>/dev/null; then exit 15; fi\n",
+                "if (printf unexpected > ./outside-scratch) 2>/dev/null; then exit 16; fi\n",
+                "mkdir -p \"$PYTHONPYCACHEPREFIX\"\n",
+                "printf writable > \"$PYTHONPYCACHEPREFIX/cache\"\n",
+            ),
+            manager_state.display(),
+            published_input.display()
+        ),
+    );
+    let tool = root.path().join("nova");
+    let tool_script = std::fs::read_to_string(&tool).unwrap();
+    executable(
+        &tool,
+        &tool_script.replacen(
+            "#!/bin/sh\n",
+            &format!(
+                concat!(
+                    "#!/bin/sh\n",
+                    "if cat '{}' 2>/dev/null; then exit 13; fi\n",
+                    "if [ \"$1\" = build ] && (printf unexpected >> '{}') 2>/dev/null; then exit 15; fi\n",
+                ),
+                manager_state.display(),
+                published_input.display()
+            ),
+            1,
+        ),
+    );
+    let generation_root = root.path().join("generations");
+    let target = recipe
+        .prepare(
+            &pack,
+            RuntimeSource::File(&source),
+            &generation_root,
+            &environment,
+        )
+        .await
+        .unwrap();
+    let cache = Path::new(&target.env["PYTHONPYCACHEPREFIX"]);
+    assert!(!cache.starts_with(&target.generation));
+    let mut command = std::process::Command::new(&target.command[0]);
+    environment.apply(&mut command);
+    command.envs(&target.env).current_dir(&target.working_dir);
+    let command = target.sandbox_invocation(command, &environment).unwrap();
+    let output = tokio::process::Command::from(command)
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(std::fs::read(cache.join("cache")).unwrap(), b"writable");
+    assert_eq!(
+        std::fs::read(&published_input).unwrap(),
+        b"published fixture input"
+    );
+    target.cleanup().await.unwrap();
+    assert_eq!(std::fs::read_dir(generation_root).unwrap().count(), 0);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires Linux Bubblewrap with unprivileged namespaces and Python"]
+async fn bubblewrap_python_recipe_keeps_import_bytecode_in_private_scratch() {
+    let python = Path::new("/usr/bin/python3");
+    if !python.is_file() {
+        panic!("Python compatibility fixture requires /usr/bin/python3");
+    }
+    let recipe: RuntimeRecipe = serde_json::from_value(serde_json::json!({
+        "tools": [{
+            "name": "python",
+            "binaries": [python],
+            "args": ["--version"],
+            "version_pattern": "Python (?<version>3\\.\\d+\\.\\d+)",
+            "primary": true
+        }],
+        "launch": {"command": ["{tool_python}", "{source_file}"]},
+        "env": {"PYTHONPYCACHEPREFIX": "{scratch_dir}/pycache"}
+    }))
+    .unwrap();
+    let environment = environment(&recipe).with_workload_sandbox(WorkloadSandbox::Bubblewrap);
+    let root = tempfile::tempdir().unwrap();
+    let pack = root.path().join("pack");
+    std::fs::create_dir(&pack).unwrap();
+    let source = pack.join("action.py");
+    std::fs::write(
+        &source,
+        "import fixture_dependency\nprint(fixture_dependency.value)\n",
+    )
+    .unwrap();
+    std::fs::write(pack.join("fixture_dependency.py"), "value = 'imported'\n").unwrap();
+    let target = recipe
+        .prepare(
+            &pack,
+            RuntimeSource::File(&source),
+            &root.path().join("generations"),
+            &environment,
+        )
+        .await
+        .unwrap();
+    let mut command = std::process::Command::new(&target.command[0]);
+    environment.apply(&mut command);
+    command
+        .args(&target.command[1..])
+        .envs(&target.env)
+        .current_dir(&target.working_dir);
+    let command = target.sandbox_invocation(command, &environment).unwrap();
+    let output = tokio::process::Command::from(command)
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"imported\n");
+    assert!(!pack.join("__pycache__").exists());
+    let cache = Path::new(&target.env["PYTHONPYCACHEPREFIX"]).join(pack.strip_prefix("/").unwrap());
+    assert!(std::fs::read_dir(cache).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with("fixture_dependency.")));
     target.cleanup().await.unwrap();
 }
 

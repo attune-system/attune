@@ -577,11 +577,7 @@ impl TestExecutor {
             .env("LANG", "C.UTF-8")
             .env("LC_ALL", "C.UTF-8")
             .args(args)
-            .current_dir(working_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null());
-        cmd.kill_on_drop(true);
+            .current_dir(working_dir);
         if let Some(target) = target {
             self.lifecycle_environment.apply(cmd.as_std_mut());
             cmd.envs(&target.env).current_dir(&target.working_dir);
@@ -590,6 +586,36 @@ impl TestExecutor {
             cmd.env("ATTUNE_CANDIDATE_EFFECTS_URL", &candidate.url)
                 .env("ATTUNE_CANDIDATE_EFFECTS_TOKEN", &candidate.token);
         }
+        let mut cmd = Command::from(
+            match target {
+                Some(target) => {
+                    target.sandbox_invocation(cmd.into_std(), &self.lifecycle_environment)
+                }
+                None if self.lifecycle_environment.uses_workload_sandbox() => {
+                    let pack_dir = working_dir
+                        .canonicalize()
+                        .map_err(|error| Error::Io(error.to_string()))?;
+                    cmd.current_dir(&pack_dir);
+                    let mut inputs = vec![pack_dir.as_path()];
+                    let runtime_dir = runtime_bin_dir
+                        .and_then(Path::parent)
+                        .map(Path::canonicalize)
+                        .transpose()
+                        .map_err(|error| Error::Io(error.to_string()))?;
+                    if let Some(runtime_dir) = &runtime_dir {
+                        inputs.push(runtime_dir);
+                    }
+                    self.lifecycle_environment
+                        .sandbox_workload(cmd.into_std(), &inputs)
+                }
+                None => Ok(cmd.into_std()),
+            }
+            .map_err(|error| Error::Io(format!("Failed to isolate pack test: {error}")))?,
+        );
+        cmd.stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
         #[cfg(unix)]
         cmd.process_group(0);
 

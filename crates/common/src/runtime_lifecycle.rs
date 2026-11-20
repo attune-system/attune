@@ -207,8 +207,23 @@ pub struct VerifiedTool {
     pub version: String,
 }
 
+fn sandbox_tool_path(tool: &VerifiedTool) -> Option<&Path> {
+    sandbox_additional_executable(&tool.identity)
+}
+
+fn sandbox_additional_executable(path: &Path) -> Option<&Path> {
+    // These trees are already mounted read-only by Bubblewrap.
+    (!["/usr", "/bin", "/sbin", "/lib", "/lib64"]
+        .iter()
+        .any(|root| path.starts_with(root)))
+    .then_some(path)
+}
+
 pub struct PreparedTarget {
     pub generation: PathBuf,
+    cleanup_root: PathBuf,
+    cleanup_generation: bool,
+    pack_dir: PathBuf,
     pub command: Vec<String>,
     pub working_dir: PathBuf,
     pub env: BTreeMap<String, String>,
@@ -217,12 +232,42 @@ pub struct PreparedTarget {
     pub primary_version: String,
 }
 
+/// The inputs to launch binding after the recipe's preparation commands have
+/// exited. This value alone does not authorize publication or reuse.
+pub struct PreparedBuild {
+    generation: PathBuf,
+    pack_dir: PathBuf,
+    file_backed: bool,
+    variables: BTreeMap<String, String>,
+    tools: BTreeMap<String, VerifiedTool>,
+    recipe_digest: String,
+    primary_version: String,
+}
+
 pub enum RuntimeSource<'a> {
     File(&'a Path),
     Inline(&'a str),
 }
 
 impl PreparedTarget {
+    pub fn sandbox_invocation(
+        &self,
+        mut command: std::process::Command,
+        environment: &ChildProcessEnvironment,
+    ) -> std::io::Result<std::process::Command> {
+        if !environment.uses_workload_sandbox() {
+            return Ok(command);
+        }
+        let home = self.cleanup_root.join("home");
+        let scratch = self.cleanup_root.join("scratch");
+        let artifacts = scratch.join("artifacts");
+        std::fs::create_dir(&artifacts)?;
+        command.env("ATTUNE_ARTIFACTS_DIR", artifacts);
+        let mut inputs = vec![self.pack_dir.as_path(), self.generation.as_path()];
+        inputs.extend(self.tools.values().filter_map(sandbox_tool_path));
+        environment.sandbox_staged_workload(command, &inputs, &[&home, &scratch])
+    }
+
     pub fn validate_selected_version(&self, expected: &str) -> Result<()> {
         if self.primary_version == expected
             || crate::version_matching::matches_constraint(
@@ -240,7 +285,10 @@ impl PreparedTarget {
     }
     /// Only call after the owning workload and its writers have been joined.
     pub async fn cleanup(self) -> Result<()> {
-        tokio::fs::remove_dir_all(self.generation).await?;
+        tokio::fs::remove_dir_all(self.cleanup_root).await?;
+        if self.cleanup_generation {
+            tokio::fs::remove_dir_all(self.generation).await?;
+        }
         Ok(())
     }
 }
@@ -378,8 +426,18 @@ impl RuntimeRecipe {
                     .args(&tool.args)
                     .current_dir(&probe_home)
                     .env("HOME", &probe_home)
+                    .env("TMPDIR", &probe_home)
                     .env("XDG_CONFIG_HOME", probe_home.join("config"))
                     .env("XDG_CACHE_HOME", probe_home.join("cache"));
+                let identity = executable.canonicalize()?;
+                let inputs: Vec<_> = sandbox_additional_executable(&identity)
+                    .into_iter()
+                    .collect();
+                let command = Command::from(environment.sandbox_staged_workload(
+                    command.into_std(),
+                    &inputs,
+                    &[&probe_home],
+                )?);
                 let Ok(output) = collect(command, Duration::from_secs(10)).await else {
                     all_probes_confirmed = false;
                     continue;
@@ -389,7 +447,7 @@ impl RuntimeRecipe {
                     .and_then(|capture| capture.name("version"))
                 {
                     found = Some(VerifiedTool {
-                        identity: executable.canonicalize()?,
+                        identity,
                         executable,
                         version: version.as_str().to_owned(),
                     });
@@ -421,6 +479,28 @@ impl RuntimeRecipe {
         generation_root: &Path,
         environment: &ChildProcessEnvironment,
     ) -> Result<PreparedTarget> {
+        let build = self
+            .prepare_build(pack_dir, source, generation_root, environment)
+            .await?;
+        if environment.uses_workload_sandbox() {
+            let mut invocation =
+                self.bind_private_invocation(&build, generation_root, environment)?;
+            invocation.cleanup_generation = true;
+            return Ok(invocation);
+        }
+        // Per-invocation recipes own their entire generation and can use the
+        // same home and scratch paths for both preparation and launch.
+        let cleanup_root = build.generation.clone();
+        self.bind_launch(&build, cleanup_root, None, environment)
+    }
+
+    pub async fn prepare_build(
+        &self,
+        pack_dir: &Path,
+        source: RuntimeSource<'_>,
+        generation_root: &Path,
+        environment: &ChildProcessEnvironment,
+    ) -> Result<PreparedBuild> {
         let recipe_digest = self.require_admission(environment)?;
         let tools = self.discover(environment).await?;
         let primary_version = self
@@ -441,18 +521,18 @@ impl RuntimeRecipe {
             Err(error) => return Err(error.into()),
         };
         std::fs::create_dir_all(generation_root)?;
-        if existing_pack.as_ref().is_some_and(|pack| {
-            generation_root
-                .canonicalize()
-                .is_ok_and(|root| root.starts_with(pack))
-        }) {
+        let generation_root = generation_root.canonicalize()?;
+        if existing_pack
+            .as_ref()
+            .is_some_and(|pack| generation_root.starts_with(pack))
+        {
             return Err(invalid(
                 "Runtime generation storage must be outside the workload release",
             ));
         }
         let generation = tempfile::Builder::new()
             .prefix("generation-")
-            .tempdir_in(generation_root)?
+            .tempdir_in(&generation_root)?
             .keep();
         let pack_dir = match existing_pack {
             Some(path) => path,
@@ -501,6 +581,7 @@ impl RuntimeRecipe {
         for path in [&output, &scratch, &home] {
             std::fs::create_dir(path)?;
         }
+        let file_backed = source_path.is_some();
         let source_file = match source {
             RuntimeSource::File(_) => {
                 let path = source_path.ok_or_else(|| invalid("Missing runtime source"))?;
@@ -541,6 +622,102 @@ impl RuntimeRecipe {
                 tool.executable.display().to_string(),
             );
         }
+        let env = self.expand_environment(&vars, &home, &scratch)?;
+        for step in &self.prepare {
+            if let Some(path) = &step.when_file_exists {
+                let input = pack_dir.join(relative_path(path)?);
+                if !input.try_exists()? {
+                    continue;
+                }
+                if !input.canonicalize()?.starts_with(&pack_dir) || !input.is_file() {
+                    return Err(invalid("Runtime step input escapes workload release"));
+                }
+            }
+            let argv = expand_command(&step.command, &vars)?;
+            let executable = resolve_executable(&argv[0], environment)?;
+            let cwd = resolve_cwd(step, &vars, &workspace, &pack_dir, &generation, None)?;
+            let mut command = Command::new(executable);
+            environment.apply(command.as_std_mut());
+            command.args(&argv[1..]).current_dir(cwd).envs(&env);
+            let mut tool_paths: Vec<_> = tools.values().filter_map(sandbox_tool_path).collect();
+            if !pack_dir.starts_with(&generation) {
+                tool_paths.push(&pack_dir);
+            }
+            let command = Command::from(environment.sandbox_staged_workload(
+                command.into_std(),
+                &tool_paths,
+                &[&generation],
+            )?);
+            collect(command, Duration::from_secs(step.timeout_seconds)).await?;
+        }
+        Ok(PreparedBuild {
+            generation,
+            pack_dir,
+            file_backed,
+            variables: vars,
+            tools,
+            recipe_digest,
+            primary_version,
+        })
+    }
+
+    /// Bind a fresh invocation to a retained build. The caller owns the pin on
+    /// that build and must enforce a read-only view of its published files.
+    /// Invocation cleanup never removes the build or the pack release.
+    pub fn bind_prepared_invocation(
+        &self,
+        build: &PreparedBuild,
+        invocation_root: &Path,
+        environment: &ChildProcessEnvironment,
+    ) -> Result<PreparedTarget> {
+        if !build.file_backed {
+            return Err(invalid(
+                "Only file-backed runtime builds can bind a separate invocation",
+            ));
+        }
+        if self.require_admission(environment)? != build.recipe_digest {
+            return Err(invalid(
+                "Prepared build belongs to a different runtime recipe",
+            ));
+        }
+        self.bind_private_invocation(build, invocation_root, environment)
+    }
+
+    fn bind_private_invocation(
+        &self,
+        build: &PreparedBuild,
+        invocation_root: &Path,
+        environment: &ChildProcessEnvironment,
+    ) -> Result<PreparedTarget> {
+        let invocation_root = invocation_root.canonicalize()?;
+        if invocation_root.starts_with(&build.generation)
+            || invocation_root.starts_with(&build.pack_dir)
+        {
+            return Err(invalid(
+                "Runtime invocation storage must be outside the build and workload release",
+            ));
+        }
+        let invocation = tempfile::Builder::new()
+            .prefix("invocation-")
+            .tempdir_in(invocation_root)?;
+        std::fs::create_dir(invocation.path().join("home"))?;
+        std::fs::create_dir(invocation.path().join("scratch"))?;
+        let target = self.bind_launch(
+            build,
+            invocation.path().to_path_buf(),
+            Some(invocation.path()),
+            environment,
+        )?;
+        let _ = invocation.keep();
+        Ok(target)
+    }
+
+    fn expand_environment(
+        &self,
+        vars: &BTreeMap<String, String>,
+        home: &Path,
+        scratch: &Path,
+    ) -> Result<BTreeMap<String, String>> {
         let mut env = BTreeMap::from([
             ("HOME".into(), home.display().to_string()),
             (
@@ -554,32 +731,30 @@ impl RuntimeRecipe {
             ("TMPDIR".into(), scratch.display().to_string()),
         ]);
         for (name, value) in &self.env {
-            env.insert(name.clone(), expand(value, &vars)?);
+            env.insert(name.clone(), expand(value, vars)?);
         }
-        for step in &self.prepare {
-            if let Some(path) = &step.when_file_exists {
-                let input = pack_dir.join(relative_path(path)?);
-                if !input.try_exists()? {
-                    continue;
-                }
-                if !input.canonicalize()?.starts_with(&pack_dir) || !input.is_file() {
-                    return Err(invalid("Runtime step input escapes workload release"));
-                }
-            }
-            let argv = expand_command(&step.command, &vars)?;
-            let executable = resolve_executable(&argv[0], environment)?;
-            let cwd = resolve_cwd(step, &vars, &workspace, &pack_dir, &generation)?;
-            let mut command = Command::new(executable);
-            environment.apply(command.as_std_mut());
-            command.args(&argv[1..]).current_dir(cwd).envs(&env);
-            collect(command, Duration::from_secs(step.timeout_seconds)).await?;
+        Ok(env)
+    }
+
+    fn bind_launch(
+        &self,
+        build: &PreparedBuild,
+        cleanup_root: PathBuf,
+        invocation: Option<&Path>,
+        environment: &ChildProcessEnvironment,
+    ) -> Result<PreparedTarget> {
+        let mut vars = build.variables.clone();
+        let scratch = cleanup_root.join("scratch");
+        if invocation.is_some() {
+            vars.insert("scratch_dir".into(), scratch.display().to_string());
         }
+        let env = self.expand_environment(&vars, &cleanup_root.join("home"), &scratch)?;
         let mut argv = expand_command(&self.launch.command, &vars)?;
         let executable = resolve_executable(&argv[0], environment)?;
         let identity = executable.canonicalize()?;
-        let permitted = tools.values().any(|tool| tool.identity == identity)
-            || identity.starts_with(generation.canonicalize()?)
-            || identity.starts_with(&pack_dir);
+        let permitted = build.tools.values().any(|tool| tool.identity == identity)
+            || identity.starts_with(build.generation.canonicalize()?)
+            || identity.starts_with(&build.pack_dir);
         if !permitted {
             return Err(invalid(
                 "Runtime launch executable was not declared or prepared",
@@ -590,15 +765,25 @@ impl RuntimeRecipe {
         if !Path::new(&argv[0]).is_absolute() {
             argv[0] = executable.display().to_string();
         }
-        let working_dir = resolve_cwd(&self.launch, &vars, &pack_dir, &pack_dir, &generation)?;
+        let working_dir = resolve_cwd(
+            &self.launch,
+            &vars,
+            &build.pack_dir,
+            &build.pack_dir,
+            &build.generation,
+            invocation,
+        )?;
         Ok(PreparedTarget {
-            generation,
+            generation: build.generation.clone(),
+            cleanup_root,
+            cleanup_generation: false,
+            pack_dir: build.pack_dir.clone(),
             command: argv,
             working_dir,
             env,
-            tools,
-            recipe_digest,
-            primary_version,
+            tools: build.tools.clone(),
+            recipe_digest: build.recipe_digest.clone(),
+            primary_version: build.primary_version.clone(),
         })
     }
 }
@@ -648,13 +833,18 @@ fn resolve_cwd(
     default: &Path,
     pack: &Path,
     generation: &Path,
+    invocation: Option<&Path>,
 ) -> Result<PathBuf> {
     let path = match &step.cwd {
         Some(value) => PathBuf::from(expand(value, vars)?),
         None => default.to_owned(),
     };
     let path = path.canonicalize()?;
-    if !path.is_dir() || !(path.starts_with(pack) || path.starts_with(generation.canonicalize()?)) {
+    if !path.is_dir()
+        || !(path.starts_with(pack)
+            || path.starts_with(generation)
+            || invocation.is_some_and(|root| path.starts_with(root)))
+    {
         return Err(invalid("Runtime working directory is outside owned roots"));
     }
     Ok(path)

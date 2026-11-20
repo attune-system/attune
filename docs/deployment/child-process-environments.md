@@ -180,5 +180,5 @@ real dumpability, reports host-restricted baseline access honestly, asserts
 protected procfs denial, and exercises cleared child environments and stdin JSON.
 The driver never changes its own dumpability; all children are joined.
 
-For the experimental final-process namespace/filesystem boundary and its remaining
+For the Bubblewrap namespace and filesystem boundary and its remaining
 setup and manager-credential gaps, see [Workload isolation](workload-isolation.md).

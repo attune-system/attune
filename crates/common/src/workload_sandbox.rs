@@ -1,5 +1,4 @@
-//! Optional Linux isolation for final workload processes. Setup commands remain
-//! outside this boundary; see docs/deployment/workload-isolation.md.
+//! Optional Linux isolation for pack-controlled local processes.
 use std::io;
 use std::path::Path;
 use std::process::Command;
@@ -13,7 +12,7 @@ pub enum WorkloadSandbox {
 
 impl WorkloadSandbox {
     /// Operator opt-in. Never silently downgrade an explicitly requested boundary.
-    pub fn from_environment(api_artifacts: bool) -> io::Result<Self> {
+    pub async fn from_environment(api_artifacts: bool) -> io::Result<Self> {
         match std::env::var("ATTUNE_WORKLOAD_SANDBOX") {
             Err(std::env::VarError::NotPresent) => Ok(Self::Disabled),
             Ok(value) if value == "disabled" => Ok(Self::Disabled),
@@ -23,10 +22,31 @@ impl WorkloadSandbox {
                         "bubblewrap workloads require Linux and API artifact transport",
                     ));
                 }
+                Self::Bubblewrap.verify_available().await?;
                 Ok(Self::Bubblewrap)
             }
             _ => Err(io::Error::other("invalid ATTUNE_WORKLOAD_SANDBOX mode")),
         }
+    }
+
+    async fn verify_available(self) -> io::Result<()> {
+        let command = self.wrap(Command::new("/usr/bin/true"), &[])?;
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::process::Command::from(command)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(|_| io::Error::other("Bubblewrap startup probe timed out"))?
+        .map_err(|error| io::Error::other(format!("Cannot start /usr/bin/bwrap: {error}")))?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "Bubblewrap startup probe failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim(),
+            )));
+        }
+        Ok(())
     }
 
     /// Call before configuring stdio, process groups or pre_exec hooks. Only
@@ -42,6 +62,28 @@ impl WorkloadSandbox {
         command: Command,
         read_paths: &[&Path],
         invocation_name: Option<&std::ffi::OsStr>,
+    ) -> io::Result<Command> {
+        self.wrap_command(command, read_paths, &[], invocation_name, false)
+    }
+
+    /// Expose only the selected read-only inputs and caller-owned writable
+    /// directories. The caller configures HOME, caches and artifact paths.
+    pub(crate) fn wrap_staged(
+        self,
+        command: Command,
+        read_paths: &[&Path],
+        write_paths: &[&Path],
+    ) -> io::Result<Command> {
+        self.wrap_command(command, read_paths, write_paths, None, true)
+    }
+
+    fn wrap_command(
+        self,
+        command: Command,
+        read_paths: &[&Path],
+        write_paths: &[&Path],
+        invocation_name: Option<&std::ffi::OsStr>,
+        preserve_writable_paths: bool,
     ) -> io::Result<Command> {
         #[cfg(unix)]
         let command = {
@@ -90,6 +132,8 @@ impl WorkloadSandbox {
             "/etc/resolv.conf",
             "/etc/hosts",
             "/etc/nsswitch.conf",
+            "/etc/passwd",
+            "/etc/group",
             "/etc/ssl/certs",
             "/etc/ld.so.cache",
         ] {
@@ -108,33 +152,51 @@ impl WorkloadSandbox {
             "/tmp/artifacts",
         ]);
         for path in read_paths {
-            if !path.exists() {
-                return Err(io::Error::other("sandbox input path does not exist"));
-            }
-            // Reject aliases and broad/system-root mounts rather than exposing a
-            // credential-bearing tree through a selected pack/runtime alias.
-            let canonical = path.canonicalize()?;
-            if !path.is_absolute()
-                || canonical != *path
-                || path.components().count() < 3
-                || ["/proc", "/dev", "/etc", "/usr", "/bin", "/lib", "/lib64"]
-                    .iter()
-                    .any(|root| path.starts_with(root))
-            {
-                return Err(io::Error::other("unsafe sandbox input path"));
-            }
+            validate_mount_path(path)?;
             sandbox.arg("--ro-bind").arg(path).arg(path);
+        }
+        for path in write_paths {
+            validate_mount_path(path)?;
+            if !path.is_dir()
+                || read_paths
+                    .iter()
+                    .any(|input| input.starts_with(path) || path.starts_with(input))
+            {
+                return Err(io::Error::other("unsafe writable sandbox path"));
+            }
+            sandbox.arg("--bind").arg(path).arg(path);
         }
         sandbox
             .arg("--chdir")
             .arg(command.get_current_dir().unwrap_or(Path::new("/tmp")));
-        install_workload_environment(&mut sandbox, &command)?;
+        install_workload_environment(&mut sandbox, &command, preserve_writable_paths)?;
         Ok(sandbox)
     }
 }
 
+fn validate_mount_path(path: &Path) -> io::Result<()> {
+    // Reject aliases and broad/system-root mounts rather than exposing a
+    // credential-bearing tree through a selected pack/runtime alias.
+    if !path.is_absolute()
+        || path.components().count() < 3
+        || [
+            "/proc", "/sys", "/dev", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64",
+        ]
+        .iter()
+        .any(|root| path.starts_with(root))
+        || path.canonicalize()? != path
+    {
+        return Err(io::Error::other("unsafe sandbox input path"));
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
-fn install_workload_environment(sandbox: &mut Command, command: &Command) -> io::Result<()> {
+fn install_workload_environment(
+    sandbox: &mut Command,
+    command: &Command,
+    preserve_writable_paths: bool,
+) -> io::Result<()> {
     use std::io::{Seek, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::{ffi::OsStrExt, process::CommandExt};
@@ -164,9 +226,20 @@ fn install_workload_environment(sandbox: &mut Command, command: &Command) -> io:
         ("TMPDIR", "/tmp"),
         ("ATTUNE_ARTIFACTS_DIR", "/tmp/artifacts"),
     ] {
+        if preserve_writable_paths && command.get_envs().any(|(name, _)| name == key) {
+            continue;
+        }
         append("--setenv".as_ref())?;
         append(key.as_ref())?;
         append(value.as_ref())?;
+    }
+    if !command
+        .get_envs()
+        .any(|(key, value)| key == "PYTHONPYCACHEPREFIX" && value.is_some())
+    {
+        append("--setenv".as_ref())?;
+        append("PYTHONPYCACHEPREFIX".as_ref())?;
+        append("/tmp/pycache".as_ref())?;
     }
     arguments.rewind()?;
     let fd = arguments.as_raw_fd();
@@ -177,17 +250,19 @@ fn install_workload_environment(sandbox: &mut Command, command: &Command) -> io:
         .arg("--")
         .arg(command.get_program())
         .args(command.get_args());
-    // SAFETY: the descriptor is owned by this closure throughout spawn. Only
-    // async-signal-safe fcntl executes after fork; parent CLOEXEC is unchanged.
+    // SAFETY: the descriptor is owned by this closure throughout spawn. The
+    // syscalls below affect the forked child's descriptors only.
     unsafe {
         sandbox.pre_exec(move || {
-            let flags = libc::fcntl(arguments.as_raw_fd(), libc::F_GETFD);
-            if flags < 0
-                || libc::fcntl(
-                    arguments.as_raw_fd(),
-                    libc::F_SETFD,
-                    flags & !libc::FD_CLOEXEC,
-                ) < 0
+            // Bubblewrap can forward inherited descriptors to the workload.
+            // Pass only the controlled stdio streams and Bubblewrap's args.
+            if libc::syscall(
+                libc::SYS_close_range,
+                3u32,
+                u32::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            ) < 0
+                || libc::fcntl(arguments.as_raw_fd(), libc::F_SETFD, 0) < 0
             {
                 return Err(io::Error::last_os_error());
             }
@@ -198,7 +273,7 @@ fn install_workload_environment(sandbox: &mut Command, command: &Command) -> io:
 }
 
 #[cfg(not(target_os = "linux"))]
-fn install_workload_environment(_: &mut Command, _: &Command) -> io::Result<()> {
+fn install_workload_environment(_: &mut Command, _: &Command, _: bool) -> io::Result<()> {
     Err(io::Error::other("bubblewrap workloads require Linux"))
 }
 
@@ -244,6 +319,52 @@ mod tests {
             &args[args.len() - 3..],
             &["/usr/bin/printf", "%s", "a b; $(false)"]
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux Bubblewrap with unprivileged namespaces"]
+    fn bubblewrap_closes_inherited_descriptors() {
+        use std::os::{fd::AsRawFd, unix::process::CommandExt};
+
+        const FD_ENV: &str = "ATTUNE_SANDBOX_TEST_INHERITED_FD";
+        if let Some(fd) = std::env::var_os(FD_ENV) {
+            let fd: i32 = fd.to_str().unwrap().parse().unwrap();
+            assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
+            let mut workload = Command::new("/bin/sh");
+            workload.args(["-c", &format!("test ! -e /proc/self/fd/{fd}")]);
+            let output = WorkloadSandbox::Bubblewrap
+                .wrap(workload, &[])
+                .unwrap()
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+
+        let fixture = tempfile::tempfile().unwrap();
+        let fd = fixture.as_raw_fd();
+        let mut test_process = Command::new(std::env::current_exe().unwrap());
+        test_process
+            .args([
+                "workload_sandbox::tests::bubblewrap_closes_inherited_descriptors",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(FD_ENV, fd.to_string());
+        // SAFETY: fixture owns fd throughout spawn. Only the forked test
+        // process inherits it.
+        unsafe {
+            test_process.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = test_process.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
     }
 
     #[cfg(target_os = "linux")]
@@ -346,6 +467,7 @@ set -eu
 [ ! -e '{secret}' ]
 [ ! -e '/proc/{pid}/environ' ]
 [ ! -e '/proc/{pid}/root' ]
+if kill -0 {pid} 2>/dev/null; then exit 40; fi
 [ "$(cat '{runtime}/published')" = original ]
 if echo poisoned > '{runtime}/published' 2>/dev/null; then exit 41; fi
 [ "$ATTUNE_API_TOKEN" = scoped-dummy-token ]

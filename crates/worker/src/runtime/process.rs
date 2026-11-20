@@ -22,7 +22,9 @@ use async_trait::async_trait;
 use attune_common::models::runtime::{
     EnvironmentConfig, InlineExecutionStrategy, RuntimeExecutionConfig,
 };
-use attune_common::runtime_cache::{sha256_bytes, RuntimeCacheKey, READY_MARKER};
+use attune_common::runtime_cache::{
+    read_runtime_marker, sha256_bytes, write_runtime_marker, RuntimeCacheKey, READY_MARKER,
+};
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -254,13 +256,7 @@ impl ProcessRuntime {
             .args(&target.command[1..])
             .current_dir(&target.working_dir);
         parameter_passing::apply_runtime_environment(&mut command, &env, &self.child_environment);
-        let mut input_roots = vec![target.generation.as_path()];
-        if pack_dir.is_dir() {
-            input_roots.push(pack_dir.as_path());
-        }
-        let command = self
-            .child_environment
-            .sandbox_workload(command.into_std(), &input_roots)?;
+        let command = target.sandbox_invocation(command.into_std(), &self.child_environment)?;
         let result = process_executor::execute_streaming_recipe(
             Command::from(command),
             &HashMap::new(),
@@ -418,7 +414,7 @@ impl ProcessRuntime {
         let ready = cache_key
             .map(|key| key.is_ready(env_dir))
             .unwrap_or_else(|| {
-                std::fs::read_to_string(env_dir.join(READY_MARKER)).is_ok_and(|marker| {
+                read_runtime_marker(&env_dir.join(READY_MARKER)).is_ok_and(|marker| {
                     env_dir
                         .file_name()
                         .is_some_and(|name| marker.trim() == name.to_string_lossy())
@@ -471,7 +467,7 @@ impl ProcessRuntime {
                 } else {
                     "ready".to_string()
                 };
-                std::fs::write(temporary.join(READY_MARKER), marker)?;
+                write_runtime_marker(&temporary.join(READY_MARKER), &marker)?;
             }
             if let Some(key) = cache_key {
                 key.publish(&temporary, env_dir)?;
@@ -479,7 +475,7 @@ impl ProcessRuntime {
                 match std::fs::rename(&temporary, env_dir) {
                     Ok(()) => {}
                     Err(_)
-                        if std::fs::read_to_string(env_dir.join(READY_MARKER)).is_ok_and(
+                        if read_runtime_marker(&env_dir.join(READY_MARKER)).is_ok_and(
                             |marker| {
                                 env_dir
                                     .file_name()
@@ -664,7 +660,12 @@ impl ProcessRuntime {
             &self.child_environment,
             &self.config,
         );
-        let output = process_executor::run_command_output_owned(command)
+        let command = self.child_environment.sandbox_environment_setup(
+            command.into_std(),
+            pack_dir,
+            env_dir,
+        )?;
+        let output = process_executor::run_command_output_owned(Command::from(command))
             .await
             .map_err(|e| {
                 RuntimeError::SetupError(format!(
@@ -737,7 +738,7 @@ impl ProcessRuntime {
         let current_checksum = Self::file_checksum(&manifest_path).await;
 
         if let Some(ref checksum) = current_checksum {
-            if let Ok(stored) = tokio::fs::read_to_string(&marker_path).await {
+            if let Ok(stored) = read_runtime_marker(&marker_path) {
                 if stored.trim() == checksum.as_str() {
                     debug!(
                         "Dependencies already installed for runtime '{}' in {} (manifest unchanged)",
@@ -774,7 +775,12 @@ impl ProcessRuntime {
             &self.child_environment,
             &self.config,
         );
-        let output = process_executor::run_command_output_owned(command)
+        let command = self.child_environment.sandbox_environment_setup(
+            command.into_std(),
+            pack_dir,
+            env_dir,
+        )?;
+        let output = process_executor::run_command_output_owned(Command::from(command))
             .await
             .map_err(|e| {
                 RuntimeError::SetupError(format!(
@@ -803,7 +809,7 @@ impl ProcessRuntime {
 
         // Write the checksum marker so subsequent calls skip the install.
         if let Some(checksum) = current_checksum {
-            if let Err(e) = tokio::fs::write(&marker_path, checksum.as_bytes()).await {
+            if let Err(e) = write_runtime_marker(&marker_path, &checksum) {
                 warn!(
                     "Failed to write dependency marker file {}: {}",
                     marker_path.display(),
@@ -1067,6 +1073,16 @@ impl ProcessRuntime {
                 }
             }
         }
+    }
+
+    async fn probe_interpreter(&self, binary: &str) -> std::io::Result<std::process::Output> {
+        let mut command = Command::new(binary);
+        self.child_environment.apply(command.as_std_mut());
+        command.arg("--version");
+        let command = self
+            .child_environment
+            .sandbox_workload(command.into_std(), &[])?;
+        Command::from(command).kill_on_drop(true).output().await
     }
 }
 
@@ -1477,9 +1493,7 @@ impl Runtime for ProcessRuntime {
         let binary = &self.config.interpreter.binary;
 
         // Verify the interpreter is available on the system
-        let mut command = Command::new(binary);
-        self.child_environment.apply(command.as_std_mut());
-        let result = command.arg("--version").output().await;
+        let result = self.probe_interpreter(binary).await;
 
         match result {
             Ok(output) => {
@@ -1522,9 +1536,7 @@ impl Runtime for ProcessRuntime {
         let binary = &self.config.interpreter.binary;
 
         // Check if interpreter is available
-        let mut command = Command::new(binary);
-        self.child_environment.apply(command.as_std_mut());
-        let output = command.arg("--version").output().await;
+        let output = self.probe_interpreter(binary).await;
 
         match output {
             Ok(output) if output.status.success() => Ok(()),

@@ -257,6 +257,7 @@ impl WorkerService {
                     config.artifacts.transport
                         == attune_common::artifact_transport::TransportMode::Api,
                 )
+                .await
                 .map_err(|error| Error::validation(error.to_string()))?,
             );
         config.validate_deployed_pack_transport()?;

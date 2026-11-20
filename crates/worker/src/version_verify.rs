@@ -431,8 +431,14 @@ async fn run_verification_command(
 ) -> std::result::Result<bool, String> {
     let mut command = Command::new(&cmd.binary);
     child_environment.apply(command.as_std_mut());
+    command.args(&cmd.args);
+    let mut command = Command::from(
+        child_environment
+            .sandbox_workload(command.into_std(), &[])
+            .map_err(|e| format!("Failed to isolate verification for '{}': {e}", cmd.binary))?,
+    );
     let output = command
-        .args(&cmd.args)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
@@ -522,8 +528,17 @@ fn log_verification_pattern_mismatch(cmd: &VerificationCommand, stdout: &[u8], s
 async fn run_basic_binary_check(binary: &str, child_environment: &ChildProcessEnvironment) -> bool {
     let mut command = Command::new(binary);
     child_environment.apply(command.as_std_mut());
+    command.arg("--version");
+    let command = child_environment.sandbox_workload(command.into_std(), &[]);
+    let mut command = match command {
+        Ok(command) => Command::from(command),
+        Err(error) => {
+            debug!("Failed to isolate binary check for '{}': {}", binary, error);
+            return false;
+        }
+    };
     match command
-        .arg("--version")
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)

@@ -87,7 +87,8 @@ impl SensorService {
                 attune_common::workload_sandbox::WorkloadSandbox::from_environment(
                     config.artifacts.transport
                         == attune_common::artifact_transport::TransportMode::Api,
-                )?,
+                )
+                .await?,
             );
         config.validate_deployed_pack_transport()?;
         config.validate_deployed_artifact_transport()?;

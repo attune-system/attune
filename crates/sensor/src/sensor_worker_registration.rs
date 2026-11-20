@@ -617,9 +617,12 @@ async fn verify_registered_runtime_version(
             let mut process = Command::new(binary);
             child_environment.apply(process.as_std_mut());
             process.args(args);
+            let Ok(process) = child_environment.sandbox_workload(process.into_std(), &[]) else {
+                continue;
+            };
             let Ok(Ok(output)) = tokio::time::timeout(
                 Duration::from_secs(10),
-                cancellable_command_output(&mut process),
+                cancellable_command_output(&mut Command::from(process)),
             )
             .await
             else {
@@ -657,9 +660,12 @@ async fn verify_registered_runtime_version(
     let mut command = Command::new(binary);
     child_environment.apply(command.as_std_mut());
     command.arg("--version");
+    let Ok(command) = child_environment.sandbox_workload(command.into_std(), &[]) else {
+        return false;
+    };
     let Ok(Ok(output)) = tokio::time::timeout(
         Duration::from_secs(10),
-        cancellable_command_output(&mut command),
+        cancellable_command_output(&mut Command::from(command)),
     )
     .await
     else {

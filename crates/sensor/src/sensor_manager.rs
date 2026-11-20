@@ -167,7 +167,7 @@ fn build_sensor_setup_command(
     env_dir: &std::path::Path,
     exec_config: &RuntimeExecutionConfig,
     environment: &ChildProcessEnvironment,
-) -> Command {
+) -> io::Result<Command> {
     let mut command = Command::new(program);
     environment.apply(command.as_std_mut());
     apply_runtime_env_vars(&mut command, exec_config, pack_dir, Some(env_dir));
@@ -183,7 +183,9 @@ fn build_sensor_setup_command(
             "PIP_CONFIG_FILE",
             if cfg!(windows) { "NUL" } else { "/dev/null" },
         );
-    command
+    environment
+        .sandbox_environment_setup(command.into_std(), pack_dir, env_dir)
+        .map(Command::from)
 }
 
 fn apply_runtime_env_vars(
@@ -1046,7 +1048,7 @@ impl SensorManager {
                 env_dir,
                 exec_config,
                 child_environment,
-            ))
+            )?)
             .await
             .map_err(|e| anyhow!("Failed to run runtime environment create command: {e}"))?;
 
@@ -1073,7 +1075,9 @@ impl SensorManager {
         }
 
         let install_marker = env_dir.join(".attune_sensor_deps_installed");
-        if install_marker.exists() {
+        if attune_common::runtime_cache::read_runtime_marker(&install_marker)
+            .is_ok_and(|marker| marker == "ok")
+        {
             return Ok(());
         }
 
@@ -1095,7 +1099,7 @@ impl SensorManager {
             env_dir,
             exec_config,
             child_environment,
-        ))
+        )?)
         .await
         .map_err(|e| anyhow!("Failed to run runtime dependency install command: {e}"))?;
 
@@ -1107,15 +1111,13 @@ impl SensorManager {
             ));
         }
 
-        tokio::fs::write(&install_marker, b"ok")
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "Failed to write dependency install marker {}: {}",
-                    install_marker.display(),
-                    e
-                )
-            })?;
+        attune_common::runtime_cache::write_runtime_marker(&install_marker, "ok").map_err(|e| {
+            anyhow!(
+                "Failed to write dependency install marker {}: {}",
+                install_marker.display(),
+                e
+            )
+        })?;
 
         Ok(())
     }
@@ -1469,6 +1471,9 @@ impl SensorManager {
                 .ensure_runtime_environment(&exec_config, &pack_dir, &env_dir, &cache_key)
                 .await
             {
+                if self.inner.child_environment.uses_workload_sandbox() {
+                    return Err(e.context("Failed to prepare sandboxed sensor environment"));
+                }
                 warn!(
                     "Failed to ensure sensor runtime environment for {} at {}: {}",
                     sensor.r#ref,
@@ -1641,8 +1646,14 @@ impl SensorManager {
         apply_runtime_env_vars(&mut cmd, &exec_config, &pack_dir, env_dir_opt);
         cmd.env_remove("ATTUNE_SENSOR_TRIGGERS")
             .env_remove("ATTUNE_SENSOR_CONFIG_JSON");
-        let mut cmd =
-            sandbox_sensor_command(cmd, &self.inner.child_environment, &pack_dir, env_dir_opt)?;
+        let mut cmd = match &prepared_target {
+            Some(target) => Command::from(
+                target.sandbox_invocation(cmd.into_std(), &self.inner.child_environment)?,
+            ),
+            _ => {
+                sandbox_sensor_command(cmd, &self.inner.child_environment, &pack_dir, env_dir_opt)?
+            }
+        };
         configure_sensor_process(&mut cmd)
             .map_err(|e| anyhow!("Failed to configure sensor process: {}", e))?;
         cmd.kill_on_drop(true);
