@@ -587,6 +587,7 @@ pub(super) async fn execution_wait(
             source.id,
             original.id,
             weak_contributor,
+            key,
         )
         .await?
     } else {
@@ -642,6 +643,17 @@ pub(super) async fn execution_wait(
     .await?;
     // Seal once, in the original creation transaction, after every independent
     // contributor has been recorded and before native source consumption.
+    if let Some(queue) = &contributor_queue {
+        super::c_native_contributors::seal_batch(
+            &mut tx,
+            queue,
+            source.id,
+            source_admission,
+            &contributor_items,
+            key,
+        )
+        .await?;
+    }
     attune_common::repositories::accepted_input::AcceptedInputRepository::seal_execution(
         &mut tx, source.id, key,
     )

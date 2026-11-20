@@ -603,6 +603,7 @@ pub(super) async fn related_wait(
             producer.id,
             original.id,
             weak_contributor,
+            key,
         )
         .await?
     } else {
@@ -657,6 +658,17 @@ pub(super) async fn related_wait(
         fixture.requester,
     )
     .await?;
+    if contributor_case {
+        super::c_native_contributors::seal_batch(
+            &mut tx,
+            &queue,
+            producer.id,
+            source_admission,
+            &contributor_items,
+            key,
+        )
+        .await?;
+    }
     attune_common::repositories::accepted_input::AcceptedInputRepository::seal_execution(
         &mut tx,
         producer.id,

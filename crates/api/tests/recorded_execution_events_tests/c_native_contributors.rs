@@ -4,14 +4,19 @@ use super::*;
 use attune_common::{
     models::{Pack, WorkQueue, WorkQueueItemStatus},
     repositories::{
+        accepted_batch_dependency::AcceptedBatchDependencyRepository as Batch,
+        execution_admission::ExecutionAdmissionRepository as Admissions,
         identity::{
             CreateIdentityInput, CreatePermissionAssignmentInput, CreatePermissionSetInput,
             IdentityRepository, PermissionAssignmentRepository, PermissionSetRepository,
         },
+        queue_configuration_input::QueueConfigurationInputRepository as Fixed,
         recorded_input_authority::RecordedInputAuthorityRepository as Contributors,
+        runtime_target::{ComponentTarget, RuntimeTarget},
+        schema_contract::SchemaContractRepository,
         work_queue::{
-            CreateWorkQueueInput, CreateWorkQueueItemInput, WorkQueueItemRepository,
-            WorkQueueRepository,
+            CreateWorkQueueInput, CreateWorkQueueItemInput, LeaseWorkQueueItemsInput,
+            WorkQueueItemRepository, WorkQueueRepository,
         },
         FindById,
     },
@@ -152,7 +157,24 @@ pub(super) async fn capture(
     execution: Id,
     key: Id,
     weak: bool,
+    master: &str,
 ) -> Result<Vec<Id>> {
+    let snapshot = ExecutionRepository::find_by_id(&mut **tx, execution)
+        .await?
+        .and_then(|execution| execution.executable_snapshot)
+        .ok_or("contributor source executable is unavailable")?;
+    let schema_source = WorkQueueRepository::item_schema_source(tx, queue.id).await?;
+    let contract = SchemaContractRepository::materialize(
+        tx,
+        schema_source,
+        attune_common::value_schema::SchemaContext::FlatDocument,
+        &queue.item_schema,
+    )
+    .await?;
+    let binding = attune_common::value_schema::ValueSchemaBinding {
+        authored_schema: queue.item_schema.clone(),
+        contract,
+    };
     let mut items = Vec::new();
     for index in 0..2 {
         let nonce = uuid::Uuid::new_v4().simple().to_string();
@@ -191,7 +213,7 @@ pub(super) async fn capture(
             },
         )
         .await?;
-        let item = WorkQueueItemRepository::create(
+        let item = WorkQueueItemRepository::create_bound_pinned(
             &mut **tx,
             CreateWorkQueueItemInput {
                 queue: queue.id,
@@ -213,9 +235,49 @@ pub(super) async fn capture(
                 last_error: None,
                 ack_summary: None,
             },
+            &snapshot,
+            &binding,
         )
         .await?;
+        // Explicit admitted fixture contract, not a production gate bypass or
+        // publication/E2E assertion. Metadata alone never supplies input proof.
+        let selected = Admissions::select(
+            tx,
+            queue.pack.unwrap(),
+            InvocationBinding::Queue {
+                queue_ref: queue.r#ref.clone(),
+                action_ref: snapshot.executable.action.r#ref.clone(),
+            },
+            &snapshot,
+            queue.permission_set_refs.as_deref().unwrap_or(&[]),
+            RequestAttribution::QueueBatch {
+                queue_ref: queue.r#ref.clone(),
+                items: BTreeMap::from([(
+                    item.id,
+                    Some(HumanAttribution {
+                        identity_id: identity.id,
+                        login: identity.login.clone(),
+                    }),
+                )]),
+            },
+            RuntimeTarget::Component(ComponentTarget::Queue, queue.id),
+        )
+        .await?;
+        let authority = selected.authority();
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(serde_jcs::to_vec(authority)?)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        sqlx::query("INSERT INTO work_queue_item_runtime_admission(item,policy_revision,authority,authority_digest) VALUES($1,$2,$3,$4)")
+            .bind(item.id).bind(authority.policy_id).bind(sqlx::types::Json(authority)).bind(digest)
+            .execute(&mut **tx).await?;
+        selected.ensure_fresh_on(tx).await?;
         Contributors::capture_human(tx, "queue_item", item.id, identity.id).await?;
+        Fixed::capture(tx, queue, &item, &snapshot, master)
+            .await?
+            .ensure_fresh_on(tx)
+            .await?;
         items.push(item.id);
     }
     Contributors::capture_queue_execution(tx, execution, &items).await?;
@@ -228,6 +290,38 @@ pub(super) async fn capture(
         "contributors must retain distinct identities"
     );
     Ok(items)
+}
+
+pub(super) async fn seal_batch(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    queue: &WorkQueue,
+    execution: Id,
+    admission: Id,
+    items: &[Id],
+    master: &str,
+) -> Result<()> {
+    let lease = uuid::Uuid::new_v4();
+    let leased = WorkQueueItemRepository::lease_next_batch(
+        &mut **tx,
+        LeaseWorkQueueItemsInput {
+            separate_requesters: false,
+            queue: queue.id,
+            ready_statuses: vec![WorkQueueItemStatus::Queued],
+            limit: items.len() as i64,
+            batch_coalescing: None,
+            leased_execution: None,
+            lease_token: lease,
+            lease_expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+        },
+    )
+    .await?;
+    assert_eq!(leased.iter().map(|item| item.id).collect::<Vec<_>>(), items);
+    WorkQueueItemRepository::attach_execution_to_lease(&mut **tx, lease, execution).await?;
+    Batch::capture_managed(tx, admission, queue, &leased, None, master)
+        .await?
+        .ensure_fresh_on(tx)
+        .await?;
+    Ok(())
 }
 
 pub(super) async fn attribution(
