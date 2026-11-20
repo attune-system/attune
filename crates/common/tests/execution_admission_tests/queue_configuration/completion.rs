@@ -293,6 +293,157 @@ async fn recorded_queue_workflow_requires_its_closed_native_producer() {
     db.cleanup().await.unwrap();
 }
 
+#[tokio::test]
+async fn recorded_workflow_log_claim_is_exact_and_single_use() {
+    use attune_common::{
+        log_delivery::WorkflowCredential,
+        models::{
+            ArtifactClassification, ArtifactType, ArtifactVisibility, OwnerType,
+            RetentionPolicyType,
+        },
+        repositories::{
+            artifact::{ArtifactRepository, ArtifactVersionRepository, CreateArtifactInput},
+            runtime_authority::RuntimeAuthorityRepository as Authority,
+            workflow::{CreateWorkflowExecutionInput, WorkflowExecutionRepository},
+            workflow_log_outbox::{WorkflowLogClaim, WorkflowLogOutboxRepository as Logs},
+        },
+    };
+    let db = create_test_pool().await.unwrap();
+    let (db, snapshot, policy, human) =
+        fixture_with_queue_shape(db, false, false, None, false, false, None).await;
+    let definition = snapshot.executable.workflow_definition.as_ref().unwrap();
+    let mut tx = db.begin().await.unwrap();
+    let (_, execution, _) = admit_and_lease(&mut tx, &snapshot, &policy, human).await;
+    let workflow = WorkflowExecutionRepository::create(
+        &mut *tx,
+        CreateWorkflowExecutionInput {
+            execution: execution.id,
+            workflow_def: definition.id,
+            task_graph: definition.definition.clone(),
+            variables: json!({}),
+            status: ExecutionStatus::Running,
+        },
+    )
+    .await
+    .unwrap();
+    let artifact = ArtifactRepository::create_or_get(
+        &mut tx,
+        CreateArtifactInput {
+            r#ref: format!("{}.workflow.log", execution.action_ref),
+            scope: OwnerType::Action,
+            owner: execution.action_ref.clone(),
+            r#type: ArtifactType::FileText,
+            visibility: ArtifactVisibility::Public,
+            classification: ArtifactClassification::General,
+            retention_policy: RetentionPolicyType::Versions,
+            retention_limit: 1,
+            name: None,
+            description: None,
+            content_type: Some("text/plain".into()),
+            data: None,
+        },
+    )
+    .await
+    .unwrap();
+    let version = ArtifactVersionRepository::create_workflow_log_pending(
+        &mut tx,
+        artifact.id,
+        &artifact.r#ref,
+        "text/plain".into(),
+        execution.id,
+        json!({"kind":"workflow_log"}),
+    )
+    .await
+    .unwrap();
+    Logs::enqueue_append(&mut tx, workflow.id, b"abc")
+        .await
+        .unwrap();
+    Logs::enqueue_seal(&mut tx, workflow.id).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let claimant = Uuid::new_v4();
+    let lease = std::time::Duration::from_secs(30);
+    let WorkflowLogClaim::Claimed(append) = Logs::claim_next_with_state(db.pool(), claimant, lease)
+        .await
+        .unwrap()
+    else {
+        panic!("prepared workflow log append was unavailable");
+    };
+    Logs::assign_delivery_sequence(db.pool(), append.id, claimant, 0)
+        .await
+        .unwrap();
+    let mut claim = WorkflowCredential {
+        outbox: append.id,
+        version: version.id,
+        claim: claimant,
+        attempt: append.attempt_count,
+    };
+    let abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    let mut tx = db.begin().await.unwrap();
+    for wrong in [
+        WorkflowCredential {
+            attempt: claim.attempt + 1,
+            ..claim.clone()
+        },
+        WorkflowCredential {
+            version: claim.version + 1,
+            ..claim.clone()
+        },
+        WorkflowCredential {
+            claim: Uuid::new_v4(),
+            ..claim.clone()
+        },
+    ] {
+        assert!(
+            Logs::require_recorded_delivery(&mut tx, &wrong, execution.id)
+                .await
+                .is_err()
+        );
+    }
+    let proof = Logs::require_recorded_delivery(&mut tx, &claim, execution.id)
+        .await
+        .unwrap();
+    proof.require_append(0, 3, abc).unwrap();
+    assert!(proof.require_append(1, 3, abc).is_err());
+    assert!(proof.require_append(0, 3, &"0".repeat(64)).is_err());
+    assert!(proof.require_seal(false).is_err());
+    tx.rollback().await.unwrap();
+    assert!(Logs::mark_delivered(db.pool(), append.id, claimant)
+        .await
+        .unwrap());
+
+    let WorkflowLogClaim::Claimed(seal) = Logs::claim_next_with_state(db.pool(), claimant, lease)
+        .await
+        .unwrap()
+    else {
+        panic!("prepared workflow log seal was unavailable");
+    };
+    let mut tx = db.begin().await.unwrap();
+    assert!(
+        Logs::require_recorded_delivery(&mut tx, &claim, execution.id)
+            .await
+            .is_err()
+    );
+    claim.outbox = seal.id;
+    claim.attempt = seal.attempt_count;
+    let proof = Logs::require_recorded_delivery(&mut tx, &claim, execution.id)
+        .await
+        .unwrap();
+    proof.require_seal(false).unwrap();
+    assert!(proof.require_seal(true).is_err());
+    assert!(proof.require_append(0, 3, abc).is_err());
+    Authority::revoke_admission(&mut tx, proof.producer.admission)
+        .await
+        .unwrap();
+    assert!(
+        Logs::require_recorded_delivery(&mut tx, &claim, execution.id)
+            .await
+            .is_err()
+    );
+    tx.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
 async fn admit_and_lease(
     conn: &mut sqlx::PgConnection,
     snapshot: &ExecutionExecutableSnapshot,

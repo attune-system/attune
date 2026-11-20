@@ -1770,11 +1770,9 @@ async fn commit_log_segment(
 
     let mut transaction = state.db.begin().await.map_err(map_sqlx_error)?;
     let effect = authorize_version_mutation(&state, &mut transaction, &user, &version).await?;
-    if let Some(fence) = &effect.log_delivery {
-        fence
-            .append(sequence, bytes.len() as i64, &digest_hex)
-            .map_err(map_transport_error)?;
-    }
+    effect
+        .require_log_append(sequence, bytes.len() as i64, &digest_hex)
+        .map_err(map_transport_error)?;
     let locked_version =
         ArtifactVersionRepository::find_by_id_for_update(&mut transaction, artifact_version)
             .await
@@ -1914,11 +1912,9 @@ async fn reserve_proxy_log_upload(
         .map_err(map_repository_error)?
         .ok_or_else(|| (StatusCode::FORBIDDEN, "Artifact version unavailable".into()))?;
     let effect = authorize_version_mutation(state, &mut transaction, user, &initial).await?;
-    if let Some(fence) = &effect.log_delivery {
-        fence
-            .append(sequence, size, sha256)
-            .map_err(map_transport_error)?;
-    }
+    effect
+        .require_log_append(sequence, size, sha256)
+        .map_err(map_transport_error)?;
     let version =
         ArtifactVersionRepository::find_by_id_for_update(&mut transaction, artifact_version)
             .await
@@ -2172,6 +2168,15 @@ async fn seal_log_stream(
             return Err((StatusCode::FORBIDDEN, "Log path binding changed".into()));
         }
         return object_close::seal(state, user, version, stream.id, headers, query.truncated).await;
+    }
+    if attune_common::log_delivery::workflow_credential(&user.claims)
+        .map_err(map_transport_error)?
+        .is_some()
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Native workflow log requires object segments".into(),
+        ));
     }
     let version = authorize_seal_log_version(&state, &user, artifact_version).await?;
     // Shared append uses source -> artifact advisory -> version -> stream ->
@@ -2804,6 +2809,17 @@ async fn authorize_log_version(
 ) -> Result<attune_common::models::artifact_version::ArtifactVersion, (StatusCode, String)> {
     let log_credential =
         attune_common::log_delivery::credential(&user.claims).map_err(map_transport_error)?;
+    let workflow_credential = attune_common::log_delivery::workflow_credential(&user.claims)
+        .map_err(map_transport_error)?;
+    if workflow_credential
+        .as_ref()
+        .is_some_and(|credential| credential.version != artifact_version)
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Workflow log delivery version mismatch".into(),
+        ));
+    }
     if log_credential
         .as_ref()
         .is_some_and(|c| c.version != artifact_version)
@@ -2837,7 +2853,7 @@ async fn authorize_log_version(
             "Log artifact version has no authorization path".to_string(),
         )
     })?;
-    if log_credential.is_none() {
+    if log_credential.is_none() && workflow_credential.is_none() {
         authorize_file_transfer(state, user, file_path, FileOperation::Mutate).await?;
     }
     Ok(version)
@@ -4777,6 +4793,36 @@ async fn authorize_version_mutation_source(
     user: &AuthenticatedUser,
     version: &attune_common::models::artifact_version::ArtifactVersion,
 ) -> Result<crate::recorded_files::FileMutationProof, (StatusCode, String)> {
+    if let Some(credential) = attune_common::log_delivery::workflow_credential(&user.claims)
+        .map_err(map_transport_error)?
+    {
+        if credential.version != version.id {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Workflow log delivery version mismatch".into(),
+            ));
+        }
+        let execution = version.execution.ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                "Workflow log execution unavailable".into(),
+            )
+        })?;
+        attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_capture(tx)
+            .await.map_err(map_transport_error)?;
+        let workflow_log = Box::pin(attune_common::repositories::workflow_log_outbox::WorkflowLogOutboxRepository::require_recorded_delivery(
+            tx, &credential, execution,
+        )).await.map_err(map_transport_error)?;
+        return Ok(crate::recorded_files::FileMutationProof {
+            log_delivery: None,
+            workflow_log: Some(workflow_log),
+            credential_deadline: user.claims.exp,
+            process: None,
+            process_delivery: None,
+            worker: None,
+            file_origin_budget: None,
+        });
+    }
     if crate::recorded_consumers::is_recorded(user).map_err(map_api_error)?
         && version.execution != user.execution_id()
     {
@@ -4894,6 +4940,7 @@ async fn authorize_version_mutation_source(
     };
     let proof = crate::recorded_files::FileMutationProof {
         log_delivery,
+        workflow_log: None,
         credential_deadline: user.claims.exp,
         process,
         process_delivery,

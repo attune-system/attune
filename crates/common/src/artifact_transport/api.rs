@@ -287,7 +287,9 @@ impl ApiTransport {
         Ok(())
     }
 
-    async fn send_log_segment_through_api(
+    /// Exact scoped log custody uses the proxy endpoint and its source fence.
+    /// It never reserves a general direct artifact-upload credential.
+    pub async fn send_log_segment_through_api(
         &self,
         artifact_version: i64,
         sequence: i64,

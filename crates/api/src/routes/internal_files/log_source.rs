@@ -29,6 +29,9 @@ pub(crate) enum Producer {
     Delegated {
         binding: LogProducerBinding,
     },
+    NativeWorkflow {
+        binding: attune_common::repositories::workflow_log_outbox::WorkflowLogProducer,
+    },
     Sensor {
         sensor: i64,
         metadata_revision: Option<i64>,
@@ -126,6 +129,19 @@ async fn acquire_binding(
 ) -> Result<(Producer, crate::recorded_files::FileMutationProof), (StatusCode, String)> {
     attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository::lock_capture(tx)
         .await.map_err(map_transport_error)?;
+    if attune_common::log_delivery::workflow_credential(&user.claims)
+        .map_err(map_transport_error)?
+        .is_some()
+    {
+        let effect = authorize_version_mutation_source(state, tx, user, version).await?;
+        let binding = effect
+            .workflow_log
+            .as_ref()
+            .ok_or_else(denied)?
+            .producer
+            .clone();
+        return Ok((Producer::NativeWorkflow { binding }, effect));
+    }
     if attune_common::log_delivery::credential(&user.claims)
         .map_err(map_transport_error)?
         .is_some()
@@ -371,6 +387,9 @@ impl<'db> Source<'db> {
         stream: &LogStream,
         truncated: bool,
     ) -> Result<(), (StatusCode, String)> {
+        if let Some(fence) = &self.effect.workflow_log {
+            fence.require_seal(truncated).map_err(map_transport_error)?;
+        }
         if let Some(fence) = &self.effect.log_delivery {
             fence
                 .seal(stream.next_sequence, stream.total_bytes)

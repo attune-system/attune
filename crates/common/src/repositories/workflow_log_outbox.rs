@@ -1,11 +1,16 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::{FromRow, PgConnection, PgPool, Row};
 use uuid::Uuid;
 
 use crate::models::log_stream::WorkflowLogOutboxRecord;
 use crate::{Error, Result};
+
+use super::runtime_authority::{ApprovalEffectFence, RuntimeOwner};
+use super::{ExecutionRepository, FindById};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryRebase {
@@ -28,9 +33,144 @@ pub enum WorkflowLogClaim {
 
 pub const WORKFLOW_LOG_WAKEUP_CHANNEL: &str = "workflow_log_outbox_ready";
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowLogProducer {
+    pub execution: i64,
+    pub workflow: i64,
+    pub admission: i64,
+    pub outbox: i64,
+}
+
+enum WorkflowLogOperation {
+    Append {
+        sequence: i64,
+        size: i64,
+        digest: String,
+    },
+    Seal,
+}
+
+pub struct WorkflowLogEffect {
+    pub producer: WorkflowLogProducer,
+    pub fence: ApprovalEffectFence,
+    operation: WorkflowLogOperation,
+}
+
+fn delivery_denied() -> Error {
+    Error::PermissionDenied("Recorded workflow log delivery is unavailable".into())
+}
+
+impl WorkflowLogEffect {
+    pub fn require_append(&self, sequence: i64, size: i64, sha256: &str) -> Result<()> {
+        if matches!(&self.operation, WorkflowLogOperation::Append {
+            sequence: expected_sequence, size: expected_size, digest
+        } if (*expected_sequence, *expected_size, digest.as_str()) == (sequence, size, sha256))
+        {
+            Ok(())
+        } else {
+            Err(delivery_denied())
+        }
+    }
+
+    pub fn require_seal(&self, truncated: bool) -> Result<()> {
+        if !truncated && matches!(self.operation, WorkflowLogOperation::Seal) {
+            Ok(())
+        } else {
+            Err(delivery_denied())
+        }
+    }
+}
+
 pub struct WorkflowLogOutboxRepository;
 
 impl WorkflowLogOutboxRepository {
+    /// Lock the exact native producer and claimed outbox operation before any
+    /// artifact write. The claim's attempt and lifetime fence retries without
+    /// granting the dispatcher an execution token or general artifact access.
+    pub async fn require_recorded_delivery(
+        conn: &mut PgConnection,
+        credential: &crate::log_delivery::WorkflowCredential,
+        execution: i64,
+    ) -> Result<WorkflowLogEffect> {
+        use super::execution_admission::ExecutionAdmissionRepository as Admission;
+
+        let workflow: (i64, i64) = sqlx::query_as(
+            "SELECT w.id, w.workflow_def FROM workflow_execution w \
+             JOIN workflow_log_outbox o ON o.workflow_execution=w.id \
+             WHERE w.execution=$1 AND o.id=$2 FOR SHARE OF w",
+        )
+        .bind(execution)
+        .bind(credential.outbox)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(delivery_denied)?;
+        let (admission, authority) = Box::pin(Admission::require_with_fence(
+            conn,
+            RuntimeOwner::Execution(execution),
+        ))
+        .await?;
+        let snapshot = ExecutionRepository::find_by_id(&mut *conn, execution)
+            .await?
+            .and_then(|row| row.executable_snapshot)
+            .ok_or_else(delivery_denied)?
+            .executable;
+        if snapshot.action.workflow_def != Some(workflow.1)
+            || !snapshot
+                .workflow_definition
+                .is_some_and(|definition| definition.id == workflow.1)
+        {
+            return Err(delivery_denied());
+        }
+        let retained: (String, Option<i64>, Option<Vec<u8>>, DateTime<Utc>) = sqlx::query_as(
+            "SELECT o.kind,o.delivery_sequence,o.payload,o.claim_expires_at \
+             FROM workflow_log_outbox o JOIN workflow_execution w ON o.workflow_execution=w.id \
+             JOIN execution e ON e.id=w.execution \
+             JOIN artifact_version v ON v.execution=e.id \
+             JOIN artifact a ON a.id=v.artifact \
+             WHERE o.id=$1 AND w.id=$2 AND v.id=$3 AND o.claimed_by=$4 AND o.attempt_count=$5 \
+               AND o.is_head AND o.delivered_at IS NULL AND o.failed_at IS NULL \
+               AND o.claim_expires_at > clock_timestamp() AND e.worker IS NULL \
+               AND NOT EXISTS(SELECT 1 FROM worker_delivery_context c WHERE c.execution=e.id) \
+               AND v.meta->>'kind'='workflow_log' AND a.ref=e.action_ref || '.workflow.log' \
+               AND a.owner=e.action_ref AND a.scope='action' \
+             FOR SHARE OF o,e",
+        )
+        .bind(credential.outbox)
+        .bind(workflow.0)
+        .bind(credential.version)
+        .bind(credential.claim)
+        .bind(credential.attempt)
+        .fetch_optional(conn)
+        .await?
+        .ok_or_else(delivery_denied)?;
+        let (kind, sequence, body, expires) = retained;
+        let operation = match (kind.as_str(), sequence, body) {
+            ("append", Some(sequence), Some(payload)) if sequence >= 0 && !payload.is_empty() => {
+                WorkflowLogOperation::Append {
+                    sequence,
+                    size: i64::try_from(payload.len()).map_err(|_| delivery_denied())?,
+                    digest: Sha256::digest(&payload)
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect(),
+                }
+            }
+            ("seal", _, None) => WorkflowLogOperation::Seal,
+            _ => return Err(delivery_denied()),
+        };
+        Ok(WorkflowLogEffect {
+            producer: WorkflowLogProducer {
+                execution,
+                workflow: workflow.0,
+                admission: admission.id,
+                outbox: credential.outbox,
+            },
+            fence: authority.intersect(&ApprovalEffectFence::from_input_approval(Some(expires))?),
+            operation,
+        })
+    }
+
     pub async fn effective_segment_max_bytes(
         connection: &mut PgConnection,
         workflow_execution: i64,

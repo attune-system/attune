@@ -300,12 +300,13 @@ impl ExecutorService {
             access_token_expiration: self.inner.config.security.jwt_access_expiration as i64,
             refresh_token_expiration: self.inner.config.security.jwt_refresh_expiration as i64,
         };
+        let workflow_log_api = ApiTransport::new_with_worker_token_provider(
+            &api_url,
+            Arc::new(WorkerTokenProvider::new(0, "executor", jwt_config.clone())),
+            &self.inner.config.artifacts_dir,
+        )?;
         let workflow_log_transport: Arc<dyn ArtifactFileTransport> =
-            Arc::new(ApiTransport::new_with_worker_token_provider(
-                &api_url,
-                Arc::new(WorkerTokenProvider::new(0, "executor", jwt_config)),
-                &self.inner.config.artifacts_dir,
-            )?);
+            Arc::new(workflow_log_api.clone());
 
         // Start event processor with its own consumer
         info!("Starting event processor...");
@@ -648,7 +649,8 @@ impl ExecutorService {
             workflow_log_transport,
             self.inner.config.artifacts.log_segment_max_bytes,
             self.inner.config.artifacts.flush_interval_ms,
-        );
+        )
+        .with_recorded_transport(workflow_log_api, jwt_config);
         let workflow_log_shutdown = self.inner.shutdown_tx.subscribe();
         let mut workflow_log_handle =
             tokio::spawn(async move { workflow_log_dispatcher.start(workflow_log_shutdown).await });
@@ -761,7 +763,14 @@ impl ExecutorService {
             .security
             .encryption_key
             .as_ref()
-            .is_some_and(|key| key.trim().len() >= 32);
+            .is_some_and(|key| key.trim().len() >= 32)
+            && self
+                .inner
+                .config
+                .security
+                .jwt_secret
+                .as_ref()
+                .is_some_and(|key| key.trim().len() >= 32 && key != &JwtConfig::default().secret);
         let mut ticks = tokio::time::interval(std::time::Duration::from_secs(5));
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {

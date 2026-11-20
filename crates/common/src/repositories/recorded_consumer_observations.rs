@@ -225,6 +225,8 @@ impl RecordedConsumerObservations {
                       ('artifact_file_origin', ARRAY['SELECT','INSERT'], TRUE),
                       ('worker_delivery_context', ARRAY['SELECT'], TRUE),
                       ('worker_delivery_permit', ARRAY['SELECT'], TRUE),
+                      ('workflow_execution', ARRAY['SELECT'], TRUE),
+                      ('workflow_log_outbox', ARRAY['SELECT'], TRUE),
                       ('log_stream', ARRAY['SELECT','INSERT','UPDATE'], TRUE)
                 ) AS required(name, privileges, locked)
                 CROSS JOIN LATERAL unnest(required.privileges) AS privilege(name)
@@ -260,6 +262,7 @@ impl RecordedConsumerObservations {
                       ('execution_runtime_read_fence', ARRAY['SELECT','INSERT','UPDATE'], TRUE),
                       ('worker_delivery_context', ARRAY['SELECT'], TRUE),
                       ('workflow_execution', ARRAY['SELECT','INSERT','UPDATE'], TRUE),
+                      ('workflow_log_outbox', ARRAY['SELECT','INSERT','UPDATE'], TRUE),
                       ('workflow_task_wait', ARRAY['SELECT','INSERT','UPDATE'], TRUE),
                       ('work_queue', ARRAY['SELECT'], TRUE),
                       ('work_queue_item', ARRAY['SELECT','UPDATE'], TRUE),

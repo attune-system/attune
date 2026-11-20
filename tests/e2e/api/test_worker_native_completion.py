@@ -410,5 +410,23 @@ def test_managed_queue_native_workflow_acknowledges_item(client, tmp_path):
         execution = client.get_execution(executions[0]["id"])
         assert execution["worker"] is None
         assert execution["result"]["queue_ack"]["items"][0]["id"] == identifier
+
+        def workflow_log_ready():
+            response = client.get(f"/api/v1/executions/{execution['id']}/artifacts", params={"type": "file_text"})
+            response.raise_for_status()
+            matches = [artifact for artifact in response.json()["items"] if artifact["ref"] == action + ".workflow.log"]
+            if not matches:
+                return False
+            assert len(matches) == 1
+            artifact = matches[0]
+            version = artifact["selected_version"]
+            assert version["execution"] == execution["id"]
+            response = client.get(f"/api/v1/artifacts/{artifact['id']}/versions/{version['version']}/download",
+                                  params={"version_id": version["id"]})
+            assert response.status_code in (200, 404)
+            return response.status_code == 200 and "Workflow Completed" in response.text
+
+        wait_for_condition(workflow_log_ready, timeout=30, poll_interval=0.25,
+                           error_message="Native workflow activity log did not finalize")
     finally:
         client.put(base, json={"enabled": False, "accepting_new_items": False}).raise_for_status()
