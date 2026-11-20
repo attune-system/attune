@@ -14,6 +14,9 @@ mod cache_regressions;
 #[allow(dead_code)]
 #[path = "../../../tests/sqlx-session/src/commit_relay.rs"]
 mod commit_relay;
+#[cfg(target_os = "linux")]
+#[path = "recorded_rollout_tests/consumer_observations.rs"]
+mod consumer_observations;
 mod helpers;
 use attune_common::{
     execution_authority::consumer_contract::{

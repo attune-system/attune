@@ -109,6 +109,7 @@ pub mod platform_catalog;
 pub mod public_input_approval;
 pub mod queue_stats;
 pub mod reclamation_cancellation;
+pub mod recorded_consumer_observations;
 pub mod recorded_input_authority;
 pub mod recorded_input_origins;
 pub mod recorded_rollout;

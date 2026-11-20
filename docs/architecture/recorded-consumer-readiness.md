@@ -61,11 +61,39 @@ API/notifier/executor replicas or their expected boots/generation. Worker rows
 cover Action/Sensor hosts only. The operator-owned PostgreSQL foundation below records expected membership;
 production aggregation still has no deployed membership writer or service integration.
 
-The pure `execution_authority::consumer_contract` protocol models role-local
-descriptors and validates them against an explicit expected membership. It has
-no production caller, transport, advertisement or readiness conversion. The
-operator repository below is a foundation, not service registration or readiness. Its checked snapshot is not authority evidence. One health response,
-an empty expected set, or support claimed by another role cannot satisfy it.
+The `execution_authority::consumer_contract` protocol models role-local
+descriptors and validates them against an explicit expected membership.
+Service startup and readiness conversion still need wiring. One health
+response, an empty expected set, or support claimed by another role cannot
+satisfy the contract.
+
+### Candidate PostgreSQL observation transport
+
+The [candidate SQL](../../deployment/rollout-admin/consumer-observations.candidate.sql)
+and `RecordedConsumerObservations` repository provide a transport for the
+existing PostgreSQL installation. The candidate is outside the migration ledger.
+
+- The deployment stages its exact expected membership as before. The DBA binds
+  each expected instance and boot to a dedicated, unprivileged PostgreSQL login
+  with no role memberships or members. It grants that login schema usage and
+  execution of the reporting function. A replacement boot uses a fresh
+  membership generation and login. Bindings do not change at runtime.
+- A report requires the authenticated PostgreSQL session login, exact rollout
+  snapshot, instance, boot, and required role mask. The server assigns the
+  observation time. A report can renew only its own row, and the same login
+  can withdraw that row. The 30-second window bounds evidence from a dead
+  process. Startup code still needs to establish the local consumer prerequisites
+  before publishing.
+- The DBA grants the admission and dispatch roles only execution of the evidence
+  reader for this transport. It returns observations from the active rollout
+  and current catalog, using a single database clock sample. The repository runs
+  the exact membership validator, requiring every replica. The transaction
+  holds the active rollout and catalog row locks so they cannot switch underneath
+  the effect that uses the evidence.
+- The tables have no service-owned DML grants. Binding uses the DBA connection,
+  and reporter login identity relies on `session_user` plus the exact catalog
+  role identity. Runtime evidence cannot stage or activate a rollout. A valid
+  observation carries no execution grant or permission to access protected data.
 
 Actions and sensors are trusted, inspected, approved cooperative workloads.
 Hostile sibling-process containment and candidate process isolation are not

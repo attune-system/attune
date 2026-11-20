@@ -1,0 +1,205 @@
+-- Candidate transport for the recorded-authority rollout contract. Install only
+-- in the trusted application schema, after recorded rollout membership.
+-- Reporter credentials are dedicated to one deployment boot and never reused.
+DO $trust$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_namespace AS ns
+        JOIN pg_roles AS owner ON owner.oid = ns.nspowner
+        WHERE ns.nspname = current_schema() AND owner.rolname = current_user
+            AND NOT owner.rolcanlogin AND NOT owner.rolsuper AND NOT owner.rolcreaterole
+            AND NOT owner.rolcreatedb AND NOT owner.rolreplication AND NOT owner.rolbypassrls
+    ) OR EXISTS (
+        SELECT 1 FROM pg_namespace AS ns
+        CROSS JOIN LATERAL aclexplode(COALESCE(ns.nspacl, acldefault('n', ns.nspowner))) AS acl
+        WHERE ns.nspname IN (current_schema(), 'pg_catalog')
+            AND acl.privilege_type = 'CREATE' AND acl.grantee <> ns.nspowner
+    ) THEN
+        RAISE EXCEPTION 'Consumer observations require the trusted installation owner' USING ERRCODE = '42501';
+    END IF;
+END $trust$;
+
+CREATE TABLE recorded_consumer_binding (
+    rollout BIGINT NOT NULL REFERENCES recorded_rollout_generation(id),
+    instance UUID NOT NULL,
+    boot UUID NOT NULL,
+    reporter NAME NOT NULL UNIQUE,
+    reporter_oid OID NOT NULL UNIQUE,
+    role TEXT NOT NULL,
+    required_mask INTEGER NOT NULL,
+    PRIMARY KEY (rollout, instance)
+);
+
+CREATE TABLE recorded_consumer_observation (
+    rollout BIGINT NOT NULL,
+    instance UUID NOT NULL,
+    observed TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (rollout, instance),
+    FOREIGN KEY (rollout, instance) REFERENCES recorded_consumer_binding (rollout, instance)
+);
+
+REVOKE ALL ON recorded_consumer_binding, recorded_consumer_observation FROM PUBLIC;
+
+-- Invoked by the DBA that provisions the dedicated PostgreSQL LOGIN. The
+-- rollout operator and all runtime services keep their existing privileges.
+CREATE FUNCTION bind_recorded_consumer(target UUID, member_id UUID, boot_id UUID, login_name NAME) RETURNS VOID
+LANGUAGE plpgsql SECURITY DEFINER AS $bind$
+DECLARE
+    rollout_id BIGINT;
+    member_mask INTEGER;
+    member_role TEXT;
+    principal OID;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = session_user AND rolsuper) THEN
+        RAISE EXCEPTION 'Consumer binding requires the DBA session' USING ERRCODE = '42501';
+    END IF;
+
+    SELECT generation.id, member.value->>'role', (member.value->>'required_mask')::INTEGER
+        INTO rollout_id, member_role, member_mask
+    FROM recorded_rollout_generation AS generation
+    CROSS JOIN LATERAL jsonb_array_elements(generation.expected->'members') AS member
+    WHERE generation.generation = target AND member.value->>'instance' = member_id::TEXT
+        AND member.value->>'boot' = boot_id::TEXT;
+
+    SELECT role.oid INTO principal
+    FROM pg_roles AS role
+    WHERE role.rolname = login_name AND role.rolcanlogin AND NOT role.rolsuper
+        AND NOT role.rolcreaterole AND NOT role.rolcreatedb AND NOT role.rolreplication
+        AND NOT role.rolbypassrls
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_auth_members WHERE member = role.oid OR roleid = role.oid
+        );
+
+    IF rollout_id IS NULL OR principal IS NULL THEN
+        RAISE EXCEPTION 'Invalid rollout member or reporter login' USING ERRCODE = '42501';
+    END IF;
+
+    INSERT INTO recorded_consumer_binding (rollout, instance, boot, reporter, reporter_oid, role, required_mask)
+    VALUES (rollout_id, member_id, boot_id, login_name, principal, member_role, member_mask)
+    ON CONFLICT (rollout, instance) DO NOTHING;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM recorded_consumer_binding
+        WHERE rollout = rollout_id AND instance = member_id AND boot = boot_id
+            AND reporter = login_name AND reporter_oid = principal
+            AND role = member_role AND required_mask = member_mask
+    ) THEN
+        RAISE EXCEPTION 'Conflicting consumer binding' USING ERRCODE = '42501';
+    END IF;
+END $bind$;
+
+-- The service cannot select the role, boot or rollout it speaks for. NULL
+-- withdraws its observation before shutdown, while mutations for any other
+-- member remain unavailable.
+CREATE FUNCTION report_recorded_consumer(snapshot JSONB, member_id UUID, boot_id UUID, mask INTEGER) RETURNS VOID
+LANGUAGE plpgsql SECURITY DEFINER AS $report$
+DECLARE
+    binding recorded_consumer_binding;
+BEGIN
+    SELECT b.* INTO binding
+    FROM recorded_consumer_binding AS b
+    JOIN recorded_rollout_generation AS g ON g.id = b.rollout
+    JOIN pg_roles AS principal ON principal.oid = b.reporter_oid AND principal.rolname = b.reporter
+    WHERE g.expected->'snapshot' = snapshot AND b.instance = member_id AND b.boot = boot_id
+        AND b.reporter = session_user AND principal.rolcanlogin AND NOT principal.rolsuper
+        AND NOT principal.rolcreaterole AND NOT principal.rolcreatedb AND NOT principal.rolreplication
+        AND NOT principal.rolbypassrls
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_auth_members WHERE member = principal.oid OR roleid = principal.oid
+        );
+
+    IF NOT FOUND OR (mask IS NOT NULL AND mask <> binding.required_mask) THEN
+        RAISE EXCEPTION 'Consumer observation not authorized' USING ERRCODE = '42501';
+    END IF;
+
+    IF mask IS NULL THEN
+        DELETE FROM recorded_consumer_observation
+        WHERE rollout = binding.rollout AND instance = binding.instance;
+    ELSE
+        INSERT INTO recorded_consumer_observation (rollout, instance, observed)
+        VALUES (binding.rollout, binding.instance, clock_timestamp())
+        ON CONFLICT (rollout, instance) DO UPDATE SET observed = clock_timestamp();
+    END IF;
+END $report$;
+
+-- Admission/dispatch callers use the active pointer and database clock in the
+-- same transaction as the effect. Reads serialize with an operator's switch.
+CREATE FUNCTION current_recorded_consumer_evidence() RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER AS $read$
+DECLARE
+    active recorded_rollout_active;
+    expected JSONB;
+    cutoff TIMESTAMPTZ;
+    observations JSONB;
+BEGIN
+    SELECT * INTO STRICT active FROM recorded_rollout_active WHERE singleton FOR SHARE;
+    SELECT g.expected INTO expected
+    FROM recorded_rollout_generation AS g
+    JOIN platform_catalog_state AS catalog ON catalog.singleton
+    WHERE g.id = active.generation
+        AND (g.expected->'snapshot'->>'catalog_epoch')::INTEGER = catalog.compatibility_epoch
+        AND (g.expected->'snapshot'->>'catalog_revision')::INTEGER = catalog.revision
+        AND g.membership_digest = recorded_membership_digest(g.expected)
+    FOR SHARE OF catalog;
+
+    IF expected IS NULL THEN RETURN NULL; END IF;
+
+    cutoff := clock_timestamp();
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+        'instance', b.instance, 'boot', b.boot,
+        'role', b.role, 'snapshot', expected->'snapshot',
+        'gate_mask', b.required_mask, 'observed', o.observed,
+        'expires', o.observed + INTERVAL '30 seconds'
+    ) ORDER BY b.instance), '[]'::JSONB) INTO observations
+    FROM recorded_consumer_observation AS o
+    JOIN recorded_consumer_binding AS b USING (rollout, instance)
+    JOIN pg_roles AS principal ON principal.oid = b.reporter_oid AND principal.rolname = b.reporter
+    WHERE o.rollout = active.generation AND o.observed > cutoff - INTERVAL '30 seconds'
+        AND principal.rolcanlogin AND NOT principal.rolsuper AND NOT principal.rolcreaterole
+        AND NOT principal.rolcreatedb AND NOT principal.rolreplication AND NOT principal.rolbypassrls
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_auth_members WHERE member = principal.oid OR roleid = principal.oid
+        );
+
+    RETURN jsonb_build_object('expected', expected, 'observations', observations, 'now', cutoff,
+        'revision', active.revision);
+END $read$;
+
+REVOKE ALL ON FUNCTION bind_recorded_consumer(UUID, UUID, UUID, NAME),
+    report_recorded_consumer(JSONB, UUID, UUID, INTEGER), current_recorded_consumer_evidence() FROM PUBLIC;
+
+DO $path$
+DECLARE signature TEXT;
+BEGIN
+    FOREACH signature IN ARRAY ARRAY[
+        'bind_recorded_consumer(UUID, UUID, UUID, NAME)',
+        'report_recorded_consumer(JSONB, UUID, UUID, INTEGER)',
+        'current_recorded_consumer_evidence()'
+    ] LOOP
+        EXECUTE format('ALTER FUNCTION %s SET search_path TO pg_catalog, %I, pg_temp',
+            signature, current_schema());
+    END LOOP;
+END $path$;
+
+-- Reject inherited default grants that would let a login bypass the functions
+-- or read a rollout without a deliberate provisioning grant.
+DO $privileges$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_class AS relation
+        CROSS JOIN LATERAL aclexplode(COALESCE(relation.relacl, acldefault('r', relation.relowner))) AS acl
+        WHERE relation.oid IN (
+            'recorded_consumer_binding'::REGCLASS, 'recorded_consumer_observation'::REGCLASS
+        ) AND acl.grantee <> relation.relowner
+    ) OR EXISTS (
+        SELECT 1 FROM pg_proc AS procedure
+        CROSS JOIN LATERAL aclexplode(COALESCE(procedure.proacl, acldefault('f', procedure.proowner))) AS acl
+        WHERE procedure.oid IN (
+            'bind_recorded_consumer(UUID, UUID, UUID, NAME)'::REGPROCEDURE,
+            'report_recorded_consumer(JSONB, UUID, UUID, INTEGER)'::REGPROCEDURE,
+            'current_recorded_consumer_evidence()'::REGPROCEDURE
+        ) AND acl.grantee <> procedure.proowner
+    ) THEN
+        RAISE EXCEPTION 'Consumer transport has unexpected default grants' USING ERRCODE = '42501';
+    END IF;
+END $privileges$;
