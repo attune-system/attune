@@ -99,6 +99,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry
     find crates -type f -name '*.rs' -exec touch {} + && \
     cargo build --release \
     --bin attune-api \
+    --bin attune-rollout-admin \
     --bin attune-executor \
     --bin attune-notifier \
     --bin attune-supervisor \
@@ -115,7 +116,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=attune-cargo-registry
 # Extract the requested service binary from the architecture-specific builder layer.
 # This is the only layer that varies per SERVICE value.
 ARG SERVICE=api
-RUN cp /build/service-binaries/${SERVICE} /build/attune-service-binary
+RUN cp /build/service-binaries/${SERVICE} /build/attune-service-binary && \
+    mkdir -p /build/rollout-tools && \
+    if [ "${SERVICE}" = api ]; then cp /build/target/release/attune-rollout-admin /build/rollout-tools/; fi
 
 # ============================================================================
 # Stage 2: Runtime - Minimal image with just the service binary
@@ -141,6 +144,7 @@ WORKDIR /opt/attune
 # Copy the service binary from builder using a fixed path (no variable in COPY source)
 # This avoids the circular dependency Docker hits when using ARG in --from paths
 COPY --from=builder /build/attune-service-binary /usr/local/bin/attune-service
+COPY --from=builder /build/rollout-tools/ /usr/local/bin/
 
 # Copy migrations only. Runtime config is mounted via Docker Compose.
 COPY migrations/ ./migrations/

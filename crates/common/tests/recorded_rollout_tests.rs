@@ -1,3 +1,10 @@
+// Reuse the owning SQL fault fixture; this suite uses only its publication gate.
+#[cfg(target_os = "linux")]
+#[path = "recorded_rollout_tests/admin_process.rs"]
+mod admin_process;
+#[allow(dead_code)]
+#[path = "../../../tests/sqlx-session/src/commit_relay.rs"]
+mod commit_relay;
 mod helpers;
 use attune_common::{
     execution_authority::consumer_contract::{
@@ -38,6 +45,7 @@ struct Fixture {
     db: TestDatabase,
     pools: Vec<PgPool>,
     roles: Vec<String>,
+    passwords: Vec<String>,
     manifest: std::path::PathBuf,
 }
 impl Fixture {
@@ -63,6 +71,7 @@ impl Fixture {
             db,
             pools: Vec::new(),
             roles: Vec::new(),
+            passwords: Vec::new(),
             manifest,
         };
         let setup=std::panic::AssertUnwindSafe(async {
@@ -84,14 +93,18 @@ impl Fixture {
             for _ in 0..3 {
                 let name=format!("ws2_rollout_{}",Uuid::new_v4().simple());
                 assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM pg_roles WHERE rolname=$1").bind(&name).fetch_one(&*f.db).await.unwrap(),0);
-                sqlx::query(&format!("CREATE ROLE {name} LOGIN")).execute(&*f.db).await.unwrap();
+                let password=format!("dummy_{}",Uuid::new_v4().simple());
+                let ddl:String=sqlx::query_scalar("SELECT format('CREATE ROLE %I LOGIN PASSWORD %L',$1::TEXT,$2::TEXT)").bind(&name).bind(&password).fetch_one(&*f.db).await.unwrap_or_else(|_|panic!("owned role DDL preparation failed"));
+                sqlx::query(&ddl).execute(&*f.db).await.unwrap_or_else(|_|panic!("owned login creation failed"));
+                f.passwords.push(password.clone());
                 f.roles.push(name.clone());
                 std::fs::write(&f.manifest,serde_json::to_vec(&f.roles).unwrap()).unwrap();
                 sqlx::raw_sql(&format!("GRANT USAGE ON SCHEMA \"{}\" TO {name}; GRANT SELECT ON recorded_rollout_generation,recorded_rollout_active TO {name}; GRANT EXECUTE ON FUNCTION stage_recorded_rollout(JSONB),activate_recorded_rollout(UUID,TEXT,BIGINT,BIGINT) TO {name}",f.db.schema())).execute(&*f.db).await.unwrap();
-                let mut url=url::Url::parse(f.db.database_url()).unwrap();url.set_username(&name).unwrap();
+                let mut url=url::Url::parse(f.db.database_url()).unwrap();url.set_username(&name).unwrap();url.set_password(Some(&password)).unwrap();
                 url.query_pairs_mut().append_pair("options",&format!("-csearch_path={},public",f.db.schema()));
-                f.pools.push(PgPoolOptions::new().max_connections(4).connect(url.as_str()).await.unwrap());
+                f.pools.push(PgPoolOptions::new().max_connections(4).connect(url.as_str()).await.unwrap_or_else(|_|panic!("owned login connection failed")));
             }
+            sqlx::query(&format!("GRANT SELECT ON recorded_rollout_installation_identity,recorded_rollout_offline_receipt,recorded_rollout_receipt_terminal TO {}",f.roles[1])).execute(&*f.db).await.unwrap();
             sqlx::raw_sql(&format!("GRANT {} TO {}; GRANT {} TO {}",f.roles[0],f.roles[1],f.roles[1],f.roles[3])).execute(&*f.db).await.unwrap();
         }).catch_unwind().await;
         if let Err(panic) = setup {
@@ -127,9 +140,10 @@ impl Fixture {
             }
         }
         for role in self.roles.iter().rev() {
-            if let Err(e) = sqlx::raw_sql(&format!("DROP OWNED BY {role}; DROP ROLE {role}"))
-                .execute(&*self.db)
-                .await
+            if let Err(e) =
+                sqlx::raw_sql(&format!("DROP OWNED BY {role} CASCADE; DROP ROLE {role}"))
+                    .execute(&*self.db)
+                    .await
             {
                 errors.push(e.to_string());
             }
@@ -166,6 +180,18 @@ async fn rollout_repository_real_login_boundaries() {
     f.cleanup().await;
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut process_fixture = Fixture::new(false).await;
+        let process_result =
+            std::panic::AssertUnwindSafe(admin_process::cases(&mut process_fixture))
+                .catch_unwind()
+                .await;
+        process_fixture.cleanup().await;
+        if let Err(panic) = process_result {
+            std::panic::resume_unwind(panic);
+        }
     }
     // Exercise actual setup-failure cleanup, not just a success-only destructor.
     let failure = std::panic::AssertUnwindSafe(Fixture::new(true))

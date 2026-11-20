@@ -114,6 +114,7 @@ pub mod recorded_input_origins;
 pub mod recorded_rollout;
 pub mod requested_execution_publication;
 pub mod retention;
+pub mod rollout_admin;
 pub mod rule;
 pub mod rule_authority;
 pub mod runtime;

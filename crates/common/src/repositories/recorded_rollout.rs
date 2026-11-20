@@ -23,7 +23,7 @@ pub struct ActiveRollout {
     pub revision: i64,
 }
 
-fn canonical(mut expected: ExpectedMembership) -> Result<ExpectedMembership> {
+pub fn canonical(mut expected: ExpectedMembership) -> Result<ExpectedMembership> {
     let s = &expected.snapshot;
     let mut instances = BTreeSet::new();
     let mut boots = BTreeSet::new();

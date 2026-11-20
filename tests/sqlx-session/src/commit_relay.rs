@@ -195,6 +195,10 @@ fn fingerprint(sql: &[u8]) -> u8 {
         "UPDATE log_stream SET close_phase='published',sealed=true,sealed_at=clock_timestamp(),",
     ) {
         2
+    } else if s == "SELECT consume_recorded_rollout_receipt($1)" {
+        // Offline-admin fault fixture: identify only the exact statement, never
+        // inspect/log the private JSON receipt or its nonce.
+        3
     } else {
         0
     }
@@ -241,7 +245,12 @@ impl Parser {
                     } else {
                         take(&mut b, len as usize)?
                     };
-                    if i == 0 && class != 0 {
+                    if i == 0 && class == 3 {
+                        if count != 1 || value.is_empty() || value.len() > 16384 {
+                            return Err(invalid());
+                        }
+                        matched = true;
+                    } else if i == 0 && class != 0 {
                         let f = if n == 0 {
                             0
                         } else {
@@ -277,7 +286,7 @@ impl Parser {
                     .ok_or_else(invalid)?
                 {
                     1 => self.selected = true,
-                    2 => {
+                    2 | 3 => {
                         self.publication = true;
                         self.publication_executions += 1;
                     }
