@@ -9,10 +9,9 @@
 //!
 //! The agent is designed to be injected into any container image. On startup it:
 //!
-//! 1. Probes the system for available interpreters (python3, node, bash, etc.)
-//! 2. Sets `ATTUNE_WORKER_RUNTIMES` based on what it finds
-//! 3. Loads configuration (env vars are the primary config source)
-//! 4. Initializes and runs the standard `WorkerService`
+//! 1. Loads configuration and checks any requested workload sandbox
+//! 2. Probes the system for interpreters and applies any operator runtime filter
+//! 3. Initializes and runs the standard `WorkerService`
 //!
 //! ## Configuration
 //!
@@ -30,6 +29,7 @@
 use anyhow::Result;
 use attune_common::{
     agent_bootstrap::{bootstrap_runtime_env, print_detect_only_report},
+    child_process_environment::ChildProcessEnvironment,
     config::Config,
     observability,
 };
@@ -39,7 +39,6 @@ use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, warn};
 
 use attune_worker::dynamic_runtime::auto_register_detected_runtimes;
-use attune_worker::runtime_detect::DetectedRuntime;
 use attune_worker::service::WorkerService;
 
 #[derive(Parser, Debug)]
@@ -100,13 +99,15 @@ fn main() -> Result<()> {
                     .map(|value| value.split(',').map(str::to_string).collect())
                     .unwrap_or_default()
             });
-        let environment =
-            attune_common::child_process_environment::ChildProcessEnvironment::capture(
-                &passthrough,
-            )?;
-        let bootstrap = bootstrap_runtime_env("ATTUNE_WORKER_RUNTIMES", &environment);
-        print_detect_only_report("ATTUNE_WORKER_RUNTIMES", &bootstrap, &environment);
-        return Ok(());
+        let runtime = tokio::runtime::Runtime::new()?;
+        return runtime.block_on(async {
+            // Detection-only runs have no artifact transport.
+            let environment =
+                ChildProcessEnvironment::capture_for_service(&passthrough, true).await?;
+            let bootstrap = bootstrap_runtime_env("ATTUNE_WORKER_RUNTIMES", &environment).await;
+            print_detect_only_report("ATTUNE_WORKER_RUNTIMES", &bootstrap, &environment).await;
+            Ok(())
+        });
     }
 
     let config = Config::load()?;
@@ -122,29 +123,12 @@ fn main() -> Result<()> {
     info!("Starting Attune Universal Worker Agent");
     info!("Agent binary: attune-agent {}", env!("CARGO_PKG_VERSION"));
 
-    let child_environment =
-        attune_common::child_process_environment::ChildProcessEnvironment::capture(
-            config
-                .worker
-                .as_ref()
-                .map(|worker| worker.passthrough_env.as_slice())
-                .unwrap_or(&[]),
-        )?;
-    let bootstrap = bootstrap_runtime_env("ATTUNE_WORKER_RUNTIMES", &child_environment);
-    let agent_detected_runtimes = bootstrap.detected_runtimes.clone();
-
-    // --- Build the tokio runtime and run the async portion ---
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async_main(args.name, config, agent_detected_runtimes))
+    runtime.block_on(async_main(args.name, config))
 }
 
-/// The async portion of the agent entrypoint. Called from `main()` via
-/// `runtime.block_on()` after all environment variable mutations are complete.
-async fn async_main(
-    name: Option<String>,
-    mut config: Config,
-    agent_detected_runtimes: Option<Vec<DetectedRuntime>>,
-) -> Result<()> {
+/// Run the agent after configuring its process environment on the main thread.
+async fn async_main(name: Option<String>, mut config: Config) -> Result<()> {
     // Override worker name if provided via CLI
     if let Some(name) = name {
         if let Some(ref mut worker_config) = config.worker {
@@ -174,6 +158,20 @@ async fn async_main(
             });
         }
     }
+
+    let child_environment = ChildProcessEnvironment::capture_for_service(
+        config
+            .worker
+            .as_ref()
+            .map(|worker| worker.passthrough_env.as_slice())
+            .unwrap_or(&[]),
+        config.artifacts.transport == attune_common::artifact_transport::TransportMode::Api,
+    )
+    .await?;
+    let agent_detected_runtimes =
+        bootstrap_runtime_env("ATTUNE_WORKER_RUNTIMES", &child_environment)
+            .await
+            .detected_runtimes;
 
     info!("Configuration loaded successfully");
     info!("Environment: {}", config.environment);
@@ -222,7 +220,7 @@ async fn async_main(
     }
 
     // --- Phase 3: Initialize and run the worker service ---
-    let service = WorkerService::new(config).await?;
+    let service = WorkerService::new_with_child_environment(config, child_environment).await?;
 
     // If we auto-detected runtimes, pass them to the worker service so that
     // registration includes the full `detected_interpreters` capability

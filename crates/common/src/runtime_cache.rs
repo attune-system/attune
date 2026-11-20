@@ -51,6 +51,7 @@ pub fn write_runtime_marker(path: &Path, value: &str) -> io::Result<()> {
         .parent()
         .ok_or_else(|| io::Error::other("Runtime marker has no parent directory"))?;
     let mut builder = tempfile::Builder::new();
+    builder.prefix(".attune-marker-");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

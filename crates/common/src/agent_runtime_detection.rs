@@ -6,7 +6,9 @@
 use crate::child_process_environment::ChildProcessEnvironment;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::process::Command;
+use std::path::Path;
+use std::time::Duration;
+use tokio::process::Command;
 use tracing::{debug, info};
 
 /// A runtime interpreter discovered on the local system.
@@ -97,13 +99,13 @@ fn candidates() -> Vec<RuntimeCandidate> {
 }
 
 /// Detect available runtimes by probing the local system.
-pub fn detect_runtimes(environment: &ChildProcessEnvironment) -> Vec<DetectedRuntime> {
+pub async fn detect_runtimes(environment: &ChildProcessEnvironment) -> Vec<DetectedRuntime> {
     info!("Starting runtime auto-detection...");
 
     let mut detected = Vec::new();
 
     for candidate in candidates() {
-        match detect_single_runtime(&candidate, environment) {
+        match detect_single_runtime(&candidate, environment).await {
             Some(runtime) => {
                 info!("  ✓ Detected: {}", runtime);
                 detected.push(runtime);
@@ -127,18 +129,19 @@ pub fn detect_runtimes(environment: &ChildProcessEnvironment) -> Vec<DetectedRun
     detected
 }
 
-fn detect_single_runtime(
+async fn detect_single_runtime(
     candidate: &RuntimeCandidate,
     environment: &ChildProcessEnvironment,
 ) -> Option<DetectedRuntime> {
     for binary in candidate.binaries {
-        if let Some(path) = which_binary(binary, environment) {
+        if let Some(path) = which_binary(binary, environment).await {
             let version = get_version(
                 &path,
                 candidate.version_args,
                 &candidate.version_parser,
                 environment,
-            );
+            )
+            .await;
 
             return Some(DetectedRuntime {
                 name: candidate.name.to_string(),
@@ -151,7 +154,7 @@ fn detect_single_runtime(
     None
 }
 
-fn which_binary(binary: &str, environment: &ChildProcessEnvironment) -> Option<String> {
+async fn which_binary(binary: &str, environment: &ChildProcessEnvironment) -> Option<String> {
     if binary == "bash" || binary == "sh" {
         let absolute_path = format!("/bin/{}", binary);
         if std::path::Path::new(&absolute_path).exists() {
@@ -159,9 +162,16 @@ fn which_binary(binary: &str, environment: &ChildProcessEnvironment) -> Option<S
         }
     }
 
+    if environment.uses_workload_sandbox() {
+        // Inspect the operator PATH without running another host subprocess.
+        return crate::runtime_lifecycle::resolve_executable(binary, environment)
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned());
+    }
+
     let mut command = Command::new("which");
-    environment.apply(&mut command);
-    match command.arg(binary).output() {
+    environment.apply(command.as_std_mut());
+    match command.arg(binary).output().await {
         Ok(output) if output.status.success() => {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if path.is_empty() {
@@ -174,10 +184,11 @@ fn which_binary(binary: &str, environment: &ChildProcessEnvironment) -> Option<S
         Err(e) => {
             debug!("'which' command failed ({}), trying 'command -v'", e);
             let mut command = Command::new("sh");
-            environment.apply(&mut command);
+            environment.apply(command.as_std_mut());
             match command
                 .args(["-c", &format!("command -v {}", binary)])
                 .output()
+                .await
             {
                 Ok(output) if output.status.success() => {
                     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -193,21 +204,42 @@ fn which_binary(binary: &str, environment: &ChildProcessEnvironment) -> Option<S
     }
 }
 
-fn get_version(
+async fn get_version(
     binary_path: &str,
     version_args: &[&str],
     parser: &VersionParser,
     environment: &ChildProcessEnvironment,
 ) -> Option<String> {
     let mut command = Command::new(binary_path);
-    environment.apply(&mut command);
-    let output = match command.args(version_args).output() {
-        Ok(output) => output,
-        Err(e) => {
-            debug!("Failed to run version command for {}: {}", binary_path, e);
-            return None;
-        }
+    environment.apply(command.as_std_mut());
+    command.args(version_args);
+    let mut command = if environment.uses_workload_sandbox() {
+        let path = Path::new(binary_path);
+        let identity = path.canonicalize().ok()?;
+        command.env("HOME", "/tmp").env("TMPDIR", "/tmp");
+        Command::from(
+            environment
+                .sandbox_staged_workload(command.into_std(), &[], &[], &[(path, &identity)])
+                .inspect_err(|error| debug!(%error, "Failed to isolate runtime version detection"))
+                .ok()?,
+        )
+    } else {
+        command
     };
+    let output =
+        match tokio::time::timeout(Duration::from_secs(10), command.kill_on_drop(true).output())
+            .await
+        {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                debug!(%error, binary_path, "Failed to run runtime version command");
+                return None;
+            }
+            Err(_) => {
+                debug!(binary_path, "Runtime version command timed out");
+                return None;
+            }
+        };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -277,9 +309,43 @@ pub fn print_detection_report_for_env(env_var_name: &str, runtimes: &[DetectedRu
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Linux Bubblewrap and unprivileged namespaces"]
+    async fn agent_detection_probes_use_the_requested_sandbox() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let executable = root.path().join("node");
+        let private_file = root.path().join("manager-fixture");
+        std::fs::write(&private_file, "fixture").unwrap();
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\ntest ! -e '{}' || exit 1\nprintf 'v3.14.15\\n'\n",
+                private_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let environment = ChildProcessEnvironment::from_parent(
+            [("PATH".into(), root.path().as_os_str().to_owned())],
+            &[],
+        )
+        .unwrap()
+        .with_workload_sandbox(crate::workload_sandbox::WorkloadSandbox::Bubblewrap);
+        let runtimes = detect_runtimes(&environment).await;
+        assert!(
+            runtimes
+                .iter()
+                .any(|runtime| runtime.name == "node"
+                    && runtime.version.as_deref() == Some("3.14.15"))
+        );
+    }
+
     #[cfg(unix)]
-    #[test]
-    fn version_detection_preserves_named_opt_ins_without_inheriting_credentials() {
+    #[tokio::test]
+    async fn version_detection_preserves_named_opt_ins_without_inheriting_credentials() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::TempDir::new().unwrap();
         let executable = root.path().join("runtime");
@@ -298,7 +364,8 @@ mod tests {
                 &[],
                 &VersionParser::SemverLike,
                 &minimal
-            ),
+            )
+            .await,
             None
         );
         assert_eq!(
@@ -308,6 +375,7 @@ mod tests {
                 &VersionParser::SemverLike,
                 &selected
             )
+            .await
             .as_deref(),
             Some("3.14.15")
         );

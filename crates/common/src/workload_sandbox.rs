@@ -30,7 +30,7 @@ impl WorkloadSandbox {
     }
 
     async fn verify_available(self) -> io::Result<()> {
-        let command = self.wrap(Command::new("/usr/bin/true"), &[])?;
+        let command = self.wrap(Command::new("true"), &[])?;
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             tokio::process::Command::from(command)
@@ -63,7 +63,7 @@ impl WorkloadSandbox {
         read_paths: &[&Path],
         invocation_name: Option<&std::ffi::OsStr>,
     ) -> io::Result<Command> {
-        self.wrap_command(command, read_paths, &[], invocation_name, false)
+        self.wrap_command(command, read_paths, &[], &[], invocation_name, false)
     }
 
     /// Expose only the selected read-only inputs and caller-owned writable
@@ -73,8 +73,9 @@ impl WorkloadSandbox {
         command: Command,
         read_paths: &[&Path],
         write_paths: &[&Path],
+        tools: &[(&Path, &Path)],
     ) -> io::Result<Command> {
-        self.wrap_command(command, read_paths, write_paths, None, true)
+        self.wrap_command(command, read_paths, write_paths, tools, None, true)
     }
 
     fn wrap_command(
@@ -82,6 +83,7 @@ impl WorkloadSandbox {
         command: Command,
         read_paths: &[&Path],
         write_paths: &[&Path],
+        tools: &[(&Path, &Path)],
         invocation_name: Option<&std::ffi::OsStr>,
         preserve_writable_paths: bool,
     ) -> io::Result<Command> {
@@ -134,6 +136,7 @@ impl WorkloadSandbox {
             "/etc/nsswitch.conf",
             "/etc/passwd",
             "/etc/group",
+            "/etc/alternatives",
             "/etc/ssl/certs",
             "/etc/ld.so.cache",
         ] {
@@ -166,6 +169,9 @@ impl WorkloadSandbox {
             }
             sandbox.arg("--bind").arg(path).arg(path);
         }
+        for &(invocation, identity) in tools {
+            add_tool_mounts(&mut sandbox, invocation, identity)?;
+        }
         sandbox
             .arg("--chdir")
             .arg(command.get_current_dir().unwrap_or(Path::new("/tmp")));
@@ -174,21 +180,43 @@ impl WorkloadSandbox {
     }
 }
 
+fn add_tool_mounts(sandbox: &mut Command, invocation: &Path, identity: &Path) -> io::Result<()> {
+    const SYSTEM_TREES: &[&str] = &["/usr", "/bin", "/sbin", "/lib", "/lib64"];
+    if !SYSTEM_TREES.iter().any(|root| identity.starts_with(root)) {
+        validate_mount_path(identity)?;
+        sandbox.arg("--ro-bind").arg(identity).arg(identity);
+    }
+    if invocation != identity && !SYSTEM_TREES.iter().any(|root| invocation.starts_with(root)) {
+        // The alias is a destination in the private root. Bubblewrap binds
+        // the already verified executable without mounting its host parent.
+        if !is_allowed_mount_location(invocation) || invocation.canonicalize()? != identity {
+            return Err(io::Error::other("unsafe sandbox executable path"));
+        }
+        sandbox.arg("--ro-bind").arg(identity).arg(invocation);
+    }
+    Ok(())
+}
+
 fn validate_mount_path(path: &Path) -> io::Result<()> {
     // Reject aliases and broad/system-root mounts rather than exposing a
     // credential-bearing tree through a selected pack/runtime alias.
-    if !path.is_absolute()
-        || path.components().count() < 3
-        || [
+    if !is_allowed_mount_location(path) || path.canonicalize()? != path {
+        return Err(io::Error::other("unsafe sandbox input path"));
+    }
+    Ok(())
+}
+
+fn is_allowed_mount_location(path: &Path) -> bool {
+    path.is_absolute()
+        && path.components().count() >= 3
+        && !path
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+        && ![
             "/proc", "/sys", "/dev", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64",
         ]
         .iter()
         .any(|root| path.starts_with(root))
-        || path.canonicalize()? != path
-    {
-        return Err(io::Error::other("unsafe sandbox input path"));
-    }
-    Ok(())
 }
 
 #[cfg(target_os = "linux")]

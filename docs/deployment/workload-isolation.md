@@ -7,8 +7,8 @@ a sandbox probe at startup to check whether the binary, kernel and container
 security profile allow the required user, PID, mount, IPC and UTS namespaces
 and `close_range(..., CLOSE_RANGE_CLOEXEC)` (Linux 5.11 or newer). The sandbox
 keeps only the workload's explicitly configured stdio descriptors across exec.
-A failed probe stops startup. A failed workload sandbox prevents that workload
-from running.
+A failed probe stops startup before automatic interpreter discovery. A failed
+workload sandbox prevents that workload from running.
 
 Each sandbox runs as a local child process of the existing worker or sensor
 manager. It mounts a private procfs, minimal devices and a private `/tmp`.
@@ -28,6 +28,13 @@ sensors and candidate tests get a read-only view of the prepared files and
 independent writable home, scratch and artifact staging. Other sandboxed
 workloads use `/tmp` for temporary files and `/tmp/artifacts` for artifact staging.
 File producers can upload through the API while those files exist.
+
+For sandboxed legacy runtimes, configure package installation to write into the
+staging path. The worker publishes the environment only after setup succeeds.
+Roll out with fresh runtime caches if the pool has unkeyed environments
+created before the completion-marker check. Install legacy interpreters and tool
+libraries in the image's system directories. Admitted lifecycle probes can also
+mount a selected executable outside those directories at its invocation path.
 
 The sandbox defaults `PYTHONPYCACHEPREFIX` to `/tmp/pycache`. Python recipes can
 also set it to `{scratch_dir}/pycache` to use their private invocation directory.

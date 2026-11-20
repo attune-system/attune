@@ -207,22 +207,13 @@ pub struct VerifiedTool {
     pub version: String,
 }
 
-fn sandbox_tool_path(tool: &VerifiedTool) -> Option<&Path> {
-    sandbox_additional_executable(&tool.identity)
-}
-
-fn sandbox_additional_executable(path: &Path) -> Option<&Path> {
-    // These trees are already mounted read-only by Bubblewrap.
-    (!["/usr", "/bin", "/sbin", "/lib", "/lib64"]
-        .iter()
-        .any(|root| path.starts_with(root)))
-    .then_some(path)
+fn sandbox_tool_paths(tool: &VerifiedTool) -> (&Path, &Path) {
+    (&tool.executable, &tool.identity)
 }
 
 pub struct PreparedTarget {
     pub generation: PathBuf,
     cleanup_root: PathBuf,
-    cleanup_generation: bool,
     pack_dir: PathBuf,
     pub command: Vec<String>,
     pub working_dir: PathBuf,
@@ -232,12 +223,10 @@ pub struct PreparedTarget {
     pub primary_version: String,
 }
 
-/// The inputs to launch binding after the recipe's preparation commands have
-/// exited. This value alone does not authorize publication or reuse.
-pub struct PreparedBuild {
+/// The private generation and launch inputs for one invocation.
+struct PreparedBuild {
     generation: PathBuf,
     pack_dir: PathBuf,
-    file_backed: bool,
     variables: BTreeMap<String, String>,
     tools: BTreeMap<String, VerifiedTool>,
     recipe_digest: String,
@@ -263,9 +252,9 @@ impl PreparedTarget {
         let artifacts = scratch.join("artifacts");
         std::fs::create_dir(&artifacts)?;
         command.env("ATTUNE_ARTIFACTS_DIR", artifacts);
-        let mut inputs = vec![self.pack_dir.as_path(), self.generation.as_path()];
-        inputs.extend(self.tools.values().filter_map(sandbox_tool_path));
-        environment.sandbox_staged_workload(command, &inputs, &[&home, &scratch])
+        let inputs = [self.pack_dir.as_path(), self.generation.as_path()];
+        let tools: Vec<_> = self.tools.values().map(sandbox_tool_paths).collect();
+        environment.sandbox_staged_workload(command, &inputs, &[&home, &scratch], &tools)
     }
 
     pub fn validate_selected_version(&self, expected: &str) -> Result<()> {
@@ -285,8 +274,8 @@ impl PreparedTarget {
     }
     /// Only call after the owning workload and its writers have been joined.
     pub async fn cleanup(self) -> Result<()> {
-        tokio::fs::remove_dir_all(self.cleanup_root).await?;
-        if self.cleanup_generation {
+        tokio::fs::remove_dir_all(&self.cleanup_root).await?;
+        if self.generation != self.cleanup_root {
             tokio::fs::remove_dir_all(self.generation).await?;
         }
         Ok(())
@@ -430,13 +419,11 @@ impl RuntimeRecipe {
                     .env("XDG_CONFIG_HOME", probe_home.join("config"))
                     .env("XDG_CACHE_HOME", probe_home.join("cache"));
                 let identity = executable.canonicalize()?;
-                let inputs: Vec<_> = sandbox_additional_executable(&identity)
-                    .into_iter()
-                    .collect();
                 let command = Command::from(environment.sandbox_staged_workload(
                     command.into_std(),
-                    &inputs,
+                    &[],
                     &[&probe_home],
+                    &[(&executable, &identity)],
                 )?);
                 let Ok(output) = collect(command, Duration::from_secs(10)).await else {
                     all_probes_confirmed = false;
@@ -483,10 +470,7 @@ impl RuntimeRecipe {
             .prepare_build(pack_dir, source, generation_root, environment)
             .await?;
         if environment.uses_workload_sandbox() {
-            let mut invocation =
-                self.bind_private_invocation(&build, generation_root, environment)?;
-            invocation.cleanup_generation = true;
-            return Ok(invocation);
+            return self.bind_private_invocation(&build, generation_root, environment);
         }
         // Per-invocation recipes own their entire generation and can use the
         // same home and scratch paths for both preparation and launch.
@@ -494,7 +478,7 @@ impl RuntimeRecipe {
         self.bind_launch(&build, cleanup_root, None, environment)
     }
 
-    pub async fn prepare_build(
+    async fn prepare_build(
         &self,
         pack_dir: &Path,
         source: RuntimeSource<'_>,
@@ -581,7 +565,6 @@ impl RuntimeRecipe {
         for path in [&output, &scratch, &home] {
             std::fs::create_dir(path)?;
         }
-        let file_backed = source_path.is_some();
         let source_file = match source {
             RuntimeSource::File(_) => {
                 let path = source_path.ok_or_else(|| invalid("Missing runtime source"))?;
@@ -639,48 +622,24 @@ impl RuntimeRecipe {
             let mut command = Command::new(executable);
             environment.apply(command.as_std_mut());
             command.args(&argv[1..]).current_dir(cwd).envs(&env);
-            let mut tool_paths: Vec<_> = tools.values().filter_map(sandbox_tool_path).collect();
-            if !pack_dir.starts_with(&generation) {
-                tool_paths.push(&pack_dir);
-            }
+            let tools: Vec<_> = tools.values().map(sandbox_tool_paths).collect();
+            let inputs = (!pack_dir.starts_with(&generation)).then_some(pack_dir.as_path());
             let command = Command::from(environment.sandbox_staged_workload(
                 command.into_std(),
-                &tool_paths,
+                inputs.as_slice(),
                 &[&generation],
+                &tools,
             )?);
             collect(command, Duration::from_secs(step.timeout_seconds)).await?;
         }
         Ok(PreparedBuild {
             generation,
             pack_dir,
-            file_backed,
             variables: vars,
             tools,
             recipe_digest,
             primary_version,
         })
-    }
-
-    /// Bind a fresh invocation to a retained build. The caller owns the pin on
-    /// that build and must enforce a read-only view of its published files.
-    /// Invocation cleanup never removes the build or the pack release.
-    pub fn bind_prepared_invocation(
-        &self,
-        build: &PreparedBuild,
-        invocation_root: &Path,
-        environment: &ChildProcessEnvironment,
-    ) -> Result<PreparedTarget> {
-        if !build.file_backed {
-            return Err(invalid(
-                "Only file-backed runtime builds can bind a separate invocation",
-            ));
-        }
-        if self.require_admission(environment)? != build.recipe_digest {
-            return Err(invalid(
-                "Prepared build belongs to a different runtime recipe",
-            ));
-        }
-        self.bind_private_invocation(build, invocation_root, environment)
     }
 
     fn bind_private_invocation(
@@ -776,7 +735,6 @@ impl RuntimeRecipe {
         Ok(PreparedTarget {
             generation: build.generation.clone(),
             cleanup_root,
-            cleanup_generation: false,
             pack_dir: build.pack_dir.clone(),
             command: argv,
             working_dir,

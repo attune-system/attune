@@ -106,79 +106,16 @@ async fn inline_recipe_owns_an_empty_input_root_when_no_pack_exists() {
     target.cleanup().await.unwrap();
 }
 
-#[tokio::test]
-async fn retained_build_binds_independent_invocations_and_survives_cleanup() {
-    let (root, mut recipe) = fixture();
-    recipe
-        .env
-        .insert("PYTHONPYCACHEPREFIX".into(), "{scratch_dir}/pycache".into());
-    let environment = environment(&recipe);
-    let pack = root.path().join("pack");
-    let generation_root = root.path().join("generations");
-    let invocation_root = root.path().join("invocations");
-    std::fs::create_dir(&pack).unwrap();
-    std::fs::create_dir(&invocation_root).unwrap();
-    let source = pack.join("action.nova");
-    executable(
-        &source,
-        "#!/bin/sh\nmkdir -p \"$PYTHONPYCACHEPREFIX\"\nprintf runtime-cache > \"$PYTHONPYCACHEPREFIX/fixture\"\n",
-    );
-    let build = recipe
-        .prepare_build(
-            &pack,
-            RuntimeSource::File(&source),
-            &generation_root,
-            &environment,
-        )
-        .await
-        .unwrap();
-    assert!(recipe
-        .bind_prepared_invocation(&build, &pack, &environment)
-        .is_err());
-
-    let first = recipe
-        .bind_prepared_invocation(&build, &invocation_root, &environment)
-        .unwrap();
-    let second = recipe
-        .bind_prepared_invocation(&build, &invocation_root, &environment)
-        .unwrap();
-    assert_eq!(first.command, second.command);
-    assert_eq!(first.generation, second.generation);
-    assert_ne!(first.env["HOME"], second.env["HOME"]);
-    assert_ne!(first.env["TMPDIR"], second.env["TMPDIR"]);
-
-    for target in [&first, &second] {
-        let mut command = tokio::process::Command::new(&target.command[0]);
-        environment.apply(command.as_std_mut());
-        let status = command
-            .envs(&target.env)
-            .current_dir(&target.working_dir)
-            .status()
-            .await
-            .unwrap();
-        assert!(status.success());
-        let cache = Path::new(&target.env["PYTHONPYCACHEPREFIX"]);
-        assert!(cache.starts_with(&invocation_root));
-        assert_eq!(
-            std::fs::read(cache.join("fixture")).unwrap(),
-            b"runtime-cache"
-        );
-    }
-
-    let generation = second.generation.clone();
-    first.cleanup().await.unwrap();
-    assert!(generation.join("output/program").is_file());
-    assert!(Path::new(&second.env["HOME"]).is_dir());
-    second.cleanup().await.unwrap();
-    assert!(generation.join("output/program").is_file());
-    assert_eq!(std::fs::read_dir(invocation_root).unwrap().count(), 0);
-}
-
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires Linux Bubblewrap with unprivileged namespaces"]
 async fn bubblewrap_recipe_enforces_build_and_invocation_paths() {
     let (root, mut recipe) = fixture();
+    let alias_dir = root.path().join("aliases");
+    std::fs::create_dir(&alias_dir).unwrap();
+    let alias = alias_dir.join("nova");
+    std::os::unix::fs::symlink(root.path().join("nova"), &alias).unwrap();
+    recipe.tools[0].binaries = vec![alias.display().to_string()];
     recipe
         .env
         .insert("PYTHONPYCACHEPREFIX".into(), "{scratch_dir}/pycache".into());
