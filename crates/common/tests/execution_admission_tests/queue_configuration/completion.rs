@@ -403,6 +403,12 @@ async fn recorded_workflow_log_claim_is_exact_and_single_use() {
     let proof = Logs::require_recorded_delivery(&mut tx, &claim, execution.id)
         .await
         .unwrap();
+    assert!(
+        Logs::require_published_recorded_delivery(&mut tx, &version)
+            .await
+            .is_err(),
+        "workflow log metadata without a published native close is not read proof"
+    );
     proof.require_append(0, 3, abc).unwrap();
     assert!(proof.require_append(1, 3, abc).is_err());
     assert!(proof.require_append(0, 3, &"0".repeat(64)).is_err());

@@ -204,6 +204,7 @@ impl RecordedConsumerObservations {
                 SELECT 1
                 FROM (
                     VALUES
+                      ('execution', ARRAY['SELECT'], TRUE),
                       ('execution_authority_selection', ARRAY['SELECT'], TRUE),
                       ('runtime_authority_admission', ARRAY['SELECT','INSERT'], TRUE),
                       ('runtime_authority_execution_fence', ARRAY['SELECT'], TRUE),

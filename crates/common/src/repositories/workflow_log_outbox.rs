@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{FromRow, PgConnection, PgPool, Row};
 use uuid::Uuid;
 
+use crate::models::artifact_version::ArtifactVersion;
 use crate::models::log_stream::WorkflowLogOutboxRecord;
 use crate::{Error, Result};
 
@@ -110,18 +111,7 @@ impl WorkflowLogOutboxRepository {
             RuntimeOwner::Execution(execution),
         ))
         .await?;
-        let snapshot = ExecutionRepository::find_by_id(&mut *conn, execution)
-            .await?
-            .and_then(|row| row.executable_snapshot)
-            .ok_or_else(delivery_denied)?
-            .executable;
-        if snapshot.action.workflow_def != Some(workflow.1)
-            || !snapshot
-                .workflow_definition
-                .is_some_and(|definition| definition.id == workflow.1)
-        {
-            return Err(delivery_denied());
-        }
+        Self::require_native_snapshot(conn, execution, workflow.1).await?;
         let retained: (String, Option<i64>, Option<Vec<u8>>, DateTime<Utc>) = sqlx::query_as(
             "SELECT o.kind,o.delivery_sequence,o.payload,o.claim_expires_at \
              FROM workflow_log_outbox o JOIN workflow_execution w ON o.workflow_execution=w.id \
@@ -169,6 +159,86 @@ impl WorkflowLogOutboxRepository {
             fence: authority.intersect(&ApprovalEffectFence::from_input_approval(Some(expires))?),
             operation,
         })
+    }
+
+    /// A closed activity log carries the server's exact native outbox producer
+    /// in the immutable close selection. Mutable log metadata is not proof.
+    pub async fn require_published_recorded_delivery(
+        conn: &mut PgConnection,
+        selected: &ArtifactVersion,
+    ) -> Result<ApprovalEffectFence> {
+        use super::execution_admission::ExecutionAdmissionRepository as Admission;
+
+        let execution = selected.execution.ok_or_else(delivery_denied)?;
+        let (workflow, definition): (i64, i64) = sqlx::query_as(
+            "SELECT id,workflow_def FROM workflow_execution WHERE execution=$1 FOR SHARE",
+        )
+        .bind(execution)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(delivery_denied)?;
+        let (admission, fence) = Box::pin(Admission::require_with_fence(
+            conn,
+            RuntimeOwner::Execution(execution),
+        ))
+        .await?;
+        let (action, pack) = Self::require_native_snapshot(conn, execution, definition).await?;
+        let binding: serde_json::Value = sqlx::query_scalar(
+            r#"SELECT s.close_input#>'{producer,binding}'
+               FROM log_stream s JOIN artifact_version v ON v.id=s.artifact_version
+               JOIN artifact a ON a.id=v.artifact JOIN execution e ON e.id=v.execution
+               JOIN artifact_runtime_owner_binding b ON b.artifact=a.id
+               WHERE v.id=$1 AND e.id=$2 AND v.artifact=$3
+                 AND v.object_key IS NOT DISTINCT FROM $4 AND v.provider_version IS NOT DISTINCT FROM $5
+                 AND v.sha256 IS NOT DISTINCT FROM $6 AND v.size_bytes IS NOT DISTINCT FROM $7
+                 AND v.file_path IS NOT DISTINCT FROM $8 AND v.version=$9
+                 AND e.worker IS NULL AND e.action=$10
+                 AND b.owner_type='action' AND b.owner_id=$10 AND b.managing_pack=$11
+                 AND NOT EXISTS(SELECT 1 FROM worker_delivery_context c WHERE c.execution=e.id)
+                 AND a.scope='action' AND a.owner=e.action_ref AND a.ref=e.action_ref || '.workflow.log'
+                 AND a.type='file_text' AND a.classification='general'
+                 AND v.meta->>'kind'='workflow_log'
+                 AND NOT (COALESCE(v.meta, '{}'::JSONB) ?| ARRAY['log_encoding','encrypted_log_manifest'])
+                 AND v.body_state='ready' AND s.backend='object_segments' AND s.sealed
+                 AND s.close_phase='published' AND NOT s.truncated AND s.total_bytes=v.size_bytes
+                 AND s.close_input->'producer'->>'kind'='native_workflow'
+                 AND s.close_input->'proof'='{"kind":"plain"}'::JSONB
+               FOR SHARE OF e"#,
+        )
+        .bind(selected.id).bind(execution).bind(selected.artifact)
+        .bind(&selected.object_key).bind(&selected.provider_version).bind(&selected.sha256)
+        .bind(selected.size_bytes).bind(&selected.file_path).bind(selected.version)
+        .bind(action).bind(pack).fetch_optional(&mut *conn).await?.ok_or_else(delivery_denied)?;
+        let source: WorkflowLogProducer =
+            serde_json::from_value(binding).map_err(|_| delivery_denied())?;
+        if (source.execution, source.workflow, source.admission)
+            != (execution, workflow, admission.id)
+            || source.outbox <= 0
+        {
+            return Err(delivery_denied());
+        }
+        fence.ensure_fresh_on(conn).await?;
+        Ok(fence)
+    }
+
+    async fn require_native_snapshot(
+        conn: &mut PgConnection,
+        execution: i64,
+        definition: i64,
+    ) -> Result<(i64, i64)> {
+        let executable = ExecutionRepository::find_by_id(&mut *conn, execution)
+            .await?
+            .and_then(|row| row.executable_snapshot)
+            .ok_or_else(delivery_denied)?
+            .executable;
+        if executable.action.workflow_def != Some(definition)
+            || !executable
+                .workflow_definition
+                .is_some_and(|snapshot| snapshot.id == definition)
+        {
+            return Err(delivery_denied());
+        }
+        Ok((executable.action.id, executable.action.pack))
     }
 
     pub async fn effective_segment_max_bytes(

@@ -459,9 +459,12 @@ def test_managed_queue_native_workflow_acknowledges_item(client, tmp_path):
             artifact = matches[0]
             version = artifact["selected_version"]
             assert version["execution"] == execution["id"]
+            if not version.get("size_bytes"):
+                return False
             response = client.get(f"/api/v1/artifacts/{artifact['id']}/versions/{version['version']}/download",
                                   params={"version_id": version["id"]})
-            assert response.status_code in (200, 404)
+            if response.status_code != 200:
+                pytest.fail(f"Finalized workflow log download returned {response.status_code}")
             return response.status_code == 200 and "Workflow Completed" in response.text
 
         wait_for_condition(workflow_log_ready, timeout=30, poll_interval=0.25,
