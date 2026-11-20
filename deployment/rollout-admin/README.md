@@ -136,6 +136,26 @@ Rendering is not applying. Exact boot IDs/release digest must come from deployme
 no asset discovers replicas or self-elects boots. SQLx ledger remains mandatory;
 Docker/manual ledger conversion is not attempted.
 
+## Owned recorded-queue validation
+
+The receipt-only provisioning above does not grant consumer publication or
+enable managed-queue admission. The owned acceptance runner separately installs
+the candidate PostgreSQL observation transport as its NOLOGIN installation owner
+and binds a distinct runtime login to each staged role, instance and boot.
+Runtime logins cannot stage or activate a rollout. The services load the
+operator-assigned identity from `ATTUNE_RECORDED_CONSUMER_IDENTITY_FILE` and
+publish only their local observation. An observation cannot add a member or
+replace a process boot in an existing generation.
+
+The host lane uses an isolated SQLx ledger and test-specific DML grants. Default
+Compose and Helm startup have no consumer identity files, reporter bindings or
+active expected membership. A target deployment needs its own least-privilege
+grant inventory, one distinct login and exact identity file per expected member,
+and an explicit installation and receipt activation sequence. An exact-boot
+process replacement requires a new staged generation. The queue admission gate
+still requires every expected current observation. See the
+[managed-queue acceptance procedure](../../docs/testing/running-tests.md#managed-queue-acceptance-on-owned-services).
+
 ## Unfrozen cache DDL candidate
 
 The separately requested owner-controlled cache creator is only a
