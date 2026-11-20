@@ -500,7 +500,7 @@ pub struct OidcConfig {
 impl OidcConfig {
     /// Validate the callback URL while retaining its exact registered spelling
     /// for the authorization and token requests.
-    pub fn browser_redirect_uri(&self, production: bool) -> crate::Result<(&str, url::Url)> {
+    pub fn browser_redirect_uri(&self, production: bool) -> crate::Result<&str> {
         let raw = self
             .redirect_uri
             .as_deref()
@@ -536,7 +536,7 @@ impl OidcConfig {
                 "OIDC redirect URI must use HTTPS except for loopback callbacks outside production",
             ));
         }
-        Ok((raw, uri))
+        Ok(raw)
     }
 }
 
@@ -2776,18 +2776,6 @@ impl Config {
         self.environment == "production"
     }
 
-    /// Browser auth cookies use the validated callback transport and default
-    /// to Secure when enabled OIDC configuration is invalid.
-    pub fn secure_browser_auth_cookies(&self) -> bool {
-        self.is_production()
-            || self.security.oidc.as_ref().is_some_and(|oidc| {
-                match oidc.browser_redirect_uri(false) {
-                    Ok((_, uri)) => uri.scheme() == "https",
-                    Err(_) => oidc.enabled,
-                }
-            })
-    }
-
     /// Check if running in development
     pub fn is_development(&self) -> bool {
         self.environment == "development"
@@ -3751,7 +3739,7 @@ enabled: false
     }
 
     #[test]
-    fn oidc_browser_redirect_policy_validates_transport_and_controls_secure_cookies() {
+    fn oidc_browser_redirect_policy_validates_transport() {
         let mut config: Config = serde_json::from_value(serde_json::json!({
             "security": {
                 "enable_auth": false,
@@ -3764,46 +3752,33 @@ enabled: false
         }))
         .unwrap();
 
-        for (environment, uri, valid, secure) in [
-            ("development", "http://localhost:3000/callback", true, false),
-            ("development", "http://127.0.0.1:3000/callback", true, false),
-            ("development", "http://[::1]:3000/callback", true, false),
-            (
-                "development",
-                "HTTPS://app.example.com/callback",
-                true,
-                true,
-            ),
-            ("production", "https://app.example.com/callback", true, true),
-            ("production", "http://localhost:3000/callback", false, true),
-            (
-                "development",
-                "http://app.example.com/callback",
-                false,
-                true,
-            ),
+        for (environment, uri, valid) in [
+            ("development", "http://localhost:3000/callback", true),
+            ("development", "http://127.0.0.1:3000/callback", true),
+            ("development", "http://[::1]:3000/callback", true),
+            ("development", "HTTPS://app.example.com/callback", true),
+            ("production", "https://app.example.com/callback", true),
+            ("production", "http://localhost:3000/callback", false),
+            ("development", "http://app.example.com/callback", false),
             (
                 "development",
                 "http://localhost.example.com/callback",
                 false,
-                true,
             ),
-            ("development", "http://192.0.2.1/callback", false, true),
-            ("development", "http://[2001:db8::1]/callback", false, true),
-            ("development", "ftp://localhost/callback", false, true),
-            ("development", "/auth/callback", false, true),
-            ("development", "https://", false, true),
+            ("development", "http://192.0.2.1/callback", false),
+            ("development", "http://[2001:db8::1]/callback", false),
+            ("development", "ftp://localhost/callback", false),
+            ("development", "/auth/callback", false),
+            ("development", "https://", false),
             (
                 "development",
                 "https://user@app.example.com/callback",
                 false,
-                true,
             ),
             (
                 "development",
                 "https://app.example.com/callback#fragment",
                 false,
-                true,
             ),
         ] {
             config.environment = environment.into();
@@ -3819,16 +3794,7 @@ enabled: false
                     "{environment} {uri}"
                 );
             }
-            assert_eq!(
-                config.secure_browser_auth_cookies(),
-                secure,
-                "{environment} {uri}"
-            );
         }
-        config.security.oidc = None;
-        assert!(!config.secure_browser_auth_cookies());
-        config.environment = "production".into();
-        assert!(config.secure_browser_auth_cookies());
     }
 
     #[test]

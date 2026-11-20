@@ -38,10 +38,11 @@ referrers; history and same-origin script access were the relevant exposure.
 
 Set `security.oidc.redirect_uri` to the absolute callback URL registered with
 the provider. It must use HTTPS in production and for any non-loopback host.
-Outside production, local development can use HTTP with `localhost` or a
-loopback IP such as `127.0.0.1` or `[::1]`. Browser auth cookies carry the
-`Secure` attribute in production and with an HTTPS callback, including when
-they are rotated or cleared.
+Browser auth cookies always carry the `Secure` attribute, including on refresh
+and removal. Outside production, HTTP callbacks on `localhost` or a loopback
+IP such as `127.0.0.1` or `[::1]` work in browsers that accept Secure cookies
+over loopback HTTP. Safari added support in version 27. Use local HTTPS if your
+browser requires HTTPS for Secure cookies.
 
 Expired/revoked session and exchange rows are retained until identity deletion;
 operators should account for this metadata growth. Tokens are hashed in session
