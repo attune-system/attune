@@ -24,6 +24,16 @@ mod transfer;
 pub use transfer::QueueInputTransfer;
 pub(in crate::repositories) use transfer::QueueReceiptParent;
 
+pub(in crate::repositories) struct QueueItemBinding<'a> {
+    pub item: Id,
+    pub authority: &'a crate::runtime_authority::SelectedRuntimeAuthority,
+    pub executable: &'a ExecutionExecutableSnapshot,
+    pub schema: &'a ActionSchemaBinding,
+    pub payload_schema: &'a crate::value_schema::ValueSchemaBinding,
+    pub contributors: &'a [(String, Value, String)],
+    pub source_receipts: &'a [Id],
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct KeyInputVersion {
@@ -315,14 +325,17 @@ impl QueueConfigurationInputRepository {
     pub(in crate::repositories) async fn validate_item_binding(
         conn: &mut PgConnection,
         id: Id,
-        item: Id,
-        authority: &crate::runtime_authority::SelectedRuntimeAuthority,
-        executable: &ExecutionExecutableSnapshot,
-        schema: &ActionSchemaBinding,
-        payload_schema: &crate::value_schema::ValueSchemaBinding,
-        contributors: &[(String, Value, String)],
-        source_receipts: &[Id],
+        expected_binding: QueueItemBinding<'_>,
     ) -> Result<()> {
+        let QueueItemBinding {
+            item,
+            authority,
+            executable,
+            schema,
+            payload_schema,
+            contributors,
+            source_receipts,
+        } = expected_binding;
         let (owner,policy,configuration,body,expected,retained):(Id,Id,Option<Id>,Value,String,Vec<Id>)=sqlx::query_as("SELECT item,policy_revision,configuration_revision,binding,binding_digest,source_receipts FROM work_queue_item_configuration_input WHERE id=$1 FOR SHARE")
             .bind(id).fetch_optional(&mut *conn).await?.ok_or_else(denied)?;
         if hash(&body)? != expected {
@@ -436,10 +449,7 @@ impl QueueConfigurationInputRepository {
         match &renderer.attribution {
             crate::runtime_authority::RequestAttribution::QueueBatch { queue_ref, items }
                 if queue_ref == &sealed.binding.queue_ref
-                    && items.contains_key(&sealed.binding.item) =>
-            {
-                ()
-            }
+                    && items.contains_key(&sealed.binding.item) => {}
             _ => return Err(denied()),
         }
         let policy = Authority::require_policy(conn, sealed.binding.policy).await?;
@@ -696,7 +706,8 @@ impl QueueConfigurationInputRepository {
     ) -> Result<QueueConfigurationInput> {
         let selected =
             Admission::queue_batch(conn, queue, std::slice::from_ref(item), snapshot).await?;
-        let row: Option<(Id,Option<Id>,Value,String,Value,String,Id,Vec<Id>)> = sqlx::query_as(
+        type RetainedInputRow = (Id, Option<Id>, Value, String, Value, String, Id, Vec<Id>);
+        let row: Option<RetainedInputRow> = sqlx::query_as(
             "SELECT policy_revision,configuration_revision,binding,binding_digest,encrypted_context,encryption_key_hash,id,source_receipts FROM work_queue_item_configuration_input WHERE item=$1 FOR SHARE",
         ).bind(item.id).fetch_optional(&mut *conn).await?;
         let (policy, configuration, body, expected, encrypted, key_hash, id, source_receipts) =

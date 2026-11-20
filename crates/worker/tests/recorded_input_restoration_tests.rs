@@ -75,7 +75,7 @@ struct RejectedSource {
 async fn build_fixture(
     second_can_decrypt: bool,
     refs: Vec<String>,
-) -> Result<Fixture, RejectedSource> {
+) -> Result<Fixture, Box<RejectedSource>> {
     let db = create_test_pool().await.unwrap();
     let pack = PackFixture::new_unique("worker_input")
         .create(&db)
@@ -413,7 +413,7 @@ async fn build_fixture(
             ..Default::default()
         }).await.unwrap();
         let mut capture = sqlx::Connection::begin(&mut *tx).await.unwrap();
-        let after_widening = Batch::capture_managed(
+        let after_widening = match Batch::capture_managed(
             &mut capture,
             record.id,
             &queue,
@@ -422,15 +422,17 @@ async fn build_fixture(
             ENCRYPTION_KEY,
         )
         .await
-        .err()
-        .expect("later IAM cannot authorize the original contributor snapshot");
+        {
+            Err(error) => error,
+            Ok(_) => panic!("later IAM cannot authorize the original contributor snapshot"),
+        };
         capture.rollback().await.unwrap();
         tx.rollback().await.unwrap();
-        return Err(RejectedSource {
+        return Err(Box::new(RejectedSource {
             db,
             before_widening,
             after_widening,
-        });
+        }));
     }
     admitted
         .unwrap()

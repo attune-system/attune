@@ -5146,8 +5146,9 @@ impl EvalContext for TraceContext<'_> {
         let path = format!("/{}", escape(name));
         // Queue members are explicitly typed arrays. Do not infer array shape
         // from arbitrary numeric object keys in the generic receipt context.
-        if matches!(name, "items" | "queue_items") && self.queue_members.is_some() {
-            let expected = self.queue_members.unwrap();
+        if let (true, Some(expected)) =
+            (matches!(name, "items" | "queue_items"), self.queue_members)
+        {
             if expected.is_empty() || expected.len() > 256 {
                 return Err(EvalError::TypeError(
                     "Invalid admitted queue membership".into(),

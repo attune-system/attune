@@ -2,7 +2,7 @@
 use super::*;
 use crate::repositories::{
     execution_secret_value::ExecutionSecretValueRepository,
-    queue_configuration_input::QueueConfigurationInputRepository as Fixed,
+    queue_configuration_input::{QueueConfigurationInputRepository as Fixed, QueueItemBinding},
     recorded_input_authority::RecordedInputAuthorityRepository as Contributors,
     work_queue::WorkQueueItemRepository,
 };
@@ -343,13 +343,15 @@ pub(super) async fn check_item(
     Fixed::validate_item_binding(
         conn,
         payload.fixed_input,
-        item,
-        &proof.authority,
-        &proof.executable,
-        &schema,
-        &payload.schema,
-        &proof.contributors,
-        &payload.parent_receipts,
+        QueueItemBinding {
+            item,
+            authority: &proof.authority,
+            executable: &proof.executable,
+            schema: &schema,
+            payload_schema: &payload.schema,
+            contributors: &proof.contributors,
+            source_receipts: &payload.parent_receipts,
+        },
     )
     .await?;
     Ok(())

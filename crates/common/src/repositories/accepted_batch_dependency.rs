@@ -367,7 +367,8 @@ impl AcceptedBatchDependencyRepository {
         conn: &mut PgConnection,
         admission: Id,
     ) -> Result<Vec<BatchRetentionEvidence>> {
-        let rows:Vec<(Option<Id>,Id,Value,String,Option<Id>)>=sqlx::query_as("SELECT source_admission,target_policy,proof,proof_digest,configuration_input FROM runtime_accepted_batch_item WHERE admission=$1 ORDER BY item LIMIT 257")
+        type RetainedItemRow = (Option<Id>, Id, Value, String, Option<Id>);
+        let rows: Vec<RetainedItemRow> = sqlx::query_as("SELECT source_admission,target_policy,proof,proof_digest,configuration_input FROM runtime_accepted_batch_item WHERE admission=$1 ORDER BY item LIMIT 257")
             .bind(admission).fetch_all(conn).await?;
         if rows.len() > 256 {
             return Err(denied());
@@ -463,7 +464,8 @@ impl AcceptedBatchDependencyRepository {
         if canonical_ids(&ids)? != items.keys().copied().collect::<Vec<_>>() {
             return Err(denied());
         }
-        let rows:Vec<(Id,Option<Id>,Id,Value,String,Option<Id>)> = sqlx::query_as("SELECT item,source_admission,target_policy,proof,proof_digest,configuration_input FROM runtime_accepted_batch_item WHERE admission = $1 ORDER BY item")
+        type BatchItemRow = (Id, Option<Id>, Id, Value, String, Option<Id>);
+        let rows: Vec<BatchItemRow> = sqlx::query_as("SELECT item,source_admission,target_policy,proof,proof_digest,configuration_input FROM runtime_accepted_batch_item WHERE admission = $1 ORDER BY item")
             .bind(record.id).fetch_all(&mut *conn).await?;
         if rows.iter().map(|row| row.0).collect::<Vec<_>>() != ids {
             return Err(denied());
