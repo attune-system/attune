@@ -4292,14 +4292,20 @@ async fn test_install_pack_storage_path_created() -> Result<()> {
 
 #[tokio::test]
 async fn test_install_pack_invalid_source() -> Result<()> {
-    let ctx = TestContext::new().await?.with_admin_auth().await?;
+    let approved = TempDir::new()?;
+    let ctx = TestContext::new()
+        .await?
+        .with_admin_auth()
+        .await?
+        .with_local_source_roots(vec![approved.path().into()])
+        .await?;
     let token = ctx.token().unwrap();
 
     let response = ctx
         .post(
             "/api/v1/packs/install",
             json!({
-                "source": "/nonexistent/path/to/pack",
+                "source": approved.path().join("missing"),
                 "force": false,
                 "skip_tests": true,
                 "skip_deps": true
@@ -4310,13 +4316,14 @@ async fn test_install_pack_invalid_source() -> Result<()> {
 
     assert_eq!(
         response.status(),
-        404,
-        "Should fail with not found status for nonexistent path"
+        StatusCode::FORBIDDEN,
+        "A path must resolve inside an approved root"
     );
 
     let body: serde_json::Value = response.json().await?;
     assert!(body["error"].is_string(), "Should have error message");
 
+    ctx.cleanup().await?;
     Ok(())
 }
 
@@ -5175,22 +5182,32 @@ async fn local_source_ingestion_requires_operator_roots_and_global_authority() -
             "{route}"
         );
     }
+    let missing = approved.path().join("missing");
+    let denied = ctx
+        .post(
+            "/api/v1/packs/install",
+            json!({"source": missing, "no_registry": true}),
+            token,
+        )
+        .await?;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
     let downloaded: serde_json::Value = ctx
         .post(
             "/api/v1/packs/download",
-            json!({"packs":[source.path()]}),
+            json!({"packs":[source.path(), missing]}),
             token,
         )
         .await?
         .json()
         .await?;
-    assert_eq!(
-        downloaded["data"]["downloaded_packs"]
-            .as_array()
-            .unwrap()
-            .len(),
-        0
-    );
+    assert_eq!(downloaded["data"]["success_count"], 0);
+    assert_eq!(downloaded["data"]["failure_count"], 2);
+    let failures = downloaded["data"]["failed_packs"].as_array().unwrap();
+    assert_eq!(failures[0]["error"], failures[1]["error"]);
+    assert!(failures[0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("operator-approved roots"));
     assert!(
         PackReleaseRepository::find_active_by_pack_ref(&ctx.pool, "local_confinement")
             .await?
@@ -5214,6 +5231,17 @@ async fn local_source_ingestion_requires_operator_roots_and_global_authority() -
         .with_local_source_roots(vec![source.path().into()])
         .await?;
     let editor = register_pack_index_user(&ctx, json!([{"resource":"packs", "actions":["install"], "constraints":{"refs":["local_confinement"]}}])).await?;
+    for path in [source.path(), &source.path().join("missing")] {
+        let denied = ctx
+            .post(
+                "/api/v1/packs/install",
+                json!({"source": path}),
+                Some(&editor),
+            )
+            .await?;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert!(denied.text().await?.contains("unconstrained"));
+    }
     assert_eq!(
         ctx.post(
             "/api/v1/packs/register",

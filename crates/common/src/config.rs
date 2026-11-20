@@ -475,6 +475,7 @@ pub struct OidcConfig {
 
     /// Redirect URI registered with the provider.
     /// Required when `enabled` is true; ignored otherwise.
+    /// HTTP is allowed only for loopback callbacks outside production.
     #[serde(default)]
     pub redirect_uri: Option<String>,
 
@@ -494,6 +495,49 @@ pub struct OidcConfig {
     /// Its verified subjects bind to the primary client identity realm.
     #[serde(default)]
     pub device_client: Option<OidcDeviceClientConfig>,
+}
+
+impl OidcConfig {
+    /// Validate the callback URL while retaining its exact registered spelling
+    /// for the authorization and token requests.
+    pub fn browser_redirect_uri(&self, production: bool) -> crate::Result<(&str, url::Url)> {
+        let raw = self
+            .redirect_uri
+            .as_deref()
+            .filter(|uri| !uri.trim().is_empty())
+            .ok_or_else(|| {
+                crate::Error::validation("OIDC redirect URI is required when OIDC is enabled")
+            })?;
+        let invalid = || {
+            crate::Error::validation(
+                "OIDC redirect URI must be an absolute HTTP(S) URL without credentials or a fragment",
+            )
+        };
+        let (scheme, rest) = raw.split_once("://").ok_or_else(invalid)?;
+        if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https")
+            || rest.is_empty()
+            || rest.starts_with('/')
+            || raw.contains('\\')
+            || raw.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+        {
+            return Err(invalid());
+        }
+        let uri = url::Url::parse(raw).map_err(|_| invalid())?;
+        if !uri.username().is_empty() || uri.password().is_some() || uri.fragment().is_some() {
+            return Err(invalid());
+        }
+        let loopback = match uri.host().ok_or_else(invalid)? {
+            url::Host::Domain(host) => host.eq_ignore_ascii_case("localhost"),
+            url::Host::Ipv4(ip) => ip.is_loopback(),
+            url::Host::Ipv6(ip) => ip.is_loopback(),
+        };
+        if uri.scheme() == "http" && (production || !loopback) {
+            return Err(crate::Error::validation(
+                "OIDC redirect URI must use HTTPS except for loopback callbacks outside production",
+            ));
+        }
+        Ok((raw, uri))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2581,11 +2625,7 @@ impl Config {
                         "OIDC device client ID cannot be empty",
                     ));
                 }
-                if oidc.redirect_uri.as_deref().unwrap_or("").trim().is_empty() {
-                    return Err(crate::Error::validation(
-                        "OIDC redirect URI is required when OIDC is enabled",
-                    ));
-                }
+                oidc.browser_redirect_uri(self.is_production())?;
             }
         }
 
@@ -2734,6 +2774,18 @@ impl Config {
     /// Check if running in production
     pub fn is_production(&self) -> bool {
         self.environment == "production"
+    }
+
+    /// Browser auth cookies use the validated callback transport and default
+    /// to Secure when enabled OIDC configuration is invalid.
+    pub fn secure_browser_auth_cookies(&self) -> bool {
+        self.is_production()
+            || self.security.oidc.as_ref().is_some_and(|oidc| {
+                match oidc.browser_redirect_uri(false) {
+                    Ok((_, uri)) => uri.scheme() == "https",
+                    Err(_) => oidc.enabled,
+                }
+            })
     }
 
     /// Check if running in development
@@ -3696,6 +3748,87 @@ enabled: false
         assert!(cfg.client_secret.is_none());
         assert_eq!(cfg.provider_name, "oidc");
         assert!(!cfg.require_groups);
+    }
+
+    #[test]
+    fn oidc_browser_redirect_policy_validates_transport_and_controls_secure_cookies() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "security": {
+                "enable_auth": false,
+                "oidc": {
+                    "enabled": true,
+                    "discovery_url": "https://login.example.com/discovery",
+                    "client_id": "browser",
+                },
+            },
+        }))
+        .unwrap();
+
+        for (environment, uri, valid, secure) in [
+            ("development", "http://localhost:3000/callback", true, false),
+            ("development", "http://127.0.0.1:3000/callback", true, false),
+            ("development", "http://[::1]:3000/callback", true, false),
+            (
+                "development",
+                "HTTPS://app.example.com/callback",
+                true,
+                true,
+            ),
+            ("production", "https://app.example.com/callback", true, true),
+            ("production", "http://localhost:3000/callback", false, true),
+            (
+                "development",
+                "http://app.example.com/callback",
+                false,
+                true,
+            ),
+            (
+                "development",
+                "http://localhost.example.com/callback",
+                false,
+                true,
+            ),
+            ("development", "http://192.0.2.1/callback", false, true),
+            ("development", "http://[2001:db8::1]/callback", false, true),
+            ("development", "ftp://localhost/callback", false, true),
+            ("development", "/auth/callback", false, true),
+            ("development", "https://", false, true),
+            (
+                "development",
+                "https://user@app.example.com/callback",
+                false,
+                true,
+            ),
+            (
+                "development",
+                "https://app.example.com/callback#fragment",
+                false,
+                true,
+            ),
+        ] {
+            config.environment = environment.into();
+            let oidc = config.security.oidc.as_mut().unwrap();
+            oidc.redirect_uri = Some(uri.into());
+            let validation = config.validate();
+            if valid {
+                assert!(validation.is_ok(), "{environment} {uri}: {validation:?}");
+            } else {
+                assert!(
+                    matches!(validation, Err(crate::Error::Validation(message))
+                        if message.contains("OIDC redirect URI")),
+                    "{environment} {uri}"
+                );
+            }
+            assert_eq!(
+                config.secure_browser_auth_cookies(),
+                secure,
+                "{environment} {uri}"
+            );
+        }
+        config.security.oidc = None;
+        assert!(!config.secure_browser_auth_cookies());
+        config.environment = "production".into();
+        assert!(config.secure_browser_auth_cookies());
     }
 
     #[test]
