@@ -48,6 +48,21 @@ class Assets(unittest.TestCase):
         self.assertEqual(service['command'][0],'verify-provisioning')
         self.assertNotIn('environment',service)
         self.assertTrue(all(not x['bind']['create_host_path'] for x in service['volumes']))
+    def test_cache_profile_separates_migration_and_runtime_credentials(self):
+        spec=yaml.safe_load((ROOT/'deployment/rollout-admin/cache-runtime.compose.yaml').read_text())
+        migrate=spec['services']['cache-sqlx-migrate'];runtime=spec['services']['cache-api']
+        self.assertEqual(migrate['profiles'],['cache-sqlx-migrate'])
+        self.assertEqual(runtime['profiles'],['cache-api'])
+        self.assertEqual(migrate['command'],['--config','/private/migrator.yaml','--migrate'])
+        self.assertEqual(runtime['command'],['--config','/private/api.yaml'])
+        self.assertNotEqual(migrate['volumes'][0]['source'],runtime['volumes'][0]['source'])
+        for service in [migrate,runtime]:
+            self.assertEqual(service['entrypoint'],['/usr/local/bin/attune-service'])
+            self.assertEqual(service['restart'],'no')
+            self.assertNotIn('environment',service)
+            self.assertNotIn('depends_on',service)
+            self.assertTrue(service['volumes'][0]['read_only'])
+            self.assertFalse(service['volumes'][0]['bind']['create_host_path'])
     def test_private_dba_inputs(self):
         with tempfile.TemporaryDirectory() as root:
             p=Path(root)/'input';p.write_text('{"owned":true}');p.chmod(0o600)

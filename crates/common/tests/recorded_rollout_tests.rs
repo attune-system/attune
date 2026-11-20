@@ -8,6 +8,9 @@ mod cache_acl_isolation;
 #[cfg(target_os = "linux")]
 #[path = "recorded_rollout_tests/cache_boundary.rs"]
 mod cache_boundary;
+#[cfg(target_os = "linux")]
+#[path = "recorded_rollout_tests/cache_regressions.rs"]
+mod cache_regressions;
 #[allow(dead_code)]
 #[path = "../../../tests/sqlx-session/src/commit_relay.rs"]
 mod commit_relay;

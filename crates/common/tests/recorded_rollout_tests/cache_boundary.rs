@@ -14,6 +14,7 @@ use attune_common::{
     },
 };
 use serde_json::json;
+use sqlx::Connection;
 
 fn generation(ns: i64, key: &str) -> CreateCacheGenerationInput {
     CreateCacheGenerationInput {
@@ -63,19 +64,255 @@ async fn absent(f: &Fixture, g: i64) {
     assert!(leaf.is_none());
 }
 
-pub(super) async fn candidate(f: &mut Fixture, upgrade: bool) {
+pub(super) struct InstalledCache {
+    pub cache_owner: String,
+    pub legacy: Option<i64>,
+}
+async fn inventory(f: &Fixture, maintenance: Option<&str>) -> serde_json::Value {
+    let mut roles = Vec::new();
+    for name in [&f.roles[4], &f.roles[6], &f.roles[2], &f.roles[5]] {
+        let oid: i64 = sqlx::query_scalar("SELECT oid::BIGINT FROM pg_roles WHERE rolname=$1")
+            .bind(name)
+            .fetch_one(&*f.db)
+            .await
+            .unwrap();
+        roles.push(json!({"name":name,"oid":oid}));
+    }
+    let maintenance = if let Some(name) = maintenance {
+        let oid: i64 = sqlx::query_scalar("SELECT oid::BIGINT FROM pg_roles WHERE rolname=$1")
+            .bind(name)
+            .fetch_one(&*f.db)
+            .await
+            .unwrap();
+        json!({"name":name,"oid":oid})
+    } else {
+        serde_json::Value::Null
+    };
+    let installation: Uuid = sqlx::query_scalar(
+        "SELECT installation FROM recorded_rollout_installation_identity WHERE id=1",
+    )
+    .fetch_one(&*f.db)
+    .await
+    .unwrap();
+    let database_oid: i64 =
+        sqlx::query_scalar("SELECT oid::BIGINT FROM pg_database WHERE datname=current_database()")
+            .fetch_one(&*f.db)
+            .await
+            .unwrap();
+    let schema_oid: i64 =
+        sqlx::query_scalar("SELECT oid::BIGINT FROM pg_namespace WHERE nspname=$1")
+            .bind(f.db.schema())
+            .fetch_one(&*f.db)
+            .await
+            .unwrap();
+    let inventory = json!({"version":1,"database_oid":database_oid,"schema_oid":schema_oid,"schema":f.db.schema(),"installation":installation,"owner":roles[0],"cache_owner":roles[1],"api":roles[2],"migrator":roles[3],"maintenance":maintenance});
+    inventory
+}
+pub(super) async fn profile(f: &Fixture, maintenance: Option<&str>) {
+    let inventory = inventory(f, maintenance).await;
+    if let Ok(python) = std::env::var("ATTUNE_TEST_CACHE_DBA_PYTHON") {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        use tokio::io::AsyncReadExt;
+        let root = tempfile::tempdir().unwrap();
+        let credentials = root.path().join("dba.json");
+        let input = root.path().join("inventory.json");
+        let mut url = url::Url::parse(f.db.database_url()).unwrap();
+        url.query_pairs_mut()
+            .clear()
+            .append_pair("sslmode", "disable");
+        url.set_password(Some("dummy-owned-dba-file-only")).unwrap();
+        for (path, value) in [
+            (&credentials, json!({"database_url":url.as_str()})),
+            (&input, inventory.clone()),
+        ] {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap();
+            file.write_all(&serde_json::to_vec(&value).unwrap())
+                .unwrap();
+        }
+        let mut child = tokio::process::Command::new(python)
+            .args([
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../scripts/provision-rollout-admin.py"
+                ),
+                "--cache-runtime-profile",
+                "--dba-credentials",
+                credentials.to_str().unwrap(),
+                "--inventory",
+                input.to_str().unwrap(),
+            ])
+            .env_clear()
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let status = tokio::time::timeout(std::time::Duration::from_secs(40), child.wait()).await;
+        if status.is_err() {
+            child.kill().await.unwrap();
+            child.wait().await.unwrap();
+            root.close().unwrap();
+            panic!("owned cache provisioning child timed out and was joined");
+        }
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .take(65536)
+            .read_to_end(&mut out)
+            .await
+            .unwrap();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .take(65536)
+            .read_to_end(&mut err)
+            .await
+            .unwrap();
+        root.close().unwrap();
+        assert!(
+            status.unwrap().unwrap().success(),
+            "cache provisioning failed: {}",
+            String::from_utf8_lossy(&err)
+        );
+        assert!(err.is_empty());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&out).unwrap(),
+            json!({"configured":true})
+        );
+        return;
+    }
+    let sql = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deployment/rollout-admin/cache-runtime-profile.sql"
+    ))
+    .unwrap();
+    let mut tx = f.db.begin().await.unwrap();
+    sqlx::query("CREATE TEMP TABLE cache_runtime_provision_input(document JSONB) ON COMMIT DROP")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO cache_runtime_provision_input VALUES($1)")
+        .bind(inventory)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::raw_sql(&sql).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+}
+pub(super) async fn profile_denials(f: &Fixture) {
+    let original = inventory(f, None).await;
+    let sql = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deployment/rollout-admin/cache-runtime-profile.sql"
+    ))
+    .unwrap();
+    for (field, value) in [
+        ("version", json!(0)),
+        ("database_oid", json!(0)),
+        ("schema_oid", json!(0)),
+        ("installation", json!(Uuid::nil())),
+        ("api", original["owner"].clone()),
+    ] {
+        let mut wrong = original.clone();
+        wrong[field] = value;
+        let mut tx = f.db.begin().await.unwrap();
+        sqlx::query(
+            "CREATE TEMP TABLE cache_runtime_provision_input(document JSONB) ON COMMIT DROP",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO cache_runtime_provision_input VALUES($1)")
+            .bind(wrong)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        assert!(
+            sqlx::raw_sql(&sql).execute(&mut *tx).await.is_err(),
+            "invalid inventory accepted: {field}"
+        );
+        tx.rollback().await.unwrap();
+    }
+    for grant in [
+        format!("GRANT TRUNCATE ON cache_namespace TO {}", f.roles[2]),
+        format!(
+            "GRANT SELECT ON cache_partition_creation_intent TO {}",
+            f.roles[2]
+        ),
+        format!(
+            "GRANT CREATE ON SCHEMA \"{}\" TO {}",
+            f.db.schema(),
+            f.roles[2]
+        ),
+        format!(
+            "GRANT {} TO {} WITH INHERIT TRUE, SET TRUE",
+            f.roles[6], f.roles[2]
+        ),
+        format!(
+            "GRANT {} TO {} WITH INHERIT TRUE, SET TRUE",
+            f.roles[4], f.roles[5]
+        ),
+    ] {
+        let mut tx = f.db.begin().await.unwrap();
+        sqlx::query(&grant).execute(&mut *tx).await.unwrap();
+        sqlx::query(
+            "CREATE TEMP TABLE cache_runtime_provision_input(document JSONB) ON COMMIT DROP",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO cache_runtime_provision_input VALUES($1)")
+            .bind(&original)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        assert!(
+            sqlx::raw_sql(&sql).execute(&mut *tx).await.is_err(),
+            "conflicting grants accepted"
+        );
+        tx.rollback().await.unwrap();
+    }
+}
+pub(super) async fn install(f: &mut Fixture, upgrade: bool) -> InstalledCache {
     let owner = f.roles[4].clone();
     let cache_owner = f.roles[6].clone();
-    let api = f.roles[2].clone();
-    sqlx::raw_sql(&format!("GRANT {cache_owner} TO {owner} WITH INHERIT TRUE, SET TRUE; GRANT USAGE ON SCHEMA \"{}\" TO {cache_owner}; ALTER TABLE cache_entry OWNER TO {cache_owner}",f.db.schema())).execute(&*f.db).await.unwrap();
+    sqlx::raw_sql(&format!("GRANT USAGE ON SCHEMA \"{}\" TO {cache_owner}; ALTER TABLE cache_entry OWNER TO {cache_owner}",f.db.schema())).execute(&*f.db).await.unwrap();
     let legacy = if upgrade {
         let ns = namespace(f.db.pool(), CacheMode::Snapshot).await;
-        Some(id(CacheGenerationRepository::create_or_get(
+        let mut input = generation(ns, "legacy");
+        input.expected_chunk_count = 1;
+        input.expected_count = Some(1);
+        let g = id(
+            CacheGenerationRepository::create_or_get(f.db.pool(), &input)
+                .await
+                .unwrap(),
+        );
+        attune_common::repositories::cache::CacheIngestRepository::insert_chunk(
             f.db.pool(),
-            &generation(ns, "legacy"),
+            g,
+            0,
+            "legacy-data",
+            &[CacheEntryInput {
+                external_id: "preserved".into(),
+                value: json!({"pre9":"preserved"}),
+                source_updated_at: None,
+                source_checksum: None,
+            }],
         )
         .await
-        .unwrap()))
+        .unwrap();
+        Some(g)
     } else {
         None
     };
@@ -85,24 +322,63 @@ pub(super) async fn candidate(f: &mut Fixture, upgrade: bool) {
     ))
     .unwrap();
     // Syntax/object creation rollback first; rollback must leave the old invoker function.
-    let mut probe = f.db.begin().await.unwrap();
-    sqlx::query(&format!("SET LOCAL ROLE {owner}"))
-        .execute(&mut *probe)
+    let migrator = &f.roles[5];
+    let password = format!("dummy_{}", Uuid::new_v4().simple());
+    let ddl: String =
+        sqlx::query_scalar("SELECT format('ALTER ROLE %I PASSWORD %L',$1::TEXT,$2::TEXT)")
+            .bind(migrator)
+            .bind(&password)
+            .fetch_one(&*f.db)
+            .await
+            .unwrap();
+    sqlx::query(&ddl).execute(&*f.db).await.unwrap();
+    let mut url = url::Url::parse(f.db.database_url()).unwrap();
+    url.set_username(migrator).unwrap();
+    url.set_password(Some(&password)).unwrap();
+    url.query_pairs_mut().append_pair(
+        "options",
+        &format!("-crole={owner} -csearch_path={},public", f.db.schema()),
+    );
+    let mut migration = sqlx::PgConnection::connect(url.as_str()).await.unwrap();
+    let identity: (String, String) = sqlx::query_as("SELECT session_user::TEXT,current_user::TEXT")
+        .fetch_one(&mut migration)
         .await
         .unwrap();
+    assert_eq!(identity, (migrator.clone(), owner.clone()));
+    let mut probe = migration.begin().await.unwrap();
     sqlx::raw_sql(&sql).execute(&mut *probe).await.unwrap();
     probe.rollback().await.unwrap();
     assert!(!sqlx::query_scalar::<_,bool>("SELECT prosecdef FROM pg_proc WHERE oid='create_cache_generation_partition(bigint)'::regprocedure").fetch_one(&*f.db).await.unwrap());
     // Explicit disposable candidate installation, NOT a committed migration-9 application.
-    let mut install = f.db.begin().await.unwrap();
-    sqlx::query(&format!("SET LOCAL ROLE {owner}"))
-        .execute(&mut *install)
-        .await
-        .unwrap();
+    let mut install = migration.begin().await.unwrap();
     sqlx::raw_sql(&sql).execute(&mut *install).await.unwrap();
     install.commit().await.unwrap();
-    let tables="cache_namespace,cache_generation,cache_entry,cache_ingest_chunk,cache_generation_clone,cache_generation_entry_usage,cache_owner_physical_byte_usage,cache_deployment_physical_byte_usage,cache_entry_statistics_state,cache_live_request";
-    sqlx::raw_sql(&format!("GRANT SELECT,INSERT,UPDATE,DELETE ON {tables} TO {api}; GRANT SELECT ON runtime_retention_config TO {api}; GRANT USAGE,SELECT ON SEQUENCE cache_namespace_id_seq,cache_generation_id_seq,cache_entry_id_seq TO {api}; GRANT EXECUTE ON FUNCTION create_cache_generation_partition(BIGINT) TO {api}")).execute(&*f.db).await.unwrap();
+    migration.close().await.unwrap();
+    profile(f, None).await;
+    profile(f, None).await; // Exact repeated application is idempotent.
+    if let Some(g) = legacy {
+        let value: serde_json::Value = sqlx::query_scalar(
+            "SELECT value FROM cache_entry WHERE generation=$1 AND external_id='preserved'",
+        )
+        .bind(g)
+        .fetch_one(&f.pools[1])
+        .await
+        .unwrap();
+        assert_eq!(value, json!({"pre9":"preserved"}));
+        let actual:String=sqlx::query_scalar("SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid=to_regclass(format('%I.cache_entry_g_%s',current_schema(),$1))").bind(g).fetch_one(&*f.db).await.unwrap();
+        assert_eq!(actual, cache_owner);
+    }
+    InstalledCache {
+        cache_owner,
+        legacy,
+    }
+}
+pub(super) async fn candidate(f: &mut Fixture, upgrade: bool) {
+    let InstalledCache {
+        cache_owner,
+        legacy,
+    } = install(f, upgrade).await;
+    let api = f.roles[2].clone();
     let probe_ns = namespace(&f.pools[1], CacheMode::Snapshot).await;
     super::cache_acl_isolation::probe(f, probe_ns).await;
     validation_probes(f).await;
@@ -184,7 +460,7 @@ pub(super) async fn candidate(f: &mut Fixture, upgrade: bool) {
             .await
             .is_err());
         tx.rollback().await.unwrap();
-        maintenance_drop(f, tables, &cache_owner, g).await;
+        maintenance_drop(f, g).await;
     }
     let ns = namespace(pool, CacheMode::Snapshot).await;
     // Repository path, nested savepoint and complete rollback (DDL+intent+usage).
@@ -335,10 +611,10 @@ pub(super) async fn candidate(f: &mut Fixture, upgrade: bool) {
         .await
         .unwrap();
     tx.commit().await.unwrap();
-    maintenance_drop(f, tables, &cache_owner, keep).await;
+    maintenance_drop(f, keep).await;
 }
 
-async fn maintenance_drop(f: &mut Fixture, tables: &str, cache_owner: &str, generation: i64) {
+pub(super) async fn maintenance_pool(f: &mut Fixture) -> PgPool {
     // Maintenance has cache ownership, never installation ownership or schema CREATE.
     let role = format!("ws2_cache_maint_{}", Uuid::new_v4().simple());
     let password = format!("dummy_{}", Uuid::new_v4().simple());
@@ -349,10 +625,18 @@ async fn maintenance_drop(f: &mut Fixture, tables: &str, cache_owner: &str, gene
             .fetch_one(&*f.db)
             .await
             .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM pg_roles WHERE rolname=$1")
+            .bind(&role)
+            .fetch_one(&*f.db)
+            .await
+            .unwrap(),
+        0
+    );
     sqlx::query(&ddl).execute(&*f.db).await.unwrap();
     f.roles.push(role.clone());
     std::fs::write(&f.manifest, serde_json::to_vec(&f.roles).unwrap()).unwrap();
-    sqlx::raw_sql(&format!("GRANT {cache_owner} TO {role} WITH INHERIT TRUE, SET FALSE; GRANT USAGE ON SCHEMA \"{}\" TO {role}; GRANT SELECT,UPDATE,DELETE ON {tables} TO {role}; GRANT SELECT ON file_evidence_pin,runtime_native_cache_frontier,workflow_cache_iteration,workflow_execution TO {role}",f.db.schema())).execute(&*f.db).await.unwrap();
+    profile(f, Some(&role)).await;
     let mut url = url::Url::parse(f.db.database_url()).unwrap();
     url.set_username(&role).unwrap();
     url.set_password(Some(&password)).unwrap();
@@ -366,6 +650,10 @@ async fn maintenance_drop(f: &mut Fixture, tables: &str, cache_owner: &str, gene
         .await
         .unwrap();
     f.pools.push(maintenance.clone());
+    maintenance
+}
+pub(super) async fn maintenance_drop(f: &mut Fixture, generation: i64) {
+    let maintenance = maintenance_pool(f).await;
     CacheGenerationRepository::fail(&f.pools[1], generation, "candidate cleanup")
         .await
         .unwrap();

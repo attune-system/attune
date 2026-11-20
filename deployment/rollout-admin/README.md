@@ -1,6 +1,12 @@
 # Explicit offline provisioning and invocation lane (WIP)
 
-These assets do not make current Attune production role grants compliant. They
+The separately approved [candidate cache runtime profile](cache-runtime-profile.md)
+adds an explicit offline DBA supplement and standalone Compose profiles. It has
+owned host PostgreSQL evidence only; migration 9 remains outside the ledger and
+the target Compose profile is not accepted. The original rollout provisioning
+transaction below retains its existing conflict checks and defaults.
+
+The original rollout assets do not make current production role grants compliant. They
 never create/adopt roles, transfer ownership, change startup/defaults, migrate,
 activate a queue gate, or deploy anything. All seven gates remain false.
 

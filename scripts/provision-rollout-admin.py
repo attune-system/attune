@@ -40,6 +40,7 @@ def main():
     parser = RedactedParser(description=__doc__)
     parser.add_argument('--dba-credentials', required=True)
     parser.add_argument('--inventory', required=True)
+    parser.add_argument('--cache-runtime-profile', action='store_true', help='Explicit cache role supplement; never creates/adopts roles or converts history')
     args = parser.parse_args()
     credential = private_json(args.dba_credentials, 16384)
     inventory = private_json(args.inventory, 65536)
@@ -58,10 +59,12 @@ def main():
             cur.execute('SELECT current_user=session_user AND rolsuper FROM pg_catalog.pg_roles WHERE rolname=session_user')
             if cur.fetchone() != (True,):
                 raise ValueError('explicit DBA session required')
-            cur.execute('CREATE TEMP TABLE rollout_provision_input(document JSONB) ON COMMIT DROP')
-            cur.execute('INSERT INTO rollout_provision_input VALUES (%s::jsonb)', (json.dumps(inventory),))
+            input_table='cache_runtime_provision_input' if args.cache_runtime_profile else 'rollout_provision_input'
+            cur.execute('CREATE TEMP TABLE '+input_table+'(document JSONB) ON COMMIT DROP')
+            cur.execute('INSERT INTO '+input_table+' VALUES (%s::jsonb)', (json.dumps(inventory),))
             root = Path(__file__).resolve().parents[1]
-            cur.execute((root / 'deployment/rollout-admin/provision.sql').read_text())
+            asset='cache-runtime-profile.sql' if args.cache_runtime_profile else 'provision.sql'
+            cur.execute((root / 'deployment/rollout-admin' / asset).read_text())
             from hashlib import sha384
             from psycopg import sql
             cur.execute(sql.SQL('SELECT version,checksum,success FROM {}._sqlx_migrations').format(sql.Identifier(inventory['schema'])))
