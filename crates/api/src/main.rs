@@ -397,8 +397,8 @@ async fn run() -> Result<()> {
     )
     .await?;
     info!("Database connection established");
-    PlatformCatalogRepository::reconcile(database.pool()).await?;
-    info!("Platform catalog reconciled");
+    PlatformCatalogRepository::ensure_reconciled(database.pool()).await?;
+    info!("Platform catalog ready");
 
     // Spawn the audit writer task. The emitter is cheap and clone-able; we
     // store it in AppState so handlers and middleware can record audit events

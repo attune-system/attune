@@ -1,7 +1,9 @@
 //! The five original cache assertion bodies, with actual separate DB principals.
 use super::helpers;
 use super::*;
-use attune_common::repositories::rollout_admin::RolloutAdminRepository;
+use attune_common::repositories::{
+    platform_catalog::PlatformCatalogRepository, rollout_admin::RolloutAdminRepository,
+};
 use serde_json::{json, Value};
 use sqlx::Connection;
 #[path = "../cache_cases/live.rs"]
@@ -111,6 +113,11 @@ async fn representative_existing_regressions_with_actual_roles() {
                     let runtime=attune_common::db::Database::new(&config).await.unwrap();
                     f.pools.push(runtime.pool().clone()); // Fixture joins this pool even if a later assertion panics.
                     assert_eq!(sqlx::query_scalar::<_,String>("SELECT session_user::TEXT").fetch_one(runtime.pool()).await.unwrap(),f.roles[2]);
+                    let catalog_error = PlatformCatalogRepository::ensure_reconciled(runtime.pool()).await.unwrap_err();
+                    assert!(matches!(catalog_error, attune_common::Error::Database(ref error)
+                        if error.as_database_error().and_then(|error| error.code()).as_deref()==Some("42501")));
+                    PlatformCatalogRepository::reconcile(f.db.pool()).await.unwrap();
+                    PlatformCatalogRepository::ensure_reconciled(runtime.pool()).await.unwrap();
                     runtime.close().await;
                 }
                 if let Some(g)=context.legacy {

@@ -100,6 +100,10 @@ Docker-managed databases must be rejected, never implicitly converted. Fresh
 SQLx bootstrap also needs the offline migrator/owner's explicit runner-marker
 permissions in `public`; grant those only to the offline installation posture,
 never to API. Do not give the runtime owner credentials to make startup pass.
+Run catalog reconciliation with the offline migrator. The API's startup check
+can validate the exact current catalog snapshot with SELECT. If that snapshot
+drifts or is missing, the split API login fails startup until the offline
+migrator reconciles it.
 
 Owned host PostgreSQL tests validate actual separate login identities, the exact
 Python driver/SQL asset, fresh and populated pre-9 candidate installation, and
