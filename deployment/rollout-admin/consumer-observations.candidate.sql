@@ -33,7 +33,8 @@ CREATE TABLE recorded_consumer_binding (
 CREATE TABLE recorded_consumer_observation (
     rollout BIGINT NOT NULL,
     instance UUID NOT NULL,
-    observed TIMESTAMPTZ NOT NULL,
+    process_claim UUID NOT NULL CHECK (process_claim <> '00000000-0000-0000-0000-000000000000'),
+    observed TIMESTAMPTZ,
     worker_id BIGINT CHECK (worker_id > 0),
     PRIMARY KEY (rollout, instance),
     FOREIGN KEY (rollout, instance) REFERENCES recorded_consumer_binding (rollout, instance)
@@ -106,11 +107,11 @@ BEGIN
     END IF;
 END $bind$;
 
--- The service cannot select the role, boot or rollout it speaks for. NULL
--- withdraws its observation before shutdown, while mutations for any other
--- member remain unavailable.
+-- The first ready publication consumes this assigned boot. Renewals must
+-- prove the same process-local claim, even after the observation is withdrawn
+-- or expires. A replacement process needs a new staged boot and reporter.
 CREATE FUNCTION report_recorded_consumer(
-    snapshot JSONB, member_id UUID, boot_id UUID, mask INTEGER, target_worker BIGINT DEFAULT NULL
+    snapshot JSONB, member_id UUID, boot_id UUID, claim UUID, mask INTEGER, target_worker BIGINT
 ) RETURNS VOID
 LANGUAGE plpgsql SECURITY DEFINER AS $report$
 DECLARE
@@ -128,7 +129,8 @@ BEGIN
             SELECT 1 FROM pg_auth_members WHERE member = principal.oid OR roleid = principal.oid
         );
 
-    IF NOT FOUND OR (mask IS NOT NULL AND mask <> binding.required_mask) THEN
+    IF NOT FOUND OR claim IS NULL OR claim = '00000000-0000-0000-0000-000000000000'
+        OR (mask IS NOT NULL AND mask <> binding.required_mask) THEN
         RAISE EXCEPTION 'Consumer observation not authorized' USING ERRCODE = '42501';
     END IF;
 
@@ -144,19 +146,30 @@ BEGIN
     END IF;
 
     IF mask IS NULL THEN
-        DELETE FROM recorded_consumer_observation
-        WHERE rollout = binding.rollout AND instance = binding.instance;
+        UPDATE recorded_consumer_observation
+        SET observed = NULL, worker_id = NULL
+        WHERE rollout = binding.rollout AND instance = binding.instance AND process_claim = claim;
+        IF NOT FOUND AND EXISTS (
+            SELECT 1 FROM recorded_consumer_observation
+            WHERE rollout = binding.rollout AND instance = binding.instance
+        ) THEN
+            RAISE EXCEPTION 'Consumer observation belongs to another process' USING ERRCODE = '42501';
+        END IF;
     ELSE
-        INSERT INTO recorded_consumer_observation (rollout, instance, observed, worker_id)
-        VALUES (binding.rollout, binding.instance, clock_timestamp(), target_worker)
+        INSERT INTO recorded_consumer_observation (rollout, instance, process_claim, observed, worker_id)
+        VALUES (binding.rollout, binding.instance, claim, clock_timestamp(), target_worker)
         ON CONFLICT (rollout, instance) DO UPDATE
-        SET observed = EXCLUDED.observed, worker_id = EXCLUDED.worker_id;
+        SET observed = EXCLUDED.observed, worker_id = EXCLUDED.worker_id
+        WHERE recorded_consumer_observation.process_claim = EXCLUDED.process_claim;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'Consumer observation belongs to another process' USING ERRCODE = '42501';
+        END IF;
     END IF;
 END $report$;
 
 -- Admission/dispatch callers use the active pointer and database clock in the
 -- same transaction as the effect. Reads serialize with an operator's switch.
-CREATE FUNCTION current_recorded_consumer_evidence() RETURNS JSONB
+CREATE FUNCTION current_recorded_consumer_evidence(claim UUID) RETURNS JSONB
 LANGUAGE plpgsql SECURITY DEFINER AS $read$
 DECLARE
     active recorded_rollout_active;
@@ -208,14 +221,16 @@ BEGIN
         'required_mask', b.required_mask) INTO caller
     FROM recorded_consumer_binding AS b
     JOIN pg_roles AS principal ON principal.oid = b.reporter_oid AND principal.rolname = b.reporter
-    WHERE b.rollout = active.generation AND b.reporter = session_user;
+    JOIN recorded_consumer_observation AS o USING (rollout, instance)
+    WHERE b.rollout = active.generation AND b.reporter = session_user
+        AND o.process_claim = claim AND o.observed > cutoff - INTERVAL '30 seconds';
 
     RETURN jsonb_build_object('expected', expected, 'observations', observations, 'now', cutoff,
         'revision', active.revision, 'caller', caller, 'worker_targets', worker_targets);
 END $read$;
 
 REVOKE ALL ON FUNCTION bind_recorded_consumer(UUID, UUID, UUID, NAME),
-    report_recorded_consumer(JSONB, UUID, UUID, INTEGER, BIGINT), current_recorded_consumer_evidence(),
+    report_recorded_consumer(JSONB, UUID, UUID, UUID, INTEGER, BIGINT), current_recorded_consumer_evidence(UUID),
     recorded_worker_registration_matches(worker, JSONB, UUID, UUID, TIMESTAMPTZ) FROM PUBLIC;
 
 DO $path$
@@ -223,9 +238,9 @@ DECLARE signature TEXT;
 BEGIN
     FOREACH signature IN ARRAY ARRAY[
         'bind_recorded_consumer(UUID, UUID, UUID, NAME)',
-        'report_recorded_consumer(JSONB, UUID, UUID, INTEGER, BIGINT)',
+        'report_recorded_consumer(JSONB, UUID, UUID, UUID, INTEGER, BIGINT)',
         'recorded_worker_registration_matches(worker, JSONB, UUID, UUID, TIMESTAMPTZ)',
-        'current_recorded_consumer_evidence()'
+        'current_recorded_consumer_evidence(UUID)'
     ] LOOP
         EXECUTE format('ALTER FUNCTION %s SET search_path TO pg_catalog, %I, pg_temp',
             signature, current_schema());
@@ -247,9 +262,9 @@ BEGIN
         CROSS JOIN LATERAL aclexplode(COALESCE(procedure.proacl, acldefault('f', procedure.proowner))) AS acl
         WHERE procedure.oid IN (
             'bind_recorded_consumer(UUID, UUID, UUID, NAME)'::REGPROCEDURE,
-            'report_recorded_consumer(JSONB, UUID, UUID, INTEGER, BIGINT)'::REGPROCEDURE,
+            'report_recorded_consumer(JSONB, UUID, UUID, UUID, INTEGER, BIGINT)'::REGPROCEDURE,
             'recorded_worker_registration_matches(worker, JSONB, UUID, UUID, TIMESTAMPTZ)'::REGPROCEDURE,
-            'current_recorded_consumer_evidence()'::REGPROCEDURE
+            'current_recorded_consumer_evidence(UUID)'::REGPROCEDURE
         ) AND acl.grantee <> procedure.proowner
     ) THEN
         RAISE EXCEPTION 'Consumer transport has unexpected default grants' USING ERRCODE = '42501';

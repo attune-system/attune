@@ -61,6 +61,8 @@ pub struct RecordedConsumerIdentity {
     snapshot: ContractSnapshot,
     instance: Uuid,
     boot: Uuid,
+    #[serde(skip, default = "Uuid::new_v4")]
+    process_claim: Uuid,
 }
 
 impl RecordedConsumerIdentity {
@@ -97,12 +99,20 @@ impl RecordedConsumerIdentity {
         connection: &mut PgConnection,
         ready_role: Option<ConsumerRole>,
     ) -> Result<()> {
-        RecordedConsumerObservations::report(
+        RecordedConsumerObservations::write(connection, self, ready_role, None).await
+    }
+
+    /// Report installed worker support against this process's own registration.
+    pub async fn publish_worker(
+        &self,
+        connection: &mut PgConnection,
+        worker: crate::models::Id,
+    ) -> Result<()> {
+        RecordedConsumerObservations::write(
             connection,
-            &self.snapshot,
-            self.instance,
-            self.boot,
-            ready_role,
+            self,
+            Some(ConsumerRole::Worker),
+            Some(worker),
         )
         .await
     }
@@ -115,7 +125,8 @@ impl RecordedConsumerIdentity {
         transaction: &mut Transaction<'_, Postgres>,
         role: ConsumerRole,
     ) -> Result<RecordedRolloutReadiness> {
-        let evidence = RecordedConsumerObservations::read(transaction).await?;
+        let evidence =
+            RecordedConsumerObservations::read(transaction, Some(self.process_claim)).await?;
         if evidence.expected.snapshot != self.snapshot
             || evidence.caller.as_ref().is_none_or(|caller| {
                 caller.instance != self.instance
@@ -212,51 +223,17 @@ impl RecordedConsumerObservations {
         Ok(access)
     }
 
-    /// Use the member's dedicated login. Supplying the expected identity also
-    /// prevents a service initialized with the wrong credentials from refreshing
-    /// a different replica of the same role.
-    pub async fn report(
-        connection: &mut PgConnection,
-        snapshot: &ContractSnapshot,
-        instance: Uuid,
-        boot: Uuid,
-        ready_role: Option<ConsumerRole>,
-    ) -> Result<()> {
-        Self::write(connection, snapshot, instance, boot, ready_role, None).await
-    }
-
-    /// Report a worker role from its exact action-worker registration. The
-    /// authenticated observation function revalidates the boot and heartbeat.
-    pub async fn report_worker(
-        connection: &mut PgConnection,
-        snapshot: &ContractSnapshot,
-        instance: Uuid,
-        boot: Uuid,
-        worker: crate::models::Id,
-    ) -> Result<()> {
-        Self::write(
-            connection,
-            snapshot,
-            instance,
-            boot,
-            Some(ConsumerRole::Worker),
-            Some(worker),
-        )
-        .await
-    }
-
     async fn write(
         connection: &mut PgConnection,
-        snapshot: &ContractSnapshot,
-        instance: Uuid,
-        boot: Uuid,
+        identity: &RecordedConsumerIdentity,
         ready_role: Option<ConsumerRole>,
         worker: Option<crate::models::Id>,
     ) -> Result<()> {
-        sqlx::query("SELECT report_recorded_consumer($1,$2,$3,$4,$5)")
-            .bind(serde_json::to_value(snapshot)?)
-            .bind(instance)
-            .bind(boot)
+        sqlx::query("SELECT report_recorded_consumer($1,$2,$3,$4,$5,$6)")
+            .bind(serde_json::to_value(&identity.snapshot)?)
+            .bind(identity.instance)
+            .bind(identity.boot)
+            .bind(identity.process_claim)
             .bind(ready_role.map(|role| i32::from(role.allowed_gate_mask())))
             .bind(worker)
             .execute(connection)
@@ -270,12 +247,16 @@ impl RecordedConsumerObservations {
     pub async fn require_current(
         transaction: &mut Transaction<'_, Postgres>,
     ) -> Result<RecordedRolloutReadiness> {
-        Self::read(transaction).await?.validate()
+        Self::read(transaction, None).await?.validate()
     }
 
-    async fn read(transaction: &mut Transaction<'_, Postgres>) -> Result<DatabaseEvidence> {
+    async fn read(
+        transaction: &mut Transaction<'_, Postgres>,
+        process_claim: Option<Uuid>,
+    ) -> Result<DatabaseEvidence> {
         let evidence: Option<sqlx::types::Json<DatabaseEvidence>> =
-            sqlx::query_scalar("SELECT current_recorded_consumer_evidence()")
+            sqlx::query_scalar("SELECT current_recorded_consumer_evidence($1)")
+                .bind(process_claim)
                 .fetch_one(&mut **transaction)
                 .await?;
         evidence

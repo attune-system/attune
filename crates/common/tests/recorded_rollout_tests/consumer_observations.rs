@@ -22,9 +22,9 @@ async fn observer_login(f: &mut Fixture, can_report: bool) -> PgPool {
     f.roles.push(name.clone());
     std::fs::write(&f.manifest, serde_json::to_vec(&f.roles).unwrap()).unwrap();
     let function = if can_report {
-        "report_recorded_consumer(JSONB, UUID, UUID, INTEGER, BIGINT)"
+        "report_recorded_consumer(JSONB, UUID, UUID, UUID, INTEGER, BIGINT)"
     } else {
-        "current_recorded_consumer_evidence()"
+        "current_recorded_consumer_evidence(UUID)"
     };
     sqlx::raw_sql(&format!(
         "GRANT USAGE ON SCHEMA \"{}\" TO {name}; GRANT EXECUTE ON FUNCTION {function} TO {name}",
@@ -42,7 +42,7 @@ async fn observer_login(f: &mut Fixture, can_report: bool) -> PgPool {
         &format!("-csearch_path={},public", f.db.schema()),
     );
     let pool = PgPoolOptions::new()
-        .max_connections(1)
+        .max_connections(if can_report { 2 } else { 1 })
         .connect(url.as_str())
         .await
         .unwrap();
@@ -52,18 +52,22 @@ async fn observer_login(f: &mut Fixture, can_report: bool) -> PgPool {
 
 async fn report(
     pool: &PgPool,
-    snapshot: &ContractSnapshot,
-    member: &ExpectedMember,
+    process: &RecordedConsumerIdentity,
     role: Option<ConsumerRole>,
 ) -> attune_common::Result<()> {
-    Observations::report(
-        &mut *pool.acquire().await?,
-        snapshot,
-        member.instance,
-        member.boot,
-        role,
-    )
-    .await
+    process.publish(&mut *pool.acquire().await?, role).await
+}
+
+fn process_identity(
+    snapshot: &ContractSnapshot,
+    member: &ExpectedMember,
+) -> RecordedConsumerIdentity {
+    serde_json::from_value(serde_json::json!({
+        "snapshot": snapshot,
+        "instance": member.instance,
+        "boot": member.boot,
+    }))
+    .unwrap()
 }
 
 async fn evidence_ready(pool: &PgPool) -> bool {
@@ -123,12 +127,29 @@ async fn exercise(f: &mut Fixture) {
     let first = &expected.members[0];
     let peer = expected.members.last().unwrap();
     let first_login = &reporters[0];
+    let identities: Vec<_> = expected
+        .members
+        .iter()
+        .map(|member| process_identity(&expected.snapshot, member))
+        .collect();
+    let first_identity = &identities[0];
+    let peer_identity = identities.last().unwrap();
+    assert!(
+        serde_json::from_value::<RecordedConsumerIdentity>(serde_json::json!({
+            "snapshot": expected.snapshot,
+            "instance": first.instance,
+            "boot": first.boot,
+            "process_claim": Uuid::new_v4(),
+        }))
+        .is_err()
+    );
     let worker_index = expected
         .members
         .iter()
         .position(|member| member.role == ConsumerRole::Worker)
         .unwrap();
     let worker = &expected.members[worker_index];
+    let worker_identity = &identities[worker_index];
     let worker_login = &reporters[worker_index];
     let worker_capability = serde_json::json!({
         (attune_common::execution_authority::RECORDED_EXECUTION_CAPABILITY): {
@@ -161,18 +182,15 @@ async fn exercise(f: &mut Fixture) {
         Some("23505")
     );
     assert!(
-        report(worker_login, &expected.snapshot, worker, Some(worker.role))
+        report(worker_login, worker_identity, Some(worker.role))
             .await
             .is_err(),
         "a worker report always names a compatible registration"
     );
-    let publish_worker = |pool: PgPool, id| {
-        let snapshot = expected.snapshot.clone();
-        let (instance, boot) = (worker.instance, worker.boot);
-        async move {
-            Observations::report_worker(&mut *pool.acquire().await?, &snapshot, instance, boot, id)
-                .await
-        }
+    let publish_worker = |pool: PgPool, id| async move {
+        worker_identity
+            .publish_worker(&mut *pool.acquire().await?, id)
+            .await
     };
     assert!(publish_worker(first_login.clone(), worker_id)
         .await
@@ -183,32 +201,28 @@ async fn exercise(f: &mut Fixture) {
     publish_worker(worker_login.clone(), worker_id)
         .await
         .unwrap();
+    assert!(report(first_login, peer_identity, Some(peer.role))
+        .await
+        .is_err());
     assert!(
-        report(first_login, &expected.snapshot, peer, Some(peer.role))
+        report(first_login, first_identity, Some(ConsumerRole::Worker))
             .await
             .is_err()
     );
+    let mut wrong_snapshot = expected.snapshot.clone();
+    wrong_snapshot.release_digest = "b".repeat(64);
     assert!(report(
         first_login,
-        &expected.snapshot,
-        first,
-        Some(ConsumerRole::Worker)
+        &process_identity(&wrong_snapshot, first),
+        Some(first.role)
     )
     .await
     .is_err());
-    let mut wrong_snapshot = expected.snapshot.clone();
-    wrong_snapshot.release_digest = "b".repeat(64);
-    assert!(
-        report(first_login, &wrong_snapshot, first, Some(first.role))
-            .await
-            .is_err()
-    );
     let mut wrong_boot = first.clone();
     wrong_boot.boot = Uuid::new_v4();
     assert!(report(
         first_login,
-        &expected.snapshot,
-        &wrong_boot,
+        &process_identity(&expected.snapshot, &wrong_boot),
         Some(first.role)
     )
     .await
@@ -219,19 +233,22 @@ async fn exercise(f: &mut Fixture) {
             .await
             .is_err()
     );
-    assert!(sqlx::query("SELECT current_recorded_consumer_evidence()")
-        .execute(first_login)
-        .await
-        .is_err());
-
-    for (pool, member) in reporters[..reporters.len() - 1]
-        .iter()
-        .zip(&expected.members)
-        .filter(|(_, member)| member.role != ConsumerRole::Worker)
-    {
-        report(pool, &expected.snapshot, member, Some(member.role))
+    assert!(
+        sqlx::query("SELECT current_recorded_consumer_evidence(NULL)")
+            .execute(first_login)
             .await
-            .unwrap();
+            .is_err()
+    );
+
+    for (index, member) in expected.members[..expected.members.len() - 1]
+        .iter()
+        .enumerate()
+    {
+        if member.role != ConsumerRole::Worker {
+            report(&reporters[index], &identities[index], Some(member.role))
+                .await
+                .unwrap();
+        }
     }
     RolloutAdminRepository::activate(&mut operator.acquire().await.unwrap(), &receipt)
         .await
@@ -241,27 +258,27 @@ async fn exercise(f: &mut Fixture) {
         "every replica is required, including a second API"
     );
     let peer_login = reporters.last().unwrap();
-    report(peer_login, &expected.snapshot, peer, Some(peer.role))
-        .await
-        .unwrap();
+    let second_process = process_identity(&expected.snapshot, peer);
+    let (first_claim, second_claim) = tokio::join!(
+        report(peer_login, peer_identity, Some(peer.role)),
+        report(peer_login, &second_process, Some(peer.role)),
+    );
+    assert_ne!(first_claim.is_ok(), second_claim.is_ok());
+    let (peer_identity, restarted_peer) = if first_claim.is_ok() {
+        (peer_identity, &second_process)
+    } else {
+        (&second_process, peer_identity)
+    };
     assert!(evidence_ready(&reader).await);
 
     let first_name: String = sqlx::query_scalar("SELECT session_user::TEXT")
         .fetch_one(first_login)
         .await
         .unwrap();
-    let permit =
-        format!("GRANT EXECUTE ON FUNCTION current_recorded_consumer_evidence() TO {first_name}");
+    let permit = format!(
+        "GRANT EXECUTE ON FUNCTION current_recorded_consumer_evidence(UUID) TO {first_name}"
+    );
     sqlx::query(&permit).execute(&*f.db).await.unwrap();
-    let local = |member: &ExpectedMember| -> RecordedConsumerIdentity {
-        serde_json::from_value(serde_json::json!({
-            "snapshot": expected.snapshot,
-            "instance": member.instance,
-            "boot": member.boot,
-        }))
-        .unwrap()
-    };
-    let first_identity = local(first);
     let mut tx = first_login.begin().await.unwrap();
     let evidence = first_identity
         .require_current(&mut tx, first.role)
@@ -275,12 +292,17 @@ async fn exercise(f: &mut Fixture) {
         worker.boot,
         chrono::Utc::now() + chrono::TimeDelta::seconds(30),
     ));
-    assert!(local(peer)
+    assert!(peer_identity
         .require_current(&mut tx, first.role)
         .await
         .is_err());
     assert!(first_identity
         .require_current(&mut tx, ConsumerRole::Executor)
+        .await
+        .is_err());
+    let restarted_first = process_identity(&expected.snapshot, first);
+    assert!(restarted_first
+        .require_current(&mut tx, first.role)
         .await
         .is_err());
     tx.rollback().await.unwrap();
@@ -373,15 +395,10 @@ async fn exercise(f: &mut Fixture) {
         .execute(&mut *impersonation)
         .await
         .unwrap();
-    assert!(Observations::report(
-        &mut impersonation,
-        &expected.snapshot,
-        peer.instance,
-        peer.boot,
-        Some(peer.role)
-    )
-    .await
-    .is_err());
+    assert!(peer_identity
+        .publish(&mut impersonation, Some(peer.role))
+        .await
+        .is_err());
     impersonation.rollback().await.unwrap();
     assert!(
         !evidence_ready(&reader).await,
@@ -395,15 +412,21 @@ async fn exercise(f: &mut Fixture) {
     sqlx::query("UPDATE recorded_consumer_observation SET observed = clock_timestamp() - interval '30 seconds' WHERE instance=$1")
         .bind(peer.instance).execute(&*f.db).await.unwrap();
     assert!(!evidence_ready(&reader).await);
-    report(peer_login, &expected.snapshot, peer, Some(peer.role))
+    assert!(report(peer_login, restarted_peer, Some(peer.role))
+        .await
+        .is_err());
+    report(peer_login, peer_identity, Some(peer.role))
         .await
         .unwrap();
     assert!(evidence_ready(&reader).await);
-    report(peer_login, &expected.snapshot, peer, None)
-        .await
-        .unwrap();
+    assert!(report(peer_login, restarted_peer, None).await.is_err());
+    assert!(evidence_ready(&reader).await);
+    report(peer_login, peer_identity, None).await.unwrap();
     assert!(!evidence_ready(&reader).await);
-    report(peer_login, &expected.snapshot, peer, Some(peer.role))
+    assert!(report(peer_login, restarted_peer, Some(peer.role))
+        .await
+        .is_err());
+    report(peer_login, peer_identity, Some(peer.role))
         .await
         .unwrap();
 

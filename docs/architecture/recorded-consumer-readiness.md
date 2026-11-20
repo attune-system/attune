@@ -49,9 +49,10 @@ older delegated credential or ambient service identity.
 - Managed queue admission and dispatch check the aggregate under their write
   transactions, before materialization and again before commit. Retry and
   recorded ad hoc enqueue still deny through their existing gates.
-- Managed dispatch control settings such as Key-backed batch size still need
-  admission evidence before the executor can report support. The current
-  resolver reads these settings from the live queue projection.
+- Managed dispatch locks the queue and the selected item before resolving that
+  item's admitted concurrency, batch size, coalescing and delay settings. The
+  owning record retains their configuration and Key versions. A Key used only
+  for a dispatch setting stays outside the action renderer's inputs.
 
 The [coordinated authority cutover](../deployment/postgresql-only.md#execution-authority-cutover)
 requires compatible service releases before admission resumes. Any production
@@ -84,10 +85,12 @@ existing PostgreSQL installation. The candidate is outside the migration ledger.
   execution of the reporting function. A replacement boot uses a fresh
   membership generation and login. Bindings do not change at runtime.
 - A report requires the authenticated PostgreSQL session login, exact rollout
-  snapshot, instance, boot, and required role mask. The server assigns the
-  observation time. A report can renew only its own row, and the same login
-  can withdraw that row. The 30-second window bounds evidence from a dead
-  process. Startup code establishes the local consumer prerequisites before
+  snapshot, instance, boot, and required role mask. The first ready report
+  binds the boot to a randomly generated process-local claim. Only that
+  process can renew or withdraw the report. Withdrawal and expiry retain the
+  claim, so restarting with the old identity file and login cannot reuse the
+  boot. The database assigns the observation time and limits freshness to
+  30 seconds. Startup code establishes the local prerequisites before
   publishing.
 - The worker role also names the actual action-worker registration. Its row
   must carry the exact snapshot, boot and instance as the recorded capability,
@@ -102,8 +105,8 @@ existing PostgreSQL installation. The candidate is outside the migration ledger.
   holds the active rollout and catalog row locks so they cannot switch underneath
   the effect that uses the evidence. A service uses its authenticated boot
   identity when requesting an effect check. The database reader returns its
-  actual session binding, and the repository checks that it matches the local
-  snapshot, role, instance, and boot. A login with only the evidence reader
+  actual session binding when the private process claim matches. The repository
+  checks the snapshot, role, instance and boot. A login with only the evidence reader
   grant can inspect the aggregate without authorizing an effect.
 - The tables have no service-owned DML grants. Binding uses the DBA connection,
   and reporter login identity relies on `session_user` plus the exact catalog
