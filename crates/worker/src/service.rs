@@ -46,7 +46,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::artifacts::ArtifactManager;
 use crate::env_setup;
-use crate::executor::ActionExecutor;
+use crate::executor::{ActionExecutor, RecordedWorkerAssignment};
 use crate::heartbeat::HeartbeatManager;
 use crate::registration::WorkerRegistration;
 use crate::runtime::local::LocalRuntime;
@@ -89,6 +89,34 @@ pub struct ExecutionScheduledPayload {
     pub release_id: Option<i64>,
     #[serde(default)]
     pub release_digest: Option<String>,
+    #[serde(default)]
+    pub scheduled_attempt_updated_at: Option<chrono::DateTime<Utc>>,
+    #[serde(default)]
+    pub recorded_worker_boot: Option<uuid::Uuid>,
+}
+
+impl ExecutionScheduledPayload {
+    fn recorded_assignment(
+        &self,
+        local_registration: (i64, uuid::Uuid),
+    ) -> Result<Option<RecordedWorkerAssignment>> {
+        let Some(boot) = self.recorded_worker_boot else {
+            return Ok(None);
+        };
+        if (self.worker_id, boot) != local_registration {
+            return Err(Error::PermissionDenied(
+                "Recorded delivery targets another worker registration".into(),
+            ));
+        }
+        let updated_at = self.scheduled_attempt_updated_at.ok_or_else(|| {
+            Error::PermissionDenied("Recorded delivery is missing its scheduling attempt".into())
+        })?;
+        Ok(Some(RecordedWorkerAssignment {
+            worker_id: self.worker_id,
+            boot,
+            updated_at,
+        }))
+    }
 }
 
 fn filter_runtime_names_for_worker(
@@ -1505,6 +1533,7 @@ impl WorkerService {
         let worker_id = self
             .worker_id
             .ok_or_else(|| Error::Internal("Worker not registered".to_string()))?;
+        let local_registration = (worker_id, self.registration.read().await.incarnation());
 
         // Queue name for this worker (already created in setup_worker_infrastructure)
         let queue_name = format!("worker.{}.executions", worker_id);
@@ -1626,6 +1655,7 @@ impl WorkerService {
                                     pack_transport,
                                     envelope,
                                     cancel_token,
+                                    local_registration,
                                 )
                                 .await
                                 {
@@ -1671,9 +1701,11 @@ impl WorkerService {
         pack_transport: Arc<dyn attune_common::pack_transport::PackFileTransport>,
         envelope: MessageEnvelope<ExecutionScheduledPayload>,
         cancel_token: CancellationToken,
+        local_registration: (i64, uuid::Uuid),
     ) -> Result<()> {
         let received_at = std::time::Instant::now();
         let execution_id = envelope.payload.execution_id;
+        let recorded_assignment = envelope.payload.recorded_assignment(local_registration)?;
 
         info!(
             "Processing execution.scheduled for execution: {}",
@@ -1738,7 +1770,9 @@ impl WorkerService {
             elapsed_us = received_at.elapsed().as_micros() as u64,
             "Worker lifecycle phase"
         );
-        let started = executor.start_execution(execution_id).await?;
+        let started = executor
+            .start_execution(execution_id, recorded_assignment)
+            .await?;
         if let Err(error) = Self::publish_persisted_status_update(&publisher, &started).await {
             error!("Failed to publish running status: {}", error);
         }
@@ -2845,17 +2879,35 @@ mod tests {
 
     #[test]
     fn test_execution_scheduled_payload_structure() {
-        let payload = ExecutionScheduledPayload {
+        let mut payload = ExecutionScheduledPayload {
             execution_id: 111,
             action_ref: "core.test".to_string(),
             worker_id: 222,
             release_id: Some(333),
             release_digest: Some("a".repeat(64)),
+            scheduled_attempt_updated_at: None,
+            recorded_worker_boot: None,
         };
 
         assert_eq!(payload.execution_id, 111);
         assert_eq!(payload.action_ref, "core.test");
         assert_eq!(payload.worker_id, 222);
+
+        let boot = uuid::Uuid::new_v4();
+        let local = (222, boot);
+        assert!(payload.recorded_assignment(local).unwrap().is_none());
+        payload.recorded_worker_boot = Some(boot);
+        assert!(payload.recorded_assignment(local).is_err());
+        let scheduled_at = Utc::now();
+        payload.scheduled_attempt_updated_at = Some(scheduled_at);
+        let accepted = payload.recorded_assignment(local).unwrap().unwrap();
+        assert_eq!(accepted.worker_id, 222);
+        assert_eq!(accepted.boot, boot);
+        assert_eq!(accepted.updated_at, scheduled_at);
+        assert!(payload.recorded_assignment((223, boot)).is_err());
+        assert!(payload
+            .recorded_assignment((222, uuid::Uuid::new_v4()))
+            .is_err());
     }
 
     #[test]

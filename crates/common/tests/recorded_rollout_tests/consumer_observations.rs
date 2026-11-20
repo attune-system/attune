@@ -22,7 +22,7 @@ async fn observer_login(f: &mut Fixture, can_report: bool) -> PgPool {
     f.roles.push(name.clone());
     std::fs::write(&f.manifest, serde_json::to_vec(&f.roles).unwrap()).unwrap();
     let function = if can_report {
-        "report_recorded_consumer(JSONB, UUID, UUID, INTEGER)"
+        "report_recorded_consumer(JSONB, UUID, UUID, INTEGER, BIGINT)"
     } else {
         "current_recorded_consumer_evidence()"
     };
@@ -73,7 +73,7 @@ async fn evidence_ready(pool: &PgPool) -> bool {
     match result {
         Ok(_) => true,
         Err(attune_common::Error::PermissionDenied(_)) => false,
-        other => panic!("unexpected evidence result: {other:?}"),
+        Err(error) => panic!("unexpected evidence error: {error:?}"),
     }
 }
 
@@ -123,6 +123,66 @@ async fn exercise(f: &mut Fixture) {
     let first = &expected.members[0];
     let peer = expected.members.last().unwrap();
     let first_login = &reporters[0];
+    let worker_index = expected
+        .members
+        .iter()
+        .position(|member| member.role == ConsumerRole::Worker)
+        .unwrap();
+    let worker = &expected.members[worker_index];
+    let worker_login = &reporters[worker_index];
+    let worker_capability = serde_json::json!({
+        (attune_common::execution_authority::RECORDED_EXECUTION_CAPABILITY): {
+            "snapshot": expected.snapshot,
+            "instance": worker.instance,
+            "boot": worker.boot,
+        }
+    });
+    let worker_id: i64 = sqlx::query_scalar(
+        "INSERT INTO worker (name, worker_type, worker_role, status, capabilities, meta, last_heartbeat) \
+         VALUES ('consumer-observation-fixture','local','action','active',$1, \
+             jsonb_build_object('registration_incarnation',$2::uuid),clock_timestamp()) RETURNING id",
+    )
+    .bind(&worker_capability)
+    .bind(worker.boot)
+    .fetch_one(&*f.db)
+    .await
+    .unwrap();
+    let duplicate = sqlx::query(
+        "INSERT INTO worker (name, worker_type, worker_role, status, capabilities, meta, last_heartbeat) \
+         SELECT 'duplicate-observation-fixture', worker_type, worker_role, status, capabilities, meta, last_heartbeat \
+         FROM worker WHERE id=$1",
+    )
+    .bind(worker_id)
+    .execute(&*f.db)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        duplicate.as_database_error().unwrap().code().as_deref(),
+        Some("23505")
+    );
+    assert!(
+        report(worker_login, &expected.snapshot, worker, Some(worker.role))
+            .await
+            .is_err(),
+        "a worker report always names a compatible registration"
+    );
+    let publish_worker = |pool: PgPool, id| {
+        let snapshot = expected.snapshot.clone();
+        let (instance, boot) = (worker.instance, worker.boot);
+        async move {
+            Observations::report_worker(&mut *pool.acquire().await?, &snapshot, instance, boot, id)
+                .await
+        }
+    };
+    assert!(publish_worker(first_login.clone(), worker_id)
+        .await
+        .is_err());
+    assert!(publish_worker(worker_login.clone(), i64::MAX)
+        .await
+        .is_err());
+    publish_worker(worker_login.clone(), worker_id)
+        .await
+        .unwrap();
     assert!(
         report(first_login, &expected.snapshot, peer, Some(peer.role))
             .await
@@ -167,6 +227,7 @@ async fn exercise(f: &mut Fixture) {
     for (pool, member) in reporters[..reporters.len() - 1]
         .iter()
         .zip(&expected.members)
+        .filter(|(_, member)| member.role != ConsumerRole::Worker)
     {
         report(pool, &expected.snapshot, member, Some(member.role))
             .await
@@ -202,10 +263,18 @@ async fn exercise(f: &mut Fixture) {
     };
     let first_identity = local(first);
     let mut tx = first_login.begin().await.unwrap();
-    first_identity
+    let evidence = first_identity
         .require_current(&mut tx, first.role)
         .await
         .unwrap();
+    assert!(evidence.matches_worker(worker_id, worker.boot, chrono::Utc::now()));
+    assert!(!evidence.matches_worker(i64::MAX, worker.boot, chrono::Utc::now()));
+    assert!(!evidence.matches_worker(worker_id, peer.boot, chrono::Utc::now()));
+    assert!(!evidence.matches_worker(
+        worker_id,
+        worker.boot,
+        chrono::Utc::now() + chrono::TimeDelta::seconds(30),
+    ));
     assert!(local(peer)
         .require_current(&mut tx, first.role)
         .await
@@ -215,6 +284,64 @@ async fn exercise(f: &mut Fixture) {
         .await
         .is_err());
     tx.rollback().await.unwrap();
+
+    sqlx::query(
+        "UPDATE worker SET last_heartbeat=clock_timestamp()-interval '25 seconds' WHERE id=$1",
+    )
+    .bind(worker_id)
+    .execute(&*f.db)
+    .await
+    .unwrap();
+    publish_worker(worker_login.clone(), worker_id)
+        .await
+        .unwrap();
+    let mut tx = first_login.begin().await.unwrap();
+    let evidence = first_identity
+        .require_current(&mut tx, first.role)
+        .await
+        .unwrap();
+    assert!(!evidence.matches_worker(
+        worker_id,
+        worker.boot,
+        chrono::Utc::now() + chrono::TimeDelta::seconds(10),
+    ));
+    tx.rollback().await.unwrap();
+
+    // A new runtime process can replace the row while the observation is still
+    // fresh. Replacement or heartbeat loss must invalidate it immediately.
+    sqlx::query(
+        "UPDATE worker SET last_heartbeat=clock_timestamp()-interval '31 seconds' WHERE id=$1",
+    )
+    .bind(worker_id)
+    .execute(&*f.db)
+    .await
+    .unwrap();
+    assert!(!evidence_ready(&reader).await);
+    assert!(publish_worker(worker_login.clone(), worker_id)
+        .await
+        .is_err());
+    sqlx::query("UPDATE worker SET last_heartbeat=clock_timestamp(),meta=jsonb_build_object('registration_incarnation',$2::uuid) WHERE id=$1")
+        .bind(worker_id).bind(Uuid::new_v4()).execute(&*f.db).await.unwrap();
+    assert!(!evidence_ready(&reader).await);
+    assert!(publish_worker(worker_login.clone(), worker_id)
+        .await
+        .is_err());
+    sqlx::query("UPDATE worker SET last_heartbeat=clock_timestamp(),meta=jsonb_build_object('registration_incarnation',$2::uuid),capabilities='{}'::jsonb WHERE id=$1")
+        .bind(worker_id).bind(worker.boot).execute(&*f.db).await.unwrap();
+    assert!(!evidence_ready(&reader).await);
+    assert!(publish_worker(worker_login.clone(), worker_id)
+        .await
+        .is_err());
+    sqlx::query("UPDATE worker SET capabilities=$2 WHERE id=$1")
+        .bind(worker_id)
+        .bind(&worker_capability)
+        .execute(&*f.db)
+        .await
+        .unwrap();
+    publish_worker(worker_login.clone(), worker_id)
+        .await
+        .unwrap();
+    assert!(evidence_ready(&reader).await);
     let mut tx = reader.begin().await.unwrap();
     assert!(first_identity
         .require_current(&mut tx, first.role)

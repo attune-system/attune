@@ -4,6 +4,7 @@
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::Deserialize;
 use sqlx::{PgConnection, Postgres, Transaction};
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 use crate::execution_authority::consumer_contract::{
@@ -23,6 +24,33 @@ struct DatabaseEvidence {
     now: DateTime<Utc>,
     revision: i64,
     caller: Option<ExpectedMember>,
+    worker_targets: Vec<WorkerTarget>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerTarget {
+    worker_id: crate::models::Id,
+    instance: Uuid,
+    boot: Uuid,
+}
+
+/// Validated rollout evidence with the exact eligible worker registrations.
+/// Target matching does not replace the scheduler's normal placement checks.
+pub struct RecordedRolloutReadiness {
+    contract: ValidatedConsumerContractSnapshot,
+    workers: BTreeMap<crate::models::Id, Uuid>,
+}
+
+impl RecordedRolloutReadiness {
+    pub fn matches_worker(
+        &self,
+        worker: crate::models::Id,
+        boot: Uuid,
+        now: DateTime<Utc>,
+    ) -> bool {
+        now < self.contract.valid_until() && self.workers.get(&worker) == Some(&boot)
+    }
 }
 
 /// Operator-supplied identity for this process boot. The database pool's
@@ -86,7 +114,7 @@ impl RecordedConsumerIdentity {
         &self,
         transaction: &mut Transaction<'_, Postgres>,
         role: ConsumerRole,
-    ) -> Result<ValidatedConsumerContractSnapshot> {
+    ) -> Result<RecordedRolloutReadiness> {
         let evidence = RecordedConsumerObservations::read(transaction).await?;
         if evidence.expected.snapshot != self.snapshot
             || evidence.caller.as_ref().is_none_or(|caller| {
@@ -194,11 +222,43 @@ impl RecordedConsumerObservations {
         boot: Uuid,
         ready_role: Option<ConsumerRole>,
     ) -> Result<()> {
-        sqlx::query("SELECT report_recorded_consumer($1,$2,$3,$4)")
+        Self::write(connection, snapshot, instance, boot, ready_role, None).await
+    }
+
+    /// Report a worker role from its exact action-worker registration. The
+    /// authenticated observation function revalidates the boot and heartbeat.
+    pub async fn report_worker(
+        connection: &mut PgConnection,
+        snapshot: &ContractSnapshot,
+        instance: Uuid,
+        boot: Uuid,
+        worker: crate::models::Id,
+    ) -> Result<()> {
+        Self::write(
+            connection,
+            snapshot,
+            instance,
+            boot,
+            Some(ConsumerRole::Worker),
+            Some(worker),
+        )
+        .await
+    }
+
+    async fn write(
+        connection: &mut PgConnection,
+        snapshot: &ContractSnapshot,
+        instance: Uuid,
+        boot: Uuid,
+        ready_role: Option<ConsumerRole>,
+        worker: Option<crate::models::Id>,
+    ) -> Result<()> {
+        sqlx::query("SELECT report_recorded_consumer($1,$2,$3,$4,$5)")
             .bind(serde_json::to_value(snapshot)?)
             .bind(instance)
             .bind(boot)
             .bind(ready_role.map(|role| i32::from(role.allowed_gate_mask())))
+            .bind(worker)
             .execute(connection)
             .await?;
         Ok(())
@@ -209,7 +269,7 @@ impl RecordedConsumerObservations {
     /// at the database's sampling time. The lease is not execution authority.
     pub async fn require_current(
         transaction: &mut Transaction<'_, Postgres>,
-    ) -> Result<ValidatedConsumerContractSnapshot> {
+    ) -> Result<RecordedRolloutReadiness> {
         Self::read(transaction).await?.validate()
     }
 
@@ -226,8 +286,8 @@ impl RecordedConsumerObservations {
 }
 
 impl DatabaseEvidence {
-    fn validate(self) -> Result<ValidatedConsumerContractSnapshot> {
-        validate_consumer_contracts(
+    fn validate(self) -> Result<RecordedRolloutReadiness> {
+        let contract = validate_consumer_contracts(
             Some(&self.expected),
             &self.observations,
             self.now,
@@ -238,6 +298,29 @@ impl DatabaseEvidence {
         )
         .map_err(|error| {
             Error::PermissionDenied(format!("Recorded consumer evidence denied: {error:?}"))
-        })
+        })?;
+        let mut expected_workers: BTreeSet<_> = self
+            .observations
+            .iter()
+            .filter(|member| member.role == ConsumerRole::Worker)
+            .map(|member| (member.instance, member.boot))
+            .collect();
+        let mut workers = BTreeMap::new();
+        for target in self.worker_targets {
+            if target.worker_id <= 0
+                || !expected_workers.remove(&(target.instance, target.boot))
+                || workers.insert(target.worker_id, target.boot).is_some()
+            {
+                return Err(Error::PermissionDenied(
+                    "Invalid recorded worker targets".into(),
+                ));
+            }
+        }
+        if !expected_workers.is_empty() {
+            return Err(Error::PermissionDenied(
+                "Recorded worker targets are incomplete".into(),
+            ));
+        }
+        Ok(RecordedRolloutReadiness { contract, workers })
     }
 }

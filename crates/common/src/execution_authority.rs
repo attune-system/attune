@@ -7,6 +7,9 @@ pub mod consumer_contract;
 /// Advertised by compatible worker startup; never authored by a pack.
 pub const DELEGATED_EXECUTION_CAPABILITY: &str = "delegated_execution_authority_v1";
 
+/// Reservation for a recorded worker's validated rollout snapshot and boot.
+pub const RECORDED_EXECUTION_CAPABILITY: &str = "recorded_execution_authority_v1";
+
 /// Supplied by coordinated service startup, not pack metadata or environment.
 /// Default is deliberately not ready. Do not enable individual consumers by
 /// treating a denied operation as a reason to issue an older broad credential.

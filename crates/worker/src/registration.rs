@@ -290,7 +290,9 @@ impl WorkerRegistration {
 
         // Merge detected capabilities with existing ones
         for (key, value) in detected_capabilities {
-            self.capabilities.insert(key, value);
+            if key != attune_common::execution_authority::RECORDED_EXECUTION_CAPABILITY {
+                self.capabilities.insert(key, value);
+            }
         }
 
         self.capabilities.insert(
@@ -419,6 +421,10 @@ impl WorkerRegistration {
     /// Get the registered worker ID
     pub fn worker_id(&self) -> Option<i64> {
         self.worker_id
+    }
+
+    pub(crate) fn incarnation(&self) -> uuid::Uuid {
+        self.incarnation
     }
 
     /// Get the worker name
@@ -583,13 +589,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_worker_capabilities() {
+        use attune_common::execution_authority::RECORDED_EXECUTION_CAPABILITY;
+
         let (mut config, pool, database) = isolated_test_context().await;
         config.worker = Some(
-            serde_json::from_value(json!({"capabilities": {"runtimes": ["python"]}})).unwrap(),
+            serde_json::from_value(json!({"capabilities": {
+                "runtimes": ["python"],
+                (RECORDED_EXECUTION_CAPABILITY): {"instance": uuid::Uuid::new_v4()}
+            }}))
+            .unwrap(),
         );
         let mut registration = WorkerRegistration::new(pool, &config);
 
         registration.detect_capabilities(&config).await.unwrap();
+        assert!(!registration
+            .capabilities
+            .contains_key(RECORDED_EXECUTION_CAPABILITY));
         assert!(registration.capabilities["runtimes"]
             .as_array()
             .unwrap()

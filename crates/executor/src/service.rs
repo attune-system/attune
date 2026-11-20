@@ -270,7 +270,7 @@ impl ExecutorService {
     /// Start the executor service
     pub async fn start(&self) -> Result<()> {
         info!("Starting Executor Service");
-        let recorded_identity = attune_common::repositories::recorded_consumer_observations::RecordedConsumerIdentity::from_environment()?;
+        let recorded_identity = attune_common::repositories::recorded_consumer_observations::RecordedConsumerIdentity::from_environment()?.map(Arc::new);
 
         // Spawn message consumers
         let mut handles: Vec<JoinHandle<Result<()>>> = Vec::new();
@@ -429,7 +429,8 @@ impl ExecutorService {
             self.inner.config.artifacts.log_segment_max_bytes,
             self.inner.config.artifacts.flush_interval_ms,
         )
-        .with_workflow_log_transport(workflow_log_transport.clone());
+        .with_workflow_log_transport(workflow_log_transport.clone())
+        .with_recorded_identity(recorded_identity.clone());
         handles.push(tokio::spawn(async move { scheduler.start().await }));
 
         // Start execution manager with its own consumer

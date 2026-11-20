@@ -95,7 +95,7 @@ pub struct WorkQueueDispatcher {
     pool: PgPool,
     publisher: Arc<Publisher>,
     encryption_key: Option<String>,
-    recorded_identity: Option<RecordedConsumerIdentity>,
+    recorded_identity: Option<Arc<RecordedConsumerIdentity>>,
     config: QueueDispatcherConfig,
 }
 
@@ -104,7 +104,7 @@ impl WorkQueueDispatcher {
         pool: PgPool,
         publisher: Arc<Publisher>,
         encryption_key: Option<String>,
-        recorded_identity: Option<RecordedConsumerIdentity>,
+        recorded_identity: Option<Arc<RecordedConsumerIdentity>>,
     ) -> Self {
         Self {
             pool,

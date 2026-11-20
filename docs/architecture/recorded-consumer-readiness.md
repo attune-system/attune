@@ -21,11 +21,11 @@ establishing coordinated production startup or successful queue execution.
 | Worker completion | worker `executor.rs`, common staged completion and worker-delivery repositories | worker `support/recorded_completion_cases.rs`, recorded restoration tests |
 | Native executor consumers | executor scheduler, retry manager, workflow/native common repositories | common native materialization, retry and outcome cases plus executor consumer tests |
 
-Managed enqueue and dispatch require a complete current rollout and the local
-session's binding to that rollout. Scheduling and retry still use the unready
-default, and worker construction has no production caller for its recorded
-readiness builder. Missing recorded evidence must never select an older
-delegated credential or ambient service identity.
+Managed enqueue, dispatch and recorded scheduling require a complete current
+rollout and the local session's binding to that rollout. Retry still uses the
+unready default, and worker construction has no production caller for its
+recorded readiness builder. Missing recorded evidence must never select an
+older delegated credential or ambient service identity.
 
 ### Current startup and compatibility gaps
 
@@ -34,9 +34,10 @@ delegated credential or ambient service identity.
   has no production caller. Worker registration advertises
   `delegated_execution_authority_v1` when encryption is configured; that is not
   recorded execution, input restoration or completion support.
-- Scheduler worker selection filters delegated capability for delegated work.
-  It has no corresponding recorded-worker compatibility filter. A registered
-  worker or successful heartbeat therefore cannot establish recorded readiness.
+- Scheduler worker selection matches recorded work to the admitted registration
+  and boot as well as the normal runtime and placement checks. A recorded
+  delivery names that boot and the scheduling attempt. The worker checks both
+  before claiming the execution.
 - API authentication validates recorded credentials and rejects routes without
   an explicit `RecordedRuntimeConsumer` marker. This protects unconverted
   routes, but a marker alone does not prove the route's data-origin, revocation
@@ -46,8 +47,8 @@ delegated credential or ambient service identity.
   candidate transport. The API, worker and executor still need their own
   local observations and validation.
 - Managed queue admission and dispatch check the aggregate under their write
-  transactions, before materialization and again before commit. Scheduling,
-  retry and recorded ad hoc enqueue still deny through their existing gates.
+  transactions, before materialization and again before commit. Retry and
+  recorded ad hoc enqueue still deny through their existing gates.
 - Managed dispatch control settings such as Key-backed batch size still need
   admission evidence before the executor can report support. The current
   resolver reads these settings from the live queue projection.
@@ -88,6 +89,12 @@ existing PostgreSQL installation. The candidate is outside the migration ledger.
   can withdraw that row. The 30-second window bounds evidence from a dead
   process. Startup code establishes the local consumer prerequisites before
   publishing.
+- The worker role also names the actual action-worker registration. Its row
+  must carry the exact snapshot, boot and instance as the recorded capability,
+  with the boot as its registration incarnation. Replacement, missing
+  capability and heartbeat expiry immediately invalidate the observation. The
+  aggregate carries the eligible registration IDs and boots. Scheduling
+  rechecks them in the worker-assignment transaction alongside normal placement.
 - The DBA grants the admission and dispatch roles only execution of the evidence
   reader for this transport. It returns observations from the active rollout
   and current catalog, using a single database clock sample. The repository runs

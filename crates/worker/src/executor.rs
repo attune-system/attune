@@ -68,6 +68,12 @@ pub(crate) struct ExecutionOutcome {
     pub result: Result<ExecutionResult>,
 }
 
+pub(crate) struct RecordedWorkerAssignment {
+    pub worker_id: i64,
+    pub boot: uuid::Uuid,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Action executor that orchestrates execution flow
 pub struct ActionExecutor {
     #[cfg(unix)]
@@ -560,18 +566,45 @@ impl ActionExecutor {
         execution_id: i64,
         cancel_token: CancellationToken,
     ) -> Result<ExecutionOutcome> {
-        let transition = self.start_execution(execution_id).await?;
+        let transition = self.start_execution(execution_id, None).await?;
         self.execute_started_outcome(transition.execution, cancel_token)
             .await
     }
 
-    pub(crate) async fn start_execution(&self, execution_id: i64) -> Result<ExecutionTransition> {
+    pub(crate) async fn start_execution(
+        &self,
+        execution_id: i64,
+        recorded_assignment: Option<RecordedWorkerAssignment>,
+    ) -> Result<ExecutionTransition> {
         let worker = self.worker_id.load(Ordering::Acquire);
         let mut tx = self.pool.begin().await?;
         let authority = attune_common::repositories::execution_runtime_admission::ExecutionAdmissionRepository::existing_authority(&mut tx, execution_id).await?;
         if authority == attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Recorded {
             self.recorded_readiness.require_ready()?;
+            let assignment = recorded_assignment.filter(|assignment| assignment.worker_id == worker)
+                .ok_or_else(|| Error::PermissionDenied("Recorded worker assignment is unavailable".into()))?;
+            let execution = ExecutionRepository::find_by_id_for_update(&mut tx, execution_id).await?
+                .ok_or_else(|| Error::PermissionDenied("Execution unavailable".into()))?;
+            if execution.worker != Some(worker) || execution.status != ExecutionStatus::Scheduled
+                || execution.updated != assignment.updated_at
+            {
+                return Err(Error::PermissionDenied("Recorded scheduling attempt is no longer current".into()));
+            }
+            let boot = assignment.boot.to_string();
+            let registration = WorkerRepository::find_registration_for_share(&mut tx, worker).await?;
+            if !registration.is_some_and(|worker| {
+                worker.status == Some(attune_common::models::enums::WorkerStatus::Active)
+                    && worker.worker_role == attune_common::models::enums::WorkerRole::Action
+                    && !worker.cordoned
+                    && worker.meta.as_ref().and_then(|meta| meta["registration_incarnation"].as_str())
+                        == Some(boot.as_str())
+            }) {
+                return Err(Error::PermissionDenied("Recorded worker registration is no longer current".into()));
+            }
         } else {
+            if recorded_assignment.is_some() {
+                return Err(Error::PermissionDenied("Unexpected recorded worker assignment".into()));
+            }
             // Claim and attempt registration commit together. A duplicate or
             // stale delivery cannot establish another credential authority.
             ExecutionRepository::find_by_id_for_update(&mut tx, execution_id).await?

@@ -34,11 +34,29 @@ CREATE TABLE recorded_consumer_observation (
     rollout BIGINT NOT NULL,
     instance UUID NOT NULL,
     observed TIMESTAMPTZ NOT NULL,
+    worker_id BIGINT CHECK (worker_id > 0),
     PRIMARY KEY (rollout, instance),
     FOREIGN KEY (rollout, instance) REFERENCES recorded_consumer_binding (rollout, instance)
 );
 
 REVOKE ALL ON recorded_consumer_binding, recorded_consumer_observation FROM PUBLIC;
+
+CREATE UNIQUE INDEX recorded_action_worker_boot ON worker ((meta->>'registration_incarnation'))
+WHERE capabilities ? 'recorded_execution_authority_v1';
+
+-- This registration is evidence of a routing destination, not an authority
+-- owner. The worker's replacement or loss of heartbeat invalidates it.
+CREATE FUNCTION recorded_worker_registration_matches(
+    registration worker, snapshot JSONB, member_id UUID, boot_id UUID, cutoff TIMESTAMPTZ
+) RETURNS BOOLEAN
+LANGUAGE SQL STABLE RETURNS NULL ON NULL INPUT AS $worker$
+    SELECT registration.worker_role = 'action' AND registration.status = 'active'
+        AND registration.last_heartbeat > cutoff - INTERVAL '30 seconds'
+        AND registration.last_heartbeat <= cutoff
+        AND registration.meta->>'registration_incarnation' = boot_id::TEXT
+        AND registration.capabilities->'recorded_execution_authority_v1' =
+            jsonb_build_object('instance', member_id, 'boot', boot_id, 'snapshot', snapshot)
+$worker$;
 
 -- Invoked by the DBA that provisions the dedicated PostgreSQL LOGIN. The
 -- rollout operator and all runtime services keep their existing privileges.
@@ -91,7 +109,9 @@ END $bind$;
 -- The service cannot select the role, boot or rollout it speaks for. NULL
 -- withdraws its observation before shutdown, while mutations for any other
 -- member remain unavailable.
-CREATE FUNCTION report_recorded_consumer(snapshot JSONB, member_id UUID, boot_id UUID, mask INTEGER) RETURNS VOID
+CREATE FUNCTION report_recorded_consumer(
+    snapshot JSONB, member_id UUID, boot_id UUID, mask INTEGER, target_worker BIGINT DEFAULT NULL
+) RETURNS VOID
 LANGUAGE plpgsql SECURITY DEFINER AS $report$
 DECLARE
     binding recorded_consumer_binding;
@@ -112,13 +132,25 @@ BEGIN
         RAISE EXCEPTION 'Consumer observation not authorized' USING ERRCODE = '42501';
     END IF;
 
+    IF (mask IS NOT NULL AND binding.role = 'worker') <> (target_worker IS NOT NULL)
+        OR (target_worker IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM worker AS registration
+            WHERE registration.id = target_worker
+                AND recorded_worker_registration_matches(
+                    registration, snapshot, member_id, boot_id, clock_timestamp()
+                )
+        )) THEN
+        RAISE EXCEPTION 'Consumer observation has no compatible worker registration' USING ERRCODE = '42501';
+    END IF;
+
     IF mask IS NULL THEN
         DELETE FROM recorded_consumer_observation
         WHERE rollout = binding.rollout AND instance = binding.instance;
     ELSE
-        INSERT INTO recorded_consumer_observation (rollout, instance, observed)
-        VALUES (binding.rollout, binding.instance, clock_timestamp())
-        ON CONFLICT (rollout, instance) DO UPDATE SET observed = clock_timestamp();
+        INSERT INTO recorded_consumer_observation (rollout, instance, observed, worker_id)
+        VALUES (binding.rollout, binding.instance, clock_timestamp(), target_worker)
+        ON CONFLICT (rollout, instance) DO UPDATE
+        SET observed = EXCLUDED.observed, worker_id = EXCLUDED.worker_id;
     END IF;
 END $report$;
 
@@ -132,6 +164,7 @@ DECLARE
     cutoff TIMESTAMPTZ;
     observations JSONB;
     caller JSONB;
+    worker_targets JSONB;
 BEGIN
     SELECT * INTO STRICT active FROM recorded_rollout_active WHERE singleton FOR SHARE;
     SELECT g.expected INTO expected
@@ -150,17 +183,26 @@ BEGIN
         'instance', b.instance, 'boot', b.boot,
         'role', b.role, 'snapshot', expected->'snapshot',
         'gate_mask', b.required_mask, 'observed', o.observed,
-        'expires', o.observed + INTERVAL '30 seconds'
-    ) ORDER BY b.instance), '[]'::JSONB) INTO observations
+        'expires', LEAST(o.observed, COALESCE(registration.last_heartbeat, o.observed)) + INTERVAL '30 seconds'
+    ) ORDER BY b.instance), '[]'::JSONB), COALESCE(jsonb_agg(jsonb_build_object(
+        'worker_id', registration.id, 'instance', b.instance, 'boot', b.boot
+    ) ORDER BY b.instance) FILTER (WHERE registration.id IS NOT NULL), '[]'::JSONB)
+    INTO observations, worker_targets
     FROM recorded_consumer_observation AS o
     JOIN recorded_consumer_binding AS b USING (rollout, instance)
     JOIN pg_roles AS principal ON principal.oid = b.reporter_oid AND principal.rolname = b.reporter
+    LEFT JOIN worker AS registration ON registration.id = o.worker_id
     WHERE o.rollout = active.generation AND o.observed > cutoff - INTERVAL '30 seconds'
         AND principal.rolcanlogin AND NOT principal.rolsuper AND NOT principal.rolcreaterole
         AND NOT principal.rolcreatedb AND NOT principal.rolreplication AND NOT principal.rolbypassrls
         AND NOT EXISTS (
             SELECT 1 FROM pg_auth_members WHERE member = principal.oid OR roleid = principal.oid
-        );
+        )
+        AND CASE WHEN b.role = 'worker' THEN
+            recorded_worker_registration_matches(
+                registration, expected->'snapshot', b.instance, b.boot, cutoff
+            )
+        ELSE o.worker_id IS NULL END;
 
     SELECT jsonb_build_object('instance', b.instance, 'boot', b.boot, 'role', b.role,
         'required_mask', b.required_mask) INTO caller
@@ -169,18 +211,20 @@ BEGIN
     WHERE b.rollout = active.generation AND b.reporter = session_user;
 
     RETURN jsonb_build_object('expected', expected, 'observations', observations, 'now', cutoff,
-        'revision', active.revision, 'caller', caller);
+        'revision', active.revision, 'caller', caller, 'worker_targets', worker_targets);
 END $read$;
 
 REVOKE ALL ON FUNCTION bind_recorded_consumer(UUID, UUID, UUID, NAME),
-    report_recorded_consumer(JSONB, UUID, UUID, INTEGER), current_recorded_consumer_evidence() FROM PUBLIC;
+    report_recorded_consumer(JSONB, UUID, UUID, INTEGER, BIGINT), current_recorded_consumer_evidence(),
+    recorded_worker_registration_matches(worker, JSONB, UUID, UUID, TIMESTAMPTZ) FROM PUBLIC;
 
 DO $path$
 DECLARE signature TEXT;
 BEGIN
     FOREACH signature IN ARRAY ARRAY[
         'bind_recorded_consumer(UUID, UUID, UUID, NAME)',
-        'report_recorded_consumer(JSONB, UUID, UUID, INTEGER)',
+        'report_recorded_consumer(JSONB, UUID, UUID, INTEGER, BIGINT)',
+        'recorded_worker_registration_matches(worker, JSONB, UUID, UUID, TIMESTAMPTZ)',
         'current_recorded_consumer_evidence()'
     ] LOOP
         EXECUTE format('ALTER FUNCTION %s SET search_path TO pg_catalog, %I, pg_temp',
@@ -203,7 +247,8 @@ BEGIN
         CROSS JOIN LATERAL aclexplode(COALESCE(procedure.proacl, acldefault('f', procedure.proowner))) AS acl
         WHERE procedure.oid IN (
             'bind_recorded_consumer(UUID, UUID, UUID, NAME)'::REGPROCEDURE,
-            'report_recorded_consumer(JSONB, UUID, UUID, INTEGER)'::REGPROCEDURE,
+            'report_recorded_consumer(JSONB, UUID, UUID, INTEGER, BIGINT)'::REGPROCEDURE,
+            'recorded_worker_registration_matches(worker, JSONB, UUID, UUID, TIMESTAMPTZ)'::REGPROCEDURE,
             'current_recorded_consumer_evidence()'::REGPROCEDURE
         ) AND acl.grantee <> procedure.proowner
     ) THEN
