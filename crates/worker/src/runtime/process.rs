@@ -94,6 +94,18 @@ fn runtime_setup_error(stage: &str, exit_code: i32, stderr: &[u8]) -> RuntimeErr
     ))
 }
 
+fn log_runtime_ready(runtime_name: &str, binary: &str, stdout: &[u8], stderr: &[u8]) {
+    // Version commands receive the selected child baseline. Do not copy their
+    // output into service logs because a tool may echo passthrough credentials.
+    info!(
+        runtime = runtime_name,
+        executable = binary,
+        stdout_bytes = stdout.len(),
+        stderr_bytes = stderr.len(),
+        "Process runtime ready"
+    );
+}
+
 fn configure_setup_command(
     command: &mut Command,
     pack_dir: &Path,
@@ -1472,18 +1484,7 @@ impl Runtime for ProcessRuntime {
         match result {
             Ok(output) => {
                 if output.status.success() {
-                    let version = String::from_utf8_lossy(&output.stdout);
-                    let stderr_version = String::from_utf8_lossy(&output.stderr);
-                    // Some interpreters print version to stderr (e.g., Python on some systems)
-                    let version_str = if version.trim().is_empty() {
-                        stderr_version.trim().to_string()
-                    } else {
-                        version.trim().to_string()
-                    };
-                    info!(
-                        "ProcessRuntime '{}' ready: {} ({})",
-                        self.runtime_name, binary, version_str
-                    );
+                    log_runtime_ready(&self.runtime_name, binary, &output.stdout, &output.stderr);
                 } else {
                     warn!(
                         "Interpreter '{}' for runtime '{}' returned non-zero exit code \
@@ -2380,6 +2381,88 @@ mod tests {
         assert!(!formatted.contains("argument-secret"));
         assert!(!formatted.contains("environment-secret"));
         assert!(!formatted.contains("visible-value"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_ready_log_excludes_version_command_output() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct TestLogWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for TestLogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("log buffer lock")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestLogWriter {
+            type Writer = Self;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let writer = TestLogWriter::default();
+        let buffer = writer.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(writer)
+            .finish();
+        let secret = "owned-dummy-version-secret";
+        let root = TempDir::new().unwrap();
+        let executable = root.path().join("runtime-version-probe");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf %s \"$OWNED_VERSION_PASSTHROUGH\"\nprintf %s \"$OWNED_VERSION_PASSTHROUGH\" >&2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let variable = "OWNED_VERSION_PASSTHROUGH".to_string();
+        let environment =
+            attune_common::child_process_environment::ChildProcessEnvironment::from_parent(
+                [(
+                    std::ffi::OsString::from(&variable),
+                    std::ffi::OsString::from(secret),
+                )],
+                std::slice::from_ref(&variable),
+            )
+            .unwrap();
+        let mut config = make_shell_config();
+        config.interpreter.binary = executable.to_string_lossy().into_owned();
+        let runtime = ProcessRuntime::new(
+            "fixture".to_string(),
+            config,
+            root.path().to_path_buf(),
+            root.path().join("runtime-envs"),
+        )
+        .with_child_environment(environment);
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let guard = tracing::dispatcher::set_default(&dispatch);
+
+        runtime.setup().await.unwrap();
+
+        drop(guard);
+        let bytes = buffer.lock().expect("log buffer lock").clone();
+        let log = String::from_utf8(bytes).expect("info log should be UTF-8");
+        assert!(log.contains("runtime=\"fixture\""));
+        assert!(log.contains("stdout_bytes=26"));
+        assert!(log.contains("stderr_bytes=26"));
+        assert!(!log.contains(secret));
     }
 
     #[test]

@@ -458,18 +458,24 @@ async fn run_verification_command(
             .map_err(|e| format!("Invalid verification pattern '{}': {}", pattern, e))?;
 
         if !re.is_match(&combined) {
-            debug!(
-                "Pattern '{}' did not match output of '{}': stdout='{}', stderr='{}'",
-                pattern,
-                cmd.binary,
-                stdout.trim(),
-                stderr.trim(),
-            );
+            log_verification_pattern_mismatch(cmd, &result.stdout, &result.stderr);
             return Ok(false);
         }
     }
 
     Ok(true)
+}
+
+fn log_verification_pattern_mismatch(cmd: &VerificationCommand, stdout: &[u8], stderr: &[u8]) {
+    // The selected child baseline can contain purpose-bounded operator
+    // passthrough values. A probe may echo them, so retain only output sizes.
+    debug!(
+        binary = %cmd.binary,
+        pattern = cmd.pattern.as_deref().unwrap_or_default(),
+        stdout_bytes = stdout.len(),
+        stderr_bytes = stderr.len(),
+        "Verification output did not match expected pattern"
+    );
 }
 
 /// Basic binary availability check: run `binary --version` and check for exit 0.
@@ -507,6 +513,33 @@ async fn run_basic_binary_check(binary: &str, child_environment: &ChildProcessEn
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct TestLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TestLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestLogWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     #[test]
     fn test_extract_verification_commands_full() {
@@ -631,6 +664,53 @@ mod tests {
         };
         let result = run_verification_command(&cmd, &Default::default()).await;
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn verification_mismatch_log_excludes_child_output() {
+        let variable = "OWNED_VERIFY_PASSTHROUGH".to_string();
+        let secret = "owned-dummy-passthrough-secret";
+        let environment = ChildProcessEnvironment::from_parent(
+            [(
+                std::ffi::OsString::from(&variable),
+                std::ffi::OsString::from(secret),
+            )],
+            std::slice::from_ref(&variable),
+        )
+        .unwrap();
+        let cmd = VerificationCommand {
+            binary: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "printf %s \"$OWNED_VERIFY_PASSTHROUGH\"; printf %s \"$OWNED_VERIFY_PASSTHROUGH\" >&2"
+                    .to_string(),
+            ],
+            expected_exit_code: 0,
+            pattern: Some("expected-version".to_string()),
+            priority: 1,
+        };
+        let writer = TestLogWriter::default();
+        let buffer = writer.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(writer)
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let guard = tracing::dispatcher::set_default(&dispatch);
+
+        assert!(!run_verification_command(&cmd, &environment).await.unwrap());
+
+        drop(guard);
+        let bytes = buffer.lock().expect("log buffer lock").clone();
+        let log = String::from_utf8(bytes).expect("debug log should be UTF-8");
+
+        assert!(log.contains("binary=/bin/sh"));
+        assert!(log.contains("stdout_bytes=30"));
+        assert!(log.contains("stderr_bytes=30"));
+        assert!(!log.contains(secret));
     }
 
     fn make_version(runtime_ref: &str, version: &str, available: bool) -> RuntimeVersion {
