@@ -26,6 +26,8 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 
 mod helpers;
+#[path = "execution_token_permissions_e2e/invocation_capability.rs"]
+mod invocation_capability;
 #[path = "execution_token_permissions_e2e/transactional_delegation.rs"]
 mod transactional_delegation;
 use helpers::{activate_test_pack_release_with_projections, TestContext};
@@ -1551,7 +1553,29 @@ async fn workflow_task_standard_access_includes_workflow_action_scope() -> TResu
     let workflow_action_key_ref = format!("action.{}.runtime_override", workflow_action.r#ref);
     let sql_action_key_ref = format!("action.{}.driver_config", sql_action.r#ref);
     let unrelated_key_ref = format!("pack.{}.secret", unrelated_pack.r#ref);
-    create_plain_key_for_pack(&ctx.pool, &workflow_pack, &workflow_pack_key_ref).await?;
+    // A provider child must receive business-owned encrypted credentials through
+    // its real immediate workflow scope, without giving the sponsor Key grants.
+    let business_credential = KeyRepository::create_encrypted_in_pool(
+        &ctx.pool,
+        CreateKeyInput {
+            local_ref: "db_credentials".into(),
+            owner_type: OwnerType::Pack,
+            owner_identity: None,
+            owner_pack: Some(workflow_pack.id),
+            owner_pack_ref: Some(workflow_pack.r#ref.clone()),
+            owner_action: None,
+            owner_action_ref: None,
+            owner_sensor: None,
+            owner_sensor_ref: None,
+            name: "Business database credential".into(),
+            encrypted: true,
+            encryption_key_hash: None,
+            value: json!({"token": "business-owned-dummy-secret"}),
+        },
+        ctx.state.config.security.encryption_key.as_deref().unwrap(),
+    )
+    .await?;
+    assert_eq!(business_credential.r#ref, workflow_pack_key_ref);
     create_plain_key_for_action(&ctx.pool, &workflow_action, &workflow_action_key_ref).await?;
     create_plain_key_for_action(&ctx.pool, &sql_action, &sql_action_key_ref).await?;
     create_plain_key_for_pack(&ctx.pool, &unrelated_pack, &unrelated_key_ref).await?;
@@ -1725,6 +1749,32 @@ async fn workflow_task_standard_access_includes_workflow_action_scope() -> TResu
             key_ref
         );
     }
+
+    let business_value: Value = ctx
+        .get(
+            &format!("/api/v1/keys/{workflow_pack_key_ref}"),
+            Some(&token),
+        )
+        .await?
+        .json()
+        .await?;
+    assert_eq!(
+        business_value["data"]["value"],
+        json!({"token":"business-owned-dummy-secret"})
+    );
+    let access = attune_common::auth::jwt::generate_access_token(
+        identity.id,
+        &identity.login,
+        &jwt_config(),
+    )?;
+    let direct = ctx
+        .get(
+            &format!("/api/v1/keys/{workflow_pack_key_ref}"),
+            Some(&access),
+        )
+        .await?;
+    assert_ne!(direct.status(), StatusCode::OK);
+    assert!(!direct.text().await?.contains("business-owned-dummy-secret"));
 
     assert_eq!(
         ctx.get(&format!("/api/v1/keys/{}", unrelated_key_ref), Some(&token))

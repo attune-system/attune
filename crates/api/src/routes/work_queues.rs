@@ -1662,22 +1662,18 @@ async fn queue_payload_editors(
     match user.claims.token_type {
         TokenType::Access => {}
         TokenType::Execution => {
-            let metadata = user.claims.metadata.as_ref().ok_or_else(|| {
-                ApiError::Unauthorized("Missing originating execution metadata".into())
-            })?;
-            let origin = user
-                .execution_id()
-                .ok_or_else(|| ApiError::Unauthorized("Missing originating execution".into()))?;
-            let action = metadata
-                .get("action_ref")
-                .and_then(JsonValue::as_str)
-                .ok_or_else(|| ApiError::Unauthorized("Missing originating action".into()))?;
-            let refs: Vec<String> =
-                serde_json::from_value(metadata.get("permission_set_refs").cloned().ok_or_else(
-                    || ApiError::Unauthorized("Missing originating selection".into()),
-                )?)
-                .map_err(|_| ApiError::Unauthorized("Invalid originating selection".into()))?;
-            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::validate_legacy_origin(connection, origin, identity, action, &refs).await?;
+            // Retain the active attempt and the selected credential ceiling.
+            // The sponsor's wider IAM authority is not the editing source.
+            let (snapshot, _) =
+                crate::authz::AuthorizationService::retain_legacy_execution_snapshot_on(
+                    connection, user,
+                )
+                .await?;
+            return Ok(vec![attune_common::delegation::DelegationAuthority::new(
+                snapshot.identity_id,
+                snapshot.identity_attributes,
+                snapshot.grants,
+            )]);
         }
         _ => {
             return Err(ApiError::Forbidden(
@@ -1908,6 +1904,39 @@ async fn enqueue_queue_item_in_transaction(
         )
         .await?
     };
+    if queue.is_adhoc && snapshot.executable.action.is_adhoc && !recorded_ad_hoc {
+        // Accepting ad hoc work sponsors a target invocation. Enqueue permission
+        // and permission-ref containment do not themselves grant Execute.
+        let identity = requested_by_identity
+            .ok_or_else(|| ApiError::Unauthorized("Item requester unavailable".into()))?;
+        let action = &snapshot.executable.action;
+        let mut context = AuthorizationContext::new(identity);
+        context.target_id = Some(action.id);
+        context.target_ref = Some(action.r#ref.clone());
+        context.pack_ref = Some(action.pack_ref.clone());
+        if user.claims.token_type == TokenType::Access {
+            state
+                .authorization_service()
+                .authorize_access_fresh(
+                    connection,
+                    user,
+                    AuthorizationCheck {
+                        resource: Resource::Actions,
+                        action: RbacAction::Execute,
+                        context,
+                    },
+                )
+                .await?;
+        } else if payload_editors.is_empty()
+            || !payload_editors.iter().all(|authority| {
+                authority.allows(Resource::Actions, RbacAction::Execute, context.clone())
+            })
+        {
+            return Err(ApiError::Forbidden(
+                "Ad hoc queue target Execute denied".into(),
+            ));
+        }
+    }
     let human_ad_hoc = queue.is_adhoc
         && !snapshot.executable.action.is_adhoc
         && user.claims.token_type == TokenType::Access;
@@ -2874,8 +2903,20 @@ fn execution_read_allowed_for_grants(
 }
 
 fn requester_identity_id(user: &AuthenticatedUser) -> Result<Option<i64>, ApiError> {
-    if user.claims.token_type != TokenType::Access {
+    if !matches!(
+        user.claims.token_type,
+        TokenType::Access | TokenType::Execution
+    ) {
         return Ok(None);
+    }
+    // Execution subjects are verified by middleware and retained again with the
+    // source attempt/selection in the enqueue transaction. Keep that attribution;
+    // never substitute a queue owner or an ambient service identity.
+    if user.claims.token_type == TokenType::Execution
+        && (user.execution_id().is_none_or(|id| id <= 0)
+            || user.identity_id().map_or(true, |id| id <= 0))
+    {
+        return Err(ApiError::Unauthorized("Invalid execution requester".into()));
     }
 
     user.identity_id()
