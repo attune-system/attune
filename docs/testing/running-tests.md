@@ -283,6 +283,37 @@ Verify snapshot hashes against the worktree, retain run evidence, and remove onl
 that snapshot and its owned test resources. Do not change Docker preferences
 automatically. A startup mount failure is not a test failure or a passing run.
 
+## Managed-queue acceptance on owned services
+
+Run the host acceptance lane with exact-source API, executor, worker and notifier
+binaries and disposable PostgreSQL and RabbitMQ instances. Give RabbitMQ a
+dedicated empty vhost and test login. The PostgreSQL DBA connection must be able
+to create and drop the fixture's uniquely named database and roles. The runner
+starts the four services, installs the candidate observation transport in its
+fresh database, verifies the SQLx ledger, and stages and activates an exact
+generation through the offline receipt functions. Runtime logins are distinct
+and use an explicit test grant set. Each service must publish its own observation
+before any positive queue case runs.
+
+In a Python 3.11+ environment, install `tests/requirements.txt` and `argon2-cffi`.
+Load `TEST_DB_ADMIN_URL` and `ATTUNE_TEST_RABBITMQ_URL` from the disposable
+services' private test configuration. Use a private evidence directory.
+
+```bash
+cargo build -p attune-api -p attune-executor -p attune-worker -p attune-notifier \
+  --bin attune-api --bin attune-executor --bin attune-worker --bin attune-notifier \
+  --profile test -j4
+python scripts/run-managed-queue-e2e.py --binaries target/debug --evidence-dir "$OWNED_EVIDENCE_DIR"
+```
+
+The lane covers pack publication through worker and native workflow
+acknowledgement, business-owned encrypted input with enqueue-only contributors,
+and the existing ad hoc path. It then stops its notifier and checks that both
+single and bulk submissions are rejected without committed work. The runner
+joins its processes and verifies removal of its exact database and roles. The
+test result establishes host behavior with the explicit role-separated fixture.
+Compose and Kubernetes deployment profiles require their own validation.
+
 ## Delegated execution authority acceptance
 
 Build production service binaries, then run the owned system-Key scenario:
