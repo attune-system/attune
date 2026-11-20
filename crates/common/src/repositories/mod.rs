@@ -111,6 +111,7 @@ pub mod queue_stats;
 pub mod reclamation_cancellation;
 pub mod recorded_input_authority;
 pub mod recorded_input_origins;
+pub mod recorded_rollout;
 pub mod requested_execution_publication;
 pub mod retention;
 pub mod rule;

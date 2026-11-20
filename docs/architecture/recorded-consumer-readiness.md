@@ -58,13 +58,13 @@ The current catalog cannot identify an expected service rollout.
 `platform_catalog_state` stores only `singleton`, `compatibility_epoch` and
 `revision`; pack-release and publication descriptors identify pack content, not
 API/notifier/executor replicas or their expected boots/generation. Worker rows
-cover Action/Sensor hosts only. Production aggregate readiness therefore remains
-unresolved until an authoritative rollout-membership source is separately agreed.
+cover Action/Sensor hosts only. The operator-owned PostgreSQL foundation below records expected membership;
+production aggregation still has no deployed membership writer or service integration.
 
 The pure `execution_authority::consumer_contract` protocol models role-local
 descriptors and validates them against an explicit expected membership. It has
-no production caller, transport, advertisement, readiness conversion or membership
-repository. Its checked snapshot is not authority evidence. One health response,
+no production caller, transport, advertisement or readiness conversion. The
+operator repository below is a foundation, not service registration or readiness. Its checked snapshot is not authority evidence. One health response,
 an empty expected set, or support claimed by another role cannot satisfy it.
 
 Actions and sensors are trusted, inspected, approved cooperative workloads.
@@ -147,3 +147,48 @@ Positive restoration evidence requires real publication/admission through
 terminal item acknowledgement, including mixed enqueue-only contributors,
 configuration changes, revocation, protected output and existing ad hoc queues.
 A successful repository fixture, enqueue response or build is insufficient.
+
+## Operator-owned membership foundation (not activated)
+
+Forward migration `20261119000007` adds append-only staged deployment generations
+and a separate singleton active pointer. This state is independent of platform
+catalog state, pack releases, authority grants and retained receipts. Stage does
+not activate. Members may repeat a service role for replicas, but instance and
+boot UUIDs must each be unique. Each member asserts its role's complete fixed
+mask; overlapping masks remain conjunctive in the pure validator. Canonical
+stored JSON and a database-generated SHA-256 digest retain the exact expected
+set. The active pointer has a monotonically incremented revision and records the
+activating session user, backend PID and database time. Activation locks that
+pointer, compares its prior ID/revision, and revalidates the exact staged digest.
+
+The boot model is **exact preassigned boots**. The offline deployment owner must
+assign or collect every expected boot before staging/activation. Every process
+restart/replacement requires a newly staged authoritative generation. Observed
+services cannot approve new boots, change expected membership or elect themselves.
+If this model is operationally unacceptable, redesign must precede integration;
+observations cannot silently become the membership authority.
+
+`RecordedRolloutRepository` supplies stage/load/active/activate seams only. The
+mutation functions require exact direct `session_user` membership in the
+separately DBA-created NOLOGIN role named by
+`recorded_rollout_operator_role()`. Its installation-specific random name is
+metadata, not a role grant. Migration creates
+no roles or membership grants. The DBA must separately grant function EXECUTE
+and read access to the offline deployment login; runtime logins receive no
+mutation grants or operator membership. Inherited membership and `SET ROLE` do
+not satisfy the direct-session check. SECURITY DEFINER functions use a fixed
+migration-selected installation schema plus `pg_catalog`; temporary schemas are explicitly searched last. That schema must be
+DBA-owned and unavailable for service CREATE. Migration rejects installation CREATE ACL grants beyond the schema owner.
+Runtime logins must not be database
+owners/superusers or have schema/trigger/function replacement privileges. A DBA
+can always change database enforcement; this boundary does not constrain DBAs.
+
+Writer inventory: SQLx migration setup owns schema installation; platform catalog
+reconciliation owns catalog definitions; the offline encryption conversion tool
+owns a distinct maintenance capability. None supplies a reviewed deployment
+membership stage/activate command. The future offline operator/deployment caller,
+its credential provisioning and deployment sequencing remain integration gaps.
+There is no HTTP/MQ mutation route, service caller, observation transport,
+scheduler/admission binding or readiness conversion in this foundation. An active
+expected set alone supplies none of the seven consumer proofs. Retained work does
+not require continued membership residency.
