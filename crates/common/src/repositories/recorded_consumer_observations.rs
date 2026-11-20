@@ -23,9 +23,141 @@ struct DatabaseEvidence {
     revision: i64,
 }
 
+/// Operator-supplied identity for this process boot. The database pool's
+/// authenticated login must have been bound to the same identity.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedConsumerIdentity {
+    snapshot: ContractSnapshot,
+    instance: Uuid,
+    boot: Uuid,
+}
+
+impl RecordedConsumerIdentity {
+    pub fn from_environment() -> Result<Option<Self>> {
+        let Some(path) = std::env::var_os("ATTUNE_RECORDED_CONSUMER_IDENTITY_FILE") else {
+            return Ok(None);
+        };
+        let denied = || Error::validation("Invalid recorded consumer identity file");
+        let body =
+            crate::rollout_offline::read_private_with(std::path::Path::new(&path), 4096, || {})
+                .map_err(|_| denied())?;
+        let identity: Self = serde_json::from_slice(&body).map_err(|_| denied())?;
+        let snapshot = &identity.snapshot;
+        if snapshot.contract_version
+            != crate::execution_authority::consumer_contract::CONTRACT_VERSION
+            || snapshot.catalog_epoch != crate::platform_catalog::COMPATIBILITY_EPOCH
+            || snapshot.catalog_revision != crate::platform_catalog::CATALOG_REVISION
+            || snapshot.rollout_generation.is_nil()
+            || identity.instance.is_nil()
+            || identity.boot.is_nil()
+            || snapshot.release_digest.len() != 64
+            || !snapshot
+                .release_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(denied());
+        }
+        Ok(Some(identity))
+    }
+
+    pub async fn publish(
+        &self,
+        connection: &mut PgConnection,
+        ready_role: Option<ConsumerRole>,
+    ) -> Result<()> {
+        RecordedConsumerObservations::report(
+            connection,
+            &self.snapshot,
+            self.instance,
+            self.boot,
+            ready_role,
+        )
+        .await
+    }
+}
+
 pub struct RecordedConsumerObservations;
 
 impl RecordedConsumerObservations {
+    /// Check the database access used by the notifier's recorded source and
+    /// target fences before renewing its observation. PostgreSQL row locks
+    /// require UPDATE on at least one column even when the query is a read.
+    pub async fn notifier_access_available(connection: &mut PgConnection) -> Result<bool> {
+        let reads = [
+            "artifact_version",
+            "recorded_execution_input_authority",
+            "recorded_queue_execution_input",
+            "recorded_queue_item_input",
+            "runtime",
+            "runtime_accepted_batch_item",
+            "runtime_accepted_batch_manifest",
+            "runtime_input_only_approval",
+            "runtime_standard_owner_binding",
+            "runtime_version",
+            "work_queue_item_ad_hoc_dispatch",
+            "work_queue_item_runtime_admission",
+            "workflow_definition",
+        ];
+        let locked_reads = [
+            "action",
+            "artifact",
+            "artifact_runtime_owner_binding",
+            "enforcement",
+            "event",
+            "execution",
+            "identity",
+            "managed_executable_metadata_revision",
+            "pack",
+            "pack_release",
+            "pack_release_executable",
+            "pack_runtime_identity",
+            "pack_runtime_policy_revision",
+            "rule",
+            "runtime_admission_dependency",
+            "runtime_authority_admission",
+            "runtime_authority_execution_fence",
+            "runtime_external_approval",
+            "runtime_workflow_policy_dependency",
+            "sensor",
+            "trigger",
+            "work_queue",
+            "work_queue_item",
+        ];
+        let access = sqlx::query_scalar(
+            "SELECT NOT EXISTS (
+                SELECT 1
+                FROM (
+                    SELECT to_regclass(name) AS relation, FALSE AS locks FROM unnest($1::text[]) name
+                    UNION ALL
+                    SELECT to_regclass(name) AS relation, TRUE AS locks FROM unnest($2::text[]) name
+                ) AS required
+                WHERE required.relation IS NULL
+                    OR NOT has_table_privilege(current_user, required.relation, 'SELECT')
+                    OR required.locks AND NOT has_any_column_privilege(
+                        current_user, required.relation, 'UPDATE'
+                    )
+            )
+            AND COALESCE((
+                SELECT has_any_column_privilege(current_user, relation, 'UPDATE')
+                FROM (SELECT to_regclass('work_queue_item_configuration_input') AS relation) input
+                WHERE relation IS NOT NULL
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM unnest(ARRAY['id', 'item', 'policy_revision', 'configuration_revision',
+                            'binding', 'binding_digest', 'source_receipts']) AS column_name
+                        WHERE NOT has_column_privilege(current_user, relation, column_name, 'SELECT')
+                    )
+            ), FALSE)",
+        )
+        .bind(&reads[..])
+        .bind(&locked_reads[..])
+        .fetch_one(connection)
+        .await?;
+        Ok(access)
+    }
+
     /// Use the member's dedicated login. Supplying the expected identity also
     /// prevents a service initialized with the wrong credentials from refreshing
     /// a different replica of the same role.

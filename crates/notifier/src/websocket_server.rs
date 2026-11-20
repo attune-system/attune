@@ -135,6 +135,10 @@ impl WebSocketServer {
 
     /// Start the WebSocket server
     pub async fn start(&self) -> Result<()> {
+        self.start_with_bound(|| {}).await
+    }
+
+    pub(crate) async fn start_with_bound(&self, on_bound: impl FnOnce()) -> Result<()> {
         let app = self.router();
 
         let notifier_config = self
@@ -148,6 +152,7 @@ impl WebSocketServer {
             .await
             .context(format!("Failed to bind to {}", addr))?;
 
+        on_bound();
         info!("WebSocket server listening on {}", addr);
 
         let shutdown = self.shutdown.clone();

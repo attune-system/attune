@@ -43,7 +43,11 @@ fn identifier(s: &str) -> bool {
 fn private_metadata(m: &std::fs::Metadata, uid: u32, max: u64) -> bool {
     m.is_file() && m.mode() & 0o7777 == 0o600 && m.uid() == uid && m.nlink() == 1 && m.len() <= max
 }
-fn read_private_with(path: &Path, max: u64, opened: impl FnOnce()) -> SafeResult<Vec<u8>> {
+pub(crate) fn read_private_with(
+    path: &Path,
+    max: u64,
+    opened: impl FnOnce(),
+) -> SafeResult<Vec<u8>> {
     #[cfg(not(unix))]
     {
         let _ = (path, max, opened);

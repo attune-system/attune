@@ -72,7 +72,7 @@ async fn main() -> Result<()> {
         result = tokio::signal::ctrl_c() => {
             result?;
             info!("Received shutdown signal");
-            service.shutdown().await?;
+            service.request_shutdown();
             service_task.await?;
         }
     }

@@ -63,7 +63,7 @@ production aggregation still has no deployed membership writer or service integr
 
 The `execution_authority::consumer_contract` protocol models role-local
 descriptors and validates them against an explicit expected membership.
-Service startup and readiness conversion still need wiring. One health
+The remaining service publishers and readiness conversion still need wiring. One health
 response, an empty expected set, or support claimed by another role cannot
 satisfy the contract.
 
@@ -82,8 +82,8 @@ existing PostgreSQL installation. The candidate is outside the migration ledger.
   snapshot, instance, boot, and required role mask. The server assigns the
   observation time. A report can renew only its own row, and the same login
   can withdraw that row. The 30-second window bounds evidence from a dead
-  process. Startup code still needs to establish the local consumer prerequisites
-  before publishing.
+  process. Startup code establishes the local consumer prerequisites before
+  publishing.
 - The DBA grants the admission and dispatch roles only execution of the evidence
   reader for this transport. It returns observations from the active rollout
   and current catalog, using a single database clock sample. The repository runs
@@ -94,6 +94,22 @@ existing PostgreSQL installation. The candidate is outside the migration ledger.
   and reporter login identity relies on `session_user` plus the exact catalog
   role identity. Runtime evidence cannot stage or activate a rollout. A valid
   observation carries no execution grant or permission to access protected data.
+
+The notifier takes its boot identity from the optional
+`ATTUNE_RECORDED_CONSUMER_IDENTITY_FILE`. The private file belongs to the
+service user, uses mode `0600`, and contains the exact staged `snapshot`,
+`instance`, and `boot` JSON fields. The notifier connection uses the dedicated
+login associated with that boot. A configured JWT secret, acknowledged
+PostgreSQL subscriptions, a bound WebSocket listener, and database access
+for the notifier's recorded authorization reads and locks are required before
+it reports. The notifier checks access again at each renewal. With reporting
+configured, it checks the dedicated LISTEN connection every five idle seconds.
+It withdraws its report at the next reporting check if the listener is
+disconnected, and attempts withdrawal during supervised shutdown. If
+connectivity is lost, the database lease expires. Service startup without
+this identity keeps the existing listener interval. API, executor, and
+worker publication still need wiring before the aggregate can authorize new
+work.
 
 Actions and sensors are trusted, inspected, approved cooperative workloads.
 Hostile sibling-process containment and candidate process isolation are not

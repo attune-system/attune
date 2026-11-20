@@ -2,7 +2,10 @@
 
 use anyhow::{Context, Result};
 use sqlx::postgres::PgPoolOptions;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::task::JoinSet;
@@ -11,6 +14,10 @@ use tracing::{debug, error, info};
 
 use attune_common::config::Config;
 use attune_common::db::ConnectionIdentity;
+use attune_common::execution_authority::consumer_contract::ConsumerRole;
+use attune_common::repositories::recorded_consumer_observations::{
+    RecordedConsumerIdentity, RecordedConsumerObservations,
+};
 
 use crate::postgres_listener::PostgresListener;
 use crate::subscriber_manager::SubscriberManager;
@@ -46,12 +53,23 @@ pub struct NotifierService {
     websocket_server: WebSocketServer,
     shutdown: CancellationToken,
     db_pool: sqlx::PgPool,
+    observation: Option<RecordedConsumerIdentity>,
 }
 
 impl NotifierService {
     /// Create a new notifier service
     pub async fn new(config: Config) -> Result<Self> {
         info!("Initializing Notifier Service");
+        let observation = RecordedConsumerIdentity::from_environment()?;
+        if observation.is_some()
+            && config
+                .security
+                .jwt_secret
+                .as_deref()
+                .is_none_or(|secret| secret.trim().is_empty())
+        {
+            anyhow::bail!("Recorded notifier observations require an explicit JWT secret");
+        }
 
         let shutdown = CancellationToken::new();
 
@@ -104,6 +122,7 @@ impl NotifierService {
             websocket_server,
             shutdown,
             db_pool,
+            observation,
         })
     }
 
@@ -113,18 +132,34 @@ impl NotifierService {
 
         // Start PostgreSQL listener
         let mut tasks = JoinSet::new();
+        let listener_ready = Arc::new(AtomicBool::new(false));
+        let websocket_ready = Arc::new(AtomicBool::new(false));
 
         {
             let listener = self.postgres_listener.clone();
             let shutdown = self.shutdown.clone();
+            let readiness = listener_ready.clone();
+            let observe = self.observation.is_some();
             tasks.spawn(async move {
+                let listen = async {
+                    if observe {
+                        listener
+                            .listen_with_health(Duration::from_secs(5), |ready| {
+                                readiness.store(ready, Ordering::Release);
+                            })
+                            .await
+                    } else {
+                        listener.listen().await
+                    }
+                };
                 let result = tokio::select! {
-                    result = listener.listen() => result,
+                    result = listen => result,
                     _ = shutdown.cancelled() => {
                         info!("PostgreSQL listener shutting down");
                         Ok(())
                     }
                 };
+                readiness.store(false, Ordering::Release);
                 ("PostgreSQL listener", result)
             });
         }
@@ -178,7 +213,16 @@ impl NotifierService {
         // Start WebSocket server
         {
             let server = self.websocket_server.clone();
-            tasks.spawn(async move { ("WebSocket server", server.start().await) });
+            let readiness = websocket_ready.clone();
+            tasks.spawn(async move {
+                let result = server
+                    .start_with_bound(|| {
+                        readiness.store(true, Ordering::Release);
+                    })
+                    .await;
+                readiness.store(false, Ordering::Release);
+                ("WebSocket server", result)
+            });
         }
 
         let notifier_config = self
@@ -192,7 +236,27 @@ impl NotifierService {
             notifier_config.host, notifier_config.port
         );
 
-        let component_result = match tasks.join_next().await {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut may_have_published = false;
+        let finished = loop {
+            tokio::select! {
+                biased;
+                result = tasks.join_next() => break result,
+                _ = interval.tick(), if self.observation.is_some() => {
+                    let ready = listener_ready.load(Ordering::Acquire)
+                        && websocket_ready.load(Ordering::Acquire)
+                        && !self.shutdown.is_cancelled();
+                    if ready || may_have_published {
+                        may_have_published = true; // A timed-out write may have committed.
+                        if self.publish_observation(ready).await && !ready {
+                            may_have_published = false;
+                        }
+                    }
+                }
+            }
+        };
+        let component_result = match finished {
             Some(Ok((component, Ok(())))) if !self.shutdown.is_cancelled() => {
                 Err(anyhow::anyhow!("{component} stopped unexpectedly"))
             }
@@ -203,11 +267,38 @@ impl NotifierService {
         };
 
         self.shutdown.cancel();
+        if may_have_published {
+            self.publish_observation(false).await;
+        }
         self.subscriber_manager.disconnect_all().await;
         abort_and_join_tasks(&mut tasks).await;
         drain_working_pool(&self.db_pool).await?;
 
         component_result
+    }
+
+    async fn publish_observation(&self, ready: bool) -> bool {
+        let Some(identity) = &self.observation else {
+            return false;
+        };
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut connection = self.db_pool.acquire().await?;
+            let ready = ready
+                && RecordedConsumerObservations::notifier_access_available(&mut connection).await?;
+            identity
+                .publish(&mut connection, ready.then_some(ConsumerRole::Notifier))
+                .await
+        })
+        .await;
+        if !matches!(result, Ok(Ok(()))) {
+            tracing::warn!("Unable to update recorded notifier observation");
+            return false;
+        }
+        true
+    }
+
+    pub fn request_shutdown(&self) {
+        self.shutdown.cancel();
     }
 
     /// Shutdown the notifier service gracefully
