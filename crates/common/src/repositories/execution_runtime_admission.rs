@@ -559,10 +559,7 @@ impl ExecutionAdmissionRepository {
                 queue_ref: queue.r#ref.clone(),
                 items: std::collections::BTreeMap::from([(item.id, actor)]),
             },
-            super::runtime_target::RuntimeTarget::Component(
-                super::runtime_target::ComponentTarget::Queue,
-                queue.id,
-            ),
+            super::runtime_target::RuntimeTarget::QueueAdmission(queue.id),
         )
         .await?;
         let authority = &admission.authority;

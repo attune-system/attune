@@ -2387,6 +2387,22 @@ impl Delete for WorkQueueDispatchRepository {
 }
 
 impl WorkQueueDispatchRepository {
+    /// Broker acknowledgement and lease recovery can race a fast completion.
+    /// Only the caller that advances the lease owns the dispatched transition.
+    pub async fn mark_dispatched_if_leased<'e, E>(executor: E, id: Id) -> Result<bool>
+    where
+        E: Executor<'e, Database = Postgres>,
+    {
+        let result = sqlx::query(
+            "UPDATE work_queue_dispatch SET status='dispatched', updated=NOW() \
+             WHERE id=$1 AND status='leased'",
+        )
+        .bind(id)
+        .execute(executor)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Observe active dispatches without fetching rows that the poller discards.
     /// This is an unlocked count; the dispatcher's admission and lease recovery
     /// protocol remains the caller's responsibility.

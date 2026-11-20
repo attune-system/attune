@@ -94,6 +94,11 @@ impl QueueConfigurationInput {
         }
         self.fence.ensure_fresh_on(conn).await
     }
+
+    /// Retain the edit's effect fence without keeping restored input bytes.
+    pub fn into_effect_fence(self) -> super::runtime_authority::ApprovalEffectFence {
+        self.fence
+    }
     pub(in crate::repositories) fn source_receipts(&self) -> &[Id] {
         &self.sealed.binding.source_receipts
     }

@@ -335,6 +335,7 @@ impl AcceptedInputRepository {
         if !original {
             return Err(denied());
         }
+        validate_inherited_queue_contributors(conn, &record, &body, encryption_key).await?;
         let mut authorities =
             super::execution_runtime_admission::ExecutionAdmissionRepository::input_authorities(
                 conn, execution, None,
@@ -958,12 +959,13 @@ async fn contributors(
             .await?;
     let authority: crate::runtime_authority::SelectedRuntimeAuthority =
         serde_json::from_value(authority)?;
-    let items = if let crate::runtime_authority::RequestAttribution::QueueBatch { items, .. } =
-        authority.attribution
-    {
-        items.keys().copied().collect::<Vec<_>>()
-    } else {
-        vec![]
+    use crate::runtime_authority::RequestAttribution;
+    let (items, inherited) = match authority.attribution {
+        RequestAttribution::QueueBatch { items, .. } => {
+            (items.keys().copied().collect::<Vec<_>>(), false)
+        }
+        RequestAttribution::ParentExecution { .. } => (vec![], true),
+        _ => (vec![], false),
     };
     let missing = items
         .iter()
@@ -978,7 +980,7 @@ async fn contributors(
     {
         return Err(denied());
     }
-    if items.is_empty() && rows.iter().any(|row| row.0 == "queue") {
+    if items.is_empty() && !inherited && rows.iter().any(|row| row.0 == "queue") {
         return Err(denied());
     }
     if items.is_empty() && rows.is_empty() {
@@ -1015,6 +1017,57 @@ async fn contributors(
         return Err(denied());
     }
     Ok(result)
+}
+
+/// A workflow child seals the original contributors of its exact parent.
+/// Subsequent use checks the child's authenticated seal and the retained
+/// admission lineage, independently of the parent's mutable execution row.
+async fn validate_inherited_queue_contributors(
+    conn: &mut PgConnection,
+    record: &RuntimeAdmissionRecord,
+    body: &Body,
+    key: &str,
+) -> Result<()> {
+    let crate::runtime_authority::RequestAttribution::ParentExecution {
+        execution_id: parent,
+    } = &record.authority.attribution
+    else {
+        return Ok(());
+    };
+    let inherited: Vec<_> = body
+        .contributors
+        .iter()
+        .filter(|contributor| contributor.kind == "queue")
+        .collect();
+    let parent_record = RuntimeAuthorityRepository::execution_admission(conn, *parent)
+        .await?
+        .ok_or_else(denied)?;
+    if let Some((_, original, digest, key_hash)) = saved(conn, parent_record.id).await? {
+        validate_saved(&original, &digest, &key_hash, key)?;
+        let original: Body = serde_json::from_value(original)?;
+        if original.execution == *parent
+            && original.admission == parent_record.id
+            && original
+                .contributors
+                .iter()
+                .filter(|contributor| contributor.kind == "queue")
+                .eq(inherited)
+        {
+            return Ok(());
+        }
+        return Err(denied());
+    }
+    let parent_has_queue: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM recorded_queue_execution_input WHERE execution=$1)",
+    )
+    .bind(parent)
+    .fetch_one(conn)
+    .await?;
+    if inherited.is_empty() && !parent_has_queue {
+        Ok(())
+    } else {
+        Err(denied())
+    }
 }
 fn restore(body: &Body, key: &str) -> Result<Value> {
     let expected = crate::crypto::hash_encryption_key(key);

@@ -1218,6 +1218,12 @@ async fn work_queue_dispatch_repository_tracks_active_and_terminal_dispatches() 
     assert_eq!(filtered.total, 1);
     assert_eq!(filtered.rows[0].id, dispatch.id);
 
+    let (publish, recover) = tokio::join!(
+        WorkQueueDispatchRepository::mark_dispatched_if_leased(&pool, dispatch.id),
+        WorkQueueDispatchRepository::mark_dispatched_if_leased(&pool, dispatch.id),
+    );
+    assert_ne!(publish.unwrap(), recover.unwrap());
+
     let updated = WorkQueueDispatchRepository::update(
         &pool,
         dispatch.id,
@@ -1229,6 +1235,19 @@ async fn work_queue_dispatch_repository_tracks_active_and_terminal_dispatches() 
     .await
     .expect("update dispatch");
     assert_eq!(updated.status, WorkQueueDispatchStatus::Completed);
+    assert!(
+        !WorkQueueDispatchRepository::mark_dispatched_if_leased(&pool, dispatch.id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        WorkQueueDispatchRepository::find_by_execution(&pool, dispatch.execution)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        WorkQueueDispatchStatus::Completed
+    );
 
     let active_after = WorkQueueDispatchRepository::list_active(&pool)
         .await

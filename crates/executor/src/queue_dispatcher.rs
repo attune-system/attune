@@ -237,15 +237,11 @@ impl WorkQueueDispatcher {
                 continue;
             }
 
-            WorkQueueDispatchRepository::update(
-                &self.pool,
-                dispatch.id,
-                UpdateWorkQueueDispatchInput {
-                    status: Some(WorkQueueDispatchStatus::Dispatched),
-                    ..Default::default()
-                },
-            )
-            .await?;
+            if !WorkQueueDispatchRepository::mark_dispatched_if_leased(&self.pool, dispatch.id)
+                .await?
+            {
+                continue;
+            }
 
             if let Some(queue) = WorkQueueRepository::find_by_id(&self.pool, dispatch.queue).await?
             {
@@ -1774,16 +1770,9 @@ impl WorkQueueDispatcher {
             .with_source("executor-queue-dispatcher");
         self.publisher.publish_envelope(&envelope).await?;
 
-        WorkQueueDispatchRepository::update(
-            &self.pool,
-            dispatch.dispatch_id,
-            UpdateWorkQueueDispatchInput {
-                status: Some(WorkQueueDispatchStatus::Dispatched),
-                ..Default::default()
-            },
-        )
-        .await?;
-
+        let advanced =
+            WorkQueueDispatchRepository::mark_dispatched_if_leased(&mut *source, dispatch_id)
+                .await?;
         for receipt in &input_receipts {
             receipt.ensure_fresh_on(&mut source).await?;
         }
@@ -1798,6 +1787,9 @@ impl WorkQueueDispatcher {
             fence.ensure_fresh()?;
         }
 
+        if !advanced {
+            return Ok(());
+        }
         if let Err(error) = work_queue_events::maybe_emit_queue_started(
             &self.pool,
             &self.publisher,
