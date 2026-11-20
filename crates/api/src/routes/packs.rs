@@ -4171,12 +4171,14 @@ pub async fn install_pack(
     // Create temp directory for installations
     let temp_dir = std::env::temp_dir().join("attune-pack-installs");
 
-    let source = detect_pack_source(
+    let source = resolve_pack_source(
+        &state,
+        &user,
         &request.source,
         request.ref_spec.as_deref(),
         !request.no_registry,
-    )?;
-    let source = authorize_local_source_variant(&state, &user, source).await?;
+    )
+    .await?;
     if request.registry_id.is_some()
         && !matches!(
             source,
@@ -4728,44 +4730,64 @@ fn confine_host_pack_paths(state: &AppState, paths: &[String]) -> ApiResult<Vec<
     Ok(approved)
 }
 
-async fn authorize_local_source_variant(
-    state: &AppState,
-    user: &crate::auth::middleware::AuthenticatedUser,
-    source: attune_common::pack_registry::PackSource,
-) -> ApiResult<attune_common::pack_registry::PackSource> {
-    use attune_common::pack_registry::PackSource;
-    Ok(match source {
-        PackSource::LocalDirectory { path } => PackSource::LocalDirectory {
-            path: authorize_local_pack_source(state, user, &path).await?,
-        },
-        PackSource::LocalArchive { path } => PackSource::LocalArchive {
-            path: authorize_local_pack_source(state, user, &path).await?,
-        },
-        remote => remote,
-    })
+#[derive(Debug)]
+enum PackSourceRequest {
+    LocalPath(PathBuf),
+    InstallerSource(attune_common::pack_registry::PackSource),
 }
 
-fn detect_pack_source(
+async fn resolve_pack_source(
+    state: &AppState,
+    user: &crate::auth::middleware::AuthenticatedUser,
     source: &str,
     ref_spec: Option<&str>,
     allow_registry: bool,
-) -> Result<attune_common::pack_registry::PackSource, ApiError> {
+) -> ApiResult<attune_common::pack_registry::PackSource> {
     use attune_common::pack_registry::PackSource;
-    use std::path::Path;
 
-    // Check if it's a URL
+    let path = match classify_pack_source(source, ref_spec, allow_registry)? {
+        PackSourceRequest::InstallerSource(source) => return Ok(source),
+        PackSourceRequest::LocalPath(path) => {
+            authorize_local_pack_source(state, user, &path).await?
+        }
+    };
+
+    let metadata = std::fs::metadata(&path)
+        .map_err(|_| ApiError::BadRequest("Local pack source is unavailable".into()))?;
+    if metadata.is_dir() {
+        Ok(PackSource::LocalDirectory { path })
+    } else if metadata.is_file() {
+        Ok(PackSource::LocalArchive { path })
+    } else {
+        Err(ApiError::BadRequest(
+            "Local pack source must be a directory or regular archive file".into(),
+        ))
+    }
+}
+
+/// Classify the request by syntax. Only an authorized, confined local path
+/// can be inspected to select a local installer.
+fn classify_pack_source(
+    source: &str,
+    ref_spec: Option<&str>,
+    allow_registry: bool,
+) -> ApiResult<PackSourceRequest> {
+    use attune_common::pack_registry::PackSource;
+
     if source.starts_with("http://") || source.starts_with("https://") {
         let url = attune_common::pack_registry::validate_remote_pack_url(source)
             .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-        if url.path().ends_with(".git") || ref_spec.is_some() {
-            return Ok(PackSource::Git {
+        let source = if url.path().ends_with(".git") || ref_spec.is_some() {
+            PackSource::Git {
                 url: url.to_string(),
                 git_ref: ref_spec.map(String::from),
-            });
-        }
-        return Ok(PackSource::Archive {
-            url: url.to_string(),
-        });
+            }
+        } else {
+            PackSource::Archive {
+                url: url.to_string(),
+            }
+        };
+        return Ok(PackSourceRequest::InstallerSource(source));
     }
 
     // Git subprocess transports other than validated HTTP(S) are never allowed.
@@ -4778,41 +4800,44 @@ fn detect_pack_source(
         ));
     }
 
-    // Check if it's a local path
-    let path = Path::new(source);
-    if path.exists() {
-        if path.is_file() {
-            return Ok(PackSource::LocalArchive {
-                path: path.to_path_buf(),
-            });
-        }
-        return Ok(PackSource::LocalDirectory {
-            path: path.to_path_buf(),
-        });
-    }
-
     if source.contains("://") {
         return Err(ApiError::BadRequest(
             "Unsupported remote pack source scheme".to_string(),
         ));
     }
 
+    let path = FsPath::new(source);
+    if path.is_absolute()
+        || source.contains(std::path::is_separator)
+        || matches!(source, "." | "..")
+    {
+        return Ok(PackSourceRequest::LocalPath(path.to_path_buf()));
+    }
+
     if !allow_registry {
         return Err(ApiError::BadRequest(
-            "Source is not an explicit remote URL or existing local path".to_string(),
+            "Use an explicit HTTP(S) URL or API-host path (for example ./pack)".to_string(),
         ));
     }
 
-    // Otherwise assume it's a registry reference
-    // Parse version if present (format: "pack@version" or "pack")
-    let (pack_ref, version) = if let Some(at_pos) = source.find('@') {
-        let (pack, ver) = source.split_at(at_pos);
-        (pack.to_string(), Some(ver[1..].to_string()))
-    } else {
-        (source.to_string(), None)
-    };
+    let (pack_ref, version) = source
+        .split_once('@')
+        .map_or((source, None), |(pack, version)| (pack, Some(version)));
+    if attune_common::schema::RefValidator::validate_pack_ref(pack_ref).is_err()
+        || version.is_some_and(|version| {
+            version.is_empty() || version.contains('@') || version.chars().any(char::is_whitespace)
+        })
+    {
+        return Err(ApiError::BadRequest(
+            "Use a registry pack reference, HTTP(S) URL, or explicit API-host path (for example ./pack)"
+                .to_string(),
+        ));
+    }
 
-    Ok(PackSource::Registry { pack_ref, version })
+    Ok(PackSourceRequest::InstallerSource(PackSource::Registry {
+        pack_ref: pack_ref.to_string(),
+        version: version.map(String::from),
+    }))
 }
 
 fn validate_registry_manifest_identity(
@@ -5532,17 +5557,20 @@ pub async fn download_packs(
     let mut failed = Vec::new();
 
     for source in &request.packs {
-        let pack_source = match detect_pack_source(source, request.ref_spec.as_deref(), true) {
-            Ok(source) => source,
-            Err(error) => {
-                failed.push(crate::dto::pack::FailedPack {
-                    source: source.clone(),
-                    error: error.to_string(),
-                    details: error.response_body().details,
-                });
-                continue;
-            }
-        };
+        let pack_source =
+            match resolve_pack_source(&state, &user, source, request.ref_spec.as_deref(), true)
+                .await
+            {
+                Ok(source) => source,
+                Err(error) => {
+                    failed.push(crate::dto::pack::FailedPack {
+                        source: source.clone(),
+                        error: error.to_string(),
+                        details: error.response_body().details,
+                    });
+                    continue;
+                }
+            };
         if matches!(
             pack_source,
             attune_common::pack_registry::PackSource::Registry { .. }
@@ -5554,17 +5582,6 @@ pub async fn download_packs(
             });
             continue;
         }
-        let pack_source = match authorize_local_source_variant(&state, &user, pack_source).await {
-            Ok(source) => source,
-            Err(error) => {
-                failed.push(crate::dto::pack::FailedPack {
-                    source: source.clone(),
-                    error: error.to_string(),
-                    details: error.response_body().details,
-                });
-                continue;
-            }
-        };
         let source_type_str = get_source_type(&pack_source).to_string();
 
         match installer.install(pack_source).await {
@@ -7022,13 +7039,13 @@ mod tests {
             "ftp://example.com/repo.zip",
         ] {
             assert!(
-                detect_pack_source(source, None, true).is_err(),
+                classify_pack_source(source, None, true).is_err(),
                 "{}",
                 source
             );
         }
 
-        let query_error = detect_pack_source(
+        let query_error = classify_pack_source(
             "https://github.com/attacker/pack.git?token=super-secret",
             None,
             true,
@@ -7038,11 +7055,44 @@ mod tests {
     }
 
     #[test]
-    fn no_registry_rejects_implicit_registry_references() {
-        assert!(detect_pack_source("example", None, false).is_err());
+    fn pack_source_classification_uses_request_syntax() {
+        use attune_common::pack_registry::PackSource;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let missing = fixture.path().join("missing");
+        for source in [
+            fixture.path().to_str().unwrap(),
+            missing.to_str().unwrap(),
+            "./example",
+            "packs/example.tar.gz",
+        ] {
+            for allow_registry in [true, false] {
+                assert!(matches!(
+                    classify_pack_source(source, None, allow_registry).unwrap(),
+                    PackSourceRequest::LocalPath(path) if path == FsPath::new(source)
+                ));
+            }
+        }
+        for (source, expected_ref, expected_version) in [
+            ("src", "src", None),
+            ("git@0.2.0", "git", Some("0.2.0")),
+            ("example@latest", "example", Some("latest")),
+        ] {
+            assert!(matches!(
+                classify_pack_source(source, None, true).unwrap(),
+                PackSourceRequest::InstallerSource(PackSource::Registry { pack_ref, version })
+                    if pack_ref == expected_ref && version.as_deref() == expected_version
+            ));
+            assert!(classify_pack_source(source, None, false).is_err());
+        }
         assert!(matches!(
-            detect_pack_source("example", None, true).unwrap(),
-            attune_common::pack_registry::PackSource::Registry { .. }
+            classify_pack_source("https://packs.example/project", Some("main"), false).unwrap(),
+            PackSourceRequest::InstallerSource(PackSource::Git { git_ref: Some(git_ref), .. })
+                if git_ref == "main"
+        ));
+        assert!(matches!(
+            classify_pack_source("https://packs.example/project.tar.gz", None, false).unwrap(),
+            PackSourceRequest::InstallerSource(PackSource::Archive { .. })
         ));
     }
 

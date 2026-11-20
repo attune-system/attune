@@ -36,6 +36,14 @@ Exchange payloads are encrypted with the configured shared encryption key;
 OIDC browser login requires that key. Fragments are not normally sent as HTTP
 referrers; history and same-origin script access were the relevant exposure.
 
+Set `security.oidc.redirect_uri` to the absolute callback URL registered with
+the provider. It must use HTTPS in production and for any non-loopback host.
+Browser auth cookies always carry the `Secure` attribute, including on refresh
+and removal. Outside production, HTTP callbacks on `localhost` or a loopback
+IP such as `127.0.0.1` or `[::1]` work in browsers that accept Secure cookies
+over loopback HTTP. Safari added support in version 27. Use local HTTPS if your
+browser requires HTTPS for Secure cookies.
+
 Expired/revoked session and exchange rows are retained until identity deletion;
 operators should account for this metadata growth. Tokens are hashed in session
 records. Exchange payload ciphertext is short-lived but currently retained after

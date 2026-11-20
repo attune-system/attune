@@ -505,8 +505,9 @@ attune pack install <url> --force
 ```
 
 `--registry-id` pins a registry ref to one enabled managed index.
-`--no-registry` requires an explicit URL or a path already visible to the API server and never falls
-back to registry lookup. They cannot be combined.
+`--no-registry` accepts a URL or an explicit API-host path such as `./pack` or
+`/srv/attune-pack-sources/pack`. Use `attune pack upload` for files on the CLI
+host. The two flags cannot be combined.
 
 #### Register Local Pack
 ```bash

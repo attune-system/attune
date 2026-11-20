@@ -125,9 +125,101 @@ async fn logout_and_password_update_revoke_refresh_but_new_login_works() {
 
 #[tokio::test]
 async fn oidc_browser_exchange_is_bound_single_use_and_has_no_bearer_fragment() {
-    use axum::{body::Body, http::Request};
+    oidc_browser_session("HTTPS://app.example.com/auth/callback").await;
+}
+
+#[tokio::test]
+async fn oidc_browser_session_supports_loopback_http() {
+    oidc_browser_session("http://localhost:3000/auth/callback").await;
+}
+
+async fn oidc_browser_session(callback: &str) {
+    use attune_api::auth::oidc::{
+        ACCESS_COOKIE_NAME, LOGIN_EXCHANGE_COOKIE, OIDC_REDIRECT_COOKIE_NAME, REFRESH_COOKIE_NAME,
+    };
+    use axum::{body::Body, http::Request, response::Response};
+    use axum_extra::extract::cookie::{Cookie, SameSite};
+    use std::sync::Arc;
     use tower::ServiceExt;
-    let ctx = TestContext::new().await.unwrap();
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    fn checked_cookies(response: &Response) -> Vec<Cookie<'_>> {
+        let cookies: Vec<_> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| Cookie::parse(value.to_str().unwrap()).unwrap())
+            .collect();
+        assert!(!cookies.is_empty());
+        for cookie in &cookies {
+            assert_eq!(cookie.secure(), Some(true), "{}", cookie.name());
+            let http_only = cookie.name() != OIDC_REDIRECT_COOKIE_NAME
+                || cookie.max_age().is_some_and(|age| age.is_zero());
+            assert_eq!(
+                cookie.http_only().unwrap_or(false),
+                http_only,
+                "{}",
+                cookie.name()
+            );
+            assert_eq!(cookie.same_site(), Some(SameSite::Lax), "{}", cookie.name());
+            assert_eq!(cookie.path(), Some("/"), "{}", cookie.name());
+        }
+        cookies
+    }
+
+    let provider = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/discovery"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": provider.uri(),
+            "authorization_endpoint": format!("{}/authorize", provider.uri()),
+            "token_endpoint": format!("{}/token", provider.uri()),
+            "jwks_uri": format!("{}/jwks", provider.uri()),
+            "response_types_supported": ["code"],
+            "subject_types_supported": ["public"],
+            "id_token_signing_alg_values_supported": ["RS256"],
+        })))
+        .expect(1)
+        .mount(&provider)
+        .await;
+    let mut ctx = TestContext::new().await.unwrap();
+    let mut config = (*ctx.state.config).clone();
+    config.security.oidc = Some(
+        serde_json::from_value(json!({
+            "enabled": true,
+            "discovery_url": format!("{}/discovery", provider.uri()),
+            "client_id": "attune-web",
+            "redirect_uri": callback,
+        }))
+        .unwrap(),
+    );
+    ctx.state = Arc::new(attune_api::state::AppState::new_with_audit(
+        ctx.pool.clone(),
+        config,
+        ctx.state.audit_emitter.clone(),
+    ));
+    ctx.app = attune_api::server::Server::new(ctx.state.clone()).router();
+    let login_redirect = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::get("/auth/oidc/login")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login_redirect.status(), StatusCode::TEMPORARY_REDIRECT);
+    let authorization_url =
+        url::Url::parse(login_redirect.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+    assert!(authorization_url
+        .query_pairs()
+        .any(|(name, value)| name == "redirect_uri" && value == callback));
+    assert_eq!(checked_cookies(&login_redirect).len(), 4);
+
     login(&ctx).await;
     let identity = IdentityRepository::find_by_login(&ctx.pool, "session-user")
         .await
@@ -148,16 +240,19 @@ async fn oidc_browser_exchange_is_bound_single_use_and_has_no_bearer_fragment() 
     assert!(!location.contains("access_token"));
     assert!(!location.contains("refresh_token"));
     let code = location.split("#code=").nth(1).unwrap();
-    let cookie = response
-        .headers()
-        .get_all(header::SET_COOKIE)
+    let callback_cookies = checked_cookies(&response);
+    let exchange = callback_cookies
         .iter()
-        .filter_map(|v| v.to_str().ok())
-        .find(|v| v.starts_with("attune_login_exchange="))
-        .unwrap()
-        .split(';')
-        .next()
+        .find(|cookie| cookie.name() == LOGIN_EXCHANGE_COOKIE)
         .unwrap();
+    let binding = format!("{}={}", exchange.name(), exchange.value());
+    assert_eq!(
+        callback_cookies
+            .iter()
+            .filter(|cookie| cookie.max_age().is_some_and(|age| age.is_zero()))
+            .count(),
+        4
+    );
     let request = |binding: &str| {
         Request::builder()
             .method("POST")
@@ -176,8 +271,17 @@ async fn oidc_browser_exchange_is_bound_single_use_and_has_no_bearer_fragment() 
             .status(),
         StatusCode::UNAUTHORIZED
     );
-    let response = ctx.app.clone().oneshot(request(cookie)).await.unwrap();
+    let response = ctx.app.clone().oneshot(request(&binding)).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    let issued = checked_cookies(&response);
+    assert!(issued
+        .iter()
+        .any(|cookie| cookie.name() == ACCESS_COOKIE_NAME));
+    let issued_refresh = issued
+        .iter()
+        .find(|cookie| cookie.name() == REFRESH_COOKIE_NAME)
+        .unwrap();
+    let refresh_credential = issued_refresh.value().to_owned();
     let body: Value = serde_json::from_slice(
         &axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -185,19 +289,57 @@ async fn oidc_browser_exchange_is_bound_single_use_and_has_no_bearer_fragment() 
     )
     .unwrap();
     assert_eq!(body["data"]["redirect_to"], "/executions");
-    assert_eq!(
-        refresh(
-            &ctx,
-            body["data"]["tokens"]["refresh_token"].as_str().unwrap()
+    assert!(body["data"]["tokens"]["refresh_token"].as_str() == Some(&refresh_credential));
+    let refreshed = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::post("/auth/refresh")
+                .header(
+                    header::COOKIE,
+                    format!("{REFRESH_COOKIE_NAME}={refresh_credential}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
         )
         .await
-        .status(),
-        StatusCode::OK
-    );
+        .unwrap();
+    assert_eq!(refreshed.status(), StatusCode::OK);
+    let rotated = checked_cookies(&refreshed);
+    assert!(rotated
+        .iter()
+        .any(|cookie| cookie.name() == ACCESS_COOKIE_NAME));
+    let rotated_refresh = rotated
+        .iter()
+        .find(|cookie| cookie.name() == REFRESH_COOKIE_NAME)
+        .unwrap();
+    assert!(rotated_refresh.value() != refresh_credential);
+    let logout = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::get("/auth/logout")
+                .header(
+                    header::COOKIE,
+                    format!("{REFRESH_COOKIE_NAME}={}", rotated_refresh.value()),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), StatusCode::TEMPORARY_REDIRECT);
+    let removed = checked_cookies(&logout);
+    assert!(removed
+        .iter()
+        .any(|cookie| cookie.name() == REFRESH_COOKIE_NAME));
+    assert!(removed
+        .iter()
+        .all(|cookie| cookie.max_age().is_some_and(|age| age.is_zero())));
     assert_eq!(
         ctx.app
             .clone()
-            .oneshot(request(cookie))
+            .oneshot(request(&binding))
             .await
             .unwrap()
             .status(),

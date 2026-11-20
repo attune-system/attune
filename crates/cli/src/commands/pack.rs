@@ -93,7 +93,7 @@ pub enum PackCommands {
         /// Permit incompatible trigger contract rollout with live admitted emitters
         #[arg(long)]
         acknowledge_incompatible_rollout: bool,
-        /// Source (git URL, archive URL, local path, or registry reference)
+        /// Registry ref, Git/archive URL, or explicit API-host path (e.g. ./pack)
         #[arg(value_name = "SOURCE")]
         source: String,
 
@@ -1079,11 +1079,7 @@ async fn handle_install(
         std::time::Duration::from_secs(8 * 60 * 60),
     )?;
 
-    // Detect source type
-    let source_type = detect_source_type(&source, ref_spec.as_deref(), no_registry);
-
     if output_format == OutputFormat::Table {
-        output::print_info(&format!("Installing pack from source type: {source_type}"));
         output::print_info("Starting installation...");
         if skip_deps {
             output::print_info("⚠ Dependency validation will be skipped");
@@ -2276,54 +2272,6 @@ async fn handle_search(
     }
 
     Ok(())
-}
-
-/// Detect the source type from the provided source string
-fn detect_source_type(source: &str, ref_spec: Option<&str>, no_registry: bool) -> &'static str {
-    // If no_registry flag is set, skip registry detection
-    if no_registry {
-        if source.starts_with("http://") || source.starts_with("https://") {
-            if source.ends_with(".git") {
-                return "git repository";
-            } else if source.ends_with(".zip")
-                || source.ends_with(".tar.gz")
-                || source.ends_with(".tgz")
-            {
-                return "archive URL";
-            }
-            return "URL";
-        } else if std::path::Path::new(source).exists() {
-            if std::path::Path::new(source).is_file() {
-                return "local archive";
-            }
-            return "local directory";
-        }
-        return "unknown source";
-    }
-
-    // Check if it's a URL
-    if source.starts_with("http://") || source.starts_with("https://") {
-        if source.ends_with(".git") || ref_spec.is_some() {
-            return "git repository";
-        }
-        return "archive URL";
-    }
-
-    // Check if it's a local path
-    if std::path::Path::new(source).exists() {
-        if std::path::Path::new(source).is_file() {
-            return "local archive";
-        }
-        return "local directory";
-    }
-
-    // Check if it looks like a git SSH URL
-    if source.starts_with("git@") || source.contains("git://") {
-        return "git repository";
-    }
-
-    // Otherwise assume it's a registry reference
-    "registry reference"
 }
 
 async fn handle_checksum(path: String, json: bool, output_format: OutputFormat) -> Result<()> {

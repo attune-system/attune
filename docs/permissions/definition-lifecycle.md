@@ -69,6 +69,12 @@ Candidate namespace authorization still applies. Scoped upload/remote deployers
 must use upload or remote sources; deployment authority alone does not disclose
 API-host files. Upload and remote staging do not require local-source approval.
 
+For install and staged download, identify an API-host path with an absolute
+path, a relative path containing a separator, or a dot prefix such as `./pack`.
+Relative paths start from the API process's working directory. Bare pack names
+and `pack@version` are registry references. Use `attune pack upload` for content
+on the CLI host.
+
 For operator local registration, configure a dedicated, operator-owned source
 mount, for example `packs: {local_source_roots: [/srv/attune-pack-sources]}`,
 and register a pack directory beneath that mount using an operator credential.

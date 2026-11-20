@@ -547,7 +547,7 @@ pub async fn login(
     let mut http_response = Json(ApiResponse::new(response)).into_response();
     apply_cookies_to_headers(
         http_response.headers_mut(),
-        &crate::auth::oidc::clear_auth_cookies(&state),
+        &crate::auth::oidc::clear_auth_cookies(),
     )?;
     Ok(http_response)
 }
@@ -1146,7 +1146,7 @@ pub async fn ldap_login(
     let mut response = Json(ApiResponse::new(authenticated.token_response)).into_response();
     apply_cookies_to_headers(
         response.headers_mut(),
-        &crate::auth::oidc::clear_auth_cookies(&state),
+        &crate::auth::oidc::clear_auth_cookies(),
     )?;
     Ok(response)
 }
@@ -1183,7 +1183,7 @@ pub async fn logout(
         let mut response = Redirect::temporary("/login").into_response();
         apply_cookies_to_headers(
             response.headers_mut(),
-            &crate::auth::oidc::clear_auth_cookies(&state),
+            &crate::auth::oidc::clear_auth_cookies(),
         )?;
         response
     };

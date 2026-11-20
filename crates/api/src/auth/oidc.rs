@@ -153,11 +153,8 @@ pub async fn build_login_redirect(
     redirect_to: Option<&str>,
 ) -> Result<OidcLoginRedirect, ApiError> {
     let oidc = oidc_config(state)?;
+    let redirect_uri = browser_redirect_url(state, &oidc)?;
     let discovery = fetch_discovery_document(&oidc).await?;
-    let redirect_uri_str = oidc.redirect_uri.clone().unwrap_or_default();
-    let redirect_uri = RedirectUrl::new(redirect_uri_str).map_err(|err| {
-        ApiError::InternalServerError(format!("Invalid OIDC redirect URI: {err}"))
-    })?;
     let client_secret = oidc
         .client_secret
         .clone()
@@ -203,33 +200,24 @@ pub async fn build_login_redirect(
         cookies: {
             vec![
                 build_cookie(
-                    state,
                     OIDC_STATE_COOKIE_NAME,
                     csrf_state.secret().to_string(),
                     600,
                     true,
                 ),
                 build_cookie(
-                    state,
                     OIDC_NONCE_COOKIE_NAME,
                     nonce.secret().to_string(),
                     600,
                     true,
                 ),
                 build_cookie(
-                    state,
                     OIDC_PKCE_COOKIE_NAME,
                     pkce.1.secret().to_string(),
                     600,
                     true,
                 ),
-                build_cookie(
-                    state,
-                    OIDC_REDIRECT_COOKIE_NAME,
-                    redirect_target,
-                    600,
-                    false,
-                ),
+                build_cookie(OIDC_REDIRECT_COOKIE_NAME, redirect_target, 600, false),
             ]
         },
     })
@@ -271,11 +259,8 @@ pub async fn handle_callback(
     }
 
     let oidc = oidc_config(state)?;
+    let redirect_uri = browser_redirect_url(state, &oidc)?;
     let discovery = fetch_discovery_document(&oidc).await?;
-    let redirect_uri_str = oidc.redirect_uri.clone().unwrap_or_default();
-    let redirect_uri = RedirectUrl::new(redirect_uri_str).map_err(|err| {
-        ApiError::InternalServerError(format!("Invalid OIDC redirect URI: {err}"))
-    })?;
     let client_secret = oidc
         .client_secret
         .clone()
@@ -433,11 +418,11 @@ pub async fn build_logout_redirect(
 
     Ok(OidcLogoutRedirect {
         redirect_url,
-        cookies: clear_auth_cookies(state),
+        cookies: clear_auth_cookies(),
     })
 }
 
-pub fn clear_auth_cookies(state: &SharedState) -> Vec<Cookie<'static>> {
+pub fn clear_auth_cookies() -> Vec<Cookie<'static>> {
     [
         ACCESS_COOKIE_NAME,
         REFRESH_COOKIE_NAME,
@@ -448,7 +433,7 @@ pub fn clear_auth_cookies(state: &SharedState) -> Vec<Cookie<'static>> {
         OIDC_REDIRECT_COOKIE_NAME,
     ]
     .into_iter()
-    .map(|name| remove_cookie(state, name))
+    .map(remove_cookie)
     .collect()
 }
 
@@ -459,14 +444,12 @@ pub fn build_auth_cookies(
 ) -> Vec<Cookie<'static>> {
     let mut cookies = vec![
         build_cookie(
-            state,
             ACCESS_COOKIE_NAME,
             token_response.access_token.clone(),
             state.jwt_config.access_token_expiration,
             true,
         ),
         build_cookie(
-            state,
             REFRESH_COOKIE_NAME,
             token_response.refresh_token.clone(),
             state.jwt_config.refresh_token_expiration,
@@ -476,7 +459,6 @@ pub fn build_auth_cookies(
 
     if !id_token.is_empty() {
         cookies.push(build_cookie(
-            state,
             OIDC_ID_TOKEN_COOKIE_NAME,
             id_token.to_string(),
             state.jwt_config.refresh_token_expiration,
@@ -538,26 +520,19 @@ pub async fn oidc_callback_redirect_response(
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
-    let mut cookies = vec![build_cookie(
-        state,
-        LOGIN_EXCHANGE_COOKIE,
-        browser,
-        60,
-        true,
-    )];
+    let mut cookies = vec![build_cookie(LOGIN_EXCHANGE_COOKIE, browser, 60, true)];
     if !id_token.is_empty() {
         cookies.push(build_cookie(
-            state,
             OIDC_ID_TOKEN_COOKIE_NAME,
             id_token.to_string(),
             state.jwt_config.refresh_token_expiration,
             true,
         ));
     }
-    cookies.push(remove_cookie(state, OIDC_STATE_COOKIE_NAME));
-    cookies.push(remove_cookie(state, OIDC_NONCE_COOKIE_NAME));
-    cookies.push(remove_cookie(state, OIDC_PKCE_COOKIE_NAME));
-    cookies.push(remove_cookie(state, OIDC_REDIRECT_COOKIE_NAME));
+    cookies.push(remove_cookie(OIDC_STATE_COOKIE_NAME));
+    cookies.push(remove_cookie(OIDC_NONCE_COOKIE_NAME));
+    cookies.push(remove_cookie(OIDC_PKCE_COOKIE_NAME));
+    cookies.push(remove_cookie(OIDC_REDIRECT_COOKIE_NAME));
     apply_cookies_to_headers(response.headers_mut(), &cookies)?;
     Ok(response)
 }
@@ -610,6 +585,14 @@ pub(super) fn oidc_config(state: &SharedState) -> Result<OidcConfig, ApiError> {
         .ok_or_else(|| {
             ApiError::NotImplemented("OIDC authentication is not configured".to_string())
         })
+}
+
+fn browser_redirect_url(state: &SharedState, oidc: &OidcConfig) -> Result<RedirectUrl, ApiError> {
+    let raw = oidc
+        .browser_redirect_uri(state.config.is_production())
+        .map_err(|error| ApiError::InternalServerError(error.to_string()))?;
+    RedirectUrl::new(raw.to_owned())
+        .map_err(|_| ApiError::InternalServerError("Invalid OIDC redirect URI".into()))
 }
 
 pub(super) fn oidc_http_client() -> &'static reqwest::Client {
@@ -871,50 +854,24 @@ where
 }
 
 fn build_cookie(
-    state: &SharedState,
     name: &'static str,
     value: String,
     max_age_seconds: i64,
     http_only: bool,
 ) -> Cookie<'static> {
-    let mut cookie = Cookie::build((name, value))
+    Cookie::build((name, value))
         .path("/")
         .same_site(SameSite::Lax)
         .http_only(http_only)
+        .secure(true)
         .max_age(CookieDuration::seconds(max_age_seconds))
-        .build();
-
-    if should_use_secure_cookies(state) {
-        cookie.set_secure(true);
-    }
-
-    cookie
+        .build()
 }
 
-fn remove_cookie(state: &SharedState, name: &'static str) -> Cookie<'static> {
-    let mut cookie = Cookie::build((name, String::new()))
-        .path("/")
-        .same_site(SameSite::Lax)
-        .http_only(true)
-        .max_age(CookieDuration::seconds(0))
-        .build();
+fn remove_cookie(name: &'static str) -> Cookie<'static> {
+    let mut cookie = build_cookie(name, String::new(), 0, true);
     cookie.make_removal();
-    if should_use_secure_cookies(state) {
-        cookie.set_secure(true);
-    }
     cookie
-}
-
-fn should_use_secure_cookies(state: &SharedState) -> bool {
-    state.config.is_production()
-        || state
-            .config
-            .security
-            .oidc
-            .as_ref()
-            .and_then(|oidc| oidc.redirect_uri.as_deref())
-            .map(|uri| uri.starts_with("https://"))
-            .unwrap_or(false)
 }
 
 fn sanitize_redirect_target(redirect_to: Option<&str>) -> String {

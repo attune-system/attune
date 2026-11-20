@@ -94,8 +94,8 @@ security:
     # provider_name: sso
     # provider_label: SSO Login
     # provider_icon_url: https://auth.example.com/favicon.ico
-    # redirect_uri: http://localhost:3000/auth/callback
-    # post_logout_redirect_uri: http://localhost:3000/login
+    # redirect_uri: https://attune.example.com/auth/callback
+    # post_logout_redirect_uri: https://attune.example.com/login
     # scopes:
     #   - groups
 
