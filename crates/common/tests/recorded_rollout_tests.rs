@@ -3,6 +3,9 @@
 #[path = "recorded_rollout_tests/admin_process.rs"]
 mod admin_process;
 #[cfg(target_os = "linux")]
+#[path = "recorded_rollout_tests/cache_acl_isolation.rs"]
+mod cache_acl_isolation;
+#[cfg(target_os = "linux")]
 #[path = "recorded_rollout_tests/cache_boundary.rs"]
 mod cache_boundary;
 #[allow(dead_code)]

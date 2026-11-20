@@ -199,6 +199,9 @@ fn fingerprint(sql: &[u8]) -> u8 {
         // Offline-admin fault fixture: identify only the exact statement, never
         // inspect/log the private JSON receipt or its nonce.
         3
+    } else if s == "SELECT create_cache_generation_partition($1)" {
+        // Exact typed owning-cache fixture, bound to one server-reserved ID.
+        4
     } else {
         0
     }
@@ -230,7 +233,7 @@ impl Parser {
                     formats.push(short(&mut b)?)
                 }
                 let count = short(&mut b)?;
-                if n != 0 && n != 1 && n != count {
+                if (class == 4 && (count != 1 || stream <= 0)) || (n != 0 && n != 1 && n != count) {
                     return Err(invalid());
                 }
                 let mut matched = false;
@@ -286,7 +289,7 @@ impl Parser {
                     .ok_or_else(invalid)?
                 {
                     1 => self.selected = true,
-                    2 | 3 => {
+                    2..=4 => {
                         self.publication = true;
                         self.publication_executions += 1;
                     }
@@ -609,6 +612,26 @@ mod tests {
         );
         p.frontend(b'C', b"Ss\0", 42).unwrap();
         assert!(p.frontend(b'E', b"\0\0\0\0\0", 42).is_err());
+    }
+    #[test]
+    fn cache_publication_is_exact_statement_and_generation() {
+        let mut p = Parser::default();
+        parse(
+            &mut p,
+            b"s",
+            b"SELECT create_cache_generation_partition($1)",
+        );
+        assert!(bind(&mut p, 43).is_err());
+        bind(&mut p, 42).unwrap();
+        p.frontend(b'E', b"\0\0\0\0\0", 42).unwrap();
+        assert_eq!(
+            p.frontend(b'Q', b"COMMIT\0", 42).unwrap(),
+            Some(Some(Class::Publication))
+        );
+        assert_eq!(
+            fingerprint(b"SELECT create_cache_generation_partition($1); SELECT 1"),
+            0
+        );
     }
     #[test]
     fn publication_overrides_selection() {

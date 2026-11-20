@@ -1,3 +1,7 @@
+> Historical checkpoint `cd1f059a`: the original failure is preserved below.
+> The user subsequently approved the isolated transactional transition in
+> [Option A](cache-option-a.md). That follow-up does not apply/freeze migration9.
+
 # Candidate migration 9: blocked, unrecorded and unfrozen
 
 `cache-partition-creation.candidate.sql` is deliberately outside `migrations/`.

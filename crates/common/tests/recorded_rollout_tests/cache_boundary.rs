@@ -103,6 +103,9 @@ pub(super) async fn candidate(f: &mut Fixture, upgrade: bool) {
     install.commit().await.unwrap();
     let tables="cache_namespace,cache_generation,cache_entry,cache_ingest_chunk,cache_generation_clone,cache_generation_entry_usage,cache_owner_physical_byte_usage,cache_deployment_physical_byte_usage,cache_entry_statistics_state,cache_live_request";
     sqlx::raw_sql(&format!("GRANT SELECT,INSERT,UPDATE,DELETE ON {tables} TO {api}; GRANT SELECT ON runtime_retention_config TO {api}; GRANT USAGE,SELECT ON SEQUENCE cache_namespace_id_seq,cache_generation_id_seq,cache_entry_id_seq TO {api}; GRANT EXECUTE ON FUNCTION create_cache_generation_partition(BIGINT) TO {api}")).execute(&*f.db).await.unwrap();
+    let probe_ns = namespace(&f.pools[1], CacheMode::Snapshot).await;
+    super::cache_acl_isolation::probe(f, probe_ns).await;
+    validation_probes(f).await;
     let api_pool = f.pools[1].clone();
     let pool = &api_pool;
     for stmt in [
@@ -130,6 +133,16 @@ pub(super) async fn candidate(f: &mut Fixture, upgrade: bool) {
         .unwrap();
     f.pools.push(offline.clone());
     denies(&offline, "SELECT create_cache_generation_partition(1)").await;
+    {
+        let mut lease = offline.acquire().await.unwrap();
+        attune_common::repositories::rollout_admin::RolloutAdminRepository::verify(
+            &mut lease,
+            f.db.schema(),
+            std::slice::from_ref(&api),
+        )
+        .await
+        .unwrap();
+    }
     offline.close().await;
     // Inherited EXECUTE and SET ROLE cannot substitute the session principal.
     sqlx::query(&format!(
@@ -232,6 +245,33 @@ pub(super) async fn candidate(f: &mut Fixture, upgrade: bool) {
         .unwrap();
     tx.commit().await.unwrap();
     absent(f, stale).await;
+    // Read-only retry must reject ownership drift as well as parent/bound drift.
+    sqlx::query(&format!(
+        "ALTER TABLE ONLY cache_entry_g_{keep} OWNER TO {}",
+        f.roles[0]
+    ))
+    .execute(&*f.db)
+    .await
+    .unwrap();
+    assert!(
+        CacheGenerationRepository::create_or_get(pool, &generation(ns, "keep"))
+            .await
+            .is_err()
+    );
+    sqlx::query(&format!(
+        "ALTER TABLE ONLY cache_entry_g_{keep} OWNER TO {cache_owner}"
+    ))
+    .execute(&*f.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        id(
+            CacheGenerationRepository::create_or_get(pool, &generation(ns, "keep"))
+                .await
+                .unwrap()
+        ),
+        keep
+    );
     let mut tx = pool.begin().await.unwrap();
     CacheEntryRepository::protect_transaction(&mut tx, CacheTransactionMode::Attach)
         .await
@@ -375,4 +415,91 @@ async fn candidate_fresh_cache_role_boundary() {
 #[tokio::test]
 async fn candidate_pre9_cache_role_boundary() {
     run_candidate(true).await;
+}
+
+async fn reject_creation(f: &Fixture, namespace: i64, label: &str) {
+    let error =
+        CacheGenerationRepository::create_or_get(&f.pools[1], &generation(namespace, label))
+            .await
+            .unwrap_err();
+    match error {
+        attune_common::Error::Database(e) => assert_eq!(
+            e.as_database_error().and_then(|e| e.code()).as_deref(),
+            Some("42501")
+        ),
+        other => panic!("wrong guard rejection: {other:?}"),
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM cache_generation WHERE namespace=$1")
+            .bind(namespace)
+            .fetch_one(&*f.db)
+            .await
+            .unwrap(),
+        0
+    );
+}
+async fn validation_probes(f: &Fixture) {
+    let cache_owner = &f.roles[6];
+    let worker = &f.roles[3];
+    let wrong_owner = &f.roles[0];
+    let ns = namespace(&f.pools[1], CacheMode::Snapshot).await;
+    let before: (i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT oid::BIGINT,nspowner::BIGINT,nspacl::TEXT FROM pg_namespace WHERE nspname=$1",
+    )
+    .bind(f.db.schema())
+    .fetch_one(&*f.db)
+    .await
+    .unwrap();
+    let creator:(i64,i64,Option<String>)=sqlx::query_as("SELECT oid::BIGINT,proowner::BIGINT,proacl::TEXT FROM pg_proc WHERE oid='create_cache_generation_partition(bigint)'::regprocedure").fetch_one(&*f.db).await.unwrap();
+    sqlx::query(&format!(
+        "GRANT CREATE ON SCHEMA \"{}\" TO {cache_owner}",
+        f.db.schema()
+    ))
+    .execute(&*f.db)
+    .await
+    .unwrap();
+    reject_creation(f, ns, "bad-existing-schema-acl").await;
+    sqlx::query(&format!(
+        "REVOKE CREATE ON SCHEMA \"{}\" FROM {cache_owner}",
+        f.db.schema()
+    ))
+    .execute(&*f.db)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "GRANT EXECUTE ON FUNCTION create_cache_generation_partition(BIGINT) TO {worker}"
+    ))
+    .execute(&*f.db)
+    .await
+    .unwrap();
+    reject_creation(f, ns, "excess-execute").await;
+    sqlx::query(&format!(
+        "REVOKE EXECUTE ON FUNCTION create_cache_generation_partition(BIGINT) FROM {worker}"
+    ))
+    .execute(&*f.db)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "ALTER TABLE ONLY cache_entry OWNER TO {wrong_owner}"
+    ))
+    .execute(&*f.db)
+    .await
+    .unwrap();
+    reject_creation(f, ns, "wrong-parent-owner").await;
+    sqlx::query(&format!(
+        "ALTER TABLE ONLY cache_entry OWNER TO {cache_owner}"
+    ))
+    .execute(&*f.db)
+    .await
+    .unwrap();
+    let after: (i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT oid::BIGINT,nspowner::BIGINT,nspacl::TEXT FROM pg_namespace WHERE nspname=$1",
+    )
+    .bind(f.db.schema())
+    .fetch_one(&*f.db)
+    .await
+    .unwrap();
+    assert_eq!(before, after);
+    let after_creator:(i64,i64,Option<String>)=sqlx::query_as("SELECT oid::BIGINT,proowner::BIGINT,proacl::TEXT FROM pg_proc WHERE oid='create_cache_generation_partition(bigint)'::regprocedure").fetch_one(&*f.db).await.unwrap();
+    assert_eq!(creator, after_creator);
 }

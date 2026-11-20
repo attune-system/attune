@@ -135,6 +135,8 @@ Docker/manual ledger conversion is not attempted.
 The separately requested owner-controlled cache creator is only a
 [candidate investigation](cache-candidate-status.md), outside migrations and not
 operational. PostgreSQL requires the target leaf owner to have schema CREATE;
-the mandated owner-only installation ACL blocks ALTER OWNER. No production grant,
+the original owner-only installation ACL blocked ALTER OWNER. The approved
+[Option A experiment](cache-option-a.md) tests an uncommitted transactional
+GRANT/ALTER OWNER/REVOKE without changing committed ACLs. No production grant,
 verifier exception, role adoption or default change has been added to resolve it.
 The test-posture census must be reviewed before any broad harness changes.

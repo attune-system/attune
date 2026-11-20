@@ -15,12 +15,13 @@ DECLARE app RECORD; parent_row RECORD; caller OID := session_user::regrole::OID;
 BEGIN
  SELECT n.oid,n.nspowner,n.nspacl,p.proowner INTO STRICT app FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
  WHERE p.oid='create_cache_generation_partition(bigint)'::regprocedure;
- SELECT c.oid,c.relowner,c.relnamespace,c.relkind,pt.partstrat INTO STRICT parent_row
+ SELECT c.oid,c.relowner,c.relnamespace,c.relkind,pt.partstrat,pt.partnatts,pt.partattrs[0] AS partition_attribute,(SELECT attnum FROM pg_attribute WHERE attrelid=c.oid AND attname='generation' AND NOT attisdropped) AS generation_attribute INTO STRICT parent_row
  FROM pg_class c JOIN pg_partitioned_table pt ON pt.partrelid=c.oid WHERE c.oid='cache_entry'::regclass;
  IF current_user::regrole::OID<>app.nspowner OR app.proowner<>app.nspowner
  OR NOT EXISTS(SELECT 1 FROM pg_roles WHERE oid=app.nspowner AND NOT rolcanlogin AND NOT rolsuper AND NOT rolcreaterole AND NOT rolcreatedb AND NOT rolbypassrls AND NOT rolreplication)
- OR parent_row.relnamespace<>app.oid OR parent_row.relkind<>'p' OR parent_row.partstrat<>'l'
+ OR parent_row.relnamespace<>app.oid OR parent_row.relkind<>'p' OR parent_row.partstrat<>'l' OR parent_row.partnatts<>1 OR parent_row.partition_attribute IS DISTINCT FROM parent_row.generation_attribute
  OR NOT EXISTS(SELECT 1 FROM pg_roles WHERE oid=parent_row.relowner AND NOT rolcanlogin AND NOT rolsuper AND NOT rolcreaterole AND NOT rolcreatedb AND NOT rolbypassrls AND NOT rolreplication)
+ OR EXISTS(SELECT 1 FROM pg_auth_members WHERE member=parent_row.relowner)
  OR parent_row.relowner=app.nspowner
  OR NOT EXISTS(SELECT 1 FROM pg_auth_members WHERE roleid=parent_row.relowner AND member=app.nspowner AND inherit_option AND set_option AND NOT admin_option)
  OR EXISTS(SELECT 1 FROM pg_auth_members WHERE member=app.nspowner AND (roleid<>parent_row.relowner OR NOT inherit_option OR NOT set_option OR admin_option))
@@ -63,10 +64,38 @@ END $$;
 REVOKE ALL ON FUNCTION guard_cache_partition_intent() FROM PUBLIC;
 CREATE TRIGGER guard_cache_partition_intent BEFORE UPDATE ON cache_partition_creation_intent FOR EACH ROW EXECUTE FUNCTION guard_cache_partition_intent();
 
+-- Replays validate the same exact ownership invariant, with a trusted path.
+CREATE OR REPLACE FUNCTION validate_cache_generation_partition(generation_id BIGINT)
+RETURNS TEXT LANGUAGE plpgsql AS $$
+DECLARE
+    parent_id OID := 'cache_entry'::REGCLASS;
+    parent_schema TEXT;
+    child_name TEXT := cache_generation_partition_name(generation_id);
+    child_id OID;
+BEGIN
+    SELECT n.nspname INTO STRICT parent_schema
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.oid = parent_id AND c.relkind = 'p';
+    SELECT c.oid INTO child_id
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+      JOIN pg_inherits i ON i.inhrelid = c.oid AND i.inhparent = parent_id
+     WHERE n.nspname = parent_schema AND c.relname = child_name
+       AND c.relkind = 'r' AND c.relispartition
+       AND c.relowner = (SELECT relowner FROM pg_class WHERE oid=parent_id)
+       AND pg_get_expr(c.relpartbound, c.oid) = format('FOR VALUES IN (%L)', generation_id::TEXT);
+    IF child_id IS NULL OR NOT EXISTS (
+        SELECT 1 FROM cache_generation_entry_usage WHERE generation = generation_id
+    ) THEN
+        RAISE EXCEPTION 'cache generation partition or usage invariant is invalid';
+    END IF;
+    RETURN format('%I.%I', parent_schema, child_name);
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION create_cache_generation_partition(generation_id BIGINT)
 RETURNS VOID LANGUAGE plpgsql SECURITY DEFINER AS $$
 DECLARE held cache_partition_creation_intent; g cache_generation; ns cache_namespace; parent_row RECORD;
- child_name TEXT; child_relation TEXT; child_id OID;
+ child_name TEXT; child_relation TEXT; child_id OID; original_acl aclitem[];
 BEGIN
  PERFORM guard_cache_partition_context();
  IF generation_id IS NULL OR generation_id<=0 THEN RAISE EXCEPTION 'Positive generation required'; END IF;
@@ -92,7 +121,17 @@ BEGIN
  EXECUTE format('CREATE TABLE %s (LIKE cache_entry INCLUDING DEFAULTS INCLUDING CONSTRAINTS)',child_relation);
  EXECUTE format('ALTER TABLE %s ADD CHECK (generation = %s)',child_relation,generation_id);
  EXECUTE format('ALTER TABLE cache_entry ATTACH PARTITION %s FOR VALUES IN (%s)',child_relation,generation_id);
+ -- Option A: privilege transition is confined to this statement/transaction.
+ -- Any failure/cancel rolls back GRANT, DDL and intent together. Never commit
+ -- an ACL change or repair a mismatched starting ACL.
+ SELECT nspacl INTO STRICT original_acl FROM pg_namespace WHERE oid=held.schema_id AND nspowner=held.owner_id;
+ EXECUTE format('GRANT CREATE ON SCHEMA %I TO %I',parent_row.nspname,pg_get_userbyid(held.cache_owner));
  EXECUTE format('ALTER TABLE %s OWNER TO %I',child_relation,pg_get_userbyid(held.cache_owner));
+ EXECUTE format('REVOKE CREATE ON SCHEMA %I FROM %I',parent_row.nspname,pg_get_userbyid(held.cache_owner));
+ IF NOT EXISTS(SELECT 1 FROM pg_namespace WHERE oid=held.schema_id AND nspowner=held.owner_id AND nspacl IS NOT DISTINCT FROM original_acl)
+ THEN RAISE EXCEPTION 'Cache creation did not restore exact schema identity/ACL'; END IF;
+ IF NOT EXISTS(SELECT 1 FROM pg_class WHERE oid=to_regclass(child_relation) AND relowner=held.cache_owner AND relnamespace=held.schema_id)
+ THEN RAISE EXCEPTION 'Cache creation owner/namespace drift'; END IF;
  PERFORM validate_cache_generation_partition(generation_id);
  UPDATE cache_entry_statistics_state SET partitions_created=partitions_created+1 WHERE id=TRUE;
  IF NOT FOUND THEN RAISE EXCEPTION 'Cache statistics state missing'; END IF;
@@ -100,7 +139,7 @@ BEGIN
 END $$;
 REVOKE ALL ON FUNCTION create_cache_generation_partition(BIGINT) FROM PUBLIC;
 DO $$ DECLARE signature TEXT; BEGIN
- FOREACH signature IN ARRAY ARRAY['guard_cache_partition_context()','admit_cache_partition_creation()','guard_cache_partition_intent()','create_cache_generation_partition(BIGINT)'] LOOP
+ FOREACH signature IN ARRAY ARRAY['guard_cache_partition_context()','admit_cache_partition_creation()','guard_cache_partition_intent()','create_cache_generation_partition(BIGINT)','validate_cache_generation_partition(BIGINT)'] LOOP
  EXECUTE format('ALTER FUNCTION %s SET search_path TO pg_catalog,%I,pg_temp',signature,current_schema());
  END LOOP;
 END $$;
