@@ -134,7 +134,9 @@ async fn oidc_browser_session_supports_loopback_http() {
 }
 
 async fn oidc_browser_session(callback: &str, secure: bool) {
-    use attune_api::auth::oidc::{ACCESS_COOKIE_NAME, LOGIN_EXCHANGE_COOKIE, REFRESH_COOKIE_NAME};
+    use attune_api::auth::oidc::{
+        ACCESS_COOKIE_NAME, LOGIN_EXCHANGE_COOKIE, OIDC_REDIRECT_COOKIE_NAME, REFRESH_COOKIE_NAME,
+    };
     use axum::{body::Body, http::Request, response::Response};
     use axum_extra::extract::cookie::{Cookie, SameSite};
     use std::sync::Arc;
@@ -159,7 +161,14 @@ async fn oidc_browser_session(callback: &str, secure: bool) {
                 "{}",
                 cookie.name()
             );
-            assert_eq!(cookie.http_only(), Some(true), "{}", cookie.name());
+            let http_only = cookie.name() != OIDC_REDIRECT_COOKIE_NAME
+                || cookie.max_age().is_some_and(|age| age.is_zero());
+            assert_eq!(
+                cookie.http_only().unwrap_or(false),
+                http_only,
+                "{}",
+                cookie.name()
+            );
             assert_eq!(cookie.same_site(), Some(SameSite::Lax), "{}", cookie.name());
             assert_eq!(cookie.path(), Some("/"), "{}", cookie.name());
         }
