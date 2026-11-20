@@ -3,11 +3,15 @@
 DO $provision$
 DECLARE d JSONB; s NAME; entry JSONB; r RECORD; role_name NAME; owner_id OID;
  cap NAME; op NAME; old_op NAME; old_id OID; installation UUID; names TEXT[] := '{}';
+ cache_profile BOOLEAN;
+ cache_owner_id OID;
  tables TEXT[] := ARRAY['recorded_rollout_generation','recorded_rollout_active','recorded_rollout_installation_identity','recorded_rollout_offline_receipt','recorded_rollout_receipt_terminal'];
  fn TEXT; t TEXT;
 BEGIN
  SELECT document INTO STRICT d FROM pg_temp.rollout_provision_input;
- IF (SELECT array_agg(k ORDER BY k) FROM jsonb_object_keys(d) k) IS DISTINCT FROM ARRAY['cache_owner','capability','installation','migrator','operation','operator','owner','previous_operator','runtimes','schema','version']::TEXT[] OR d->>'version'<>'1' OR d->>'operation' NOT IN ('configure','rotate')
+ cache_profile := d ? 'cache_runtime_profile';
+ IF (cache_profile AND d->'cache_runtime_profile' IS DISTINCT FROM 'true'::JSONB)
+ OR (SELECT array_agg(k ORDER BY k) FROM jsonb_object_keys(d - 'cache_runtime_profile') k) IS DISTINCT FROM ARRAY['cache_owner','capability','installation','migrator','operation','operator','owner','previous_operator','runtimes','schema','version']::TEXT[] OR d->>'version'<>'1' OR d->>'operation' NOT IN ('configure','rotate')
  OR jsonb_array_length(d->'runtimes') NOT BETWEEN 1 AND 64 THEN RAISE EXCEPTION 'Invalid provisioning inventory'; END IF;
  s:=(d->>'schema')::NAME;
  IF s::TEXT<>d->>'schema' OR s::TEXT !~ '^[a-z][a-z0-9_]{0,62}$' THEN RAISE EXCEPTION 'Invalid installation schema'; END IF;
@@ -20,10 +24,40 @@ BEGIN
   names:=array_append(names,r.rolname::TEXT);
  END LOOP;
  owner_id:=(d->'owner'->>'oid')::OID; cap:=(d->'capability'->>'name')::NAME; op:=(d->'operator'->>'name')::NAME;
+ cache_owner_id := (d->'cache_owner'->>'oid')::OID;
  IF NOT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname=s AND nspowner=owner_id) OR EXISTS(SELECT 1 FROM pg_namespace n CROSS JOIN LATERAL aclexplode(COALESCE(n.nspacl,acldefault('n',n.nspowner))) a WHERE n.nspname IN (s,'pg_catalog') AND a.privilege_type='CREATE' AND a.grantee<>n.nspowner) THEN RAISE EXCEPTION 'Untrusted installation schema'; END IF;
  -- Serialize all configure/rotation with the existing immutable-installation pointer lock.
  EXECUTE format('SELECT singleton FROM %I.recorded_rollout_active WHERE singleton FOR UPDATE',s) INTO STRICT r;
- IF EXISTS(SELECT 1 FROM pg_auth_members WHERE member IN ((d->'owner'->>'oid')::OID,(d->'cache_owner'->>'oid')::OID,(d->'capability'->>'oid')::OID)) THEN RAISE EXCEPTION 'Owner/capability inheritance forbidden'; END IF;
+ IF EXISTS(SELECT 1 FROM pg_auth_members WHERE member IN (cache_owner_id,(d->'capability'->>'oid')::OID))
+ OR EXISTS(
+  SELECT 1 FROM pg_auth_members WHERE member=owner_id
+   AND (NOT cache_profile OR roleid<>cache_owner_id OR NOT inherit_option OR NOT set_option OR admin_option)
+ ) THEN RAISE EXCEPTION 'Owner/capability inheritance forbidden'; END IF;
+ IF cache_profile THEN
+  -- Recognize only an installed cache candidate's exact ownership posture.
+  -- The cache supplement alone grants this membership.
+  IF (SELECT count(*) FROM pg_auth_members WHERE member=owner_id)<>1
+  OR NOT EXISTS(
+   SELECT 1 FROM pg_proc p
+   WHERE p.oid=to_regprocedure(format('%I.create_cache_generation_partition(bigint)',s))
+     AND p.proowner=owner_id AND p.prosecdef
+     AND p.proconfig=ARRAY[format('search_path=pg_catalog, %I, pg_temp',s)]
+  )
+  OR NOT EXISTS(
+   SELECT 1 FROM pg_class c
+   WHERE c.oid=to_regclass(format('%I.cache_partition_creation_intent',s))
+     AND c.relkind='r' AND c.relowner=owner_id
+  )
+  OR NOT EXISTS(
+   SELECT 1 FROM pg_class c JOIN pg_partitioned_table p ON p.partrelid=c.oid
+   WHERE c.oid=to_regclass(format('%I.cache_entry',s))
+     AND c.relowner=cache_owner_id AND p.partstrat='l'
+  )
+  OR EXISTS(
+   SELECT 1 FROM pg_inherits h JOIN pg_class c ON c.oid=h.inhrelid
+   WHERE h.inhparent=to_regclass(format('%I.cache_entry',s)) AND c.relowner<>cache_owner_id
+  ) THEN RAISE EXCEPTION 'Exact installed cache ownership posture required'; END IF;
+ END IF;
  IF NOT EXISTS(SELECT 1 FROM pg_auth_members WHERE member=(d->'migrator'->>'oid')::OID AND roleid=owner_id AND NOT admin_option AND NOT inherit_option AND set_option)
  OR EXISTS(SELECT 1 FROM pg_auth_members WHERE member=(d->'migrator'->>'oid')::OID AND roleid<>owner_id) THEN RAISE EXCEPTION 'Exact offline migrator SET membership required'; END IF;
  FOR entry IN SELECT value FROM jsonb_array_elements(d->'runtimes') LOOP

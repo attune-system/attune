@@ -967,7 +967,7 @@ async fn cross_database(
 }
 
 // Execute the shipped DBA SQL in the same transaction/temporary-input contract.
-async fn apply_provisioning(f: &Fixture, inventory: &Value) -> sqlx::Result<()> {
+pub(super) async fn apply_provisioning(f: &Fixture, inventory: &Value) -> sqlx::Result<()> {
     let mut tx = f.db.begin().await?;
     sqlx::query("CREATE TEMP TABLE rollout_provision_input(document JSONB) ON COMMIT DROP")
         .execute(&mut *tx)
@@ -984,7 +984,7 @@ async fn apply_provisioning(f: &Fixture, inventory: &Value) -> sqlx::Result<()> 
     sqlx::raw_sql(&sql).execute(&mut *tx).await?;
     tx.commit().await
 }
-pub(super) async fn provisioning_assets(f: &mut Fixture) {
+pub(super) async fn provisioning_assets(f: &mut Fixture) -> (Value, Value) {
     let owner = f.roles[4].clone();
     let mut extra = Vec::new();
     for login in [true, false, true] {
@@ -1049,6 +1049,9 @@ pub(super) async fn provisioning_assets(f: &mut Fixture) {
     apply_provisioning(f, &inventory).await.unwrap();
     apply_provisioning(f, &inventory).await.unwrap();
     let mut wrong = inventory.clone();
+    wrong["cache_runtime_profile"] = json!(true);
+    assert!(apply_provisioning(f, &wrong).await.is_err());
+    wrong = inventory.clone();
     wrong["operator"]["oid"] = json!(0);
     assert!(apply_provisioning(f, &wrong).await.is_err());
     sqlx::query(&format!(
@@ -1100,4 +1103,7 @@ pub(super) async fn provisioning_assets(f: &mut Fixture) {
     inventory["previous_operator"] = ids[6].clone();
     inventory["operator"] = ids[3].clone();
     apply_provisioning(f, &inventory).await.unwrap();
+    inventory["operation"] = json!("configure");
+    inventory["previous_operator"] = Value::Null;
+    (inventory, ids[6].clone())
 }

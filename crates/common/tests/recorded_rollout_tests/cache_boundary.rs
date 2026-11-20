@@ -118,10 +118,18 @@ pub(super) async fn profile(f: &Fixture, maintenance: Option<&str>) {
         let credentials = root.path().join("dba.json");
         let input = root.path().join("inventory.json");
         let mut url = url::Url::parse(f.db.database_url()).unwrap();
+        let sslmode = url
+            .query_pairs()
+            .find(|(key, _)| key == "sslmode")
+            .map_or_else(|| "disable".to_owned(), |(_, value)| value.into_owned());
         url.query_pairs_mut()
             .clear()
-            .append_pair("sslmode", "disable");
-        url.set_password(Some("dummy-owned-dba-file-only")).unwrap();
+            .append_pair("sslmode", &sslmode);
+        if url.password().is_none() {
+            // The owned local trust lane has no configured password. The
+            // driver still requires an explicit password in the input file.
+            url.set_password(Some("dummy-owned-dba-file-only")).unwrap();
+        }
         for (path, value) in [
             (&credentials, json!({"database_url":url.as_str()})),
             (&input, inventory.clone()),
