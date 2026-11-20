@@ -21,11 +21,11 @@ establishing coordinated production startup or successful queue execution.
 | Worker completion | worker `executor.rs`, common staged completion and worker-delivery repositories | worker `support/recorded_completion_cases.rs`, recorded restoration tests |
 | Native executor consumers | executor scheduler, retry manager, workflow/native common repositories | common native materialization, retry and outcome cases plus executor consumer tests |
 
-Production enqueue, dispatch, scheduling and retry paths currently call the
-unready default. Worker construction also defaults to unready; its readiness
-builder has no production caller. Replacing these calls requires evidence and a
-coordinated startup contract. Missing recorded evidence must never select an
-older delegated credential or ambient service identity.
+Managed enqueue and dispatch require a complete current rollout and the local
+session's binding to that rollout. Scheduling and retry still use the unready
+default, and worker construction has no production caller for its recorded
+readiness builder. Missing recorded evidence must never select an older
+delegated credential or ambient service identity.
 
 ### Current startup and compatibility gaps
 
@@ -42,11 +42,15 @@ older delegated credential or ambient service identity.
   routes, but a marker alone does not prove the route's data-origin, revocation
   or commit/delivery fences. API health exposes catalog compatibility rather
   than a coordinated recorded-consumer handshake.
-- Notifier source and notification checks retain independent authorization and
-  delivery fences. Their presence does not establish API, worker or executor
-  support, and there is no shared startup handshake between these services.
-- Queue admission, dispatch, scheduling and retry still deny through default
-  readiness. The API also retains its explicit recorded enqueue rejection.
+- Notifier startup publishes only its own delivery observation through the
+  candidate transport. The API, worker and executor still need their own
+  local observations and validation.
+- Managed queue admission and dispatch check the aggregate under their write
+  transactions, before materialization and again before commit. Scheduling,
+  retry and recorded ad hoc enqueue still deny through their existing gates.
+- Managed dispatch control settings such as Key-backed batch size still need
+  admission evidence before the executor can report support. The current
+  resolver reads these settings from the live queue projection.
 
 The [coordinated authority cutover](../deployment/postgresql-only.md#execution-authority-cutover)
 requires compatible service releases before admission resumes. Any production
@@ -89,7 +93,11 @@ existing PostgreSQL installation. The candidate is outside the migration ledger.
   and current catalog, using a single database clock sample. The repository runs
   the exact membership validator, requiring every replica. The transaction
   holds the active rollout and catalog row locks so they cannot switch underneath
-  the effect that uses the evidence.
+  the effect that uses the evidence. A service uses its authenticated boot
+  identity when requesting an effect check. The database reader returns its
+  actual session binding, and the repository checks that it matches the local
+  snapshot, role, instance, and boot. A login with only the evidence reader
+  grant can inspect the aggregate without authorizing an effect.
 - The tables have no service-owned DML grants. Binding uses the DBA connection,
   and reporter login identity relies on `session_user` plus the exact catalog
   role identity. Runtime evidence cannot stage or activate a rollout. A valid

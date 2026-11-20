@@ -1689,13 +1689,14 @@ async fn queue_payload_editors(
 
 async fn enqueue_queue_item_in_transaction(
     state: &Arc<AppState>,
-    connection: &mut PgConnection,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     queue: &WorkQueue,
     user: &AuthenticatedUser,
     requested_by_identity: Option<i64>,
     inherited_trace_tag: Option<&str>,
     request: EnqueueWorkQueueItemRequest,
 ) -> ApiResult<EnqueueQueueItemResult> {
+    let connection = &mut **transaction;
     attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
         &mut *connection,
     )
@@ -2009,6 +2010,31 @@ async fn enqueue_queue_item_in_transaction(
             "Delegated queue execution output encryption is unavailable".into(),
         ));
     }
+    let readiness_missing = || {
+        ApiError::NotImplemented(
+            "Recorded queue sponsorship requires coordinated runtime readiness".into(),
+        )
+    };
+    if recorded_ad_hoc {
+        return Err(readiness_missing());
+    }
+    let managed_identity = if queue.is_adhoc {
+        None
+    } else {
+        let identity = state
+            .recorded_consumer_identity
+            .as_deref()
+            .ok_or_else(readiness_missing)?;
+        identity
+            .require_current(
+                transaction,
+                attune_common::execution_authority::consumer_contract::ConsumerRole::Api,
+            )
+            .await
+            .map_err(|_| readiness_missing())?;
+        Some(identity)
+    };
+    let connection = &mut **transaction;
     let item = WorkQueueItemRepository::create_bound_pinned(
         &mut *connection,
         CreateWorkQueueItemInput {
@@ -2035,26 +2061,7 @@ async fn enqueue_queue_item_in_transaction(
         &binding,
     )
     .await?;
-    if recorded_ad_hoc || !queue.is_adhoc {
-        return Err(ApiError::NotImplemented(
-            "Recorded queue sponsorship requires coordinated runtime readiness".into(),
-        ));
-    }
-    if recorded_ad_hoc {
-        use attune_common::repositories::ad_hoc_queue_admission::AdHocQueueSource;
-        let source = AdHocQueueSource::Execution(requested_by_execution.ok_or_else(|| {
-            ApiError::Forbidden("Recorded item source execution unavailable".into())
-        })?);
-        attune_common::repositories::ad_hoc_queue_admission::AdHocQueueAdmissionRepository::accept(
-            connection, queue, &item, source, &snapshot,
-        )
-        .await?;
-        if recorded_ad_hoc {
-            attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::copy(connection, "execution", requested_by_execution.ok_or_else(|| ApiError::Forbidden("Recorded item source execution unavailable".into()))?, "queue_item", item.id).await?;
-        } else {
-            attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::capture_human(connection, "queue_item", item.id, requested_by_identity.ok_or_else(|| ApiError::Unauthorized("Item requester unavailable".into()))?).await?;
-        }
-    } else if !queue.is_adhoc {
+    if let Some(identity) = managed_identity {
         let actor = requested_by_identity
             .filter(|_| user.claims.token_type == TokenType::Access)
             .map(
@@ -2063,7 +2070,8 @@ async fn enqueue_queue_item_in_transaction(
                     login: user.login().to_string(),
                 },
             );
-        attune_common::repositories::execution_admission::ExecutionAdmissionRepository::admit_queue_item(connection, queue, &item, actor, &snapshot).await?;
+        attune_common::repositories::execution_admission::ExecutionAdmissionRepository::admit_queue_item(transaction, Some(identity), queue, &item, actor, &snapshot).await?;
+        let connection = &mut **transaction;
         if user.claims.token_type == TokenType::Access {
             attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::capture_human(connection, "queue_item", item.id, requested_by_identity.ok_or_else(|| ApiError::Unauthorized("Input requester unavailable".into()))?).await?;
         } else if let Some(parent) = requested_by_execution {
@@ -2072,6 +2080,7 @@ async fn enqueue_queue_item_in_transaction(
     } else {
         attune_common::repositories::delegated_execution::DelegatedExecutionRepository::accept_queue_item(connection,queue,&item,&snapshot).await?;
     }
+    let connection = &mut **transaction;
     if !queue.is_adhoc {
         attune_common::repositories::queue_configuration_input::QueueConfigurationInputRepository::capture(
             connection, queue, &item, &snapshot,
@@ -2084,6 +2093,15 @@ async fn enqueue_queue_item_in_transaction(
 
     if let Some(fence) = &effect_fence {
         fence.ensure_fresh_on(connection).await?;
+    }
+    if let Some(identity) = managed_identity {
+        identity
+            .require_current(
+                transaction,
+                attune_common::execution_authority::consumer_contract::ConsumerRole::Api,
+            )
+            .await
+            .map_err(|_| readiness_missing())?;
     }
     Ok(EnqueueQueueItemResult {
         item,

@@ -270,6 +270,7 @@ impl ExecutorService {
     /// Start the executor service
     pub async fn start(&self) -> Result<()> {
         info!("Starting Executor Service");
+        let recorded_identity = attune_common::repositories::recorded_consumer_observations::RecordedConsumerIdentity::from_environment()?;
 
         // Spawn message consumers
         let mut handles: Vec<JoinHandle<Result<()>>> = Vec::new();
@@ -600,6 +601,7 @@ impl ExecutorService {
             self.inner.pool.clone(),
             self.inner.publisher.clone(),
             self.inner.config.security.encryption_key.clone(),
+            recorded_identity,
         );
         handles.push(tokio::spawn(async move { queue_dispatcher.start().await }));
 

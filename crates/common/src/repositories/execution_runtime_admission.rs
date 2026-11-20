@@ -508,7 +508,8 @@ impl ExecutionAdmissionRepository {
     /// Called in the enqueue transaction after the item's immutable executable
     /// has been selected. Attribution is supplied by authenticated server code.
     pub async fn admit_queue_item(
-        connection: &mut PgConnection,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        identity: Option<&super::recorded_consumer_observations::RecordedConsumerIdentity>,
         queue: &crate::models::WorkQueue,
         item: &crate::models::WorkQueueItem,
         actor: Option<crate::runtime_authority::HumanAttribution>,
@@ -517,7 +518,18 @@ impl ExecutionAdmissionRepository {
         if queue.is_adhoc {
             return Ok(());
         }
-        crate::execution_authority::RecordedConsumerReadiness::default().require_ready()?;
+        identity
+            .ok_or_else(|| {
+                Error::PermissionDenied(
+                    "Recorded queue sponsorship requires coordinated admission".into(),
+                )
+            })?
+            .require_current(
+                transaction,
+                crate::execution_authority::consumer_contract::ConsumerRole::Api,
+            )
+            .await?;
+        let connection = &mut **transaction;
         if item.queue != queue.id
             || item.queue_ref != queue.r#ref
             || item.pack_release != Some(snapshot.release.id)

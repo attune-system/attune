@@ -1167,9 +1167,10 @@ async fn accepted_mixed_requester_queue_keeps_policy_and_attribution_after_human
             identity_id: identity,
             login: format!("historical-{identity}"),
         });
-        let denied = Admission::admit_queue_item(&mut tx, &queue, &item, actor.clone(), &snapshot)
-            .await
-            .unwrap_err();
+        let denied =
+            Admission::admit_queue_item(&mut tx, None, &queue, &item, actor.clone(), &snapshot)
+                .await
+                .unwrap_err();
         assert!(denied.to_string().contains("coordinated admission"));
         let written: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM work_queue_item_runtime_admission WHERE item=$1",

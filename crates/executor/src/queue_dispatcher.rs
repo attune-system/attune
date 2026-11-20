@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use attune_common::{
+    execution_authority::consumer_contract::ConsumerRole,
     models::{
         enums::{ExecutionStatus, WorkQueueDispatchStatus, WorkQueueItemStatus},
         key::Key,
@@ -22,6 +23,7 @@ use attune_common::{
         execution_secret_value::ExecutionSecretValueRepository,
         key::KeyRepository,
         pack::PackRepository,
+        recorded_consumer_observations::RecordedConsumerIdentity,
         work_queue::{
             CreateWorkQueueDispatchInput, LeaseWorkQueueItemsInput, ReleaseWorkQueueLeaseInput,
             UpdateWorkQueueDispatchInput, WorkQueueDispatchRepository,
@@ -93,15 +95,22 @@ pub struct WorkQueueDispatcher {
     pool: PgPool,
     publisher: Arc<Publisher>,
     encryption_key: Option<String>,
+    recorded_identity: Option<RecordedConsumerIdentity>,
     config: QueueDispatcherConfig,
 }
 
 impl WorkQueueDispatcher {
-    pub fn new(pool: PgPool, publisher: Arc<Publisher>, encryption_key: Option<String>) -> Self {
+    pub fn new(
+        pool: PgPool,
+        publisher: Arc<Publisher>,
+        encryption_key: Option<String>,
+        recorded_identity: Option<RecordedConsumerIdentity>,
+    ) -> Self {
         Self {
             pool,
             publisher,
             encryption_key,
+            recorded_identity,
             config: QueueDispatcherConfig::default(),
         }
     }
@@ -318,8 +327,22 @@ impl WorkQueueDispatcher {
     }
 
     async fn dispatch_ready_batches_for_queue(&self, queue: &WorkQueue) -> Result<()> {
-        let context =
-            Self::resolve_queue_context(&self.pool, self.encryption_key.as_deref(), queue).await?;
+        let encryption_key = self.encryption_key.as_deref();
+        let context = if queue.is_adhoc {
+            let mut connection = self.pool.acquire().await?;
+            Self::resolve_queue_context(&mut connection, encryption_key, queue).await?
+        } else {
+            let Some(identity) = &self.recorded_identity else {
+                return Ok(());
+            };
+            let mut tx = self.pool.begin().await?;
+            identity
+                .require_current(&mut tx, ConsumerRole::Executor)
+                .await?;
+            let context = Self::resolve_queue_context(&mut tx, encryption_key, queue).await?;
+            tx.commit().await?;
+            context
+        };
         let active_dispatches =
             WorkQueueDispatchRepository::count_active_for_queue(&self.pool, queue.id).await?;
 
@@ -353,15 +376,7 @@ impl WorkQueueDispatcher {
 
         let open_slots = context.concurrency - active_dispatches;
         for _ in 0..open_slots {
-            let Some(dispatch) = Self::prepare_next_dispatch(
-                &self.pool,
-                self.encryption_key.as_deref(),
-                queue,
-                &context,
-                self.config.lease_duration,
-            )
-            .await?
-            else {
+            let Some(dispatch) = self.prepare_next_dispatch(queue, &context).await? else {
                 break;
             };
 
@@ -372,16 +387,16 @@ impl WorkQueueDispatcher {
     }
 
     async fn resolve_queue_context(
-        pool: &PgPool,
+        connection: &mut sqlx::PgConnection,
         encryption_key: Option<&str>,
         queue: &WorkQueue,
     ) -> Result<ResolvedQueueContext> {
         // Action lifecycle is checked at enqueue admission. Deferred work uses
         // its pinned executable; ordinary disablement is not cancellation.
         let pack = if let Some(pack_id) = queue.pack {
-            PackRepository::find_by_id(pool, pack_id).await?
+            PackRepository::find_by_id(&mut *connection, pack_id).await?
         } else if let Some(pack_ref) = &queue.pack_ref {
-            PackRepository::find_by_ref(pool, pack_ref).await?
+            PackRepository::find_by_ref(&mut *connection, pack_ref).await?
         } else {
             None
         };
@@ -390,7 +405,7 @@ impl WorkQueueDispatcher {
             .with_context(|| format!("invalid config persisted for queue '{}'", queue.r#ref))?;
 
         let concurrency = Self::resolve_u32_tunable(
-            pool,
+            connection,
             encryption_key,
             pack.as_ref(),
             parsed_config
@@ -408,7 +423,7 @@ impl WorkQueueDispatcher {
             1
         } else {
             Self::resolve_u32_tunable(
-                pool,
+                connection,
                 encryption_key,
                 pack.as_ref(),
                 parsed_config
@@ -441,7 +456,7 @@ impl WorkQueueDispatcher {
     }
 
     async fn resolve_u32_tunable(
-        pool: &PgPool,
+        connection: &mut sqlx::PgConnection,
         encryption_key: Option<&str>,
         pack: Option<&Pack>,
         tunable: Option<&WorkQueueTunableValue>,
@@ -453,29 +468,25 @@ impl WorkQueueDispatcher {
             return Ok(default);
         };
 
-        let resolved = Self::resolve_tunable_value(pool, encryption_key, pack, tunable).await?;
+        let resolved =
+            Self::resolve_tunable_value(connection, encryption_key, pack, tunable).await?;
         let parsed_resolved = resolved.as_ref().and_then(Self::parse_positive_u32);
         let parsed = parsed_resolved
             .or_else(|| tunable.fallback.as_ref().and_then(Self::parse_positive_u32))
             .unwrap_or(default);
 
-        if parsed == default && parsed_resolved.is_none() {
-            if let Some(resolved_value) = resolved.as_ref() {
-                warn!(
-                    "Queue '{}' resolved non-positive/non-integer {} tunable {}, falling back to {}",
-                    queue.r#ref,
-                    name,
-                    resolved_value,
-                    default
-                );
-            }
+        if parsed == default && parsed_resolved.is_none() && resolved.is_some() {
+            warn!(
+                "Queue '{}' resolved an invalid {} tunable, falling back to {}",
+                queue.r#ref, name, default
+            );
         }
 
         Ok(parsed)
     }
 
     async fn resolve_tunable_value(
-        pool: &PgPool,
+        connection: &mut sqlx::PgConnection,
         encryption_key: Option<&str>,
         pack: Option<&Pack>,
         tunable: &WorkQueueTunableValue,
@@ -494,7 +505,7 @@ impl WorkQueueDispatcher {
                 let Some(key_ref) = tunable.key_ref.as_deref() else {
                     return Ok(tunable.fallback.clone());
                 };
-                let key = KeyRepository::find_by_ref(pool, key_ref).await?;
+                let key = KeyRepository::find_by_ref(connection, key_ref).await?;
                 match key {
                     Some(key) => {
                         let value = Self::resolve_key_value(&key, encryption_key)?;
@@ -555,12 +566,11 @@ impl WorkQueueDispatcher {
     }
 
     async fn prepare_next_dispatch(
-        pool: &PgPool,
-        encryption_key: Option<&str>,
+        &self,
         queue: &WorkQueue,
         context: &ResolvedQueueContext,
-        lease_duration: Duration,
     ) -> Result<Option<PreparedDispatch>> {
+        let encryption_key = self.encryption_key.as_deref();
         let batch_limit = if queue.batch_mode == attune_common::models::WorkQueueBatchMode::Single {
             1
         } else {
@@ -569,12 +579,23 @@ impl WorkQueueDispatcher {
 
         let lease_token = Uuid::new_v4();
         let lease_expires_at = Utc::now()
-            + chrono::Duration::from_std(lease_duration)
+            + chrono::Duration::from_std(self.config.lease_duration)
                 .unwrap_or_else(|_| chrono::Duration::hours(24));
 
-        let mut tx = pool.begin().await?;
+        let mut tx = self.pool.begin().await?;
         attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
             .await?;
+        let managed_identity = if queue.is_adhoc {
+            None
+        } else {
+            let identity = self.recorded_identity.as_ref().ok_or_else(|| {
+                anyhow!("Recorded queue dispatch requires coordinated runtime readiness")
+            })?;
+            identity
+                .require_current(&mut tx, ConsumerRole::Executor)
+                .await?;
+            Some(identity)
+        };
         let mut items = WorkQueueItemRepository::lease_next_batch(
             &mut *tx,
             LeaseWorkQueueItemsInput {
@@ -674,11 +695,12 @@ impl WorkQueueDispatcher {
             ));
         }
         let dispatch_action = &dispatch_snapshot.executable.action;
-        let recorded = !queue.is_adhoc || attune_common::repositories::execution_admission::ExecutionAdmissionRepository::has_queue_item_admission(&mut tx, &items).await?;
-        if recorded {
+        let recorded_ad_hoc = queue.is_adhoc && attune_common::repositories::execution_admission::ExecutionAdmissionRepository::has_queue_item_admission(&mut tx, &items).await?;
+        if recorded_ad_hoc {
             attune_common::execution_authority::RecordedConsumerReadiness::default()
                 .require_ready()?;
         }
+        let recorded = managed_identity.is_some() || recorded_ad_hoc;
         let admission = if recorded {
             Some(attune_common::repositories::execution_admission::ExecutionAdmissionRepository::queue_batch(&mut tx, queue, &items, &dispatch_snapshot).await?)
         } else {
@@ -1079,6 +1101,11 @@ impl WorkQueueDispatcher {
         }
         for receipt in &input_receipts {
             receipt.ensure_fresh_on(&mut tx).await?;
+        }
+        if let Some(identity) = managed_identity {
+            identity
+                .require_current(&mut tx, ConsumerRole::Executor)
+                .await?;
         }
         tx.commit().await?;
         for receipt in &input_receipts {

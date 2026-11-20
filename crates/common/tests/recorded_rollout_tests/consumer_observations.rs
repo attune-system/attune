@@ -1,7 +1,9 @@
 //! PostgreSQL authorization and freshness boundaries for the candidate transport.
 use super::*;
 use attune_common::repositories::{
-    recorded_consumer_observations::RecordedConsumerObservations as Observations,
+    recorded_consumer_observations::{
+        RecordedConsumerIdentity, RecordedConsumerObservations as Observations,
+    },
     rollout_admin::RolloutAdminRepository,
 };
 use futures::FutureExt;
@@ -182,6 +184,43 @@ async fn exercise(f: &mut Fixture) {
         .await
         .unwrap();
     assert!(evidence_ready(&reader).await);
+
+    let first_name: String = sqlx::query_scalar("SELECT session_user::TEXT")
+        .fetch_one(first_login)
+        .await
+        .unwrap();
+    let permit =
+        format!("GRANT EXECUTE ON FUNCTION current_recorded_consumer_evidence() TO {first_name}");
+    sqlx::query(&permit).execute(&*f.db).await.unwrap();
+    let local = |member: &ExpectedMember| -> RecordedConsumerIdentity {
+        serde_json::from_value(serde_json::json!({
+            "snapshot": expected.snapshot,
+            "instance": member.instance,
+            "boot": member.boot,
+        }))
+        .unwrap()
+    };
+    let first_identity = local(first);
+    let mut tx = first_login.begin().await.unwrap();
+    first_identity
+        .require_current(&mut tx, first.role)
+        .await
+        .unwrap();
+    assert!(local(peer)
+        .require_current(&mut tx, first.role)
+        .await
+        .is_err());
+    assert!(first_identity
+        .require_current(&mut tx, ConsumerRole::Executor)
+        .await
+        .is_err());
+    tx.rollback().await.unwrap();
+    let mut tx = reader.begin().await.unwrap();
+    assert!(first_identity
+        .require_current(&mut tx, first.role)
+        .await
+        .is_err());
+    tx.rollback().await.unwrap();
 
     // An active manifest only describes this catalog revision.
     sqlx::query("UPDATE platform_catalog_state SET revision=revision+1 WHERE singleton")

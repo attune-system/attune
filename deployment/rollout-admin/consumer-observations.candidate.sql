@@ -131,6 +131,7 @@ DECLARE
     expected JSONB;
     cutoff TIMESTAMPTZ;
     observations JSONB;
+    caller JSONB;
 BEGIN
     SELECT * INTO STRICT active FROM recorded_rollout_active WHERE singleton FOR SHARE;
     SELECT g.expected INTO expected
@@ -161,8 +162,14 @@ BEGIN
             SELECT 1 FROM pg_auth_members WHERE member = principal.oid OR roleid = principal.oid
         );
 
+    SELECT jsonb_build_object('instance', b.instance, 'boot', b.boot, 'role', b.role,
+        'required_mask', b.required_mask) INTO caller
+    FROM recorded_consumer_binding AS b
+    JOIN pg_roles AS principal ON principal.oid = b.reporter_oid AND principal.rolname = b.reporter
+    WHERE b.rollout = active.generation AND b.reporter = session_user;
+
     RETURN jsonb_build_object('expected', expected, 'observations', observations, 'now', cutoff,
-        'revision', active.revision);
+        'revision', active.revision, 'caller', caller);
 END $read$;
 
 REVOKE ALL ON FUNCTION bind_recorded_consumer(UUID, UUID, UUID, NAME),

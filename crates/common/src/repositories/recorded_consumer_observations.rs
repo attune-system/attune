@@ -8,7 +8,8 @@ use uuid::Uuid;
 
 use crate::execution_authority::consumer_contract::{
     validate_consumer_contracts, ConsumerRole, ContractFreshnessPolicy, ContractSnapshot,
-    ExpectedMembership, RecordedAuthorityConsumerContract, ValidatedConsumerContractSnapshot,
+    ExpectedMember, ExpectedMembership, RecordedAuthorityConsumerContract,
+    ValidatedConsumerContractSnapshot,
 };
 use crate::{Error, Result};
 
@@ -21,6 +22,7 @@ struct DatabaseEvidence {
     observations: Vec<RecordedAuthorityConsumerContract>,
     now: DateTime<Utc>,
     revision: i64,
+    caller: Option<ExpectedMember>,
 }
 
 /// Operator-supplied identity for this process boot. The database pool's
@@ -75,6 +77,30 @@ impl RecordedConsumerIdentity {
             ready_role,
         )
         .await
+    }
+
+    /// Check the aggregate under the effect transaction and require this
+    /// service's actual database session to be its exact admitted member.
+    /// A reader-only login or a sibling boot cannot use the aggregate.
+    pub async fn require_current(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        role: ConsumerRole,
+    ) -> Result<ValidatedConsumerContractSnapshot> {
+        let evidence = RecordedConsumerObservations::read(transaction).await?;
+        if evidence.expected.snapshot != self.snapshot
+            || evidence.caller.as_ref().is_none_or(|caller| {
+                caller.instance != self.instance
+                    || caller.boot != self.boot
+                    || caller.role != role
+                    || caller.required_mask != role.allowed_gate_mask()
+            })
+        {
+            return Err(Error::PermissionDenied(
+                "Recorded consumer session does not match active rollout member".into(),
+            ));
+        }
+        evidence.validate()
     }
 }
 
@@ -184,18 +210,27 @@ impl RecordedConsumerObservations {
     pub async fn require_current(
         transaction: &mut Transaction<'_, Postgres>,
     ) -> Result<ValidatedConsumerContractSnapshot> {
+        Self::read(transaction).await?.validate()
+    }
+
+    async fn read(transaction: &mut Transaction<'_, Postgres>) -> Result<DatabaseEvidence> {
         let evidence: Option<sqlx::types::Json<DatabaseEvidence>> =
             sqlx::query_scalar("SELECT current_recorded_consumer_evidence()")
                 .fetch_one(&mut **transaction)
                 .await?;
-        let evidence = evidence
+        evidence
             .map(|value| value.0)
             .filter(|value| value.revision > 0)
-            .ok_or_else(|| Error::PermissionDenied("No compatible active rollout".into()))?;
+            .ok_or_else(|| Error::PermissionDenied("No compatible active rollout".into()))
+    }
+}
+
+impl DatabaseEvidence {
+    fn validate(self) -> Result<ValidatedConsumerContractSnapshot> {
         validate_consumer_contracts(
-            Some(&evidence.expected),
-            &evidence.observations,
-            evidence.now,
+            Some(&self.expected),
+            &self.observations,
+            self.now,
             ContractFreshnessPolicy {
                 window: TimeDelta::seconds(OBSERVATION_WINDOW_SECONDS),
                 max_clock_skew: TimeDelta::zero(),
