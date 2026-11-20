@@ -13,7 +13,7 @@ import {
   useParams,
   useSearchParams,
 } from "react-router-dom";
-import yaml from "js-yaml";
+import { dump } from "js-yaml";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -1266,7 +1266,7 @@ export default function DashboardEditorPage() {
 
   const yamlText = useMemo(
     () =>
-      yaml.dump(dashboardDocumentToYamlObject(draft), {
+      dump(dashboardDocumentToYamlObject(draft), {
         noRefs: true,
         lineWidth: 120,
         sortKeys: false,

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import yaml from "js-yaml";
+import { dump, load } from "js-yaml";
 import {
   builderStateToDefinition,
   builderStateToGraph,
@@ -155,7 +155,7 @@ describe("finite workflow target conversion", () => {
         },
       },
     });
-    const exported: unknown = yaml.load(yaml.dump(graph));
+    const exported: unknown = load(dump(graph));
     expect(exported).toEqual(graph);
     const reopened = definitionToBuilderState(saved, "example", "flow");
     expect(builderStateToGraph(reopened)).toEqual(graph);
