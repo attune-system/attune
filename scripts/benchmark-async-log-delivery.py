@@ -3,7 +3,9 @@
 import argparse
 import hashlib
 import re
-import os, sys, json, time, uuid, signal, shutil, socket, subprocess, urllib.request, urllib.error
+import os, sys, json, time, uuid, signal, shutil, socket, subprocess
+from contextlib import contextmanager
+from http.client import HTTPConnection
 from pathlib import Path
 import yaml
 ROOT=Path(__file__).resolve().parents[1]
@@ -51,19 +53,54 @@ def until(fn,seconds,desc):
         try:
             value=fn()
             if value:return value
-        except (OSError,urllib.error.URLError,subprocess.CalledProcessError):pass
+        except (OSError,subprocess.CalledProcessError):pass
         time.sleep(.5)
     raise TimeoutError(desc)
 def pg(sql):
     return capture(['docker','exec','-e','PGAPPNAME=echo-validation-monitor',cid('postgres'),'psql','-X','-U','attune','-d','attune','-At','-v','ON_ERROR_STOP=1','-c','SET search_path TO attune,public; '+sql]).removeprefix('SET\n')
-def request(path,data=None,token=None,method=None):
-    headers={'Content-Type':'application/json'}
-    if token:headers['Authorization']='Bearer '+token
-    req=urllib.request.Request(BASE+path,data=json.dumps(data).encode() if data is not None else None,headers=headers,method=method)
+@contextmanager
+def api_response(path, *, data=None, headers=None, method=None, timeout=30):
+    if not path.startswith('/') or path.startswith('//'):
+        raise ValueError('Expected an absolute path on the benchmark API')
+    connection = HTTPConnection('127.0.0.1', apiport, timeout=timeout)
     try:
-        with urllib.request.urlopen(req,timeout=30) as r:return json.load(r)
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f'{path}: {e.code}: {e.read().decode()[:2000]}')
+        connection.request(method or ('POST' if data is not None else 'GET'),
+                           path, body=data, headers=headers or {})
+        with connection.getresponse() as response:
+            if 300 <= response.status < 400:
+                raise RuntimeError(f'{path}: unexpected redirect (HTTP {response.status})')
+            yield response
+    finally:
+        connection.close()
+
+
+def request(path, data=None, token=None, method=None):
+    headers = {'Content-Type': 'application/json'}
+    if token:
+        headers['Authorization'] = 'Bearer ' + token
+    body = json.dumps(data).encode() if data is not None else None
+    with api_response(path, data=body, headers=headers, method=method) as response:
+        if response.status >= 400:
+            detail = response.read().decode()[:2000]
+            raise RuntimeError(f'{path}: {response.status}: {detail}')
+        return json.load(response)
+
+
+def publication_request(url, **kwargs):
+    if not url.startswith(BASE + '/'):
+        raise ValueError('Expected a URL on the benchmark API')
+    return api_response(url.removeprefix(BASE), timeout=180, **kwargs)
+
+
+def finite_status(version, token):
+    path = (f"/api/v1/artifacts/{version['artifact']}/versions/{version['version']}"
+            f"/download?version_id={version['id']}")
+    with api_response(path, headers={'Authorization': 'Bearer ' + token}) as response:
+        if response.status >= 400:
+            return response.status, json.load(response).get('code')
+        return response.status, response.read().decode()
+
+
 def start(name,config,extra=None):
     if name=='worker':
         worker_values=yaml.safe_load(config.read_text())
@@ -128,8 +165,6 @@ try:
     run(['docker','exec','-e','DB_HOST=127.0.0.1',cid('postgres'),'sh','/tmp/init-user.sh'])
     access=request('/auth/login',{'login':'test@attune.local','password':'TestPass123!'})['data']['access_token']
     sys.path.insert(0,str(ROOT/'scripts')); import bootstrap_core_pack
-    def publication_request(url, **kwargs):
-        return urllib.request.build_opener(bootstrap_core_pack.NoApiRedirects()).open(urllib.request.Request(url, **kwargs), timeout=180)
     bootstrap_core_pack.request = publication_request
     bootstrap_core_pack.upload(BASE,access,packs/'core')
     start('notifier',cfg); start('executor',cfg); worker_process=start('worker',cfg)
@@ -247,16 +282,11 @@ try:
         until(lambda:pg('SELECT status::text FROM execution WHERE id='+str(execution))=='completed',10,'echo completion during held delivery')
         intent=json.loads(pg('SELECT row_to_json(i) FROM (SELECT artifact_version,custody,state,finalize_by FROM log_delivery_intent WHERE execution='+str(execution)+') i'))
         return execution,intent
-    def finite_status(version):
-        req=urllib.request.Request(BASE+'/api/v1/artifacts/'+str(version['artifact'])+'/versions/'+str(version['version'])+'/download?version_id='+str(version['id']),headers={'Authorization':'Bearer '+access})
-        try:
-            with urllib.request.urlopen(req,timeout=30) as response:return response.status,response.read().decode()
-        except urllib.error.HTTPError as response:return response.code,json.load(response).get('code')
     def version_for(execution):return json.loads(pg('SELECT row_to_json(v) FROM (SELECT id,artifact,version FROM artifact_version WHERE execution='+str(execution)+') v'))
     (OUT/'worker.log').rename(OUT/'worker-asynchronous.log')
     restart_worker()
     execution,intent=echo();version=version_for(execution)
-    assert finite_status(version)==(409,'LOG_FINALIZING')
+    assert finite_status(version,access)==(409,'LOG_FINALIZING')
     assert pg('SELECT log_delivery_pinned('+str(version['id'])+'),file_evidence_version_eligible_without_log_delivery('+str(version['id'])+'),file_evidence_version_eligible('+str(version['id'])+')')=='t|t|f','custody must independently retain a pending version before close selection'
     assert pg('SELECT file_evidence_request_cleanup(ARRAY['+str(version['id'])+']::bigint[])')=='{}','the supervisor cleanup admission must honor active custody'
     assert pg("SELECT NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='log_delivery_intent'::regclass AND contype='f' AND confrelid IN ('execution'::regclass,'worker'::regclass,'identity'::regclass))")=='t','log custody must not pin runtime/identity retention'
@@ -264,14 +294,14 @@ try:
     restart_worker(kill=True);blocked.clear()
     until(lambda:pg('SELECT body_state::text FROM artifact_version WHERE id='+str(version['id']))=='ready',30,'spool recovery and seal')
     assert pg('SELECT result::text FROM execution WHERE id='+str(execution))==preserved
-    assert 'async-log-custody-fault' in finite_status(version)[1]
+    assert 'async-log-custody-fault' in finite_status(version,access)[1]
     print('Persistent-spool restart recovery passed',flush=True)
     blocked.set();execution,intent=echo();version=version_for(execution);preserved=pg('SELECT result::text FROM execution WHERE id='+str(execution))
     os.killpg(worker_process.pid,signal.SIGKILL);worker_process.wait(timeout=10);procs.remove(worker_process)
     spool=OUT/'runtime-envs'/'.log-delivery';spool.rename(OUT/'lost-spool-volume')
     worker_process=start('worker',cfg,{'ATTUNE_API_URL':f'http://127.0.0.1:{proxy.server_port}'})
     until(lambda:pg('SELECT state FROM log_delivery_intent WHERE artifact_version='+str(version['id']))=='incomplete',30,'missing spool custody diagnosis')
-    assert finite_status(version)==(409,'LOG_INCOMPLETE')
+    assert finite_status(version,access)==(409,'LOG_INCOMPLETE')
     assert pg('SELECT result::text FROM execution WHERE id='+str(execution))==preserved
     print('Lost-volume incomplete-log diagnosis passed',flush=True)
     blocked.set()
@@ -280,12 +310,12 @@ try:
     until(lambda:pg('SELECT state FROM log_delivery_intent WHERE artifact_version='+str(version['id']))=='ready',30,'lost seal acknowledgement reconciliation')
     assert not drop_seal_reply.is_set(),'fault must intercept a successful real seal'
     assert pg('SELECT count(*) FROM log_segment WHERE stream=(SELECT id FROM log_stream WHERE artifact_version='+str(version['id'])+')')=='1'
-    assert 'async-log-custody-fault' in finite_status(version)[1]
+    assert 'async-log-custody-fault' in finite_status(version,access)[1]
     until(lambda:not any((OUT/'runtime-envs'/'.log-delivery').glob('*/'+str(version['id'])+'.spool')),10,'acknowledged spool cleanup')
     print('Lost seal acknowledgement reconciliation passed',flush=True)
     blocked.set();execution,intent=echo();version=version_for(execution);preserved=pg('SELECT result::text FROM execution WHERE id='+str(execution))
     until(lambda:pg('SELECT finalize_by<=clock_timestamp() FROM log_delivery_intent WHERE artifact_version='+str(version['id']))=='t',75,'authoritative delivery deadline')
-    assert finite_status(version)==(409,'LOG_INCOMPLETE')
+    assert finite_status(version,access)==(409,'LOG_INCOMPLETE')
     assert pg('SELECT result::text FROM execution WHERE id='+str(execution))==preserved
     until(lambda:pg('SELECT state FROM log_delivery_intent WHERE artifact_version='+str(version['id']))=='incomplete',10,'expired delivery settlement')
     blocked.clear()
