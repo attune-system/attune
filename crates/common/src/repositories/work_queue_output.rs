@@ -190,7 +190,7 @@ impl WorkQueueOutputRepository {
     ) -> Result<()> {
         use super::{
             execution_admission::ExecutionAdmissionRepository as Admission,
-            runtime_authority::RuntimeOwner,
+            runtime_authority::RuntimeOwner, ExecutionRepository, FindById,
         };
         let denied = || {
             Error::PermissionDenied("Recorded queue acknowledgement producer is unavailable".into())
@@ -198,14 +198,30 @@ impl WorkQueueOutputRepository {
         accepted.ensure_fresh_on(conn).await?;
         let execution = accepted.execution;
         let admission = Admission::require(conn, RuntimeOwner::Execution(execution)).await?;
-        let closed: Option<Id> = sqlx::query_scalar(
-            "SELECT e.id FROM execution e JOIN worker_delivery_context c ON c.execution=e.id \
-             JOIN runtime_authority_execution_fence f ON f.execution=e.id AND f.admission=c.admission \
-             JOIN execution_runtime_read_fence r ON r.admission=f.admission \
-             WHERE e.id=$1 AND c.admission=$2 AND e.worker=c.worker AND c.attempt=f.attempt AND r.closed \
-             AND e.status IN ('completed','failed','cancelled','timeout','abandoned') \
-             FOR SHARE OF e,c,f,r",
-        ).bind(execution).bind(admission.id).fetch_optional(&mut *conn).await?;
+        let snapshot = ExecutionRepository::find_by_id(&mut *conn, execution)
+            .await?
+            .and_then(|row| row.executable_snapshot)
+            .ok_or_else(denied)?
+            .executable;
+        let closed: Option<Id> = match (snapshot.action.workflow_def, snapshot.workflow_definition) {
+            (None, None) => sqlx::query_scalar(
+                "SELECT e.id FROM execution e JOIN worker_delivery_context c ON c.execution=e.id \
+                 JOIN runtime_authority_execution_fence f ON f.execution=e.id AND f.admission=c.admission \
+                 JOIN execution_runtime_read_fence r ON r.admission=f.admission \
+                 WHERE e.id=$1 AND c.admission=$2 AND e.worker=c.worker AND c.attempt=f.attempt AND r.closed \
+                 AND e.status IN ('completed','failed','cancelled','timeout','abandoned') \
+                 FOR SHARE OF e,c,f,r",
+            ).bind(execution).bind(admission.id).fetch_optional(&mut *conn).await?,
+            (Some(definition), Some(snapshot)) if snapshot.id == definition => sqlx::query_scalar(
+                "SELECT e.id FROM execution e JOIN workflow_execution w ON w.execution=e.id \
+                 JOIN execution_runtime_read_fence r ON r.admission=$2 \
+                 WHERE e.id=$1 AND w.workflow_def=$3 AND e.worker IS NULL AND r.closed \
+                 AND e.status=w.status AND e.status IN ('completed','failed','cancelled','timeout','abandoned') \
+                 AND NOT EXISTS(SELECT 1 FROM worker_delivery_context c WHERE c.execution=e.id) \
+                 FOR SHARE OF e,w,r",
+            ).bind(execution).bind(admission.id).bind(definition).fetch_optional(&mut *conn).await?,
+            _ => return Err(denied()),
+        };
         if closed.is_none() {
             return Err(denied());
         }

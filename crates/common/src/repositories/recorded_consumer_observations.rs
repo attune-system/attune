@@ -196,6 +196,89 @@ impl RecordedConsumerIdentity {
 pub struct RecordedConsumerObservations;
 
 impl RecordedConsumerObservations {
+    /// Check access on the API's admitted queue writes, runtime provenance and
+    /// exact artifact delivery paths before reporting the installed consumer.
+    pub async fn api_access_available(connection: &mut PgConnection) -> Result<bool> {
+        sqlx::query_scalar(
+            "SELECT NOT EXISTS (
+                SELECT 1
+                FROM (
+                    VALUES
+                      ('execution_authority_selection', ARRAY['SELECT'], TRUE),
+                      ('runtime_authority_admission', ARRAY['SELECT','INSERT'], TRUE),
+                      ('runtime_authority_execution_fence', ARRAY['SELECT'], TRUE),
+                      ('runtime_input_receipt', ARRAY['SELECT','INSERT'], TRUE),
+                      ('execution_secret_value', ARRAY['SELECT','INSERT','DELETE'], TRUE),
+                      ('execution_runtime_read_fence', ARRAY['SELECT','INSERT'], TRUE),
+                      ('execution_runtime_read_origin', ARRAY['SELECT','INSERT'], TRUE),
+                      ('execution_key_read_origin', ARRAY['SELECT','INSERT'], FALSE),
+                      ('key', ARRAY['SELECT','INSERT','UPDATE','DELETE'], TRUE),
+                      ('work_queue', ARRAY['SELECT'], TRUE),
+                      ('work_queue_item', ARRAY['SELECT','INSERT','UPDATE'], TRUE),
+                      ('work_queue_item_runtime_admission', ARRAY['SELECT','INSERT'], TRUE),
+                      ('work_queue_item_configuration_input', ARRAY['SELECT','INSERT'], TRUE),
+                      ('recorded_execution_input_authority', ARRAY['SELECT','INSERT'], TRUE),
+                      ('artifact', ARRAY['SELECT','INSERT','UPDATE','DELETE'], TRUE),
+                      ('artifact_version', ARRAY['SELECT','INSERT','UPDATE'], TRUE),
+                      ('artifact_runtime_owner_binding', ARRAY['SELECT','INSERT'], TRUE),
+                      ('artifact_file_body', ARRAY['SELECT','INSERT','UPDATE'], TRUE),
+                      ('artifact_file_origin', ARRAY['SELECT','INSERT'], TRUE),
+                      ('worker_delivery_context', ARRAY['SELECT'], TRUE),
+                      ('worker_delivery_permit', ARRAY['SELECT'], TRUE),
+                      ('log_stream', ARRAY['SELECT','INSERT','UPDATE'], TRUE)
+                ) AS required(name, privileges, locked)
+                CROSS JOIN LATERAL unnest(required.privileges) AS privilege(name)
+                WHERE to_regclass(required.name) IS NULL
+                    OR NOT has_table_privilege(current_user, to_regclass(required.name), privilege.name)
+                    OR required.locked AND NOT has_any_column_privilege(
+                        current_user, to_regclass(required.name), 'UPDATE'
+                    )
+            )",
+        )
+        .fetch_one(connection)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Rights used by dispatch, native workflow effects and protected item
+    /// completion. The subscription proof is verified independently in the
+    /// executor that runs those paths.
+    pub async fn executor_access_available(connection: &mut PgConnection) -> Result<bool> {
+        sqlx::query_scalar(
+            "SELECT NOT EXISTS (
+                SELECT 1
+                FROM (
+                    VALUES
+                      ('execution', ARRAY['SELECT','INSERT','UPDATE'], TRUE),
+                      ('execution_authority_selection', ARRAY['SELECT','INSERT'], TRUE),
+                      ('runtime_authority_admission', ARRAY['SELECT','INSERT'], TRUE),
+                      ('runtime_accepted_batch_manifest', ARRAY['SELECT','INSERT'], FALSE),
+                      ('runtime_accepted_batch_item', ARRAY['SELECT','INSERT'], FALSE),
+                      ('recorded_queue_execution_input', ARRAY['SELECT','INSERT'], TRUE),
+                      ('runtime_input_receipt', ARRAY['SELECT','INSERT'], TRUE),
+                      ('execution_secret_value', ARRAY['SELECT','INSERT','DELETE'], TRUE),
+                      ('execution_runtime_read_fence', ARRAY['SELECT','INSERT','UPDATE'], TRUE),
+                      ('worker_delivery_context', ARRAY['SELECT'], TRUE),
+                      ('workflow_execution', ARRAY['SELECT','INSERT','UPDATE'], TRUE),
+                      ('workflow_task_wait', ARRAY['SELECT','INSERT','UPDATE'], TRUE),
+                      ('work_queue', ARRAY['SELECT'], TRUE),
+                      ('work_queue_item', ARRAY['SELECT','UPDATE'], TRUE),
+                      ('work_queue_dispatch', ARRAY['SELECT','INSERT','UPDATE'], TRUE),
+                      ('work_queue_item_configuration_input', ARRAY['SELECT'], TRUE)
+                ) AS required(name, privileges, locked)
+                CROSS JOIN LATERAL unnest(required.privileges) AS privilege(name)
+                WHERE to_regclass(required.name) IS NULL
+                    OR NOT has_table_privilege(current_user, to_regclass(required.name), privilege.name)
+                    OR required.locked AND NOT has_any_column_privilege(
+                        current_user, to_regclass(required.name), 'UPDATE'
+                    )
+            )",
+        )
+        .fetch_one(connection)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Check the database access used by the notifier's recorded source and
     /// target fences before renewing its observation. PostgreSQL row locks
     /// require UPDATE on at least one column even when the query is a read.

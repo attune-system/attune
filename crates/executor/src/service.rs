@@ -38,6 +38,14 @@ use crate::scheduler::{ExecutionScheduler, SchedulerMetadataCaches};
 use crate::timeout_monitor::{ExecutionTimeoutMonitor, TimeoutMonitorConfig};
 use crate::workflow::log::WorkflowLogDispatcher;
 
+use attune_common::{
+    execution_authority::consumer_contract::ConsumerRole,
+    mq::consumer::SubscriptionObservation,
+    repositories::recorded_consumer_observations::{
+        RecordedConsumerIdentity, RecordedConsumerObservations,
+    },
+};
+
 const WORKFLOW_LOG_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Main executor service that orchestrates execution processing
@@ -270,7 +278,8 @@ impl ExecutorService {
     /// Start the executor service
     pub async fn start(&self) -> Result<()> {
         info!("Starting Executor Service");
-        let recorded_identity = attune_common::repositories::recorded_consumer_observations::RecordedConsumerIdentity::from_environment()?.map(Arc::new);
+        let recorded_identity = RecordedConsumerIdentity::from_environment()?.map(Arc::new);
+        let mut recorded_subscriptions = recorded_identity.as_ref().map(|_| Vec::new());
 
         // Spawn message consumers
         let mut handles: Vec<JoinHandle<Result<()>>> = Vec::new();
@@ -322,7 +331,7 @@ impl ExecutorService {
         let event_processor = EventProcessor::new(
             self.inner.pool.clone(),
             self.inner.publisher.clone(),
-            Arc::new(event_consumer),
+            Self::observe_subscription(event_consumer, &mut recorded_subscriptions),
             self.inner.config.security.encryption_key.clone(),
         );
         handles.push(tokio::spawn(async move { event_processor.start().await }));
@@ -350,7 +359,7 @@ impl ExecutorService {
         .await?;
         let completion_listener = CompletionListener::new(
             self.inner.pool.clone(),
-            Arc::new(completion_consumer),
+            Self::observe_subscription(completion_consumer, &mut recorded_subscriptions),
             self.inner.publisher.clone(),
             self.inner.queue_manager.clone(),
             self.inner.config.artifacts_dir.clone(),
@@ -388,7 +397,7 @@ impl ExecutorService {
         let enforcement_processor = EnforcementProcessor::new(
             self.inner.pool.clone(),
             self.inner.publisher.clone(),
-            Arc::new(enforcement_consumer),
+            Self::observe_subscription(enforcement_consumer, &mut recorded_subscriptions),
             self.inner.policy_enforcer.clone(),
             self.inner.queue_manager.clone(),
             self.inner.config.security.encryption_key.clone(),
@@ -421,7 +430,7 @@ impl ExecutorService {
         let scheduler = ExecutionScheduler::new(
             self.inner.pool.clone(),
             self.inner.publisher.clone(),
-            Arc::new(scheduler_consumer),
+            Self::observe_subscription(scheduler_consumer, &mut recorded_subscriptions),
             self.inner.policy_enforcer.clone(),
             self.inner.config.artifacts_dir.clone(),
             self.inner.config.security.encryption_key.clone(),
@@ -457,7 +466,7 @@ impl ExecutorService {
         let execution_manager = ExecutionManager::new(
             self.inner.pool.clone(),
             self.inner.publisher.clone(),
-            Arc::new(manager_consumer),
+            Self::observe_subscription(manager_consumer, &mut recorded_subscriptions),
             self.inner.config.security.encryption_key.clone(),
         );
         handles.push(tokio::spawn(async move { execution_manager.start().await }));
@@ -486,7 +495,7 @@ impl ExecutorService {
         let inquiry_handler = InquiryHandler::new(
             self.inner.pool.clone(),
             self.inner.publisher.clone(),
-            Arc::new(inquiry_consumer),
+            Self::observe_subscription(inquiry_consumer, &mut recorded_subscriptions),
             self.inner.config.security.encryption_key.clone(),
         );
         handles.push(tokio::spawn(async move { inquiry_handler.start().await }));
@@ -602,7 +611,7 @@ impl ExecutorService {
             self.inner.pool.clone(),
             self.inner.publisher.clone(),
             self.inner.config.security.encryption_key.clone(),
-            recorded_identity,
+            recorded_identity.clone(),
         );
         handles.push(tokio::spawn(async move { queue_dispatcher.start().await }));
 
@@ -649,12 +658,17 @@ impl ExecutorService {
 
         // Wait for shutdown signal
         let mut shutdown_rx = self.inner.shutdown_tx.subscribe();
+        let mut observations = Box::pin(self.observe_recorded_executor(
+            recorded_identity.as_deref(),
+            recorded_subscriptions.as_deref().unwrap_or_default(),
+        ));
         let mut dispatcher_failure = None;
         let dispatcher_finished = tokio::select! {
             _ = shutdown_rx.recv() => {
                 info!("Shutdown signal received");
                 false
             }
+            () = observations.as_mut() => unreachable!("recorded observation loop returned"),
             result = Self::wait_for_tasks(handles) => {
                 match result {
                     Ok(_) => info!("All tasks completed"),
@@ -680,6 +694,7 @@ impl ExecutorService {
                 true
             }
         };
+        drop(observations);
 
         if dispatcher_finished {
             let shutdown_was_requested = matches!(
@@ -694,6 +709,9 @@ impl ExecutorService {
         }
 
         let _ = self.inner.shutdown_tx.send(());
+        if let Some(identity) = &recorded_identity {
+            self.publish_recorded_executor(identity, false).await;
+        }
         if !dispatcher_finished {
             match tokio::time::timeout(WORKFLOW_LOG_SHUTDOWN_TIMEOUT, &mut workflow_log_handle)
                 .await
@@ -714,6 +732,67 @@ impl ExecutorService {
             return Err(error);
         }
         Ok(())
+    }
+
+    fn observe_subscription(
+        consumer: Consumer,
+        subscriptions: &mut Option<Vec<SubscriptionObservation>>,
+    ) -> Arc<Consumer> {
+        if let Some(subscriptions) = subscriptions {
+            let (consumer, observation) = consumer.with_subscription_observation();
+            subscriptions.push(observation);
+            Arc::new(consumer)
+        } else {
+            Arc::new(consumer)
+        }
+    }
+
+    async fn observe_recorded_executor(
+        &self,
+        identity: Option<&RecordedConsumerIdentity>,
+        subscriptions: &[SubscriptionObservation],
+    ) {
+        let Some(identity) = identity else {
+            return std::future::pending().await;
+        };
+        let configured = self
+            .inner
+            .config
+            .security
+            .encryption_key
+            .as_ref()
+            .is_some_and(|key| key.trim().len() >= 32);
+        let mut ticks = tokio::time::interval(std::time::Duration::from_secs(5));
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticks.tick().await;
+            let ready = configured
+                && subscriptions.len() == 6
+                && subscriptions
+                    .iter()
+                    .all(SubscriptionObservation::is_current);
+            self.publish_recorded_executor(identity, ready).await;
+        }
+    }
+
+    async fn publish_recorded_executor(
+        &self,
+        identity: &RecordedConsumerIdentity,
+        installed: bool,
+    ) {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut connection = self.inner.pool.acquire().await?;
+            let ready = installed
+                && self.inner.publisher.channel().await.status().connected()
+                && RecordedConsumerObservations::executor_access_available(&mut connection).await?;
+            identity
+                .publish(&mut connection, ready.then_some(ConsumerRole::Executor))
+                .await
+        })
+        .await;
+        if !matches!(result, Ok(Ok(()))) {
+            warn!("Unable to update the recorded executor observation");
+        }
     }
 
     /// Stop the executor service

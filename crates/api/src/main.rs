@@ -417,7 +417,7 @@ async fn run() -> Result<()> {
         audit_emitter,
     ).with_recorded_consumer_identity(recorded_identity));
     info!("Checking blob storage exact-version operations");
-    state.blob_store.preflight().await?;
+    state.verify_blob_store().await?;
     info!("Blob storage preflight passed");
 
     let upgrade = upgrade_legacy_pack_releases(

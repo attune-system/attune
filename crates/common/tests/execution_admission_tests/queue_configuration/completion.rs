@@ -34,76 +34,7 @@ async fn recorded_queue_completion_uses_the_closed_worker_and_accepted_settings(
     )
     .await;
     let mut tx = db.begin().await.unwrap();
-    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
-        .await
-        .unwrap();
-    let queue =
-        WorkQueueRepository::find_by_ref(&mut *tx, &format!("{}.inbox", policy.owner.pack_ref))
-            .await
-            .unwrap()
-            .unwrap();
-    let queue = WorkQueueRepository::update(
-        &mut *tx,
-        queue.id,
-        UpdateWorkQueueInput {
-            config: Some(json!({"ack_contract":{"version":2},"dispatch":{"retry_limit":3}})),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    let revision = Authority::capture_policy(&mut tx, &policy).await.unwrap();
-    Authority::activate_policy(&mut tx, revision.id)
-        .await
-        .unwrap();
-    let item = accepted_record(&mut tx, &queue, &snapshot, human, json!({})).await;
-    let admission = Admission::queue_batch(&mut tx, &queue, std::slice::from_ref(&item), &snapshot)
-        .await
-        .unwrap();
-    let execution = ExecutionRepository::create_pinned(
-        &mut *tx,
-        CreateExecutionInput {
-            action: Some(snapshot.executable.action.id),
-            action_ref: snapshot.executable.action.r#ref.clone(),
-            permission_set_refs: admission.authority().selected_refs.clone(),
-            status: ExecutionStatus::Requested,
-            ..Default::default()
-        },
-        &snapshot,
-    )
-    .await
-    .unwrap();
-    let record = admission
-        .attach(&mut tx, RuntimeOwner::Execution(execution.id))
-        .await
-        .unwrap();
-    let binding = SchemaContractRepository::materialize_action_pair(&mut tx, &snapshot)
-        .await
-        .unwrap();
-    SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, execution.id, &binding)
-        .await
-        .unwrap();
-    let items = WorkQueueItemRepository::lease_next_batch(
-        &mut *tx,
-        LeaseWorkQueueItemsInput {
-            queue: queue.id,
-            ready_statuses: vec![WorkQueueItemStatus::Queued],
-            limit: 1,
-            separate_requesters: false,
-            batch_coalescing: None,
-            leased_execution: Some(execution.id),
-            lease_token: Uuid::new_v4(),
-            lease_expires_at: Utc::now() + Duration::minutes(5),
-        },
-    )
-    .await
-    .unwrap();
-    Contributors::capture_queue_execution(&mut tx, execution.id, &[item.id])
-        .await
-        .unwrap();
-    Batch::capture_managed(&mut tx, record.id, &queue, &items, None, QUEUE_KEY)
-        .await
-        .unwrap();
+    let (queue, execution, items) = admit_and_lease(&mut tx, &snapshot, &policy, human).await;
     let worker = WorkerRepository::create(
         &mut *tx,
         CreateWorkerInput {
@@ -287,4 +218,158 @@ async fn recorded_queue_completion_uses_the_closed_worker_and_accepted_settings(
         .contains("dummy-ack-secret"));
     terminal.rollback().await.unwrap();
     db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn recorded_queue_workflow_requires_its_closed_native_producer() {
+    use attune_common::repositories::{
+        runtime_read::RuntimeReadRepository,
+        workflow::{
+            CreateWorkflowExecutionInput, UpdateWorkflowExecutionInput, WorkflowExecutionRepository,
+        },
+    };
+    let db = create_test_pool().await.unwrap();
+    let (db, snapshot, policy, human) =
+        fixture_with_queue_shape(db, false, false, None, false, false, None).await;
+    let definition = snapshot.executable.workflow_definition.as_ref().unwrap();
+    let mut tx = db.begin().await.unwrap();
+    let (queue, execution, items) = admit_and_lease(&mut tx, &snapshot, &policy, human).await;
+    let workflow = WorkflowExecutionRepository::create(
+        &mut *tx,
+        CreateWorkflowExecutionInput {
+            execution: execution.id,
+            workflow_def: definition.id,
+            task_graph: definition.definition.clone(),
+            variables: json!({}),
+            status: ExecutionStatus::Running,
+        },
+    )
+    .await
+    .unwrap();
+    let accepted = Output::accepted_completion_config(&mut tx, &queue, &execution, &items)
+        .await
+        .unwrap();
+    assert!(Output::require_closed_recorded_producer(&mut tx, &accepted)
+        .await
+        .is_err());
+    let result =
+        json!({"queue_ack":{"version":2,"items":[{"id":items[0].id,"status":"completed"}]}});
+    RuntimeReadRepository::close_execution(&mut tx, execution.id)
+        .await
+        .unwrap();
+    ExecutionRepository::update(
+        &mut *tx,
+        execution.id,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Completed),
+            result: Some(result),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(Output::require_closed_recorded_producer(&mut tx, &accepted)
+        .await
+        .is_err());
+    WorkflowExecutionRepository::update(
+        &mut *tx,
+        workflow.id,
+        UpdateWorkflowExecutionInput {
+            status: Some(ExecutionStatus::Completed),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let (ack, frontier) = Output::recorded_ack_controls(&mut tx, &accepted, None)
+        .await
+        .unwrap();
+    let ProtectedQueueAck::Controls(ack) = ack else {
+        panic!("native acknowledgement expected")
+    };
+    assert_eq!(ack.items[0].id, items[0].id);
+    frontier.ensure_fresh_on(&mut tx).await.unwrap();
+    tx.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+async fn admit_and_lease(
+    conn: &mut sqlx::PgConnection,
+    snapshot: &ExecutionExecutableSnapshot,
+    policy: &RuntimePolicy,
+    human: i64,
+) -> (
+    attune_common::models::WorkQueue,
+    attune_common::models::Execution,
+    Vec<attune_common::models::WorkQueueItem>,
+) {
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(conn)
+        .await
+        .unwrap();
+    let queue =
+        WorkQueueRepository::find_by_ref(&mut *conn, &format!("{}.inbox", policy.owner.pack_ref))
+            .await
+            .unwrap()
+            .unwrap();
+    let queue = WorkQueueRepository::update(
+        &mut *conn,
+        queue.id,
+        UpdateWorkQueueInput {
+            config: Some(json!({"ack_contract":{"version":2},"dispatch":{"retry_limit":3}})),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let revision = Authority::capture_policy(conn, policy).await.unwrap();
+    Authority::activate_policy(conn, revision.id).await.unwrap();
+    let item = accepted_record(conn, &queue, snapshot, human, json!({})).await;
+    let admission = Admission::queue_batch(conn, &queue, std::slice::from_ref(&item), snapshot)
+        .await
+        .unwrap();
+    let execution = ExecutionRepository::create_pinned(
+        &mut *conn,
+        CreateExecutionInput {
+            action: Some(snapshot.executable.action.id),
+            action_ref: snapshot.executable.action.r#ref.clone(),
+            permission_set_refs: admission.authority().selected_refs.clone(),
+            status: ExecutionStatus::Requested,
+            ..Default::default()
+        },
+        snapshot,
+    )
+    .await
+    .unwrap();
+    let record = admission
+        .attach(conn, RuntimeOwner::Execution(execution.id))
+        .await
+        .unwrap();
+    let binding = SchemaContractRepository::materialize_action_pair(conn, snapshot)
+        .await
+        .unwrap();
+    SchemaContractRepository::attach(conn, BindingOwner::Execution, execution.id, &binding)
+        .await
+        .unwrap();
+    let items = WorkQueueItemRepository::lease_next_batch(
+        &mut *conn,
+        LeaseWorkQueueItemsInput {
+            queue: queue.id,
+            ready_statuses: vec![WorkQueueItemStatus::Queued],
+            limit: 1,
+            separate_requesters: false,
+            batch_coalescing: None,
+            leased_execution: Some(execution.id),
+            lease_token: Uuid::new_v4(),
+            lease_expires_at: Utc::now() + Duration::minutes(5),
+        },
+    )
+    .await
+    .unwrap();
+    Contributors::capture_queue_execution(conn, execution.id, &[item.id])
+        .await
+        .unwrap();
+    Batch::capture_managed(conn, record.id, &queue, &items, None, QUEUE_KEY)
+        .await
+        .unwrap();
+    (queue, execution, items)
 }
