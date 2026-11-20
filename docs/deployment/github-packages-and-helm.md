@@ -233,6 +233,36 @@ See the
 for supported values, existing Secret requirements, external-service profiles,
 and storage configuration.
 
+### Login disclosure and branding
+
+```yaml
+security:
+  loginDisclosure: |-
+    Authorized use only.
+    Follow your organization's acceptable use policy.
+branding:
+  logoUrl: https://assets.example.com/attune/logo.svg
+  iconUrl: https://assets.example.com/attune/icon.svg
+  faviconUrl: /branding/favicon.png
+  workflowWatermarkUrl: /branding/workflow-watermark.svg
+```
+
+On install and upgrade, the chart writes these optional settings to the
+application ConfigMap. The API reads them at startup. The disclosure is public
+plain text. The web app shows it above the sign-in controls, and
+`attune auth login`, `sso-login`, and `token-login` write it to stderr before
+authentication. The notice is informational.
+
+Serve branding images at public HTTPS URLs or absolute paths on the Attune web
+origin. The logo appears on the sign-in page and expanded sidebar. The compact
+sidebar uses `iconUrl` and falls back to `logoUrl` when supplied. The browser tab
+uses `faviconUrl`. Supplying a custom logo or compact icon hides the built-in
+workflow watermark unless `workflowWatermarkUrl` is supplied.
+
+For deployments outside Helm, set `security.login_disclosure` and the `branding`
+fields in [Attune's configuration file](../../config.example.yaml). Restart the
+API after changing the file. Reload the web app to load the updated settings.
+
 ## Release sequence
 
 1. Push the workflow changes.

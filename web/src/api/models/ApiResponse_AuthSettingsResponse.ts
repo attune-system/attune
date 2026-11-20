@@ -2,18 +2,23 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { BrandingConfig } from "./BrandingConfig";
 /**
  * Standard API response wrapper
  */
 export type ApiResponse_AuthSettingsResponse = {
   /**
-   * Public authentication settings for the login page.
+   * Public authentication and branding settings for the installation.
    */
   data: {
     /**
      * Whether authentication is enabled for the server.
      */
     authentication_enabled: boolean;
+    /**
+     * Installation branding for the web UI.
+     */
+    branding: BrandingConfig;
     /**
      * Whether LDAP login is configured and enabled.
      */
@@ -42,6 +47,10 @@ export type ApiResponse_AuthSettingsResponse = {
      * Whether local username/password login should be shown by default.
      */
     local_password_visible_by_default: boolean;
+    /**
+     * Plain-text disclosure to show before login, when configured.
+     */
+    login_disclosure?: string | null;
     /**
      * Whether OIDC login is configured and enabled.
      */

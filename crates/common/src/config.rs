@@ -395,6 +395,9 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub allow_self_registration: bool,
 
+    /// Optional public, plain-text notice shown before login.
+    pub login_disclosure: Option<String>,
+
     /// Login page visibility defaults for the web UI.
     #[serde(default)]
     pub login_page: LoginPageConfig,
@@ -439,6 +442,47 @@ impl Default for LoginPageConfig {
             show_oidc_login: true,
             show_ldap_login: true,
         }
+    }
+}
+
+/// Public image URLs for installation branding in the web UI.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct BrandingConfig {
+    /// Logo for the sign-in page and expanded sidebar.
+    pub logo_url: Option<String>,
+    /// Compact logo for the collapsed sidebar.
+    pub icon_url: Option<String>,
+    /// Browser tab icon.
+    pub favicon_url: Option<String>,
+    /// Tiled watermark for the workflow builder canvas.
+    pub workflow_watermark_url: Option<String>,
+}
+
+impl BrandingConfig {
+    fn validate(&self) -> crate::Result<()> {
+        for (field, value) in [
+            ("logo_url", &self.logo_url),
+            ("icon_url", &self.icon_url),
+            ("favicon_url", &self.favicon_url),
+            ("workflow_watermark_url", &self.workflow_watermark_url),
+        ] {
+            if let Some(value) = value {
+                let same_origin_path = value.starts_with('/') && !value.starts_with("//");
+                let https_url = value.starts_with("https://")
+                    && url::Url::parse(value).is_ok_and(|url| {
+                        url.has_host() && url.username().is_empty() && url.password().is_none()
+                    });
+                if (!same_origin_path && !https_url)
+                    || value.contains('\\')
+                    || value.chars().any(|c| c.is_whitespace() || c.is_control())
+                {
+                    return Err(crate::Error::validation(format!(
+                        "branding.{field} must be a same-origin absolute path or an HTTPS URL without credentials"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2035,6 +2079,10 @@ pub struct Config {
     #[serde(default)]
     pub security: SecurityConfig,
 
+    /// Operator-provided web branding.
+    #[serde(default)]
+    pub branding: BrandingConfig,
+
     /// Worker configuration (optional, for worker services)
     pub worker: Option<WorkerConfig>,
 
@@ -2331,6 +2379,7 @@ impl Default for SecurityConfig {
             encryption_key: None,
             enable_auth: true,
             allow_self_registration: false,
+            login_disclosure: None,
             login_page: LoginPageConfig::default(),
             oidc: None,
             ldap: None,
@@ -2463,6 +2512,7 @@ impl Config {
 
     /// Validate configuration
     pub fn validate(&self) -> crate::Result<()> {
+        self.branding.validate()?;
         self.packs.republish.validate()?;
         self.artifacts.validate_file_memory()?;
         if let Some(worker) = &self.worker {
@@ -2958,6 +3008,7 @@ mod tests {
             server: ServerConfig::default(),
             log: LogConfig::default(),
             security: SecurityConfig::default(),
+            branding: BrandingConfig::default(),
             worker: None,
             sensor: None,
             packs_base_dir: default_packs_base_dir(),
@@ -3508,10 +3559,12 @@ mod tests {
                 encryption_key: Some("a".repeat(32)),
                 enable_auth: true,
                 allow_self_registration: false,
+                login_disclosure: None,
                 login_page: LoginPageConfig::default(),
                 oidc: None,
                 ldap: None,
             },
+            branding: BrandingConfig::default(),
             worker: None,
             sensor: None,
             packs_base_dir: default_packs_base_dir(),
@@ -3575,6 +3628,7 @@ mod tests {
                 encryption_key: Some("a".repeat(32)),
                 ..SecurityConfig::default()
             },
+            branding: BrandingConfig::default(),
             worker: None,
             sensor: None,
             packs_base_dir: default_packs_base_dir(),
@@ -3798,6 +3852,26 @@ provider_icon_url: "https://corp.com/icon.svg"
         let cfg: LoginPageConfig = serde_yaml_ng::from_str("{}").unwrap();
 
         assert!(cfg.show_ldap_login);
+    }
+
+    #[test]
+    fn installation_branding_accepts_only_browser_image_locations() {
+        for (url, valid) in [
+            ("/branding/favicon.png", true),
+            ("https://assets.example/attune/logo.svg?revision=2", true),
+            ("https://user:secret@assets.example/logo.svg", false),
+            ("http://assets.example/logo.svg", false),
+            ("//assets.example/logo.svg", false),
+            ("/\\assets.example/logo.svg", false),
+            ("/branding/invalid\nlogo.svg", false),
+            ("data:image/png;base64,...", false),
+        ] {
+            let branding = BrandingConfig {
+                logo_url: Some(url.into()),
+                ..BrandingConfig::default()
+            };
+            assert_eq!(branding.validate().is_ok(), valid, "{url}");
+        }
     }
 
     #[test]

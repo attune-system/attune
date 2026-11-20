@@ -124,10 +124,10 @@ async fn device_login_timeout_is_bounded_and_does_not_save_tokens() {
         std::fs::read_to_string(&fixture.config_path).unwrap(),
         before
     );
-    assert_eq!(
-        fixture.mock_server.received_requests().await.unwrap().len(),
-        1
-    );
+    let requests = fixture.mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].url.path(), "/auth/settings");
+    assert_eq!(requests[1].url.path(), "/auth/oidc/device/start");
 }
 
 #[cfg(target_os = "linux")]
@@ -644,6 +644,14 @@ async fn check_login_token_output(sso: bool) {
             ),
         )
         .unwrap();
+        Mock::given(method("GET"))
+            .and(path("/auth/settings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+                "login_disclosure": "Authorized users only.\r\nRead the policy.\u{1b}"
+            }})))
+            .expect(1)
+            .mount(&fixture.mock_server)
+            .await;
         if sso {
             mock_device_login(
                 &fixture,
@@ -674,6 +682,9 @@ async fn check_login_token_output(sso: bool) {
             .assert()
             .success()
             .stdout("new-exported-access\n")
+            .stderr(predicate::str::starts_with(
+                "Login disclosure\n\nAuthorized users only.\nRead the policy.\n",
+            ))
             .stderr(predicate::str::contains("new-exported-access").not())
             .stderr(predicate::str::contains("never-export-refresh").not());
 
@@ -868,7 +879,8 @@ async fn ldap_login_supports_print_access_token() {
     Mock::given(method("GET"))
         .and(path("/auth/settings"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
-            "local_password_enabled": false, "ldap_enabled": true
+            "local_password_enabled": false, "ldap_enabled": true,
+            "login_disclosure": "Directory users only."
         }})))
         .mount(&fixture.mock_server)
         .await;
@@ -896,6 +908,7 @@ async fn ldap_login_supports_print_access_token() {
         .assert()
         .success()
         .stdout("ldap-access\n")
+        .stderr(predicate::str::contains("Directory users only."))
         .stderr(predicate::str::contains("ldap-refresh").not());
     assert_eq!(
         load_test_config(&fixture).profiles["default"]
@@ -903,4 +916,46 @@ async fn ldap_login_supports_print_access_token() {
             .as_deref(),
         Some("ldap")
     );
+}
+
+#[tokio::test]
+async fn token_login_disclosure_stays_off_json_stdout() {
+    let fixture = TestFixture::new().await;
+    fixture.write_default_config();
+    Mock::given(method("GET"))
+        .and(path("/auth/settings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+            "login_disclosure": "Authorized users only."
+        }})))
+        .expect(1)
+        .mount(&fixture.mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/auth/token-login"))
+        .and(body_json(json!({"token":"integration-token"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+            "access_token":"access", "refresh_token":"refresh", "expires_in":3600
+        }})))
+        .expect(1)
+        .mount(&fixture.mock_server)
+        .await;
+
+    let result = token_output_command(&fixture)
+        .args([
+            "--json",
+            "auth",
+            "token-login",
+            "--token",
+            "integration-token",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Authorized users only."));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&result.get_output().stdout).unwrap(),
+        json!({"expires_in":3600})
+    );
+    let requests = fixture.mock_server.received_requests().await.unwrap();
+    assert_eq!(requests[0].url.path(), "/auth/settings");
+    assert!(!requests[0].headers.contains_key("authorization"));
 }

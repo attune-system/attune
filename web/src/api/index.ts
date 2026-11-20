@@ -98,6 +98,7 @@ export type { AuthErrorDetail } from "./models/AuthErrorDetail";
 export type { AuthErrorResponse } from "./models/AuthErrorResponse";
 export type { AuthoredGrantConstraints } from "./models/AuthoredGrantConstraints";
 export { AuthorizationBasis } from "./models/AuthorizationBasis";
+export type { BrandingConfig } from "./models/BrandingConfig";
 export type { BuildInfo } from "./models/BuildInfo";
 export type { BuildPackEnvsRequest } from "./models/BuildPackEnvsRequest";
 export type { BuildPackEnvsResponse } from "./models/BuildPackEnvsResponse";

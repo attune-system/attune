@@ -674,6 +674,7 @@ mod tests {
             server: attune_common::config::ServerConfig::default(),
             log: attune_common::config::LogConfig::default(),
             security: attune_common::config::SecurityConfig::default(),
+            branding: attune_common::config::BrandingConfig::default(),
             worker: Some(
                 serde_json::from_value(json!({
                     "capabilities": {"runtimes": ["python"]}

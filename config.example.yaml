@@ -108,6 +108,11 @@ security:
   # Enable authentication
   enable_auth: true
 
+  # Optional public, plain-text notice displayed before web and CLI login.
+  # login_disclosure: |-
+  #   Authorized use only.
+  #   Follow your organization's acceptable use policy.
+
   # Login page defaults for the web UI. Users can still override with:
   #   /login?auth=direct
   #   /login?auth=<provider_name>
@@ -168,6 +173,14 @@ security:
     danger_skip_tls_verify: false
     provider_name: ldap
     provider_label: Company LDAP
+
+# Optional installation branding. Use public HTTPS URLs or absolute paths on
+# the Attune web origin. Browsers load these images directly.
+# branding:
+#   logo_url: https://assets.example.com/attune/logo.svg
+#   icon_url: https://assets.example.com/attune/icon.svg
+#   favicon_url: /branding/favicon.png
+#   workflow_watermark_url: /branding/workflow-watermark.svg
 
 # Worker configuration (optional, for worker services)
 # Uncomment and configure if running worker processes

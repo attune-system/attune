@@ -143,6 +143,34 @@ struct LoginRequest {
     password: String,
 }
 
+#[derive(Default, Deserialize)]
+struct LoginSettings {
+    login_disclosure: Option<String>,
+    local_password_enabled: Option<bool>,
+    ldap_enabled: Option<bool>,
+}
+
+async fn show_login_disclosure(client: &mut ApiClient) -> LoginSettings {
+    let settings = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.get::<LoginSettings>("/auth/settings"),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_default();
+    if let Some(disclosure) = &settings.login_disclosure {
+        let text: String = disclosure
+            .chars()
+            .filter(|c| matches!(c, '\n' | '\t') || !c.is_control())
+            .collect();
+        if !text.trim().is_empty() {
+            eprintln!("Login disclosure\n\n{text}\n");
+        }
+    }
+    settings
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct TokenLoginRequest {
     token: String,
@@ -300,12 +328,13 @@ async fn handle_sso_login(
     let mut anonymous_config = config.clone();
     anonymous_config.current_profile_mut()?.clear_credentials();
     anonymous_config.ephemeral_auth = true;
-    let client = ApiClient::from_config_with_timeout(
+    let mut client = ApiClient::from_config_with_timeout(
         &anonymous_config,
         &Some(base_api_url.clone()),
         // A successful poll can perform four sequential ten-second provider requests.
         Duration::from_secs(60),
     )?;
+    show_login_disclosure(&mut client).await;
     let authorization: DeviceAuthorizationResponse = client
         .post_anonymous("/auth/oidc/device/start", &serde_json::json!({}))
         .await?;
@@ -558,6 +587,11 @@ async fn handle_login(
     let mut login_config = config.clone();
     login_config.current_profile = target_profile_name.clone();
 
+    login_config.current_profile_mut()?.clear_credentials();
+    login_config.ephemeral_auth = true;
+    let mut client = ApiClient::from_config(&login_config, api_url)?;
+    let settings = show_login_disclosure(&mut client).await;
+
     let password = match password {
         Some(p) => p,
         None => dialoguer::Password::new()
@@ -565,37 +599,12 @@ async fn handle_login(
             .interact()?,
     };
 
-    login_config.current_profile_mut()?.clear_credentials();
-    login_config.ephemeral_auth = true;
-    let mut client = ApiClient::from_config(&login_config, api_url)?;
-
-    // Auto-detect: query /auth/settings to determine whether to use local or LDAP login.
-    let login_path = match client.get::<serde_json::Value>("/auth/settings").await {
-        Ok(settings) => {
-            let data = settings.get("data").unwrap_or(&settings);
-            let local_enabled = data
-                .get("local_password_enabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            let ldap_enabled = data
-                .get("ldap_enabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if !local_enabled && ldap_enabled {
-                "/auth/ldap/login"
-            } else {
-                "/auth/login"
-            }
-        }
-        // If settings endpoint is unreachable, default to local login.
-        Err(_) => "/auth/login",
-    };
-
-    let auth_method = if login_path == "/auth/ldap/login" {
-        "ldap"
-    } else {
-        "direct"
-    };
+    let (login_path, auth_method) =
+        if settings.local_password_enabled == Some(false) && settings.ldap_enabled == Some(true) {
+            ("/auth/ldap/login", "ldap")
+        } else {
+            ("/auth/login", "direct")
+        };
 
     let login_req = LoginRequest {
         login: username.clone(),
@@ -688,6 +697,11 @@ async fn handle_token_login(
     let mut login_config = config.clone();
     login_config.current_profile = target_profile_name.clone();
 
+    login_config.current_profile_mut()?.clear_credentials();
+    login_config.ephemeral_auth = true;
+    let mut client = ApiClient::from_config(&login_config, api_url)?;
+    show_login_disclosure(&mut client).await;
+
     let token = match token {
         Some(token) => token,
         None => dialoguer::Password::new()
@@ -695,9 +709,6 @@ async fn handle_token_login(
             .interact()?,
     };
 
-    login_config.current_profile_mut()?.clear_credentials();
-    login_config.ephemeral_auth = true;
-    let mut client = ApiClient::from_config(&login_config, api_url)?;
     let response: LoginResponse = client
         .post("/auth/token-login", &TokenLoginRequest { token })
         .await?;
