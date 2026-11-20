@@ -220,9 +220,39 @@ def test_managed_queue_retries_until_retained_limit(client, tmp_path):
         client.put(base, json={"enabled": False, "accepting_new_items": False}).raise_for_status()
 
 
+def _publish_business_queue(client, tmp_path, provider, credential, *, batch_size):
+    owner, owner_path = _pack(tmp_path)
+    client.upload_pack(str(owner_path))
+    key = client.post("/api/v1/keys", json={
+        "local_ref": "queue_credential", "owner_type": "pack", "owner_pack_ref": owner,
+        "name": "Owned managed queue credential", "encrypted": True, "value": credential,
+    })
+    key.raise_for_status()
+    key_ref = key.json()["data"]["ref"]
+    queue_ref = owner + ".work"
+    # Use a new release to publish the now-existing owner-qualified Key selector.
+    pack_path = owner_path / "pack.yaml"
+    pack = yaml.safe_load(pack_path.read_text())
+    _write(pack_path, {**pack, "version": "1.0.1"})
+    _write(owner_path / "queues/work.yaml", {
+        "ref": queue_ref, "label": "Business-owned work", "dispatch_action": provider + ".ack",
+        "enabled": False, "accepting_new_items": True, "batch_mode": "batch",
+        "allow_pending_update": True, "update_strategy": "replace",
+        "permission_set_refs": [],
+        "item_schema": {"message": {"type": "string", "required": True}},
+        "action_params": {"records": "{{ queue_items }}", "credential": "{{ keystore['" + key_ref + "'] }}"},
+        "config": {"dispatch": {"batch_size": {"source": "literal", "value": batch_size}, "retry_limit": 0}},
+    })
+    _write(owner_path / "permission_sets/enqueue.yaml", {
+        "ref": owner + ".enqueue",
+        "grants": [{"resource": "queue_items", "actions": ["create"], "constraints": {"refs": [queue_ref]}}],
+    })
+    client.upload_pack(str(owner_path), force=True)
+    return owner, key_ref, f"/api/v1/queues/{queue_ref}"
+
+
 def test_cross_pack_queue_batches_enqueue_only_contributors(client, tmp_path, api_base_url, test_timeout):
     provider, provider_path = _pack(tmp_path)
-    owner, owner_path = _pack(tmp_path)
     _write(provider_path / "actions/ack.yaml", {
         "ref": provider + ".ack", "label": "Acknowledge business records",
         "runner_type": "python", "entry_point": "ack.py", "output_format": "json",
@@ -243,38 +273,13 @@ print(json.dumps({"queue_ack": {"version": 1, "items": [
 ]}}))
 ''')
     client.upload_pack(str(provider_path))
-    client.upload_pack(str(owner_path))
-    credential, replacement = (f"owned-{uuid.uuid4().hex}" for _ in range(2))
-    key = client.post("/api/v1/keys", json={
-        "local_ref": "queue_credential", "owner_type": "pack", "owner_pack_ref": owner,
-        "name": "Owned managed queue credential", "encrypted": True, "value": credential,
-    })
-    key.raise_for_status()
-    key_ref = key.json()["data"]["ref"]
-    queue_ref = owner + ".work"
-    # Use a new release to publish the now-existing owner-qualified Key selector.
-    pack_path = owner_path / "pack.yaml"
-    pack = yaml.safe_load(pack_path.read_text())
-    _write(pack_path, {**pack, "version": "1.0.1"})
-    _write(owner_path / "queues/work.yaml", {
-        "ref": queue_ref, "label": "Business-owned work", "dispatch_action": provider + ".ack",
-        "enabled": False, "accepting_new_items": True, "batch_mode": "batch",
-        "allow_pending_update": True, "update_strategy": "replace",
-        "permission_set_refs": [],
-        "item_schema": {"message": {"type": "string", "required": True}},
-        "action_params": {"records": "{{ queue_items }}", "credential": "{{ keystore['" + key_ref + "'] }}"},
-        "config": {"dispatch": {"batch_size": {"source": "literal", "value": 3}, "retry_limit": 0}},
-    })
-    _write(owner_path / "permission_sets/enqueue.yaml", {
-        "ref": owner + ".enqueue",
-        "grants": [{"resource": "queue_items", "actions": ["create"], "constraints": {"refs": [queue_ref]}}],
-    })
-    client.upload_pack(str(owner_path), force=True)
-    base = f"/api/v1/queues/{queue_ref}"
+    credential, replacement, other_credential = (f"owned-{uuid.uuid4().hex}" for _ in range(3))
+    owner, key_ref, base = _publish_business_queue(client, tmp_path, provider, credential, batch_size=3)
+    other_base = None
     contributors, assignments, accepted = [], [], {}
 
     def require_redacted(text):
-        if credential in text or replacement in text:
+        if any(secret in text for secret in (credential, replacement, other_credential)):
             pytest.fail("Managed queue credential appeared in a public projection")
 
     try:
@@ -349,9 +354,42 @@ print(json.dumps({"queue_ack": {"version": 1, "items": [
         source = response.json()["data"]["result"]["queue_ack"]["items"]
         assert {item["id"]: item["summary"]["message"] for item in source} == accepted
         assert all(item["summary"]["business"] == credential for item in source)
+        # Keep the provider release and action identical while changing the
+        # owning business pack, its credential, and the admitted queue.
+        _, _, other_base = _publish_business_queue(
+            client, tmp_path, provider, other_credential, batch_size=1,
+        )
+        request = {"payload": {"message": "different business"}}
+        denied = contributors[0].post(other_base + "/items", json=request)
+        assert denied.status_code == 403
+        require_redacted(denied.text)
+        submitted = client.post(other_base + "/items", json=request)
+        assert submitted.status_code == 201
+        other_item = submitted.json()["data"]["id"]
+        client.put(other_base, json={"enabled": True}).raise_for_status()
+
+        def settle_other_item():
+            response = client.get(other_base + f"/items/{other_item}")
+            response.raise_for_status()
+            require_redacted(response.text)
+            item = response.json()["data"]
+            assert item["status"] not in {"failed", "cancelled"}
+            return item["status"] == "completed" and item["lease_token"] is None
+
+        wait_for_condition(settle_other_item, timeout=60, poll_interval=0.1,
+                           error_message="Second business queue did not settle")
+        rows = client.list_executions(action_ref=provider + ".ack", limit=100)
+        other_execution, = [row["id"] for row in rows if row["id"] != execution["id"]]
+        require_redacted(str(client.get_execution(other_execution)))
+        response = client.get(f"/api/v1/executions/{other_execution}", params={"include_secret_values": "true"})
+        response.raise_for_status()
+        item, = response.json()["data"]["result"]["queue_ack"]["items"]
+        assert item["id"] == other_item
+        assert item["summary"] == {"business": other_credential, "message": "different business"}
     finally:
-        disabled = client.put(base, json={"enabled": False, "accepting_new_items": False})
-        disabled.raise_for_status()
+        for queue_url in (base, other_base):
+            if queue_url is not None:
+                client.put(queue_url, json={"enabled": False, "accepting_new_items": False}).raise_for_status()
         for assignment in assignments:
             client.delete(f"/api/v1/permissions/assignments/{assignment}").raise_for_status()
         for member in contributors:
