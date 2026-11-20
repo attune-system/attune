@@ -556,7 +556,7 @@ dependencies = [
  "futures",
  "hmac 0.13.0",
  "icu_casemap",
- "icu_casemap_data",
+ "icu_casemap_data 2.4.0",
  "icu_normalizer 1.5.0",
  "icu_normalizer_data 1.5.1",
  "ignore",
@@ -2848,7 +2848,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ff0c8ae9f8d31b12e27fc385ff9ab1f3cd9b17417c665c49e4ec958c37da75f"
 dependencies = [
  "displaydoc",
- "icu_casemap_data",
+ "icu_casemap_data 1.5.1",
  "icu_collections 1.5.0",
  "icu_locid",
  "icu_properties 1.5.1",
@@ -2862,6 +2862,12 @@ name = "icu_casemap_data"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02bd9f6276270c85a5cd54611adbbf94e993ec464a2a86a452a6c565b7ded5d9"
+
+[[package]]
+name = "icu_casemap_data"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71a5c321208537711696af55bc2ab5dad939e4f6e0aef92dd6a2555deceedf3a"
 
 [[package]]
 name = "icu_collections"
