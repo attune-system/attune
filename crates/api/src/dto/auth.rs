@@ -1,5 +1,6 @@
 //! Authentication DTOs
 
+use attune_common::config::BrandingConfig;
 pub use attune_common::device_auth::DeviceAuthorizationResponse;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -245,9 +246,15 @@ pub struct ProviderProfileResponse {
     pub groups: Vec<String>,
 }
 
-/// Public authentication settings for the login page.
+/// Public authentication and branding settings for the installation.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AuthSettingsResponse {
+    /// Plain-text disclosure to show before login, when configured.
+    pub login_disclosure: Option<String>,
+
+    /// Installation branding for the web UI.
+    pub branding: BrandingConfig,
+
     /// Whether authentication is enabled for the server.
     #[schema(example = true)]
     pub authentication_enabled: bool,

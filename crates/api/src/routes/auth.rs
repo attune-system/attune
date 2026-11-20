@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Query, State},
-    http::HeaderMap,
+    http::{header, HeaderMap},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
     Json, Router,
@@ -385,9 +385,7 @@ fn require_access_token(user: &crate::auth::middleware::AuthenticatedUser) -> Re
         (status = 200, description = "Authentication settings", body = inline(ApiResponse<AuthSettingsResponse>))
     )
 )]
-pub async fn auth_settings(
-    State(state): State<SharedState>,
-) -> Result<Json<ApiResponse<AuthSettingsResponse>>, ApiError> {
+pub async fn auth_settings(State(state): State<SharedState>) -> impl IntoResponse {
     let oidc = state
         .config
         .security
@@ -403,6 +401,14 @@ pub async fn auth_settings(
         .filter(|ldap| ldap.enabled);
 
     let response = AuthSettingsResponse {
+        login_disclosure: state
+            .config
+            .security
+            .login_disclosure
+            .as_ref()
+            .filter(|text| !text.trim().is_empty())
+            .cloned(),
+        branding: state.config.branding.clone(),
         authentication_enabled: state.config.security.enable_auth,
         local_password_enabled: state.config.security.enable_auth,
         local_password_visible_by_default: state.config.security.enable_auth
@@ -428,7 +434,10 @@ pub async fn auth_settings(
         self_registration_enabled: state.config.security.allow_self_registration,
     };
 
-    Ok(Json(ApiResponse::new(response)))
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(ApiResponse::new(response)),
+    )
 }
 
 /// Login endpoint

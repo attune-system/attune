@@ -16,6 +16,7 @@ import {
   PRESET_LABELS,
 } from "@/types/workflow";
 import { Plus, Maximize } from "lucide-react";
+import { useInstallationSettings } from "@/contexts/InstallationSettingsContext";
 
 interface WorkflowCanvasProps {
   tasks: WorkflowTask[];
@@ -77,9 +78,7 @@ function gridBackground(pan: { x: number; y: number }, zoom: number) {
 function watermarkBackground(pan: { x: number; y: number }, zoom: number) {
   const tileW = 1000 * zoom;
   const tileH = 700 * zoom;
-  const logo = `url("/attune-logo-watermark-tile.svg")`;
   return {
-    backgroundImage: `${logo}, ${logo}`,
     backgroundSize: `${tileW}px ${tileH}px, ${tileW}px ${tileH}px`,
     backgroundPosition: `${pan.x}px ${pan.y}px, ${pan.x + tileW / 2}px ${pan.y + tileH / 2}px`,
   };
@@ -100,6 +99,16 @@ export default function WorkflowCanvas({
   onSetConnection,
   onEdgeClick,
 }: WorkflowCanvasProps) {
+  const { settings } = useInstallationSettings();
+  const branding = settings?.branding;
+  const watermarkUrl =
+    branding?.workflow_watermark_url ||
+    (branding?.logo_url || branding?.icon_url
+      ? null
+      : "/attune-logo-watermark-tile.svg");
+  const watermarkImage = watermarkUrl
+    ? `url(${JSON.stringify(watermarkUrl)})`
+    : "none";
   const canvasRef = useRef<HTMLDivElement>(null);
   const innerRef = useRef<HTMLDivElement>(null);
   const watermarkRef = useRef<HTMLDivElement>(null);
@@ -167,7 +176,6 @@ export default function WorkflowCanvas({
     }
     if (watermarkRef.current) {
       const wm = watermarkBackground(panRef.current, zoomRef.current);
-      watermarkRef.current.style.backgroundImage = wm.backgroundImage;
       watermarkRef.current.style.backgroundSize = wm.backgroundSize;
       watermarkRef.current.style.backgroundPosition = wm.backgroundPosition;
     }
@@ -536,7 +544,7 @@ export default function WorkflowCanvas({
         ref={watermarkRef}
         className="absolute inset-0 pointer-events-none opacity-[0.15]"
         style={{
-          backgroundImage: wmBg.backgroundImage,
+          backgroundImage: `${watermarkImage}, ${watermarkImage}`,
           backgroundSize: wmBg.backgroundSize,
           backgroundPosition: wmBg.backgroundPosition,
         }}

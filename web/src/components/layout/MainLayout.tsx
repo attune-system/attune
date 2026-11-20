@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { Link, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
+import { useInstallationSettings } from "@/contexts/InstallationSettingsContext";
 import {
   ChevronDown,
   ChevronLeft,
@@ -289,6 +290,8 @@ function NavLink({
 
 export default function MainLayout() {
   const { user, logout } = useAuth();
+  const { settings } = useInstallationSettings();
+  const branding = settings?.branding;
   const location = useLocation();
   const navigate = useNavigate();
   const userMenuButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -439,14 +442,18 @@ export default function MainLayout() {
         <div className="flex items-center justify-center h-20 bg-gray-800 whitespace-nowrap">
           <Link to="/" className="flex items-center justify-center">
             <img
-              src="/attune-logo-icon.svg"
+              src={
+                branding?.icon_url ||
+                branding?.logo_url ||
+                "/attune-logo-icon.svg"
+              }
               alt="Attune"
-              className={`h-14 transition-opacity duration-300 ${isCollapsed ? "opacity-100" : "md:hidden"}`}
+              className={`h-14 max-w-16 object-contain transition-opacity duration-300 ${isCollapsed ? "opacity-100" : "md:hidden"}`}
             />
             <img
-              src="/attune-logo-navbar.svg"
+              src={branding?.logo_url || "/attune-logo-navbar.svg"}
               alt="Attune"
-              className={`hidden h-14 transition-opacity duration-300 ${isCollapsed ? "opacity-0 w-0" : "md:block md:opacity-100"}`}
+              className={`hidden h-14 max-w-56 object-contain transition-opacity duration-300 ${isCollapsed ? "opacity-0 w-0" : "md:block md:opacity-100"}`}
             />
           </Link>
         </div>

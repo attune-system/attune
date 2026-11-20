@@ -1,9 +1,9 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { ApiError, AuthService } from "@/api";
 import { useAuth } from "@/contexts/AuthContext";
+import { useInstallationSettings } from "@/contexts/InstallationSettingsContext";
 import { apiClient } from "@/lib/api-client";
-import { safeErrorSummary } from "@/lib/safe-error-summary";
 
 interface LocationState {
   from?: {
@@ -11,31 +11,15 @@ interface LocationState {
   };
 }
 
-interface AuthSettingsResponse {
-  authentication_enabled: boolean;
-  local_password_enabled: boolean;
-  local_password_visible_by_default: boolean;
-  oidc_enabled: boolean;
-  oidc_visible_by_default: boolean;
-  oidc_provider_name: string | null;
-  oidc_provider_label: string | null;
-  oidc_provider_icon_url: string | null;
-  ldap_enabled: boolean;
-  ldap_visible_by_default: boolean;
-  ldap_provider_name: string | null;
-  ldap_provider_label: string | null;
-  ldap_provider_icon_url: string | null;
-  self_registration_enabled: boolean;
-}
-
 export default function LoginPage() {
   const navigate = useNavigate();
   const location = useLocation();
   const { login: startOidcLogin, completeLogin } = useAuth();
-  const [settings, setSettings] = useState<AuthSettingsResponse | null>(null);
-  const [settingsError, setSettingsError] = useState<string | null>(null);
+  const { settings, isLoading: isLoadingSettings } = useInstallationSettings();
+  const settingsError = !isLoadingSettings && !settings;
+  const logoUrl = settings?.branding?.logo_url;
+  const disclosure = settings?.login_disclosure;
   const [loginError, setLoginError] = useState<string | null>(null);
-  const [isLoadingSettings, setIsLoadingSettings] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [credentials, setCredentials] = useState({ login: "", password: "" });
   const [ldapCredentials, setLdapCredentials] = useState({
@@ -48,24 +32,6 @@ export default function LoginPage() {
   const redirectPath = sessionStorage.getItem("redirect_after_login");
   const from =
     redirectPath || (location.state as LocationState)?.from?.pathname || "/";
-
-  useEffect(() => {
-    const loadAuthSettings = async () => {
-      try {
-        const response = await apiClient.get<{ data: AuthSettingsResponse }>(
-          "/auth/settings",
-        );
-        setSettings(response.data.data);
-      } catch (error) {
-        console.error("Failed to load auth settings:", safeErrorSummary(error));
-        setSettingsError("Unable to load authentication options.");
-      } finally {
-        setIsLoadingSettings(false);
-      }
-    };
-
-    void loadAuthSettings();
-  }, []);
 
   const authOverride = new URLSearchParams(location.search)
     .get("auth")
@@ -204,7 +170,15 @@ export default function LoginPage() {
       <div className="max-w-md w-full">
         <div>
           <h1 className="text-center text-4xl font-bold text-gray-900">
-            Attune
+            {logoUrl ? (
+              <img
+                src={logoUrl}
+                alt="Attune"
+                className="mx-auto h-16 max-w-full object-contain"
+              />
+            ) : (
+              "Attune"
+            )}
           </h1>
           <h2 className="mt-6 text-center text-3xl font-extrabold text-gray-900">
             Sign in to your account
@@ -220,7 +194,7 @@ export default function LoginPage() {
             <>
               {settingsError ? (
                 <div className="rounded-lg bg-red-50 p-4 text-sm text-red-700">
-                  {settingsError}
+                  Unable to load authentication options.
                 </div>
               ) : null}
 
@@ -235,6 +209,20 @@ export default function LoginPage() {
                   Authentication is disabled in the current server
                   configuration.
                 </div>
+              ) : null}
+
+              {disclosure ? (
+                <section
+                  aria-labelledby="login-disclosure-heading"
+                  className="mb-6 rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950"
+                >
+                  <h3 id="login-disclosure-heading" className="font-semibold">
+                    Login disclosure
+                  </h3>
+                  <p className="mt-2 whitespace-pre-wrap break-words">
+                    {disclosure}
+                  </p>
+                </section>
               ) : null}
 
               {authEnabled && showLocal ? (
