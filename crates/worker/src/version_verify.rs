@@ -14,6 +14,7 @@ use attune_common::repositories::{FindById, List, RuntimeRepository};
 use serde_json::{json, Value as JsonValue};
 use sqlx::PgPool;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
@@ -320,7 +321,7 @@ async fn verify_single_version(
 
     // Run commands in priority order (lowest priority number = highest priority)
     for cmd in &commands {
-        match run_verification_command(cmd, child_environment).await {
+        match run_verification_command(cmd, child_environment, &version.runtime_ref).await {
             Ok(true) => {
                 debug!(
                     "Verification passed for '{}' {} using binary '{}'",
@@ -426,6 +427,7 @@ fn extract_verification_commands(distributions: &serde_json::Value) -> Vec<Verif
 async fn run_verification_command(
     cmd: &VerificationCommand,
     child_environment: &ChildProcessEnvironment,
+    runtime_ref: &str,
 ) -> std::result::Result<bool, String> {
     let mut command = Command::new(&cmd.binary);
     child_environment.apply(command.as_std_mut());
@@ -458,18 +460,62 @@ async fn run_verification_command(
             .map_err(|e| format!("Invalid verification pattern '{}': {}", pattern, e))?;
 
         if !re.is_match(&combined) {
-            debug!(
-                "Pattern '{}' did not match output of '{}': stdout='{}', stderr='{}'",
-                pattern,
-                cmd.binary,
-                stdout.trim(),
-                stderr.trim(),
-            );
+            log_verification_pattern_mismatch(cmd, &result.stdout, &result.stderr);
             return Ok(false);
+        }
+
+        let version = (cmd.args == ["--version"])
+            .then(|| observed_builtin_version(runtime_ref, &result.stdout, &result.stderr))
+            .flatten();
+        if let Some(version) = version {
+            info!(
+                runtime = runtime_ref,
+                version = version,
+                "Verified interpreter version"
+            );
         }
     }
 
     Ok(true)
+}
+
+/// Extract a bounded version field independently of the runtime's acceptance regex.
+fn observed_builtin_version<'a>(
+    runtime_ref: &str,
+    stdout: &'a [u8],
+    stderr: &'a [u8],
+) -> Option<&'a str> {
+    static VERSION: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\A[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\z")
+            .expect("valid interpreter version regex")
+    });
+    let prefix = match runtime_ref {
+        "core.python" => "Python ",
+        "core.nodejs" => "v",
+        _ => return None,
+    };
+    let output = match (stdout, stderr) {
+        ([], output) | (output, []) => std::str::from_utf8(output).ok()?,
+        _ => return None,
+    };
+    let line = output
+        .strip_suffix("\r\n")
+        .or_else(|| output.strip_suffix('\n'))
+        .unwrap_or(output);
+    let version = line.strip_prefix(prefix)?;
+    VERSION.is_match(version).then_some(version)
+}
+
+fn log_verification_pattern_mismatch(cmd: &VerificationCommand, stdout: &[u8], stderr: &[u8]) {
+    // The selected child baseline can contain purpose-bounded operator
+    // passthrough values. A probe may echo them, so retain only output sizes.
+    debug!(
+        binary = %cmd.binary,
+        pattern = cmd.pattern.as_deref().unwrap_or_default(),
+        stdout_bytes = stdout.len(),
+        stderr_bytes = stderr.len(),
+        "Verification output did not match expected pattern"
+    );
 }
 
 /// Basic binary availability check: run `binary --version` and check for exit 0.
@@ -507,6 +553,33 @@ async fn run_basic_binary_check(binary: &str, child_environment: &ChildProcessEn
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct TestLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TestLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestLogWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     #[test]
     fn test_extract_verification_commands_full() {
@@ -629,8 +702,148 @@ mod tests {
             pattern: None,
             priority: 1,
         };
-        let result = run_verification_command(&cmd, &Default::default()).await;
+        let result = run_verification_command(&cmd, &Default::default(), "core.python").await;
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn verification_mismatch_log_excludes_child_output() {
+        let variable = "OWNED_VERIFY_PASSTHROUGH".to_string();
+        let secret = "owned-dummy-passthrough-secret";
+        let environment = ChildProcessEnvironment::from_parent(
+            [(
+                std::ffi::OsString::from(&variable),
+                std::ffi::OsString::from(secret),
+            )],
+            std::slice::from_ref(&variable),
+        )
+        .unwrap();
+        let cmd = VerificationCommand {
+            binary: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "printf %s \"$OWNED_VERIFY_PASSTHROUGH\"; printf %s \"$OWNED_VERIFY_PASSTHROUGH\" >&2"
+                    .to_string(),
+            ],
+            expected_exit_code: 0,
+            pattern: Some("expected-version".to_string()),
+            priority: 1,
+        };
+        let writer = TestLogWriter::default();
+        let buffer = writer.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(writer)
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let guard = tracing::dispatcher::set_default(&dispatch);
+
+        assert!(!run_verification_command(&cmd, &environment, "core.python")
+            .await
+            .unwrap());
+
+        drop(guard);
+        let bytes = buffer.lock().expect("log buffer lock").clone();
+        let log = String::from_utf8(bytes).expect("debug log should be UTF-8");
+
+        assert!(log.contains("binary=/bin/sh"));
+        assert!(log.contains("stdout_bytes=30"));
+        assert!(log.contains("stderr_bytes=30"));
+        assert!(!log.contains(secret));
+    }
+
+    #[test]
+    fn observed_version_requires_one_builtin_version_line() {
+        assert_eq!(
+            observed_builtin_version("core.python", b"Python 3.12.8\n", b""),
+            Some("3.12.8")
+        );
+        assert_eq!(
+            observed_builtin_version("core.nodejs", b"", b"v22.5.1\r\n"),
+            Some("22.5.1")
+        );
+        assert_eq!(
+            observed_builtin_version("custom.python", b"Python 3.12.8\n", b""),
+            None
+        );
+        for (stdout, stderr) in [
+            (&b"Python 3.12.8\nextra"[..], &b""[..]),
+            (b"Python 3.12.8 extra\n", b""),
+            (b"Python 3.12.8\n", b"extra"),
+            (b"Python 3.12.8675309\n", b""),
+            (b"Python 3.12.8\n\n", b""),
+        ] {
+            assert_eq!(
+                observed_builtin_version("core.python", stdout, stderr),
+                None
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn verification_logs_only_a_matched_builtin_version() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("version-probe");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf 'Python 3.12.8\\n%s' \"$PROBE_EXTRA\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut cmd = VerificationCommand {
+            binary: executable.to_string_lossy().into_owned(),
+            args: vec!["--version".to_string()],
+            expected_exit_code: 0,
+            pattern: Some(r"Python 3\.12\.".to_string()),
+            priority: 1,
+        };
+        let variable = "PROBE_EXTRA".to_string();
+        let extra = ChildProcessEnvironment::from_parent(
+            [(variable.clone().into(), "owned-dummy-extra".into())],
+            std::slice::from_ref(&variable),
+        )
+        .unwrap();
+
+        let writer = TestLogWriter::default();
+        let buffer = writer.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(writer)
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        assert!(
+            run_verification_command(&cmd, &Default::default(), "core.python")
+                .await
+                .unwrap()
+        );
+        assert!(run_verification_command(&cmd, &extra, "core.python")
+            .await
+            .unwrap());
+        assert!(
+            run_verification_command(&cmd, &Default::default(), "custom.python")
+                .await
+                .unwrap()
+        );
+        cmd.pattern = Some(r"Python 3\.13\.".to_string());
+        assert!(
+            !run_verification_command(&cmd, &Default::default(), "core.python")
+                .await
+                .unwrap()
+        );
+
+        let bytes = buffer.lock().unwrap();
+        let log = std::str::from_utf8(&bytes).unwrap();
+        assert_eq!(log.matches("Verified interpreter version").count(), 1);
+        assert!(log.contains("version=\"3.12.8\""));
+        assert!(!log.contains("owned-dummy-extra"));
     }
 
     fn make_version(runtime_ref: &str, version: &str, available: bool) -> RuntimeVersion {
