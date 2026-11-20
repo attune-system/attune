@@ -18,7 +18,7 @@ import {
   PanelLeftClose,
 } from "lucide-react";
 import SearchableSelect from "@/components/common/SearchableSelect";
-import yaml from "js-yaml";
+import { dump } from "js-yaml";
 import type { WorkflowYamlDefinition } from "@/types/workflow";
 import ActionPalette from "@/components/workflows/ActionPalette";
 import WorkflowInputsPanel from "@/components/workflows/WorkflowInputsPanel";
@@ -676,13 +676,12 @@ export default function WorkflowBuilderPage() {
     if (!showYamlPreview) return "";
     try {
       const actionDef = builderStateToActionYaml(state);
-      return yaml.dump(actionDef, {
+      return dump(actionDef, {
         indent: 2,
         lineWidth: 120,
         noRefs: true,
         sortKeys: false,
-        quotingType: '"',
-        forceQuotes: false,
+        quoteStyle: "double",
       });
     } catch {
       return "# Error generating action YAML preview";
@@ -693,13 +692,12 @@ export default function WorkflowBuilderPage() {
     if (!showYamlPreview) return "";
     try {
       const graphDef = builderStateToGraph(state, actionSchemaMap);
-      return yaml.dump(graphDef, {
+      return dump(graphDef, {
         indent: 2,
         lineWidth: 120,
         noRefs: true,
         sortKeys: false,
-        quotingType: '"',
-        forceQuotes: false,
+        quoteStyle: "double",
       });
     } catch {
       return "# Error generating workflow YAML preview";

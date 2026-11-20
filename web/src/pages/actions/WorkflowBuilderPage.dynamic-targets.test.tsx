@@ -1,5 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { load } from "js-yaml";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { WorkflowTask, WorkflowYamlDefinition } from "@/types/workflow";
@@ -244,8 +245,25 @@ describe("workflow builder finite target authoring", () => {
     });
     expect(api.update).toHaveBeenLastCalledWith(expected);
     fireEvent.click(screen.getByRole("button", { name: "Raw YAML" }));
-    expect(view.container.textContent).toContain("allowed_action_refs:");
-    expect(view.container.textContent).toContain("foreign.manually_entered");
+    const [actionYaml, workflowYaml] = view.container.querySelectorAll("pre");
+    expect(load(actionYaml?.textContent ?? "")).toMatchObject({
+      ref: "example.flow",
+      label: "Only a label edit",
+      workflow_file: "workflows/flow.workflow.yaml",
+    });
+    expect(load(workflowYaml?.textContent ?? "")).toMatchObject({
+      version: "1.0",
+      tasks: {
+        "group/name~": {
+          tasks: {
+            "choose/target": {
+              action: "{{ parameters.target }}",
+              allowed_action_refs: ["foreign.manually_entered"],
+            },
+          },
+        },
+      },
+    });
     fireEvent.click(screen.getByRole("button", { name: "Run" }));
     await waitFor(() =>
       expect(api.execute).toHaveBeenCalledWith({
