@@ -1,11 +1,67 @@
 use crate::{Error, Result};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 pub const RUNTIME_CACHE_FORMAT_VERSION: &str = "1";
 pub const READY_MARKER: &str = ".attune-runtime-ready";
 pub const PACK_REF_MARKER: &str = ".attune-pack-ref";
+
+/// Runtime commands can create files in a staging tree. Open metadata without
+/// following links or blocking on a FIFO that a build left behind.
+pub fn read_runtime_marker(path: &Path) -> io::Result<String> {
+    const MAX_MARKER_BYTES: u64 = 4096;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    if !path.symlink_metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid runtime marker",
+        ));
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid runtime marker",
+        ));
+    }
+    let mut marker = String::new();
+    file.take(MAX_MARKER_BYTES + 1)
+        .read_to_string(&mut marker)?;
+    if marker.len() as u64 > MAX_MARKER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Oversized runtime marker",
+        ));
+    }
+    Ok(marker)
+}
+
+/// Replace a marker atomically. In particular, do not open a link planted at
+/// the marker path by a preparation command.
+pub fn write_runtime_marker(path: &Path, value: &str) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("Runtime marker has no parent directory"))?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".attune-marker-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o666));
+    }
+    let mut staging = builder.tempfile_in(parent)?;
+    staging.write_all(value.as_bytes())?;
+    staging.persist(path)?;
+    Ok(())
+}
 
 pub fn pack_runtime_environment_relative_paths(
     root: &Path,
@@ -167,7 +223,7 @@ fn validated_pack_runtime_paths(
     if let Ok(entries) = fs::read_dir(&cache_root) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if fs::read_to_string(path.join(PACK_REF_MARKER))
+            if read_runtime_marker(&path.join(PACK_REF_MARKER))
                 .is_ok_and(|owner| owner.trim() == pack_ref)
             {
                 candidates.push((path, false));
@@ -265,17 +321,16 @@ impl RuntimeCacheKey {
     }
 
     pub fn is_ready(&self, path: &Path) -> bool {
-        std::fs::read_to_string(path.join(READY_MARKER))
-            .is_ok_and(|value| value.trim() == self.digest)
+        read_runtime_marker(&path.join(READY_MARKER)).is_ok_and(|value| value.trim() == self.digest)
     }
 
     pub fn write_ready_marker(&self, path: &Path) -> std::io::Result<()> {
-        std::fs::write(path.join(READY_MARKER), &self.digest)
+        write_runtime_marker(&path.join(READY_MARKER), &self.digest)
     }
 
     pub fn write_pack_ref_marker(&self, path: &Path, pack_ref: &str) -> Result<()> {
         crate::schema::RefValidator::validate_pack_ref(pack_ref)?;
-        std::fs::write(path.join(PACK_REF_MARKER), pack_ref).map_err(|error| {
+        write_runtime_marker(&path.join(PACK_REF_MARKER), pack_ref).map_err(|error| {
             Error::io(format!(
                 "Failed to write runtime cache pack marker at {}: {error}",
                 path.display()
@@ -340,6 +395,26 @@ fn target_libc() -> &'static str {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_markers_never_follow_links_left_by_builds() {
+        let root = TempDir::new().unwrap();
+        let staging = root.path().join("staging");
+        fs::create_dir(&staging).unwrap();
+        let manager_file = root.path().join("manager-state");
+        fs::write(&manager_file, "owned fixture state").unwrap();
+        let marker = staging.join(READY_MARKER);
+        std::os::unix::fs::symlink(&manager_file, &marker).unwrap();
+
+        assert!(read_runtime_marker(&marker).is_err());
+        write_runtime_marker(&marker, "ready").unwrap();
+        assert_eq!(read_runtime_marker(&marker).unwrap(), "ready");
+        assert_eq!(
+            fs::read_to_string(manager_file).unwrap(),
+            "owned fixture state"
+        );
+    }
 
     #[test]
     fn purge_pack_runtime_environments_removes_only_owned_paths() {

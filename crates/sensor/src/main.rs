@@ -48,7 +48,8 @@ async fn run() -> Result<()> {
     info!("Version: {}", env!("CARGO_PKG_VERSION"));
 
     log_config_details(&config);
-    run_sensor_service(config, None, "Attune Sensor Service is ready").await?;
+    let service = attune_sensor::service::SensorService::new(config).await?;
+    run_sensor_service(service, None, "Attune Sensor Service is ready").await?;
     info!("Attune Sensor Service shutdown complete");
 
     Ok(())

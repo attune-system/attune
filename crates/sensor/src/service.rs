@@ -74,21 +74,24 @@ impl SensorService {
 
     /// Create a new sensor service
     pub async fn new(config: Config) -> Result<Self> {
-        info!("Initializing Sensor Service");
         let child_environment =
-            attune_common::child_process_environment::ChildProcessEnvironment::capture(
+            attune_common::child_process_environment::ChildProcessEnvironment::capture_for_service(
                 config
                     .sensor
                     .as_ref()
                     .map(|sensor| sensor.passthrough_env.as_slice())
                     .unwrap_or(&[]),
-            )?
-            .with_workload_sandbox(
-                attune_common::workload_sandbox::WorkloadSandbox::from_environment(
-                    config.artifacts.transport
-                        == attune_common::artifact_transport::TransportMode::Api,
-                )?,
-            );
+                config.artifacts.transport == attune_common::artifact_transport::TransportMode::Api,
+            )
+            .await?;
+        Self::new_with_child_environment(config, child_environment).await
+    }
+
+    pub async fn new_with_child_environment(
+        config: Config,
+        child_environment: attune_common::child_process_environment::ChildProcessEnvironment,
+    ) -> Result<Self> {
+        info!("Initializing Sensor Service");
         config.validate_deployed_pack_transport()?;
         config.validate_deployed_artifact_transport()?;
         let configured_api_url = std::env::var("ATTUNE_API_URL").ok();

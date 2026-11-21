@@ -401,7 +401,11 @@ impl RuntimeDetector {
         // Execute command
         let mut command = Command::new(binary);
         child_environment.apply(&mut command);
-        let output = match command.args(&args).output() {
+        command.args(&args);
+        let output = match child_environment
+            .sandbox_workload(command, &[])
+            .and_then(|mut command| command.output())
+        {
             Ok(output) => output,
             Err(e) => {
                 if !optional {

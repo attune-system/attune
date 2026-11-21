@@ -44,10 +44,10 @@ Do not silently broaden the existing deployment trust model during this refactor
   over extension matching.
 - [Child-process environments](../deployment/child-process-environments.md)
   govern inheritance, caller overrides, protected Attune context, and setup tokens.
-- [Workload isolation](../deployment/workload-isolation.md) is experimental and
-  opt-in. It isolates final action/sensor processes only; setup and verification
-  remain outside that sandbox. Network egress is not isolated. Managers still hold
-  control-plane credentials. These gaps remain security limitations until closed.
+- [Workload isolation](../deployment/workload-isolation.md) describes the
+  opt-in Bubblewrap profile for discovery, preparation, tests and final
+  action/sensor processes. The profile shares the manager's network namespace.
+  Managers still hold control-plane credentials.
 - [Delegation and secret disclosure](../permissions/delegation-and-secret-disclosure.md)
   governs immutable executable selection, attempt-bound authority, input origins,
   output policy, and log custody. The runtime refactor must preserve these contracts.
@@ -386,17 +386,17 @@ an eligibility gate, even in a trusted profile. No required capability may be
 silently downgraded. The hostile profile is **unavailable until implemented and
 validated**; its column is an acceptance target, not current behavior.
 
-| Capability / phase | Initial trusted profile | Trusted profile with final-process sandbox | Hostile-pack profile (future) |
+| Capability / phase | Initial trusted profile | Trusted profile with Bubblewrap | Hostile-pack profile (future) |
 | --- | --- | --- | --- |
 | Exact pool admission, immutable bindings, stdin JSON, cleared environments, no setup/probe API token | Required in every phase | Required in every phase | Required in every phase |
 | Phase deadlines, bounded output, cancellation accounting | Required; uncertain teardown is reported/quarantined | Required; uncertain teardown is reported/quarantined | Required, with enforced process-tree teardown |
-| Probe/setup host filesystem and sibling isolation | Outside guarantee; code/dependencies trusted | Outside guarantee; code/dependencies trusted | Required |
+| Probe/setup host filesystem and sibling isolation | Outside guarantee; code/dependencies trusted | Separate sandbox with read-only inputs and private writable staging | Required |
 | Final workload mount/process isolation and read-only runtime | Outside guarantee unless separately required | Required; current sandbox prerequisites apply | Required |
 | Publication fencing, distinct build generations, ownership records | Required | Required | Required |
-| OS prevention of cross-generation/cache modification | Outside guarantee; one admitted shared trust scope | Final workloads isolated; build hooks remain trusted | Required for all pack-controlled phases |
+| OS prevention of cross-generation/cache modification | Outside guarantee; one admitted shared trust scope | Sandbox writes limited to the current build or invocation | Required for all pack-controlled phases |
 | OS CPU/memory/disk/process-count quotas | Required only when explicitly selected and supported; otherwise outside guarantee | Same; current sandbox alone does not supply all quotas | Required in every phase |
 | Destination-restricted setup network / invocation egress | Outside guarantee unless separately selected and enforced | Outside guarantee; current sandbox shares networking | Required according to explicit operator network policy |
-| Manager master credentials inaccessible to every pack-controlled phase | Environment/parent protections required; full host isolation outside guarantee | Final-process isolation required; probe/setup gap remains | Required, including setup/discovery and sibling-launcher protection |
+| Manager master credentials inaccessible to every pack-controlled phase | Environment/parent protections required; full host isolation outside guarantee | Pack processes separated from manager environment, descriptors and host files during sandboxed phases | Required, including setup/discovery and sibling-launcher protection |
 
 Bind the selected profile, its version/digest, and any additional requirements to
 capability advertisement, placement, preparation identity, and captured invocation
