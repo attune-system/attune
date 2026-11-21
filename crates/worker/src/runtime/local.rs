@@ -197,6 +197,7 @@ mod tests {
 
         let context = ExecutionContext {
             native_invocation: None,
+            installed_preparation: None,
             execution_id: 2,
             action_ref: "test.shell_action".to_string(),
             parameters: HashMap::new(),
@@ -238,6 +239,7 @@ mod tests {
 
         let context = ExecutionContext {
             native_invocation: None,
+            installed_preparation: None,
             execution_id: 3,
             action_ref: "test.unknown_action".to_string(),
             parameters: HashMap::new(),

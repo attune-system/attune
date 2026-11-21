@@ -1261,6 +1261,7 @@ impl WorkerService {
             .worker_id
             .ok_or_else(|| Error::Internal("Worker not registered".to_string()))?;
 
+        let incarnation = self.registration.read().await.incarnation();
         let queue_name = format!("worker.{}.packtests", worker_id);
         info!("Starting pack test consumer for queue: {}", queue_name);
 
@@ -1316,8 +1317,9 @@ impl WorkerService {
                             let payload = envelope.payload;
                             if let Err(e) = handle_pack_test(
                                 &db_pool,
-                                worker_id,
-                                PackTestLocation {
+                                PackTestWorker {
+                                    worker_id,
+                                    incarnation,
                                     packs_base_dir: packs_base_dir.as_path(),
                                     runtime_envs_dir: runtime_envs_dir.as_path(),
                                     api_url: &candidate_api_url,
@@ -2202,8 +2204,10 @@ impl Drop for PackTestCandidateCleanup {
     }
 }
 
-/// Worker-owned locations, never values supplied by the pack test request.
-struct PackTestLocation<'a> {
+/// Worker identity and locations for the candidate handler.
+struct PackTestWorker<'a> {
+    worker_id: i64,
+    incarnation: uuid::Uuid,
     packs_base_dir: &'a std::path::Path,
     runtime_envs_dir: &'a std::path::Path,
     api_url: &'a str,
@@ -2212,20 +2216,25 @@ struct PackTestLocation<'a> {
 /// Run a pack's test suite on this worker and persist the outcome.
 async fn handle_pack_test(
     db_pool: &PgPool,
-    worker_id: i64,
-    location: PackTestLocation<'_>,
+    worker: PackTestWorker<'_>,
     pack_transport: &dyn attune_common::pack_transport::PackFileTransport,
     payload: &PackTestRequestedPayload,
     child_environment: &attune_common::child_process_environment::ChildProcessEnvironment,
     cancellation: CancellationToken,
 ) -> Result<()> {
+    use attune_common::repositories::runtime_preparation::{
+        RuntimePreparationRepository, ATTEMPT_SECONDS,
+    };
+    use attune_common::runtime_lifecycle::{PreparationScope, PREPARATION_TRIGGER};
     use attune_common::test_executor::{TestConfig, TestExecutor};
     use std::path::PathBuf;
-    let PackTestLocation {
+    let PackTestWorker {
+        worker_id,
+        incarnation,
         packs_base_dir,
         runtime_envs_dir,
         api_url,
-    } = location;
+    } = worker;
 
     validate_mq_pack_ref(&payload.pack_ref, "PackTestRequested")?;
 
@@ -2243,6 +2252,7 @@ async fn handle_pack_test(
         || install.assigned_worker_id != Some(worker_id)
     {
         if install.status != PackInstallStatus::Running.as_str()
+            && install.trigger_reason != PREPARATION_TRIGGER
             && pack_transport.transport_mode() != "volume"
             && payload.candidate_path.is_some()
         {
@@ -2298,6 +2308,28 @@ async fn handle_pack_test(
             return Ok(());
         }
     }
+
+    let preparation = if install.trigger_reason == PREPARATION_TRIGGER {
+        let scope = PreparationScope::open(runtime_envs_dir, child_environment)
+            .map_err(|error| Error::validation(error.to_string()))?
+            .ok_or_else(|| {
+                Error::validation("Runtime preparation requires an admitted Bubblewrap scope")
+            })?;
+        let Some(attempt) = RuntimePreparationRepository::begin(
+            db_pool,
+            install.id,
+            worker_id,
+            incarnation,
+            &scope,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        Some((scope, attempt))
+    } else {
+        None
+    };
 
     let _candidate_cleanup = payload
         .candidate_path
@@ -2374,6 +2406,56 @@ async fn handle_pack_test(
             &release.digest,
         )?
     };
+    if let Some((scope, attempt)) = preparation {
+        let build = async {
+            let mut ready = Vec::with_capacity(attempt.requests.len());
+            for request in attempt.requests.0 {
+                let prepared = request
+                    .recipe
+                    .prepare_for_install(
+                        &pack_dir,
+                        request.target,
+                        &attempt.release_digest,
+                        &scope,
+                        child_environment,
+                    )
+                    .await
+                    .map_err(|error| Error::validation(error.to_string()))?;
+                ready.push(prepared);
+            }
+            Ok::<_, Error>(ready)
+        };
+        let observe_cancellation = async {
+            loop {
+                if !RuntimePreparationRepository::is_running(
+                    db_pool,
+                    install.id,
+                    worker_id,
+                    incarnation,
+                )
+                .await?
+                {
+                    return Ok::<_, Error>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        };
+        let ready = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(Error::validation("Runtime preparation cancelled")),
+            result = observe_cancellation => {
+                result?;
+                return Ok(());
+            }
+            result = tokio::time::timeout(std::time::Duration::from_secs(ATTEMPT_SECONDS as u64), build) => {
+                result.map_err(|_| Error::validation("Runtime preparation timed out"))??
+            }
+        };
+        RuntimePreparationRepository::finish(db_pool, install.id, worker_id, incarnation, &ready)
+            .await?;
+        return Ok(());
+    }
+
     let pack_yaml_path = pack_dir.join("pack.yaml");
     if !pack_yaml_path.exists() {
         mark_pack_install_failed(

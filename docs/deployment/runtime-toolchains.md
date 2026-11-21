@@ -98,12 +98,9 @@ are defense in depth; trusted profile networking is not restricted by Attune.
 
 ## Generations and cleanup
 
-Every preparation creates a new mode-0700 generation under
+By default, preparation creates a new mode-0700 generation under
 `runtime_envs_dir/lifecycle-generations/`. The path is stable for its lifetime,
 so virtualenv shebangs and compiled resources do not break through relocation.
-There is no reuse or shared ready marker. Changed operator config therefore cannot
-accidentally select an older prepared result. Future reuse requires revisioned
-effective config, tool/platform/policy identity, and trusted publication fencing.
 Each generation contains a private diagnostic ownership record with the recipe
 digest, workload root, manager PID, and creation time. It contains no credentials.
 Its contents are not proof of writer termination or authority to reuse/delete it.
@@ -127,6 +124,63 @@ credentials and invocation-dependent compilation remain gated by the plan.
 Failed or cancelled probes similarly retain their private
 `attune-runtime-probe-*` home under the manager's temporary directory. Successful
 discovery removes it only when every attempted probe confirmed teardown.
+
+## Install-time preparation
+
+Set `prepare_at_install: true` under `execution_config.lifecycle` to run that
+recipe's `prepare` commands before activating a pack release. The supported
+targets are declared file-backed actions and managed sensors with a default
+toolchain recipe. Use vendored input files or dependencies already in the
+operator image. Install preparation runs offline, with a fixed baseline
+environment, an immutable copy of the candidate release, and a private writable
+generation. It receives no invocation inputs or credentials. Inline actions and
+explicit candidate test runners still prepare for each invocation.
+
+- Enable Bubblewrap and API artifact transport on eligible action workers and
+  sensor managers. Admit the recipe digest on each pool and set
+  `ATTUNE_RUNTIME_PREPARATION_REVISION` to a nonsecret revision for the exact
+  image, toolchain and effective operator build configuration. Change that
+  revision when those inputs change. Use read-only, revisioned system tooling.
+- A builder and its consumers must see the same runtime storage at the same
+  absolute path, using compatible images and a common manager UID. A persistent
+  storage ID distinguishes separate worker-local volumes even if their paths
+  and configured revisions match. Keep that ID unique when provisioning
+  independent volumes. Give the managers write access for generation creation
+  and invocation scratch. An action-only release can use a worker's local
+  volume. A release with a managed sensor needs explicitly shared storage
+  between the builder and eligible sensor managers.
+- The initial implementation admits up to 16 required targets per release on
+  one storage scope, with a five-minute preparation attempt. Install-prepared
+  file workloads use the parent recipe without runtime version variants.
+  Install-prepared actions currently require no additional worker runtime
+  constraints. Pack and workload placement, including active sensor rule
+  placement, still apply.
+- Pack activation checks the worker's complete readiness evidence against the
+  release digest, entrypoint, recipe and eligible storage scope. A failed build,
+  expired attempt or unavailable scope leaves the previous release active,
+  including on forced installs and installs that skip candidate tests. A new
+  install request starts a fresh attempt at a new physical path.
+- At launch, the manager verifies its scope, the manager-written completion
+  seal, the retained files, and the resolved tools against the recorded
+  identities. It mounts the prepared files read-only and allocates independent
+  writable home, scratch, artifact staging and Python bytecode paths. Loss of
+  the storage or an identity mismatch prevents launch until a matching scope is
+  available or the release is prepared again.
+
+Installed generations keep their original physical paths under
+`runtime_envs_dir/.installed-runtime-preparations/` across manager restarts.
+Invocation teardown removes its own scratch after process teardown. Installed
+generation storage is retained for pinned executions and sensors and has no
+online reclamation in this slice. Size the volume for retained and quarantined
+generations. Reclaim it only after retiring its release references, draining all
+workloads and proving that writers have stopped.
+
+The full-service regression is in
+[test_install_runtime_preparation.py](../../tests/e2e/api/test_install_runtime_preparation.py).
+Set `ATTUNE_E2E_INSTALL_PREPARATION=1` for the test runner against an owned
+stack with the [fixture recipe](../../tests/fixtures/runtime-services/install_recipe.json)
+admitted on both pools. It exercises upload, activation, action reuse, sensor
+startup, failed and ineligible updates, and a changed release.
 
 ## Candidate tests and local deployment
 

@@ -118,6 +118,7 @@ pub mod rule_authority;
 pub mod runtime;
 pub mod runtime_authority;
 pub mod runtime_log_completion;
+pub mod runtime_preparation;
 pub mod runtime_read;
 pub mod runtime_target;
 mod runtime_target_binding;

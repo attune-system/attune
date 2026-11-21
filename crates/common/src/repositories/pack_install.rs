@@ -130,7 +130,7 @@ impl PackInstallRepository {
     /// Find the most recent install record for a pack ref
     pub async fn find_latest_by_pack_ref(&self, pack_ref: &str) -> Result<Option<PackInstall>> {
         let sql = format!(
-            "SELECT {} FROM pack_install WHERE pack_ref = $1 ORDER BY id DESC LIMIT 1",
+            "SELECT {} FROM pack_install WHERE pack_ref = $1 AND trigger_reason <> 'runtime_preparation' ORDER BY id DESC LIMIT 1",
             PACK_INSTALL_COLUMNS
         );
         let record = sqlx::query_as::<_, PackInstall>(sql.as_str())

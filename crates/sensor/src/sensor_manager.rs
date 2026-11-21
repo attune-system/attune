@@ -1411,20 +1411,42 @@ impl SensorManager {
         let runtime_env_suffix = version_env_suffix.unwrap_or(base_runtime_suffix);
 
         let prepared_target = if let Some(recipe) = &exec_config.lifecycle {
-            Some(
+            use attune_common::repositories::runtime_preparation::RuntimePreparationRepository;
+            use attune_common::runtime_lifecycle::{
+                PreparationScope, PreparationTarget, RuntimeSource,
+            };
+            let runtime_root = std::path::Path::new(&self.inner.runtime_envs_dir);
+            let environment = &self.inner.child_environment;
+            let target = if let Some(target) =
+                PreparationTarget::for_sensor(&sensor, &runtime, recipe)?
+            {
+                let scope = PreparationScope::open(runtime_root, environment)?;
+                let ready = RuntimePreparationRepository::ready_for(
+                    &self.inner.db,
+                    pack_revision.release_id,
+                    &pack_revision.digest,
+                    &target,
+                )
+                .await?
+                .into_iter()
+                .find(|ready| Some(&ready.scope) == scope.as_ref())
+                .ok_or_else(|| {
+                    anyhow!("No ready installed runtime generation in this sensor manager's scope")
+                })?;
+                recipe
+                    .open_installed(&ready, runtime_root, environment)
+                    .await
+            } else {
                 recipe
                     .prepare(
                         &pack_dir,
-                        attune_common::runtime_lifecycle::RuntimeSource::File(
-                            std::path::Path::new(&sensor_script),
-                        ),
-                        &std::path::Path::new(&self.inner.runtime_envs_dir)
-                            .join("lifecycle-generations"),
-                        &self.inner.child_environment,
+                        RuntimeSource::File(std::path::Path::new(&sensor_script)),
+                        &runtime_root.join("lifecycle-generations"),
+                        environment,
                     )
                     .await
-                    .map_err(|error| anyhow!("Sensor runtime preparation failed: {error}"))?,
-            )
+            };
+            Some(target.map_err(|error| anyhow!("Sensor runtime preparation failed: {error}"))?)
         } else {
             None
         };

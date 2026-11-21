@@ -733,3 +733,128 @@ async fn candidate_runner_timeout_includes_preparation_and_quarantines_target() 
     assert!(!config.accepts_result(&result));
     assert_eq!(std::fs::read_dir(generations).unwrap().count(), 1);
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires Linux Bubblewrap with unprivileged namespaces"]
+async fn bubblewrap_installed_generation_requires_local_seal_and_exact_identity() {
+    use attune_common::runtime_lifecycle::{
+        PreparationScope, PreparationTarget, PreparationWorkload,
+    };
+
+    let (root, mut recipe) = fixture();
+    recipe.prepare_at_install = true;
+    let environment_for = |recipe: &RuntimeRecipe, revision: &str| {
+        ChildProcessEnvironment::from_parent(
+            [
+                (
+                    "ATTUNE_RUNTIME_RECIPE_DIGESTS".into(),
+                    recipe.digest().unwrap().into(),
+                ),
+                (
+                    "ATTUNE_RUNTIME_PREPARATION_REVISION".into(),
+                    revision.into(),
+                ),
+            ],
+            &[],
+        )
+        .unwrap()
+        .with_workload_sandbox(WorkloadSandbox::Bubblewrap)
+    };
+    let environment = environment_for(&recipe, "test-image-1");
+    let pack = root.path().join("pack");
+    let pack_actions = pack.join("actions");
+    std::fs::create_dir_all(&pack_actions).unwrap();
+    executable(&pack_actions.join("run.nova"), "#!/bin/sh\nprintf ready\n");
+    let runtime_root = root.path().join("runtime");
+    let scope = PreparationScope::open(&runtime_root, &environment)
+        .unwrap()
+        .unwrap();
+    let target = PreparationTarget {
+        kind: PreparationWorkload::Action,
+        reference: "fixture.run".into(),
+        source: "actions/run.nova".into(),
+        runtime_ref: "fixture.nova".into(),
+        runtime_names: vec!["nova".into()],
+        recipe_digest: recipe.digest().unwrap(),
+    };
+    let ready = recipe
+        .prepare_for_install(&pack, target, &"a".repeat(64), &scope, &environment)
+        .await
+        .unwrap();
+    for distinct_root in [
+        root.path().join("other-volume"),
+        root.path().join("another-pool"),
+    ] {
+        assert!(recipe
+            .open_installed(&ready, &distinct_root, &environment)
+            .await
+            .is_err());
+    }
+    assert!(recipe
+        .open_installed(
+            &ready,
+            &runtime_root,
+            &environment_for(&recipe, "test-image-2")
+        )
+        .await
+        .is_err());
+    let mut changed_recipe = recipe.clone();
+    changed_recipe.env.insert("MODE".into(), "different".into());
+    assert!(changed_recipe
+        .open_installed(
+            &ready,
+            &runtime_root,
+            &environment_for(&changed_recipe, "test-image-1")
+        )
+        .await
+        .is_err());
+
+    let first = recipe
+        .open_installed(&ready, &runtime_root, &environment)
+        .await
+        .unwrap();
+    let second = recipe
+        .open_installed(&ready, &runtime_root, &environment)
+        .await
+        .unwrap();
+    assert_eq!(first.generation, second.generation);
+    assert_ne!(first.env["HOME"], second.env["HOME"]);
+    let generation = first.generation.clone();
+    first.cleanup().await.unwrap();
+    second.cleanup().await.unwrap();
+    assert!(
+        generation.is_dir(),
+        "invocation teardown reclaimed an installed generation"
+    );
+
+    // Changing the executable without changing the reported version fails closed.
+    let tool = root.path().join("nova");
+    let original = std::fs::read_to_string(&tool).unwrap();
+    executable(
+        &tool,
+        &(original.clone() + "\n# different executable bytes\n"),
+    );
+    assert!(recipe
+        .open_installed(&ready, &runtime_root, &environment)
+        .await
+        .is_err());
+    executable(&tool, &original);
+
+    let executable = generation.join("output/program");
+    let bytes = std::fs::read(&executable).unwrap();
+    let permissions = std::fs::metadata(&executable).unwrap().permissions();
+    std::fs::remove_file(&executable).unwrap();
+    assert!(recipe
+        .open_installed(&ready, &runtime_root, &environment)
+        .await
+        .is_err());
+    std::fs::write(&executable, bytes).unwrap();
+    std::fs::set_permissions(executable, permissions).unwrap();
+
+    std::fs::remove_file(generation.parent().unwrap().join("ready")).unwrap();
+    assert!(recipe
+        .open_installed(&ready, &runtime_root, &environment)
+        .await
+        .is_err());
+}

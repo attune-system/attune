@@ -1508,12 +1508,69 @@ impl ActionExecutor {
         } else {
             None
         };
+        use attune_common::repositories::runtime_preparation::RuntimePreparationRepository;
+        use attune_common::runtime_lifecycle::{PreparationScope, PreparationTarget};
+        let installed_preparation =
+            match (runtime_record.as_ref(), runtime_config_override.as_ref()) {
+                (Some(runtime), Some(config)) => {
+                    let parent_recipe = runtime.parsed_execution_config().lifecycle;
+                    let target = parent_recipe
+                        .as_ref()
+                        .map(|recipe| PreparationTarget::for_action(action, runtime, recipe))
+                        .transpose()
+                        .map_err(|error| Error::validation(error.to_string()))?
+                        .flatten();
+                    if let Some(target) = target {
+                        if config
+                            .lifecycle
+                            .as_ref()
+                            .and_then(|recipe| recipe.digest().ok())
+                            .as_ref()
+                            != Some(&target.recipe_digest)
+                        {
+                            return Err(Error::validation(
+                                "Installed action recipe differs from the selected runtime",
+                            ));
+                        }
+                        let release = &execution
+                            .executable_snapshot
+                            .as_ref()
+                            .ok_or_else(|| {
+                                Error::validation("Installed runtime requires a pinned release")
+                            })?
+                            .release;
+                        let scope =
+                            PreparationScope::open(&self.runtime_envs_dir, &self.child_environment)
+                                .map_err(|error| Error::validation(error.to_string()))?;
+                        Some(
+                            RuntimePreparationRepository::ready_for(
+                                &self.pool,
+                                release.id,
+                                &release.digest,
+                                &target,
+                            )
+                            .await?
+                            .into_iter()
+                            .find(|ready| Some(&ready.scope) == scope.as_ref())
+                            .ok_or_else(|| {
+                                Error::validation(
+                                    "No ready installed runtime generation in this worker's scope",
+                                )
+                            })?,
+                        )
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
         let log_artifacts = self
             .allocate_execution_log_artifacts(execution, action, preparation)
             .await?;
 
         let context = ExecutionContext {
             native_invocation,
+            installed_preparation,
             execution_id: execution.id,
             action_ref: execution.action_ref.clone(),
             parameters,

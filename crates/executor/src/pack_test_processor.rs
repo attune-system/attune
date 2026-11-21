@@ -201,6 +201,20 @@ impl PackTestProcessor {
         payload: &PackTestRequestedPayload,
         counter: &AtomicUsize,
     ) -> Result<Worker> {
+        let preparation_scopes = if payload.trigger_reason
+            == attune_common::runtime_lifecycle::PREPARATION_TRIGGER
+        {
+            let scopes = attune_common::repositories::runtime_preparation::RuntimePreparationRepository::dispatch_scopes(
+                pool, payload.pack_install_id,
+            ).await?;
+            anyhow::ensure!(
+                !scopes.is_empty(),
+                "No admitted storage scope for runtime preparation"
+            );
+            scopes
+        } else {
+            Vec::new()
+        };
         // Prefer explicit required runtimes when present.
         let placement = WorkerPlacement {
             selector: parse_worker_selector(&payload.worker_selector)?,
@@ -212,6 +226,7 @@ impl PackTestProcessor {
             &payload.required_runtimes,
             &payload.required_recipe_digests,
             placement,
+            &preparation_scopes,
             counter,
         )
         .await

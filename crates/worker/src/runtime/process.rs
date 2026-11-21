@@ -200,10 +200,22 @@ impl ProcessRuntime {
             _ => RuntimeSource::File(&action_file),
         };
         let root = self.runtime_envs_dir.join("lifecycle-generations");
-        let preparation = tokio::time::timeout_at(
-            deadline,
-            recipe.prepare(&pack_dir, source, &root, &self.child_environment),
-        );
+        let prepare = async {
+            if let Some(installed) = &context.installed_preparation {
+                return recipe
+                    .open_installed(installed, &self.runtime_envs_dir, &self.child_environment)
+                    .await;
+            }
+            if recipe.prepare_at_install && matches!(source, RuntimeSource::File(_)) {
+                return Err(attune_common::runtime_lifecycle::Error::Invalid(
+                    "File-backed recipe action has no installed runtime generation".into(),
+                ));
+            }
+            recipe
+                .prepare(&pack_dir, source, &root, &self.child_environment)
+                .await
+        };
+        let preparation = tokio::time::timeout_at(deadline, prepare);
         let target = if let Some(token) = &context.cancel_token {
             tokio::select! {
                 biased;
@@ -2545,6 +2557,7 @@ mod tests {
 
         let context = ExecutionContext {
             native_invocation: None,
+            installed_preparation: None,
             execution_id: 1,
             action_ref: "mypack.hello".to_string(),
             parameters: HashMap::new(),
@@ -2588,6 +2601,7 @@ mod tests {
 
         let context = ExecutionContext {
             native_invocation: None,
+            installed_preparation: None,
             execution_id: 1,
             action_ref: "mypack.hello".to_string(),
             parameters: HashMap::new(),
@@ -2631,6 +2645,7 @@ mod tests {
 
         let context = ExecutionContext {
             native_invocation: None,
+            installed_preparation: None,
             execution_id: 1,
             action_ref: "mypack.hello".to_string(),
             parameters: HashMap::new(),
@@ -2730,6 +2745,7 @@ mod tests {
 
         let context = ExecutionContext {
             native_invocation: None,
+            installed_preparation: None,
             execution_id: 1,
             action_ref: "testpack.hello".to_string(),
             parameters: HashMap::new(),
@@ -2798,6 +2814,7 @@ mod tests {
 
         let context = ExecutionContext {
             native_invocation: None,
+            installed_preparation: None,
             execution_id: 2,
             action_ref: "testpack.hello".to_string(),
             parameters: HashMap::new(),
@@ -2888,6 +2905,7 @@ mod tests {
 
         let context = ExecutionContext {
             native_invocation: None,
+            installed_preparation: None,
             execution_id: 22,
             action_ref: "testpack.hello".to_string(),
             parameters: HashMap::new(),
@@ -2976,6 +2994,7 @@ mod tests {
 
         let context = ExecutionContext {
             native_invocation: None,
+            installed_preparation: None,
             execution_id: 3,
             action_ref: "testpack.hello".to_string(),
             parameters: HashMap::new(),
@@ -3026,6 +3045,7 @@ mod tests {
 
         let context = ExecutionContext {
             native_invocation: None,
+            installed_preparation: None,
             execution_id: 3,
             action_ref: "adhoc.test".to_string(),
             parameters: HashMap::new(),
@@ -3073,6 +3093,7 @@ mod tests {
 
         let context = ExecutionContext {
             native_invocation: None,
+            installed_preparation: None,
             execution_id: 30,
             action_ref: "adhoc.test_inputs".to_string(),
             parameters: {
@@ -3149,6 +3170,7 @@ mod tests {
         // No code_path, no code — should resolve via entry_point
         let context = ExecutionContext {
             native_invocation: None,
+            installed_preparation: None,
             execution_id: 4,
             action_ref: "testpack.greet".to_string(),
             parameters: HashMap::new(),
@@ -3413,6 +3435,7 @@ mod tests {
         );
         let context = |code: &str| ExecutionContext {
             native_invocation: None,
+            installed_preparation: None,
             execution_id: 42,
             action_ref: "adhoc.equal_id".to_string(),
             parameters: HashMap::new(),
@@ -3473,6 +3496,7 @@ mod tests {
 
         let context = ExecutionContext {
             native_invocation: None,
+            installed_preparation: None,
             execution_id: 5,
             action_ref: "testpack.pwd".to_string(),
             parameters: HashMap::new(),

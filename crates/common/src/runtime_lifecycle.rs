@@ -1,8 +1,8 @@
 //! Pack-defined toolchains for the explicitly admitted trusted execution profile.
 //!
 //! Preparation gets no execution context or credentials. Every preparation owns a
-//! fresh, nonrelocatable generation; reuse and cross-host distribution are disabled.
-//! Unconfirmed cleanup leaves that generation quarantined, never published/reused.
+//! fresh, nonrelocatable generation. Release preparation may publish that
+//! generation through the pack install fence after confirmed writer teardown.
 
 use crate::child_process_environment::ChildProcessEnvironment;
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,12 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+
+mod installed;
+pub use installed::{
+    InstalledPreparation, PreparationScope, PreparationTarget, PreparationWorkload, MAX_TARGETS,
+    PREPARATION_TRIGGER,
+};
 
 const CAPTURE_BYTES: usize = 64 * 1024;
 const MAX_WORKSPACE_BYTES: u64 = 512 * 1024 * 1024;
@@ -88,6 +94,16 @@ pub fn validate_version_mode(
             "Runtime parent and version must use the same lifecycle mode",
         ));
     }
+    let installed = |config: &serde_json::Value| {
+        config["lifecycle"]["prepare_at_install"]
+            .as_bool()
+            .unwrap_or(false)
+    };
+    if installed(parent) != installed(version) {
+        return Err(invalid(
+            "Runtime parent and version must use the same preparation timing",
+        ));
+    }
     Ok(())
 }
 
@@ -122,6 +138,8 @@ pub struct RuntimeRecipe {
     pub workspace: bool,
     #[serde(default)]
     pub prepare: Vec<RecipeCommand>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prepare_at_install: bool,
     pub launch: RecipeCommand,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -200,7 +218,7 @@ pub async fn stop_owned_process_group(group: Option<u32>) -> Result<()> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifiedTool {
     pub executable: PathBuf,
     pub identity: PathBuf,
@@ -214,6 +232,7 @@ fn sandbox_tool_paths(tool: &VerifiedTool) -> (&Path, &Path) {
 pub struct PreparedTarget {
     pub generation: PathBuf,
     cleanup_root: PathBuf,
+    owns_generation: bool,
     pack_dir: PathBuf,
     pub command: Vec<String>,
     pub working_dir: PathBuf,
@@ -251,6 +270,14 @@ impl PreparedTarget {
         let scratch = self.cleanup_root.join("scratch");
         let artifacts = scratch.join("artifacts");
         std::fs::create_dir(&artifacts)?;
+        if !self.owns_generation {
+            command
+                .env("HOME", &home)
+                .env("TMPDIR", &scratch)
+                .env("XDG_CONFIG_HOME", home.join("config"))
+                .env("XDG_CACHE_HOME", home.join("cache"))
+                .env("PYTHONPYCACHEPREFIX", scratch.join("pycache"));
+        }
         command.env("ATTUNE_ARTIFACTS_DIR", artifacts);
         let inputs = [self.pack_dir.as_path(), self.generation.as_path()];
         let tools: Vec<_> = self.tools.values().map(sandbox_tool_paths).collect();
@@ -275,7 +302,7 @@ impl PreparedTarget {
     /// Only call after the owning workload and its writers have been joined.
     pub async fn cleanup(self) -> Result<()> {
         tokio::fs::remove_dir_all(&self.cleanup_root).await?;
-        if self.generation != self.cleanup_root {
+        if self.owns_generation && self.generation != self.cleanup_root {
             tokio::fs::remove_dir_all(self.generation).await?;
         }
         Ok(())
@@ -333,6 +360,11 @@ impl RuntimeRecipe {
         }
         if self.prepare.len() > 32 {
             return Err(invalid("Too many runtime preparation steps"));
+        }
+        if self.prepare_at_install && self.prepare.is_empty() {
+            return Err(invalid(
+                "Install-time runtime preparation requires prepare commands",
+            ));
         }
         for step in self.prepare.iter().chain(std::iter::once(&self.launch)) {
             if step.command.is_empty()
@@ -735,6 +767,7 @@ impl RuntimeRecipe {
         Ok(PreparedTarget {
             generation: build.generation.clone(),
             cleanup_root,
+            owns_generation: true,
             pack_dir: build.pack_dir.clone(),
             command: argv,
             working_dir,
