@@ -818,8 +818,8 @@ current command results and CI state; older checkpoints above are historical.
 
 The opt-in slice in [runtime toolchains](../deployment/runtime-toolchains.md#install-time-preparation)
 uses the pinned candidate dispatch and keeps the pack activation transaction
-closed while the worker prepares its generations. Activation rechecks the same
-projected executable targets and eligible storage scope before publishing ready
+closed while workers prepare their generations. Activation rechecks the same
+projected executable targets and each target's eligible storage scope before publishing ready
 references. File-backed actions and managed sensors open the resulting content
 read-only. Retained-file and tool verification fails closed if the generation
 cannot be used on the selected manager. Inline and candidate test invocations

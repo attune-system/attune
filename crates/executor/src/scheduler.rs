@@ -10465,7 +10465,6 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
         required_runtimes: &[String],
         required_recipe_digests: &[String],
         placement: WorkerPlacement,
-        preparation_scopes: &[attune_common::runtime_lifecycle::PreparationScope],
         round_robin_counter: &AtomicUsize,
     ) -> Result<attune_common::models::Worker> {
         let workers = WorkerRepository::find_action_workers(pool).await?;
@@ -10480,11 +10479,6 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
 
         let capable_workers: Vec<_> = workers
             .into_iter()
-            .filter(|worker| {
-                preparation_scopes.is_empty()
-                    || attune_common::runtime_lifecycle::PreparationScope::for_worker(worker)
-                        .is_some_and(|scope| preparation_scopes.contains(&scope))
-            })
             .filter(|worker| Self::worker_admits_test_recipes(worker, required_recipe_digests))
             .filter(|w| {
                 w.status == Some(attune_common::models::enums::WorkerStatus::Active) && !w.cordoned

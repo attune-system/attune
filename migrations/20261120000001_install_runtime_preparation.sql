@@ -2,11 +2,12 @@ CREATE TABLE pack_runtime_preparation_attempt (
     install BIGINT PRIMARY KEY REFERENCES pack_install(id) ON DELETE CASCADE,
     activation BIGINT NOT NULL REFERENCES pack_install(id) ON DELETE CASCADE,
     release_digest TEXT NOT NULL,
-    requests JSONB NOT NULL,
-    scopes JSONB NOT NULL,
+    job JSONB NOT NULL,
     expires_at TIMESTAMPTZ NOT NULL,
     builder_incarnation UUID,
-    prepared JSONB
+    builder_scope JSONB,
+    prepared JSONB,
+    CHECK ((builder_incarnation IS NULL) = (builder_scope IS NULL))
 );
 
 CREATE TABLE pack_release_runtime_preparation (

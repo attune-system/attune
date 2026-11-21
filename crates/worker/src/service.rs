@@ -2407,24 +2407,16 @@ async fn handle_pack_test(
         )?
     };
     if let Some((scope, attempt)) = preparation {
-        let build = async {
-            let mut ready = Vec::with_capacity(attempt.requests.len());
-            for request in attempt.requests.0 {
-                let prepared = request
-                    .recipe
-                    .prepare_for_install(
-                        &pack_dir,
-                        request.target,
-                        &attempt.release_digest,
-                        &scope,
-                        child_environment,
-                    )
-                    .await
-                    .map_err(|error| Error::validation(error.to_string()))?;
-                ready.push(prepared);
-            }
-            Ok::<_, Error>(ready)
-        };
+        let build_cancellation = CancellationToken::new();
+        let build = attempt.job.recipe.prepare_for_install(
+            &pack_dir,
+            attempt.job.target.clone(),
+            &attempt.release_digest,
+            &scope,
+            child_environment,
+            &build_cancellation,
+        );
+        tokio::pin!(build);
         let observe_cancellation = async {
             loop {
                 if !RuntimePreparationRepository::is_running(
@@ -2440,20 +2432,24 @@ async fn handle_pack_test(
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         };
-        let ready = tokio::select! {
+        let interrupted = tokio::select! {
             biased;
-            _ = cancellation.cancelled() => return Err(Error::validation("Runtime preparation cancelled")),
-            result = observe_cancellation => {
-                result?;
+            _ = cancellation.cancelled() => Err(Error::validation("Runtime preparation cancelled")),
+            result = observe_cancellation => result,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(ATTEMPT_SECONDS as u64)) => {
+                Err(Error::validation("Runtime preparation timed out"))
+            }
+            result = &mut build => {
+                let ready = result.map_err(|error| Error::validation(error.to_string()))?;
+                RuntimePreparationRepository::finish(db_pool, install.id, worker_id, incarnation, &ready).await?;
                 return Ok(());
             }
-            result = tokio::time::timeout(std::time::Duration::from_secs(ATTEMPT_SECONDS as u64), build) => {
-                result.map_err(|_| Error::validation("Runtime preparation timed out"))??
-            }
         };
-        RuntimePreparationRepository::finish(db_pool, install.id, worker_id, incarnation, &ready)
-            .await?;
-        return Ok(());
+        build_cancellation.cancel();
+        // Keep the worker-owned candidate tree alive until the copy and any
+        // running preparation commands have joined. No receipt is published.
+        let _ = build.await;
+        return interrupted;
     }
 
     let pack_yaml_path = pack_dir.join("pack.yaml");

@@ -13,6 +13,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 mod installed;
 pub use installed::{
@@ -423,6 +424,15 @@ impl RuntimeRecipe {
         &self,
         environment: &ChildProcessEnvironment,
     ) -> Result<BTreeMap<String, VerifiedTool>> {
+        self.discover_tools(environment, None).await
+    }
+
+    async fn discover_tools(
+        &self,
+        environment: &ChildProcessEnvironment,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<BTreeMap<String, VerifiedTool>> {
+        check_preparation_cancelled(cancellation)?;
         self.require_admission(environment)?;
         // A dropped probe can still have writers awaiting termination. Keep its
         // private home unless every attempted command completed with confirmed
@@ -438,6 +448,7 @@ impl RuntimeRecipe {
                 .map_err(|_| invalid("Invalid runtime version pattern"))?;
             let mut found = None;
             for binary in &tool.binaries {
+                check_preparation_cancelled(cancellation)?;
                 let Ok(executable) = resolve_executable(binary, environment) else {
                     continue;
                 };
@@ -457,7 +468,9 @@ impl RuntimeRecipe {
                     &[&probe_home],
                     &[(&executable, &identity)],
                 )?);
-                let Ok(output) = collect(command, Duration::from_secs(10)).await else {
+                let Ok(output) = collect(command, Duration::from_secs(10), cancellation).await
+                else {
+                    check_preparation_cancelled(cancellation)?;
                     all_probes_confirmed = false;
                     continue;
                 };
@@ -499,7 +512,7 @@ impl RuntimeRecipe {
         environment: &ChildProcessEnvironment,
     ) -> Result<PreparedTarget> {
         let build = self
-            .prepare_build(pack_dir, source, generation_root, environment)
+            .prepare_build(pack_dir, source, generation_root, environment, None)
             .await?;
         if environment.uses_workload_sandbox() {
             return self.bind_private_invocation(&build, generation_root, environment);
@@ -516,9 +529,10 @@ impl RuntimeRecipe {
         source: RuntimeSource<'_>,
         generation_root: &Path,
         environment: &ChildProcessEnvironment,
+        cancellation: Option<&CancellationToken>,
     ) -> Result<PreparedBuild> {
         let recipe_digest = self.require_admission(environment)?;
-        let tools = self.discover(environment).await?;
+        let tools = self.discover_tools(environment, cancellation).await?;
         let primary_version = self
             .tools
             .iter()
@@ -587,7 +601,12 @@ impl RuntimeRecipe {
         let workspace = generation.join("workspace");
         let use_workspace = self.workspace || source_path.is_none();
         if use_workspace {
-            copy_workspace(&pack_dir, &workspace)?;
+            match cancellation {
+                Some(cancellation) => {
+                    copy_install_workspace(&pack_dir, &workspace, cancellation).await?
+                }
+                None => copy_workspace(&pack_dir, &workspace, None)?,
+            }
         } else {
             std::fs::create_dir(&workspace)?;
         }
@@ -639,6 +658,7 @@ impl RuntimeRecipe {
         }
         let env = self.expand_environment(&vars, &home, &scratch)?;
         for step in &self.prepare {
+            check_preparation_cancelled(cancellation)?;
             if let Some(path) = &step.when_file_exists {
                 let input = pack_dir.join(relative_path(path)?);
                 if !input.try_exists()? {
@@ -662,7 +682,12 @@ impl RuntimeRecipe {
                 &[&generation],
                 &tools,
             )?);
-            collect(command, Duration::from_secs(step.timeout_seconds)).await?;
+            collect(
+                command,
+                Duration::from_secs(step.timeout_seconds),
+                cancellation,
+            )
+            .await?;
         }
         Ok(PreparedBuild {
             generation,
@@ -874,7 +899,33 @@ pub fn resolve_executable(binary: &str, environment: &ChildProcessEnvironment) -
     Err(invalid("Runtime executable is unavailable"))
 }
 
-fn copy_workspace(source: &Path, destination: &Path) -> Result<()> {
+async fn copy_install_workspace(
+    source: &Path,
+    destination: &Path,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let source = source.to_path_buf();
+    let destination = destination.to_path_buf();
+    let cancellation = cancellation.child_token();
+    let _cancel_on_drop = cancellation.clone().drop_guard();
+    tokio::task::spawn_blocking(move || copy_workspace(&source, &destination, Some(&cancellation)))
+        .await
+        .map_err(|_| invalid("Runtime workspace copy did not complete"))?
+}
+
+fn check_preparation_cancelled(cancellation: Option<&CancellationToken>) -> Result<()> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Err(invalid("Runtime preparation cancelled"));
+    }
+    Ok(())
+}
+
+fn copy_workspace(
+    source: &Path,
+    destination: &Path,
+    cancellation: Option<&CancellationToken>,
+) -> Result<()> {
+    check_preparation_cancelled(cancellation)?;
     std::fs::create_dir(destination)?;
     let mut bytes = 0u64;
     for (index, entry) in walkdir::WalkDir::new(source)
@@ -882,6 +933,7 @@ fn copy_workspace(source: &Path, destination: &Path) -> Result<()> {
         .into_iter()
         .enumerate()
     {
+        check_preparation_cancelled(cancellation)?;
         if index > MAX_WORKSPACE_FILES {
             return Err(invalid("Runtime workspace file limit exceeded"));
         }
@@ -897,18 +949,23 @@ fn copy_workspace(source: &Path, destination: &Path) -> Result<()> {
         if entry.file_type().is_dir() {
             std::fs::create_dir(&target)?;
         } else if entry.file_type().is_file() {
+            let metadata = entry
+                .metadata()
+                .map_err(|_| invalid("Cannot inspect workspace input"))?;
             bytes = bytes
-                .checked_add(
-                    entry
-                        .metadata()
-                        .map_err(|_| invalid("Cannot inspect workspace input"))?
-                        .len(),
-                )
+                .checked_add(metadata.len())
                 .ok_or_else(|| invalid("Runtime workspace size overflow"))?;
             if bytes > MAX_WORKSPACE_BYTES {
                 return Err(invalid("Runtime workspace byte limit exceeded"));
             }
-            std::fs::copy(entry.path(), &target)?;
+            if let Some(cancellation) = cancellation {
+                let mut input = std::fs::File::open(entry.path())?;
+                let mut output = std::fs::File::create_new(&target)?;
+                copy_install_file(&mut input, &mut output, metadata.len(), cancellation)?;
+                output.set_permissions(metadata.permissions())?;
+            } else {
+                std::fs::copy(entry.path(), &target)?;
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -925,9 +982,39 @@ fn copy_workspace(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn copy_install_file(
+    source: &mut impl std::io::Read,
+    destination: &mut impl std::io::Write,
+    mut remaining: u64,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let mut chunk = [0; 64 * 1024];
+    loop {
+        check_preparation_cancelled(Some(cancellation))?;
+        let size = match source.read(&mut chunk) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        check_preparation_cancelled(Some(cancellation))?;
+        if size == 0 && remaining == 0 {
+            return Ok(());
+        }
+        if size == 0 || size as u64 > remaining {
+            return Err(invalid("Runtime workspace input size changed during copy"));
+        }
+        destination.write_all(&chunk[..size])?;
+        remaining -= size as u64;
+    }
+}
+
 /// Bounded setup/probe capture. Failure diagnostics deliberately exclude child
 /// output, which can contain dependency credentials or arbitrary pack content.
-async fn collect(mut command: Command, deadline: Duration) -> Result<String> {
+async fn collect(
+    mut command: Command,
+    deadline: Duration,
+    cancellation: Option<&CancellationToken>,
+) -> Result<String> {
+    check_preparation_cancelled(cancellation)?;
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -972,18 +1059,29 @@ async fn collect(mut command: Command, deadline: Duration) -> Result<String> {
             String::from_utf8_lossy(&err)
         ))
     };
-    match tokio::time::timeout(deadline, work).await {
-        Ok(Ok(result)) => Ok(result),
-        result => {
-            group.kill()?;
-            child.kill().await.ok();
-            child.wait().await?;
-            match result {
-                Ok(Err(error)) => Err(error),
-                _ => Err(invalid("Runtime command timed out")),
-            }
+    let cancelled = async {
+        match cancellation {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    let result = tokio::select! {
+        biased;
+        _ = cancelled => Err(invalid("Runtime preparation cancelled")),
+        result = tokio::time::timeout(deadline, work) => {
+            result.map_err(|_| invalid("Runtime command timed out")).and_then(|result| result)
+        }
+    };
+    if result.is_err() {
+        group.kill()?;
+        let _ = child.kill().await;
+        child.wait().await?;
+        #[cfg(unix)]
+        if cancellation.is_some() {
+            stop_owned_process_group(owned_group).await?;
         }
     }
+    result
 }
 
 async fn read_bounded(reader: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u8>> {
@@ -1018,5 +1116,41 @@ impl ProcessGroup {
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         let _ = self.kill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_copy_stops_before_writing_a_chunk_read_during_cancellation() {
+        struct CancelDuringRead {
+            cancellation: CancellationToken,
+            reads: usize,
+        }
+
+        impl std::io::Read for CancelDuringRead {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                if self.reads == 2 {
+                    self.cancellation.cancel();
+                }
+                buffer.fill(b'x');
+                Ok(buffer.len())
+            }
+        }
+
+        let cancellation = CancellationToken::new();
+        let mut input = CancelDuringRead {
+            cancellation: cancellation.clone(),
+            reads: 0,
+        };
+        let mut output = Vec::new();
+        let error =
+            copy_install_file(&mut input, &mut output, 128 * 1024, &cancellation).unwrap_err();
+        assert_eq!(error.to_string(), "Runtime preparation cancelled");
+        assert_eq!(input.reads, 2);
+        assert_eq!(output.len(), 64 * 1024);
     }
 }

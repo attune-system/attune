@@ -1,5 +1,5 @@
 use crate::models::{
-    ActionExecutableSnapshot, Id, Pack, PackRelease, Sensor, Worker, WorkerStatus,
+    ActionExecutableSnapshot, Id, Pack, PackRelease, Sensor, Worker, WorkerRole, WorkerStatus,
 };
 use crate::runtime_lifecycle::{
     InstalledPreparation, PreparationScope, PreparationTarget, PreparationWorkload, RuntimeRecipe,
@@ -14,26 +14,48 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Executor, PgConnection, PgPool, Postgres};
 use std::collections::HashMap;
 
-use super::{PackInstallRepository, SensorAdmissionRepository, WorkerRepository};
+use super::{FindById, PackInstallRepository, SensorAdmissionRepository, WorkerRepository};
 
 pub const ATTEMPT_SECONDS: i64 = 300;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PreparationRequest {
+pub struct PreparationJob {
     pub target: PreparationTarget,
     pub recipe: RuntimeRecipe,
+    pub scopes: Vec<PreparationScope>,
+    pub placements: Vec<WorkerPlacement>,
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+impl PreparationJob {
+    fn builder_scope(&self, worker: &Worker) -> Option<PreparationScope> {
+        (worker.worker_role == WorkerRole::Action
+            && live(worker)
+            && worker_matches_target(worker, &self.target)
+            && worker_matches_all_placements(
+                &worker_labels_from_capabilities(worker.capabilities.as_ref()),
+                &worker_taints_from_capabilities(worker.capabilities.as_ref()),
+                &self.placements,
+            ))
+        .then(|| PreparationScope::for_worker(worker))
+        .flatten()
+    }
+
+    pub fn can_build(&self, worker: &Worker) -> bool {
+        self.builder_scope(worker)
+            .is_some_and(|scope| self.scopes.contains(&scope))
+    }
+
+    fn matches_ready(&self, release_digest: &str, ready: &InstalledPreparation) -> bool {
+        ready.target == self.target
+            && ready.release_digest == release_digest
+            && self.scopes.contains(&ready.scope)
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
 pub struct PreparationAttempt {
     pub release_digest: String,
-    pub requests: sqlx::types::Json<Vec<PreparationRequest>>,
-    pub scopes: sqlx::types::Json<Vec<PreparationScope>>,
-}
-
-pub struct PreparationPlan {
-    pub requests: Vec<PreparationRequest>,
-    pub scopes: Vec<PreparationScope>,
+    pub job: sqlx::types::Json<PreparationJob>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -53,7 +75,7 @@ impl RuntimePreparationRepository {
         connection: &mut PgConnection,
         pack: &Pack,
         release: &PackRelease,
-    ) -> Result<PreparationPlan> {
+    ) -> Result<Vec<PreparationJob>> {
         let snapshots: Vec<(String, serde_json::Value)> = sqlx::query_as(
             "SELECT component_kind, snapshot FROM pack_release_executable WHERE release = $1 \
              AND snapshot->'runtime'->'execution_config'->'lifecycle'->'prepare_at_install' = 'true'::jsonb \
@@ -62,12 +84,8 @@ impl RuntimePreparationRepository {
         .bind(release.id)
         .fetch_all(&mut *connection)
         .await?;
-        let mut requests = Vec::new();
         if snapshots.is_empty() {
-            return Ok(PreparationPlan {
-                requests,
-                scopes: Vec::new(),
-            });
+            return Ok(Vec::new());
         }
         if snapshots.len() > MAX_TARGETS {
             return Err(Error::validation(
@@ -75,20 +93,14 @@ impl RuntimePreparationRepository {
             ));
         }
         let builders = WorkerRepository::find_action_workers(&mut *connection).await?;
-        let mut scopes = builders
-            .iter()
-            .filter(|worker| live(worker))
-            .filter_map(PreparationScope::for_worker)
-            .collect::<Vec<_>>();
-        scopes.sort_unstable();
-        scopes.dedup();
+        let mut jobs = Vec::with_capacity(snapshots.len());
         let pack_placement = WorkerPlacement {
             selector: pack.worker_selector_labels(),
             tolerations: pack.worker_toleration_specs(),
             affinity: pack.worker_affinity_spec(),
         };
         for (kind, snapshot) in snapshots {
-            let (target, recipe, reachable) = if kind == "action" {
+            let (target, recipe, placements, sensor_scopes) = if kind == "action" {
                 let snapshot: ActionExecutableSnapshot = serde_json::from_value(snapshot)?;
                 let runtime = snapshot
                     .runtime
@@ -108,7 +120,7 @@ impl RuntimePreparationRepository {
                 {
                     return Err(Error::validation("Install-prepared actions currently require a default recipe without registered version variants or additional worker runtime constraints"));
                 }
-                let placement = [
+                let placements = vec![
                     pack_placement.clone(),
                     WorkerPlacement {
                         selector: action.worker_selector_labels(),
@@ -116,19 +128,7 @@ impl RuntimePreparationRepository {
                         affinity: action.worker_affinity_spec(),
                     },
                 ];
-                let reachable: Vec<_> = builders
-                    .iter()
-                    .filter(|worker| live(worker) && worker_matches_target(worker, &target))
-                    .filter(|worker| {
-                        worker_matches_all_placements(
-                            &worker_labels_from_capabilities(worker.capabilities.as_ref()),
-                            &worker_taints_from_capabilities(worker.capabilities.as_ref()),
-                            &placement,
-                        )
-                    })
-                    .filter_map(PreparationScope::for_worker)
-                    .collect();
-                (target, recipe, reachable)
+                (target, recipe, placements, None)
             } else {
                 let sensor: Sensor = serde_json::from_value(snapshot["sensor"].clone())?;
                 let runtime = serde_json::from_value(snapshot["runtime"].clone())?;
@@ -149,26 +149,41 @@ impl RuntimePreparationRepository {
                 let reachable =
                     SensorAdmissionRepository::preparation_scopes(connection, sensor.id, &target)
                         .await?;
-                (target, recipe, reachable)
+                // Sensor and rule placement govern sensor consumers. The builder
+                // is an action worker and must satisfy the pack placement.
+                (
+                    target,
+                    recipe,
+                    vec![pack_placement.clone()],
+                    Some(reachable),
+                )
             };
-            scopes.retain(|scope| reachable.contains(scope));
-            requests.push(PreparationRequest { target, recipe });
-        }
-        if !requests.is_empty() {
-            scopes.retain(|scope| {
-                builders.iter().any(|worker| {
-                    live(worker)
-                        && PreparationScope::for_worker(worker).as_ref() == Some(scope)
-                        && requests
-                            .iter()
-                            .all(|request| worker_admits(worker, &request.target.recipe_digest))
+            let mut job = PreparationJob {
+                target,
+                recipe,
+                scopes: Vec::new(),
+                placements,
+            };
+            job.scopes = builders
+                .iter()
+                .filter_map(|worker| job.builder_scope(worker))
+                .filter(|scope| {
+                    sensor_scopes
+                        .as_ref()
+                        .is_none_or(|scopes| scopes.contains(scope))
                 })
-            });
-            if scopes.is_empty() {
-                return Err(Error::validation("No live runtime preparation storage scope can build and run every required action and sensor in this release"));
+                .collect();
+            job.scopes.sort_unstable();
+            job.scopes.dedup();
+            if job.scopes.is_empty() {
+                return Err(Error::validation(format!(
+                    "No live runtime preparation storage scope can build and run '{}'",
+                    job.target.reference,
+                )));
             }
+            jobs.push(job);
         }
-        Ok(PreparationPlan { requests, scopes })
+        Ok(jobs)
     }
 
     pub async fn create_attempt(
@@ -176,29 +191,28 @@ impl RuntimePreparationRepository {
         install: Id,
         activation: Id,
         release_digest: &str,
-        plan: &PreparationPlan,
+        job: &PreparationJob,
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO pack_runtime_preparation_attempt (install, activation, release_digest, requests, scopes, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, clock_timestamp() + $6 * interval '1 second')",
+            "INSERT INTO pack_runtime_preparation_attempt (install, activation, release_digest, job, expires_at) \
+             VALUES ($1, $2, $3, $4, clock_timestamp() + $5 * interval '1 second')",
         )
         .bind(install)
         .bind(activation)
         .bind(release_digest)
-        .bind(sqlx::types::Json(&plan.requests))
-        .bind(sqlx::types::Json(&plan.scopes))
+        .bind(sqlx::types::Json(job))
         .bind(ATTEMPT_SECONDS)
         .execute(connection)
         .await?;
         Ok(())
     }
 
-    pub async fn dispatch_scopes(pool: &PgPool, install: Id) -> Result<Vec<PreparationScope>> {
-        let scopes: Option<sqlx::types::Json<Vec<PreparationScope>>> = sqlx::query_scalar(
-            "SELECT a.scopes FROM pack_runtime_preparation_attempt a JOIN pack_install parent ON a.activation = parent.id \
+    pub async fn dispatch_job(pool: &PgPool, install: Id) -> Result<Option<PreparationJob>> {
+        let job: Option<sqlx::types::Json<PreparationJob>> = sqlx::query_scalar(
+            "SELECT a.job FROM pack_runtime_preparation_attempt a JOIN pack_install parent ON a.activation = parent.id
              WHERE a.install = $1 AND a.expires_at > clock_timestamp() AND parent.status = 'activating'",
         ).bind(install).fetch_optional(pool).await?;
-        Ok(scopes.map(|scopes| scopes.0).unwrap_or_default())
+        Ok(job.map(|job| job.0))
     }
 
     pub async fn begin(
@@ -208,23 +222,47 @@ impl RuntimePreparationRepository {
         incarnation: uuid::Uuid,
         scope: &PreparationScope,
     ) -> Result<Option<PreparationAttempt>> {
-        Ok(sqlx::query_as(
-            "UPDATE pack_runtime_preparation_attempt a SET builder_incarnation = $3 \
-             FROM pack_install i, pack_install parent, worker w \
-             WHERE a.install = $1 AND i.id = a.install AND i.trigger_reason = $5 \
-             AND i.status = 'running' AND i.assigned_worker_id = $2 AND i.candidate_digest = a.release_digest \
-             AND parent.id = a.activation AND parent.status = 'activating' \
-             AND w.id = $2 AND w.meta->>'registration_incarnation' = $3::uuid::text \
-             AND a.builder_incarnation IS NULL AND a.expires_at > clock_timestamp() \
-             AND a.scopes @> $4 RETURNING a.release_digest, a.requests, a.scopes",
+        let Some(job) = Self::dispatch_job(pool, install).await? else {
+            return Ok(None);
+        };
+        let mut tx = pool.begin().await?;
+        // Freeze placement and scope for the claim without depending on
+        // unrelated changes to the worker's advertised capabilities.
+        let exists: Option<Id> =
+            sqlx::query_scalar("SELECT id FROM worker WHERE id = $1 FOR SHARE")
+                .bind(worker)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if exists.is_none() {
+            return Ok(None);
+        }
+        let Some(builder) = WorkerRepository::find_by_id(&mut *tx, worker).await? else {
+            return Ok(None);
+        };
+        if !job.can_build(&builder)
+            || PreparationScope::for_worker(&builder).as_ref() != Some(scope)
+        {
+            return Ok(None);
+        }
+        let attempt = sqlx::query_as(
+            "UPDATE pack_runtime_preparation_attempt a SET builder_incarnation = $3, builder_scope = $5
+             FROM pack_install i, pack_install parent, worker w
+             WHERE a.install = $1 AND i.id = a.install AND i.trigger_reason = $4
+             AND i.status = 'running' AND i.assigned_worker_id = $2 AND i.candidate_digest = a.release_digest
+             AND parent.id = a.activation AND parent.status = 'activating'
+             AND w.id = $2 AND w.meta->>'registration_incarnation' = $3::uuid::text
+             AND a.builder_incarnation IS NULL AND a.expires_at > clock_timestamp()
+             RETURNING a.release_digest, a.job",
         )
         .bind(install)
         .bind(worker)
         .bind(incarnation)
-        .bind(serde_json::json!([scope]))
         .bind(PREPARATION_TRIGGER)
-        .fetch_optional(pool)
-        .await?)
+        .bind(sqlx::types::Json(scope))
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(attempt)
     }
 
     pub async fn is_running(
@@ -251,7 +289,7 @@ impl RuntimePreparationRepository {
         install: Id,
         worker: Id,
         incarnation: uuid::Uuid,
-        prepared: &[InstalledPreparation],
+        prepared: &InstalledPreparation,
     ) -> Result<bool> {
         let mut tx = pool.begin().await?;
         let owner: Option<Id> = sqlx::query_scalar(
@@ -278,7 +316,7 @@ impl RuntimePreparationRepository {
             return Ok(false);
         }
         let claim: Option<PreparationAttempt> = sqlx::query_as(
-            "SELECT release_digest, requests, scopes FROM pack_runtime_preparation_attempt
+            "SELECT release_digest, job FROM pack_runtime_preparation_attempt
              WHERE install = $1 AND builder_incarnation = $2",
         )
         .bind(install)
@@ -288,12 +326,7 @@ impl RuntimePreparationRepository {
         let Some(claim) = claim else {
             return Ok(false);
         };
-        if !matches_plan(
-            prepared,
-            &claim.release_digest,
-            &claim.requests,
-            &claim.scopes,
-        ) {
+        if !claim.job.matches_ready(&claim.release_digest, prepared) {
             return Err(Error::validation(
                 "Runtime preparation evidence does not match its worker claim",
             ));
@@ -302,7 +335,7 @@ impl RuntimePreparationRepository {
             "UPDATE pack_runtime_preparation_attempt a SET prepared = $4 \
              FROM pack_install parent, worker w \
              WHERE a.install = $1 AND w.id = $2 AND a.builder_incarnation = $3 \
-             AND w.meta->>'registration_incarnation' = $3::uuid::text \
+             AND a.builder_scope = $5 AND w.meta->>'registration_incarnation' = $3::uuid::text \
              AND parent.id = a.activation AND parent.status = 'activating' \
              AND a.prepared IS NULL AND a.expires_at > clock_timestamp()",
         )
@@ -310,6 +343,7 @@ impl RuntimePreparationRepository {
         .bind(worker)
         .bind(incarnation)
         .bind(sqlx::types::Json(prepared))
+        .bind(sqlx::types::Json(&prepared.scope))
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -329,38 +363,49 @@ impl RuntimePreparationRepository {
 
     pub async fn bind_release(
         connection: &mut PgConnection,
-        install: Id,
+        installs: &[Id],
         activation: Id,
         release: &PackRelease,
-        plan: &PreparationPlan,
+        jobs: &[PreparationJob],
     ) -> Result<()> {
-        let result: Option<sqlx::types::Json<Vec<InstalledPreparation>>> = sqlx::query_scalar(
-            "SELECT a.prepared FROM pack_runtime_preparation_attempt a \
-             JOIN pack_install i ON i.id = a.install JOIN pack_install parent ON parent.id = a.activation \
-             WHERE a.install = $1 AND a.activation = $2 AND a.release_digest = $3 \
-             AND i.candidate_digest = a.release_digest AND i.status = 'activating' \
+        let prepared: Vec<(Id, sqlx::types::Json<InstalledPreparation>)> = sqlx::query_as(
+            "SELECT i.id, a.prepared FROM pack_runtime_preparation_attempt a
+             JOIN pack_install i ON i.id = a.install JOIN pack_install parent ON parent.id = a.activation
+             WHERE a.install = ANY($1) AND a.activation = $2 AND a.release_digest = $3
+             AND i.candidate_digest = a.release_digest AND i.status = 'activating'
              AND parent.status = 'activating' AND a.prepared IS NOT NULL
              AND EXISTS (SELECT 1 FROM pack WHERE id = $4 AND active_release = $5)
-             FOR UPDATE OF i",
-        ).bind(install).bind(activation).bind(&release.digest).bind(release.pack).bind(release.id)
-        .fetch_optional(&mut *connection).await?;
-        let prepared = result.ok_or_else(|| {
-            Error::validation("Release preparation did not publish ready evidence")
-        })?;
-        if !matches_plan(&prepared, &release.digest, &plan.requests, &plan.scopes) {
+             ORDER BY i.id FOR UPDATE OF i",
+        ).bind(installs).bind(activation).bind(&release.digest).bind(release.pack).bind(release.id)
+        .fetch_all(&mut *connection).await?;
+
+        // Verify the entire set against the freshly projected release before
+        // writing any readiness rows. Each target can use its own scope.
+        if installs.len() != jobs.len()
+            || prepared.len() != jobs.len()
+            || !jobs.iter().all(|job| {
+                prepared
+                    .iter()
+                    .any(|(_, ready)| job.matches_ready(&release.digest, ready))
+            })
+        {
             return Err(Error::validation(
-                "Release preparation targets or storage eligibility changed during installation",
+                "Release preparation evidence is incomplete or storage eligibility changed during installation",
             ));
         }
-        for ready in &prepared.0 {
+        for (install, ready) in prepared {
             sqlx::query(
                 "INSERT INTO pack_release_runtime_preparation (release, component_kind, component_ref, prepared) VALUES ($1, $2, $3, $4)",
-            ).bind(release.id).bind(kind_name(ready.target.kind)).bind(&ready.target.reference).bind(sqlx::types::Json(ready))
+            ).bind(release.id).bind(kind_name(ready.target.kind)).bind(&ready.target.reference).bind(&ready)
             .execute(&mut *connection).await?;
-        }
-        PackInstallRepository::finish_activation_in_transaction(connection, install, release.pack)
+            PackInstallRepository::finish_activation_in_transaction(
+                connection,
+                install,
+                release.pack,
+            )
             .await?
             .ok_or_else(|| Error::validation("Runtime preparation activation was cancelled"))?;
+        }
         Ok(())
     }
 
@@ -424,24 +469,6 @@ impl RuntimePreparationRepository {
             .filter(|record| record.release_digest == digest && record.target == *target)
             .collect())
     }
-}
-
-fn matches_plan(
-    prepared: &[InstalledPreparation],
-    release_digest: &str,
-    requests: &[PreparationRequest],
-    scopes: &[PreparationScope],
-) -> bool {
-    let Some(first) = prepared.first() else {
-        return false;
-    };
-    scopes.contains(&first.scope)
-        && prepared.len() == requests.len()
-        && prepared.iter().zip(requests).all(|(ready, request)| {
-            ready.scope == first.scope
-                && ready.target == request.target
-                && ready.release_digest == release_digest
-        })
 }
 
 pub fn worker_admits(worker: &Worker, digest: &str) -> bool {

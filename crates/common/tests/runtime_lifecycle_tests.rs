@@ -779,7 +779,14 @@ async fn bubblewrap_installed_generation_requires_local_seal_and_exact_identity(
         recipe_digest: recipe.digest().unwrap(),
     };
     let ready = recipe
-        .prepare_for_install(&pack, target, &"a".repeat(64), &scope, &environment)
+        .prepare_for_install(
+            &pack,
+            target,
+            &"a".repeat(64),
+            &scope,
+            &environment,
+            &tokio_util::sync::CancellationToken::new(),
+        )
         .await
         .unwrap();
     for distinct_root in [

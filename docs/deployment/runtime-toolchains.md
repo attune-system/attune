@@ -146,20 +146,22 @@ explicit candidate test runners still prepare for each invocation.
   storage ID distinguishes separate worker-local volumes even if their paths
   and configured revisions match. Keep that ID unique when provisioning
   independent volumes. Give the managers write access for generation creation
-  and invocation scratch. An action-only release can use a worker's local
-  volume. A release with a managed sensor needs explicitly shared storage
-  between the builder and eligible sensor managers.
-- The initial implementation admits up to 16 required targets per release on
-  one storage scope, with a five-minute preparation attempt. Install-prepared
-  file workloads use the parent recipe without runtime version variants.
-  Install-prepared actions currently require no additional worker runtime
-  constraints. Pack and workload placement, including active sensor rule
-  placement, still apply.
+  and invocation scratch. An action can use a worker's local volume. Each
+  managed sensor needs explicitly shared storage between its builder and
+  eligible sensor managers.
+- A release can prepare up to 16 targets. Each target gets its own eligible
+  storage scope and a five-minute preparation attempt. Builders honor pack
+  placement, and action builders also honor action placement. Sensor and rule
+  placement govern the sensor managers that can consume a result. All required
+  targets must be ready before the release activates. Install-prepared file
+  workloads use the parent recipe without runtime version variants or additional
+  action runtime constraints.
 - Pack activation checks the worker's complete readiness evidence against the
   release digest, entrypoint, recipe and eligible storage scope. A failed build,
   expired attempt or unavailable scope leaves the previous release active,
   including on forced installs and installs that skip candidate tests. A new
-  install request starts a fresh attempt at a new physical path.
+  install request starts fresh attempts at new physical paths. On cancellation,
+  the worker stops and joins build input copies before releasing the candidate.
 - At launch, the manager verifies its scope, the manager-written completion
   seal, the retained files, and the resolved tools against the recorded
   identities. It mounts the prepared files read-only and allocates independent
@@ -180,7 +182,11 @@ The full-service regression is in
 Set `ATTUNE_E2E_INSTALL_PREPARATION=1` for the test runner against an owned
 stack with the [fixture recipe](../../tests/fixtures/runtime-services/install_recipe.json)
 admitted on both pools. It exercises upload, activation, action reuse, sensor
-startup, failed and ineligible updates, and a changed release.
+startup, failed and ineligible updates, and a changed release. To exercise two
+worker-local scopes, also set `ATTUNE_E2E_SPLIT_PREPARATION_POOLS=1` and configure
+action workers with the label `fixture=install-preparation` and separate
+`pool=first` and `pool=second` labels and runtime volumes. Put a `dedicated`
+no-schedule taint on the second pool.
 
 ## Candidate tests and local deployment
 

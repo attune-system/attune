@@ -207,7 +207,9 @@ impl RuntimeRecipe {
         release_digest: &str,
         scope: &PreparationScope,
         environment: &ChildProcessEnvironment,
+        cancellation: &CancellationToken,
     ) -> Result<InstalledPreparation> {
+        check_preparation_cancelled(Some(cancellation))?;
         if !self.prepare_at_install
             || target.recipe_digest != self.require_admission(environment)?
         {
@@ -229,22 +231,25 @@ impl RuntimeRecipe {
         }
         #[cfg(not(unix))]
         std::fs::create_dir(&root)?;
-        copy_workspace(candidate, &pack)?;
+        copy_install_workspace(candidate, &pack, cancellation).await?;
         let build = self
             .prepare_build(
                 &pack,
                 RuntimeSource::File(&pack.join(&target.source)),
                 &root,
                 &execution_environment,
+                Some(cancellation),
             )
             .await?;
+        check_preparation_cancelled(Some(cancellation))?;
         // Validate the launch while the complete tree is still private, using
         // the same expansion and path checks as the consumer.
         let invocation = self.bind_private_invocation(&build, &root, &execution_environment)?;
-        std::fs::remove_dir_all(invocation.cleanup_root)?;
+        tokio::fs::remove_dir_all(invocation.cleanup_root).await?;
         for disposable in ["home", "scratch"] {
-            std::fs::remove_dir_all(build.generation.join(disposable))?;
+            tokio::fs::remove_dir_all(build.generation.join(disposable)).await?;
         }
+        check_preparation_cancelled(Some(cancellation))?;
         let generation = build
             .generation
             .file_name()
@@ -254,6 +259,7 @@ impl RuntimeRecipe {
         let tool_hashes = hash_tools(&build.tools)?;
         let seal = Uuid::new_v4();
         let retained = fingerprint_preparation(&pack, &build.generation, true).await?;
+        check_preparation_cancelled(Some(cancellation))?;
         let mut marker = std::fs::File::create_new(root.join("ready"))?;
         write!(marker, "{seal}")?;
         marker.sync_all()?;

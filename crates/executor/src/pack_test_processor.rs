@@ -13,13 +13,20 @@ use attune_common::{
         Consumer, MessageEnvelope, MessageType, MqError, MqResult, PackTestRequestedPayload,
         Publisher,
     },
-    repositories::PackInstallRepository,
+    repositories::{
+        runtime_preparation::RuntimePreparationRepository, PackInstallRepository, WorkerRepository,
+    },
+    runtime_lifecycle::PREPARATION_TRIGGER,
     scheduling::{
-        parse_worker_affinity, parse_worker_selector, parse_worker_tolerations, WorkerPlacement,
+        parse_worker_affinity, parse_worker_selector, parse_worker_tolerations,
+        preferred_affinity_score_all, worker_labels_from_capabilities, WorkerPlacement,
     },
 };
 use sqlx::PgPool;
-use std::sync::{atomic::AtomicUsize, Arc};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use tracing::{error, info, warn};
 
 use crate::scheduler::ExecutionScheduler;
@@ -201,20 +208,31 @@ impl PackTestProcessor {
         payload: &PackTestRequestedPayload,
         counter: &AtomicUsize,
     ) -> Result<Worker> {
-        let preparation_scopes = if payload.trigger_reason
-            == attune_common::runtime_lifecycle::PREPARATION_TRIGGER
-        {
-            let scopes = attune_common::repositories::runtime_preparation::RuntimePreparationRepository::dispatch_scopes(
-                pool, payload.pack_install_id,
-            ).await?;
-            anyhow::ensure!(
-                !scopes.is_empty(),
-                "No admitted storage scope for runtime preparation"
-            );
-            scopes
-        } else {
-            Vec::new()
-        };
+        if payload.trigger_reason == PREPARATION_TRIGGER {
+            let job = RuntimePreparationRepository::dispatch_job(pool, payload.pack_install_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Runtime preparation job is unavailable"))?;
+            let mut workers: Vec<_> = WorkerRepository::find_action_workers(pool)
+                .await?
+                .into_iter()
+                .filter(|worker| job.can_build(worker))
+                .collect();
+            let score = |worker: &Worker| {
+                preferred_affinity_score_all(
+                    &worker_labels_from_capabilities(worker.capabilities.as_ref()),
+                    &job.placements,
+                )
+            };
+            let best = workers.iter().map(score).max().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No eligible runtime preparation builder for '{}'",
+                    job.target.reference
+                )
+            })?;
+            workers.retain(|worker| score(worker) == best);
+            let index = counter.fetch_add(1, Ordering::Relaxed) % workers.len();
+            return Ok(workers.swap_remove(index));
+        }
         // Prefer explicit required runtimes when present.
         let placement = WorkerPlacement {
             selector: parse_worker_selector(&payload.worker_selector)?,
@@ -226,7 +244,6 @@ impl PackTestProcessor {
             &payload.required_runtimes,
             &payload.required_recipe_digests,
             placement,
-            &preparation_scopes,
             counter,
         )
         .await

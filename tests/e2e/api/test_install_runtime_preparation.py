@@ -45,7 +45,7 @@ release = (pack / "release.txt").read_text()
 (output / "build.json").write_text(json.dumps({
     "release": release, "generation": uuid.uuid4().hex, "entrypoint": source.name,
 }))
-if release == "fail":
+if release in ("fail", f"fail:{source.name}"):
     raise RuntimeError("Build failed after writing partial output")
 """
 
@@ -106,7 +106,7 @@ Event().wait()
 """
 
 
-def _fixture(root, ref):
+def _fixture(root, ref, include_sensor=True):
     for directory in ("actions", "runtimes", "sensors", "triggers"):
         (root / directory).mkdir(parents=True)
 
@@ -119,20 +119,22 @@ def _fixture(root, ref):
              runner_type=f"{ref}.prepared", entry_point="read.py",
              parameter_delivery="stdin", parameter_format="json", output_format="json",
              parameters={"message": {"type": "string", "required": True}})
-    metadata("sensors/watch.yaml", ref=f"{ref}.watch", label="Report prepared build",
-             runner_type=f"{ref}.prepared", entry_point="watch.py",
-             enabled=False, trigger_types=[f"{ref}.tick"])
-    metadata("triggers/tick.yaml", ref=f"{ref}.tick", label="Prepared sensor event",
-             type="prepared_fixture", enabled=True, parameters={},
-             output={"message": {"type": "string", "required": True}})
+    if include_sensor:
+        metadata("sensors/watch.yaml", ref=f"{ref}.watch", label="Report prepared build",
+                 runner_type=f"{ref}.prepared", entry_point="watch.py",
+                 enabled=False, trigger_types=[f"{ref}.tick"])
+        metadata("triggers/tick.yaml", ref=f"{ref}.tick", label="Prepared sensor event",
+                 type="prepared_fixture", enabled=True, parameters={},
+                 output={"message": {"type": "string", "required": True}})
     (root / "build.py").write_text(BUILD)
     (root / "actions/read.py").write_text(ACTION)
-    (root / "sensors/watch.py").write_text(SENSOR)
-    for directory in ("actions", "sensors"):
-        (root / directory / "fixture_dependency.py").write_text("dependency = 'retained'\n")
+    (root / "actions/fixture_dependency.py").write_text("dependency = 'retained'\n")
+    if include_sensor:
+        (root / "sensors/watch.py").write_text(SENSOR)
+        (root / "sensors/fixture_dependency.py").write_text("dependency = 'retained'\n")
 
-    def release(version, content):
-        metadata("pack.yaml", ref=ref, name=ref, version=version)
+    def release(version, content, **placement):
+        metadata("pack.yaml", ref=ref, name=ref, version=version, **placement)
         (root / "release.txt").write_text(content)
 
     return release
@@ -193,3 +195,42 @@ def test_install_prepares_actions_and_sensors_before_activation(client, tmp_path
     updated = run("after update")
     assert updated["release"] == "changed input"
     assert updated["generation"] != original["generation"]
+
+@pytest.mark.skipif(
+    os.getenv("ATTUNE_E2E_SPLIT_PREPARATION_POOLS") != "1",
+    reason="requires two configured action pools with separate preparation storage",
+)
+def test_install_prepares_each_workload_on_its_eligible_storage_scope(client, tmp_path):
+    ref = "install_split_" + uuid.uuid4().hex[:10]
+    release = _fixture(tmp_path, ref, include_sensor=False)
+    first_metadata = tmp_path / "actions/read.yaml"
+    first = yaml.safe_load(first_metadata.read_text())
+    first["worker_selector"] = {"pool": "first"}
+    first_metadata.write_text(yaml.safe_dump(first))
+    second = dict(first, ref=f"{ref}.other", entry_point="other.py",
+                  worker_selector={"pool": "second"})
+    (tmp_path / "actions/other.yaml").write_text(yaml.safe_dump(second))
+    (tmp_path / "actions/other.py").write_text(ACTION)
+
+    placement = {
+        "worker_selector": {"fixture": "install-preparation"},
+        "worker_tolerations": [{"key": "dedicated", "operator": "exists", "effect": "no_schedule"}],
+    }
+
+    def run(action):
+        execution = client.create_execution(action_ref=f"{ref}.{action}", parameters={"message": action})
+        result = wait_for_execution_status(client, execution["id"], "completed", timeout=30)["result"]
+        assert result["input"] == action
+        assert result["entrypoint"] == f"{action}.py"
+        return result["generation"]
+
+    release("1.0.0", "original", **placement)
+    assert client.upload_pack(str(tmp_path))["version"] == "1.0.0"
+    original = {action: run(action) for action in ("read", "other")}
+    assert original["read"] != original["other"]
+
+    release("1.1.0", "fail:other.py", **placement)
+    with pytest.raises(Exception, match="Runtime command failed"):
+        client.upload_pack(str(tmp_path), force=True)
+    assert client.get_pack_by_ref(ref)["version"] == "1.0.0"
+    assert {action: run(action) for action in original} == original
