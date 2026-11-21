@@ -6,12 +6,11 @@ prepares a target, and supplies its launch command to actions, sensors, and
 candidate test runners. No language name, package manager, source extension, or
 invocation flag is hardcoded in this path.
 
-This first implementation supports the **trusted** execution profile on Unix. Preparation
-and discovery are not a sandbox for hostile dependency hooks. Keep the limitations
-in [workload isolation](workload-isolation.md) and
-[child-process environments](child-process-environments.md) in view when admitting
-code. It does not implement hostile-pack admission, network egress enforcement,
-cross-host output distribution, or reusable prepared-target caching.
+Runtime recipes are intended for audited pack code. Linux pools can opt in to
+Bubblewrap for tool discovery, preparation and execution. See
+[workload isolation](workload-isolation.md) and
+[child-process environments](child-process-environments.md) for the launch
+boundary and the prerequisites for enabling it.
 
 ## Admission and discovery
 
@@ -58,7 +57,8 @@ separate. Constrained action/sensor selection requires registered, verified runt
 versions; invocation rechecks the selected primary version and fails on drift.
 `extensions` supplies source hints and an inline source suffix. Explicit
 action runtime selection remains authoritative. `workspace: true` provides an
-owned writable copy of the workload release, including source-relative imports.
+owned copy of the workload release, including source-relative imports. With
+Bubblewrap, preparation can write the copy and final processes see it read-only.
 Symlinks/special files in copied inputs fail; copies have bounded file/byte counts.
 Ad hoc recipe actions use private inline files; when no pack exists, preparation
 creates an empty input root inside the private generation.
@@ -75,7 +75,9 @@ Templates are expanded once, preserving argument-array boundaries:
 - `{pack_dir}`: pinned workload input root.
 - `{workspace_dir}`: owned build working copy (empty unless requested or inline).
 - `{env_dir}`: permanent physical path of this private generation.
-- `{output_dir}` and `{scratch_dir}`: owned output and scratch directories.
+- `{output_dir}`: owned build output, read-only during a sandboxed invocation.
+- `{scratch_dir}`: writable scratch. The sandbox gives each final invocation a
+  fresh scratch path outside the build generation.
 - `{source_file}`: selected source or its workspace/inline mapping.
 - `{tool_NAME}`: verified absolute executable for a declared tool.
 

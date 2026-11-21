@@ -3,7 +3,7 @@
 use anyhow::Result;
 use attune_common::{
     agent_bootstrap::{bootstrap_runtime_env, print_detect_only_report},
-    agent_runtime_detection::DetectedRuntime,
+    child_process_environment::ChildProcessEnvironment,
     config::Config,
     observability,
 };
@@ -65,13 +65,15 @@ fn main() -> Result<()> {
                     .map(|value| value.split(',').map(str::to_string).collect())
                     .unwrap_or_default()
             });
-        let environment =
-            attune_common::child_process_environment::ChildProcessEnvironment::capture(
-                &passthrough,
-            )?;
-        let bootstrap = bootstrap_runtime_env("ATTUNE_SENSOR_RUNTIMES", &environment);
-        print_detect_only_report("ATTUNE_SENSOR_RUNTIMES", &bootstrap, &environment);
-        return Ok(());
+        let runtime = tokio::runtime::Runtime::new()?;
+        return runtime.block_on(async {
+            // Detection-only runs have no artifact transport.
+            let environment =
+                ChildProcessEnvironment::capture_for_service(&passthrough, true).await?;
+            let bootstrap = bootstrap_runtime_env("ATTUNE_SENSOR_RUNTIMES", &environment).await;
+            print_detect_only_report("ATTUNE_SENSOR_RUNTIMES", &bootstrap, &environment).await;
+            Ok(())
+        });
     }
 
     let config = Config::load()?;
@@ -91,33 +93,38 @@ fn main() -> Result<()> {
         env!("CARGO_PKG_VERSION")
     );
 
-    let child_environment =
-        attune_common::child_process_environment::ChildProcessEnvironment::capture(
-            config
-                .sensor
-                .as_ref()
-                .map(|sensor| sensor.passthrough_env.as_slice())
-                .unwrap_or(&[]),
-        )?;
-    let bootstrap = bootstrap_runtime_env("ATTUNE_SENSOR_RUNTIMES", &child_environment);
-    let agent_detected_runtimes = bootstrap.detected_runtimes.clone();
-
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async_main(args.name, config, agent_detected_runtimes))
+    runtime.block_on(async_main(args.name, config))
 }
 
-async fn async_main(
-    name: Option<String>,
-    mut config: Config,
-    agent_detected_runtimes: Option<Vec<DetectedRuntime>>,
-) -> Result<()> {
+/// Run the agent after configuring its process environment on the main thread.
+async fn async_main(name: Option<String>, mut config: Config) -> Result<()> {
     if let Some(name) = name {
         apply_sensor_name_override(&mut config, name);
     }
 
+    let child_environment = ChildProcessEnvironment::capture_for_service(
+        config
+            .sensor
+            .as_ref()
+            .map(|sensor| sensor.passthrough_env.as_slice())
+            .unwrap_or(&[]),
+        config.artifacts.transport == attune_common::artifact_transport::TransportMode::Api,
+    )
+    .await?;
+    let agent_detected_runtimes =
+        bootstrap_runtime_env("ATTUNE_SENSOR_RUNTIMES", &child_environment)
+            .await
+            .detected_runtimes;
+
     log_config_details(&config);
-    run_sensor_service(
+    let service = attune_sensor::service::SensorService::new_with_child_environment(
         config,
+        child_environment,
+    )
+    .await?;
+    run_sensor_service(
+        service,
         agent_detected_runtimes,
         "Attune Sensor Agent is ready",
     )

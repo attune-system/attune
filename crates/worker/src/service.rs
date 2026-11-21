@@ -281,23 +281,25 @@ struct RecordedWorkerObservation {
 impl WorkerService {
     /// Create a new worker service
     pub async fn new(config: Config) -> Result<Self> {
-        info!("Initializing Worker Service");
-        let recorded_identity = RecordedConsumerIdentity::from_environment()?;
         let child_environment =
-            attune_common::child_process_environment::ChildProcessEnvironment::capture(
+            attune_common::child_process_environment::ChildProcessEnvironment::capture_for_service(
                 config
                     .worker
                     .as_ref()
                     .map(|worker| worker.passthrough_env.as_slice())
                     .unwrap_or(&[]),
-            )?
-            .with_workload_sandbox(
-                attune_common::workload_sandbox::WorkloadSandbox::from_environment(
-                    config.artifacts.transport
-                        == attune_common::artifact_transport::TransportMode::Api,
-                )
-                .map_err(|error| Error::validation(error.to_string()))?,
-            );
+                config.artifacts.transport == attune_common::artifact_transport::TransportMode::Api,
+            )
+            .await?;
+        Self::new_with_child_environment(config, child_environment).await
+    }
+
+    pub async fn new_with_child_environment(
+        config: Config,
+        child_environment: attune_common::child_process_environment::ChildProcessEnvironment,
+    ) -> Result<Self> {
+        info!("Initializing Worker Service");
+        let recorded_identity = RecordedConsumerIdentity::from_environment()?;
         config.validate_deployed_pack_transport()?;
         config.validate_deployed_artifact_transport()?;
         let configured_api_url = std::env::var("ATTUNE_API_URL").ok();

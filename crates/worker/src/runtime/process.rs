@@ -22,7 +22,9 @@ use async_trait::async_trait;
 use attune_common::models::runtime::{
     EnvironmentConfig, InlineExecutionStrategy, RuntimeExecutionConfig,
 };
-use attune_common::runtime_cache::{sha256_bytes, RuntimeCacheKey, READY_MARKER};
+use attune_common::runtime_cache::{
+    read_runtime_marker, sha256_bytes, write_runtime_marker, RuntimeCacheKey, READY_MARKER,
+};
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -254,13 +256,7 @@ impl ProcessRuntime {
             .args(&target.command[1..])
             .current_dir(&target.working_dir);
         parameter_passing::apply_runtime_environment(&mut command, &env, &self.child_environment);
-        let mut input_roots = vec![target.generation.as_path()];
-        if pack_dir.is_dir() {
-            input_roots.push(pack_dir.as_path());
-        }
-        let command = self
-            .child_environment
-            .sandbox_workload(command.into_std(), &input_roots)?;
+        let command = target.sandbox_invocation(command.into_std(), &self.child_environment)?;
         let result = process_executor::execute_streaming_recipe(
             Command::from(command),
             &HashMap::new(),
@@ -410,21 +406,22 @@ impl ProcessRuntime {
             .parent()
             .and_then(Path::file_name)
             .is_some_and(|name| name == "sha256");
-        if cache_key.is_none() && !content_addressed {
+        if cache_key.is_none()
+            && !content_addressed
+            && !self.child_environment.uses_workload_sandbox()
+        {
             return self
                 .setup_pack_environment_in_place(pack_dir, env_dir)
                 .await;
         }
-        let ready = cache_key
-            .map(|key| key.is_ready(env_dir))
-            .unwrap_or_else(|| {
-                std::fs::read_to_string(env_dir.join(READY_MARKER)).is_ok_and(|marker| {
-                    env_dir
-                        .file_name()
-                        .is_some_and(|name| marker.trim() == name.to_string_lossy())
-                })
-            });
-        if ready {
+        let marker = env_dir.file_name().unwrap_or_default().to_string_lossy();
+        let is_ready = |path: &Path| {
+            cache_key.map(|key| key.is_ready(path)).unwrap_or_else(|| {
+                read_runtime_marker(&path.join(READY_MARKER))
+                    .is_ok_and(|value| value.trim() == marker)
+            })
+        };
+        if is_ready(env_dir) {
             return Ok(());
         }
         if env_dir.exists() {
@@ -458,34 +455,12 @@ impl ProcessRuntime {
             }
             if let Some(key) = cache_key {
                 key.write_ready_marker(&temporary)?;
-            } else {
-                let marker = if env_dir
-                    .parent()
-                    .and_then(Path::file_name)
-                    .is_some_and(|name| name == "sha256")
-                {
-                    env_dir
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "ready".to_string())
-                } else {
-                    "ready".to_string()
-                };
-                std::fs::write(temporary.join(READY_MARKER), marker)?;
-            }
-            if let Some(key) = cache_key {
                 key.publish(&temporary, env_dir)?;
             } else {
+                write_runtime_marker(&temporary.join(READY_MARKER), &marker)?;
                 match std::fs::rename(&temporary, env_dir) {
                     Ok(()) => {}
-                    Err(_)
-                        if std::fs::read_to_string(env_dir.join(READY_MARKER)).is_ok_and(
-                            |marker| {
-                                env_dir
-                                    .file_name()
-                                    .is_some_and(|name| marker.trim() == name.to_string_lossy())
-                            },
-                        ) => {}
+                    Err(_) if is_ready(env_dir) => {}
                     Err(error) => return Err(error.into()),
                 }
             }
@@ -664,7 +639,12 @@ impl ProcessRuntime {
             &self.child_environment,
             &self.config,
         );
-        let output = process_executor::run_command_output_owned(command)
+        let command = self.child_environment.sandbox_environment_setup(
+            command.into_std(),
+            pack_dir,
+            env_dir,
+        )?;
+        let output = process_executor::run_command_output_owned(Command::from(command))
             .await
             .map_err(|e| {
                 RuntimeError::SetupError(format!(
@@ -737,7 +717,7 @@ impl ProcessRuntime {
         let current_checksum = Self::file_checksum(&manifest_path).await;
 
         if let Some(ref checksum) = current_checksum {
-            if let Ok(stored) = tokio::fs::read_to_string(&marker_path).await {
+            if let Ok(stored) = read_runtime_marker(&marker_path) {
                 if stored.trim() == checksum.as_str() {
                     debug!(
                         "Dependencies already installed for runtime '{}' in {} (manifest unchanged)",
@@ -774,7 +754,12 @@ impl ProcessRuntime {
             &self.child_environment,
             &self.config,
         );
-        let output = process_executor::run_command_output_owned(command)
+        let command = self.child_environment.sandbox_environment_setup(
+            command.into_std(),
+            pack_dir,
+            env_dir,
+        )?;
+        let output = process_executor::run_command_output_owned(Command::from(command))
             .await
             .map_err(|e| {
                 RuntimeError::SetupError(format!(
@@ -803,7 +788,7 @@ impl ProcessRuntime {
 
         // Write the checksum marker so subsequent calls skip the install.
         if let Some(checksum) = current_checksum {
-            if let Err(e) = tokio::fs::write(&marker_path, checksum.as_bytes()).await {
+            if let Err(e) = write_runtime_marker(&marker_path, &checksum) {
                 warn!(
                     "Failed to write dependency marker file {}: {}",
                     marker_path.display(),
@@ -954,13 +939,25 @@ impl ProcessRuntime {
         env_dir: &Path,
         effective_config: &RuntimeExecutionConfig,
         cache_key: Option<&RuntimeCacheKey>,
-    ) {
+    ) -> RuntimeResult<()> {
         if effective_config.environment.is_none() || !pack_dir.exists() {
-            return;
+            return Ok(());
         }
 
         let env_lock = get_env_setup_lock(env_dir);
         let _guard = env_lock.lock().await;
+
+        if self.child_environment.uses_workload_sandbox() {
+            return ProcessRuntime::new(
+                self.runtime_name.clone(),
+                effective_config.clone(),
+                self.packs_base_dir.clone(),
+                self.runtime_envs_dir.clone(),
+            )
+            .with_child_environment(self.child_environment.clone())
+            .setup_pack_environment_with_key(pack_dir, env_dir, cache_key)
+            .await;
+        }
 
         if !env_dir.exists() {
             info!(
@@ -1067,6 +1064,17 @@ impl ProcessRuntime {
                 }
             }
         }
+        Ok(())
+    }
+
+    async fn probe_interpreter(&self, binary: &str) -> std::io::Result<std::process::Output> {
+        let mut command = Command::new(binary);
+        self.child_environment.apply(command.as_std_mut());
+        command.arg("--version");
+        let command = self
+            .child_environment
+            .sandbox_workload(command.into_std(), &[])?;
+        Command::from(command).kill_on_drop(true).output().await
     }
 }
 
@@ -1202,7 +1210,7 @@ impl Runtime for ProcessRuntime {
             &effective_config,
             cache_key.as_ref(),
         )
-        .await;
+        .await?;
 
         let mut env_dir_opt = if effective_config.environment.is_some() {
             Some(env_dir.as_path())
@@ -1236,7 +1244,7 @@ impl Runtime for ProcessRuntime {
                 &effective_config,
                 cache_key.as_ref(),
             )
-            .await;
+            .await?;
 
             env_dir_opt = if effective_config.environment.is_some() {
                 Some(env_dir.as_path())
@@ -1477,9 +1485,7 @@ impl Runtime for ProcessRuntime {
         let binary = &self.config.interpreter.binary;
 
         // Verify the interpreter is available on the system
-        let mut command = Command::new(binary);
-        self.child_environment.apply(command.as_std_mut());
-        let result = command.arg("--version").output().await;
+        let result = self.probe_interpreter(binary).await;
 
         match result {
             Ok(output) => {
@@ -1522,9 +1528,7 @@ impl Runtime for ProcessRuntime {
         let binary = &self.config.interpreter.binary;
 
         // Check if interpreter is available
-        let mut command = Command::new(binary);
-        self.child_environment.apply(command.as_std_mut());
-        let output = command.arg("--version").output().await;
+        let output = self.probe_interpreter(binary).await;
 
         match output {
             Ok(output) if output.status.success() => Ok(()),
@@ -3307,6 +3311,53 @@ mod tests {
             .await
             .is_err());
         assert!(!env_dir.join(".attune_deps_installed").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Linux Bubblewrap and unprivileged namespaces"]
+    async fn sandboxed_unkeyed_setup_publishes_only_after_dependencies_succeed() {
+        let temp_dir = TempDir::new().unwrap();
+        let pack_dir = temp_dir.path().join("pack");
+        let env_dir = temp_dir.path().join("environment");
+        std::fs::create_dir(&pack_dir).unwrap();
+        let manifest = pack_dir.join("requirements.txt");
+        std::fs::write(&manifest, "waiting").unwrap();
+        let mut config = make_dependency_test_config("grep -qx ready \"$1\"");
+        config.environment = Some(EnvironmentConfig {
+            env_type: "fixture".into(),
+            dir_name: "environment".into(),
+            create_command: vec!["/bin/mkdir".into(), "-p".into(), "{env_dir}/bin".into()],
+            interpreter_path: None,
+        });
+        let environment =
+            attune_common::child_process_environment::ChildProcessEnvironment::default()
+                .with_workload_sandbox(
+                    attune_common::workload_sandbox::WorkloadSandbox::Bubblewrap,
+                );
+        let runtime = ProcessRuntime::new(
+            "test".into(),
+            config.clone(),
+            pack_dir.clone(),
+            temp_dir.path().to_path_buf(),
+        )
+        .with_child_environment(environment);
+
+        assert!(runtime
+            .ensure_runtime_environment("fixture.run", &pack_dir, &env_dir, &config, None)
+            .await
+            .is_err());
+        assert!(!env_dir.exists());
+        std::fs::write(&manifest, "ready").unwrap();
+        runtime
+            .ensure_runtime_environment("fixture.run", &pack_dir, &env_dir, &config, None)
+            .await
+            .unwrap();
+        assert!(env_dir.join("bin").is_dir());
+        assert_eq!(
+            read_runtime_marker(&env_dir.join(READY_MARKER)).unwrap(),
+            "environment"
+        );
     }
 
     #[tokio::test]

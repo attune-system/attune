@@ -1,69 +1,89 @@
-# Final workload process isolation (experimental opt-in)
+# Workload process isolation with Bubblewrap
 
-Linux action and sensor managers can set `ATTUNE_WORKLOAD_SANDBOX=bubblewrap`.
-The default is disabled; existing deployments retain their execution behavior.
-An unknown mode, non-Linux platform, or shared-volume artifact transport rejects
-startup. API artifact transport is required. Install operator-owned Bubblewrap
-at `/usr/bin/bwrap` with support for `--disable-userns` and enable unprivileged
-user and PID namespaces. A failed sandbox launch fails the workload; it never
-falls back to an ordinary process. No privileged container mode or host change
-is performed by Attune.
+Linux action and sensor managers can opt in with
+`ATTUNE_WORKLOAD_SANDBOX=bubblewrap` and API artifact transport. Provision an
+operator-owned `/usr/bin/bwrap` that supports `--disable-userns`. The manager runs
+a sandbox probe at startup to check whether the binary, kernel and container
+security profile allow the required user, PID, mount, IPC and UTS namespaces
+and `close_range(..., CLOSE_RANGE_CLOEXEC)` (Linux 5.11 or newer). The sandbox
+keeps only the workload's explicitly configured stdio descriptors across exec.
+A failed probe stops startup before automatic interpreter discovery. A failed
+workload sandbox prevents that workload from running.
 
-Each final interpreted/native action and managed sensor receives a new user,
-PID, mount, IPC and UTS namespace, a fresh procfs, minimal devices, and private
-`/tmp`. Only system executables/libraries, DNS/TLS public configuration, and the
-selected pack and runtime are mounted. Pack/runtime mounts are read-only.
-Inline action files are individually mounted read-only. Native actions receive
-the selected executable file. Path aliases and broad/system input mounts are
-rejected. Pack/runtime paths must be absolute canonical paths. No host home,
-service configuration, database/broker credentials, custody spool or sibling
-scratch/artifact tree is mounted. The operator must keep credentials out of
-system binary/certificate trees and selected pack/runtime trees.
+Each sandbox runs as a local child process of the existing worker or sensor
+manager. It mounts a private procfs, minimal devices and a private `/tmp`.
+System executables and libraries, public DNS/TLS configuration and the selected
+pack and runtime inputs are read-only. Inline inputs and declared tool
+executables are exposed only as needed. Keep credentials out of these mounted
+trees. The private PID namespace limits access to the manager and sibling
+processes by PID. The sandbox shares the manager's network namespace, so
+application HTTP paths remain available.
 
-The existing selected environment, scoped API credential and stdin JSON are
-preserved. Bubblewrap itself starts with only a fixed trusted PATH; workload
-variables are installed through an unlinked private file descriptor after
-namespace setup. Executable arguments retain their ordinary argv contract. Loader controls never apply to the host launcher. `HOME` and `TMPDIR` become `/tmp`; `ATTUNE_ARTIFACTS_DIR` becomes the
-private `/tmp/artifacts` directory. File producers must upload through the API
-before exit. File writes under the pack, runtime, or any arbitrary host working
-directory fail. Dependencies needing writable state must use private scratch.
-Network access remains shared so admitted execution/sensor/control HTTP paths
-continue to work; this feature does not enforce network egress policy.
+## Preparation and execution
 
-The process namespace prevents a final workload from reading another workload's
-initial environment through host procfs or signaling a host sibling by PID.
-Read-only mounts prevent a final workload from poisoning the published runtime
-used by a later execution. This does not protect against a hostile host service
-or a privileged tracer. Operator pack publication and runtime setup must remain
-trusted and must not run concurrently with untrusted workloads on the same host.
+Tool probes and dependency preparation run with writable staging owned by
+that preparation. The pack release stays read-only. Lifecycle recipes can request
+a writable workspace copy during preparation. Final recipe actions, managed
+sensors and candidate tests get a read-only view of the prepared files and
+independent writable home, scratch and artifact staging. Other sandboxed
+workloads use `/tmp` for temporary files and `/tmp/artifacts` for artifact staging.
+File producers can upload through the API while those files exist.
 
-## Finding mapping and remaining stages
+For sandboxed legacy runtimes, configure package installation to write into the
+staging path. The worker publishes the environment only after setup succeeds.
+Roll out with fresh runtime caches if the pool has unkeyed environments
+created before the completion-marker check. Install legacy interpreters and tool
+libraries in the image's system directories. Admitted lifecycle probes can also
+mount a selected executable outside those directories at its invocation path.
 
-Findings s-2/s-23 and issue 137 remain open. `env_clear` controls inheritance;
-`PR_SET_DUMPABLE(0)` protects the manager after startup. Neither mechanism alone
-isolates siblings or writable shared runtimes. This stage adds an independent
-OS/filesystem boundary around **final** workload processes and removes their
-access to credential-bearing host trees. It does not remove master credentials
-from managers: worker JWT signing supports execution and worker transport tokens,
-encryption supports admitted inputs and encrypted log custody, and DB/MQ support
-control operations. Sensors still use DB/MQ/JWT and optional encryption for
-recorded configurations.
+The sandbox defaults `PYTHONPYCACHEPREFIX` to `/tmp/pycache`. Python recipes can
+also set it to `{scratch_dir}/pycache` to use their private invocation directory.
+These settings let imports generate bytecode while pack files and dependencies
+remain read-only. Recipes with other launch-time caches should direct that state
+to scratch. Resolve dependencies and generate build outputs during `prepare`.
 
-Dependency setup/build hooks and runtime verification still execute outside this
-new sandbox. They can inspect or modify the manager's host filesystem and attack
-same-UID launcher processes. Do not treat this opt-in stage as safe admission of
-untrusted dependency hooks or a complete solution for mutually hostile packs.
-Further implementation must isolate setup/verification and introduce explicitly
-attempt-bound control APIs before removing worker/sensor master credentials.
-Recorded authority, input origins, output secrecy and log custody must survive
-that transition. No runtime credential or snapshot format is changed here.
+Setup and tool probes do not receive the invocation token or inputs. Final
+workloads retain scoped API credentials, stdin and normal argument delivery.
+Bubblewrap starts with a trusted PATH. The workload's environment, including
+any token, is delivered through an unlinked file and applied inside the sandbox.
 
-Compose and Helm do not enable this mode automatically. Chart images, namespace
-support, API artifact transport and writable-state expectations need coordinated
-validation in the canonical chart repository before enabling a worker pool.
+## Helm and GKE rollout
 
-The common `workload_sandbox` boundary tests include an explicitly selected Linux
-Bubblewrap case with owned dummy credentials, a readable same-UID sibling,
-stdin/scoped-token delivery and a read-only published runtime. Missing prerequisites
-fail that selected case. It is not evidence that the full manager/control API
-or the setup stage has been isolated.
+Enable the setting on every action and sensor pool eligible for the workloads
+that require isolation. The runtime image must include Bubblewrap. The Attune
+Charts pool `env` and `containerSecurityContext` fields support the opt-in and
+a cluster-approved seccomp profile for the agent container. Chart object-storage
+mode selects API artifact transport. The Pod default stays `RuntimeDefault`.
+Validate the exact runtime image, non-root identity, node pool and security
+profile together. In GKE Standard a cluster operator can supply a
+[`Localhost` seccomp profile](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/seccomp-in-gke)
+when the default blocks the required namespace operations.
+
+Run a representative action, sensor, dependency build and candidate test on
+the target pool before rollout. The startup probe exercises the namespace
+policy. The Linux tests exercise the file and process boundaries and prove that
+Python writes real bytecode into private scratch:
+
+```bash
+ATTUNE_TEST_RUN_ID=bwrap-boundary cargo test -p attune-common --lib \
+  workload_sandbox::tests::bubblewrap_ -- --ignored --nocapture --test-threads=4
+ATTUNE_TEST_RUN_ID=bwrap-recipe cargo test -p attune-common --test runtime_lifecycle_tests \
+  bubblewrap_ -- --ignored --nocapture --test-threads=4
+```
+
+## Mantis findings s-2 and s-23
+
+The process and filesystem boundary limits a pack workload's access to
+manager credentials, sibling processes and published files. Workers and sensor
+managers still hold their control-plane credentials. Moving those credentials
+out of the managers requires a separately designed, attempt-scoped control
+protocol that preserves recorded authority, secret origins and log custody.
+Control-plane network policy can restrict direct database reachability after
+workers and sensor managers switch to that protocol.
+
+Recipes still prepare on the worker or sensor manager when needed. Durable
+install-time preparation requires release-pinned readiness for actions and
+sensors, immutable publication gated on preparation success, and placement
+that can resolve the prepared generation on the selected pool. Findings s-2
+and s-23 remain open pending the remaining remediation and target-pool
+validation.

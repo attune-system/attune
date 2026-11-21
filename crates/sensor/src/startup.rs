@@ -45,11 +45,10 @@ pub fn log_config_details(config: &Config) {
 }
 
 pub async fn run_sensor_service(
-    config: Config,
+    mut service: SensorService,
     detected_runtimes: Option<Vec<DetectedRuntime>>,
     ready_message: &str,
 ) -> Result<()> {
-    let mut service = SensorService::new(config).await?;
     if let Some(detected) = detected_runtimes {
         service = service.with_detected_runtimes(detected).await;
     }

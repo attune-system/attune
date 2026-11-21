@@ -60,6 +60,17 @@ impl Default for ChildProcessEnvironment {
 }
 
 impl ChildProcessEnvironment {
+    pub async fn capture_for_service(
+        passthrough: &[String],
+        api_artifacts: bool,
+    ) -> crate::Result<Self> {
+        let environment = Self::capture(passthrough)?;
+        let sandbox = crate::workload_sandbox::WorkloadSandbox::from_environment(api_artifacts)
+            .await
+            .map_err(|error| crate::Error::validation(error.to_string()))?;
+        Ok(environment.with_workload_sandbox(sandbox))
+    }
+
     pub fn capture(passthrough: &[String]) -> crate::Result<Self> {
         Self::from_parent(std::env::vars_os(), passthrough)
     }
@@ -133,6 +144,49 @@ impl ChildProcessEnvironment {
 
     pub fn runtime_recipe_digests(&self) -> impl Iterator<Item = &str> {
         self.runtime_recipe_digests.iter().map(String::as_str)
+    }
+
+    pub fn uses_workload_sandbox(&self) -> bool {
+        matches!(
+            self.workload_sandbox,
+            crate::workload_sandbox::WorkloadSandbox::Bubblewrap
+        )
+    }
+
+    /// Call before configuring process supervision. Writable paths must be owned
+    /// by this build or invocation.
+    pub(crate) fn sandbox_staged_workload(
+        &self,
+        command: Command,
+        read_paths: &[&std::path::Path],
+        write_paths: &[&std::path::Path],
+        tools: &[(&std::path::Path, &std::path::Path)],
+    ) -> std::io::Result<Command> {
+        self.workload_sandbox
+            .wrap_staged(command, read_paths, write_paths, tools)
+    }
+
+    /// Legacy environment builders can write to their staging tree and read the
+    /// pack's files. Provision the destination before Bubblewrap binds it.
+    pub fn sandbox_environment_setup(
+        &self,
+        mut command: Command,
+        pack_dir: &std::path::Path,
+        staging_dir: &std::path::Path,
+    ) -> std::io::Result<Command> {
+        if !self.uses_workload_sandbox() {
+            return Ok(command);
+        }
+        let pack = pack_dir.canonicalize()?;
+        std::fs::create_dir_all(staging_dir)?;
+        let staging = staging_dir.canonicalize()?;
+        if staging.starts_with(&pack) {
+            return Err(std::io::Error::other(
+                "Runtime staging must be outside the pack",
+            ));
+        }
+        command.env("TMPDIR", "/tmp");
+        self.sandbox_staged_workload(command, &[&pack], &[&staging], &[])
     }
 
     pub fn with_workload_sandbox(
