@@ -2993,6 +2993,22 @@ async fn register_pack_internal(
             details: Box::new(attune_common::pack_registry::diagnostics::DeploymentDetails::new("sensor_admission", diagnostics)),
         });
     }
+    if let Some(metadata) = &installation_metadata {
+        PackRepository::update_installation_metadata(
+            &mut *tx,
+            pack.id,
+            metadata.source_type.clone(),
+            metadata.source_url.clone(),
+            metadata.source_ref.clone(),
+            metadata.checksum.clone(),
+            metadata.checksum_verified,
+            pack.installed_by,
+            "api".to_string(),
+            metadata.storage_path.clone(),
+        )
+        .await?;
+    }
+    // Activation sets storage_path to the immutable release tree.
     PackReleaseRepository::activate_projected(&mut tx, pack.id, release.id, &projections).await?;
     deployment_admission.finish_authorized_deployment(
         &mut tx, pack.id, release.id, state.config.security.encryption_key.as_deref(), &registration_authority,
@@ -3025,21 +3041,6 @@ async fn register_pack_internal(
         }
     }
 
-    if let Some(metadata) = &installation_metadata {
-        PackRepository::update_installation_metadata(
-            &mut *tx,
-            pack.id,
-            metadata.source_type.clone(),
-            metadata.source_url.clone(),
-            metadata.source_ref.clone(),
-            metadata.checksum.clone(),
-            metadata.checksum_verified,
-            pack.installed_by,
-            "api".to_string(),
-            metadata.storage_path.clone(),
-        )
-        .await?;
-    }
     // Keep PREVIOUS roles through every deployment authorization and approval
     // recheck. The candidate cannot supply its own missing authority, and an
     // authorized member can remove its own role without invalidating this deploy.
