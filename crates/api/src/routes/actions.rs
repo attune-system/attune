@@ -14,6 +14,7 @@ use validator::Validate;
 
 use attune_common::action_visibility::action_reference_allowed;
 use attune_common::action_visibility::collect_workflow_action_refs;
+use attune_common::delegation::DelegationAuthority;
 use attune_common::models::action::Action as ActionModel;
 use attune_common::models::enums::ActionReferenceVisibility;
 use attune_common::mq::{ActionChangedPayload, MessageEnvelope, MessageType};
@@ -24,10 +25,14 @@ use attune_common::repositories::{
         CreateActionInput, UpdateActionInput,
     },
     cache::CacheNamespaceRepository,
+    iam_ownership::IamOwnershipRepository,
+    managed_executable::ManagedExecutableRepository,
     pack::PackRepository,
     queue_stats::QueueStatsRepository,
     rule::{RuleRepository, RuleSearchFilters},
     runtime::RuntimeRepository,
+    runtime_target::ComponentTarget,
+    schema_type::SchemaTypeRepository,
     work_queue::{WorkQueueRepository, WorkQueueSearchFilters},
     workflow::{WorkflowDefinitionRepository, WorkflowSearchFilters},
     Delete, FindByRef, Patch,
@@ -391,13 +396,12 @@ pub async fn update_action(
     let authz = state.authorization_service();
     let mut ctx = AuthorizationContext::new(identity_id);
     ctx.target_id = Some(existing_action.id);
-    ctx.managing_pack_id =
-        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
-            &state.db,
-            attune_common::repositories::runtime_target::ComponentTarget::Action,
-            existing_action.id,
-        )
-        .await?;
+    ctx.managing_pack_id = IamOwnershipRepository::component_pack(
+        &state.db,
+        ComponentTarget::Action,
+        existing_action.id,
+    )
+    .await?;
     ctx.target_ref = Some(existing_action.r#ref.clone());
     ctx.pack_ref = Some(existing_action.pack_ref.clone());
     authz
@@ -504,53 +508,73 @@ pub async fn update_action(
     };
 
     let mut tx = state.db.begin().await?;
-    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
-        .await?;
-    attune_common::repositories::pack::PackRepository::acquire_mutation_lock(
-        &mut tx,
-        &existing_action.pack_ref,
-    )
-    .await?;
-    let editor = user
-        .identity_id()
-        .map_err(|_| ApiError::Unauthorized("Invalid user identity".into()))?;
-    let authority =
-        attune_common::delegation::DelegationAuthority::load_for_share(&mut tx, editor).await?;
-    let mut context = AuthorizationContext::new(editor);
-    context.target_id = Some(existing_action.id);
-    context.target_ref = Some(existing_action.r#ref.clone());
-    context.pack_ref = Some(existing_action.pack_ref.clone());
+    SchemaTypeRepository::lock_reclamation(&mut tx).await?;
+    PackRepository::acquire_mutation_lock(&mut tx, &existing_action.pack_ref).await?;
+    let target = ActionRepository::find_by_ref(&mut *tx, &action_ref)
+        .await?
+        .filter(|target| {
+            target.id == existing_action.id && target.pack_ref == existing_action.pack_ref
+        })
+        .ok_or_else(|| ApiError::NotFound(format!("Action '{}' not found", action_ref)))?;
+    let mut context = AuthorizationContext::new(identity_id);
+    context.target_id = Some(target.id);
+    context.target_ref = Some(target.r#ref.clone());
+    context.pack_ref = Some(target.pack_ref.clone());
     context.managing_pack_id =
-        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+        IamOwnershipRepository::component_pack(&mut *tx, ComponentTarget::Action, target.id)
+            .await?;
+
+    let delegated = user.claims.token_type == crate::auth::jwt::TokenType::Execution;
+    if delegated {
+        // Retain the source attempt, sponsor coverage and selected grants through
+        // both the projection write and managed readmission.
+        let (snapshot, canonical_grants) =
+            AuthorizationService::retain_legacy_execution_snapshot_on(&mut tx, &user).await?;
+        authz.authorize_with_snapshot(
+            &user,
+            Some(&snapshot),
+            AuthorizationCheck {
+                resource: Resource::Actions,
+                action: Action::Update,
+                context,
+            },
+        )?;
+        if let Some(refs) = &update_input.default_execution_permission_set_refs {
+            DelegationAuthority::new(
+                snapshot.identity_id,
+                snapshot.identity_attributes,
+                canonical_grants,
+            )
+            .require_refs_for_share(&mut tx, refs)
+            .await?;
+        }
+    } else {
+        let authority = DelegationAuthority::load_for_share(&mut tx, identity_id).await?;
+        IamOwnershipRepository::populate_pack_owner(&mut *tx, Resource::Actions, &mut context)
+            .await?;
+        IamOwnershipRepository::lock_pack_owner_memberships(&mut tx, identity_id).await?;
+        IamOwnershipRepository::populate_pack_role_membership(
             &mut *tx,
-            attune_common::repositories::runtime_target::ComponentTarget::Action,
-            existing_action.id,
+            Resource::Actions,
+            &mut context,
+            true,
         )
         .await?;
-    attune_common::repositories::iam_ownership::IamOwnershipRepository::populate_pack_owner(
-        &mut *tx,
-        Resource::Actions,
-        &mut context,
-    )
-    .await?;
-    if user.claims.token_type == crate::auth::jwt::TokenType::Access {
-        attune_common::repositories::iam_ownership::IamOwnershipRepository::lock_pack_owner_memberships(&mut tx, editor).await?;
-        attune_common::repositories::iam_ownership::IamOwnershipRepository::populate_pack_role_membership(
-            &mut *tx, Resource::Actions, &mut context, true,
-        ).await?;
+        if !authority.allows(Resource::Actions, Action::Update, context) {
+            return Err(ApiError::Forbidden(
+                "Action update authority changed before readmission".into(),
+            ));
+        }
     }
-    if !authority.allows(Resource::Actions, Action::Update, context) {
-        return Err(ApiError::Forbidden(
-            "Action update authority changed before readmission".into(),
-        ));
-    }
-    let readmit = attune_common::repositories::managed_executable::ManagedExecutableRepository::changes_admitted_metadata(&update_input);
-    let action = ActionRepository::update(&mut *tx, existing_action.id, update_input).await?;
+    let readmit = ManagedExecutableRepository::changes_admitted_metadata(&update_input);
+    let action = ActionRepository::update(&mut *tx, target.id, update_input).await?;
     if readmit {
-        attune_common::repositories::managed_executable::ManagedExecutableRepository::readmit_action(
-        &mut tx, action.id, editor,
-    )
-    .await?;
+        ManagedExecutableRepository::readmit_action(&mut tx, action.id, identity_id).await?;
+    }
+    if delegated && user.claims.exp <= chrono::Utc::now().timestamp() {
+        return Err(ApiError::Unauthorized(
+            "Delegated execution authority is unavailable".into(),
+        ));
     }
     tx.commit().await?;
     let operation = if existing_action.enabled != action.enabled {

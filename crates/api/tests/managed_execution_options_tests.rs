@@ -4,15 +4,16 @@ mod managed_readmission_fixture;
 use attune_common::{
     repositories::{
         action::{ActionRepository, UpdateActionInput},
+        delegated_execution::DelegatedExecutionRepository,
         execution::{CreateExecutionInput, ExecutionRepository},
         identity::{
             CreatePermissionAssignmentInput, CreatePermissionSetInput,
-            PermissionAssignmentRepository, PermissionSetRepository,
+            PermissionAssignmentRepository, PermissionSetRepository, UpdatePermissionSetInput,
         },
         managed_executable::ManagedExecutableRepository,
         runtime_authority::{RuntimeAuthorityRepository, RuntimeOwner, RuntimePolicyRevision},
         schema_type::SchemaTypeRepository,
-        Create, FindByRef,
+        Create, FindByRef, Update,
     },
     runtime_authority::{HumanAttribution, InvocationBinding, RequestAttribution},
 };
@@ -189,6 +190,171 @@ async fn admitted_options_action(
         .metadata_revision
         .is_some());
     Ok((action, original))
+}
+
+#[tokio::test]
+async fn action_put_rechecks_delegated_attempt_and_defaults_after_graph_wait() -> Result<()> {
+    let ctx = TestContext::new_without_authorization_metadata_cache()
+        .await?
+        .with_auth()
+        .await?;
+    let result: Result<()> = async {
+        let (action, original) = admitted_options_action(&ctx).await?;
+        let actor = ctx.user.as_ref().ok_or("actor missing")?.id;
+        let grants = json!([
+            {"resource":"actions","actions":["update"],"constraints":{"refs":[action.r#ref]}}
+        ]);
+        let assign_set = async |name, pack_local: bool| -> Result<_> {
+            let set = PermissionSetRepository::create(
+                &ctx.pool,
+                CreatePermissionSetInput {
+                    r#ref: format!("{}.{name}", action.pack_ref),
+                    pack: pack_local.then_some(action.pack),
+                    pack_ref: pack_local.then(|| action.pack_ref.clone()),
+                    label: None,
+                    description: None,
+                    grants: grants.clone(),
+                },
+            )
+            .await?;
+            PermissionAssignmentRepository::create(
+                &ctx.pool,
+                CreatePermissionAssignmentInput {
+                    identity: actor,
+                    permset: set.id,
+                },
+            )
+            .await?;
+            Ok(set)
+        };
+        let selected = assign_set("delegated_editor", false).await?;
+        let requested = assign_set("requested_default", true).await?;
+        let execution = helpers::delegated_source::create(
+            &ctx.pool,
+            CreateExecutionInput {
+                action: Some(action.id),
+                action_ref: action.r#ref.clone(),
+                executor: Some(actor),
+                permission_set_refs: vec![selected.r#ref.clone()],
+                ..Default::default()
+            },
+        )
+        .await?;
+        let token = helpers::delegated_source::execution_token(&ctx, execution.id).await?;
+        let path = format!("/api/v1/actions/{}", action.r#ref);
+        let body = json!({"default_execution_permission_set_refs":[requested.r#ref]});
+        let deadline = std::time::Duration::from_secs(20);
+
+        for (close_attempt, expected) in [
+            (false, StatusCode::FORBIDDEN),
+            (true, StatusCode::UNAUTHORIZED),
+        ] {
+            let mut blocker = ctx.pool.begin().await?;
+            SchemaTypeRepository::lock_reclamation(&mut blocker).await?;
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *blocker)
+                .await?;
+            let mut observer = ctx.pool.acquire().await?;
+            let invalidate = async {
+                let result: Result<()> = async {
+                    // The PUT has passed its preflight authorization at this point.
+                    wait_for_blocking_edge(&mut observer, pid, None).await?;
+                    if close_attempt {
+                        DelegatedExecutionRepository::close(&mut blocker, execution.id).await?;
+                    } else {
+                        // The new grant is still assigned to the sponsor, but is
+                        // outside the execution's unchanged selected ceiling.
+                        PermissionSetRepository::update(
+                            &mut *blocker,
+                            requested.id,
+                            UpdatePermissionSetInput {
+                                grants: Some(json!([
+                                    {"resource":"actions","actions":["execute"],"constraints":{"refs":[action.r#ref]}}
+                                ])),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                }
+                .await;
+                if result.is_ok() {
+                    blocker.commit().await?;
+                } else {
+                    blocker.rollback().await?;
+                }
+                result
+            };
+            let (response, invalidated) = tokio::join!(
+                tokio::time::timeout(deadline, ctx.put(&path, &body, Some(&token))),
+                invalidate,
+            );
+            invalidated?;
+            expect_status(response??, expected, "in-flight delegated update").await?;
+
+            let after = ActionRepository::find_by_ref(&ctx.pool, &action.r#ref)
+                .await?
+                .ok_or("action missing after rejection")?;
+            assert_eq!(after.updated, action.updated);
+            assert_eq!(
+                after.default_execution_permission_set_refs,
+                action.default_execution_permission_set_refs
+            );
+            let current = RuntimeAuthorityRepository::current_policy(&mut observer, action.pack)
+                .await?
+                .ok_or("policy missing after rejection")?;
+            assert_eq!(current.id, original.id);
+            if !close_attempt {
+                PermissionSetRepository::update(
+                    &ctx.pool,
+                    requested.id,
+                    UpdatePermissionSetInput {
+                        grants: Some(grants.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            }
+        }
+
+        let token =
+            helpers::delegated_source::token(&ctx, actor, std::slice::from_ref(&selected.r#ref))
+                .await?;
+        let updated = expect_status(
+            ctx.put(&path, &body, Some(&token)).await?,
+            StatusCode::OK,
+            "valid delegated update",
+        )
+        .await?;
+        assert_eq!(
+            updated["data"]["default_execution_permission_set_refs"],
+            json!([requested.r#ref])
+        );
+        let mut tx = ctx.pool.begin().await?;
+        let current = RuntimeAuthorityRepository::current_policy(&mut tx, action.pack)
+            .await?
+            .ok_or("policy missing after readmission")?;
+        assert_ne!(current.id, original.id);
+        assert_eq!(current.policy.release_id, original.policy.release_id);
+        let admitted = ManagedExecutableRepository::resolve_invocation(
+            &mut tx,
+            &current.policy,
+            &InvocationBinding::Action {
+                action_ref: action.r#ref.clone(),
+            },
+        )
+        .await?;
+        assert_eq!(
+            admitted.executable.action.default_execution_permission_set_refs,
+            [requested.r#ref.clone()]
+        );
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+    ctx.cleanup().await?;
+    result
 }
 
 #[tokio::test]
