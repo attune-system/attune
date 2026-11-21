@@ -222,13 +222,13 @@ impl RuntimeRecipe {
         let directory = Uuid::new_v4();
         let root = scope.root.join(directory.to_string());
         let pack = root.join("pack");
-        let mut directory_builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
-            directory_builder.mode(0o700);
+            std::fs::DirBuilder::new().mode(0o700).create(&root)?;
         }
-        directory_builder.create(&root)?;
+        #[cfg(not(unix))]
+        std::fs::create_dir(&root)?;
         copy_workspace(candidate, &pack)?;
         let build = self
             .prepare_build(
