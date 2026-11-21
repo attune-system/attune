@@ -54,7 +54,8 @@ These command names and flags are verified against the current Rust CLI implemen
 - Shortcut: `attune run REF` is a shortcut for `attune action execute REF` and supports the same parameter/watch flags.
 - Execution watch: `attune execution watch [EXECUTION_ID] --timeout SECONDS --notifier-url ws://...`; list mode can include filters.
 - Workflow upload: `attune workflow upload ACTION_YAML --force`.
-- MCP: `attune-mcp --transport stdio|http --listen-addr HOST:PORT --profile NAME --api-url URL`; env alternatives include `ATTUNE_MCP_TRANSPORT`, `ATTUNE_MCP_LISTEN_ADDR`, `ATTUNE_AUTH_TOKEN`, `ATTUNE_REFRESH_TOKEN`, `ATTUNE_API_TOKEN`, `ATTUNE_LOGIN`, and `ATTUNE_PASSWORD`.
+- Launch MCP over stdio with `attune-mcp --profile NAME --api-url URL`. Startup credentials can come from `ATTUNE_AUTH_TOKEN`, `ATTUNE_REFRESH_TOKEN`, `ATTUNE_API_TOKEN`, `ATTUNE_LOGIN`, and `ATTUNE_PASSWORD`.
+- Launch MCP over HTTP with `attune-mcp --transport http --api-url URL --http-host HOST:PORT`. Set the listener with `--listen-addr HOST:PORT` or `ATTUNE_MCP_LISTEN_ADDR`. `ATTUNE_MCP_TRANSPORT` also selects the transport.
 
 Some older docs may mention `--wait` or `pack install --ref`. If the installed CLI differs, run `attune action execute --help` or `attune pack install --help` and prefer the installed help, but use the verified current commands above when possible.
 
@@ -368,12 +369,14 @@ attune-mcp --api-url http://localhost:8080
 ATTUNE_API_URL=http://localhost:8080 ATTUNE_AUTH_TOKEN="$ATTUNE_AUTH_TOKEN" attune-mcp
 ```
 
-HTTP service mode:
+HTTP service mode defaults to `127.0.0.1:8090`. Set `--listen-addr` or
+`ATTUNE_MCP_LISTEN_ADDR` to override the bind address. Each `POST /mcp` request
+requires a caller bearer token and an exact allowed Host.
 
 ```bash
-attune-mcp --transport http --listen-addr 0.0.0.0:8090 --profile local
-curl http://localhost:8090/health
-# MCP JSON-RPC endpoint: POST http://localhost:8090/mcp
+attune-mcp --transport http --api-url http://127.0.0.1:8080 --http-host 127.0.0.1:8090
+curl http://127.0.0.1:8090/health
+# MCP JSON-RPC endpoint: POST http://127.0.0.1:8090/mcp
 ```
 
 Inside an Attune execution, prefer the execution-scoped token:
@@ -382,13 +385,13 @@ Inside an Attune execution, prefer the execution-scoped token:
 ATTUNE_API_URL=http://attune-api:8080 ATTUNE_API_TOKEN="$ATTUNE_API_TOKEN" attune-mcp
 ```
 
-Non-interactive startup login is also supported:
+Stdio also supports non-interactive startup login:
 
 ```bash
 ATTUNE_API_URL=http://localhost:8080 \
 ATTUNE_LOGIN="test@attune.local" \
 ATTUNE_PASSWORD="$ATTUNE_PASSWORD" \
-attune-mcp --transport http --listen-addr 127.0.0.1:8090
+attune-mcp
 ```
 
 ## Safety rules

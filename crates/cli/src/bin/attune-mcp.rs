@@ -67,7 +67,7 @@ struct Cli {
     access_policy: Option<String>,
 
     /// Listen address for the HTTP transport
-    #[arg(long, env = "ATTUNE_MCP_LISTEN_ADDR", default_value = "0.0.0.0:8090")]
+    #[arg(long, env = "ATTUNE_MCP_LISTEN_ADDR", default_value = "127.0.0.1:8090")]
     listen_addr: String,
 
     /// Exact HTTP Host authorities accepted (repeatable, including port).
@@ -3166,10 +3166,34 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::{builder::Resettable, CommandFactory};
     use wiremock::{
         matchers::{body_json, method, path, query_param},
         Mock, MockServer, ResponseTemplate,
     };
+
+    #[test]
+    fn http_listener_defaults_to_loopback_and_accepts_an_explicit_address() {
+        // Exercise the fallback without changing the test process environment.
+        let matches = Cli::command()
+            .mut_arg("listen_addr", |arg| arg.env(Resettable::Reset))
+            .try_get_matches_from(["attune-mcp", "--transport", "http"])
+            .unwrap();
+        assert_eq!(
+            matches.get_one::<String>("listen_addr").unwrap(),
+            "127.0.0.1:8090"
+        );
+
+        let cli = Cli::try_parse_from([
+            "attune-mcp",
+            "--transport",
+            "http",
+            "--listen-addr",
+            "0.0.0.0:9000",
+        ])
+        .unwrap();
+        assert_eq!(cli.listen_addr, "0.0.0.0:9000");
+    }
 
     fn test_server(api_url: String) -> McpServer {
         test_server_with_access(api_url, PacksCheckAccess::Unrestricted)
