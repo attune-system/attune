@@ -40,6 +40,10 @@ pub struct WorkerRegistration {
 }
 
 impl WorkerRegistration {
+    pub(crate) fn incarnation(&self) -> uuid::Uuid {
+        self.incarnation
+    }
+
     pub fn with_child_environment(
         mut self,
         environment: attune_common::child_process_environment::ChildProcessEnvironment,
@@ -340,6 +344,13 @@ impl WorkerRegistration {
         detector
             .enrich_recipe_capabilities(&mut self.capabilities, filter.as_deref())
             .await?;
+        attune_common::runtime_lifecycle::PreparationScope::attach_capability(
+            &mut self.capabilities,
+            std::path::Path::new(&config.runtime_envs_dir),
+            &self.child_environment,
+            filter.as_deref(),
+        )
+        .map_err(|error| attune_common::Error::validation(error.to_string()))?;
         info!("Worker capabilities detected: {:?}", self.capabilities);
 
         Ok(())

@@ -10315,6 +10315,36 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
             None
         };
 
+        use attune_common::repositories::runtime_preparation::{
+            can_consume, RuntimePreparationRepository,
+        };
+        use attune_common::runtime_lifecycle::PreparationTarget;
+        let preparation_target = match runtime.as_ref() {
+            Some(runtime) => match runtime.parsed_execution_config().lifecycle {
+                Some(recipe) => PreparationTarget::for_action(action, runtime, &recipe)?,
+                None => None,
+            },
+            None => None,
+        };
+        let installed = if let Some(target) = preparation_target {
+            let snapshot = execution
+                .and_then(|execution| execution.executable_snapshot.as_ref())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Installed recipe action requires a pinned release")
+                })?;
+            Some(
+                RuntimePreparationRepository::ready_for(
+                    pool,
+                    snapshot.release.id,
+                    &snapshot.release.digest,
+                    &target,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
         // Find available action workers (role = 'action')
         let require_delegated = if let Some(execution) =
             execution.filter(|_| recorded_evidence.is_none())
@@ -10379,7 +10409,10 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
         let runtime_compatible_workers: Vec<_> = if let Some(ref runtime) = runtime {
             workers
                 .into_iter()
-                .filter(|w| Self::worker_supports_runtime(w, runtime))
+                .filter(|w| match &installed {
+                    Some(ready) => can_consume(w, ready),
+                    None => Self::worker_supports_runtime(w, runtime),
+                })
                 .filter(|w| {
                     Self::worker_supports_runtime_constraint(
                         w,
@@ -10649,16 +10682,7 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
         digests: &[String],
     ) -> bool {
         digests.iter().all(|digest| {
-            worker
-                .capabilities
-                .as_ref()
-                .and_then(|capabilities| capabilities.get("runtime_recipe_digests"))
-                .and_then(|value| value.as_array())
-                .is_some_and(|admitted| {
-                    admitted
-                        .iter()
-                        .any(|value| value.as_str() == Some(digest.as_str()))
-                })
+            attune_common::repositories::runtime_preparation::worker_admits(worker, digest)
         })
     }
 

@@ -81,9 +81,9 @@ protocol that preserves recorded authority, secret origins and log custody.
 Control-plane network policy can restrict direct database reachability after
 workers and sensor managers switch to that protocol.
 
-Recipes still prepare on the worker or sensor manager when needed. Durable
-install-time preparation requires release-pinned readiness for actions and
-sensors, immutable publication gated on preparation success, and placement
-that can resolve the prepared generation on the selected pool. Findings s-2
-and s-23 remain open pending the remaining remediation and target-pool
-validation.
+For eligible recipes, install-time preparation publishes a release-pinned
+generation before activation. The worker or sensor manager opens it read-only
+with private scratch for each invocation. See the
+[install-time preparation requirements](runtime-toolchains.md#install-time-preparation)
+for storage placement and toolchain compatibility. Findings s-2 and s-23 remain
+open pending the remaining remediation and target-pool validation.

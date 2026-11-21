@@ -91,7 +91,7 @@ pub struct WorkerAffinity {
     pub anti_affinity: Vec<WorkerSelectorTerm>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerPlacement {
     pub selector: BTreeMap<String, String>,
     pub tolerations: Vec<WorkerToleration>,

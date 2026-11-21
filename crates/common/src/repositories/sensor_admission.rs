@@ -4,6 +4,9 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use sqlx::{FromRow, PgConnection, Row};
 
+use super::runtime_preparation::{
+    can_consume, worker_matches_target, RuntimePreparationRepository,
+};
 use crate::models::{
     Id, Pack, Rule, Runtime, RuntimeVersion, Sensor, Trigger, Worker, WorkerRole, WorkerStatus,
 };
@@ -12,6 +15,7 @@ use crate::repositories::{
     SensorRepository, TriggerRepository, WorkerRepository,
 };
 use crate::runtime_detection::normalize_runtime_name;
+use crate::runtime_lifecycle::{InstalledPreparation, PreparationScope, PreparationTarget};
 use crate::scheduling::{
     parse_rule_sensor_placement, structural_placement_compatibility,
     worker_labels_from_capabilities, worker_matches_all_placements,
@@ -170,6 +174,24 @@ impl SensorAdmissionRepository {
         assess_snapshot(&snapshot, None, requirement)
     }
 
+    pub async fn preparation_scopes(
+        connection: &mut PgConnection,
+        sensor_id: Id,
+        target: &PreparationTarget,
+    ) -> Result<Vec<PreparationScope>> {
+        let snapshot = load_sensor_snapshot(connection, sensor_id).await?;
+        let placements = active_placements(&snapshot)?;
+        Ok(snapshot
+            .workers
+            .iter()
+            .filter(|worker| worker_is_live(worker, snapshot.observed_at))
+            .filter(|worker| {
+                worker_matches_target(worker, target) && worker_matches(worker, &placements)
+            })
+            .filter_map(PreparationScope::for_worker)
+            .collect())
+    }
+
     pub async fn worker_is_eligible(
         connection: &mut PgConnection,
         sensor_id: Id,
@@ -180,12 +202,7 @@ impl SensorAdmissionRepository {
         Ok(snapshot.workers.iter().any(|worker| {
             worker.id == worker_id
                 && worker_is_live(worker, snapshot.observed_at)
-                && worker_supports_runtime(
-                    worker,
-                    &snapshot.runtime,
-                    &snapshot.runtime_versions,
-                    &snapshot.sensor,
-                )
+                && snapshot.supports_runtime(worker)
                 && worker_matches(worker, &placements)
         }))
     }
@@ -268,6 +285,8 @@ impl SensorAdmissionRepository {
                 .push(rule);
         }
 
+        let mut prepared =
+            RuntimePreparationRepository::ready_for_sensors(&mut *connection, &sensor_ids).await?;
         sensors
             .iter()
             .map(|sensor| {
@@ -283,17 +302,23 @@ impl SensorAdmissionRepository {
                 for rule in active_rules {
                     placements.push(rule.placement()?);
                 }
+                let preparation = prepared.remove(&sensor.id);
                 let eligible = worker.as_ref().is_some_and(|worker| {
                     worker.worker_role == WorkerRole::Sensor
                         && worker_is_live(worker, observed_at)
-                        && worker_supports_runtime(
-                            worker,
-                            runtime,
-                            runtime_versions
-                                .get(&runtime.id)
-                                .map(Vec::as_slice)
-                                .unwrap_or_default(),
-                            sensor,
+                        && preparation.as_ref().map_or_else(
+                            || {
+                                worker_supports_runtime(
+                                    worker,
+                                    runtime,
+                                    runtime_versions
+                                        .get(&runtime.id)
+                                        .map(Vec::as_slice)
+                                        .unwrap_or_default(),
+                                    sensor,
+                                )
+                            },
+                            |ready| can_consume(worker, ready),
                         )
                         && worker_matches(worker, &placements)
                 });
@@ -345,12 +370,7 @@ impl SensorAdmissionRepository {
         Ok(snapshot.workers.iter().any(|worker| {
             worker.id == worker_id
                 && worker_is_live(worker, snapshot.observed_at)
-                && worker_supports_runtime(
-                    worker,
-                    &snapshot.runtime,
-                    &snapshot.runtime_versions,
-                    &snapshot.sensor,
-                )
+                && snapshot.supports_runtime(worker)
                 && worker_matches(worker, &placements)
         }))
     }
@@ -382,6 +402,18 @@ struct SensorAdmissionSnapshot {
     runtime_versions: Vec<RuntimeVersion>,
     trigger_rules: Vec<(Trigger, Rule)>,
     workers: Vec<Worker>,
+    preparation: Option<Vec<InstalledPreparation>>,
+}
+
+impl SensorAdmissionSnapshot {
+    fn supports_runtime(&self, worker: &Worker) -> bool {
+        match &self.preparation {
+            Some(ready) => can_consume(worker, ready),
+            None => {
+                worker_supports_runtime(worker, &self.runtime, &self.runtime_versions, &self.sensor)
+            }
+        }
+    }
 }
 
 async fn load_sensor_snapshot(
@@ -411,6 +443,9 @@ async fn load_sensor_snapshot(
         }
     }
     let workers = WorkerRepository::find_sensor_workers(&mut *connection).await?;
+    let preparation = RuntimePreparationRepository::ready_for_sensors(connection, &[sensor_id])
+        .await?
+        .remove(&sensor_id);
     Ok(SensorAdmissionSnapshot {
         observed_at,
         sensor,
@@ -419,6 +454,7 @@ async fn load_sensor_snapshot(
         runtime_versions,
         trigger_rules,
         workers,
+        preparation,
     })
 }
 
@@ -489,12 +525,7 @@ fn assess_snapshot(
         let placements = active_placements(snapshot)?;
         let eligible = snapshot.workers.iter().any(|worker| {
             worker_is_live(worker, snapshot.observed_at)
-                && worker_supports_runtime(
-                    worker,
-                    &snapshot.runtime,
-                    &snapshot.runtime_versions,
-                    &snapshot.sensor,
-                )
+                && snapshot.supports_runtime(worker)
                 && worker_matches(worker, &placements)
         });
         if !eligible {

@@ -67,6 +67,7 @@ fn make_python_context(
 ) -> ExecutionContext {
     ExecutionContext {
         native_invocation: None,
+        installed_preparation: None,
         execution_id,
         action_ref: action_ref.to_string(),
         parameters: HashMap::new(),
@@ -159,6 +160,7 @@ done
 
     let context = ExecutionContext {
         native_invocation: None,
+        installed_preparation: None,
         execution_id: 3,
         action_ref: "test.shell_large_output".to_string(),
         parameters: HashMap::new(),
@@ -331,6 +333,7 @@ async fn test_shell_process_runtime_truncation() {
 
     let context = ExecutionContext {
         native_invocation: None,
+        installed_preparation: None,
         execution_id: 8,
         action_ref: "test.shell_process_truncation".to_string(),
         parameters: HashMap::new(),

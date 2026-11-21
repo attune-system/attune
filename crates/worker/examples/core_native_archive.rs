@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 fn context(action_ref: String, code: Option<String>) -> ExecutionContext {
     ExecutionContext {
         native_invocation: None,
+        installed_preparation: None,
         execution_id: 1,
         action_ref,
         parameters: HashMap::new(),

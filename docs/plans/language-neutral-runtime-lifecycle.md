@@ -813,3 +813,14 @@ Status remains work in progress until the updated tests and required CI pass on
 the final PR head. ARM64 execution and all broader deferred architecture milestones
 remain outside this initial delivery's validated guarantees. The PR handoff holds
 current command results and CI state; older checkpoints above are historical.
+
+### Install-time preparation follow-up
+
+The opt-in slice in [runtime toolchains](../deployment/runtime-toolchains.md#install-time-preparation)
+uses the pinned candidate dispatch and keeps the pack activation transaction
+closed while workers prepare their generations. Activation rechecks the same
+projected executable targets and each target's eligible storage scope before publishing ready
+references. File-backed actions and managed sensors open the resulting content
+read-only. Retained-file and tool verification fails closed if the generation
+cannot be used on the selected manager. Inline and candidate test invocations
+retain private, per-invocation preparation.

@@ -92,7 +92,6 @@ struct PackInstallationMetadata {
     source_ref: Option<String>,
     checksum: Option<String>,
     checksum_verified: bool,
-    installed_by: Option<i64>,
     storage_path: String,
     provenance: PackInstallProvenance,
 }
@@ -122,6 +121,7 @@ struct PackActivationFailureGuard {
     pool: sqlx::PgPool,
     install_id: i64,
     armed: bool,
+    preparation: bool,
 }
 
 impl PackActivationFailureGuard {
@@ -130,7 +130,14 @@ impl PackActivationFailureGuard {
             pool,
             install_id,
             armed: true,
+            preparation: false,
         }
+    }
+
+    fn for_preparation(pool: sqlx::PgPool, install_id: i64) -> Self {
+        let mut guard = Self::new(pool, install_id);
+        guard.preparation = true;
+        guard
     }
 
     fn disarm(&mut self) {
@@ -145,16 +152,37 @@ impl Drop for PackActivationFailureGuard {
         }
         let pool = self.pool.clone();
         let install_id = self.install_id;
+        let preparation = self.preparation;
         tokio::spawn(async move {
-            if let Err(error) = PackInstallRepository::new(pool)
-                .finish_activation(
-                    install_id,
-                    PackInstallStatus::Failed,
-                    Some("Pack activation was interrupted".to_string()),
-                )
-                .await
-            {
-                tracing::warn!(install_id, %error, "Failed to record interrupted pack activation");
+            let repository = PackInstallRepository::new(pool);
+            let message = if preparation {
+                "Runtime preparation was interrupted"
+            } else {
+                "Pack activation was interrupted"
+            };
+            let result = async {
+                if preparation
+                    && repository
+                        .finish_active(
+                            install_id,
+                            PackInstallStatus::Failed,
+                            None,
+                            None,
+                            Some(message.into()),
+                        )
+                        .await?
+                        .is_some()
+                {
+                    return Ok(());
+                }
+                repository
+                    .finish_activation(install_id, PackInstallStatus::Failed, Some(message.into()))
+                    .await?;
+                Ok::<_, attune_common::Error>(())
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(install_id, %error, "Failed to record interrupted pack installation");
             }
         });
     }
@@ -1675,10 +1703,11 @@ fn required_runtimes_for_test_config(
     required.into_iter().collect()
 }
 
-async fn wait_for_pack_test(
+async fn wait_for_pack_worker(
     state: &AppState,
     install_id: i64,
     max_wait: Duration,
+    activity: &str,
 ) -> Result<PackInstall, ApiError> {
     let repo = PackInstallRepository::new(state.db.clone());
     let deadline = tokio::time::Instant::now() + max_wait;
@@ -1697,7 +1726,9 @@ async fn wait_for_pack_test(
                     PackInstallStatus::Failed,
                     None,
                     None,
-                    Some("Timed out waiting for worker to complete pack tests".to_string()),
+                    Some(format!(
+                        "Timed out waiting for worker to complete {activity}"
+                    )),
                 )
                 .await?
             {
@@ -1709,6 +1740,109 @@ async fn wait_for_pack_test(
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+}
+
+async fn prepare_pack_release(
+    state: &AppState,
+    activation: i64,
+    published: &attune_common::pack_registry::storage::PublishedPackRelease,
+    stored: &attune_common::blob_store::StoredObject,
+    jobs: &[attune_common::repositories::runtime_preparation::PreparationJob],
+) -> Result<Vec<PackActivationFailureGuard>, ApiError> {
+    use attune_common::repositories::runtime_preparation::{
+        RuntimePreparationRepository, ATTEMPT_SECONDS,
+    };
+    use attune_common::runtime_lifecycle::PREPARATION_TRIGGER;
+
+    let publisher = state.get_publisher().await.ok_or_else(|| {
+        ApiError::InternalServerError(
+            "Runtime preparation requires a message queue publisher".into(),
+        )
+    })?;
+    let repository = PackInstallRepository::new(state.db.clone());
+    let mut attempts = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        let install = repository
+            .create(
+                &published.manifest.pack_ref,
+                &published.manifest.version,
+                PREPARATION_TRIGGER,
+                None,
+                None,
+            )
+            .await?;
+        attempts.push(PackActivationFailureGuard::for_preparation(
+            state.db.clone(),
+            install.id,
+        ));
+
+        // Each job independently pins the same deterministic candidate object.
+        let mut tx = state.db.begin().await?;
+        if !PackInstallRepository::attach_candidate_object(&mut tx, install.id, stored).await? {
+            return Err(ApiError::Conflict(
+                "Runtime preparation candidate is no longer pending".into(),
+            ));
+        }
+        RuntimePreparationRepository::create_attempt(
+            &mut tx,
+            install.id,
+            activation,
+            &published.digest,
+            job,
+        )
+        .await?;
+        tx.commit().await?;
+
+        // The executor reads preparation eligibility from the persisted job.
+        let payload = PackTestRequestedPayload {
+            pack_install_id: install.id,
+            pack_ref: install.pack_ref,
+            pack_version: install.pack_version,
+            candidate_path: Some("runtime_preparation".into()),
+            candidate_access_token: None,
+            trigger_reason: PREPARATION_TRIGGER.into(),
+            required_runtimes: vec![],
+            required_recipe_digests: vec![],
+            worker_selector: serde_json::json!({}),
+            worker_tolerations: serde_json::json!([]),
+            worker_affinity: serde_json::json!({}),
+        };
+        publisher
+            .publish_envelope(&MessageEnvelope::new(
+                MessageType::PackTestRequested,
+                payload,
+            ))
+            .await
+            .map_err(|error| {
+                ApiError::InternalServerError(format!(
+                    "Could not dispatch runtime preparation for '{}': {error}",
+                    job.target.reference
+                ))
+            })?;
+    }
+
+    // A failure ends the wait and the guards cancel the remaining attempts.
+    futures::future::try_join_all(attempts.iter().zip(jobs).map(|(attempt, job)| async move {
+        let finished = wait_for_pack_worker(
+            state,
+            attempt.install_id,
+            Duration::from_secs(ATTEMPT_SECONDS as u64),
+            "runtime preparation",
+        )
+        .await?;
+        if finished.status != PackInstallStatus::Activating.as_str() {
+            let message = finished
+                .error_message
+                .unwrap_or_else(|| "Required runtime preparation did not complete".into());
+            return Err(ApiError::UnprocessableEntity(format!(
+                "{}: {message}",
+                job.target.reference
+            )));
+        }
+        Ok(())
+    }))
+    .await?;
+    Ok(attempts)
 }
 
 async fn candidate_test_failure(state: &AppState, install: &PackInstall) -> ApiError {
@@ -2414,7 +2548,8 @@ async fn register_pack_internal(
             } => {
                 candidate_path = std::path::Path::new(&state.config.packs_base_dir)
                     .join(format!(".pack-test-{}", install.id));
-                let terminal = wait_for_pack_test(&state, install.id, wait_timeout).await;
+                let terminal =
+                    wait_for_pack_worker(&state, install.id, wait_timeout, "pack tests").await;
                 let terminal = match terminal {
                     Ok(terminal) => terminal,
                     Err(error) => {
@@ -2592,10 +2727,16 @@ async fn register_pack_internal(
     // Keep local commit/publication order aligned even after the transaction's
     // cross-process advisory lock is released by commit.
     let _projection_guard = state.lock_pack_projection(&pack_ref).await;
+    let ownership = attune_common::pack_ownership::PackOwnershipMetadata::read(&published_release.pack_path)?;
+    use attune_common::repositories::runtime_preparation::RuntimePreparationRepository;
+    let mut prepared_installs = Vec::<PackActivationFailureGuard>::new();
+    let mut original_release = None;
+    let preflight_diagnostics = metadata_diagnostics.clone();
+    let (pack, release, projections, pack_path) = loop {
+    metadata_diagnostics.clone_from(&preflight_diagnostics);
     let deployment_admission = attune_common::pack_registry::deployment_admission::DeploymentAdmission::read(
         &published_release.pack_path, &pack_ref,
     )?;
-    let ownership = attune_common::pack_ownership::PackOwnershipMetadata::read(&published_release.pack_path)?;
     let mut tx = state.db.begin().await?;
     attune_common::pack_registry::deployment_admission::DeploymentAdmission::lock(&mut tx).await?;
     attune_common::repositories::cache::CacheEntryRepository::protect_transaction(
@@ -2666,6 +2807,11 @@ async fn register_pack_internal(
         )));
     }
 
+    let previous_release = existing_pack.as_ref().and_then(|pack| pack.active_release);
+    if original_release.is_some_and(|expected| expected != previous_release) {
+        return Err(ApiError::Conflict("The active pack release changed during runtime preparation".into()));
+    }
+
     if let Some(existing) = &existing_pack {
         attune_common::pack_registry::deployment_admission::DeploymentAdmission::preserve(
             &mut tx, existing.id, state.config.security.encryption_key.as_deref(),
@@ -2679,18 +2825,18 @@ async fn register_pack_internal(
 
         // Update existing pack in place, preserving pack and component IDs.
         let update_input = UpdatePackInput {
-            label: Some(label),
-            description: Some(match description {
-                Some(value) => Patch::Set(value),
+            label: Some(label.clone()),
+            description: Some(match &description {
+                Some(value) => Patch::Set(value.clone()),
                 None => Patch::Clear,
             }),
             version: Some(version.clone()),
-            conf_schema: Some(conf_schema),
+            conf_schema: Some(conf_schema.clone()),
             config: None, // preserve user-set config
-            meta: Some(meta),
-            tags: Some(tags),
-            runtime_deps: Some(runtime_deps),
-            dependencies: Some(dependencies),
+            meta: Some(meta.clone()),
+            tags: Some(tags.clone()),
+            runtime_deps: Some(runtime_deps.clone()),
+            dependencies: Some(dependencies.clone()),
             is_standard: None,
             installers,
         };
@@ -2709,15 +2855,15 @@ async fn register_pack_internal(
         // Create new pack
         let pack_input = CreatePackInput {
             r#ref: pack_ref.clone(),
-            label,
-            description,
+            label: label.clone(),
+            description: description.clone(),
             version: version.clone(),
-            conf_schema,
+            conf_schema: conf_schema.clone(),
             config: serde_json::json!({}),
-            meta,
-            tags,
-            runtime_deps,
-            dependencies,
+            meta: meta.clone(),
+            tags: tags.clone(),
+            runtime_deps: runtime_deps.clone(),
+            dependencies: dependencies.clone(),
             is_standard: false,
             installers: installation_metadata
                 .as_ref()
@@ -2847,27 +2993,54 @@ async fn register_pack_internal(
             details: Box::new(attune_common::pack_registry::diagnostics::DeploymentDetails::new("sensor_admission", diagnostics)),
         });
     }
-    if let Some(mut metadata) = installation_metadata {
-        metadata.installed_by = pack.installed_by;
+    if let Some(metadata) = &installation_metadata {
         PackRepository::update_installation_metadata(
             &mut *tx,
             pack.id,
-            metadata.source_type,
-            metadata.source_url,
-            metadata.source_ref,
-            metadata.checksum,
+            metadata.source_type.clone(),
+            metadata.source_url.clone(),
+            metadata.source_ref.clone(),
+            metadata.checksum.clone(),
             metadata.checksum_verified,
-            metadata.installed_by,
+            pack.installed_by,
             "api".to_string(),
-            metadata.storage_path,
+            metadata.storage_path.clone(),
         )
         .await?;
     }
+    // Activation sets storage_path to the immutable release tree.
     PackReleaseRepository::activate_projected(&mut tx, pack.id, release.id, &projections).await?;
     deployment_admission.finish_authorized_deployment(
         &mut tx, pack.id, release.id, state.config.security.encryption_key.as_deref(), &registration_authority,
         &authorized_deployment,
     ).await.map_err(|error| ApiError::from(error).in_deployment("deployment_admission", &pack_ref, &version, active_install_id))?;
+    let preparation = RuntimePreparationRepository::plan(&mut tx, &pack, &release)
+        .await.map_err(|error| ApiError::from(error).in_deployment(
+            "runtime_preparation", &pack_ref, &version, active_install_id,
+        ))?;
+    if !preparation.is_empty() || !prepared_installs.is_empty() {
+        let activation_id = active_install_id.ok_or_else(|| {
+            ApiError::Conflict("Runtime preparation requires a tracked pack activation".into())
+        })?;
+        if !prepared_installs.is_empty() {
+            let ids = prepared_installs.iter().map(|attempt| attempt.install_id).collect::<Vec<_>>();
+            RuntimePreparationRepository::bind_release(
+                &mut tx, &ids, activation_id, &release, &preparation,
+            ).await.map_err(|error| ApiError::from(error).in_deployment(
+                "runtime_preparation", &pack_ref, &version, active_install_id,
+            ))?;
+        } else {
+            original_release = Some(previous_release);
+            tx.rollback().await?;
+            prepared_installs = prepare_pack_release(
+                &state, activation_id, &published_release, &stored_release, &preparation,
+            ).await.map_err(|error| error.in_deployment(
+                "runtime_preparation", &pack_ref, &version, active_install_id,
+            ))?;
+            continue;
+        }
+    }
+
     // Keep PREVIOUS roles through every deployment authorization and approval
     // recheck. The candidate cannot supply its own missing authority, and an
     // authorized member can remove its own role without invalidating this deploy.
@@ -2891,6 +3064,11 @@ async fn register_pack_internal(
     let pack = PackRepository::find_by_id(&mut *tx, pack.id).await?
         .ok_or_else(|| ApiError::NotFound("Pack disappeared during activation".into()))?;
     tx.commit().await?;
+    for attempt in &mut prepared_installs {
+        attempt.disarm();
+    }
+    break (pack, release, projections, pack_path);
+    };
     committed = true;
     committed_release_id = Some(release.id);
     active_replacement.publish_fail_closed().map_err(|error| {
@@ -2911,8 +3089,7 @@ async fn register_pack_internal(
     // and cross-pack FK references survive reinstallation automatically.
     // No need to save/restore rules or re-link FKs.
 
-    // Candidate tests have passed. Publish the active pack so workers can
-    // prewarm its runtime environments.
+    // Publish the active pack for legacy runtime prewarming and file sync.
     if let Some(publisher) = state.get_publisher().await {
         let runtime_names = attune_common::pack_environment::collect_runtime_names_for_pack(
             &state.db, pack.id, &pack_path,
@@ -4167,7 +4344,6 @@ pub async fn install_pack(
     authorize_pack_install_preflight(&state, &user).await?;
 
     // Get user ID early to avoid borrow issues
-    let user_id = user.identity_id().ok();
     // Create temp directory for installations
     let temp_dir = std::env::temp_dir().join("attune-pack-installs");
 
@@ -4454,7 +4630,8 @@ pub async fn install_pack(
             } => {
                 candidate_path = std::path::Path::new(&state.config.packs_base_dir)
                     .join(format!(".pack-test-{}", install.id));
-                let terminal = wait_for_pack_test(&state, install.id, wait_timeout).await;
+                let terminal =
+                    wait_for_pack_worker(&state, install.id, wait_timeout, "pack tests").await;
                 if terminal.is_err() {
                     let _ = std::fs::remove_dir_all(&candidate_path);
                 }
@@ -4539,7 +4716,6 @@ pub async fn install_pack(
         source_ref,
         checksum: checksum.clone(),
         checksum_verified,
-        installed_by: user_id,
         storage_path: final_path.to_string_lossy().to_string(),
         provenance: provenance.clone(),
     };
@@ -5296,7 +5472,7 @@ pub async fn test_pack(
     let install_status = install.status.clone();
     let cleanup_state = state.clone();
     tokio::spawn(async move {
-        let _ = wait_for_pack_test(&cleanup_state, install_id, wait_timeout).await;
+        let _ = wait_for_pack_worker(&cleanup_state, install_id, wait_timeout, "pack tests").await;
         if let Err(error) = tokio::fs::remove_dir_all(&candidate_path).await {
             if error.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(

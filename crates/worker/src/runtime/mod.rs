@@ -98,6 +98,7 @@ pub struct NativeInvocation {
 pub struct ExecutionContext {
     /// Prepared only from the immutable admitted launch/schema and protected origins.
     pub native_invocation: Option<NativeInvocation>,
+    pub installed_preparation: Option<attune_common::runtime_lifecycle::InstalledPreparation>,
     /// Execution ID
     pub execution_id: i64,
 
@@ -218,6 +219,7 @@ impl ExecutionContext {
         use std::collections::HashMap;
         Self {
             native_invocation: None,
+            installed_preparation: None,
             execution_id: 1,
             action_ref,
             parameters: HashMap::new(),

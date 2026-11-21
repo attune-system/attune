@@ -1,0 +1,30 @@
+{
+  "execution_config": {
+    "lifecycle": {
+      "tools": [
+        {
+          "name": "python",
+          "binaries": ["/usr/bin/python3"],
+          "args": ["--version"],
+          "version_pattern": "Python (?<version>[0-9.]+)",
+          "primary": true
+        }
+      ],
+      "extensions": ["py"],
+      "prepare_at_install": true,
+      "prepare": [
+        {
+          "command": [
+            "{tool_python}", "{pack_dir}/build.py", "{pack_dir}",
+            "{source_file}", "{output_dir}"
+          ],
+          "timeout_seconds": 10
+        }
+      ],
+      "launch": {
+        "command": ["{tool_python}", "-u", "{source_file}", "{pack_dir}", "{output_dir}"]
+      },
+      "env": {"PYTHONPYCACHEPREFIX": "{scratch_dir}/pycache"}
+    }
+  }
+}

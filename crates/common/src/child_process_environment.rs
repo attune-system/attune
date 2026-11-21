@@ -42,6 +42,8 @@ pub struct ChildProcessEnvironment {
     values: BTreeMap<OsString, OsString>,
     runtime_recipe_digests: BTreeSet<String>,
     workload_sandbox: crate::workload_sandbox::WorkloadSandbox,
+    preparation_revision: Option<String>,
+    offline_preparation: bool,
 }
 
 impl fmt::Debug for ChildProcessEnvironment {
@@ -81,6 +83,23 @@ impl ChildProcessEnvironment {
     ) -> crate::Result<Self> {
         validate_passthrough_env(passthrough)?;
         let parent: Vec<_> = parent.into_iter().collect();
+        let preparation_revision = parent
+            .iter()
+            .find(|(name, _)| name == "ATTUNE_RUNTIME_PREPARATION_REVISION")
+            .map(|(_, value)| {
+                value
+                    .to_str()
+                    .filter(|value| {
+                        !value.is_empty()
+                            && value.len() <= 128
+                            && value
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
+                    })
+                    .map(str::to_owned)
+                    .ok_or_else(|| crate::Error::validation("Invalid runtime preparation revision"))
+            })
+            .transpose()?;
         let runtime_recipe_digests = parent
             .iter()
             .find(|(name, _)| name == "ATTUNE_RUNTIME_RECIPE_DIGESTS")
@@ -129,6 +148,8 @@ impl ChildProcessEnvironment {
             values,
             runtime_recipe_digests,
             workload_sandbox: Default::default(),
+            preparation_revision,
+            offline_preparation: false,
         })
     }
 
@@ -153,6 +174,23 @@ impl ChildProcessEnvironment {
         )
     }
 
+    pub(crate) fn preparation_revision(&self) -> Option<&str> {
+        self.preparation_revision
+            .as_deref()
+            .filter(|_| self.uses_workload_sandbox())
+    }
+
+    pub(crate) fn for_install_preparation(&self) -> Self {
+        let mut environment = self.clone();
+        environment.values = BTreeMap::from([
+            ("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()),
+            ("LANG".into(), "C.UTF-8".into()),
+            ("TZ".into(), "UTC".into()),
+        ]);
+        environment.offline_preparation = true;
+        environment
+    }
+
     /// Call before configuring process supervision. Writable paths must be owned
     /// by this build or invocation.
     pub(crate) fn sandbox_staged_workload(
@@ -162,8 +200,13 @@ impl ChildProcessEnvironment {
         write_paths: &[&std::path::Path],
         tools: &[(&std::path::Path, &std::path::Path)],
     ) -> std::io::Result<Command> {
-        self.workload_sandbox
-            .wrap_staged(command, read_paths, write_paths, tools)
+        self.workload_sandbox.wrap_staged(
+            command,
+            read_paths,
+            write_paths,
+            tools,
+            self.offline_preparation,
+        )
     }
 
     /// Legacy environment builders can write to their staging tree and read the

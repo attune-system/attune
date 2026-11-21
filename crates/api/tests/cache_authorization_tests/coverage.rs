@@ -631,6 +631,7 @@ async fn worker_probe(ctx: &TestContext) -> Result<()> {
     let result = runtime
         .execute(ExecutionContext {
             native_invocation: None,
+            installed_preparation: None,
             execution_id: execution.id,
             action_ref: fixture.action.r#ref,
             parameters: HashMap::from([("namespace".into(), json!("repro.users"))]),

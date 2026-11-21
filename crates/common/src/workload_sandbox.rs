@@ -63,7 +63,7 @@ impl WorkloadSandbox {
         read_paths: &[&Path],
         invocation_name: Option<&std::ffi::OsStr>,
     ) -> io::Result<Command> {
-        self.wrap_command(command, read_paths, &[], &[], invocation_name, false)
+        self.wrap_command(command, read_paths, &[], &[], invocation_name, false, false)
     }
 
     /// Expose only the selected read-only inputs and caller-owned writable
@@ -74,10 +74,12 @@ impl WorkloadSandbox {
         read_paths: &[&Path],
         write_paths: &[&Path],
         tools: &[(&Path, &Path)],
+        offline: bool,
     ) -> io::Result<Command> {
-        self.wrap_command(command, read_paths, write_paths, tools, None, true)
+        self.wrap_command(command, read_paths, write_paths, tools, None, true, offline)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn wrap_command(
         self,
         command: Command,
@@ -86,6 +88,7 @@ impl WorkloadSandbox {
         tools: &[(&Path, &Path)],
         invocation_name: Option<&std::ffi::OsStr>,
         preserve_writable_paths: bool,
+        offline: bool,
     ) -> io::Result<Command> {
         #[cfg(unix)]
         let command = {
@@ -103,6 +106,9 @@ impl WorkloadSandbox {
             return Err(io::Error::other("bubblewrap workloads require Linux"));
         }
         let mut sandbox = Command::new("/usr/bin/bwrap");
+        if offline {
+            sandbox.arg("--unshare-net");
+        }
         if let Some(name) = invocation_name {
             sandbox.arg("--argv0").arg(name);
         }

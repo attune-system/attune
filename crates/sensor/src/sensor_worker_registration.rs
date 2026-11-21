@@ -511,6 +511,13 @@ impl SensorWorkerRegistration {
                             .collect()
                     })
             });
+        attune_common::runtime_lifecycle::PreparationScope::attach_capability(
+            &mut self.capabilities,
+            std::path::Path::new(&config.runtime_envs_dir),
+            &self.child_environment,
+            filter.as_deref(),
+        )
+        .map_err(|error| attune_common::Error::validation(error.to_string()))?;
         RuntimeDetector::new(self.pool.clone())
             .with_child_environment(self.child_environment.clone())
             .enrich_recipe_capabilities(&mut self.capabilities, filter.as_deref())
