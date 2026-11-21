@@ -13,6 +13,36 @@ use wiremock::{
 mod common;
 use common::*;
 
+#[test]
+fn pack_check_reports_test_runner_entrypoint_field() {
+    let root = tempfile::tempdir().unwrap();
+    let pack = root.path().join("pack");
+    std::fs::create_dir(&pack).unwrap();
+    std::fs::write(
+        pack.join("pack.yaml"),
+        r#"ref: check_runner
+version: 1.0.0
+testing:
+  enabled: true
+  discovery: {method: explicit}
+  runners:
+    smoke: {type: script, entry_point: missing.sh}
+"#,
+    )
+    .unwrap();
+
+    assert_cmd::cargo::cargo_bin_cmd!("attune")
+        .env_clear()
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .args(["pack", "check"])
+        .arg(pack)
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains(
+            "pack.yaml at /testing/runners/smoke/entry_point",
+        ));
+}
+
 #[tokio::test]
 async fn test_pack_list_authenticated() {
     let fixture = TestFixture::new().await;

@@ -371,6 +371,18 @@ impl PackChecker {
         self.optional_type(map, tags_field, "array", "pack.yaml");
         self.optional_type(map, "runtime_deps", "array", "pack.yaml");
         self.optional_type(map, "dependencies", "array", "pack.yaml");
+        if let Some(testing) = yaml_get(map, "testing") {
+            if let Err(crate::Error::Deployment { details, .. }) =
+                crate::pack_registry::diagnostics::validate_testing_metadata(
+                    &self.root,
+                    testing.clone(),
+                )
+            {
+                for diagnostic in details.diagnostics {
+                    self.push_diagnostic(diagnostic);
+                }
+            }
+        }
         if let Err(error) =
             serde_yaml_ng::from_value::<crate::pack_ownership::PackOwnershipMetadata>(value.clone())
         {
@@ -2012,6 +2024,112 @@ mod tests {
         let path = root.join(path);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, content).unwrap();
+    }
+
+    fn write_test_runner_manifest(root: &Path, entry_point: &str) {
+        let manifest = serde_json::json!({
+            "ref": "demo",
+            "version": "1.0.0",
+            "testing": {
+                "enabled": true,
+                "discovery": {"method": "explicit"},
+                "runners": {"script/smoke~local": {
+                    "type": "script",
+                    "entry_point": entry_point
+                }}
+            }
+        });
+        write(root, "pack.yaml", &manifest.to_string());
+    }
+
+    fn assert_invalid_test_runner_entrypoint(root: &Path, entry_point: &str) {
+        write_test_runner_manifest(root, entry_point);
+
+        let report = check_pack(root);
+        assert!(!report.valid, "accepted entrypoint {entry_point:?}");
+        assert_eq!(
+            report.diagnostics,
+            vec![PackDiagnostic::at(
+                "pack.yaml",
+                "/testing/runners/script~1smoke~0local/entry_point",
+                "Test entrypoint must name an existing file within the pack",
+            )]
+        );
+
+        let crate::Error::Deployment { details, .. } =
+            crate::pack_registry::diagnostics::validate_metadata(root).unwrap_err()
+        else {
+            panic!("missing deployment details");
+        };
+        assert_eq!(details.diagnostics, report.diagnostics);
+    }
+
+    #[test]
+    fn test_runner_entrypoints_match_metadata_admission() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("pack");
+        let outside = temp.path().join("outside.sh");
+        write(temp.path(), "outside.sh", "#!/bin/sh\n");
+        write(&root, "tests/smoke.sh", "#!/bin/sh\n");
+
+        for entry_point in [
+            "",
+            "../outside.sh",
+            outside.to_str().unwrap(),
+            "tests/missing.sh",
+            "tests",
+        ] {
+            assert_invalid_test_runner_entrypoint(&root, entry_point);
+        }
+
+        write_test_runner_manifest(&root, "./tests/smoke.sh");
+        let report = check_pack(&root);
+        assert!(report.valid, "{:?}", report.diagnostics);
+        assert_eq!(
+            crate::pack_registry::diagnostics::validate_metadata(&root).unwrap(),
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_runner_errors_are_reported_in_runner_name_order() {
+        let root = TempDir::new().unwrap();
+        for (timeout, field) in [(0, "timeout"), (1, "entry_point")] {
+            let manifest = format!(
+                "ref: demo\nversion: 1.0.0\ntesting:\n  enabled: true\n  discovery: {{method: explicit}}\n  runners:\n    zulu: {{type: script, entry_point: missing.sh, timeout: {timeout}}}\n    alpha: {{type: script, entry_point: missing.sh, timeout: {timeout}}}\n"
+            );
+            write(root.path(), "pack.yaml", &manifest);
+
+            let expected_path = format!("/testing/runners/alpha/{field}");
+            for _ in 0..16 {
+                let report = check_pack(root.path());
+                assert_eq!(report.errors, 1);
+                assert_eq!(
+                    report.diagnostics[0].metadata_path.as_deref(),
+                    Some(expected_path.as_str())
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_runner_entrypoints_reject_symlinks_leaving_the_pack() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("pack");
+        write(temp.path(), "outside.sh", "#!/bin/sh\n");
+        write(&root, "tests/smoke.sh", "#!/bin/sh\n");
+        std::os::unix::fs::symlink(temp.path().join("outside.sh"), root.join("tests/link.sh"))
+            .unwrap();
+        std::os::unix::fs::symlink(temp.path(), root.join("linked-dir")).unwrap();
+
+        assert_invalid_test_runner_entrypoint(&root, "tests/link.sh");
+        assert_invalid_test_runner_entrypoint(&root, "linked-dir/outside.sh");
+
+        std::os::unix::fs::symlink("smoke.sh", root.join("tests/local.sh")).unwrap();
+        write_test_runner_manifest(&root, "tests/local.sh");
+        let report = check_pack(&root);
+        assert!(report.valid, "{:?}", report.diagnostics);
     }
 
     #[test]

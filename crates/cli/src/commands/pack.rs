@@ -767,9 +767,18 @@ fn handle_check(path: String, output_format: OutputFormat) -> Result<()> {
                 let mut table = output::create_table();
                 output::add_header(&mut table, vec!["Severity", "Path", "Code", "Message"]);
                 for diagnostic in &report.diagnostics {
+                    let path = diagnostic.path.as_deref().unwrap_or("-");
+                    let location = match diagnostic
+                        .metadata_path
+                        .as_deref()
+                        .filter(|field| !field.is_empty())
+                    {
+                        Some(field) => format!("{path} at {field}"),
+                        None => path.to_string(),
+                    };
                     table.add_row(vec![
                         format!("{:?}", diagnostic.severity).to_lowercase(),
-                        diagnostic.path.as_deref().unwrap_or("-").to_string(),
+                        location,
                         diagnostic.code.clone(),
                         diagnostic.message.clone(),
                     ]);
