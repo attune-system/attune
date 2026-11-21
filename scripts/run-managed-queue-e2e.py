@@ -219,6 +219,7 @@ def stop_processes():
             forced.append(name)
         if process.returncode != 0:
             unexpected.append(name)
+    processes.clear()
     if forced or unexpected:
         raise RuntimeError(f"Owned service shutdown failed: forced={forced}, unexpected={unexpected}")
 
@@ -352,22 +353,36 @@ with psycopg.connect(admin_dsn, autocommit=True, connect_timeout=5, client_encod
                            "tests/e2e/api/test_work_queue_api.py::TestWorkQueueApi::test_enabled_queue_dispatches_item_and_applies_ack")
             print("Owned queue HTTP and worker test passed", flush=True)
 
+            outage_test = "tests/e2e/api/queue_consumer_outage.py::test_missing_consumer_rejects_without_accepting"
+
+            def consumer_withdrawn(role):
+                return dba.execute("""SELECT NOT EXISTS (
+                    SELECT 1 FROM recorded_consumer_binding AS binding
+                    JOIN recorded_consumer_observation USING (rollout, instance)
+                    WHERE binding.role=%s AND observed > clock_timestamp() - INTERVAL '30 seconds'
+                )""", (role,)).fetchone()[0]
+
+            for role, sequence in (
+                ("api", "work_queue_item_configuration_input_id_seq"),
+                ("executor", "work_queue_dispatch_id_seq"),
+            ):
+                sequence = sql.Identifier("attune", sequence)
+                login = sql.Identifier(profile[role][0])
+                dba.execute(sql.SQL("REVOKE USAGE ON SEQUENCE {} FROM {}").format(sequence, login))
+                bounded_wait(lambda: consumer_withdrawn(role), f"{role} sequence privilege withdrawal", 15)
+                run_http_tests(test_env, f"queue-{role}-sequence-outage-e2e.log", outage_test)
+                dba.execute(sql.SQL("GRANT USAGE ON SEQUENCE {} TO {}").format(sequence, login))
+                bounded_wait(live_roles, f"{role} sequence privilege recovery", 15)
+                print(f"Missing {role} sequence privilege denied admission until restored", flush=True)
+
             notifier = processes["notifier"]
             notifier.send_signal(signal.SIGINT)
             if notifier.wait(timeout=20) != 0:
                 raise RuntimeError("Owned notifier shutdown failed")
             del processes["notifier"]
 
-            def notifier_withdrawn():
-                return dba.execute("""SELECT NOT EXISTS (
-                    SELECT 1 FROM recorded_consumer_binding AS binding
-                    JOIN recorded_consumer_observation USING (rollout, instance)
-                    WHERE binding.role='notifier' AND observed > clock_timestamp() - INTERVAL '30 seconds'
-                )""").fetchone()[0]
-
-            bounded_wait(notifier_withdrawn, "notifier readiness withdrawal", 35)
-            run_http_tests(test_env, "queue-outage-e2e.log",
-                           "tests/e2e/api/queue_consumer_outage.py::test_missing_notifier_rejects_without_accepting")
+            bounded_wait(lambda: consumer_withdrawn("notifier"), "notifier readiness withdrawal", 35)
+            run_http_tests(test_env, "queue-outage-e2e.log", outage_test)
             print("Missing notifier denied single and bulk enqueue with no accepted work", flush=True)
     finally:
         try:
@@ -377,7 +392,13 @@ with psycopg.connect(admin_dsn, autocommit=True, connect_timeout=5, client_encod
                 clean_logs()
             finally:
                 if created:
-                    assert not cluster.execute("SELECT 1 FROM pg_stat_activity WHERE datname=%s", (database,)).fetchone()
+                    bounded_wait(
+                        lambda: cluster.execute(
+                            "SELECT 1 FROM pg_stat_activity WHERE datname=%s", (database,),
+                        ).fetchone() is None,
+                        "owned database sessions to close after service shutdown",
+                        10,
+                    )
                     cluster.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(database)))
                 for role in reversed(roles):
                     cluster.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))

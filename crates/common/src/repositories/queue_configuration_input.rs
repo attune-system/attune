@@ -27,6 +27,8 @@ pub(in crate::repositories) use transfer::QueueReceiptParent;
 pub use tuning::QueueDispatchTuning;
 use tuning::QueueTuningInputs;
 
+pub const MAX_MANAGED_QUEUE_PROTECTED_FIELDS: usize = 256;
+
 pub(in crate::repositories) struct QueueItemBinding<'a> {
     pub item: Id,
     pub authority: &'a crate::runtime_authority::SelectedRuntimeAuthority,
@@ -608,6 +610,11 @@ impl QueueConfigurationInputRepository {
         let tuning = QueueTuningInputs::from_metadata(&metadata)?;
         let mut configuration = Value::Null;
         if tuning.uses_pack_configuration()
+            || metadata["trace_tag_template"]
+                .as_str()
+                .is_some_and(|template| {
+                    crate::template_resolver::workflow_template_uses_namespace(template, "config")
+                })
             || binding
                 .declarations
                 .iter()
@@ -921,7 +928,7 @@ async fn validate_transfer_fields(
     master: &str,
 ) -> Result<Vec<QueueReceiptParent>> {
     validate_transfer_ids(sealed, master)?;
-    if fields.len() > 256 {
+    if fields.len() > MAX_MANAGED_QUEUE_PROTECTED_FIELDS {
         return Err(denied());
     }
     let mut parents = Vec::new();

@@ -344,7 +344,7 @@ impl TransferProof {
 pub(super) async fn fields(conn: &mut PgConnection, item: Id) -> Result<Vec<PreparedSecretValue>> {
     let fields =
         Secrets::find_stored_by_entity(&mut *conn, ENTITY_QUEUE_ITEM_PAYLOAD, item).await?;
-    if fields.len() > 256 {
+    if fields.len() > super::MAX_MANAGED_QUEUE_PROTECTED_FIELDS {
         return Err(denied());
     }
     fields

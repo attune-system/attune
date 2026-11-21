@@ -1,9 +1,9 @@
-"""Explicitly selected by the owned runner after it stops its notifier."""
+"""Admission boundary when the owned runner withdraws a required observation."""
 
 from .test_worker_native_completion import _publish_single_item_queue
 
 
-def test_missing_notifier_rejects_without_accepting(client, tmp_path):
+def test_missing_consumer_rejects_without_accepting(client, tmp_path):
     ref = _publish_single_item_queue(client, tmp_path)
     base = f"/api/v1/queues/{ref}.work/items"
     item = {"item_key": "readiness-blocked", "payload": {}}

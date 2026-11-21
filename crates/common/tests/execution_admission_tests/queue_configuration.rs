@@ -111,6 +111,72 @@ async fn queue_configuration_declaration_retains_authored_site_after_projection_
 }
 
 #[tokio::test]
+async fn queue_trace_template_alone_captures_pack_configuration() {
+    use attune_common::repositories::{
+        component_configuration::ComponentConfigurationRepository as Configuration,
+        pack::PackRepository,
+        queue_configuration_input::QueueConfigurationInputRepository as Fixed,
+    };
+
+    let (db, snapshot, policy, human) = fixture_with_defaults(true).await;
+    let mut tx = db.begin().await.unwrap();
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await
+        .unwrap();
+    let queue =
+        WorkQueueRepository::find_by_ref(&mut *tx, &format!("{}.inbox", policy.owner.pack_ref))
+            .await
+            .unwrap()
+            .unwrap();
+    let queue = WorkQueueRepository::update(
+        &mut *tx,
+        queue.id,
+        UpdateWorkQueueInput {
+            trace_tag_template: Some(attune_common::repositories::Patch::Set(
+                "tag.{{ config.default_value }}".into(),
+            )),
+            action_params: Some(json!({})),
+            config: Some(json!({})),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let pack = PackRepository::find_by_id(&mut *tx, policy.owner.pack_id)
+        .await
+        .unwrap()
+        .unwrap();
+    Configuration::bind_pack(
+        &mut tx,
+        &pack,
+        Some(&json!({"default_value":"public-trace","selector":"4"})),
+        Some(QUEUE_KEY),
+    )
+    .await
+    .unwrap();
+    let revision = Authority::capture_policy(&mut tx, &policy).await.unwrap();
+    Authority::activate_policy(&mut tx, revision.id)
+        .await
+        .unwrap();
+    let item = stage_record(
+        &mut tx,
+        &queue,
+        &snapshot,
+        human,
+        json!({"message":"record"}),
+    )
+    .await;
+    let input = Fixed::capture(&mut tx, &queue, &item, &snapshot, QUEUE_KEY)
+        .await
+        .unwrap();
+    assert!(input.configuration_revision().is_some());
+    assert_eq!(input.configuration()["default_value"], "public-trace");
+    assert!(input.declarations().is_empty());
+    tx.rollback().await.unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
 async fn queue_fixed_inputs_seal_credentials_without_contributor_key_rights() {
     use attune_common::{
         crypto,

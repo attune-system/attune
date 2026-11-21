@@ -502,6 +502,49 @@ async fn exercise(f: &mut Fixture) {
 }
 
 #[tokio::test]
+async fn queue_sequence_privileges_gate_readiness_renewal_for_real_logins() {
+    let fixture = Fixture::new(false).await;
+    let result = std::panic::AssertUnwindSafe(async {
+        for (index, sequence, check_api) in [
+            (1, "work_queue_item_configuration_input_id_seq", true),
+            (2, "work_queue_dispatch_id_seq", false),
+        ] {
+            let pool = &fixture.pools[index];
+            let role = &fixture.roles[index + 1];
+            let schema = fixture.db.schema();
+            let mut conn = pool.acquire().await.unwrap();
+            let has_access = async |conn: &mut sqlx::PgConnection| {
+                if check_api {
+                    Observations::api_access_available(conn).await.unwrap()
+                } else {
+                    Observations::executor_access_available(conn).await.unwrap()
+                }
+            };
+            sqlx::raw_sql(&format!(
+                "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA \"{schema}\" TO {role};
+                 GRANT USAGE ON ALL SEQUENCES IN SCHEMA \"{schema}\" TO {role}"
+            )).execute(&*fixture.db).await.unwrap();
+            assert!(has_access(&mut conn).await);
+            sqlx::raw_sql(&format!(
+                "REVOKE USAGE ON SEQUENCE \"{schema}\".{sequence} FROM {role};
+                 GRANT SELECT ON SEQUENCE \"{schema}\".{sequence} TO {role}"
+            )).execute(&*fixture.db).await.unwrap();
+            assert!(!has_access(&mut conn).await);
+            sqlx::query(&format!(
+                "GRANT UPDATE ON SEQUENCE \"{schema}\".{sequence} TO {role}"
+            )).execute(&*fixture.db).await.unwrap();
+            assert!(has_access(&mut conn).await);
+        }
+    })
+    .catch_unwind()
+    .await;
+    fixture.cleanup().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
 async fn authenticated_observations_require_every_exact_fresh_replica() {
     let mut fixture = Fixture::new(false).await;
     let result = std::panic::AssertUnwindSafe(exercise(&mut fixture))

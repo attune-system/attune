@@ -16,6 +16,8 @@ use std::collections::BTreeSet;
 mod queue;
 pub(in crate::repositories) use queue::QueueContributorSource;
 
+pub const MAX_ACCEPTED_BATCH_ITEMS: usize = 256;
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ItemProof {
@@ -624,7 +626,7 @@ fn canonical_ids(ids: &[Id]) -> Result<Vec<Id>> {
         .into_iter()
         .collect::<Vec<_>>();
     if canonical.is_empty()
-        || canonical.len() > 256
+        || canonical.len() > MAX_ACCEPTED_BATCH_ITEMS
         || canonical.len() != ids.len()
         || canonical[0] <= 0
     {

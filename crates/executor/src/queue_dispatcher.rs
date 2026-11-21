@@ -978,6 +978,7 @@ impl WorkQueueDispatcher {
             } else {
                 &context.pack_config
             },
+            if recorded { &pack_secret_paths } else { &[] },
             &items,
             reserved_dispatch_id,
         )?;
@@ -1551,6 +1552,7 @@ impl WorkQueueDispatcher {
         queue: &WorkQueue,
         parsed_config: &WorkQueueConfig,
         pack_config: &JsonValue,
+        pack_secret_paths: &[JsonPointer],
         items: &[WorkQueueItem],
         dispatch_id: Option<i64>,
     ) -> Result<String> {
@@ -1562,11 +1564,17 @@ impl WorkQueueDispatcher {
                 items,
                 dispatch_id,
             )?;
+            context.mark_secret_pointer_paths("config", pack_secret_paths, |path| {
+                SecretSource::PackConfig {
+                    pack_ref: queue.pack_ref.clone(),
+                    path: path.clone(),
+                }
+            });
             Self::mark_queue_item_secret_paths(&context, queue, items)?;
             let rendered = context
                 .render_json_with_sensitivity(&JsonValue::String(template.clone()))
-                .with_context(|| {
-                    format!(
+                .map_err(|_| {
+                    anyhow!(
                         "failed to render trace_tag_template for queue '{}'",
                         queue.r#ref
                     )
@@ -2070,6 +2078,52 @@ mod tests {
     }
 
     #[test]
+    fn resolve_queue_trace_tag_rejects_secret_pack_config_but_allows_public_siblings() {
+        let mut queue = sample_queue(WorkQueueBatchMode::Single, json!({}), json!({}));
+        let config = json!({"nested": {"password":"dummy-password", "label":"public-label"}});
+        let paths = ["/nested/password".into()];
+        let items = [sample_item(42, 1, json!({}))];
+        queue.trace_tag_template = Some("trace.{{ config.nested.password }}".into());
+        let error = WorkQueueDispatcher::resolve_queue_trace_tag(
+            &queue,
+            &WorkQueueConfig::default(),
+            &config,
+            &paths,
+            &items,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Queue trace tags cannot contain secret values"
+        );
+
+        queue.trace_tag_template = Some("{{ config.nested[config.nested.password] }}".into());
+        let error = WorkQueueDispatcher::resolve_queue_trace_tag(
+            &queue,
+            &WorkQueueConfig::default(),
+            &config,
+            &paths,
+            &items,
+            None,
+        )
+        .unwrap_err();
+        assert!(!format!("{error:#}").contains("dummy-password"));
+
+        queue.trace_tag_template = Some("trace.{{ config.nested.label }}".into());
+        let tag = WorkQueueDispatcher::resolve_queue_trace_tag(
+            &queue,
+            &WorkQueueConfig::default(),
+            &config,
+            &paths,
+            &items,
+            None,
+        )
+        .unwrap();
+        assert_eq!(tag, "trace.public-label");
+    }
+
+    #[test]
     fn resolve_queue_trace_tag_uses_rendered_template_when_non_empty() {
         let mut queue = sample_queue(WorkQueueBatchMode::Single, json!({}), json!({}));
         queue.trace_tag_template = Some("trace.{{ item.customer }}".to_string());
@@ -2080,6 +2134,7 @@ mod tests {
             &queue,
             &parsed_config,
             &json!({}),
+            &[],
             &[item],
             None,
         )
@@ -2099,6 +2154,7 @@ mod tests {
             &queue,
             &parsed_config,
             &json!({}),
+            &[],
             &[item],
             None,
         )
@@ -2118,6 +2174,7 @@ mod tests {
             &queue,
             &parsed_config,
             &json!({}),
+            &[],
             &[item],
             None,
         )
@@ -2137,6 +2194,7 @@ mod tests {
             &queue,
             &parsed_config,
             &json!({}),
+            &[],
             &[item],
             Some(99),
         )
@@ -2158,6 +2216,7 @@ mod tests {
             &queue,
             &parsed_config,
             &json!({}),
+            &[],
             &[first, second],
             Some(99),
         )
@@ -2179,6 +2238,7 @@ mod tests {
             &queue,
             &parsed_config,
             &json!({}),
+            &[],
             &[first, second],
             Some(99),
         )
@@ -2200,6 +2260,7 @@ mod tests {
             &queue,
             &parsed_config,
             &json!({}),
+            &[],
             &[item],
             None,
         )
@@ -2219,6 +2280,7 @@ mod tests {
             &queue,
             &parsed_config,
             &json!({}),
+            &[],
             &[item],
             Some(99),
         )

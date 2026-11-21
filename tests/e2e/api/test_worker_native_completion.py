@@ -142,7 +142,11 @@ print(json.dumps({"queue_ack": {"version": 1, "items": [{
     _write(path / "queues/work.yaml", {
         "ref": ref + ".work", "label": "Released work queue", "dispatch_action": ref + ".ack",
         "enabled": True, "accepting_new_items": True, "batch_mode": "single",
-        "permission_set_refs": [], "action_params": {"queue_item": "{{ queue_item }}"},
+        "permission_set_refs": [],
+        "item_schema": {"private_fields": {"type": "array", "items": {"type": "string", "secret": True}}},
+        "action_params": {"queue_item": {
+            "id": "{{ queue_item.id }}", "attempt_count": "{{ queue_item.attempt_count }}",
+        }},
         "config": {"ack_contract": {"version": 1}, "dispatch": {"retry_limit": retry_limit}},
     })
     client.upload_pack(str(path))
@@ -155,8 +159,20 @@ def test_worker_managed_queue_completion(client, tmp_path):
     response = client.session.get(base, timeout=10)
     response.raise_for_status()
     assert response.json()["data"]["is_adhoc"] is False
-    response = client.session.post(base + "/items", json={"item_key": "owned-one", "payload": {}}, timeout=10)
+    def protected_item(size):
+        return {"item_key": "owned-one", "payload": {"private_fields": ["private-field"] * size}}
+
+    oversized = client.session.post(base + "/items/bulk", json={"items": [
+        {"payload": {}}, protected_item(257),
+    ]}, timeout=10)
+    assert oversized.status_code == 422, oversized.json().get("error")
+    retained = client.session.get(base + "/items", timeout=10)
+    retained.raise_for_status()
+    assert retained.json()["items"] == []
+
+    response = client.session.post(base + "/items", json=protected_item(256), timeout=10)
     response.raise_for_status()
+    assert "private-field" not in response.text
     item_id, item, settled = response.json()["data"]["id"], {}, False
     try:
         def terminal_item():
@@ -330,6 +346,12 @@ print(json.dumps({"queue_ack": {"version": 1, "items": [
         started = client.put(base, json={"enabled": True})
         started.raise_for_status()
 
+        # Item reads can lock individual rows, and dispatch deliberately skips
+        # locked candidates. Wait for the first lease through the execution list
+        # so status polling doesn't split the batch under test.
+        wait_for_condition(lambda: client.list_executions(action_ref=provider + ".ack", limit=1),
+                           timeout=60, poll_interval=0.2,
+                           error_message="Business-owned batch was not dispatched")
         items = []
 
         def settle_items():

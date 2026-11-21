@@ -382,7 +382,7 @@ pub(super) async fn bulk_apply(
                         .ok_or_else(|| ApiError::BadRequest("Missing payload patch".into()))?,
                 );
                 let (payload, secrets) =
-                    prepare_queue_payload(state, &admitted_item_schema(&item)?, &merged)?;
+                    prepare_queue_payload(state, queue, &admitted_item_schema(&item)?, &merged)?;
                 attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::replace_entity_with_conn(&mut tx, attune_common::secret_values::ENTITY_QUEUE_ITEM_PAYLOAD, item.id, &secrets).await?;
                 UpdateWorkQueueItemInput {
                     payload: Some(payload),

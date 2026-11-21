@@ -1975,11 +1975,15 @@ impl WorkQueueItemRepository {
         .await?)
     }
 
+    /// Lease a managed cohort whose members fit in one recorded admission.
     pub async fn lease_batch_from_dispatch_item(
         connection: &mut sqlx::PgConnection,
-        input: LeaseWorkQueueItemsInput,
+        mut input: LeaseWorkQueueItemsInput,
         anchor: Id,
     ) -> Result<Vec<WorkQueueItem>> {
+        input.limit = input
+            .limit
+            .min(super::accepted_batch_dependency::MAX_ACCEPTED_BATCH_ITEMS as i64);
         Self::lease_batch(connection, input, Some(anchor)).await
     }
 

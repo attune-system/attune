@@ -196,10 +196,26 @@ impl RecordedConsumerIdentity {
 pub struct RecordedConsumerObservations;
 
 impl RecordedConsumerObservations {
+    // Implicit IDENTITY inserts do not need sequence privileges. Explicit
+    // nextval calls and SERIAL defaults require USAGE or UPDATE.
+    async fn can_allocate_ids(connection: &mut PgConnection, tables: &[&str]) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT NOT EXISTS (
+                SELECT 1 FROM unnest($1::text[]) AS required(name)
+                WHERE has_sequence_privilege(
+                    current_user, pg_get_serial_sequence(required.name, 'id'), 'USAGE, UPDATE'
+                ) IS DISTINCT FROM TRUE
+            )",
+        )
+        .bind(tables)
+        .fetch_one(connection)
+        .await?)
+    }
+
     /// Check access on the API's admitted queue writes, runtime provenance and
     /// exact artifact delivery paths before reporting the installed consumer.
     pub async fn api_access_available(connection: &mut PgConnection) -> Result<bool> {
-        sqlx::query_scalar(
+        let tables_available: bool = sqlx::query_scalar(
             "SELECT NOT EXISTS (
                 SELECT 1
                 FROM (
@@ -238,16 +254,31 @@ impl RecordedConsumerObservations {
                     )
             )",
         )
-        .fetch_one(connection)
-        .await
-        .map_err(Into::into)
+        .fetch_one(&mut *connection)
+        .await?;
+        Ok(tables_available
+            && Self::can_allocate_ids(
+                connection,
+                &[
+                    "runtime_authority_admission",
+                    "execution_secret_value",
+                    "execution_runtime_read_origin",
+                    "key",
+                    "work_queue_item",
+                    "work_queue_item_configuration_input",
+                    "artifact",
+                    "artifact_version",
+                    "log_stream",
+                ],
+            )
+            .await?)
     }
 
     /// Rights used by dispatch, native workflow effects and protected item
     /// completion. The subscription proof is verified independently in the
     /// executor that runs those paths.
     pub async fn executor_access_available(connection: &mut PgConnection) -> Result<bool> {
-        sqlx::query_scalar(
+        let tables_available: bool = sqlx::query_scalar(
             "SELECT NOT EXISTS (
                 SELECT 1
                 FROM (
@@ -278,9 +309,22 @@ impl RecordedConsumerObservations {
                     )
             )",
         )
-        .fetch_one(connection)
-        .await
-        .map_err(Into::into)
+        .fetch_one(&mut *connection)
+        .await?;
+        Ok(tables_available
+            && Self::can_allocate_ids(
+                connection,
+                &[
+                    "execution",
+                    "runtime_authority_admission",
+                    "execution_secret_value",
+                    "workflow_execution",
+                    "workflow_log_outbox",
+                    "workflow_task_wait",
+                    "work_queue_dispatch",
+                ],
+            )
+            .await?)
     }
 
     /// Check the database access used by the notifier's recorded source and

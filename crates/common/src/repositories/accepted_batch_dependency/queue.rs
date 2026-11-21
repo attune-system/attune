@@ -567,7 +567,10 @@ pub(super) async fn validate_contributor_origins(
     parents: &[crate::repositories::queue_configuration_input::QueueReceiptParent],
 ) -> Result<()> {
     let payload = proof.queue_payload.as_ref().ok_or_else(denied)?;
-    if proof.contributors.is_empty() || proof.contributors.len() > 256 || payload.fields.len() > 256
+    if proof.contributors.is_empty()
+        || proof.contributors.len() > 256
+        || payload.fields.len()
+            > crate::repositories::queue_configuration_input::MAX_MANAGED_QUEUE_PROTECTED_FIELDS
     {
         return Err(denied());
     }

@@ -659,6 +659,54 @@ async fn work_queue_item_repository_leases_releases_and_reclaims_items() {
 }
 
 #[tokio::test]
+async fn anchored_queue_leasing_drains_backlog_within_the_accepted_batch_limit() {
+    use attune_common::repositories::accepted_batch_dependency::MAX_ACCEPTED_BATCH_ITEMS;
+
+    let (db, queue) = create_queue_fixture().await;
+    let requested_size = MAX_ACCEPTED_BATCH_ITEMS as i64 + 5;
+    let item_ids: Vec<i64> = sqlx::query_scalar(
+        "INSERT INTO work_queue_item(queue, queue_ref, payload, enqueue_source)
+         SELECT $1, $2, '{\"order_id\":1}'::jsonb, 'test' FROM generate_series(1,$3::bigint)
+         RETURNING id",
+    )
+    .bind(queue.id)
+    .bind(&queue.r#ref)
+    .bind(requested_size)
+    .fetch_all(&*db)
+    .await
+    .unwrap();
+    let mut leased_ids = Vec::new();
+    for expected_count in [MAX_ACCEPTED_BATCH_ITEMS, 5] {
+        let mut tx = db.begin().await.unwrap();
+        let anchor = WorkQueueItemRepository::lock_next_dispatch_item(&mut tx, queue.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let items = WorkQueueItemRepository::lease_batch_from_dispatch_item(
+            &mut tx,
+            LeaseWorkQueueItemsInput {
+                separate_requesters: false,
+                queue: queue.id,
+                ready_statuses: vec![WorkQueueItemStatus::Queued],
+                limit: requested_size,
+                batch_coalescing: None,
+                leased_execution: None,
+                lease_token: Uuid::new_v4(),
+                lease_expires_at: Utc::now() + Duration::minutes(5),
+            },
+            anchor.id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(items.len(), expected_count);
+        leased_ids.extend(items.into_iter().map(|item| item.id));
+        tx.commit().await.unwrap();
+    }
+    assert_eq!(leased_ids, item_ids);
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
 async fn work_queue_item_repository_coalesces_within_same_priority_band() {
     let (pool, queue) = create_queue_fixture().await;
 

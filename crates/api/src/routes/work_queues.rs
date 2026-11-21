@@ -1353,7 +1353,7 @@ pub async fn update_queue_item(
         .as_ref()
         .map(|payload| {
             let binding = admitted_item_schema(&item)?;
-            prepare_queue_payload(&state, &binding, payload)
+            prepare_queue_payload(&state, &queue, &binding, payload)
         })
         .transpose()?;
 
@@ -1532,6 +1532,7 @@ fn admitted_item_schema(
 
 fn prepare_queue_payload(
     state: &AppState,
+    queue: &WorkQueue,
     binding: &attune_common::value_schema::ValueSchemaBinding,
     payload: &JsonValue,
 ) -> ApiResult<(
@@ -1548,6 +1549,12 @@ fn prepare_queue_payload(
         .map_err(|error| ApiError::ValidationError(format!("Invalid queue payload: {error}")))?;
     let (redacted, inputs) =
         attune_common::secret_values::merge_contract_secret_redactions(payload, &[], &contract)?;
+    use attune_common::repositories::queue_configuration_input::MAX_MANAGED_QUEUE_PROTECTED_FIELDS;
+    if !queue.is_adhoc && inputs.len() > MAX_MANAGED_QUEUE_PROTECTED_FIELDS {
+        return Err(ApiError::ValidationError(format!(
+            "A managed queue payload may contain at most {MAX_MANAGED_QUEUE_PROTECTED_FIELDS} protected fields"
+        )));
+    }
     let prepared = if inputs.is_empty() {
         Vec::new()
     } else {
@@ -1819,7 +1826,7 @@ async fn enqueue_queue_item_in_transaction(
                     }
                     attune_common::models::WorkQueueUpdateStrategy::Replace => {
                         let binding = admitted_item_schema(&existing)?;
-                        let (payload, secrets) = prepare_queue_payload(state, &binding, &request.payload)?;
+                        let (payload, secrets) = prepare_queue_payload(state, queue, &binding, &request.payload)?;
                         let updated = WorkQueueItemRepository::update_if_statuses(
                             &mut *connection,
                             existing.id,
@@ -1844,7 +1851,7 @@ async fn enqueue_queue_item_in_transaction(
                         let binding = admitted_item_schema(&existing)?;
                         let original = restore_queue_payload(state, user, &mut *connection, queue, &existing).await?;
                         let merged_payload = merge_patch_value(original, &request.payload);
-                        let (merged_payload, secrets) = prepare_queue_payload(state, &binding, &merged_payload)?;
+                        let (merged_payload, secrets) = prepare_queue_payload(state, queue, &binding, &merged_payload)?;
                         let merged_metadata =
                             merge_patch_value(existing.metadata, &request.metadata);
                         let updated = WorkQueueItemRepository::update_if_statuses(
@@ -1920,7 +1927,7 @@ async fn enqueue_queue_item_in_transaction(
         authored_schema: queue.item_schema.clone(),
         contract,
     };
-    let (payload, secrets) = prepare_queue_payload(state, &binding, &request.payload)?;
+    let (payload, secrets) = prepare_queue_payload(state, queue, &binding, &request.payload)?;
     let recorded_ad_hoc = queue.is_adhoc && recorded::active(user)?;
     if recorded_ad_hoc {
         attune_common::repositories::ad_hoc_queue_admission::AdHocQueueAdmissionRepository::validate_shape(queue)?;
@@ -2120,16 +2127,15 @@ async fn enqueue_queue_item_in_transaction(
         attune_common::repositories::delegated_execution::DelegatedExecutionRepository::accept_queue_item(connection,queue,&item,&snapshot).await?;
     }
     let connection = &mut **transaction;
+    attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::replace_entity_with_conn(
+        &mut *connection, attune_common::secret_values::ENTITY_QUEUE_ITEM_PAYLOAD, item.id, &secrets,
+    ).await?;
     if !queue.is_adhoc {
         attune_common::repositories::queue_configuration_input::QueueConfigurationInputRepository::capture(
             connection, queue, &item, &snapshot,
             state.config.security.encryption_key.as_deref().ok_or_else(|| ApiError::Forbidden("Managed queue fixed-input encryption is unavailable".into()))?,
         ).await?;
     }
-    attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::replace_entity_with_conn(
-        &mut *connection, attune_common::secret_values::ENTITY_QUEUE_ITEM_PAYLOAD, item.id, &secrets,
-    ).await?;
-
     if let Some(fence) = &effect_fence {
         fence.ensure_fresh_on(connection).await?;
     }
@@ -3105,7 +3111,7 @@ async fn apply_payload_patch_to_selected_items(
         let binding = admitted_item_schema(&item)?;
         let original = restore_queue_payload(state, user, &mut tx, queue, &item).await?;
         let merged_payload = merge_patch_value(original, patch);
-        let (payload, secrets) = prepare_queue_payload(state, &binding, &merged_payload)?;
+        let (payload, secrets) = prepare_queue_payload(state, queue, &binding, &merged_payload)?;
         updates.push((item.id, payload, secrets));
     }
 
