@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use attune_common::{
+    execution_authority::consumer_contract::ConsumerRole,
     models::{
         enums::{ExecutionStatus, WorkQueueDispatchStatus, WorkQueueItemStatus},
         key::Key,
@@ -22,6 +23,7 @@ use attune_common::{
         execution_secret_value::ExecutionSecretValueRepository,
         key::KeyRepository,
         pack::PackRepository,
+        recorded_consumer_observations::RecordedConsumerIdentity,
         work_queue::{
             CreateWorkQueueDispatchInput, LeaseWorkQueueItemsInput, ReleaseWorkQueueLeaseInput,
             UpdateWorkQueueDispatchInput, WorkQueueDispatchRepository,
@@ -93,15 +95,22 @@ pub struct WorkQueueDispatcher {
     pool: PgPool,
     publisher: Arc<Publisher>,
     encryption_key: Option<String>,
+    recorded_identity: Option<Arc<RecordedConsumerIdentity>>,
     config: QueueDispatcherConfig,
 }
 
 impl WorkQueueDispatcher {
-    pub fn new(pool: PgPool, publisher: Arc<Publisher>, encryption_key: Option<String>) -> Self {
+    pub fn new(
+        pool: PgPool,
+        publisher: Arc<Publisher>,
+        encryption_key: Option<String>,
+        recorded_identity: Option<Arc<RecordedConsumerIdentity>>,
+    ) -> Self {
         Self {
             pool,
             publisher,
             encryption_key,
+            recorded_identity,
             config: QueueDispatcherConfig::default(),
         }
     }
@@ -228,15 +237,11 @@ impl WorkQueueDispatcher {
                 continue;
             }
 
-            WorkQueueDispatchRepository::update(
-                &self.pool,
-                dispatch.id,
-                UpdateWorkQueueDispatchInput {
-                    status: Some(WorkQueueDispatchStatus::Dispatched),
-                    ..Default::default()
-                },
-            )
-            .await?;
+            if !WorkQueueDispatchRepository::mark_dispatched_if_leased(&self.pool, dispatch.id)
+                .await?
+            {
+                continue;
+            }
 
             if let Some(queue) = WorkQueueRepository::find_by_id(&self.pool, dispatch.queue).await?
             {
@@ -318,8 +323,23 @@ impl WorkQueueDispatcher {
     }
 
     async fn dispatch_ready_batches_for_queue(&self, queue: &WorkQueue) -> Result<()> {
-        let context =
-            Self::resolve_queue_context(&self.pool, self.encryption_key.as_deref(), queue).await?;
+        if !queue.is_adhoc {
+            if self.recorded_identity.is_none() {
+                return Ok(());
+            }
+            for _ in 0..MAX_LEASED_DISPATCHES_PER_POLL {
+                let Some(dispatch) = self.prepare_next_dispatch(queue, None).await? else {
+                    break;
+                };
+                self.publish_dispatch(dispatch).await?;
+            }
+            return Ok(());
+        }
+        let context = {
+            let mut connection = self.pool.acquire().await?;
+            Self::resolve_queue_context(&mut connection, self.encryption_key.as_deref(), queue)
+                .await?
+        };
         let active_dispatches =
             WorkQueueDispatchRepository::count_active_for_queue(&self.pool, queue.id).await?;
 
@@ -353,15 +373,7 @@ impl WorkQueueDispatcher {
 
         let open_slots = context.concurrency - active_dispatches;
         for _ in 0..open_slots {
-            let Some(dispatch) = Self::prepare_next_dispatch(
-                &self.pool,
-                self.encryption_key.as_deref(),
-                queue,
-                &context,
-                self.config.lease_duration,
-            )
-            .await?
-            else {
+            let Some(dispatch) = self.prepare_next_dispatch(queue, Some(&context)).await? else {
                 break;
             };
 
@@ -372,16 +384,16 @@ impl WorkQueueDispatcher {
     }
 
     async fn resolve_queue_context(
-        pool: &PgPool,
+        connection: &mut sqlx::PgConnection,
         encryption_key: Option<&str>,
         queue: &WorkQueue,
     ) -> Result<ResolvedQueueContext> {
         // Action lifecycle is checked at enqueue admission. Deferred work uses
         // its pinned executable; ordinary disablement is not cancellation.
         let pack = if let Some(pack_id) = queue.pack {
-            PackRepository::find_by_id(pool, pack_id).await?
+            PackRepository::find_by_id(&mut *connection, pack_id).await?
         } else if let Some(pack_ref) = &queue.pack_ref {
-            PackRepository::find_by_ref(pool, pack_ref).await?
+            PackRepository::find_by_ref(&mut *connection, pack_ref).await?
         } else {
             None
         };
@@ -390,7 +402,7 @@ impl WorkQueueDispatcher {
             .with_context(|| format!("invalid config persisted for queue '{}'", queue.r#ref))?;
 
         let concurrency = Self::resolve_u32_tunable(
-            pool,
+            connection,
             encryption_key,
             pack.as_ref(),
             parsed_config
@@ -408,7 +420,7 @@ impl WorkQueueDispatcher {
             1
         } else {
             Self::resolve_u32_tunable(
-                pool,
+                connection,
                 encryption_key,
                 pack.as_ref(),
                 parsed_config
@@ -441,7 +453,7 @@ impl WorkQueueDispatcher {
     }
 
     async fn resolve_u32_tunable(
-        pool: &PgPool,
+        connection: &mut sqlx::PgConnection,
         encryption_key: Option<&str>,
         pack: Option<&Pack>,
         tunable: Option<&WorkQueueTunableValue>,
@@ -453,29 +465,25 @@ impl WorkQueueDispatcher {
             return Ok(default);
         };
 
-        let resolved = Self::resolve_tunable_value(pool, encryption_key, pack, tunable).await?;
+        let resolved =
+            Self::resolve_tunable_value(connection, encryption_key, pack, tunable).await?;
         let parsed_resolved = resolved.as_ref().and_then(Self::parse_positive_u32);
         let parsed = parsed_resolved
             .or_else(|| tunable.fallback.as_ref().and_then(Self::parse_positive_u32))
             .unwrap_or(default);
 
-        if parsed == default && parsed_resolved.is_none() {
-            if let Some(resolved_value) = resolved.as_ref() {
-                warn!(
-                    "Queue '{}' resolved non-positive/non-integer {} tunable {}, falling back to {}",
-                    queue.r#ref,
-                    name,
-                    resolved_value,
-                    default
-                );
-            }
+        if parsed == default && parsed_resolved.is_none() && resolved.is_some() {
+            warn!(
+                "Queue '{}' resolved an invalid {} tunable, falling back to {}",
+                queue.r#ref, name, default
+            );
         }
 
         Ok(parsed)
     }
 
     async fn resolve_tunable_value(
-        pool: &PgPool,
+        connection: &mut sqlx::PgConnection,
         encryption_key: Option<&str>,
         pack: Option<&Pack>,
         tunable: &WorkQueueTunableValue,
@@ -494,7 +502,7 @@ impl WorkQueueDispatcher {
                 let Some(key_ref) = tunable.key_ref.as_deref() else {
                     return Ok(tunable.fallback.clone());
                 };
-                let key = KeyRepository::find_by_ref(pool, key_ref).await?;
+                let key = KeyRepository::find_by_ref(connection, key_ref).await?;
                 match key {
                     Some(key) => {
                         let value = Self::resolve_key_value(&key, encryption_key)?;
@@ -554,49 +562,141 @@ impl WorkQueueDispatcher {
         })
     }
 
-    async fn prepare_next_dispatch(
-        pool: &PgPool,
+    async fn prepare_managed_dispatch_context(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        queue_id: i64,
+        identity: &RecordedConsumerIdentity,
         encryption_key: Option<&str>,
+    ) -> Result<Option<(WorkQueue, ResolvedQueueContext, i64)>> {
+        // Serialize capacity checks and lease creation for this queue. The
+        // same queue lock precedes rollout evidence in API admission.
+        let Some(queue) = WorkQueueRepository::find_by_id_for_update(tx, queue_id).await? else {
+            return Ok(None);
+        };
+        if queue.is_adhoc || !queue.enabled {
+            return Ok(None);
+        }
+        identity.require_current(tx, ConsumerRole::Executor).await?;
+        let Some(anchor) = WorkQueueItemRepository::lock_next_dispatch_item(tx, queue_id).await?
+        else {
+            return Ok(None);
+        };
+        let snapshot =
+            serde_json::from_value(anchor.executable_snapshot.clone().ok_or_else(|| {
+                anyhow!("Managed queue dispatch item has no accepted executable snapshot")
+            })?)?;
+        let input = attune_common::repositories::queue_configuration_input::QueueConfigurationInputRepository::load(
+            tx, &queue, &anchor, &snapshot, encryption_key.ok_or_else(|| {
+                anyhow!("Managed queue fixed-input encryption is unavailable")
+            })?,
+        ).await?;
+        let tuning = input.dispatch_tuning()?;
+        if WorkQueueDispatchRepository::count_active_for_queue(&mut **tx, queue_id).await?
+            >= u64::from(tuning.concurrency)
+        {
+            return Ok(None);
+        }
+        let queue = input.accepted_template(&queue)?;
+        let parsed_config: WorkQueueConfig = serde_json::from_value(queue.config.clone())?;
+        let delay = parsed_config
+            .dispatch
+            .as_ref()
+            .and_then(|dispatch| dispatch.inter_execution_delay_seconds)
+            .unwrap_or_default();
+        if tuning.concurrency == 1
+            && delay > 0
+            && Self::sequential_delay_until(
+                WorkQueueDispatchRepository::latest_terminal_for_queue(&mut **tx, queue_id)
+                    .await?
+                    .as_ref(),
+                tuning.concurrency,
+                delay,
+            )
+            .is_some_and(|until| until > Utc::now())
+        {
+            return Ok(None);
+        }
+        let context = ResolvedQueueContext {
+            parsed_config,
+            pack_config: JsonValue::Null,
+            pack_ref: queue.pack_ref.clone(),
+            concurrency: tuning.concurrency,
+            batch_size: tuning.batch_size,
+            inter_execution_delay_seconds: delay,
+        };
+        Ok(Some((queue, context, anchor.id)))
+    }
+
+    async fn prepare_next_dispatch(
+        &self,
         queue: &WorkQueue,
-        context: &ResolvedQueueContext,
-        lease_duration: Duration,
+        ad_hoc_context: Option<&ResolvedQueueContext>,
     ) -> Result<Option<PreparedDispatch>> {
+        let encryption_key = self.encryption_key.as_deref();
+        let lease_token = Uuid::new_v4();
+        let lease_expires_at = Utc::now()
+            + chrono::Duration::from_std(self.config.lease_duration)
+                .unwrap_or_else(|_| chrono::Duration::hours(24));
+
+        let mut tx = self.pool.begin().await?;
+        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
+            .await?;
+        let managed_identity = if queue.is_adhoc {
+            None
+        } else {
+            self.recorded_identity.as_deref()
+        };
+        let managed_context = if queue.is_adhoc {
+            None
+        } else {
+            let identity = managed_identity.ok_or_else(|| {
+                anyhow!("Recorded queue dispatch requires coordinated runtime readiness")
+            })?;
+            let Some(context) =
+                Self::prepare_managed_dispatch_context(&mut tx, queue.id, identity, encryption_key)
+                    .await?
+            else {
+                tx.commit().await?;
+                return Ok(None);
+            };
+            Some(context)
+        };
+        let (queue, context) = if let Some((queue, context, _)) = &managed_context {
+            (queue, context)
+        } else {
+            (
+                queue,
+                ad_hoc_context.ok_or_else(|| anyhow!("Ad hoc dispatch context unavailable"))?,
+            )
+        };
         let batch_limit = if queue.batch_mode == attune_common::models::WorkQueueBatchMode::Single {
             1
         } else {
             context.batch_size.max(1)
         };
-
-        let lease_token = Uuid::new_v4();
-        let lease_expires_at = Utc::now()
-            + chrono::Duration::from_std(lease_duration)
-                .unwrap_or_else(|_| chrono::Duration::hours(24));
-
-        let mut tx = pool.begin().await?;
-        attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(&mut tx)
-            .await?;
-        let mut items = WorkQueueItemRepository::lease_next_batch(
-            &mut *tx,
-            LeaseWorkQueueItemsInput {
-                separate_requesters: context
-                    .parsed_config
-                    .dispatch
-                    .as_ref()
-                    .is_some_and(|dispatch| dispatch.separate_requesters),
-                queue: queue.id,
-                ready_statuses: vec![WorkQueueItemStatus::Queued, WorkQueueItemStatus::Retry],
-                limit: i64::from(batch_limit),
-                batch_coalescing: context
-                    .parsed_config
-                    .dispatch
-                    .as_ref()
-                    .and_then(|dispatch| dispatch.coalescing.clone()),
-                leased_execution: None,
-                lease_token,
-                lease_expires_at,
-            },
-        )
-        .await?;
+        let lease = LeaseWorkQueueItemsInput {
+            separate_requesters: context
+                .parsed_config
+                .dispatch
+                .as_ref()
+                .is_some_and(|dispatch| dispatch.separate_requesters),
+            queue: queue.id,
+            ready_statuses: vec![WorkQueueItemStatus::Queued, WorkQueueItemStatus::Retry],
+            limit: i64::from(batch_limit),
+            batch_coalescing: context
+                .parsed_config
+                .dispatch
+                .as_ref()
+                .and_then(|dispatch| dispatch.coalescing.clone()),
+            leased_execution: None,
+            lease_token,
+            lease_expires_at,
+        };
+        let mut items = if let Some((_, _, anchor)) = managed_context.as_ref() {
+            WorkQueueItemRepository::lease_batch_from_dispatch_item(&mut tx, lease, *anchor).await?
+        } else {
+            WorkQueueItemRepository::lease_next_batch(&mut *tx, lease).await?
+        };
 
         if items.is_empty() {
             tx.commit().await?;
@@ -674,16 +774,34 @@ impl WorkQueueDispatcher {
             ));
         }
         let dispatch_action = &dispatch_snapshot.executable.action;
-        let recorded = !queue.is_adhoc || attune_common::repositories::execution_admission::ExecutionAdmissionRepository::has_queue_item_admission(&mut tx, &items).await?;
-        if recorded {
+        let recorded_ad_hoc = queue.is_adhoc && attune_common::repositories::execution_admission::ExecutionAdmissionRepository::has_queue_item_admission(&mut tx, &items).await?;
+        if recorded_ad_hoc {
             attune_common::execution_authority::RecordedConsumerReadiness::default()
                 .require_ready()?;
         }
+        let recorded = managed_identity.is_some() || recorded_ad_hoc;
         let admission = if recorded {
             Some(attune_common::repositories::execution_admission::ExecutionAdmissionRepository::queue_batch(&mut tx, queue, &items, &dispatch_snapshot).await?)
         } else {
             None
         };
+        let mut fixed_inputs = Vec::new();
+        for item in items.iter().filter(|_| !queue.is_adhoc) {
+            fixed_inputs.push(attune_common::repositories::queue_configuration_input::QueueConfigurationInputRepository::load(
+                &mut tx, queue, item, &dispatch_snapshot,
+                encryption_key.ok_or_else(||anyhow!("Managed queue fixed-input encryption is unavailable"))?,
+            ).await?);
+        }
+        if let Some(first) = fixed_inputs.first() {
+            if fixed_inputs
+                .iter()
+                .any(|input| !first.compatible_fixed_inputs(input))
+            {
+                return Err(anyhow!(
+                    "Queue batch spans incompatible accepted fixed-input bindings"
+                ));
+            }
+        }
         let permission_set_refs = if let Some(admission) = &admission {
             admission.authority().selected_refs.clone()
         } else {
@@ -691,6 +809,8 @@ impl WorkQueueDispatcher {
         };
         let binding = if accepted_queue.is_some() {
             attune_common::repositories::ad_hoc_queue_admission::AdHocQueueAdmissionRepository::schema(&mut tx, items[0].id).await?
+        } else if let Some(input) = fixed_inputs.first() {
+            input.schema().clone()
         } else if recorded {
             attune_common::repositories::schema_contract::SchemaContractRepository::materialize_action_pair(&mut tx, &dispatch_snapshot).await?
         } else {
@@ -703,9 +823,15 @@ impl WorkQueueDispatcher {
             let first = iter.next().flatten();
             first.filter(|id| iter.all(|other| other == Some(*id)))
         };
-        let (pack_config, pack_secret_paths, pack_revision) = if let Some(reference) =
-            &context.pack_ref
+        let (pack_config, pack_secret_paths, pack_revision) = if let Some(input) =
+            fixed_inputs.first()
         {
+            (
+                input.configuration().clone(),
+                input.configuration_secret_paths(&mut tx).await?,
+                input.configuration_revision(),
+            )
+        } else if let Some(reference) = &context.pack_ref {
             let pack = PackRepository::find_by_ref(&mut *tx, reference)
                 .await?
                 .ok_or_else(|| anyhow!("Queue configuration owner is unavailable"))?;
@@ -748,6 +874,14 @@ impl WorkQueueDispatcher {
         let key_refs = key_context.referenced_key_refs(&queue.action_params)?;
         let keys = if key_refs.is_empty() {
             std::collections::BTreeMap::new()
+        } else if let Some(input) = fixed_inputs.first() {
+            let keys = input.resolved_keys();
+            if keys.keys().cloned().collect::<Vec<_>>() != key_refs {
+                return Err(anyhow!(
+                    "Queue record cannot change accepted fixed Key selectors"
+                ));
+            }
+            keys
         } else {
             if recorded {
                 let mut authorities = Vec::new();
@@ -785,12 +919,12 @@ impl WorkQueueDispatcher {
             keys,
         )?;
         let supplied_config = rendered_config.value.clone();
-        let config_with_defaults = if accepted_queue.is_some() {
+        let config_with_defaults = if accepted_queue.is_some() || !queue.is_adhoc {
             rendered_config.value.clone()
         } else {
             input_contract.apply_defaults(&rendered_config.value)?
         };
-        if accepted_queue.is_none() {
+        if accepted_queue.is_none() && queue.is_adhoc {
             input_contract.validate(&config_with_defaults)?;
         }
         attune_common::secret_values::validate_contract_secret_destination_paths(
@@ -805,7 +939,11 @@ impl WorkQueueDispatcher {
                 &input_contract,
             )?;
         let ad_hoc_secret_inputs = accepted_queue.as_ref().map(|_| secret_inputs.clone());
-        let mut prepared_secrets = if secret_inputs.is_empty() || ad_hoc_secret_inputs.is_some() {
+        let managed_secret_inputs = (!queue.is_adhoc).then(|| secret_inputs.clone());
+        let mut prepared_secrets = if secret_inputs.is_empty()
+            || ad_hoc_secret_inputs.is_some()
+            || managed_secret_inputs.is_some()
+        {
             Vec::new()
         } else {
             let encryption_key = encryption_key.ok_or_else(|| {
@@ -840,6 +978,7 @@ impl WorkQueueDispatcher {
             } else {
                 &context.pack_config
             },
+            if recorded { &pack_secret_paths } else { &[] },
             &items,
             reserved_dispatch_id,
         )?;
@@ -848,7 +987,7 @@ impl WorkQueueDispatcher {
             CreateExecutionInput {
                 action: Some(dispatch_action.id),
                 action_ref: dispatch_action.r#ref.clone(),
-                config: if accepted_queue.is_some() {
+                config: if accepted_queue.is_some() || !queue.is_adhoc {
                     None
                 } else {
                     Some(execution_config)
@@ -881,6 +1020,10 @@ impl WorkQueueDispatcher {
             &dispatch_snapshot,
         )
         .await?;
+        WorkQueueItemRepository::attach_execution_to_lease(&mut *tx, lease_token, execution.id)
+            .await?;
+        // Manifest capture requires the exact execution attachment, before
+        // canonical admission or any renderer can consume accepted members.
         let mut initial_admission = None;
         let mut accepted_batch_fence = None;
         if let Some(admission) = &admission {
@@ -906,6 +1049,11 @@ impl WorkQueueDispatcher {
                 // can consume canonical destination authority.
                 accepted_batch_fence = Some(attune_common::repositories::accepted_batch_dependency::AcceptedBatchDependencyRepository::capture(
                     &mut tx, record.id, &items.iter().map(|item| item.id).collect::<Vec<_>>(),
+                ).await?);
+            } else if !queue.is_adhoc {
+                accepted_batch_fence = Some(attune_common::repositories::accepted_batch_dependency::AcceptedBatchDependencyRepository::capture_managed(
+                    &mut tx,record.id,queue,&items,reserved_dispatch_id,
+                    encryption_key.ok_or_else(||anyhow!("Managed queue payload receipt encryption is unavailable"))?,
                 ).await?);
             }
         }
@@ -946,7 +1094,37 @@ impl WorkQueueDispatcher {
             )
             .await?;
         }
-        if !prepared_secrets.is_empty() && accepted_queue.is_none() {
+        if let (Some(input), Some(inputs)) = (fixed_inputs.first(), managed_secret_inputs) {
+            let inputs = Self::seal_fixed_queue_fields(
+                &mut tx,
+                execution.id,
+                input,
+                &rendered_config.value,
+                inputs,
+                encryption_key
+                    .ok_or_else(|| anyhow!("Managed queue receipt encryption is unavailable"))?,
+            )
+            .await?;
+            let (config,inputs)=attune_common::repositories::declared_input_materialization::DeclaredInputMaterializationRepository::workflow_child_defaults(
+                &mut tx,execution.id,&supplied_config,inputs,encryption_key,
+            ).await?;
+            prepared_secrets = prepare_secret_values(
+                inputs,
+                encryption_key.ok_or_else(|| {
+                    anyhow!("Managed queue default input encryption is unavailable")
+                })?,
+            )?;
+            execution = ExecutionRepository::initialize_config_with_conn(
+                &mut tx,
+                execution.id,
+                initial_admission,
+                &dispatch_snapshot,
+                Some(config),
+                &prepared_secrets,
+            )
+            .await?;
+        }
+        if !prepared_secrets.is_empty() && accepted_queue.is_none() && queue.is_adhoc {
             ExecutionSecretValueRepository::upsert_many_with_conn(
                 &mut tx,
                 ENTITY_EXECUTION_CONFIG,
@@ -962,9 +1140,6 @@ impl WorkQueueDispatcher {
         } else {
             Vec::new()
         };
-
-        WorkQueueItemRepository::attach_execution_to_lease(&mut *tx, lease_token, execution.id)
-            .await?;
 
         let dispatch = WorkQueueDispatchRepository::create(
             &mut *tx,
@@ -988,6 +1163,11 @@ impl WorkQueueDispatcher {
         for receipt in &input_receipts {
             receipt.ensure_fresh_on(&mut tx).await?;
         }
+        if let Some(identity) = managed_identity {
+            identity
+                .require_current(&mut tx, ConsumerRole::Executor)
+                .await?;
+        }
         tx.commit().await?;
         for receipt in &input_receipts {
             receipt.ensure_fresh()?;
@@ -1010,6 +1190,95 @@ impl WorkQueueDispatcher {
             queue: queue.clone(),
             leased_item_ids: items.iter().map(|item| item.id).collect(),
         }))
+    }
+
+    async fn seal_fixed_queue_fields(
+        conn: &mut sqlx::PgConnection,
+        execution: i64,
+        input: &attune_common::repositories::queue_configuration_input::QueueConfigurationInput,
+        actual: &JsonValue,
+        mut secrets: Vec<attune_common::secret_values::SecretValueInput>,
+        key: &str,
+    ) -> Result<Vec<attune_common::secret_values::SecretValueInput>> {
+        use attune_common::repositories::inherited_input::{
+            InheritedInputRepository as Inputs, InputEntityKind, InputSite, InputSitePurpose,
+        };
+        for site in input.declarations() {
+            let path = site
+                .source_path
+                .strip_prefix("/queue/action_params")
+                .ok_or_else(|| anyhow!("Queue declaration path mismatch"))?;
+            let mut session = Inputs::begin_render(
+                conn,
+                execution,
+                &site.declaration_revision,
+                &site.source_path,
+                &site.expression,
+                InputSitePurpose::Value,
+            )
+            .await?;
+            Inputs::bind_queue_configuration(conn, &mut session, input.id(), key).await?;
+            Inputs::bind_queue_contributors(conn, &mut session, key).await?;
+            let rendered = Inputs::evaluate(conn, session).await?;
+            if actual.pointer(path) != Some(rendered.value()) {
+                return Err(anyhow!(
+                    "Accepted queue fixed input differs from rendered destination"
+                ));
+            }
+            let destination = InputSite {
+                execution,
+                kind: InputEntityKind::ExecutionConfig,
+                purpose: InputSitePurpose::Value,
+                path: path.into(),
+            };
+            let receipt = Inputs::record_render(
+                conn,
+                &rendered,
+                &destination,
+                rendered.value(),
+                rendered.selections(),
+                key,
+            )
+            .await?;
+            for secret in secrets.iter_mut().filter(|secret| {
+                attune_common::secret_values::pointer_suffix(&secret.json_path, path).is_some()
+            }) {
+                let provenance = if secret.json_path == path {
+                    receipt.provenance()
+                } else {
+                    let suffix =
+                        attune_common::secret_values::pointer_suffix(&secret.json_path, path)
+                            .ok_or_else(|| anyhow!("Queue secret projection path mismatch"))?;
+                    let projected = Inputs::project_queue_render(conn, &rendered, &suffix).await?;
+                    if projected.value() != &secret.value {
+                        return Err(anyhow!(
+                            "Queue secret leaf differs from admitted expression projection"
+                        ));
+                    }
+                    let destination = InputSite {
+                        execution,
+                        kind: InputEntityKind::ExecutionConfig,
+                        purpose: InputSitePurpose::Value,
+                        path: secret.json_path.clone(),
+                    };
+                    let leaf = Inputs::record_render(
+                        conn,
+                        &projected,
+                        &destination,
+                        projected.value(),
+                        projected.selections(),
+                        key,
+                    )
+                    .await?;
+                    leaf.ensure_fresh_on(conn).await?;
+                    leaf.provenance()
+                };
+                secret.source_kind = "provenance".into();
+                secret.source_ref = Some(serde_json::to_string(&provenance)?);
+            }
+            receipt.ensure_fresh_on(conn).await?;
+        }
+        Ok(secrets)
     }
 
     #[expect(
@@ -1283,6 +1552,7 @@ impl WorkQueueDispatcher {
         queue: &WorkQueue,
         parsed_config: &WorkQueueConfig,
         pack_config: &JsonValue,
+        pack_secret_paths: &[JsonPointer],
         items: &[WorkQueueItem],
         dispatch_id: Option<i64>,
     ) -> Result<String> {
@@ -1294,11 +1564,17 @@ impl WorkQueueDispatcher {
                 items,
                 dispatch_id,
             )?;
+            context.mark_secret_pointer_paths("config", pack_secret_paths, |path| {
+                SecretSource::PackConfig {
+                    pack_ref: queue.pack_ref.clone(),
+                    path: path.clone(),
+                }
+            });
             Self::mark_queue_item_secret_paths(&context, queue, items)?;
             let rendered = context
                 .render_json_with_sensitivity(&JsonValue::String(template.clone()))
-                .with_context(|| {
-                    format!(
+                .map_err(|_| {
+                    anyhow!(
                         "failed to render trace_tag_template for queue '{}'",
                         queue.r#ref
                     )
@@ -1502,16 +1778,9 @@ impl WorkQueueDispatcher {
             .with_source("executor-queue-dispatcher");
         self.publisher.publish_envelope(&envelope).await?;
 
-        WorkQueueDispatchRepository::update(
-            &self.pool,
-            dispatch.dispatch_id,
-            UpdateWorkQueueDispatchInput {
-                status: Some(WorkQueueDispatchStatus::Dispatched),
-                ..Default::default()
-            },
-        )
-        .await?;
-
+        let advanced =
+            WorkQueueDispatchRepository::mark_dispatched_if_leased(&mut *source, dispatch_id)
+                .await?;
         for receipt in &input_receipts {
             receipt.ensure_fresh_on(&mut source).await?;
         }
@@ -1526,6 +1795,9 @@ impl WorkQueueDispatcher {
             fence.ensure_fresh()?;
         }
 
+        if !advanced {
+            return Ok(());
+        }
         if let Err(error) = work_queue_events::maybe_emit_queue_started(
             &self.pool,
             &self.publisher,
@@ -1806,6 +2078,52 @@ mod tests {
     }
 
     #[test]
+    fn resolve_queue_trace_tag_rejects_secret_pack_config_but_allows_public_siblings() {
+        let mut queue = sample_queue(WorkQueueBatchMode::Single, json!({}), json!({}));
+        let config = json!({"nested": {"password":"dummy-password", "label":"public-label"}});
+        let paths = ["/nested/password".into()];
+        let items = [sample_item(42, 1, json!({}))];
+        queue.trace_tag_template = Some("trace.{{ config.nested.password }}".into());
+        let error = WorkQueueDispatcher::resolve_queue_trace_tag(
+            &queue,
+            &WorkQueueConfig::default(),
+            &config,
+            &paths,
+            &items,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Queue trace tags cannot contain secret values"
+        );
+
+        queue.trace_tag_template = Some("{{ config.nested[config.nested.password] }}".into());
+        let error = WorkQueueDispatcher::resolve_queue_trace_tag(
+            &queue,
+            &WorkQueueConfig::default(),
+            &config,
+            &paths,
+            &items,
+            None,
+        )
+        .unwrap_err();
+        assert!(!format!("{error:#}").contains("dummy-password"));
+
+        queue.trace_tag_template = Some("trace.{{ config.nested.label }}".into());
+        let tag = WorkQueueDispatcher::resolve_queue_trace_tag(
+            &queue,
+            &WorkQueueConfig::default(),
+            &config,
+            &paths,
+            &items,
+            None,
+        )
+        .unwrap();
+        assert_eq!(tag, "trace.public-label");
+    }
+
+    #[test]
     fn resolve_queue_trace_tag_uses_rendered_template_when_non_empty() {
         let mut queue = sample_queue(WorkQueueBatchMode::Single, json!({}), json!({}));
         queue.trace_tag_template = Some("trace.{{ item.customer }}".to_string());
@@ -1816,6 +2134,7 @@ mod tests {
             &queue,
             &parsed_config,
             &json!({}),
+            &[],
             &[item],
             None,
         )
@@ -1835,6 +2154,7 @@ mod tests {
             &queue,
             &parsed_config,
             &json!({}),
+            &[],
             &[item],
             None,
         )
@@ -1854,6 +2174,7 @@ mod tests {
             &queue,
             &parsed_config,
             &json!({}),
+            &[],
             &[item],
             None,
         )
@@ -1873,6 +2194,7 @@ mod tests {
             &queue,
             &parsed_config,
             &json!({}),
+            &[],
             &[item],
             Some(99),
         )
@@ -1894,6 +2216,7 @@ mod tests {
             &queue,
             &parsed_config,
             &json!({}),
+            &[],
             &[first, second],
             Some(99),
         )
@@ -1915,6 +2238,7 @@ mod tests {
             &queue,
             &parsed_config,
             &json!({}),
+            &[],
             &[first, second],
             Some(99),
         )
@@ -1936,6 +2260,7 @@ mod tests {
             &queue,
             &parsed_config,
             &json!({}),
+            &[],
             &[item],
             None,
         )
@@ -1955,6 +2280,7 @@ mod tests {
             &queue,
             &parsed_config,
             &json!({}),
+            &[],
             &[item],
             Some(99),
         )

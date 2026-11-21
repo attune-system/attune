@@ -20,10 +20,10 @@ COPY . .
 # targets. Never silently download a different toolchain or regenerate lockfiles.
 RUN test "$BUILDPLATFORM" = "$TARGETPLATFORM" && \
     test -f Cargo.lock && test -f crates/core-timer-sensor/Cargo.lock && test -f crates/core-actions/Cargo.lock && \
-    cargo build --locked --release -j 2 --bin attune-api --bin attune-executor --bin attune-notifier --bin attune-supervisor --bin export-openapi && \
+    cargo build --locked --release -j 2 --bin attune-api --bin attune-rollout-admin --bin attune-executor --bin attune-notifier --bin attune-supervisor --bin export-openapi && \
     cargo build --locked --release -j 2 -p attune-common --example bootstrap_acceptance_archive --example storage_probe_inspector --example interoperability_acceptance_archive --example interoperability_inspector --example legacy_native_writer --example native_settlement_adapter --example native_producer_acceptance_archive && \
     mkdir -p /out/services /out/agents /out/tools /out/core/sensors/bin /out/native-controller && \
-    cp target/release/attune-api target/release/attune-executor target/release/attune-notifier target/release/attune-supervisor /out/services/ && \
+    cp target/release/attune-api target/release/attune-rollout-admin target/release/attune-executor target/release/attune-notifier target/release/attune-supervisor /out/services/ && \
     cp target/release/examples/bootstrap_acceptance_archive target/release/examples/storage_probe_inspector target/release/examples/interoperability_acceptance_archive target/release/examples/interoperability_inspector target/release/examples/legacy_native_writer target/release/examples/native_settlement_adapter target/release/examples/native_producer_acceptance_archive /out/tools/ && \
     for module in main controller journal native protocol http_input; do cp "scripts/legacy_storage_controller/$module.py" /out/native-controller/ || exit 1; done && \
     cp docker/acceptance/attune-native-legacy@.service /out/native-controller/ && \

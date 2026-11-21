@@ -1,0 +1,39 @@
+# Standalone candidate profile; never merge into shared-owner development services.
+# Requires an independently provisioned SQLx installation. No history conversion.
+services:
+  cache-sqlx-migrate:
+    profiles: [cache-sqlx-migrate]
+    image: ${CACHE_API_IMAGE:?Supply immutable API image digest}
+    user: "1000:1000"
+    entrypoint: ["/usr/local/bin/attune-service"]
+    command: ["--config", "/private/migrator.yaml", "--migrate"]
+    restart: "no"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck: {disable: true}
+    volumes:
+      - type: bind
+        source: ${CACHE_MIGRATOR_INPUT:?Existing uid1000 owner-only directory}
+        target: /private
+        read_only: true
+        bind: {create_host_path: false}
+    logging: {driver: none}
+  cache-api:
+    profiles: [cache-api]
+    image: ${CACHE_API_IMAGE:?Supply immutable API image digest}
+    user: "1000:1000"
+    entrypoint: ["/usr/local/bin/attune-service"]
+    command: ["--config", "/private/api.yaml"]
+    restart: "no"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck: {disable: true}
+    volumes:
+      - type: bind
+        source: ${CACHE_API_INPUT:?Existing uid1000 owner-only directory}
+        target: /private
+        read_only: true
+        bind: {create_host_path: false}
+    logging: {driver: none}

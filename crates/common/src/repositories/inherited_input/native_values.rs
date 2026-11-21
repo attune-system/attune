@@ -153,6 +153,7 @@ impl InheritedInputRepository {
             return Err(denied());
         }
         let rendered = RenderedReceiptContext {
+            queue_projection: None,
             result_reads,
             empty_reads,
             wait_reads,
@@ -235,6 +236,7 @@ impl InheritedInputRepository {
             return Err(denied());
         }
         let rendered = RenderedReceiptContext {
+            queue_projection: None,
             result_reads: Vec::new(),
             empty_reads: Vec::new(),
             wait_reads: Vec::new(),

@@ -59,6 +59,7 @@ impl InheritedInputRepository {
             return Err(denied());
         }
         let mut rendered = RenderedReceiptContext {
+            queue_projection: None,
             empty_reads: Vec::new(),
             result_reads: Vec::new(),
             wait_reads,

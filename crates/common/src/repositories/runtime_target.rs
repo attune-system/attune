@@ -51,6 +51,9 @@ pub enum RuntimeTarget {
     QueueItem(Id),
     /// Prospective item or queue-scoped item collection, not queue metadata.
     QueueItems(Id),
+    /// New managed item acceptance follows the queue's accepting-items switch.
+    /// Dispatch enablement is evaluated separately by the dispatcher.
+    QueueAdmission(Id),
     Inquiry(Id),
     Key(Id),
     Artifact(Id),
@@ -439,6 +442,22 @@ impl RuntimeTargetRepository {
                 context.target_ref = Some(component.reference);
                 (kind.metadata().1, id, component.pack, component.available)
             }
+            RuntimeTarget::QueueAdmission(id) => {
+                positive_id(id)?;
+                let row: Option<(String, Option<Id>, bool)> = sqlx::query_as(
+                    "SELECT ref, CASE WHEN management_origin='pack' THEN pack END, \
+                            retired_at IS NULL AND accepting_new_items AND NOT is_adhoc \
+                     FROM work_queue WHERE id=$1 FOR SHARE",
+                )
+                .bind(id)
+                .fetch_optional(&mut *connection)
+                .await?;
+                let Some((reference, pack, accepting)) = row else {
+                    return Ok(None);
+                };
+                context.target_ref = Some(reference);
+                (Resource::Queues, id, pack, accepting)
+            }
             RuntimeTarget::EventTrigger(id) => {
                 let Some(component) = component(connection, ComponentTarget::Trigger, id).await?
                 else {
@@ -747,6 +766,7 @@ impl RuntimeTargetRepository {
             kind: match target {
                 RuntimeTarget::Pack(_) => "pack",
                 RuntimeTarget::Component(component, _) => component.metadata().0,
+                RuntimeTarget::QueueAdmission(_) => "work_queue",
                 RuntimeTarget::Execution(_) => "execution",
                 RuntimeTarget::Enforcement(_) => "enforcement",
                 RuntimeTarget::QueueItem(_) | RuntimeTarget::QueueItems(_) => "work_queue_item",

@@ -1353,7 +1353,7 @@ pub async fn update_queue_item(
         .as_ref()
         .map(|payload| {
             let binding = admitted_item_schema(&item)?;
-            prepare_queue_payload(&state, &binding, payload)
+            prepare_queue_payload(&state, &queue, &binding, payload)
         })
         .transpose()?;
 
@@ -1382,6 +1382,11 @@ pub async fn update_queue_item(
         attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::replace_entity_with_conn(
             &mut transaction, attune_common::secret_values::ENTITY_QUEUE_ITEM_PAYLOAD, item.id, &secrets,
         ).await?;
+        if let Some(proof) =
+            managed_payload_edit_fence(&state, &mut transaction, &queue, &updated).await?
+        {
+            proof.ensure_fresh_on(&mut transaction).await?;
+        }
     }
     if let Some(fence) = effect_fence {
         fence.ensure_fresh_on(&mut transaction).await?;
@@ -1527,6 +1532,7 @@ fn admitted_item_schema(
 
 fn prepare_queue_payload(
     state: &AppState,
+    queue: &WorkQueue,
     binding: &attune_common::value_schema::ValueSchemaBinding,
     payload: &JsonValue,
 ) -> ApiResult<(
@@ -1543,6 +1549,12 @@ fn prepare_queue_payload(
         .map_err(|error| ApiError::ValidationError(format!("Invalid queue payload: {error}")))?;
     let (redacted, inputs) =
         attune_common::secret_values::merge_contract_secret_redactions(payload, &[], &contract)?;
+    use attune_common::repositories::queue_configuration_input::MAX_MANAGED_QUEUE_PROTECTED_FIELDS;
+    if !queue.is_adhoc && inputs.len() > MAX_MANAGED_QUEUE_PROTECTED_FIELDS {
+        return Err(ApiError::ValidationError(format!(
+            "A managed queue payload may contain at most {MAX_MANAGED_QUEUE_PROTECTED_FIELDS} protected fields"
+        )));
+    }
     let prepared = if inputs.is_empty() {
         Vec::new()
     } else {
@@ -1687,15 +1699,45 @@ async fn queue_payload_editors(
     ])
 }
 
+async fn managed_payload_edit_fence(
+    state: &AppState,
+    connection: &mut PgConnection,
+    queue: &WorkQueue,
+    item: &WorkQueueItem,
+) -> ApiResult<Option<attune_common::repositories::runtime_authority::ApprovalEffectFence>> {
+    if queue.is_adhoc {
+        return Ok(None);
+    }
+    let key = state
+        .config
+        .security
+        .encryption_key
+        .as_deref()
+        .ok_or_else(|| {
+            ApiError::Forbidden("Managed queue fixed-input encryption is unavailable".into())
+        })?;
+    let snapshot = item.executable_snapshot.clone().ok_or_else(|| {
+        ApiError::Forbidden("Accepted queue item executable snapshot is unavailable".into())
+    })?;
+    let snapshot = serde_json::from_value(snapshot).map_err(|_| {
+        ApiError::Forbidden("Accepted queue item executable snapshot is invalid".into())
+    })?;
+    let proof = attune_common::repositories::queue_configuration_input::QueueConfigurationInputRepository::load(
+        connection, queue, item, &snapshot, key,
+    ).await?;
+    Ok(Some(proof.into_effect_fence()))
+}
+
 async fn enqueue_queue_item_in_transaction(
     state: &Arc<AppState>,
-    connection: &mut PgConnection,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     queue: &WorkQueue,
     user: &AuthenticatedUser,
     requested_by_identity: Option<i64>,
     inherited_trace_tag: Option<&str>,
     request: EnqueueWorkQueueItemRequest,
 ) -> ApiResult<EnqueueQueueItemResult> {
+    let connection = &mut **transaction;
     attune_common::repositories::schema_type::SchemaTypeRepository::lock_selection(
         &mut *connection,
     )
@@ -1784,7 +1826,7 @@ async fn enqueue_queue_item_in_transaction(
                     }
                     attune_common::models::WorkQueueUpdateStrategy::Replace => {
                         let binding = admitted_item_schema(&existing)?;
-                        let (payload, secrets) = prepare_queue_payload(state, &binding, &request.payload)?;
+                        let (payload, secrets) = prepare_queue_payload(state, queue, &binding, &request.payload)?;
                         let updated = WorkQueueItemRepository::update_if_statuses(
                             &mut *connection,
                             existing.id,
@@ -1809,7 +1851,7 @@ async fn enqueue_queue_item_in_transaction(
                         let binding = admitted_item_schema(&existing)?;
                         let original = restore_queue_payload(state, user, &mut *connection, queue, &existing).await?;
                         let merged_payload = merge_patch_value(original, &request.payload);
-                        let (merged_payload, secrets) = prepare_queue_payload(state, &binding, &merged_payload)?;
+                        let (merged_payload, secrets) = prepare_queue_payload(state, queue, &binding, &merged_payload)?;
                         let merged_metadata =
                             merge_patch_value(existing.metadata, &request.metadata);
                         let updated = WorkQueueItemRepository::update_if_statuses(
@@ -1839,6 +1881,11 @@ async fn enqueue_queue_item_in_transaction(
                     )
                 })?;
 
+                if let Some(proof) =
+                    managed_payload_edit_fence(state, connection, queue, &updated).await?
+                {
+                    proof.ensure_fresh_on(connection).await?;
+                }
                 if let Some(fence) = &effect_fence {
                     fence.ensure_fresh_on(connection).await?;
                 }
@@ -1880,7 +1927,7 @@ async fn enqueue_queue_item_in_transaction(
         authored_schema: queue.item_schema.clone(),
         contract,
     };
-    let (payload, secrets) = prepare_queue_payload(state, &binding, &request.payload)?;
+    let (payload, secrets) = prepare_queue_payload(state, queue, &binding, &request.payload)?;
     let recorded_ad_hoc = queue.is_adhoc && recorded::active(user)?;
     if recorded_ad_hoc {
         attune_common::repositories::ad_hoc_queue_admission::AdHocQueueAdmissionRepository::validate_shape(queue)?;
@@ -1888,7 +1935,7 @@ async fn enqueue_queue_item_in_transaction(
     let snapshot = if !queue.is_adhoc {
         attune_common::repositories::execution_admission::ExecutionAdmissionRepository::resolve_current_snapshot(
             connection, queue.pack.ok_or_else(|| ApiError::Forbidden("Queue sponsor unavailable".into()))?,
-            attune_common::repositories::runtime_target::RuntimeTarget::Component(attune_common::repositories::runtime_target::ComponentTarget::Queue, queue.id),
+            attune_common::repositories::runtime_target::RuntimeTarget::QueueAdmission(queue.id),
             &attune_common::runtime_authority::InvocationBinding::Queue { queue_ref: queue.r#ref.clone(), action_ref: queue.dispatch_action_ref.clone() },
         ).await?
     } else if let Some(action_id) = queue.dispatch_action {
@@ -2009,6 +2056,31 @@ async fn enqueue_queue_item_in_transaction(
             "Delegated queue execution output encryption is unavailable".into(),
         ));
     }
+    let readiness_missing = || {
+        ApiError::NotImplemented(
+            "Recorded queue sponsorship requires coordinated runtime readiness".into(),
+        )
+    };
+    if recorded_ad_hoc {
+        return Err(readiness_missing());
+    }
+    let managed_identity = if queue.is_adhoc {
+        None
+    } else {
+        let identity = state
+            .recorded_consumer_identity
+            .as_deref()
+            .ok_or_else(readiness_missing)?;
+        identity
+            .require_current(
+                transaction,
+                attune_common::execution_authority::consumer_contract::ConsumerRole::Api,
+            )
+            .await
+            .map_err(|_| readiness_missing())?;
+        Some(identity)
+    };
+    let connection = &mut **transaction;
     let item = WorkQueueItemRepository::create_bound_pinned(
         &mut *connection,
         CreateWorkQueueItemInput {
@@ -2035,26 +2107,7 @@ async fn enqueue_queue_item_in_transaction(
         &binding,
     )
     .await?;
-    if recorded_ad_hoc || !queue.is_adhoc {
-        return Err(ApiError::NotImplemented(
-            "Recorded queue sponsorship requires coordinated runtime readiness".into(),
-        ));
-    }
-    if recorded_ad_hoc {
-        use attune_common::repositories::ad_hoc_queue_admission::AdHocQueueSource;
-        let source = AdHocQueueSource::Execution(requested_by_execution.ok_or_else(|| {
-            ApiError::Forbidden("Recorded item source execution unavailable".into())
-        })?);
-        attune_common::repositories::ad_hoc_queue_admission::AdHocQueueAdmissionRepository::accept(
-            connection, queue, &item, source, &snapshot,
-        )
-        .await?;
-        if recorded_ad_hoc {
-            attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::copy(connection, "execution", requested_by_execution.ok_or_else(|| ApiError::Forbidden("Recorded item source execution unavailable".into()))?, "queue_item", item.id).await?;
-        } else {
-            attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::capture_human(connection, "queue_item", item.id, requested_by_identity.ok_or_else(|| ApiError::Unauthorized("Item requester unavailable".into()))?).await?;
-        }
-    } else if !queue.is_adhoc {
+    if let Some(identity) = managed_identity {
         let actor = requested_by_identity
             .filter(|_| user.claims.token_type == TokenType::Access)
             .map(
@@ -2063,7 +2116,8 @@ async fn enqueue_queue_item_in_transaction(
                     login: user.login().to_string(),
                 },
             );
-        attune_common::repositories::execution_admission::ExecutionAdmissionRepository::admit_queue_item(connection, queue, &item, actor, &snapshot).await?;
+        attune_common::repositories::execution_admission::ExecutionAdmissionRepository::admit_queue_item(transaction, Some(identity), queue, &item, actor, &snapshot).await?;
+        let connection = &mut **transaction;
         if user.claims.token_type == TokenType::Access {
             attune_common::repositories::recorded_input_authority::RecordedInputAuthorityRepository::capture_human(connection, "queue_item", item.id, requested_by_identity.ok_or_else(|| ApiError::Unauthorized("Input requester unavailable".into()))?).await?;
         } else if let Some(parent) = requested_by_execution {
@@ -2072,12 +2126,27 @@ async fn enqueue_queue_item_in_transaction(
     } else {
         attune_common::repositories::delegated_execution::DelegatedExecutionRepository::accept_queue_item(connection,queue,&item,&snapshot).await?;
     }
+    let connection = &mut **transaction;
     attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::replace_entity_with_conn(
         &mut *connection, attune_common::secret_values::ENTITY_QUEUE_ITEM_PAYLOAD, item.id, &secrets,
     ).await?;
-
+    if !queue.is_adhoc {
+        attune_common::repositories::queue_configuration_input::QueueConfigurationInputRepository::capture(
+            connection, queue, &item, &snapshot,
+            state.config.security.encryption_key.as_deref().ok_or_else(|| ApiError::Forbidden("Managed queue fixed-input encryption is unavailable".into()))?,
+        ).await?;
+    }
     if let Some(fence) = &effect_fence {
         fence.ensure_fresh_on(connection).await?;
+    }
+    if let Some(identity) = managed_identity {
+        identity
+            .require_current(
+                transaction,
+                attune_common::execution_authority::consumer_contract::ConsumerRole::Api,
+            )
+            .await
+            .map_err(|_| readiness_missing())?;
     }
     Ok(EnqueueQueueItemResult {
         item,
@@ -2457,13 +2526,13 @@ pub(crate) async fn authorize_queue_item_action(
         ));
     }
     let authz = state.authorization_service();
-    let context = queue_authorization_context_for_token(user, queue)?;
     if !matches!(
         user.claims.token_type,
         TokenType::Access | TokenType::Execution
     ) {
         return Ok(());
     }
+    let context = item_queue_authorization_context(state, user, queue).await?;
 
     let grants = authz.effective_grants(user).await?;
     if AuthorizationService::is_allowed(&grants, Resource::QueueItems, action, &context)
@@ -2557,7 +2626,7 @@ async fn constrained_queue_item_grant_allowed(
 ) -> Result<bool, ApiError> {
     let authz = state.authorization_service();
     let grants = authz.effective_grants(user).await?;
-    let ctx = queue_authorization_context_for_token(user, queue)?;
+    let ctx = item_queue_authorization_context(state, user, queue).await?;
 
     Ok(grants.iter().any(|grant| {
         grant.resource == Resource::QueueItems
@@ -2577,14 +2646,7 @@ async fn has_queue_management_access(
 ) -> Result<bool, ApiError> {
     let authz = state.authorization_service();
     let grants = authz.resolved_grants(user).await?;
-    let mut ctx = queue_authorization_context_for_token(user, queue)?;
-    ctx.managing_pack_id =
-        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
-            &state.db,
-            attune_common::repositories::runtime_target::ComponentTarget::Queue,
-            queue.id,
-        )
-        .await?;
+    let ctx = item_queue_authorization_context(state, user, queue).await?;
 
     Ok([RbacAction::Update, RbacAction::Delete]
         .into_iter()
@@ -2717,6 +2779,24 @@ fn queue_authorization_context_for_token(
         _ => 0,
     };
     Ok(queue_authorization_context(identity_id, queue))
+}
+
+async fn item_queue_authorization_context(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    queue: &WorkQueue,
+) -> ApiResult<AuthorizationContext> {
+    let mut context = queue_authorization_context_for_token(user, queue)?;
+    // An item grant targets the actual containing queue. An assigned,
+    // pack-scoped grant resolves ownership through that installed component.
+    context.managing_pack_id =
+        attune_common::repositories::iam_ownership::IamOwnershipRepository::component_pack(
+            &state.db,
+            attune_common::repositories::runtime_target::ComponentTarget::Queue,
+            queue.id,
+        )
+        .await?;
+    Ok(context)
 }
 
 fn execution_caller_pack_refs(user: &AuthenticatedUser) -> Vec<String> {
@@ -3031,11 +3111,12 @@ async fn apply_payload_patch_to_selected_items(
         let binding = admitted_item_schema(&item)?;
         let original = restore_queue_payload(state, user, &mut tx, queue, &item).await?;
         let merged_payload = merge_patch_value(original, patch);
-        let (payload, secrets) = prepare_queue_payload(state, &binding, &merged_payload)?;
+        let (payload, secrets) = prepare_queue_payload(state, queue, &binding, &merged_payload)?;
         updates.push((item.id, payload, secrets));
     }
 
     let mut affected_count = 0_u64;
+    let mut managed_fences = Vec::new();
     for (item_id, merged_payload, secrets) in updates {
         let updated = WorkQueueItemRepository::update_if_statuses(
             &mut *tx,
@@ -3047,16 +3128,23 @@ async fn apply_payload_patch_to_selected_items(
             },
         )
         .await?;
-        if updated.is_some() {
+        if let Some(updated) = updated {
             attune_common::repositories::execution_secret_value::ExecutionSecretValueRepository::replace_entity_with_conn(
                 &mut tx, attune_common::secret_values::ENTITY_QUEUE_ITEM_PAYLOAD, item_id, &secrets,
             ).await?;
+            if let Some(proof) = managed_payload_edit_fence(state, &mut tx, queue, &updated).await?
+            {
+                managed_fences.push(proof);
+            }
             affected_count += 1;
         }
     }
 
     if let Some(fence) = effect_fence {
         fence.ensure_fresh_on(&mut tx).await?;
+    }
+    for proof in managed_fences {
+        proof.ensure_fresh_on(&mut tx).await?;
     }
     tx.commit().await?;
     Ok(affected_count)

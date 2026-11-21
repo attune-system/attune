@@ -64,6 +64,8 @@ impl ListenConnection for PgListener {
 async fn run_listener<C, F, Fut>(
     mut connect: F,
     mut on_notification: impl FnMut(C::Notification),
+    idle_interval: Duration,
+    mut on_health: impl FnMut(bool),
 ) -> Result<()>
 where
     C: ListenConnection,
@@ -74,9 +76,10 @@ where
         .await
         .context("PostgreSQL listener connection/subscription timed out")??;
 
+    on_health(true);
     loop {
         trace!("Calling listener.recv() — waiting for next notification");
-        let received = match tokio::time::timeout(IDLE_INTERVAL, listener.recv()).await {
+        let received = match tokio::time::timeout(idle_interval, listener.recv()).await {
             Ok(result) => result.map(Some),
             // A pending receive cannot detect a silently broken socket. Probe the
             // dedicated LISTEN connection, not the service's role lookup pool.
@@ -92,6 +95,7 @@ where
             Err(e) => {
                 warn!("PostgreSQL listener connection failed: {:#}", e);
                 // Never return to recv on this connection, even if reconnect fails.
+                on_health(false);
                 drop(listener);
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 loop {
@@ -103,6 +107,7 @@ where
                     match reconnected {
                         Ok(new_listener) => {
                             listener = new_listener;
+                            on_health(true);
                             info!("PostgreSQL listener reconnected successfully");
                             break;
                         }
@@ -152,6 +157,14 @@ impl PostgresListener {
 
     /// Start listening for PostgreSQL notifications
     pub async fn listen(&self) -> Result<()> {
+        self.listen_with_health(IDLE_INTERVAL, |_| {}).await
+    }
+
+    pub(crate) async fn listen_with_health(
+        &self,
+        idle_interval: Duration,
+        on_health: impl FnMut(bool),
+    ) -> Result<()> {
         info!(
             "Starting PostgreSQL LISTEN on channels: {:?}",
             NOTIFICATION_CHANNELS
@@ -174,6 +187,8 @@ impl PostgresListener {
                     );
                 }
             },
+            idle_interval,
+            on_health,
         )
         .await
     }
@@ -296,6 +311,7 @@ mod tests {
             receives: BTreeMap<usize, usize>,
             probes: BTreeMap<usize, usize>,
             dropped: Vec<usize>,
+            health: Vec<bool>,
         }
 
         struct FakeConnection {
@@ -390,14 +406,19 @@ mod tests {
             };
             let result = tokio::time::timeout(
                 Duration::from_secs(181),
-                run_listener(connect, |id| {
-                    notifier
-                        .process_notification(
-                            "execution_status_changed",
-                            &format!(r#"{{"entity_type":"execution","entity_id":{id}}}"#),
-                        )
-                        .unwrap();
-                }),
+                run_listener(
+                    connect,
+                    |id| {
+                        notifier
+                            .process_notification(
+                                "execution_status_changed",
+                                &format!(r#"{{"entity_type":"execution","entity_id":{id}}}"#),
+                            )
+                            .unwrap();
+                    },
+                    IDLE_INTERVAL,
+                    |ready| calls.lock().unwrap().health.push(ready),
+                ),
             )
             .await;
             assert!(
@@ -421,6 +442,7 @@ mod tests {
                 "idle timeouts must probe the LISTEN connection"
             );
             assert_eq!(calls.connects, 1);
+            assert_eq!(calls.health, vec![true]);
             assert!(delivered.is_empty());
         }
 
@@ -436,6 +458,7 @@ mod tests {
             assert_eq!(calls.connect_times[1], Duration::from_secs(61));
             assert_eq!(calls.receives.get(&1), Some(&1));
             assert_eq!(calls.dropped, vec![1, 2]);
+            assert_eq!(calls.health, vec![true, false, true]);
             assert_eq!(delivered, vec![123]);
         }
 
@@ -499,7 +522,12 @@ mod tests {
         async fn initial_connection_has_a_deadline() {
             let result = tokio::time::timeout(
                 Duration::from_secs(11),
-                run_listener(std::future::pending::<Result<FakeConnection>>, |_| {}),
+                run_listener(
+                    std::future::pending::<Result<FakeConnection>>,
+                    |_| {},
+                    IDLE_INTERVAL,
+                    |_| {},
+                ),
             )
             .await;
             assert!(

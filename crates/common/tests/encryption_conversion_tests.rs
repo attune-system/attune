@@ -38,6 +38,25 @@ async fn conversion_database() -> attune_common::test_database::TestDatabase {
         .execute(&*db).await.unwrap();
     db
 }
+// A raw operator connection intentionally loads no service configuration. Carry
+// this owned fixture's trusted schema explicitly, as its normal pool does.
+fn operator_url(db: &attune_common::test_database::TestDatabase) -> String {
+    let mut target = url::Url::parse(db.database_url()).unwrap();
+    let mut pairs = target.query_pairs().into_owned().collect::<Vec<_>>();
+    let inherited = pairs
+        .iter()
+        .filter(|(name, _)| name == "options")
+        .map(|(_, value)| value.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    pairs.retain(|(name, _)| name != "options");
+    target.set_query(None);
+    target.query_pairs_mut().extend_pairs(pairs).append_pair(
+        "options",
+        &format!("{inherited} -csearch_path={},public", db.schema()),
+    );
+    target.into()
+}
 fn old_verifier() -> String {
     Sha256::digest(MASTER.as_bytes())
         .iter()
@@ -321,7 +340,7 @@ async fn operator_tool_requires_explicit_environment_and_offline_acknowledgement
             .args(&args)
             .env(
                 "ATTUNE_ENCRYPTION_CONVERSION_DATABASE_URL",
-                db.database_url(),
+                operator_url(&db),
             )
             .env("ATTUNE_ENCRYPTION_CONVERSION_SECRET", MASTER)
             .output()
@@ -362,7 +381,7 @@ async fn interrupted_operator_process_leaves_rows_unchanged_and_conversion_can_r
         .args(["--apply", "--offline-writers-stopped"])
         .env(
             "ATTUNE_ENCRYPTION_CONVERSION_DATABASE_URL",
-            db.database_url(),
+            operator_url(&db),
         )
         .env("ATTUNE_ENCRYPTION_CONVERSION_SECRET", MASTER)
         .stdout(std::process::Stdio::null())

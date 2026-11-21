@@ -1234,12 +1234,14 @@ impl RuntimeAuthorityRepository {
         .bind(releases.into_iter().collect::<Vec<_>>())
         .execute(&mut *connection)
         .await?;
-        super::declared_input::DeclaredInputRepository::capture(connection, &record).await?;
         // The exact policy ID is known now. Publish all dispatch source bodies
         // before activation or any rule/sensor producer can observe this policy.
         super::managed_component_readmission::ManagedComponentReadmission::capture_deployment_dispatch(
             connection, &record,
         ).await?;
+        // Queue declarations use the exact retained dispatch body above, never
+        // the mutable projection or a contributor-supplied expression.
+        super::declared_input::DeclaredInputRepository::capture(connection, &record).await?;
         let (_, dependencies) = lock_policy_with_deadline(connection, record.id).await?;
         approvals
             .fence
@@ -1377,7 +1379,18 @@ impl RuntimeAuthorityRepository {
         target: Id,
     ) -> Result<()> {
         let source = Self::require_retained_admission(connection, source).await?;
-        let target = Self::require_retained_admission(connection, target).await?;
+        let target: RuntimeAdmissionRecord = sqlx::query_as(&format!(
+            "SELECT {ADMISSION_COLUMNS} FROM runtime_authority_admission WHERE id=$1 FOR SHARE"
+        ))
+        .bind(target)
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(|| Error::PermissionDenied("Retry target admission is unavailable".into()))?;
+        super::accepted_batch_dependency::AcceptedBatchDependencyRepository::copy_inherited(
+            connection, &source, &target,
+        )
+        .await?;
+        let target = Self::require_retained_admission(connection, target.id).await?;
         let mut expected = source.authority.0.clone();
         expected.attempt = target.authority.attempt;
         if source.id >= target.id || expected != target.authority.0 {

@@ -520,6 +520,41 @@ async fn work_queue_item_repository_leases_releases_and_reclaims_items() {
 
     let lease_token = Uuid::new_v4();
     let lease_expires_at = Utc::now() + Duration::minutes(5);
+    let mut held = pool.begin().await.expect("lock first dispatch item");
+    let original = WorkQueueItemRepository::lock_next_dispatch_item(&mut held, queue.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.id, high.id);
+    let mut alternate = pool.begin().await.expect("lock another dispatch item");
+    let anchor = WorkQueueItemRepository::lock_next_dispatch_item(&mut alternate, queue.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(anchor.id, retry.id);
+    let selected = WorkQueueItemRepository::lease_batch_from_dispatch_item(
+        &mut alternate,
+        LeaseWorkQueueItemsInput {
+            separate_requesters: false,
+            queue: queue.id,
+            ready_statuses: vec![WorkQueueItemStatus::Queued, WorkQueueItemStatus::Retry],
+            limit: 1,
+            batch_coalescing: None,
+            leased_execution: None,
+            lease_token,
+            lease_expires_at,
+        },
+        anchor.id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        selected.iter().map(|item| item.id).collect::<Vec<_>>(),
+        [retry.id]
+    );
+    alternate.rollback().await.unwrap();
+    held.rollback().await.unwrap();
+
     let leased = WorkQueueItemRepository::lease_next_batch(
         &pool,
         LeaseWorkQueueItemsInput {
@@ -621,6 +656,54 @@ async fn work_queue_item_repository_leases_releases_and_reclaims_items() {
     .expect("search retry rows");
     assert_eq!(retry_rows.total, 1);
     assert_eq!(retry_rows.rows[0].id, low.id);
+}
+
+#[tokio::test]
+async fn anchored_queue_leasing_drains_backlog_within_the_accepted_batch_limit() {
+    use attune_common::repositories::accepted_batch_dependency::MAX_ACCEPTED_BATCH_ITEMS;
+
+    let (db, queue) = create_queue_fixture().await;
+    let requested_size = MAX_ACCEPTED_BATCH_ITEMS as i64 + 5;
+    let item_ids: Vec<i64> = sqlx::query_scalar(
+        "INSERT INTO work_queue_item(queue, queue_ref, payload, enqueue_source)
+         SELECT $1, $2, '{\"order_id\":1}'::jsonb, 'test' FROM generate_series(1,$3::bigint)
+         RETURNING id",
+    )
+    .bind(queue.id)
+    .bind(&queue.r#ref)
+    .bind(requested_size)
+    .fetch_all(&*db)
+    .await
+    .unwrap();
+    let mut leased_ids = Vec::new();
+    for expected_count in [MAX_ACCEPTED_BATCH_ITEMS, 5] {
+        let mut tx = db.begin().await.unwrap();
+        let anchor = WorkQueueItemRepository::lock_next_dispatch_item(&mut tx, queue.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let items = WorkQueueItemRepository::lease_batch_from_dispatch_item(
+            &mut tx,
+            LeaseWorkQueueItemsInput {
+                separate_requesters: false,
+                queue: queue.id,
+                ready_statuses: vec![WorkQueueItemStatus::Queued],
+                limit: requested_size,
+                batch_coalescing: None,
+                leased_execution: None,
+                lease_token: Uuid::new_v4(),
+                lease_expires_at: Utc::now() + Duration::minutes(5),
+            },
+            anchor.id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(items.len(), expected_count);
+        leased_ids.extend(items.into_iter().map(|item| item.id));
+        tx.commit().await.unwrap();
+    }
+    assert_eq!(leased_ids, item_ids);
+    db.cleanup().await.unwrap();
 }
 
 #[tokio::test]
@@ -1183,6 +1266,12 @@ async fn work_queue_dispatch_repository_tracks_active_and_terminal_dispatches() 
     assert_eq!(filtered.total, 1);
     assert_eq!(filtered.rows[0].id, dispatch.id);
 
+    let (publish, recover) = tokio::join!(
+        WorkQueueDispatchRepository::mark_dispatched_if_leased(&pool, dispatch.id),
+        WorkQueueDispatchRepository::mark_dispatched_if_leased(&pool, dispatch.id),
+    );
+    assert_ne!(publish.unwrap(), recover.unwrap());
+
     let updated = WorkQueueDispatchRepository::update(
         &pool,
         dispatch.id,
@@ -1194,6 +1283,19 @@ async fn work_queue_dispatch_repository_tracks_active_and_terminal_dispatches() 
     .await
     .expect("update dispatch");
     assert_eq!(updated.status, WorkQueueDispatchStatus::Completed);
+    assert!(
+        !WorkQueueDispatchRepository::mark_dispatched_if_leased(&pool, dispatch.id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        WorkQueueDispatchRepository::find_by_execution(&pool, dispatch.execution)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        WorkQueueDispatchStatus::Completed
+    );
 
     let active_after = WorkQueueDispatchRepository::list_active(&pool)
         .await

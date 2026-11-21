@@ -144,6 +144,19 @@ pub struct KeyRepository;
 pub const SELECT_COLUMNS: &str = "id, ref, local_ref, owner_type, owner, owner_identity, owner_pack, owner_pack_ref, owner_action, owner_action_ref, owner_sensor, owner_sensor_ref, name, encrypted, encryption_key_hash, value, created, updated";
 
 impl KeyRepository {
+    /// Internal durable metadata only. The caller retains the same Key row lock
+    /// while capturing its exact input bytes; this is never a value fingerprint.
+    pub(in crate::repositories) async fn input_revision(
+        connection: &mut sqlx::PgConnection,
+        key: Id,
+    ) -> Result<Option<i64>> {
+        Ok(
+            sqlx::query_scalar("SELECT input_revision FROM key WHERE id=$1 FOR SHARE")
+                .bind(key)
+                .fetch_optional(connection)
+                .await?,
+        )
+    }
     pub async fn find_by_ref_for_share(
         connection: &mut sqlx::PgConnection,
         key_ref: &str,

@@ -184,6 +184,7 @@ impl InheritedInputRepository {
         let transaction = prepared.source.source.transaction.clone();
         let fence = prepared.source.fence.clone();
         let rendered = RenderedReceiptContext {
+            queue_projection: None,
             transaction: transaction.clone(),
             renderer: renderer.clone(),
             declaration: None,

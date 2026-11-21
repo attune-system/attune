@@ -52,6 +52,7 @@ use attune_common::{
         identity::{IdentityRepository, PermissionSetRepository},
         inquiry::InquiryRepository,
         pack::PackRepository,
+        recorded_consumer_observations::{RecordedConsumerIdentity, RecordedRolloutReadiness},
         runtime::{RuntimeRepository, WorkerRepository},
         trigger::SensorRepository,
         work_queue::WorkQueueItemRepository,
@@ -113,6 +114,7 @@ struct SchedulingRequestContext<'a> {
     workflow_log_transport: &'a Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
     workflow_log_segment_max_bytes: usize,
     workflow_log_flush_interval_ms: u64,
+    recorded_identity: Option<&'a RecordedConsumerIdentity>,
 }
 
 /// Extract workflow parameters from an execution's `config` field.
@@ -775,6 +777,8 @@ struct ExecutionScheduledPayload {
     action_ref: String,
     config: Option<JsonValue>,
     scheduled_attempt_updated_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recorded_worker_boot: Option<uuid::Uuid>,
     release_id: Option<i64>,
     release_digest: Option<String>,
 }
@@ -1037,6 +1041,7 @@ pub struct ExecutionScheduler {
     workflow_log_flush_interval_ms: u64,
     encryption_key: Option<String>,
     metadata_caches: Arc<SchedulerMetadataCaches>,
+    recorded_identity: Option<Arc<RecordedConsumerIdentity>>,
 }
 
 /// Default heartbeat interval in seconds (should match worker config default)
@@ -1204,6 +1209,7 @@ impl ExecutionScheduler {
             workflow_log_flush_interval_ms,
             encryption_key,
             metadata_caches,
+            recorded_identity: None,
         }
     }
 
@@ -1212,6 +1218,14 @@ impl ExecutionScheduler {
         workflow_log_transport: Arc<dyn attune_common::artifact_transport::ArtifactFileTransport>,
     ) -> Self {
         self.workflow_log_transport = workflow_log_transport;
+        self
+    }
+
+    pub(crate) fn with_recorded_identity(
+        mut self,
+        identity: Option<Arc<RecordedConsumerIdentity>>,
+    ) -> Self {
+        self.recorded_identity = identity;
         self
     }
 
@@ -1224,6 +1238,7 @@ impl ExecutionScheduler {
         let policy_enforcer = self.policy_enforcer.clone();
         let artifacts_dir = self.artifacts_dir.clone();
         let encryption_key = self.encryption_key.clone();
+        let recorded_identity = self.recorded_identity.clone();
         let metadata_caches = self.metadata_caches.clone();
         let workflow_log_transport = self.workflow_log_transport.clone();
         let workflow_log_segment_max_bytes = self.workflow_log_segment_max_bytes;
@@ -1245,6 +1260,7 @@ impl ExecutionScheduler {
                     let counter = counter.clone();
                     let artifacts_dir = artifacts_dir.clone();
                     let encryption_key = encryption_key.clone();
+                    let recorded_identity = recorded_identity.clone();
                     let metadata_caches = metadata_caches.clone();
                     let workflow_log_transport = workflow_log_transport.clone();
 
@@ -1262,6 +1278,7 @@ impl ExecutionScheduler {
                             workflow_log_segment_max_bytes,
                             workflow_log_flush_interval_ms,
                             &metadata_caches,
+                            recorded_identity.as_deref(),
                             &envelope,
                         ))
                         .await
@@ -1295,6 +1312,7 @@ impl ExecutionScheduler {
         workflow_log_segment_max_bytes: usize,
         workflow_log_flush_interval_ms: u64,
         metadata_caches: &SchedulerMetadataCaches,
+        recorded_identity: Option<&RecordedConsumerIdentity>,
         envelope: &MessageEnvelope<ExecutionRequestedPayload>,
     ) -> Result<()> {
         debug!(
@@ -1355,6 +1373,7 @@ impl ExecutionScheduler {
                     workflow_log_transport,
                     workflow_log_segment_max_bytes,
                     workflow_log_flush_interval_ms,
+                    recorded_identity,
                 };
                 return Box::pin(Self::process_claimed_execution(
                     pool,
@@ -1416,6 +1435,7 @@ impl ExecutionScheduler {
             workflow_log_transport,
             workflow_log_segment_max_bytes,
             workflow_log_flush_interval_ms,
+            recorded_identity,
         };
         let execution =
             match ExecutionRepository::claim_for_scheduling(pool, execution_id, None).await? {
@@ -1459,10 +1479,27 @@ impl ExecutionScheduler {
         let mut tx = pool.begin().await?;
         let authority = attune_common::repositories::execution_runtime_admission::ExecutionAdmissionRepository::existing_authority(&mut tx,execution.id).await?;
         let recorded = authority == attune_common::repositories::execution_runtime_admission::ExistingExecutionAuthority::Recorded;
-        if recorded {
-            attune_common::execution_authority::RecordedConsumerReadiness::default()
-                .require_ready()?;
-        }
+        let recorded_evidence = if recorded {
+            let evidence = match request_context.recorded_identity {
+                Some(identity) => identity.require_current(
+                    &mut tx,
+                    attune_common::execution_authority::consumer_contract::ConsumerRole::Executor,
+                ).await,
+                None => Err(attune_common::Error::PermissionDenied(
+                    "Recorded scheduling requires coordinated runtime readiness".into(),
+                )),
+            };
+            match evidence {
+                Ok(evidence) => Some(evidence),
+                Err(error) => {
+                    tx.rollback().await?;
+                    Self::revert_scheduling_claim(pool, execution_id).await?;
+                    return Err(MqError::Timeout(error.to_string()).into());
+                }
+            }
+        } else {
+            None
+        };
         tx.commit().await?;
         if !recorded && (!action.enabled || action.retired_at.is_some()) {
             Self::fail_unschedulable_execution(
@@ -1623,6 +1660,7 @@ impl ExecutionScheduler {
             &action,
             Some(&execution),
             request_context.round_robin_counter,
+            recorded_evidence.as_ref(),
         ))
         .await
         {
@@ -1679,18 +1717,47 @@ impl ExecutionScheduler {
 
         // Persist the selected worker so later cancellation requests can be
         // routed to the correct per-worker cancel queue.
-        let scheduled_execution = match ExecutionRepository::update_if_status(
-            pool,
-            execution_id,
-            ExecutionStatus::Scheduling,
-            UpdateExecutionInput {
-                status: Some(ExecutionStatus::Scheduled),
-                worker: Some(worker.id),
-                ..Default::default()
-            },
-        )
-        .await?
-        {
+        let update = UpdateExecutionInput {
+            status: Some(ExecutionStatus::Scheduled),
+            worker: Some(worker.id),
+            ..Default::default()
+        };
+        let (assignment, recorded_worker_boot) = if recorded {
+            let result = Self::assign_recorded_worker(
+                pool,
+                execution_id,
+                &worker,
+                request_context.recorded_identity,
+                update,
+            )
+            .await;
+            match result {
+                Ok((execution, boot)) => (execution, Some(boot)),
+                Err(error) => {
+                    Self::release_acquired_policy_slot(
+                        policy_enforcer,
+                        pool,
+                        publisher,
+                        execution_id,
+                    )
+                    .await?;
+                    Self::revert_scheduling_claim(pool, execution_id).await?;
+                    return Err(MqError::Timeout(error.to_string()).into());
+                }
+            }
+        } else {
+            (
+                ExecutionRepository::update_if_status(
+                    pool,
+                    execution_id,
+                    ExecutionStatus::Scheduling,
+                    update,
+                )
+                .await?,
+                None,
+            )
+        };
+        let scheduled_execution = match assignment {
             Some(execution) => execution,
             None => {
                 warn!(
@@ -1711,6 +1778,7 @@ impl ExecutionScheduler {
             &request_context.envelope.payload.action_ref,
             &execution_config,
             scheduled_execution.updated,
+            recorded_worker_boot,
             scheduled_execution.pack_release,
             scheduled_execution.pack_release_digest.clone(),
         )
@@ -10216,7 +10284,8 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
         action: &Action,
         round_robin_counter: &AtomicUsize,
     ) -> Result<attune_common::models::Worker> {
-        Self::select_worker_for_action_execution(pool, action, None, round_robin_counter).await
+        Self::select_worker_for_action_execution(pool, action, None, round_robin_counter, None)
+            .await
     }
 
     async fn select_worker_for_action_execution(
@@ -10224,6 +10293,7 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
         action: &Action,
         execution: Option<&Execution>,
         round_robin_counter: &AtomicUsize,
+        recorded_evidence: Option<&RecordedRolloutReadiness>,
     ) -> Result<attune_common::models::Worker> {
         let pack = PackRepository::find_by_id(pool, action.pack)
             .await?
@@ -10246,9 +10316,15 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
         };
 
         // Find available action workers (role = 'action')
-        let require_delegated = if let Some(execution) = execution {
+        let require_delegated = if let Some(execution) =
+            execution.filter(|_| recorded_evidence.is_none())
+        {
+            let mut connection = pool.acquire().await?;
+            if attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(&mut connection, execution.id).await? {
+                return Err(anyhow::anyhow!("Recorded worker selection requires current rollout evidence"));
+            }
             attune_common::repositories::delegated_execution::DelegatedExecutionRepository::find(
-                &mut *pool.acquire().await?,
+                &mut connection,
                 execution.id,
             )
             .await?
@@ -10260,6 +10336,12 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
         let workers: Vec<_> = WorkerRepository::find_action_workers(pool)
             .await?
             .into_iter()
+            .filter(|worker| {
+                recorded_evidence.is_none_or(|evidence| {
+                    Self::worker_boot(worker)
+                        .is_some_and(|boot| evidence.matches_worker(worker.id, boot, Utc::now()))
+                })
+            })
             .filter(|worker| Self::worker_supports_launch(worker, action.launch.as_ref()))
             .filter(|worker| {
                 !require_delegated
@@ -10275,6 +10357,11 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
                         == Some(true)
             })
             .collect();
+        if recorded_evidence.is_some() && workers.is_empty() {
+            return Err(
+                MqError::Timeout("No current recorded action-worker registration".into()).into(),
+            );
+        }
         if action.launch.is_some() && workers.is_empty() {
             return Err(anyhow::anyhow!("No compatible workers advertise action_cli_arguments_v1 and the required execution authority"));
         }
@@ -10417,8 +10504,71 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
             &action,
             Some(&execution),
             round_robin_counter,
+            None,
         )
         .await
+    }
+
+    fn worker_boot(worker: &attune_common::models::Worker) -> Option<uuid::Uuid> {
+        worker
+            .meta
+            .as_ref()?
+            .get("registration_incarnation")?
+            .as_str()?
+            .parse()
+            .ok()
+    }
+
+    async fn assign_recorded_worker(
+        pool: &PgPool,
+        execution: i64,
+        worker: &attune_common::models::Worker,
+        identity: Option<&RecordedConsumerIdentity>,
+        update: UpdateExecutionInput,
+    ) -> Result<(Option<Execution>, uuid::Uuid)> {
+        let boot = Self::worker_boot(worker)
+            .ok_or_else(|| anyhow::anyhow!("Recorded worker registration is missing"))?;
+        let identity =
+            identity.ok_or_else(|| anyhow::anyhow!("Recorded executor identity is unavailable"))?;
+        let mut tx = pool.begin().await?;
+        let evidence = identity
+            .require_current(
+                &mut tx,
+                attune_common::execution_authority::consumer_contract::ConsumerRole::Executor,
+            )
+            .await?;
+        if !evidence.matches_worker(worker.id, boot, Utc::now()) {
+            return Err(anyhow::anyhow!(
+                "Recorded worker registration is no longer current"
+            ));
+        }
+        let assigned = ExecutionRepository::update_if_status(
+            &mut *tx,
+            execution,
+            ExecutionStatus::Scheduling,
+            update,
+        )
+        .await?;
+        if assigned.is_some() {
+            let current = identity
+                .require_current(
+                    &mut tx,
+                    attune_common::execution_authority::consumer_contract::ConsumerRole::Executor,
+                )
+                .await?;
+            let registration = WorkerRepository::find_by_id(&mut *tx, worker.id).await?;
+            if !current.matches_worker(worker.id, boot, Utc::now())
+                || registration.is_none_or(|current| {
+                    current.cordoned || Self::worker_boot(&current) != Some(boot)
+                })
+            {
+                return Err(anyhow::anyhow!(
+                    "Recorded worker registration is no longer current"
+                ));
+            }
+        }
+        tx.commit().await?;
+        Ok((assigned, boot))
     }
 
     /// Select an active, fresh worker that supports the runtimes required to
@@ -11273,6 +11423,7 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
         action_ref: &str,
         config: &Option<JsonValue>,
         scheduled_attempt_updated_at: DateTime<Utc>,
+        recorded_worker_boot: Option<uuid::Uuid>,
         release_id: Option<i64>,
         release_digest: Option<String>,
     ) -> Result<()> {
@@ -11285,6 +11436,7 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
             action_ref: action_ref.to_string(),
             config: config.clone(),
             scheduled_attempt_updated_at,
+            recorded_worker_boot,
             release_id,
             release_digest,
         };

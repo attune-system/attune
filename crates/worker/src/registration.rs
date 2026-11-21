@@ -6,6 +6,7 @@
 use attune_common::config::Config;
 use attune_common::error::{Error, Result};
 use attune_common::models::{WorkerRole, WorkerType};
+use attune_common::repositories::recorded_consumer_observations::RecordedConsumerIdentity;
 use attune_common::repositories::runtime::{CreateWorkerInput, WorkerRepository};
 use attune_common::runtime_detection::{normalize_runtime_name, RuntimeDetector};
 use attune_common::scheduling::{
@@ -290,7 +291,9 @@ impl WorkerRegistration {
 
         // Merge detected capabilities with existing ones
         for (key, value) in detected_capabilities {
-            self.capabilities.insert(key, value);
+            if key != attune_common::execution_authority::RECORDED_EXECUTION_CAPABILITY {
+                self.capabilities.insert(key, value);
+            }
         }
 
         self.capabilities.insert(
@@ -344,26 +347,49 @@ impl WorkerRegistration {
 
     /// Register the worker in the database
     pub async fn register(&mut self) -> Result<i64> {
+        self.register_with_rollout(None).await
+    }
+
+    pub(crate) async fn register_with_rollout(
+        &mut self,
+        rollout: Option<&RecordedConsumerIdentity>,
+    ) -> Result<i64> {
         info!("Registering worker: {}", self.worker_name);
 
-        // Generate only at registration; heartbeat/capability refreshes retain it.
-        let incarnation = uuid::Uuid::new_v4();
-        let worker = WorkerRepository::register_incarnation(
-            &self.pool,
-            CreateWorkerInput {
-                name: self.worker_name.clone(),
-                worker_type: self.worker_type,
-                runtime: self.runtime_id,
-                host: self.host.clone(),
-                port: self.port,
-                status: None,
-                capabilities: Some(serde_json::to_value(&self.capabilities)?),
-                meta: None,
-            },
-            self.worker_role,
-            incarnation,
-        )
-        .await?;
+        let input = CreateWorkerInput {
+            name: self.worker_name.clone(),
+            worker_type: self.worker_type,
+            runtime: self.runtime_id,
+            host: self.host.clone(),
+            port: self.port,
+            status: None,
+            capabilities: Some(serde_json::to_value(&self.capabilities)?),
+            meta: None,
+        };
+        let (worker, incarnation) = if let Some(rollout) = rollout {
+            if self.worker_role != WorkerRole::Action {
+                return Err(Error::validation(
+                    "Only an Action worker can join a recorded rollout",
+                ));
+            }
+            let (worker, boot) = rollout.register_worker(&self.pool, input).await?;
+            if let Some(capability) = worker.capabilities.as_ref().and_then(|capabilities| {
+                capabilities.get(attune_common::execution_authority::RECORDED_EXECUTION_CAPABILITY)
+            }) {
+                self.capabilities.insert(
+                    attune_common::execution_authority::RECORDED_EXECUTION_CAPABILITY.into(),
+                    capability.clone(),
+                );
+            }
+            (worker, boot)
+        } else {
+            // Heartbeat and capability refreshes retain this incarnation.
+            let boot = uuid::Uuid::new_v4();
+            let worker =
+                WorkerRepository::register_incarnation(&self.pool, input, self.worker_role, boot)
+                    .await?;
+            (worker, boot)
+        };
         self.incarnation = incarnation;
         let worker_id = worker.id;
 
@@ -419,6 +445,10 @@ impl WorkerRegistration {
     /// Get the registered worker ID
     pub fn worker_id(&self) -> Option<i64> {
         self.worker_id
+    }
+
+    pub(crate) fn incarnation(&self) -> uuid::Uuid {
+        self.incarnation
     }
 
     /// Get the worker name
@@ -583,13 +613,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_worker_capabilities() {
+        use attune_common::execution_authority::RECORDED_EXECUTION_CAPABILITY;
+
         let (mut config, pool, database) = isolated_test_context().await;
         config.worker = Some(
-            serde_json::from_value(json!({"capabilities": {"runtimes": ["python"]}})).unwrap(),
+            serde_json::from_value(json!({"capabilities": {
+                "runtimes": ["python"],
+                (RECORDED_EXECUTION_CAPABILITY): {"instance": uuid::Uuid::new_v4()}
+            }}))
+            .unwrap(),
         );
         let mut registration = WorkerRegistration::new(pool, &config);
 
         registration.detect_capabilities(&config).await.unwrap();
+        assert!(!registration
+            .capabilities
+            .contains_key(RECORDED_EXECUTION_CAPABILITY));
         assert!(registration.capabilities["runtimes"]
             .as_array()
             .unwrap()

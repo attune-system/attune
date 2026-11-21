@@ -1956,6 +1956,45 @@ impl WorkQueueItemRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
+        Self::lease_batch(executor, input, None).await
+    }
+
+    /// Select a managed queue's next item before resolving its admitted
+    /// dispatch settings. The caller holds this lock through the lease.
+    pub async fn lock_next_dispatch_item(
+        connection: &mut sqlx::PgConnection,
+        queue: Id,
+    ) -> Result<Option<WorkQueueItem>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT {WORK_QUEUE_ITEM_SELECT_COLUMNS} FROM work_queue_item \
+             WHERE queue = $1 AND status IN ('queued', 'retry') \
+             ORDER BY priority DESC, created ASC, id ASC LIMIT 1 FOR UPDATE SKIP LOCKED"
+        ))
+        .bind(queue)
+        .fetch_optional(connection)
+        .await?)
+    }
+
+    /// Lease a managed cohort whose members fit in one recorded admission.
+    pub async fn lease_batch_from_dispatch_item(
+        connection: &mut sqlx::PgConnection,
+        mut input: LeaseWorkQueueItemsInput,
+        anchor: Id,
+    ) -> Result<Vec<WorkQueueItem>> {
+        input.limit = input
+            .limit
+            .min(super::accepted_batch_dependency::MAX_ACCEPTED_BATCH_ITEMS as i64);
+        Self::lease_batch(connection, input, Some(anchor)).await
+    }
+
+    async fn lease_batch<'e, E>(
+        executor: E,
+        input: LeaseWorkQueueItemsInput,
+        anchor: Option<Id>,
+    ) -> Result<Vec<WorkQueueItem>>
+    where
+        E: Executor<'e, Database = Postgres> + 'e,
+    {
         if input.limit <= 0 {
             return Ok(Vec::new());
         }
@@ -1990,10 +2029,14 @@ impl WorkQueueItemRepository {
                        pack_release,
                        pack_release_digest,
                        executable_snapshot,
+                       (SELECT jsonb_build_object('policy',fixed.policy_revision,'config',fixed.configuration_revision,
+                           'template',fixed.binding->'template_digest','schema',fixed.binding->'item_schema_digest',
+                           'keys',fixed.binding->'key_versions') FROM work_queue_item_configuration_input fixed WHERE fixed.item=work_queue_item.id) AS fixed_configuration,
                        payload #> $7::text[] AS group_value
                 FROM work_queue_item
                 WHERE queue = $1
                   AND status = ANY($2::work_queue_item_status_enum[])
+                  AND ($11::BIGINT IS NULL OR id = $11)
                 ORDER BY priority DESC, created ASC, id ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
@@ -2011,6 +2054,10 @@ impl WorkQueueItemRepository {
                   AND item.pack_release IS NOT DISTINCT FROM anchor.pack_release
                   AND item.pack_release_digest IS NOT DISTINCT FROM anchor.pack_release_digest
                   AND item.executable_snapshot IS NOT DISTINCT FROM anchor.executable_snapshot
+                  AND (SELECT jsonb_build_object('policy',fixed.policy_revision,'config',fixed.configuration_revision,
+                           'template',fixed.binding->'template_digest','schema',fixed.binding->'item_schema_digest',
+                           'keys',fixed.binding->'key_versions') FROM work_queue_item_configuration_input fixed WHERE fixed.item=item.id)
+                      IS NOT DISTINCT FROM anchor.fixed_configuration
                   AND (
                         $8 = false
                         OR anchor.group_value IS NULL
@@ -2066,6 +2113,7 @@ impl WorkQueueItemRepository {
             .bind(coalescing_enabled)
             .bind(across_priorities)
             .bind(input.separate_requesters)
+            .bind(anchor)
             .fetch_all(executor)
             .await
             .map_err(Into::into)
@@ -2343,6 +2391,22 @@ impl Delete for WorkQueueDispatchRepository {
 }
 
 impl WorkQueueDispatchRepository {
+    /// Broker acknowledgement and lease recovery can race a fast completion.
+    /// Only the caller that advances the lease owns the dispatched transition.
+    pub async fn mark_dispatched_if_leased<'e, E>(executor: E, id: Id) -> Result<bool>
+    where
+        E: Executor<'e, Database = Postgres>,
+    {
+        let result = sqlx::query(
+            "UPDATE work_queue_dispatch SET status='dispatched', updated=NOW() \
+             WHERE id=$1 AND status='leased'",
+        )
+        .bind(id)
+        .execute(executor)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Observe active dispatches without fetching rows that the poller discards.
     /// This is an unlocked count; the dispatcher's admission and lease recovery
     /// protocol remains the caller's responsibility.

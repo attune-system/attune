@@ -699,6 +699,20 @@ impl Delete for WorkerRepository {
 }
 
 impl WorkerRepository {
+    /// Hold a registration through the assigned execution claim. Replacement
+    /// and cordoning cannot cross that transition with a stale worker boot.
+    pub async fn find_registration_for_share(
+        connection: &mut sqlx::PgConnection,
+        id: Id,
+    ) -> Result<Option<Worker>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT {WORKER_SELECT_COLUMNS} FROM worker WHERE id=$1 FOR SHARE"
+        ))
+        .bind(id)
+        .fetch_optional(connection)
+        .await?)
+    }
+
     /// Lists workers whose persisted discovery metadata matches every query
     /// token. Dynamic health filters remain in the API because they depend on
     /// current execution load.
@@ -742,8 +756,8 @@ impl WorkerRepository {
 
     /// Atomically replace registration ownership while preserving operator metadata
     /// and cordons. This marker fences worker-row maintenance, not delivery grants.
-    pub async fn register_incarnation(
-        pool: &sqlx::PgPool,
+    pub async fn register_incarnation<'e>(
+        executor: impl sqlx::Executor<'e, Database = Postgres>,
         input: CreateWorkerInput,
         role: crate::models::WorkerRole,
         incarnation: uuid::Uuid,
@@ -758,7 +772,7 @@ impl WorkerRepository {
         ))
         .bind(input.name).bind(input.worker_type).bind(role).bind(input.runtime)
         .bind(input.host).bind(input.port).bind(input.capabilities).bind(incarnation.to_string())
-        .fetch_one(pool).await?)
+        .fetch_one(executor).await?)
     }
 
     pub async fn deregister_incarnation(

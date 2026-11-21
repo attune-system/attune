@@ -1,0 +1,25 @@
+# Standalone opt-in lane. NEVER merge this into development shared-owner services.
+services:
+  rollout-admin:
+    profiles: [offline-rollout]
+    image: ${ROLLOUT_API_IMAGE:?Supply immutable API image digest}
+    user: "1000:1000"
+    entrypoint: ["/usr/local/bin/attune-rollout-admin"]
+    command: ["verify-provisioning", "--credentials", "/private/database.json"]
+    restart: "no"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck: {disable: true}
+    network_mode: bridge
+    volumes:
+      - type: bind
+        source: ${ROLLOUT_PRIVATE_INPUT:?Existing uid1000 mode0700 input directory}
+        target: /private
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${ROLLOUT_RECEIPT_CUSTODY:?Existing uid1000 mode0700 receipt directory}
+        target: /custody
+        bind: {create_host_path: false}
+    logging: {driver: none}

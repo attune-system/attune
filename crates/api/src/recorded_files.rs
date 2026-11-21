@@ -12,6 +12,7 @@ use sqlx::PgConnection;
 
 pub(crate) struct FileMutationProof {
     pub log_delivery: Option<attune_common::repositories::log_delivery::LogDeliveryFence>,
+    pub workflow_log: Option<attune_common::repositories::workflow_log_outbox::WorkflowLogEffect>,
     pub credential_deadline: i64,
     pub process: Option<ValidatedRuntimeAuthority>,
     pub process_delivery: Option<DeliveryEffectFence>,
@@ -19,6 +20,21 @@ pub(crate) struct FileMutationProof {
     pub file_origin_budget: Option<crate::recorded_disclosure::OriginBudget>,
 }
 impl FileMutationProof {
+    pub(crate) fn require_log_append(
+        &self,
+        sequence: i64,
+        size: i64,
+        digest: &str,
+    ) -> attune_common::Result<()> {
+        if let Some(fence) = &self.log_delivery {
+            fence.append(sequence, size, digest)?;
+        }
+        if let Some(fence) = &self.workflow_log {
+            fence.require_append(sequence, size, digest)?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn commit(
         &self,
         transaction: sqlx::Transaction<'_, sqlx::Postgres>,
@@ -29,6 +45,9 @@ impl FileMutationProof {
     pub(crate) fn ensure_fresh(&self) -> ApiResult<()> {
         if let Some(fence) = &self.log_delivery {
             fence.ensure_fresh()?;
+        }
+        if let Some(effect) = &self.workflow_log {
+            effect.fence.ensure_fresh()?;
         }
         if let Some(authority) = &self.process {
             authority.ensure_fresh()?;
@@ -47,6 +66,9 @@ impl FileMutationProof {
     pub async fn ensure_fresh_on(&self, conn: &mut PgConnection) -> ApiResult<()> {
         if let Some(fence) = &self.log_delivery {
             fence.ensure_fresh_on(conn).await?;
+        }
+        if let Some(effect) = &self.workflow_log {
+            effect.fence.ensure_fresh_on(conn).await?;
         }
         if let Some(authority) = &self.process {
             authority.ensure_fresh_on(conn).await?;

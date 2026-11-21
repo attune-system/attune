@@ -255,6 +255,7 @@ impl InheritedInputRepository {
             )?);
             let archive = PreparedReceiptArchive::new(
                 &RenderProof {
+                    queue_projection: None,
                     native: rendered.native.clone(),
                     site: destination.site.clone(),
                     renderer: rendered.renderer.id,
@@ -299,6 +300,7 @@ impl InheritedInputRepository {
         bounded(&body)?;
         let root_archive = PreparedReceiptArchive::new(
             &RenderProof {
+                queue_projection: None,
                 native: Some(NativeValueRecipe::EmptyRoot {
                     snapshot: source.snapshot(),
                 }),
@@ -412,6 +414,7 @@ impl InheritedInputRepository {
         }
         let renderer = DeclaredInputRepository::require_source(conn, recipe.execution).await?;
         let rendered = RenderedReceiptContext {
+            queue_projection: None,
             transaction: recipe.transaction.clone(),
             renderer: renderer.clone(),
             declaration: None,

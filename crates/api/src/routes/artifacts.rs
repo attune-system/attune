@@ -15,7 +15,7 @@
 use axum::{
     body::{Body, Bytes},
     extract::{Multipart, Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse,
@@ -2440,13 +2440,21 @@ pub(crate) fn protected_file_response<'a>(
             if let Some(execution) = version.execution {
                 let mut conn = state.db.acquire().await?;
                 if attune_common::repositories::runtime_authority::RuntimeAuthorityRepository::execution_admission(&mut conn,execution).await?.is_some() {
-                let artifact=ArtifactRepository::find_by_id(&mut *conn,version.artifact).await?
-                    .ok_or_else(||ApiError::Forbidden("File owner unavailable".into()))?;
-                if artifact.classification!=ArtifactClassification::RuntimeLog &&
-                    (is_file_backed_type(artifact.r#type) || version.file_path.is_some() || version.object_key.is_some()) {
-                    return Err(ApiError::Forbidden("Admitted file is missing its retained body proof".into()));
+                    let artifact=ArtifactRepository::find_by_id(&mut *conn,version.artifact).await?
+                        .ok_or_else(||ApiError::Forbidden("File owner unavailable".into()))?;
+                    if artifact.classification!=ArtifactClassification::RuntimeLog &&
+                        (is_file_backed_type(artifact.r#type) || version.file_path.is_some() || version.object_key.is_some()) {
+                        drop(conn);
+                        if user.claims.token_type == TokenType::Access
+                            && version.body_state == Some(ArtifactBodyState::Ready)
+                            && version.meta.as_ref().and_then(|meta| meta.get("kind"))
+                                .and_then(serde_json::Value::as_str) == Some("workflow_log")
+                        {
+                            return Box::pin(recorded_workflow_log_response(state, user, artifact, version, headers)).await.map(Some);
+                        }
+                        return Err(ApiError::Forbidden("Admitted file is missing its retained body proof".into()));
+                    }
                 }
-            }
             }
             return Ok(None);
         };
@@ -2608,6 +2616,72 @@ pub(crate) fn protected_file_response<'a>(
         };
         Ok(Some(response))
     })
+}
+
+async fn recorded_workflow_log_response(
+    state: &Arc<AppState>,
+    user: &AuthenticatedUser,
+    artifact: attune_common::models::Artifact,
+    version: &attune_common::models::ArtifactVersion,
+    headers: &HeaderMap,
+) -> ApiResult<axum::response::Response> {
+    async fn authorize(
+        state: &Arc<AppState>,
+        user: &AuthenticatedUser,
+        artifact: &attune_common::models::Artifact,
+        version: &attune_common::models::ArtifactVersion,
+    ) -> ApiResult<()> {
+        use attune_common::repositories::file_evidence_retention::FileEvidenceRetentionRepository;
+
+        authorize_selected_artifact_version(state, user, artifact, version).await?;
+        let mut tx = state.db.begin().await?;
+        FileEvidenceRetentionRepository::lock_capture(&mut tx).await?;
+        let fence = Box::pin(
+            WorkflowLogOutboxRepository::require_published_recorded_delivery(&mut tx, version),
+        )
+        .await?;
+        tx.commit().await?;
+        fence.ensure_fresh()?;
+        if user.claims.exp <= chrono::Utc::now().timestamp() {
+            return Err(ApiError::Forbidden(
+                "Workflow log credential expired".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    authorize(state, user, &artifact, version).await?;
+    let response = serve_object_body(state, version, &artifact.r#ref, headers).await?;
+    let audit = (
+        state.clone(),
+        user.clone(),
+        artifact.clone(),
+        version.clone(),
+    );
+    let (mut parts, body) = response.into_parts();
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    let (state, user, artifact, version) = audit.clone();
+    let guarded = crate::recorded_reads::guarded_chunks(body.into_data_stream(), move || {
+        let (state, user, artifact, version) = (
+            state.clone(),
+            user.clone(),
+            artifact.clone(),
+            version.clone(),
+        );
+        async move {
+            authorize(&state, &user, &artifact, &version)
+                .await
+                .map_err(|_| std::io::Error::other("Workflow log disclosure authority unavailable"))
+        }
+    });
+    Ok(audit_log_download_eof(
+        audit,
+        axum::response::Response::from_parts(parts, Body::from_stream(guarded)),
+    ))
 }
 
 async fn authorize_file_chunk(

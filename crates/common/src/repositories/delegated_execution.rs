@@ -50,7 +50,7 @@ pub enum ProtectedQueueAck {
 }
 
 impl ProtectedQueueAck {
-    fn validate(value: &serde_json::Value, items: &[Id], version: i32) -> Self {
+    pub(crate) fn validate(value: &serde_json::Value, items: &[Id], version: i32) -> Self {
         let Ok(Some(ack)) = crate::models::WorkQueueAck::from_execution_result(value) else {
             return Self::Invalid;
         };

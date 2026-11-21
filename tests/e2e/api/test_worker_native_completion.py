@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 import yaml
+from helpers import AttuneClient
 from helpers.polling import TERMINAL_STATUSES, wait_for_condition, wait_for_execution_status
 
 pytestmark = [pytest.mark.api, pytest.mark.integration, pytest.mark.timeout(180)]
@@ -124,30 +125,54 @@ sys.exit(7 if attempt < parameters["success_after"] else 0)
                 _settle(client, execution)
 
 
-def test_worker_managed_queue_completion(client, tmp_path):
+def _publish_single_item_queue(client, tmp_path, *, ack_status="completed", retry_limit=0):
     ref, path = _pack(tmp_path)
     _write(path / "actions/ack.yaml", {
         "ref": ref + ".ack", "label": "Acknowledge one leased item", "runner_type": "python",
         "entry_point": "ack.py", "output_format": "json", "default_execution_permission_set_refs": [],
         "parameters": {"queue_item": {"type": "object", "required": True}},
     })
-    (path / "actions/ack.py").write_text('''import json, sys
-item = json.load(sys.stdin)["queue_item"]["id"]
-print(json.dumps({"queue_ack": {"version": 1, "items": [{"id": item, "status": "completed", "summary": {"source": "released-worker"}}]}}))
+    (path / "actions/ack.py").write_text(f"ACK_STATUS = {ack_status!r}\n" + '''import json, sys
+item = json.load(sys.stdin)["queue_item"]
+print(json.dumps({"queue_ack": {"version": 1, "items": [{
+    "id": item["id"], "status": ACK_STATUS,
+    "summary": {"source": "released-worker", "attempt": item["attempt_count"]},
+}]}}))
 ''')
     _write(path / "queues/work.yaml", {
         "ref": ref + ".work", "label": "Released work queue", "dispatch_action": ref + ".ack",
         "enabled": True, "accepting_new_items": True, "batch_mode": "single",
-        "permission_set_refs": [], "action_params": {"queue_item": "{{ queue_item }}"},
-        "config": {"ack_contract": {"version": 1}, "dispatch": {"retry_limit": 0}},
+        "permission_set_refs": [],
+        "item_schema": {"private_fields": {"type": "array", "items": {"type": "string", "secret": True}}},
+        "action_params": {"queue_item": {
+            "id": "{{ queue_item.id }}", "attempt_count": "{{ queue_item.attempt_count }}",
+        }},
+        "config": {"ack_contract": {"version": 1}, "dispatch": {"retry_limit": retry_limit}},
     })
     client.upload_pack(str(path))
+    return ref
+
+
+def test_worker_managed_queue_completion(client, tmp_path):
+    ref = _publish_single_item_queue(client, tmp_path)
     base = client.base_url + "/api/v1/queues/" + ref + ".work"
     response = client.session.get(base, timeout=10)
     response.raise_for_status()
     assert response.json()["data"]["is_adhoc"] is False
-    response = client.session.post(base + "/items", json={"item_key": "owned-one", "payload": {}}, timeout=10)
+    def protected_item(size):
+        return {"item_key": "owned-one", "payload": {"private_fields": ["private-field"] * size}}
+
+    oversized = client.session.post(base + "/items/bulk", json={"items": [
+        {"payload": {}}, protected_item(257),
+    ]}, timeout=10)
+    assert oversized.status_code == 422, oversized.json().get("error")
+    retained = client.session.get(base + "/items", timeout=10)
+    retained.raise_for_status()
+    assert retained.json()["items"] == []
+
+    response = client.session.post(base + "/items", json=protected_item(256), timeout=10)
     response.raise_for_status()
+    assert "private-field" not in response.text
     item_id, item, settled = response.json()["data"]["id"], {}, False
     try:
         def terminal_item():
@@ -179,3 +204,292 @@ print(json.dumps({"queue_ack": {"version": 1, "items": [{"id": item, "status": "
         if not settled and item.get("leased_execution"):
             client.cancel_execution(item["leased_execution"])
             _settle(client, item["leased_execution"])
+
+
+def test_managed_queue_retries_until_retained_limit(client, tmp_path):
+    ref = _publish_single_item_queue(client, tmp_path, ack_status="retry", retry_limit=1)
+    base = f"/api/v1/queues/{ref}.work"
+    try:
+        response = client.post(base + "/items", json={"payload": {}})
+        response.raise_for_status()
+        identifier = response.json()["data"]["id"]
+        settled = {}
+
+        def terminal():
+            item = client.get(base + f"/items/{identifier}")
+            item.raise_for_status()
+            settled.update(item.json()["data"])
+            return settled["status"] in {"completed", "failed", "cancelled"}
+
+        wait_for_condition(terminal, timeout=60, poll_interval=0.1,
+                           error_message="Managed queue item did not reach its retry limit")
+        assert settled["status"] == "failed"
+        assert settled["attempt_count"] == 2
+        assert settled["lease_token"] is None and settled["leased_execution"] is None
+        assert settled["last_error"]["code"] == "queue_dispatch_retry_limit_exhausted"
+        executions = client.list_executions(action_ref=ref + ".ack", limit=20)
+        assert len(executions) == 2
+        attempts = [client.get_execution(execution["id"])["config"]["queue_item"]["attempt_count"]
+                    for execution in executions]
+        assert sorted(attempts) == [1, 2]
+    finally:
+        client.put(base, json={"enabled": False, "accepting_new_items": False}).raise_for_status()
+
+
+def _publish_business_queue(client, tmp_path, provider, credential, *, batch_size):
+    owner, owner_path = _pack(tmp_path)
+    client.upload_pack(str(owner_path))
+    key = client.post("/api/v1/keys", json={
+        "local_ref": "queue_credential", "owner_type": "pack", "owner_pack_ref": owner,
+        "name": "Owned managed queue credential", "encrypted": True, "value": credential,
+    })
+    key.raise_for_status()
+    key_ref = key.json()["data"]["ref"]
+    queue_ref = owner + ".work"
+    # Use a new release to publish the now-existing owner-qualified Key selector.
+    pack_path = owner_path / "pack.yaml"
+    pack = yaml.safe_load(pack_path.read_text())
+    _write(pack_path, {**pack, "version": "1.0.1"})
+    _write(owner_path / "queues/work.yaml", {
+        "ref": queue_ref, "label": "Business-owned work", "dispatch_action": provider + ".ack",
+        "enabled": False, "accepting_new_items": True, "batch_mode": "batch",
+        "allow_pending_update": True, "update_strategy": "replace",
+        "permission_set_refs": [],
+        "item_schema": {"message": {"type": "string", "required": True}},
+        "action_params": {"records": "{{ queue_items }}", "credential": "{{ keystore['" + key_ref + "'] }}"},
+        "config": {"dispatch": {"batch_size": {"source": "literal", "value": batch_size}, "retry_limit": 0}},
+    })
+    _write(owner_path / "permission_sets/enqueue.yaml", {
+        "ref": owner + ".enqueue",
+        "grants": [{"resource": "queue_items", "actions": ["create"], "constraints": {"refs": [queue_ref]}}],
+    })
+    client.upload_pack(str(owner_path), force=True)
+    return owner, key_ref, f"/api/v1/queues/{queue_ref}"
+
+
+def test_cross_pack_queue_batches_enqueue_only_contributors(client, tmp_path, api_base_url, test_timeout):
+    provider, provider_path = _pack(tmp_path)
+    _write(provider_path / "actions/ack.yaml", {
+        "ref": provider + ".ack", "label": "Acknowledge business records",
+        "runner_type": "python", "entry_point": "ack.py", "output_format": "json",
+        "reference_visibility": "public", "default_execution_permission_set_refs": [],
+        "parameters": {
+            "records": {"type": "array", "items": {"type": "object"}, "required": True},
+            "credential": {"type": "string", "secret": True, "required": True},
+        },
+        "out_schema": {"queue_ack": {"type": "object", "secret": True}},
+    })
+    (provider_path / "actions/ack.py").write_text('''import json, os, sys
+assert "ATTUNE_API_TOKEN" not in os.environ
+parameters = json.load(sys.stdin)
+print(json.dumps({"queue_ack": {"version": 1, "items": [
+    {"id": record["id"], "status": "completed",
+     "summary": {"business": parameters["credential"], "message": record["payload"]["message"]}}
+    for record in parameters["records"]
+]}}))
+''')
+    client.upload_pack(str(provider_path))
+    credential, replacement, other_credential = (f"owned-{uuid.uuid4().hex}" for _ in range(3))
+    owner, key_ref, base = _publish_business_queue(client, tmp_path, provider, credential, batch_size=3)
+    other_base = None
+    contributors, assignments, accepted = [], [], {}
+
+    def require_redacted(text):
+        if any(secret in text for secret in (credential, replacement, other_credential)):
+            pytest.fail("Managed queue credential appeared in a public projection")
+
+    try:
+        for _ in range(2):
+            member = AttuneClient(base_url=api_base_url, timeout=test_timeout, auto_login=False)
+            login, password = f"queue-{uuid.uuid4().hex}@attune.local", f"Test-{uuid.uuid4().hex}!"
+            account = member.register(login=login, password=password, display_name="Queue contributor")
+            member.login(login=login, password=password)
+            contributors.append(member)
+            assigned = client.post("/api/v1/permissions/assignments", json={
+                "identity_id": account["user"]["id"], "permission_set_ref": owner + ".enqueue",
+            })
+            assigned.raise_for_status()
+            assignments.append(assigned.json()["data"]["id"])
+            key_attempt = member.get(f"/api/v1/keys/{key_ref}", params={"decrypt": "true"})
+            assert key_attempt.status_code in (403, 404)
+            require_redacted(key_attempt.text)
+
+        single = contributors[0].post(base + "/items", json={
+            "item_key": "first", "payload": {"message": "first"},
+        })
+        require_redacted(single.text)
+        assert single.status_code == 201, single.json().get("error")
+        first_id = single.json()["data"]["id"]
+        assert single.json()["data"]["status"] == "queued"
+        bulk = contributors[1].post(base + "/items/bulk", json={"items": [
+            {"payload": {"message": message}} for message in ("second", "third")
+        ]})
+        require_redacted(bulk.text)
+        assert bulk.status_code == 201, bulk.json().get("error")
+        assert bulk.json()["data"]["created_count"] == 2
+        accepted.update((item["id"], item["payload"]["message"]) for item in bulk.json()["data"]["items"])
+
+        update = client.put(f"/api/v1/keys/{key_ref}", json={"value": replacement})
+        update.raise_for_status()
+        denied = contributors[0].put(base + f"/items/{first_id}", json={
+            "payload": {"message": "unauthorized edit"},
+        })
+        assert denied.status_code == 403
+        edited = client.put(base + f"/items/{first_id}", json={"payload": {"message": "edited"}})
+        assert edited.status_code == 200, edited.json().get("error")
+        upsert = client.post(base + "/items", json={
+            "item_key": "first", "payload": {"message": "first-updated"},
+        })
+        assert upsert.status_code == 200, upsert.json().get("error")
+        assert upsert.json()["data"]["id"] == first_id
+        accepted[first_id] = "first-updated"
+        started = client.put(base, json={"enabled": True})
+        started.raise_for_status()
+
+        # Item reads can lock individual rows, and dispatch deliberately skips
+        # locked candidates. Wait for the first lease through the execution list
+        # so status polling doesn't split the batch under test.
+        wait_for_condition(lambda: client.list_executions(action_ref=provider + ".ack", limit=1),
+                           timeout=60, poll_interval=0.2,
+                           error_message="Business-owned batch was not dispatched")
+        items = []
+
+        def settle_items():
+            items.clear()
+            for identifier in accepted:
+                response = client.get(base + f"/items/{identifier}")
+                response.raise_for_status()
+                require_redacted(response.text)
+                items.append(response.json()["data"])
+            return all(item["status"] in {"completed", "failed", "cancelled"} for item in items)
+
+        wait_for_condition(settle_items, timeout=60, poll_interval=0.1,
+                           error_message="Business-owned managed items did not settle")
+        assert all(item["status"] == "completed" and item["lease_token"] is None for item in items)
+        rows = client.list_executions(action_ref=provider + ".ack", limit=100)
+        assert len(rows) == 1
+        execution = client.get_execution(rows[0]["id"])
+        assert execution["status"] == "completed"
+        require_redacted(str(execution))
+        response = client.get(f"/api/v1/executions/{execution['id']}", params={"include_secret_values": "true"})
+        response.raise_for_status()
+        source = response.json()["data"]["result"]["queue_ack"]["items"]
+        assert {item["id"]: item["summary"]["message"] for item in source} == accepted
+        assert all(item["summary"]["business"] == credential for item in source)
+        # Keep the provider release and action identical while changing the
+        # owning business pack, its credential, and the admitted queue.
+        _, _, other_base = _publish_business_queue(
+            client, tmp_path, provider, other_credential, batch_size=1,
+        )
+        request = {"payload": {"message": "different business"}}
+        denied = contributors[0].post(other_base + "/items", json=request)
+        assert denied.status_code == 403
+        require_redacted(denied.text)
+        submitted = client.post(other_base + "/items", json=request)
+        assert submitted.status_code == 201
+        other_item = submitted.json()["data"]["id"]
+        client.put(other_base, json={"enabled": True}).raise_for_status()
+
+        def settle_other_item():
+            response = client.get(other_base + f"/items/{other_item}")
+            response.raise_for_status()
+            require_redacted(response.text)
+            item = response.json()["data"]
+            assert item["status"] not in {"failed", "cancelled"}
+            return item["status"] == "completed" and item["lease_token"] is None
+
+        wait_for_condition(settle_other_item, timeout=60, poll_interval=0.1,
+                           error_message="Second business queue did not settle")
+        rows = client.list_executions(action_ref=provider + ".ack", limit=100)
+        other_execution, = [row["id"] for row in rows if row["id"] != execution["id"]]
+        require_redacted(str(client.get_execution(other_execution)))
+        response = client.get(f"/api/v1/executions/{other_execution}", params={"include_secret_values": "true"})
+        response.raise_for_status()
+        item, = response.json()["data"]["result"]["queue_ack"]["items"]
+        assert item["id"] == other_item
+        assert item["summary"] == {"business": other_credential, "message": "different business"}
+    finally:
+        for queue_url in (base, other_base):
+            if queue_url is not None:
+                client.put(queue_url, json={"enabled": False, "accepting_new_items": False}).raise_for_status()
+        for assignment in assignments:
+            client.delete(f"/api/v1/permissions/assignments/{assignment}").raise_for_status()
+        for member in contributors:
+            member.logout()
+
+
+def test_managed_queue_native_workflow_acknowledges_item(client, tmp_path):
+    ref, path = _pack(tmp_path)
+    action = ref + ".acknowledge"
+    _write(path / "actions/acknowledge.yaml", {
+        "ref": action, "label": "Acknowledge in the workflow executor",
+        "workflow_file": "workflows/acknowledge.workflow.yaml",
+        "parameters": {"ack": {"type": "object", "required": True}},
+        "out_schema": {"queue_ack": {"type": "object"}},
+        "default_execution_permission_set_refs": [],
+    })
+    _write(path / "actions/validate.yaml", {
+        "ref": ref + ".validate", "label": "Validate the item",
+        "runner_type": "shell", "entry_point": "validate.sh",
+        "default_execution_permission_set_refs": [],
+    })
+    (path / "actions/validate.sh").write_text("#!/bin/sh\nexit 0\n")
+    _write(path / "actions/workflows/acknowledge.workflow.yaml", {
+        "version": "1.0.0",
+        "tasks": [{"name": "validate", "action": ref + ".validate", "next": []}],
+        "output_map": {"queue_ack": "{{ parameters.ack }}"},
+    })
+    _write(path / "queues/work.yaml", {
+        "ref": ref + ".work", "label": "Native completion work", "dispatch_action": action,
+        "enabled": True, "accepting_new_items": True, "batch_mode": "single",
+        "permission_set_refs": [], "action_params": {"ack": {"version": 1, "items": [{
+            "id": "{{ queue_item.id }}", "status": "completed",
+            "summary": {"source": "native-workflow"},
+        }]}},
+    })
+    client.upload_pack(str(path))
+    base = f"/api/v1/queues/{ref}.work"
+    try:
+        response = client.post(base + "/items", json={"payload": {}})
+        response.raise_for_status()
+        identifier = response.json()["data"]["id"]
+        settled = {}
+
+        def terminal():
+            item = client.get(base + f"/items/{identifier}")
+            item.raise_for_status()
+            settled.update(item.json()["data"])
+            return settled["status"] in {"completed", "failed", "cancelled"}
+
+        wait_for_condition(terminal, timeout=60, poll_interval=0.1,
+                           error_message="Native workflow did not settle its queue item")
+        assert settled["status"] == "completed" and settled["lease_token"] is None
+        assert settled["ack_summary"]["summary"]["source"] == "native-workflow"
+        executions = client.list_executions(action_ref=action, limit=20)
+        assert len(executions) == 1 and executions[0]["status"] == "completed"
+        execution = client.get_execution(executions[0]["id"])
+        assert execution["worker"] is None
+        assert execution["result"]["queue_ack"]["items"][0]["id"] == identifier
+
+        def workflow_log_ready():
+            response = client.get(f"/api/v1/executions/{execution['id']}/artifacts", params={"type": "file_text"})
+            response.raise_for_status()
+            matches = [artifact for artifact in response.json()["items"] if artifact["ref"] == action + ".workflow.log"]
+            if not matches:
+                return False
+            assert len(matches) == 1
+            artifact = matches[0]
+            version = artifact["selected_version"]
+            assert version["execution"] == execution["id"]
+            if not version.get("size_bytes"):
+                return False
+            response = client.get(f"/api/v1/artifacts/{artifact['id']}/versions/{version['version']}/download",
+                                  params={"version_id": version["id"]})
+            if response.status_code != 200:
+                pytest.fail(f"Finalized workflow log download returned {response.status_code}")
+            return response.status_code == 200 and "Workflow Completed" in response.text
+
+        wait_for_condition(workflow_log_ready, timeout=30, poll_interval=0.25,
+                           error_message="Native workflow activity log did not finalize")
+    finally:
+        client.put(base, json={"enabled": False, "accepting_new_items": False}).raise_for_status()

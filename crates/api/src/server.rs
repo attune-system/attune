@@ -1,11 +1,18 @@
 //! Server setup and lifecycle management
 
 use anyhow::Result;
+use attune_common::{
+    execution_authority::consumer_contract::ConsumerRole,
+    repositories::recorded_consumer_observations::{
+        RecordedConsumerIdentity, RecordedConsumerObservations,
+    },
+};
 use axum::{extract::Request, middleware, Router};
 use std::future::IntoFuture;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::{net::TcpListener, time::Instant};
+use tokio_util::task::AbortOnDropHandle;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing::info;
@@ -140,6 +147,17 @@ impl Server {
         let router = self.build_router();
 
         let shutdown = self.state.execution_log_streams.shutdown_token();
+        let recorded_observation = self
+            .state
+            .recorded_consumer_identity
+            .as_ref()
+            .map(|identity| {
+                let state = Arc::clone(&self.state);
+                let identity = Arc::clone(identity);
+                AbortOnDropHandle::new(tokio::spawn(async move {
+                    Self::observe_recorded_api(&state, &identity).await;
+                }))
+            });
         let shutdown_signal = shutdown.clone();
         let mut server = Box::pin(
             axum::serve(
@@ -158,6 +176,14 @@ impl Server {
             }
             _ = shutdown.cancelled() => Some(Instant::now()),
         };
+
+        if let Some(observer) = recorded_observation {
+            observer.abort();
+            let _ = observer.await;
+            if let Some(identity) = &self.state.recorded_consumer_identity {
+                Self::publish_recorded_api(&self.state, identity, false).await;
+            }
+        }
 
         let release_deadline = if let Some(shutdown_started) = shutdown_started {
             let deadline = shutdown_started
@@ -201,5 +227,61 @@ impl Server {
         cancellation_shutdown?;
 
         Ok(())
+    }
+
+    async fn observe_recorded_api(state: &AppState, identity: &RecordedConsumerIdentity) {
+        use attune_common::auth::jwt::JwtConfig;
+
+        if !state
+            .config
+            .security
+            .encryption_key
+            .as_ref()
+            .is_some_and(|key| key.trim().len() >= 32)
+            || state.jwt_config.secret.trim().len() < 32
+            || state.jwt_config.secret == JwtConfig::default().secret
+        {
+            tracing::warn!("Recorded API consumers require configured cryptography");
+            return;
+        }
+        // Check real exact-version blob operations through the same backend as
+        // the routes. Router construction and an open socket alone are insufficient.
+        if state.verify_blob_store().await.is_err() {
+            tracing::warn!("Recorded API consumers could not verify their storage backend");
+            return;
+        }
+        let mut ticks = tokio::time::interval(Duration::from_secs(5));
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticks.tick().await;
+            Self::publish_recorded_api(state, identity, true).await;
+        }
+    }
+
+    async fn publish_recorded_api(
+        state: &AppState,
+        identity: &RecordedConsumerIdentity,
+        installed: bool,
+    ) {
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut connection = state.db.acquire().await?;
+            let mut ready = installed
+                && RecordedConsumerObservations::api_access_available(&mut connection).await?;
+            if ready {
+                let publisher = state.publisher.read().await.clone();
+                ready = if let Some(publisher) = publisher {
+                    publisher.channel().await.status().connected()
+                } else {
+                    false
+                };
+            }
+            identity
+                .publish(&mut connection, ready.then_some(ConsumerRole::Api))
+                .await
+        })
+        .await;
+        if !matches!(result, Ok(Ok(()))) {
+            tracing::warn!("Unable to update the recorded API observation");
+        }
     }
 }

@@ -1,6 +1,6 @@
 //! Atomic platform metadata reconciliation and managed-component ownership reads.
 
-use serde_json::json;
+use serde_json::{json, Value};
 use sqlx::{Executor, PgConnection, PgPool, Postgres};
 
 use crate::models::{IntrinsicHandler, ManagementOrigin, ManagementOriginKind as StoredOrigin};
@@ -9,6 +9,17 @@ use crate::platform_catalog::{
 };
 use crate::version_matching::extract_version_components;
 use crate::{Error, Result};
+
+fn bootstrap_snapshot(definitions: &[(ManagedComponentKind, Value)]) -> Result<Value> {
+    let mut snapshot = json!({});
+    for (kind, definition) in definitions {
+        let component_ref = definition["ref"]
+            .as_str()
+            .ok_or_else(|| Error::internal("Catalog ref missing"))?;
+        snapshot[kind.table()][component_ref] = definition.clone();
+    }
+    Ok(snapshot)
+}
 
 #[derive(sqlx::FromRow)]
 struct OwnershipRow {
@@ -153,6 +164,37 @@ impl PlatformCatalogRepository {
     /// Reconcile before bootstrap authorization or pack writes. No installed pack
     /// or filesystem content is needed. Every transfer and update commits together.
     pub async fn reconcile(pool: &PgPool) -> Result<()> {
+        Self::reconcile_definitions(pool, definitions()?).await
+    }
+
+    /// A separately provisioned API can start on an already reconciled catalog
+    /// with read access. Drift still goes through the ordinary fenced writer,
+    /// which fails if this login cannot reconcile the installation.
+    pub async fn ensure_reconciled(pool: &PgPool) -> Result<()> {
+        let definitions = definitions()?;
+        let snapshot = bootstrap_snapshot(&definitions)?;
+        let current: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1 FROM platform_catalog_state
+                WHERE singleton AND compatibility_epoch=$1 AND revision=$2
+                    AND bootstrap_definitions=$3
+            )",
+        )
+        .bind(COMPATIBILITY_EPOCH)
+        .bind(CATALOG_REVISION)
+        .bind(&snapshot)
+        .fetch_one(pool)
+        .await?;
+        if current {
+            return Ok(());
+        }
+        Self::reconcile_definitions(pool, definitions).await
+    }
+
+    async fn reconcile_definitions(
+        pool: &PgPool,
+        definitions: Vec<(ManagedComponentKind, Value)>,
+    ) -> Result<()> {
         let mut tx = pool.begin().await?;
         // A singleton row lock is schema-local, including schema-per-test fixtures.
         let revision: i32 = sqlx::query_scalar(
@@ -161,14 +203,7 @@ impl PlatformCatalogRepository {
         .fetch_one(&mut *tx)
         .await?;
         Self::check_compatibility(&mut *tx).await?;
-        let definitions = definitions()?;
-        let mut bootstrap_definitions = json!({});
-        for (kind, definition) in &definitions {
-            let component_ref = definition["ref"]
-                .as_str()
-                .ok_or_else(|| Error::internal("Catalog ref missing"))?;
-            bootstrap_definitions[kind.table()][component_ref] = definition.clone();
-        }
+        let bootstrap_definitions = bootstrap_snapshot(&definitions)?;
         // Backfill the source snapshot even when metadata is already at this
         // revision. The row lock also serializes the Python bootstrap bridge.
         sqlx::query("UPDATE platform_catalog_state SET bootstrap_definitions = $1 WHERE singleton AND bootstrap_definitions IS DISTINCT FROM $1")

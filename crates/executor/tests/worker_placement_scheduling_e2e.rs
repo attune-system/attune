@@ -12,8 +12,13 @@ use attune_common::{
     },
     repositories::{
         action::{ActionRepository, CreateActionInput},
+        delegated_execution::DelegatedExecutionRepository,
+        executable_snapshot::ExecutableSnapshotRepository,
         execution::{CreateExecutionInput, ExecutionRepository},
+        identity::{CreateIdentityInput, IdentityRepository},
         pack::{CreatePackInput, PackRepository},
+        pack_release::{CreatePackReleaseInput, PackReleaseRepository},
+        schema_contract::{BindingOwner, SchemaContractRepository},
         Create,
     },
     test_database::TestDatabase,
@@ -33,8 +38,9 @@ async fn create_test_pool() -> anyhow::Result<TestDatabase> {
 }
 
 async fn create_pack(pool: &PgPool, suffix: &str) -> anyhow::Result<Pack> {
-    Ok(PackRepository::create(
-        pool,
+    let mut tx = pool.begin().await?;
+    let pack = PackRepository::create(
+        &mut *tx,
         CreatePackInput {
             r#ref: format!("placement_pack_{}", suffix),
             label: format!("Placement Pack {}", suffix),
@@ -50,7 +56,25 @@ async fn create_pack(pool: &PgPool, suffix: &str) -> anyhow::Result<Pack> {
             installers: json!({}),
         },
     )
-    .await?)
+    .await?;
+    let release = PackReleaseRepository::create_or_get(
+        &mut tx,
+        CreatePackReleaseInput {
+            pack: pack.id,
+            pack_ref: pack.r#ref.clone(),
+            version: pack.version.clone(),
+            digest: "a".repeat(64),
+            object_key: "placement-fixture.tar".into(),
+            provider_version: "test".into(),
+            content_path: "placement-fixture".into(),
+            archive_size: 1,
+            manifest: json!({}),
+        },
+    )
+    .await?;
+    PackReleaseRepository::activate(&mut tx, pack.id, release.id).await?;
+    tx.commit().await?;
+    Ok(pack)
 }
 
 async fn create_action(
@@ -84,7 +108,7 @@ async fn create_action(
             worker_affinity,
             param_schema: None,
             out_schema: None,
-            is_adhoc: false,
+            is_adhoc: true,
             accesses_mcp: false,
             default_execution_permission_set_refs: Vec::new(),
             reference_visibility: Default::default(),
@@ -110,32 +134,15 @@ async fn create_execution_with_placement(
     worker_tolerations: Option<JsonValue>,
     worker_affinity: Option<JsonValue>,
 ) -> anyhow::Result<i64> {
-    Ok(ExecutionRepository::create(
+    create_placement_fixture_execution(
         pool,
-        CreateExecutionInput {
-            action: Some(action.id),
-            action_ref: action.r#ref.clone(),
-            config: None,
-            env_vars: None,
-            parent: None,
-            enforcement: None,
-            executor: None,
-            permission_set_refs: Vec::new(),
-            artifact_retention_policy: None,
-            artifact_retention_limit: None,
-            worker_selector,
-            worker_tolerations,
-            worker_affinity,
-            worker: None,
-            status: ExecutionStatus::Requested,
-            trace_tag: None,
-            result: None,
-            workflow_task: None,
-            timeout_seconds: None,
-        },
+        action,
+        worker_selector,
+        worker_tolerations,
+        worker_affinity,
+        None,
     )
-    .await?
-    .id)
+    .await
 }
 
 async fn create_workflow_task_execution_with_placement(
@@ -145,46 +152,75 @@ async fn create_workflow_task_execution_with_placement(
     worker_tolerations: Option<JsonValue>,
     worker_affinity: Option<JsonValue>,
 ) -> anyhow::Result<i64> {
-    Ok(ExecutionRepository::create(
+    // Exercise the persisted task overrides in worker selection. Workflow
+    // ancestry and task creation are covered by the orchestration tests.
+    create_placement_fixture_execution(
         pool,
+        action,
+        worker_selector,
+        worker_tolerations,
+        worker_affinity,
+        Some(WorkflowTaskMetadata {
+            workflow_execution: 1,
+            task_name: "placement_task".into(),
+            triggered_by: None,
+            task_index: None,
+            task_batch: None,
+            retry_count: 0,
+            max_retries: 0,
+            next_retry_at: None,
+            timeout_seconds: None,
+            timed_out: false,
+            duration_ms: None,
+            started_at: None,
+            completed_at: None,
+        }),
+    )
+    .await
+}
+
+async fn create_placement_fixture_execution(
+    pool: &PgPool,
+    action: &Action,
+    worker_selector: Option<JsonValue>,
+    worker_tolerations: Option<JsonValue>,
+    worker_affinity: Option<JsonValue>,
+    workflow_task: Option<WorkflowTaskMetadata>,
+) -> anyhow::Result<i64> {
+    let mut tx = pool.begin().await?;
+    let owner = IdentityRepository::create(
+        &mut *tx,
+        CreateIdentityInput {
+            login: format!("placement-{}@attune.local", uuid::Uuid::new_v4().simple()),
+            display_name: None,
+            password_hash: None,
+            attributes: Default::default(),
+        },
+    )
+    .await?;
+    let snapshot = ExecutableSnapshotRepository::resolve_for_action(&mut *tx, action.id).await?;
+    let binding = SchemaContractRepository::materialize_action(&mut tx, &snapshot).await?;
+    let execution = ExecutionRepository::create_pinned(
+        &mut *tx,
         CreateExecutionInput {
             action: Some(action.id),
             action_ref: action.r#ref.clone(),
-            config: None,
-            env_vars: None,
-            parent: Some(1),
-            enforcement: None,
-            executor: None,
-            permission_set_refs: Vec::new(),
-            artifact_retention_policy: None,
-            artifact_retention_limit: None,
+            executor: Some(owner.id),
             worker_selector,
             worker_tolerations,
             worker_affinity,
-            worker: None,
             status: ExecutionStatus::Requested,
-            trace_tag: None,
-            result: None,
-            workflow_task: Some(WorkflowTaskMetadata {
-                workflow_execution: 1,
-                task_name: "placement_task".to_string(),
-                triggered_by: None,
-                task_index: None,
-                task_batch: None,
-                retry_count: 0,
-                max_retries: 0,
-                next_retry_at: None,
-                timeout_seconds: None,
-                timed_out: false,
-                duration_ms: None,
-                started_at: None,
-                completed_at: None,
-            }),
-            timeout_seconds: None,
+            workflow_task,
+            ..Default::default()
         },
+        &snapshot,
     )
-    .await?
-    .id)
+    .await?;
+    SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, execution.id, &binding)
+        .await?;
+    DelegatedExecutionRepository::select(&mut tx, execution.id, None).await?;
+    tx.commit().await?;
+    Ok(execution.id)
 }
 
 async fn selected_worker_for_execution_id(
@@ -210,6 +246,7 @@ async fn create_worker(
         "runtimes": [],
         "labels": labels,
         "taints": taints,
+        (attune_common::execution_authority::DELEGATED_EXECUTION_CAPABILITY): true,
     });
 
     Ok(sqlx::query_as::<_, Worker>(
@@ -238,7 +275,8 @@ async fn selected_worker_for_execution(pool: &PgPool, action: &Action) -> anyhow
 }
 
 #[tokio::test]
-async fn schema_isolated_executions_do_not_reuse_cached_actions() -> anyhow::Result<()> {
+async fn schema_isolated_executions_select_workers_for_their_own_pinned_actions(
+) -> anyhow::Result<()> {
     let first_pool = create_test_pool().await?;
     let second_pool = create_test_pool().await?;
 
@@ -570,5 +608,34 @@ async fn workflow_task_toleration_override_allows_tainted_child_execution() -> a
     let selected = selected_worker_for_execution_id(&pool, execution_id).await?;
 
     assert_eq!(selected.id, isolated_worker.id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn unadmitted_recorded_execution_cannot_select_a_worker() -> anyhow::Result<()> {
+    let db = create_test_pool().await?;
+    let pack = create_pack(&db, "recorded_guard").await?;
+    let action = create_action(&db, &pack, "recorded", json!({}), json!([]), json!({})).await?;
+    let _worker = create_worker(&db, "compatible", json!({}), json!([])).await?;
+    // An inserted execution stays recorded until it receives an explicit,
+    // validated delegated selection or a genuine recorded admission.
+    let execution = ExecutionRepository::create(
+        &*db,
+        CreateExecutionInput {
+            action: Some(action.id),
+            action_ref: action.r#ref,
+            status: ExecutionStatus::Requested,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let error = selected_worker_for_execution_id(&db, execution.id)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Recorded worker selection requires current rollout evidence"
+    );
+    db.cleanup().await?;
     Ok(())
 }

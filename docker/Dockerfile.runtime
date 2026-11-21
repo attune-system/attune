@@ -17,6 +17,7 @@ RUN useradd -m -u 1000 attune && \
 WORKDIR /opt/attune
 
 COPY dist/attune-service-binary /usr/local/bin/attune-service
+COPY dist/rollout-tools/ /usr/local/bin/
 COPY migrations/ ./migrations/
 
 RUN chown -R attune:attune /opt/attune

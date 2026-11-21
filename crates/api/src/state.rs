@@ -6,7 +6,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use tokio::sync::{broadcast, Mutex, OwnedMutexGuard, RwLock};
+use tokio::sync::{broadcast, Mutex, OnceCell, OwnedMutexGuard, RwLock};
 
 use crate::execution_log_streams::ExecutionLogStreams;
 use crate::log_stream_wakeups::LogStreamWakeups;
@@ -34,6 +34,10 @@ pub struct AppState {
     pub cors_origins: Vec<String>,
     /// Application configuration
     pub config: Arc<Config>,
+    /// Provisioned identity for this API replica's recorded-authority effects.
+    pub(crate) recorded_consumer_identity: Option<
+        Arc<attune_common::repositories::recorded_consumer_observations::RecordedConsumerIdentity>,
+    >,
     /// Optional message queue publisher (shared, swappable after reconnection)
     pub publisher: Arc<RwLock<Option<Arc<Publisher>>>>,
     /// Broadcast channel for SSE notifications
@@ -46,6 +50,7 @@ pub struct AppState {
     pub audit_emitter: AuditEmitter,
     /// Durable immutable storage. Only the API receives provider credentials.
     pub blob_store: Arc<dyn BlobStore>,
+    verified_blob_store: Arc<OnceCell<()>>,
     pub file_transfers: crate::file_transfers::FileTransfers,
     pub legacy_file_controller: Arc<attune_common::file_legacy_controller::StorageLegacyController>,
     /// Process-unique namespace for caches shared by multiple app states.
@@ -55,6 +60,14 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Check the exact backend used by this state, once per initialized service.
+    pub async fn verify_blob_store(&self) -> Result<(), attune_common::blob_store::BlobStoreError> {
+        self.verified_blob_store
+            .get_or_try_init(|| self.blob_store.preflight())
+            .await
+            .map(|_| ())
+    }
+
     /// Create new application state
     pub fn new(db: PgPool, config: Config) -> Self {
         Self::new_with_audit(db, config, AuditEmitter::noop())
@@ -160,16 +173,28 @@ impl AppState {
             jwt_config: Arc::new(jwt_config),
             cors_origins,
             config: Arc::new(config),
+            recorded_consumer_identity: None,
             publisher: Arc::new(RwLock::new(None)),
             broadcast_tx,
             log_stream_wakeups: LogStreamWakeups::default(),
             execution_log_streams,
             audit_emitter,
             blob_store,
+            verified_blob_store: Arc::new(OnceCell::new()),
             cache_namespace: NEXT_CACHE_NAMESPACE.fetch_add(1, Ordering::Relaxed),
             authorization_metadata_cache_enabled: true,
             pack_projection_locks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn with_recorded_consumer_identity(
+        mut self,
+        identity: Option<
+            attune_common::repositories::recorded_consumer_observations::RecordedConsumerIdentity,
+        >,
+    ) -> Self {
+        self.recorded_consumer_identity = identity.map(Arc::new);
+        self
     }
 
     /// Count fresh authorization metadata reads in isolated benchmarks without

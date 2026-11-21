@@ -1,6 +1,8 @@
 mod helpers;
 #[path = "execution_admission_tests/native_staged_completion.rs"]
 mod native_staged_completion;
+#[path = "execution_admission_tests/queue_configuration.rs"]
+mod queue_configuration;
 
 use attune_common::{
     models::{ExecutionExecutableSnapshot, ExecutionStatus},
@@ -143,12 +145,43 @@ async fn fixture_on_database_with_output_mismatch(
     RuntimePolicy,
     i64,
 ) {
+    fixture_with_queue_shape(
+        db,
+        authored_defaults,
+        empty_workflow,
+        staged,
+        invalid_output,
+        false,
+        None,
+    )
+    .await
+}
+
+async fn fixture_with_queue_shape(
+    db: TestDatabase,
+    authored_defaults: bool,
+    empty_workflow: bool,
+    staged: Option<native_staged_completion::Case>,
+    invalid_output: bool,
+    structured_queue: bool,
+    queue_output: Option<serde_json::Value>,
+) -> (
+    TestDatabase,
+    ExecutionExecutableSnapshot,
+    RuntimePolicy,
+    i64,
+) {
     let mut pack_fixture = PackFixture::new_unique("exec_admission");
     if authored_defaults {
         pack_fixture.conf_schema =
             json!({"default_value":{"type":"string"},"selector":{"type":"string"}});
         pack_fixture.config =
             json!({"default_value":"child-default-value","selector":"default_value"});
+    }
+    if structured_queue {
+        pack_fixture.conf_schema["connection"] = json!({"type":"object","properties":{"host":{"type":"string"},"token":{"type":"string","secret":true}}});
+        pack_fixture.config["connection"] =
+            json!({"host":"fixture.invalid","token":"queue-config-secret"});
     }
     let pack = pack_fixture.create(&db).await.unwrap();
     if authored_defaults {
@@ -159,7 +192,7 @@ async fn fixture_on_database_with_output_mismatch(
         .await
         .unwrap();
         attune_common::repositories::component_configuration::ComponentConfigurationRepository::bind_pack(
-            &mut configuration, &pack, Some(&pack.config), None,
+            &mut configuration, &pack, Some(&pack.config), structured_queue.then_some("queue-input-contract-test-encryption-key"),
         ).await.unwrap();
         configuration.commit().await.unwrap();
     }
@@ -167,6 +200,19 @@ async fn fixture_on_database_with_output_mismatch(
         .create(&db)
         .await
         .unwrap();
+    let worker_queue = queue_output.is_some();
+    if let Some(schema) = queue_output {
+        attune_common::repositories::action::ActionRepository::update(
+            &db,
+            action.id,
+            attune_common::repositories::action::UpdateActionInput {
+                out_schema: Some(schema),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
     if authored_defaults {
         attune_common::repositories::action::ActionRepository::update(
             &db,
@@ -189,6 +235,26 @@ async fn fixture_on_database_with_output_mismatch(
                     "result_output":{"type":"string"},
                     "literal_output":{"type":if invalid_output { "integer" } else { "string" }}
                 })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    if structured_queue {
+        let mut schema =
+            attune_common::repositories::action::ActionRepository::find_by_id(&db, action.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .param_schema
+                .unwrap();
+        schema["connection"] = json!({"type":"object","properties":{"host":{"type":"string"},"token":{"type":"string","secret":true}}});
+        attune_common::repositories::action::ActionRepository::update(
+            &db,
+            action.id,
+            attune_common::repositories::action::UpdateActionInput {
+                param_schema: Some(schema),
                 ..Default::default()
             },
         )
@@ -301,9 +367,11 @@ async fn fixture_on_database_with_output_mismatch(
     )
     .await
     .unwrap();
-    ActionRepository::link_workflow_def(&db, action.id, definition.id)
-        .await
-        .unwrap();
+    if !worker_queue {
+        ActionRepository::link_workflow_def(&db, action.id, definition.id)
+            .await
+            .unwrap();
+    }
     let human = IdentityFixture::new_unique("requester")
         .create(&db)
         .await
@@ -381,7 +449,7 @@ async fn fixture_on_database_with_output_mismatch(
         owner,
         release_id: release.id,
         release_digest: release.digest,
-        invocations: if empty_workflow {
+        invocations: if empty_workflow || worker_queue {
             vec![invocation, queue, leaf_invocation]
         } else {
             vec![invocation, task, queue, leaf_invocation]
@@ -1043,7 +1111,14 @@ async fn accepted_mixed_requester_queue_keeps_policy_and_attribution_after_human
     use attune_common::{
         models::WorkQueueItemStatus,
         repositories::{
-            work_queue::{CreateWorkQueueItemInput, WorkQueueItemRepository, WorkQueueRepository},
+            accepted_batch_dependency::AcceptedBatchDependencyRepository as Batch,
+            queue_configuration_input::QueueConfigurationInputRepository as Fixed,
+            recorded_input_authority::RecordedInputAuthorityRepository as Contributors,
+            schema_contract::SchemaContractRepository,
+            work_queue::{
+                CreateWorkQueueItemInput, LeaseWorkQueueItemsInput, WorkQueueItemRepository,
+                WorkQueueRepository,
+            },
             Delete, FindByRef,
         },
     };
@@ -1061,9 +1136,24 @@ async fn accepted_mixed_requester_queue_keeps_policy_and_attribution_after_human
             .await
             .unwrap()
             .unwrap();
+    let source = WorkQueueRepository::item_schema_source(&mut tx, queue.id)
+        .await
+        .unwrap();
+    let contract = SchemaContractRepository::materialize(
+        &mut tx,
+        source,
+        attune_common::value_schema::SchemaContext::FlatDocument,
+        &queue.item_schema,
+    )
+    .await
+    .unwrap();
+    let item_schema = attune_common::value_schema::ValueSchemaBinding {
+        authored_schema: queue.item_schema.clone(),
+        contract,
+    };
     let mut items = Vec::new();
     for identity in [human, other.id] {
-        let item = WorkQueueItemRepository::create_pinned(
+        let item = WorkQueueItemRepository::create_bound_pinned(
             &mut *tx,
             CreateWorkQueueItemInput {
                 queue: queue.id,
@@ -1086,6 +1176,7 @@ async fn accepted_mixed_requester_queue_keeps_policy_and_attribution_after_human
                 ack_summary: None,
             },
             &snapshot,
+            &item_schema,
         )
         .await
         .unwrap();
@@ -1093,9 +1184,10 @@ async fn accepted_mixed_requester_queue_keeps_policy_and_attribution_after_human
             identity_id: identity,
             login: format!("historical-{identity}"),
         });
-        let denied = Admission::admit_queue_item(&mut tx, &queue, &item, actor.clone(), &snapshot)
-            .await
-            .unwrap_err();
+        let denied =
+            Admission::admit_queue_item(&mut tx, None, &queue, &item, actor.clone(), &snapshot)
+                .await
+                .unwrap_err();
         assert!(denied.to_string().contains("coordinated admission"));
         let written: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM work_queue_item_runtime_admission WHERE item=$1",
@@ -1133,6 +1225,18 @@ async fn accepted_mixed_requester_queue_keeps_policy_and_attribution_after_human
         sqlx::query("INSERT INTO work_queue_item_runtime_admission(item,policy_revision,authority,authority_digest) VALUES($1,$2,$3,$4)")
             .bind(item.id).bind(authority.policy_id).bind(sqlx::types::Json(authority))
             .bind(fixture_digest(authority)).execute(&mut *tx).await.unwrap();
+        Contributors::capture_human(&mut tx, "queue_item", item.id, identity)
+            .await
+            .unwrap();
+        Fixed::capture(
+            &mut tx,
+            &queue,
+            &item,
+            &snapshot,
+            queue_configuration::QUEUE_KEY,
+        )
+        .await
+        .unwrap();
         admitted.ensure_fresh_on(&mut tx).await.unwrap();
         items.push(item);
     }
@@ -1159,6 +1263,23 @@ async fn accepted_mixed_requester_queue_keeps_policy_and_attribution_after_human
     attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
         .await
         .unwrap();
+    let lease = uuid::Uuid::new_v4();
+    let items = WorkQueueItemRepository::lease_next_batch(
+        &mut *tx,
+        LeaseWorkQueueItemsInput {
+            separate_requesters: false,
+            queue: queue.id,
+            ready_statuses: vec![WorkQueueItemStatus::Queued],
+            limit: 2,
+            batch_coalescing: None,
+            leased_execution: None,
+            lease_token: lease,
+            lease_expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(items.len(), 2);
     let selected = Admission::queue_batch(&mut tx, &queue, &items, &snapshot)
         .await
         .unwrap();
@@ -1190,6 +1311,26 @@ async fn accepted_mixed_requester_queue_keeps_policy_and_attribution_after_human
         .attach(&mut tx, RuntimeOwner::Execution(dispatch.id))
         .await
         .unwrap();
+    WorkQueueItemRepository::attach_execution_to_lease(&mut *tx, lease, dispatch.id)
+        .await
+        .unwrap();
+    Contributors::capture_queue_execution(
+        &mut tx,
+        dispatch.id,
+        &items.iter().map(|item| item.id).collect::<Vec<_>>(),
+    )
+    .await
+    .unwrap();
+    Batch::capture_managed(
+        &mut tx,
+        dispatch_admission.id,
+        &queue,
+        &items,
+        None,
+        queue_configuration::QUEUE_KEY,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         dispatch_admission.policy_revision,
         old.authority().policy_id
@@ -1208,11 +1349,19 @@ async fn accepted_mixed_requester_queue_keeps_policy_and_attribution_after_human
             .is_err()
     );
     revoked.rollback().await.unwrap();
-    for item in &items {
-        attune_common::repositories::work_queue::WorkQueueItemRepository::update_if_statuses(&mut *tx, item.id,
-            attune_common::repositories::work_queue::WorkQueueItemRepository::mutable_pending_statuses(),
-            attune_common::repositories::work_queue::UpdateWorkQueueItemInput { status: Some(WorkQueueItemStatus::Cancelled), ..Default::default() }).await.unwrap().unwrap();
-    }
+    let cancelled = WorkQueueItemRepository::release_lease(
+        &mut *tx,
+        attune_common::repositories::work_queue::ReleaseWorkQueueLeaseInput {
+            lease_token: lease,
+            new_status: WorkQueueItemStatus::Cancelled,
+            leased_execution: Some(dispatch.id),
+            last_error: None,
+            ack_summary: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(cancelled.len(), items.len());
     // Activate only in a new graph-first transaction after the accepted items
     // have drained. Already recorded dispatch authority still retains old pins.
     tx.commit().await.unwrap();

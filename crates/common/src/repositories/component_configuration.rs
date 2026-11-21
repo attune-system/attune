@@ -164,6 +164,10 @@ impl ComponentConfigurationRepository {
     pub async fn cleanup_retired(pool: &sqlx::PgPool, limit: u32) -> Result<(usize, usize)> {
         let mut tx = pool.begin().await?;
         SchemaTypeRepository::lock_reclamation(&mut tx).await?;
+        super::queue_configuration_input::QueueConfigurationInputRepository::reclaim_with_conn(
+            &mut tx, limit,
+        )
+        .await?;
         let limit = i64::from(limit.min(1000));
         let generations: Vec<i64> = sqlx::query_scalar("WITH expired AS ( \
             SELECT b.id FROM sensor_generation_schema_binding b \
@@ -194,6 +198,7 @@ impl ComponentConfigurationRepository {
                AND NOT EXISTS (SELECT 1 FROM runtime_secret_origin_reference p WHERE p.source_entity = 'component_configuration' AND p.source_id = r.id) \
                AND NOT file_evidence_pinned('component_configuration_revision',r.id) \
                 AND NOT EXISTS (SELECT 1 FROM runtime_input_configuration_reference p WHERE p.revision = r.id) \
+                AND NOT EXISTS (SELECT 1 FROM work_queue_item_configuration_input q WHERE q.configuration_revision = r.id) \
             ORDER BY r.created, r.id LIMIT $1 \
         ) DELETE FROM component_configuration_revision r USING expired e WHERE r.id = e.id RETURNING r.id")
             .bind(limit).fetch_all(&mut *tx).await?;

@@ -137,6 +137,10 @@ pub struct WorkflowLogDispatcher {
     owner: Uuid,
     segment_max_bytes: usize,
     flush_interval_ms: u64,
+    recorded_transport: Option<(
+        attune_common::artifact_transport::ApiTransport,
+        attune_common::auth::jwt::JwtConfig,
+    )>,
 }
 
 impl WorkflowLogDispatcher {
@@ -152,7 +156,41 @@ impl WorkflowLogDispatcher {
             owner: Uuid::new_v4(),
             segment_max_bytes,
             flush_interval_ms,
+            recorded_transport: None,
         }
+    }
+
+    pub fn with_recorded_transport(
+        mut self,
+        transport: attune_common::artifact_transport::ApiTransport,
+        jwt: attune_common::auth::jwt::JwtConfig,
+    ) -> Self {
+        self.recorded_transport = Some((transport, jwt));
+        self
+    }
+
+    async fn scoped_transport(
+        &self,
+        record: &attune_common::models::log_stream::WorkflowLogOutboxRecord,
+        version: i64,
+    ) -> Result<Option<attune_common::artifact_transport::ApiTransport>> {
+        let Some((transport, jwt)) = &self.recorded_transport else {
+            return Ok(None);
+        };
+        let recorded = {
+            let mut conn = self.pool.acquire().await?;
+            attune_common::repositories::execution_admission::ExecutionAdmissionRepository::is_recorded(
+                &mut conn, record.parent_execution,
+            ).await?
+        };
+        if !recorded {
+            return Ok(None);
+        }
+        let mut transport = transport.clone();
+        transport.set_auth_token(&attune_common::log_delivery::mint_workflow(
+            record, version, jwt,
+        )?);
+        Ok(Some(transport))
     }
 
     pub async fn start(self, mut shutdown: tokio::sync::broadcast::Receiver<()>) -> Result<()> {
@@ -251,14 +289,32 @@ impl WorkflowLogDispatcher {
                             return Ok(DeliveryResult::Permanent(code))
                         }
                     }
-                    self.transport
-                        .commit_log_segment(stream.version_id, delivery_sequence, payload)
-                        .await?;
+                    if let Some(transport) =
+                        self.scoped_transport(&record, stream.version_id).await?
+                    {
+                        transport
+                            .send_log_segment_through_api(
+                                stream.version_id,
+                                delivery_sequence,
+                                payload,
+                            )
+                            .await?;
+                    } else {
+                        self.transport
+                            .commit_log_segment(stream.version_id, delivery_sequence, payload)
+                            .await?;
+                    }
                 }
                 "seal" => {
-                    self.transport
-                        .seal_log_stream(stream.version_id, false)
-                        .await?;
+                    if let Some(transport) =
+                        self.scoped_transport(&record, stream.version_id).await?
+                    {
+                        transport.seal_log_stream(stream.version_id, false).await?;
+                    } else {
+                        self.transport
+                            .seal_log_stream(stream.version_id, false)
+                            .await?;
+                    }
                     ArtifactVersionRepository::mark_log_ready(&self.pool, stream.version_id)
                         .await?;
                 }

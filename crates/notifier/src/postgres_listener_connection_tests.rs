@@ -127,14 +127,16 @@ async fn cancelled_subscription_discards_sqlx_connection_without_async_cleanup()
         let (url, started, peer) = wire_peer(Failure::Subscription).await?;
         let (tx, _rx) = broadcast::channel(4);
         let notifier = PostgresListener::new(url, tx).await?;
+        let mut healthy = false;
         {
-            let connection = notifier.create_listener();
+            let connection = notifier.listen_with_health(IDLE_INTERVAL, |ready| healthy = ready);
             tokio::pin!(connection);
             tokio::select! {
                 result = &mut connection => anyhow::bail!("subscription unexpectedly completed: {result:?}"),
                 result = started => result?,
             }
         }
+        assert!(!healthy, "sending LISTEN is insufficient without acknowledgement");
         peer.await??;
         Ok::<_, anyhow::Error>(())
     }).await?

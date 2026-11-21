@@ -109,10 +109,13 @@ pub mod platform_catalog;
 pub mod public_input_approval;
 pub mod queue_stats;
 pub mod reclamation_cancellation;
+pub mod recorded_consumer_observations;
 pub mod recorded_input_authority;
 pub mod recorded_input_origins;
+pub mod recorded_rollout;
 pub mod requested_execution_publication;
 pub mod retention;
+pub mod rollout_admin;
 pub mod rule;
 pub mod rule_authority;
 pub mod runtime;
@@ -531,3 +534,5 @@ mod tests {
 pub mod iam_ownership;
 
 pub mod work_queue_output;
+
+pub mod queue_configuration_input;

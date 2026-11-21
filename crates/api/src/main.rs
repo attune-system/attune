@@ -397,8 +397,8 @@ async fn run() -> Result<()> {
     )
     .await?;
     info!("Database connection established");
-    PlatformCatalogRepository::reconcile(database.pool()).await?;
-    info!("Platform catalog reconciled");
+    PlatformCatalogRepository::ensure_reconciled(database.pool()).await?;
+    info!("Platform catalog ready");
 
     // Spawn the audit writer task. The emitter is cheap and clone-able; we
     // store it in AppState so handlers and middleware can record audit events
@@ -409,13 +409,15 @@ async fn run() -> Result<()> {
 
     let outcome = async {
     // Initialize application state (publisher starts as None)
+    let recorded_identity =
+        attune_common::repositories::recorded_consumer_observations::RecordedConsumerIdentity::from_environment()?;
     let state = Arc::new(AppState::new_with_audit(
         database.pool().clone(),
         config.clone(),
         audit_emitter,
-    ));
+    ).with_recorded_consumer_identity(recorded_identity));
     info!("Checking blob storage exact-version operations");
-    state.blob_store.preflight().await?;
+    state.verify_blob_store().await?;
     info!("Blob storage preflight passed");
 
     let upgrade = upgrade_legacy_pack_releases(

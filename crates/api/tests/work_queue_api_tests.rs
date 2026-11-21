@@ -652,6 +652,21 @@ async fn private_queue_item_submission_requires_constrained_item_grant() {
         .as_str()
         .unwrap()
         .contains("Recorded queue sponsorship"));
+
+    let bulk = ctx
+        .post(
+            &format!("/api/v1/queues/{}/items/bulk", public_queue.r#ref),
+            json!({
+                "items": [
+                    { "item_key": "denied-first", "payload": { "id": 4 } },
+                    { "item_key": "denied-second", "payload": { "id": 5 } }
+                ]
+            }),
+            Some(&broad_item_token),
+        )
+        .await
+        .expect("bulk enqueue without coordinated readiness");
+    assert_eq!(bulk.status(), StatusCode::NOT_IMPLEMENTED);
     for queue in [&public_queue, &private_queue] {
         assert!(WorkQueueItemRepository::list_for_queue(&ctx.pool, queue.id)
             .await

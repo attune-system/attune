@@ -10,11 +10,9 @@ use attune_common::{
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-/// Persist an authentic pre-rollout recorded item for consumer tests. New API
-/// sponsorship is tested separately and stays disabled. The repository selector
-/// validates the retained policy, executable, source target and approval fences;
-/// only the historical item table write is fixture-owned (there is deliberately
-/// no ungated production managed-item admission writer).
+/// Persist a previously admitted item for consumer tests without enabling API
+/// sponsorship. Only the managed admission insert is fixture-owned. The
+/// repository selects the admission and seals the accepted configuration.
 pub(crate) async fn pre_admitted_item(
     ctx: &TestContext,
     queue: &attune_common::models::WorkQueue,
@@ -25,6 +23,7 @@ pub(crate) async fn pre_admitted_item(
     use attune_common::repositories::{
         ad_hoc_queue_admission::{AdHocQueueAdmissionRepository, AdHocQueueSource},
         execution_runtime_admission::ExecutionAdmissionRepository as Admissions,
+        queue_configuration_input::QueueConfigurationInputRepository,
         recorded_input_authority::RecordedInputAuthorityRepository as Inputs,
         runtime_target::{ComponentTarget, RuntimeTarget},
         work_queue::{CreateWorkQueueItemInput, WorkQueueItemRepository, WorkQueueRepository},
@@ -123,6 +122,23 @@ pub(crate) async fn pre_admitted_item(
         Inputs::copy(&mut tx, "execution", parent, "queue_item", item.id).await?;
     } else {
         Inputs::capture_human(&mut tx, "queue_item", item.id, human.unwrap()).await?;
+    }
+    if !queue.is_adhoc {
+        let encryption_key = ctx
+            .state
+            .config
+            .security
+            .encryption_key
+            .as_deref()
+            .expect("managed queue test encryption key");
+        QueueConfigurationInputRepository::capture(
+            &mut tx,
+            queue,
+            &item,
+            &snapshot,
+            encryption_key,
+        )
+        .await?;
     }
     tx.commit().await?;
     Ok(item)

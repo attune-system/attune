@@ -20,6 +20,8 @@ use serde_json::Value;
 use sqlx::PgConnection;
 use std::sync::LazyLock;
 
+mod queue;
+
 static KEY_LOOKUP: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"\{\{\s*keystore(?:\.|\[)").expect("authored Key lookup regex")
 });
@@ -50,7 +52,8 @@ impl DeclaredInputBinding {
         )) || self.bare_workflow_condition()
             && crate::workflow::expression::uses_namespace(&self.expression, "config")
                 .unwrap_or(false)
-            || self.source_path.starts_with("/workflow/")
+            || (self.source_path.starts_with("/workflow/")
+                || self.source_path.starts_with("/queue/"))
                 && crate::template_resolver::workflow_template_uses_namespace(
                     &self.expression,
                     "config",
@@ -60,7 +63,9 @@ impl DeclaredInputBinding {
         if self.bare_workflow_condition() {
             crate::workflow::expression::uses_namespace_access(&self.expression, "keystore")
                 .unwrap_or(false)
-        } else if self.source_path.starts_with("/workflow/") {
+        } else if self.source_path.starts_with("/workflow/")
+            || self.source_path.starts_with("/queue/")
+        {
             crate::template_resolver::workflow_template_uses_lookup(&self.expression, "keystore")
         } else {
             KEY_LOOKUP.is_match(&self.expression)
@@ -203,11 +208,8 @@ impl DeclaredInputRepository {
             .ok_or_else(denied)?;
         let snapshot =
             ManagedExecutableRepository::invocation_snapshot(connection, invocation).await?;
-        let actual = declarations(
-            &snapshot.executable,
-            snapshot.release.id,
-            invocation.metadata_revision,
-        )?;
+        let actual =
+            Self::invocation_declarations(connection, &policy, invocation, &snapshot).await?;
         let rows:Vec<(Id,Value,String)>=sqlx::query_as("SELECT id,declaration,declaration_digest FROM runtime_declared_input_binding WHERE policy_revision = $1 AND invocation_digest = $2 AND declaration->>'source_path' = $3 FOR SHARE")
             .bind(policy_revision).bind(hash(&serde_json::to_value(binding)?)?).bind(path).fetch_all(&mut *connection).await?;
         let mut matched = None;
@@ -260,11 +262,8 @@ impl DeclaredInputRepository {
         for invocation in &policy.policy.invocations {
             let executable =
                 ManagedExecutableRepository::invocation_snapshot(connection, invocation).await?;
-            let declarations = declarations(
-                &executable.executable,
-                executable.release.id,
-                invocation.metadata_revision,
-            )?;
+            let declarations =
+                Self::invocation_declarations(connection, policy, invocation, &executable).await?;
             let invocation_digest = hash(&serde_json::to_value(&invocation.binding)?)?;
             for declaration in declarations {
                 let value = serde_json::to_value(&declaration)?;
@@ -273,6 +272,28 @@ impl DeclaredInputRepository {
             }
         }
         Ok(())
+    }
+
+    async fn invocation_declarations(
+        connection: &mut PgConnection,
+        policy: &super::runtime_authority::RuntimePolicyRevision,
+        invocation: &crate::runtime_authority::InvocationPolicy,
+        executable: &crate::models::ExecutionExecutableSnapshot,
+    ) -> Result<Vec<DeclaredInputBinding>> {
+        let mut sites = declarations(
+            &executable.executable,
+            executable.release.id,
+            invocation.metadata_revision,
+        )?;
+        queue::append(
+            connection,
+            policy,
+            invocation,
+            executable.executable.action.id,
+            &mut sites,
+        )
+        .await?;
+        Ok(sites)
     }
 
     /// The caller must identify the immutable authored field being evaluated.
@@ -358,12 +379,9 @@ impl DeclaredInputRepository {
             .ok_or_else(denied)?;
         let executable =
             ManagedExecutableRepository::invocation_snapshot(connection, invocation).await?;
-        if !declarations(
-            &executable.executable,
-            executable.release.id,
-            invocation.metadata_revision,
-        )?
-        .contains(declaration)
+        if !Self::invocation_declarations(connection, &policy, invocation, &executable)
+            .await?
+            .contains(declaration)
         {
             return Err(denied());
         }

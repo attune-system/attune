@@ -11,7 +11,10 @@ use attune_common::{
         WorkQueueItemStatus, WorkQueueUpdateStrategy,
     },
     repositories::{
+        accepted_batch_dependency::AcceptedBatchDependencyRepository as Batch,
         component_lifecycle::PackProjectionIds,
+        declared_input::DeclaredInputRepository as Declarations,
+        declared_input_materialization::DeclaredInputMaterializationRepository as Materialize,
         executable_snapshot::ExecutableSnapshotRepository,
         execution::{CreateExecutionInput, ExecutionRepository, UpdateExecutionInput},
         execution_admission::ExecutionAdmissionRepository as Admission,
@@ -20,21 +23,25 @@ use attune_common::{
             CreatePermissionAssignmentInput, CreatePermissionSetInput, IdentityRepository,
             PermissionAssignmentRepository, PermissionSetRepository, UpdateIdentityInput,
         },
+        inherited_input::{
+            InheritedInputRepository as Inputs, InputEntityKind, InputSite, InputSitePurpose,
+        },
         key::{CreateKeyInput, KeyRepository},
         pack_release::{CreatePackReleaseInput, PackReleaseRepository},
+        queue_configuration_input::QueueConfigurationInputRepository as Fixed,
         recorded_input_authority::RecordedInputAuthorityRepository,
         rule_authority::RuleAuthorityRepository,
         runtime_authority::{RuntimeAuthorityRepository as Authority, RuntimeOwner},
         schema_contract::{BindingOwner, SchemaContractRepository},
         work_queue::{
-            CreateWorkQueueInput, CreateWorkQueueItemInput, WorkQueueItemRepository,
-            WorkQueueRepository,
+            CreateWorkQueueInput, CreateWorkQueueItemInput, LeaseWorkQueueItemsInput,
+            WorkQueueItemRepository, WorkQueueRepository,
         },
         Create, Delete, Update,
     },
     runtime_authority::{HumanAttribution, InvocationBinding, InvocationPolicy, RuntimePolicy},
     secret_provenance::SecretProvenance,
-    secret_values::{prepare_secret_values, SecretValueInput, ENTITY_EXECUTION_CONFIG},
+    secret_values::{prepare_secret_values, SecretValueInput, ENTITY_QUEUE_ITEM_PAYLOAD},
     test_database::TestDatabase,
 };
 use attune_worker::SecretManager;
@@ -50,11 +57,25 @@ struct Fixture {
     sponsor: i64,
     humans: Vec<i64>,
     items: Vec<i64>,
-    second_set: i64,
-    key_ref: String,
 }
 
 async fn fixture(second_can_decrypt: bool) -> Fixture {
+    match build_fixture(second_can_decrypt, vec!["standard".into()]).await {
+        Ok(fixture) => fixture,
+        Err(_) => panic!("valid accepted queue fixture must seal its inputs"),
+    }
+}
+
+struct RejectedSource {
+    db: TestDatabase,
+    before_widening: attune_common::Error,
+    after_widening: attune_common::Error,
+}
+
+async fn build_fixture(
+    second_can_decrypt: bool,
+    refs: Vec<String>,
+) -> Result<Fixture, Box<RejectedSource>> {
     let db = create_test_pool().await.unwrap();
     let pack = PackFixture::new_unique("worker_input")
         .create(&db)
@@ -82,10 +103,10 @@ async fn fixture(second_can_decrypt: bool) -> Fixture {
             allow_pending_update: false,
             update_strategy: WorkQueueUpdateStrategy::Immutable,
             batch_mode: WorkQueueBatchMode::Batch,
-            item_schema: json!({}),
-            action_params: json!({}),
+            item_schema: json!({"input":{"type":"string","secret":true}}),
+            action_params: json!({"input":"{{ items[0].input }}"}),
             trace_tag_template: None,
-            permission_set_refs: Some(vec!["standard".into()]),
+            permission_set_refs: Some(refs.clone()),
             config: json!({}),
             reference_visibility: ActionReferenceVisibility::Public,
             reference_allowed_pack_refs: Vec::new(),
@@ -144,6 +165,9 @@ async fn fixture(second_can_decrypt: bool) -> Fixture {
         sets.push(set.id);
     }
     let mut tx = db.begin().await.unwrap();
+    attune_common::repositories::schema_type::SchemaTypeRepository::lock_reclamation(&mut tx)
+        .await
+        .unwrap();
     let release = PackReleaseRepository::create_or_get(
         &mut tx,
         CreatePackReleaseInput {
@@ -211,9 +235,24 @@ async fn fixture(second_can_decrypt: bool) -> Fixture {
     let snapshot = ExecutableSnapshotRepository::resolve_for_action(&mut *tx, action.id)
         .await
         .unwrap();
+    let schema_source = WorkQueueRepository::item_schema_source(&mut tx, queue.id)
+        .await
+        .unwrap();
+    let payload_contract = SchemaContractRepository::materialize(
+        &mut tx,
+        schema_source,
+        attune_common::value_schema::SchemaContext::FlatDocument,
+        &queue.item_schema,
+    )
+    .await
+    .unwrap();
+    let payload_binding = attune_common::value_schema::ValueSchemaBinding {
+        authored_schema: queue.item_schema.clone(),
+        contract: payload_contract,
+    };
     let mut items = Vec::new();
     for human in &humans {
-        let item = WorkQueueItemRepository::create_pinned(
+        let item = WorkQueueItemRepository::create_bound_pinned(
             &mut *tx,
             CreateWorkQueueItemInput {
                 queue: queue.id,
@@ -221,7 +260,7 @@ async fn fixture(second_can_decrypt: bool) -> Fixture {
                 item_key: None,
                 priority: 0,
                 status: WorkQueueItemStatus::Queued,
-                payload: json!({}),
+                payload: json!({"input":"***"}),
                 metadata: json!({}),
                 trace_tag: None,
                 enqueue_source: "worker-input-test".into(),
@@ -236,12 +275,12 @@ async fn fixture(second_can_decrypt: bool) -> Fixture {
                 ack_summary: None,
             },
             &snapshot,
+            &payload_binding,
         )
         .await
         .unwrap();
-        // This consumer fixture represents an item accepted before rollout.
-        // New managed-item admission stays gated. Select authentic policy/source
-        // authority, then persist only the fixture-owned historical item row.
+        // Explicit admitted-fixture construction, not production readiness or
+        // publication/E2E evidence. Retain the actual item admission and inputs.
         let admitted = Admission::select(
             &mut tx,
             snapshot.executable.action.pack,
@@ -281,8 +320,48 @@ async fn fixture(second_can_decrypt: bool) -> Fixture {
         RecordedInputAuthorityRepository::capture_human(&mut tx, "queue_item", item.id, human.id)
             .await
             .unwrap();
+        let fields = prepare_secret_values(
+            vec![SecretValueInput {
+                json_path: "/input".into(),
+                value: json!("accepted value"),
+                source_kind: "provenance".into(),
+                source_ref: Some(
+                    serde_json::to_string(&SecretProvenance::key(origin.clone())).unwrap(),
+                ),
+            }],
+            ENCRYPTION_KEY,
+        )
+        .unwrap();
+        ExecutionSecretValueRepository::upsert_many_with_conn(
+            &mut tx,
+            ENTITY_QUEUE_ITEM_PAYLOAD,
+            item.id,
+            &fields,
+        )
+        .await
+        .unwrap();
+        Fixed::capture(&mut tx, &queue, &item, &snapshot, ENCRYPTION_KEY)
+            .await
+            .unwrap();
         items.push(item);
     }
+    let lease = uuid::Uuid::new_v4();
+    let items = WorkQueueItemRepository::lease_next_batch(
+        &mut *tx,
+        LeaseWorkQueueItemsInput {
+            separate_requesters: false,
+            queue: queue.id,
+            ready_statuses: vec![WorkQueueItemStatus::Queued],
+            limit: 2,
+            batch_coalescing: None,
+            leased_execution: None,
+            lease_token: lease,
+            lease_expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(items.len(), 2);
     let admission = Admission::queue_batch(&mut tx, &queue, &items, &snapshot)
         .await
         .unwrap();
@@ -292,9 +371,9 @@ async fn fixture(second_can_decrypt: bool) -> Fixture {
             action: Some(action.id),
             action_ref: action.r#ref,
             executor: None,
-            permission_set_refs: vec!["standard".into()],
-            status: ExecutionStatus::Running,
-            config: Some(json!({"input":"***"})),
+            permission_set_refs: refs,
+            status: ExecutionStatus::Requested,
+            config: None,
             ..Default::default()
         },
         &snapshot,
@@ -309,43 +388,156 @@ async fn fixture(second_can_decrypt: bool) -> Fixture {
     RecordedInputAuthorityRepository::capture_queue_execution(&mut tx, execution.id, &item_ids)
         .await
         .unwrap();
-    let binding = SchemaContractRepository::materialize_action(&mut tx, &snapshot)
+    WorkQueueItemRepository::attach_execution_to_lease(&mut *tx, lease, execution.id)
         .await
         .unwrap();
-    SchemaContractRepository::attach(&mut tx, BindingOwner::Execution, execution.id, &binding)
-        .await
-        .unwrap();
-    let prepared = prepare_secret_values(
-        vec![SecretValueInput {
-            json_path: "/input".into(),
-            value: json!("accepted value"),
-            source_kind: "provenance".into(),
-            source_ref: Some(
-                serde_json::to_string(&SecretProvenance::key(origin.clone())).unwrap(),
-            ),
-        }],
+    let mut capture = sqlx::Connection::begin(&mut *tx).await.unwrap();
+    let admitted = Batch::capture_managed(
+        &mut capture,
+        record.id,
+        &queue,
+        &items,
+        None,
         ENCRYPTION_KEY,
     )
-    .unwrap();
-    ExecutionSecretValueRepository::upsert_many_with_conn(
+    .await;
+    if let Err(before_widening) = admitted {
+        capture.rollback().await.unwrap();
+        assert!(
+            !second_can_decrypt,
+            "complete source fixture unexpectedly rejected: {before_widening}"
+        );
+        use attune_common::repositories::identity::UpdatePermissionSetInput;
+        PermissionSetRepository::update(&mut *tx, sets[1], UpdatePermissionSetInput {
+            grants: Some(json!([{"resource":"keys","actions":["read","decrypt"],"constraints":{"refs":[origin.key_ref]}}])),
+            ..Default::default()
+        }).await.unwrap();
+        let mut capture = sqlx::Connection::begin(&mut *tx).await.unwrap();
+        let after_widening = match Batch::capture_managed(
+            &mut capture,
+            record.id,
+            &queue,
+            &items,
+            None,
+            ENCRYPTION_KEY,
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("later IAM cannot authorize the original contributor snapshot"),
+        };
+        capture.rollback().await.unwrap();
+        tx.rollback().await.unwrap();
+        return Err(Box::new(RejectedSource {
+            db,
+            before_widening,
+            after_widening,
+        }));
+    }
+    admitted
+        .unwrap()
+        .ensure_fresh_on(&mut capture)
+        .await
+        .unwrap();
+    capture.commit().await.unwrap();
+    let fixed = Fixed::load(&mut tx, &queue, &items[0], &snapshot, ENCRYPTION_KEY)
+        .await
+        .unwrap();
+    SchemaContractRepository::attach(
         &mut tx,
-        ENTITY_EXECUTION_CONFIG,
+        BindingOwner::Execution,
         execution.id,
-        &prepared,
+        fixed.schema(),
+    )
+    .await
+    .unwrap();
+    let declaration = Declarations::bindings(&mut tx, execution.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|site| site.source_path == "/queue/action_params/input")
+        .unwrap();
+    let mut session = Inputs::begin_render(
+        &mut tx,
+        execution.id,
+        &declaration.declaration_revision,
+        &declaration.source_path,
+        &declaration.expression,
+        InputSitePurpose::Value,
+    )
+    .await
+    .unwrap();
+    Inputs::bind_queue_configuration(&mut tx, &mut session, fixed.id(), ENCRYPTION_KEY)
+        .await
+        .unwrap();
+    Inputs::bind_queue_contributors(&mut tx, &mut session, ENCRYPTION_KEY)
+        .await
+        .unwrap();
+    let rendered = Inputs::evaluate(&mut tx, session).await.unwrap();
+    let site = InputSite {
+        execution: execution.id,
+        kind: InputEntityKind::ExecutionConfig,
+        purpose: InputSitePurpose::Value,
+        path: "/input".into(),
+    };
+    let receipt = Inputs::record_render(
+        &mut tx,
+        &rendered,
+        &site,
+        rendered.value(),
+        rendered.selections(),
+        ENCRYPTION_KEY,
+    )
+    .await
+    .unwrap();
+    let supplied = json!({"input":rendered.value()});
+    let (config, fields) = Materialize::workflow_child_defaults(
+        &mut tx,
+        execution.id,
+        &supplied,
+        vec![SecretValueInput {
+            json_path: "/input".into(),
+            value: rendered.value().clone(),
+            source_kind: "provenance".into(),
+            source_ref: Some(serde_json::to_string(&receipt.provenance()).unwrap()),
+        }],
+        Some(ENCRYPTION_KEY),
+    )
+    .await
+    .unwrap();
+    let fields = prepare_secret_values(fields, ENCRYPTION_KEY).unwrap();
+    ExecutionRepository::initialize_config_with_conn(
+        &mut tx,
+        execution.id,
+        Some(record.id),
+        &snapshot,
+        Some(config),
+        &fields,
+    )
+    .await
+    .unwrap();
+    Materialize::seal_execution_inputs(&mut tx, execution.id, ENCRYPTION_KEY)
+        .await
+        .unwrap();
+    ExecutionRepository::update(
+        &mut *tx,
+        execution.id,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Running),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
     tx.commit().await.unwrap();
-    Fixture {
+    Ok(Fixture {
         db,
         execution: execution.id,
         admission: record.id,
         sponsor,
         humans: humans.into_iter().map(|human| human.id).collect(),
         items: item_ids,
-        second_set: sets[1],
-        key_ref: origin.key_ref,
-    }
+    })
 }
 
 #[tokio::test]
@@ -387,23 +579,24 @@ async fn worker_restores_mixed_inputs_after_requester_and_queue_item_deletion() 
 
 #[tokio::test]
 async fn worker_does_not_union_contributor_grants_or_follow_later_iam_widening() {
-    let fixture = fixture(false).await;
-    let manager =
-        SecretManager::new(fixture.db.pool().clone(), Some(ENCRYPTION_KEY.into())).unwrap();
-    assert!(manager
-        .restore_execution_parameters(fixture.execution, json!({"input":"***"}))
-        .await
-        .is_err());
-    use attune_common::repositories::identity::UpdatePermissionSetInput;
-    PermissionSetRepository::update(&fixture.db, fixture.second_set, UpdatePermissionSetInput {
-        grants: Some(json!([{"resource":"keys","actions":["read","decrypt"],"constraints":{"refs":[fixture.key_ref]}}])),
-        ..Default::default()
-    }).await.unwrap();
-    assert!(manager
-        .restore_execution_parameters(fixture.execution, json!({"input":"***"}))
-        .await
-        .is_err());
-    fixture.db.cleanup().await.unwrap();
+    let rejected = match build_fixture(false, vec!["standard".into()]).await {
+        Ok(fixture) => {
+            fixture.db.cleanup().await.unwrap();
+            panic!("one contributor's decrypt grant cannot authorize another contributor");
+        }
+        Err(rejected) => rejected,
+    };
+    // Fail at the first protected capture, not at a later worker read of a
+    // missing manifest. The same original snapshots still deny after IAM widens.
+    assert!(matches!(
+        rejected.before_widening,
+        attune_common::Error::PermissionDenied(_)
+    ));
+    assert!(matches!(
+        rejected.after_widening,
+        attune_common::Error::PermissionDenied(_)
+    ));
+    rejected.db.cleanup().await.unwrap();
 }
 
 #[tokio::test]
