@@ -40,10 +40,6 @@ pub struct WorkerRegistration {
 }
 
 impl WorkerRegistration {
-    pub(crate) fn incarnation(&self) -> uuid::Uuid {
-        self.incarnation
-    }
-
     pub fn with_child_environment(
         mut self,
         environment: attune_common::child_process_environment::ChildProcessEnvironment,

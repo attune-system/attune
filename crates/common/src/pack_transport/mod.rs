@@ -54,6 +54,30 @@ pub trait PackFileTransport: Send + Sync + std::fmt::Debug {
         candidate_access_token: Option<&str>,
     ) -> Result<PathBuf>;
 
+    async fn publish_prepared_runtime(
+        &self,
+        _attempt: i64,
+        _access_token: &str,
+        _prepared: &crate::runtime_lifecycle::InstalledPreparation,
+    ) -> Result<()> {
+        Err(Error::configuration(
+            "Prepared runtime publication requires an API transport",
+        ))
+    }
+
+    async fn sync_prepared_runtime(
+        &self,
+        _release: i64,
+        prepared: &crate::runtime_lifecycle::InstalledPreparation,
+    ) -> Result<()> {
+        if prepared.archive().is_some() {
+            return Err(Error::configuration(
+                "Prepared runtime download requires an API transport",
+            ));
+        }
+        Ok(())
+    }
+
     /// Remove the local copy of a pack's file tree.
     ///
     /// For volume transport this is a no-op (volume is managed externally).

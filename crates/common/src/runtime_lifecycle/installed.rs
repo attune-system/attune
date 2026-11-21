@@ -6,6 +6,11 @@ use crate::models::{Action, ParameterDelivery, ParameterFormat, Runtime, Sensor}
 use std::io::Write;
 use uuid::Uuid;
 
+mod archive;
+pub use archive::{
+    PreparedRuntimeArchive, MAX_PREPARATION_ARCHIVE_BYTES, MAX_PREPARATION_RECEIPT_BYTES,
+};
+
 pub const PREPARATION_TRIGGER: &str = "runtime_preparation";
 const STORAGE: &str = ".installed-runtime-preparations";
 pub const MAX_TARGETS: usize = 16;
@@ -26,9 +31,27 @@ impl PreparationScope {
         let root = root.join(STORAGE);
         std::fs::create_dir_all(&root)?;
         let root = root.canonicalize()?;
+        let storage = if environment.object_backed_preparation() {
+            Uuid::nil()
+        } else {
+            Self::local_storage_id(&root)?
+        };
+        Ok(Some(Self {
+            storage,
+            root,
+            revision: revision.into(),
+            platform: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
+        }))
+    }
+
+    pub fn is_object_backed(&self) -> bool {
+        self.storage.is_nil()
+    }
+
+    fn local_storage_id(root: &Path) -> Result<Uuid> {
         let marker = root.join("storage-id");
         if !marker.try_exists()? {
-            let mut file = tempfile::NamedTempFile::new_in(&root)?;
+            let mut file = tempfile::NamedTempFile::new_in(root)?;
             write!(file, "{}", Uuid::new_v4())?;
             file.as_file().sync_all()?;
             if let Err(error) = file.persist_noclobber(&marker) {
@@ -36,17 +59,17 @@ impl PreparationScope {
                     return Err(error.error.into());
                 }
             }
-            sync_dir(&root)?;
+            sync_dir(root)?;
         }
-        let storage = std::fs::read_to_string(&marker)?
+        let storage: Uuid = std::fs::read_to_string(&marker)?
             .parse()
             .map_err(|_| invalid("Invalid runtime preparation storage identity"))?;
-        Ok(Some(Self {
-            storage,
-            root,
-            revision: revision.into(),
-            platform: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
-        }))
+        if storage.is_nil() {
+            return Err(invalid(
+                "Invalid local runtime preparation storage identity",
+            ));
+        }
+        Ok(storage)
     }
 
     pub fn for_worker(worker: &crate::models::Worker) -> Option<Self> {
@@ -197,6 +220,8 @@ pub struct InstalledPreparation {
     retained: (String, String),
     tools: BTreeMap<String, VerifiedTool>,
     tool_hashes: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    archive: Option<PreparedRuntimeArchive>,
 }
 
 impl RuntimeRecipe {
@@ -275,6 +300,7 @@ impl RuntimeRecipe {
             retained,
             tools: build.tools,
             tool_hashes,
+            archive: None,
         })
     }
 

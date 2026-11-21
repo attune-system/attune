@@ -17,8 +17,9 @@ use tokio_util::sync::CancellationToken;
 
 mod installed;
 pub use installed::{
-    InstalledPreparation, PreparationScope, PreparationTarget, PreparationWorkload, MAX_TARGETS,
-    PREPARATION_TRIGGER,
+    InstalledPreparation, PreparationScope, PreparationTarget, PreparationWorkload,
+    PreparedRuntimeArchive, MAX_PREPARATION_ARCHIVE_BYTES, MAX_PREPARATION_RECEIPT_BYTES,
+    MAX_TARGETS, PREPARATION_TRIGGER,
 };
 
 const CAPTURE_BYTES: usize = 64 * 1024;

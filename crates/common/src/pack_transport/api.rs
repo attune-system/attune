@@ -375,6 +375,140 @@ impl PackFileTransport for ApiPackTransport {
         Ok(pack_dir)
     }
 
+    async fn publish_prepared_runtime(
+        &self,
+        attempt: i64,
+        access_token: &str,
+        prepared: &crate::runtime_lifecycle::InstalledPreparation,
+    ) -> Result<()> {
+        use futures::StreamExt;
+        use tokio_util::io::ReaderStream;
+
+        let receipt = serde_json::to_vec(prepared)?;
+        if receipt.len() > crate::runtime_lifecycle::MAX_PREPARATION_RECEIPT_BYTES {
+            return Err(Error::validation(
+                "Prepared runtime receipt exceeds the size limit",
+            ));
+        }
+        let (archive, size, digest) = prepared
+            .build_archive()
+            .await
+            .map_err(|error| Error::validation(error.to_string()))?;
+        let mut prefix = (receipt.len() as u32).to_be_bytes().to_vec();
+        prefix.extend(receipt);
+        let url = format!(
+            "{}/api/v1/internal/pack-installs/{attempt}/prepared-runtime",
+            self.api_url
+        );
+        let mut token = self.auth_token_source.token()?;
+        for retry in [false, true] {
+            let file = tokio::fs::File::open(archive.path())
+                .await
+                .map_err(|error| Error::io(error.to_string()))?;
+            let prefix_bytes = bytes::Bytes::copy_from_slice(&prefix);
+            let body = futures::stream::once(async move { Ok::<_, std::io::Error>(prefix_bytes) })
+                .chain(ReaderStream::new(file));
+            let response = self
+                .client
+                .post(&url)
+                .bearer_auth(&token)
+                .header("x-attune-pack-candidate-token", access_token)
+                .header("x-attune-runtime-archive-size", size)
+                .header("x-attune-sha256", &digest)
+                .header(reqwest::header::CONTENT_LENGTH, size + prefix.len() as u64)
+                .body(reqwest::Body::wrap_stream(body))
+                .send()
+                .await
+                .map_err(|error| Error::io(format!("Prepared runtime upload failed: {error}")))?;
+            if response.status() == reqwest::StatusCode::NO_CONTENT {
+                return Ok(());
+            }
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED
+                && !retry
+                && self.auth_token_source.can_force_refresh()
+            {
+                token = self.auth_token_source.force_refresh()?;
+                continue;
+            }
+            return Err(Error::validation(format!(
+                "Prepared runtime upload returned {}",
+                response.status()
+            )));
+        }
+        unreachable!("prepared runtime upload retry always returns")
+    }
+
+    async fn sync_prepared_runtime(
+        &self,
+        release: i64,
+        prepared: &crate::runtime_lifecycle::InstalledPreparation,
+    ) -> Result<()> {
+        let Some(archive) = prepared.archive() else {
+            return Ok(());
+        };
+        if prepared.is_local() {
+            return Ok(());
+        }
+        if archive.size > crate::runtime_lifecycle::MAX_PREPARATION_ARCHIVE_BYTES {
+            return Err(Error::validation("Prepared runtime exceeds the size limit"));
+        }
+        let url = format!(
+            "{}/api/v1/internal/pack-releases/{release}/prepared-runtimes/{}",
+            self.api_url,
+            prepared.directory()
+        );
+        let token = self.auth_token_source.token()?;
+        let download = |token: String| self.client.get(&url).bearer_auth(token).send();
+        let mut response = download(token)
+            .await
+            .map_err(|error| Error::io(format!("Prepared runtime download failed: {error}")))?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && self.auth_token_source.can_force_refresh()
+        {
+            response = download(self.auth_token_source.force_refresh()?)
+                .await
+                .map_err(|error| Error::io(format!("Prepared runtime download failed: {error}")))?;
+        }
+        if !response.status().is_success() || response.content_length() != Some(archive.size) {
+            return Err(Error::validation(format!(
+                "Unexpected prepared runtime response ({})",
+                response.status()
+            )));
+        }
+        let file = tempfile::NamedTempFile::new_in(&self.candidate_base_dir)
+            .map_err(|error| Error::io(error.to_string()))?;
+        let mut writer = tokio::fs::File::from_std(
+            file.reopen()
+                .map_err(|error| Error::io(error.to_string()))?,
+        );
+        let mut remaining = archive.size;
+        while let Some(bytes) = response
+            .chunk()
+            .await
+            .map_err(|error| Error::io(format!("Prepared runtime download interrupted: {error}")))?
+        {
+            remaining = remaining
+                .checked_sub(bytes.len() as u64)
+                .ok_or_else(|| Error::validation("Prepared runtime is larger than its receipt"))?;
+            writer
+                .write_all(&bytes)
+                .await
+                .map_err(|error| Error::io(error.to_string()))?;
+        }
+        if remaining != 0 {
+            return Err(Error::validation("Prepared runtime download is incomplete"));
+        }
+        writer
+            .sync_all()
+            .await
+            .map_err(|error| Error::io(error.to_string()))?;
+        drop(writer);
+        prepared
+            .restore_archive(file)
+            .await
+            .map_err(|error| Error::validation(error.to_string()))
+    }
+
     async fn remove_pack(&self, pack_ref: &str) -> Result<()> {
         RefValidator::validate_pack_ref(pack_ref)?;
         let pack_dir = std::path::Path::new(&self.packs_base_dir).join(pack_ref); // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- RefValidator rejects separators and traversal components before joining to the trusted pack root.

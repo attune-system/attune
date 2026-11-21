@@ -49,6 +49,7 @@ impl PreparationJob {
         ready.target == self.target
             && ready.release_digest == release_digest
             && self.scopes.contains(&ready.scope)
+            && ready.scope.is_object_backed() == ready.archive().is_some()
     }
 }
 
@@ -350,6 +351,16 @@ impl RuntimePreparationRepository {
         if affected != 1 {
             return Ok(false);
         }
+        if let Some(archive) = prepared.archive() {
+            super::ObjectMaintenanceRepository::record_uploaded(
+                &mut *tx,
+                &archive.key,
+                &archive.version,
+                i64::try_from(archive.size)
+                    .map_err(|_| Error::validation("Invalid archive size"))?,
+            )
+            .await?;
+        }
         sqlx::query(
             "UPDATE pack_install SET status = 'activating', candidate_access_token_hash = NULL, \
              updated_at = clock_timestamp() WHERE id = $1",
@@ -359,6 +370,33 @@ impl RuntimePreparationRepository {
         .await?;
         tx.commit().await?;
         Ok(true)
+    }
+
+    /// The HTTP worker token identifies a delivery instance. Translate that
+    /// registered instance to the separate preparation claim incarnation.
+    pub async fn builder_for_upload(
+        pool: &PgPool,
+        install: Id,
+        worker: Id,
+        instance: uuid::Uuid,
+    ) -> Result<Option<uuid::Uuid>> {
+        Ok(sqlx::query_scalar(
+            "SELECT a.builder_incarnation
+             FROM pack_runtime_preparation_attempt a
+             JOIN pack_install i ON i.id = a.install
+             JOIN pack_install parent ON parent.id = a.activation
+             JOIN worker w ON w.id = i.assigned_worker_id
+             WHERE a.install = $1 AND w.id = $2
+                AND w.capabilities->>'log_delivery_instance' = $3::uuid::text
+                AND w.meta->>'registration_incarnation' = a.builder_incarnation::text
+                AND i.status = 'running' AND parent.status = 'activating'
+                AND a.expires_at > clock_timestamp() AND a.prepared IS NULL",
+        )
+        .bind(install)
+        .bind(worker)
+        .bind(instance)
+        .fetch_optional(pool)
+        .await?)
     }
 
     pub async fn bind_release(
@@ -468,6 +506,32 @@ impl RuntimePreparationRepository {
             .map(|record| record.0)
             .filter(|record| record.release_digest == digest && record.target == *target)
             .collect())
+    }
+
+    /// Only a registered, compatible manager can download release-bound output.
+    pub async fn find_download(
+        pool: &PgPool,
+        worker: Id,
+        release: Id,
+        directory: uuid::Uuid,
+    ) -> Result<Option<InstalledPreparation>> {
+        let Some(worker) = WorkerRepository::find_by_id(pool, worker).await? else {
+            return Ok(None);
+        };
+        let ready: Option<sqlx::types::Json<InstalledPreparation>> = sqlx::query_scalar(
+            "SELECT p.prepared FROM pack_release_runtime_preparation p
+             JOIN pack_release r ON r.id = p.release
+             WHERE p.release = $1 AND p.prepared->>'directory' = $2
+                 AND p.prepared->>'release_digest' = r.digest
+             ORDER BY p.id DESC LIMIT 1",
+        )
+        .bind(release)
+        .bind(directory.to_string())
+        .fetch_optional(pool)
+        .await?;
+        Ok(ready.map(|ready| ready.0).filter(|ready| {
+            ready.archive().is_some() && can_consume(&worker, std::slice::from_ref(ready))
+        }))
     }
 }
 

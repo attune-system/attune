@@ -141,14 +141,15 @@ explicit candidate test runners still prepare for each invocation.
   `ATTUNE_RUNTIME_PREPARATION_REVISION` to a nonsecret revision for the exact
   image, toolchain and effective operator build configuration. Change that
   revision when those inputs change. Use read-only, revisioned system tooling.
-- A builder and its consumers must see the same runtime storage at the same
-  absolute path, using compatible images and a common manager UID. A persistent
-  storage ID distinguishes separate worker-local volumes even if their paths
-  and configured revisions match. Keep that ID unique when provisioning
-  independent volumes. Give the managers write access for generation creation
-  and invocation scratch. An action can use a worker's local volume. Each
-  managed sensor needs explicitly shared storage between its builder and
-  eligible sensor managers.
+- Builders and consumers need the same absolute runtime path, compatible images,
+  and a common manager UID. Give each manager writable storage for its local
+  cache and invocation scratch. In object mode the API publishes a version-pinned
+  archive of the prepared files before activation. Compatible action workers and
+  sensor managers restore it into their own cache on demand, including after Pod
+  replacement. An `emptyDir` or per-Pod ReadWriteOnce volume supports this mode.
+  With filesystem-backed storage, prepared files stay on the runtime volume.
+  Consumers of a managed sensor's files must share its builder's volume, and
+  a persistent storage ID keeps independent volumes distinct.
 - A release can prepare up to 16 targets. Each target gets its own eligible
   storage scope and a five-minute preparation attempt. Builders honor pack
   placement, and action builders also honor action placement. Sensor and rule
@@ -166,16 +167,17 @@ explicit candidate test runners still prepare for each invocation.
   seal, the retained files, and the resolved tools against the recorded
   identities. It mounts the prepared files read-only and allocates independent
   writable home, scratch, artifact staging and Python bytecode paths. Loss of
-  the storage or an identity mismatch prevents launch until a matching scope is
-  available or the release is prepared again.
+  the local cache in object mode triggers a restore of the exact recorded
+  object at its original absolute path. An identity mismatch or unavailable
+  archive prevents launch.
 
 Installed generations keep their original physical paths under
 `runtime_envs_dir/.installed-runtime-preparations/` across manager restarts.
 Invocation teardown removes its own scratch after process teardown. Installed
-generation storage is retained for pinned executions and sensors and has no
-online reclamation in this slice. Size the volume for retained and quarantined
-generations. Reclaim it only after retiring its release references, draining all
-workloads and proving that writers have stopped.
+generation storage is retained for pinned executions and sensors. Size local
+volumes for retained and quarantined generations. Coordinate local reclamation
+with workload drain and writer teardown. Object archives remain pinned by their
+release references.
 
 The full-service regression is in
 [test_install_runtime_preparation.py](../../tests/e2e/api/test_install_runtime_preparation.py).

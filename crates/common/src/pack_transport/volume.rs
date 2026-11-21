@@ -102,6 +102,34 @@ impl PackFileTransport for VolumePackTransport {
             .await
     }
 
+    async fn publish_prepared_runtime(
+        &self,
+        attempt: i64,
+        access_token: &str,
+        prepared: &crate::runtime_lifecycle::InstalledPreparation,
+    ) -> Result<()> {
+        let transport = self.candidate_transport.as_ref().ok_or_else(|| {
+            crate::Error::configuration("Prepared runtime publication requires an API transport")
+        })?;
+        transport
+            .publish_prepared_runtime(attempt, access_token, prepared)
+            .await
+    }
+
+    async fn sync_prepared_runtime(
+        &self,
+        release: i64,
+        prepared: &crate::runtime_lifecycle::InstalledPreparation,
+    ) -> Result<()> {
+        if prepared.archive().is_none() {
+            return Ok(());
+        }
+        let transport = self.candidate_transport.as_ref().ok_or_else(|| {
+            crate::Error::configuration("Prepared runtime download requires an API transport")
+        })?;
+        transport.sync_prepared_runtime(release, prepared).await
+    }
+
     async fn remove_pack(&self, pack_ref: &str) -> Result<()> {
         RefValidator::validate_pack_ref(pack_ref)?;
         self.verified.lock().await.clear();
