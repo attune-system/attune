@@ -249,7 +249,18 @@ async fn recorded_queue_operations_use_structural_ownership_and_exact_execution_
             Some(&fixture.token),
         )
         .await?;
-    assert_eq!(replaced.status(), StatusCode::OK);
+    assert_eq!(
+        replaced.status(),
+        StatusCode::OK,
+        "{}",
+        replaced.text().await?
+    );
+    let replacement: Value = replaced.json().await?;
+    assert_eq!(replacement["data"]["id"], id);
+    assert_eq!(
+        replacement["data"]["payload"],
+        json!({"message":"replacement"})
+    );
     assert_eq!(
         fixture
             .ctx
