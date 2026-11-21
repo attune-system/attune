@@ -6,19 +6,22 @@ mod helpers;
 
 use attune_common::{
     artifact_transport::VolumeTransport,
-    models::{ExecutionStatus, OutputFormat, WorkerStatus, WorkerType},
+    models::{Execution, ExecutionStatus, OutputFormat, WorkerRole, WorkerStatus, WorkerType},
     pack_format::LaunchSpec,
     repositories::{
         action::{ActionRepository, UpdateActionInput},
         component_lifecycle::PackProjectionIds,
         delegated_execution::DelegatedExecutionRepository,
         executable_snapshot::ExecutableSnapshotRepository,
-        execution::{CreateExecutionInput, ExecutionRepository, UpdateExecutionInput},
+        execution::{
+            CreateExecutionInput, ExecutionRepository, UpdateExecutionInput,
+            WorkerExecutionAssignment,
+        },
         execution_program::ExecutionProgramRepository,
         pack_release::{CreatePackReleaseInput, PackReleaseRepository},
         runtime::{CreateWorkerInput, WorkerRepository},
         schema_contract::{BindingOwner, SchemaContractRepository},
-        Create, Delete, FindById, Patch, Update,
+        Delete, FindById, Patch, Update,
     },
     value_schema::CompiledContract,
 };
@@ -75,6 +78,99 @@ enum Case {
     MissingRoot,
     ProtectedInput,
 }
+
+async fn assert_assignment_fences(
+    db: &sqlx::PgPool,
+    scheduled: &Execution,
+    input: CreateWorkerInput,
+    first: uuid::Uuid,
+) {
+    let worker = scheduled.worker.unwrap();
+    let assignment = WorkerExecutionAssignment {
+        instance: first,
+        scheduled_at: scheduled.updated,
+        pack_release: scheduled.pack_release,
+        pack_release_digest: scheduled.pack_release_digest.clone(),
+        recorded: false,
+    };
+    let mut tx = db.begin().await.unwrap();
+    let claimed = ExecutionRepository::claim_worker_execution(
+        &mut tx,
+        scheduled.id,
+        worker,
+        Some(&assignment),
+    )
+    .await
+    .unwrap();
+    assert_eq!(claimed.execution.status, ExecutionStatus::Running);
+    assert!(ExecutionRepository::claim_worker_execution(
+        &mut tx,
+        scheduled.id,
+        worker,
+        Some(&assignment)
+    )
+    .await
+    .is_err());
+    tx.rollback().await.unwrap();
+
+    let second = uuid::Uuid::new_v4();
+    let replacement = WorkerRepository::register_incarnation(db, input, WorkerRole::Action, second)
+        .await
+        .unwrap();
+    assert_eq!(replacement.id, worker);
+    let mut tx = db.begin().await.unwrap();
+    assert!(ExecutionRepository::claim_worker_execution(
+        &mut tx,
+        scheduled.id,
+        worker,
+        Some(&assignment)
+    )
+    .await
+    .is_err());
+    tx.rollback().await.unwrap();
+
+    let stale = WorkerExecutionAssignment {
+        instance: second,
+        scheduled_at: scheduled.updated - chrono::TimeDelta::microseconds(1),
+        ..assignment
+    };
+    let mut tx = db.begin().await.unwrap();
+    assert!(ExecutionRepository::claim_worker_execution(
+        &mut tx,
+        scheduled.id,
+        worker,
+        Some(&stale)
+    )
+    .await
+    .is_err());
+    tx.rollback().await.unwrap();
+
+    let mut tx = db.begin().await.unwrap();
+    let canceling = ExecutionRepository::update(
+        &mut *tx,
+        scheduled.id,
+        UpdateExecutionInput {
+            status: Some(ExecutionStatus::Canceling),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let current = WorkerExecutionAssignment {
+        scheduled_at: canceling.updated,
+        ..stale
+    };
+    assert!(ExecutionRepository::claim_worker_execution(
+        &mut tx,
+        scheduled.id,
+        worker,
+        Some(&current)
+    )
+    .await
+    .is_err());
+    tx.rollback().await.unwrap();
+}
+
 async fn execute_case(case: Case) {
     let packaged = matches!(case, Case::Packaged);
     let stdin = matches!(case, Case::Stdin);
@@ -207,20 +303,24 @@ async fn execute_case(case: Case) {
         .create(&db)
         .await
         .unwrap();
-    let worker = WorkerRepository::create(
+    let incarnation = uuid::Uuid::new_v4();
+    let worker_input = CreateWorkerInput {
+        name: "cli-worker".into(),
+        worker_type: WorkerType::Local,
+        runtime: None,
+        host: None,
+        port: None,
+        status: Some(WorkerStatus::Active),
+        capabilities: Some(
+            json!({"role":"action","runtimes":["native"],"action_cli_arguments_v1":true}),
+        ),
+        meta: None,
+    };
+    let worker = WorkerRepository::register_incarnation(
         &db,
-        CreateWorkerInput {
-            name: "cli-worker".into(),
-            worker_type: WorkerType::Local,
-            runtime: None,
-            host: None,
-            port: None,
-            status: Some(WorkerStatus::Active),
-            capabilities: Some(
-                json!({"role":"action","runtimes":["native"],"action_cli_arguments_v1":true}),
-            ),
-            meta: None,
-        },
+        worker_input.clone(),
+        WorkerRole::Action,
+        incarnation,
     )
     .await
     .unwrap();
@@ -294,7 +394,7 @@ async fn execute_case(case: Case) {
         .await
         .unwrap();
     tx.commit().await.unwrap();
-    ExecutionRepository::update(
+    let scheduled = ExecutionRepository::update(
         &db,
         execution.id,
         UpdateExecutionInput {
@@ -305,6 +405,9 @@ async fn execute_case(case: Case) {
     )
     .await
     .unwrap();
+    if matches!(case, Case::Command) {
+        assert_assignment_fences(&db, &scheduled, worker_input, incarnation).await;
+    }
     // Mutable current metadata must never change an admitted execution.
     ActionRepository::update(
         &db,

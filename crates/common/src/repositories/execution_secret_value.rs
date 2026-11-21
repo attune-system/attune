@@ -2,10 +2,14 @@
 
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
-use sqlx::{Executor, PgConnection, Postgres};
+use sqlx::{Executor, PgConnection, Postgres, Transaction};
 
-use crate::secret_values::{PreparedSecretValue, StoredSecretValue};
-use crate::{models::Id, Result};
+use crate::secret_values::{
+    restore_secret_values, PreparedSecretValue, StoredSecretValue, ENTITY_EXECUTION_CONFIG,
+};
+use crate::{models::Id, Error, Result};
+
+use super::{inherited_input::ReceiptContext, FindById};
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ExecutionSecretValue {
@@ -33,6 +37,80 @@ pub struct SecretProvenanceRow {
 }
 
 impl ExecutionSecretValueRepository {
+    /// Restore accepted execution inputs within the transaction that owns
+    /// delivery. Check the returned receipts again after commit and before
+    /// handing plaintext to a caller.
+    pub async fn restore_execution_parameters(
+        transaction: &mut Transaction<'_, Postgres>,
+        execution_id: Id,
+        redacted_config: JsonValue,
+        encryption_key: Option<&str>,
+    ) -> Result<(JsonValue, Vec<String>, Vec<ReceiptContext>)> {
+        let connection = &mut **transaction;
+        super::schema_type::SchemaTypeRepository::lock_selection(connection).await?;
+        let secrets =
+            Self::find_stored_by_entity(&mut *connection, ENTITY_EXECUTION_CONFIG, execution_id)
+                .await?;
+        let paths = secrets
+            .iter()
+            .map(|secret| secret.json_path.clone())
+            .collect();
+        let execution =
+            super::execution::ExecutionRepository::find_by_id(&mut *connection, execution_id)
+                .await?
+                .ok_or_else(|| Error::invalid_state("Execution secret owner is unavailable"))?;
+        if secrets.is_empty() {
+            crate::key_access::authorize_execution_parameter_key_origins_with_conn(
+                connection,
+                execution_id,
+                execution.executor,
+                &secrets,
+            )
+            .await?;
+            return Ok((redacted_config, paths, Vec::new()));
+        }
+
+        let encryption_key =
+            encryption_key.ok_or_else(|| Error::internal("No encryption key configured"))?;
+
+        let (ordinary, receipts) = super::immutable_input_origin::prepare_input_receipts(
+            connection,
+            ENTITY_EXECUTION_CONFIG,
+            execution_id,
+            &secrets,
+            encryption_key,
+        )
+        .await?;
+        if !ordinary.is_empty() {
+            crate::key_access::authorize_execution_parameter_key_origins_with_conn(
+                connection,
+                execution_id,
+                execution.executor,
+                &ordinary,
+            )
+            .await?;
+        }
+        super::immutable_input_origin::bind_input_receipt_buffers(
+            connection,
+            ENTITY_EXECUTION_CONFIG,
+            execution_id,
+            &secrets,
+        )
+        .await?;
+
+        let restored =
+            restore_secret_values(redacted_config, &secrets, encryption_key).map_err(|e| {
+                Error::Internal(format!(
+                    "Failed to restore secret parameters for execution {}: {}",
+                    execution_id, e
+                ))
+            })?;
+        for receipt in &receipts {
+            receipt.ensure_fresh_on(connection).await?;
+        }
+        Ok((restored, paths, receipts))
+    }
+
     /// Read only the exact source sites in one disclosure frontier. Zipped
     /// selectors must not turn into a cross product of entity kinds and IDs.
     pub async fn find_bounded_provenance_by_sites(

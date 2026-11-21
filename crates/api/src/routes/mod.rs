@@ -22,6 +22,7 @@ pub mod inquiry_callbacks;
 pub mod internal_files;
 pub mod keys;
 mod lifecycle_authorization;
+pub(crate) mod managers;
 mod pack_request;
 pub mod packs;
 pub mod permissions;

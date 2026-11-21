@@ -693,6 +693,8 @@ pub struct LogDeliveryConfig {
     pub enabled: bool,
     /// Optional private persistent root; defaults below runtime_envs_dir.
     pub spool_dir: Option<String>,
+    /// File containing a dedicated worker spool key. Keep it stable with the spool.
+    pub spool_key_file: Option<PathBuf>,
     pub max_spool_bytes: u64,
     pub max_finalizers: usize,
 }
@@ -701,6 +703,7 @@ impl Default for LogDeliveryConfig {
         Self {
             enabled: true,
             spool_dir: None,
+            spool_key_file: None,
             max_spool_bytes: 1024 * 1024 * 1024,
             max_finalizers: 64,
         }
@@ -710,7 +713,7 @@ impl Default for LogDeliveryConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerConfig {
     /// Persistent local custody for asynchronous object logs. Shared-file logs
-    /// retain synchronous delivery. The worker encryption key is required.
+    /// retain synchronous delivery. Local custody requires an encryption key.
     #[serde(default)]
     pub log_delivery: LogDeliveryConfig,
 
@@ -2175,6 +2178,10 @@ pub struct Config {
     /// Agent configuration (optional, for agent binary distribution)
     pub agent: Option<AgentConfig>,
 
+    /// API-side enrollment grants for action and sensor manager pools.
+    #[serde(default)]
+    pub manager_enrollments: Vec<crate::manager_control::ManagerEnrollmentGrant>,
+
     /// Pack upload safety limits (optional; sensible defaults are used when absent).
     #[serde(default)]
     pub pack_upload: PackUploadConfig,
@@ -2557,6 +2564,18 @@ impl Config {
     /// Validate configuration
     pub fn validate(&self) -> crate::Result<()> {
         self.branding.validate()?;
+        crate::manager_control::ManagerEnrollmentGrant::validate_all(&self.manager_enrollments)?;
+        if !self.manager_enrollments.is_empty()
+            && !self
+                .security
+                .jwt_secret
+                .as_deref()
+                .is_some_and(|key| key.trim().len() >= 32)
+        {
+            return Err(crate::Error::configuration(
+                "Workload manager enrollment requires an explicit signing key",
+            ));
+        }
         self.packs.republish.validate()?;
         self.artifacts.validate_file_memory()?;
         if let Some(worker) = &self.worker {
@@ -3061,6 +3080,7 @@ mod tests {
             pack_registry: PackRegistryConfig::default(),
             executor: None,
             agent: None,
+            manager_enrollments: Vec::new(),
             pack_upload: PackUploadConfig::default(),
             retention: RetentionConfig::default(),
             maintenance: SupervisorMaintenanceConfig::default(),
@@ -3617,6 +3637,7 @@ mod tests {
             pack_registry: PackRegistryConfig::default(),
             executor: None,
             agent: None,
+            manager_enrollments: Vec::new(),
             pack_upload: PackUploadConfig::default(),
             retention: RetentionConfig::default(),
             maintenance: SupervisorMaintenanceConfig::default(),
@@ -3681,6 +3702,7 @@ mod tests {
             pack_registry: PackRegistryConfig::default(),
             executor: None,
             agent: None,
+            manager_enrollments: Vec::new(),
             pack_upload: PackUploadConfig::default(),
             retention: RetentionConfig::default(),
             maintenance: SupervisorMaintenanceConfig::default(),

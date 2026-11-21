@@ -85,6 +85,7 @@ pub mod maintenance_admission;
 pub mod managed_component_readmission;
 pub mod managed_executable;
 pub mod managed_sensor_metadata;
+pub mod manager_session;
 pub mod native_cache_materialization;
 pub mod native_failure_materialization;
 pub mod native_generation_origin;

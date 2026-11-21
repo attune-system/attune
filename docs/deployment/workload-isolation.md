@@ -75,11 +75,10 @@ ATTUNE_TEST_RUN_ID=bwrap-recipe cargo test -p attune-common --test runtime_lifec
 
 The process and filesystem boundary limits a pack workload's access to
 manager credentials, sibling processes and published files. Workers and sensor
-managers still hold their control-plane credentials. Moving those credentials
-out of the managers requires a separately designed, attempt-scoped control
-protocol that preserves recorded authority, secret origins and log custody.
-Control-plane network policy can restrict direct database reachability after
-workers and sensor managers switch to that protocol.
+managers still hold their control-plane credentials. The
+[API-only manager cutover](api-only-managers.md) requires wiring both manager
+binaries to the API and validating attempt authority, secret origins, and log
+custody before restricting direct control-plane network access.
 
 For eligible recipes, install-time preparation publishes a release-pinned
 generation before activation. The worker or sensor manager opens it read-only

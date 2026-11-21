@@ -7,7 +7,7 @@ use crate::models::{
     runtime::*,
     Id, JsonDict,
 };
-use crate::Result;
+use crate::{Error, Result};
 use sqlx::{Executor, Postgres, QueryBuilder};
 
 use super::{
@@ -762,17 +762,19 @@ impl WorkerRepository {
         role: crate::models::WorkerRole,
         incarnation: uuid::Uuid,
     ) -> Result<Worker> {
-        Ok(sqlx::query_as::<_, Worker>(&format!(
+        sqlx::query_as::<_, Worker>(&format!(
             "INSERT INTO worker (name, worker_type, worker_role, runtime, host, port, status, capabilities, meta, last_heartbeat) \
              VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, jsonb_build_object('registration_incarnation', $8::text), NOW()) \
              ON CONFLICT (name) DO UPDATE SET status = 'active', last_heartbeat = NOW(), \
              host = EXCLUDED.host, port = EXCLUDED.port, capabilities = EXCLUDED.capabilities, \
              meta = COALESCE(worker.meta, '{{}}'::jsonb) || EXCLUDED.meta, updated = NOW() \
+             WHERE worker.worker_role = EXCLUDED.worker_role \
              RETURNING {WORKER_SELECT_COLUMNS}"
         ))
         .bind(input.name).bind(input.worker_type).bind(role).bind(input.runtime)
         .bind(input.host).bind(input.port).bind(input.capabilities).bind(incarnation.to_string())
-        .fetch_one(executor).await?)
+        .fetch_optional(executor).await?
+        .ok_or_else(|| Error::PermissionDenied("Worker name belongs to another role".into()))
     }
 
     pub async fn deregister_incarnation(

@@ -84,6 +84,15 @@ pub struct WorkerExecutionLoad {
     pub total_active: i64,
 }
 
+/// The executor's selected worker and exact scheduling attempt seen at dispatch.
+pub struct WorkerExecutionAssignment {
+    pub instance: uuid::Uuid,
+    pub scheduled_at: DateTime<Utc>,
+    pub pack_release: Option<Id>,
+    pub pack_release_digest: Option<String>,
+    pub recorded: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkflowTaskExecutionCreateOrGetResult {
     pub execution: Execution,
@@ -213,6 +222,67 @@ impl From<&Execution> for ExecutionAuthorizationRow {
 }
 
 impl ExecutionRepository {
+    /// Claim an executor-scheduled execution under the same transaction as its
+    /// attempt authority. Callers authenticate the worker instance separately.
+    pub async fn claim_worker_execution(
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        id: Id,
+        worker: Id,
+        assignment: Option<&WorkerExecutionAssignment>,
+    ) -> Result<ExecutionTransition> {
+        use super::execution_runtime_admission::{
+            ExecutionAdmissionRepository, ExistingExecutionAuthority,
+        };
+        let recorded = ExecutionAdmissionRepository::existing_authority(tx, id).await?
+            == ExistingExecutionAuthority::Recorded;
+        let stale = || {
+            Error::PermissionDenied("Worker execution assignment is stale or unavailable".into())
+        };
+        if recorded != assignment.is_some_and(|assignment| assignment.recorded) {
+            return Err(stale());
+        }
+
+        let execution = Self::find_by_id_for_update(tx, id)
+            .await?
+            .ok_or_else(stale)?;
+        if let Some(assignment) = assignment {
+            if execution.worker != Some(worker)
+                || execution.status != ExecutionStatus::Scheduled
+                || execution.updated != assignment.scheduled_at
+                || execution.pack_release != assignment.pack_release
+                || execution.pack_release_digest != assignment.pack_release_digest
+            {
+                return Err(stale());
+            }
+            let instance = assignment.instance.to_string();
+            let registration =
+                super::runtime::WorkerRepository::find_registration_for_share(tx, worker).await?;
+            if !registration.is_some_and(|worker| {
+                worker.worker_role == crate::models::WorkerRole::Action
+                    && worker.status == Some(crate::models::WorkerStatus::Active)
+                    && (!recorded || !worker.cordoned)
+                    && worker
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta["registration_incarnation"].as_str())
+                        == Some(instance.as_str())
+            }) {
+                return Err(stale());
+            }
+        }
+        if !recorded {
+            super::delegated_execution::DelegatedExecutionRepository::start(tx, id, worker).await?;
+        }
+        Self::transition_worker(
+            &mut **tx,
+            id,
+            Some(worker).filter(|id| *id > 0),
+            ExecutionStatus::Running,
+            None,
+        )
+        .await
+    }
+
     /// Return the locked predecessor and updated row in one round trip. Stale
     /// deliveries cannot resurrect a terminal or canceling execution at startup.
     /// An absent worker is reserved for direct, unassigned executor callers.
