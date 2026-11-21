@@ -91,6 +91,7 @@ impl SensorService {
         config: Config,
         child_environment: attune_common::child_process_environment::ChildProcessEnvironment,
     ) -> Result<Self> {
+        let child_environment = child_environment.with_preparation_storage(&config.storage);
         info!("Initializing Sensor Service");
         config.validate_deployed_pack_transport()?;
         config.validate_deployed_artifact_transport()?;

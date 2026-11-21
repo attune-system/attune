@@ -101,6 +101,7 @@ pub struct ActionExecutor {
     recorded_boot: OnceLock<uuid::Uuid>,
     /// Transport abstraction for artifact file content.
     transport: Arc<dyn ArtifactFileTransport>,
+    pack_transport: Option<Arc<dyn attune_common::pack_transport::PackFileTransport>>,
     action_cache_by_id: Arc<MetadataCache<String, Action>>,
     action_cache_by_ref: Arc<MetadataCache<String, Action>>,
     runtime_cache_by_id: Arc<MetadataCache<String, RuntimeModel>>,
@@ -371,6 +372,14 @@ impl ActionExecutor {
             .ok_or_else(|| Error::PermissionDenied("Recorded worker support is unavailable".into()))
     }
 
+    pub fn with_pack_transport(
+        mut self,
+        transport: Arc<dyn attune_common::pack_transport::PackFileTransport>,
+    ) -> Self {
+        self.pack_transport = Some(transport);
+        self
+    }
+
     pub fn with_child_environment(
         mut self,
         environment: attune_common::child_process_environment::ChildProcessEnvironment,
@@ -430,6 +439,7 @@ impl ActionExecutor {
             jwt_config,
             recorded_boot: OnceLock::new(),
             transport,
+            pack_transport: None,
             action_cache_by_id: Arc::new(MetadataCache::new(
                 ACTION_CACHE_TTL,
                 ACTION_CACHE_MAX_ENTRIES,
@@ -1612,22 +1622,32 @@ impl ActionExecutor {
                         let scope =
                             PreparationScope::open(&self.runtime_envs_dir, &self.child_environment)
                                 .map_err(|error| Error::validation(error.to_string()))?;
-                        Some(
-                            RuntimePreparationRepository::ready_for(
-                                &self.pool,
-                                release.id,
-                                &release.digest,
-                                &target,
-                            )
-                            .await?
-                            .into_iter()
-                            .find(|ready| Some(&ready.scope) == scope.as_ref())
-                            .ok_or_else(|| {
-                                Error::validation(
-                                    "No ready installed runtime generation in this worker's scope",
-                                )
-                            })?,
+                        let ready = RuntimePreparationRepository::ready_for(
+                            &self.pool,
+                            release.id,
+                            &release.digest,
+                            &target,
                         )
+                        .await?
+                        .into_iter()
+                        .find(|ready| Some(&ready.scope) == scope.as_ref())
+                        .ok_or_else(|| {
+                            Error::validation(
+                                "No ready installed runtime generation in this worker's scope",
+                            )
+                        })?;
+                        if ready.archive().is_some() {
+                            self.pack_transport
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    Error::configuration(
+                                        "Prepared runtime download requires pack transport",
+                                    )
+                                })?
+                                .sync_prepared_runtime(release.id, &ready)
+                                .await?;
+                        }
+                        Some(ready)
                     } else {
                         None
                     }

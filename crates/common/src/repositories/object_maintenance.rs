@@ -149,6 +149,11 @@ impl ObjectMaintenanceRepository {
                   AND i.candidate_provider_version = l.provider_version \
                   AND ((i.status IN ('pending', 'running') AND i.started_at >= NOW() - ($3::bigint * INTERVAL '1 second')) \
                     OR (i.status = 'activating' AND i.updated_at >= NOW() - ($4::bigint * INTERVAL '1 second')))) \
+               AND NOT EXISTS (SELECT 1 FROM pack_release_runtime_preparation p
+                WHERE p.prepared->'archive'->>'key' = l.object_key AND p.prepared->'archive'->>'version' = l.provider_version)
+               AND NOT EXISTS (SELECT 1 FROM pack_runtime_preparation_attempt a JOIN pack_install i ON i.id = a.install
+                WHERE a.prepared->'archive'->>'key' = l.object_key AND a.prepared->'archive'->>'version' = l.provider_version
+                  AND i.status = 'activating' AND i.updated_at >= NOW() - ($4::bigint * INTERVAL '1 second')) \
                AND NOT EXISTS (SELECT 1 FROM artifact_version v WHERE v.object_key = l.object_key AND v.provider_version = l.provider_version) \
                AND NOT EXISTS (SELECT 1 FROM log_segment s WHERE s.object_key = l.object_key AND s.provider_version = l.provider_version) \
                AND NOT EXISTS (SELECT 1 FROM artifact_upload_grant g \
@@ -210,7 +215,12 @@ impl ObjectMaintenanceRepository {
                           AND i.candidate_provider_version = object_maintenance_ledger.provider_version \
                           AND ((i.status IN ('pending', 'running') AND i.started_at >= NOW() - ($3::bigint * INTERVAL '1 second')) \
                             OR (i.status = 'activating' AND i.updated_at >= NOW() - ($4::bigint * INTERVAL '1 second')))) \
-                   AND NOT EXISTS (SELECT 1 FROM artifact_version v \
+                   AND NOT EXISTS (SELECT 1 FROM pack_release_runtime_preparation p
+                WHERE p.prepared->'archive'->>'key' = object_maintenance_ledger.object_key AND p.prepared->'archive'->>'version' = object_maintenance_ledger.provider_version)
+               AND NOT EXISTS (SELECT 1 FROM pack_runtime_preparation_attempt a JOIN pack_install i ON i.id = a.install
+                WHERE a.prepared->'archive'->>'key' = object_maintenance_ledger.object_key AND a.prepared->'archive'->>'version' = object_maintenance_ledger.provider_version
+                  AND i.status = 'activating' AND i.updated_at >= NOW() - ($4::bigint * INTERVAL '1 second')) \
+               AND NOT EXISTS (SELECT 1 FROM artifact_version v \
                                    WHERE v.object_key = object_maintenance_ledger.object_key \
                                      AND v.provider_version = object_maintenance_ledger.provider_version) \
                    AND NOT EXISTS (SELECT 1 FROM log_segment s \
@@ -420,6 +430,11 @@ impl ObjectMaintenanceRepository {
              OR EXISTS (SELECT 1 FROM pack_install WHERE candidate_object_key = $1 AND candidate_provider_version = $2 \
                  AND ((status IN ('pending', 'running') AND started_at >= NOW() - ($3::bigint * INTERVAL '1 second')) \
                    OR (status = 'activating' AND updated_at >= NOW() - ($4::bigint * INTERVAL '1 second')))) \
+             OR EXISTS (SELECT 1 FROM pack_release_runtime_preparation p
+                WHERE p.prepared->'archive'->>'key' = $1 AND p.prepared->'archive'->>'version' = $2)
+             OR EXISTS (SELECT 1 FROM pack_runtime_preparation_attempt a JOIN pack_install i ON i.id = a.install
+                WHERE a.prepared->'archive'->>'key' = $1 AND a.prepared->'archive'->>'version' = $2
+                  AND i.status = 'activating' AND i.updated_at >= NOW() - ($4::bigint * INTERVAL '1 second')) \
              OR EXISTS (SELECT 1 FROM artifact_version WHERE object_key = $1 AND provider_version = $2) \
               OR EXISTS (SELECT 1 FROM log_segment WHERE object_key = $1 AND provider_version = $2) \
               OR EXISTS(SELECT 1 FROM file_evidence_put p JOIN file_evidence_owner o ON o.version=p.owner WHERE o.object_key=$1)",

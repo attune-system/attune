@@ -10,11 +10,11 @@ use attune_common::{
         pack_release::{CreatePackReleaseInput, PackReleaseRepository},
         runtime::CreateWorkerInput,
         runtime_preparation::{can_consume, PreparationJob, RuntimePreparationRepository},
-        PackInstallRepository, WorkerRepository,
+        ObjectMaintenanceRepository, PackInstallRepository, WorkerRepository,
     },
     runtime_lifecycle::{
         InstalledPreparation, PreparationScope, PreparationTarget, PreparationWorkload,
-        RuntimeRecipe, PREPARATION_TRIGGER,
+        PreparedRuntimeArchive, RuntimeRecipe, PREPARATION_TRIGGER,
     },
     scheduling::WorkerPlacement,
     workload_sandbox::WorkloadSandbox,
@@ -24,6 +24,15 @@ use uuid::Uuid;
 
 #[tokio::test]
 async fn activation_only_binds_complete_current_attempts_to_the_exact_release() {
+    exercise_activation(false).await;
+}
+
+#[tokio::test]
+async fn object_readiness_preserves_pinned_archive_for_compatible_replacement() {
+    exercise_activation(true).await;
+}
+
+async fn exercise_activation(object_backed: bool) {
     let database = helpers::create_test_pool().await.unwrap();
     let pack = helpers::PackFixture::new_unique("prepared_release")
         .create(&database)
@@ -80,7 +89,20 @@ async fn activation_only_binds_complete_current_attempts_to_the_exact_release() 
     .unwrap()
     .with_workload_sandbox(WorkloadSandbox::Bubblewrap);
     let volume = tempfile::tempdir().unwrap();
-    let scope = PreparationScope::open(volume.path(), &preparation_environment)
+    let builder_environment = if object_backed {
+        preparation_environment.clone().with_preparation_storage(
+            &attune_common::config::BlobStorageConfig::S3 {
+                bucket: "fixture".into(),
+                region: "fixture".into(),
+                prefix: String::new(),
+                endpoint: None,
+                kms_key: None,
+            },
+        )
+    } else {
+        preparation_environment.clone()
+    };
+    let scope = PreparationScope::open(volume.path(), &builder_environment)
         .unwrap()
         .unwrap();
     let isolated = tempfile::tempdir().unwrap();
@@ -240,7 +262,24 @@ async fn activation_only_binds_complete_current_attempts_to_the_exact_release() 
             }))
             .unwrap()
         };
-    let ready = fake_ready(&target, &scope);
+    let mut ready = fake_ready(&target, &scope);
+    if object_backed {
+        ready
+            .set_archive(PreparedRuntimeArchive {
+                key: format!("packs/prepared/{}/{}.tar", activation.id, Uuid::new_v4()),
+                version: "v:fixture".into(),
+                size: 1,
+                sha256: "d".repeat(64),
+            })
+            .unwrap();
+        ObjectMaintenanceRepository::reserve_upload(
+            &*database,
+            &ready.archive().unwrap().key,
+            "pack",
+        )
+        .await
+        .unwrap();
+    }
     let second_ready = fake_ready(&second_target, &other);
     let abandoned = make_attempt(worker.id, 0).await;
     let dispatch = RuntimePreparationRepository::dispatch_job(&database, abandoned)
@@ -445,6 +484,52 @@ async fn activation_only_binds_complete_current_attempts_to_the_exact_release() 
     assert_eq!(ready.len(), 1);
     assert!(can_consume(&worker, &ready));
     assert!(!can_consume(&second_worker, &ready));
+    if object_backed {
+        let published = &ready[0];
+        let archive = published.archive().unwrap();
+        let replacement = RuntimePreparationRepository::find_download(
+            &database,
+            outsider.id,
+            candidate.id,
+            published.directory(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(replacement.archive(), Some(archive));
+        assert!(RuntimePreparationRepository::find_download(
+            &database,
+            second_worker.id,
+            candidate.id,
+            published.directory(),
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert!(RuntimePreparationRepository::find_download(
+            &database,
+            outsider.id,
+            original.id,
+            published.directory(),
+        )
+        .await
+        .unwrap()
+        .is_none());
+        let cutoff = chrono::Utc::now() + chrono::Duration::seconds(5);
+        assert_eq!(
+            ObjectMaintenanceRepository::schedule_unreferenced(&database, cutoff, cutoff)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(ObjectMaintenanceRepository::exact_reference_exists(
+            &database,
+            &archive.key,
+            &archive.version,
+        )
+        .await
+        .unwrap());
+    }
     let second = RuntimePreparationRepository::ready_for(
         &*database,
         candidate.id,

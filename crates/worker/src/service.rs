@@ -298,6 +298,7 @@ impl WorkerService {
         config: Config,
         child_environment: attune_common::child_process_environment::ChildProcessEnvironment,
     ) -> Result<Self> {
+        let child_environment = child_environment.with_preparation_storage(&config.storage);
         info!("Initializing Worker Service");
         let recorded_identity = RecordedConsumerIdentity::from_environment()?;
         config.validate_deployed_pack_transport()?;
@@ -657,7 +658,8 @@ impl WorkerService {
                 jwt_config,
                 transport,
             )
-            .with_child_environment(child_environment.clone()),
+            .with_child_environment(child_environment.clone())
+            .with_pack_transport(pack_transport.clone()),
         );
 
         // Initialize heartbeat manager
@@ -2542,14 +2544,44 @@ async fn handle_pack_test(
     };
     if let Some((scope, attempt)) = preparation {
         let build_cancellation = CancellationToken::new();
-        let build = attempt.job.recipe.prepare_for_install(
-            &pack_dir,
-            attempt.job.target.clone(),
-            &attempt.release_digest,
-            &scope,
-            child_environment,
-            &build_cancellation,
-        );
+        let build = async {
+            let ready = attempt
+                .job
+                .recipe
+                .prepare_for_install(
+                    &pack_dir,
+                    attempt.job.target.clone(),
+                    &attempt.release_digest,
+                    &scope,
+                    child_environment,
+                    &build_cancellation,
+                )
+                .await
+                .map_err(|error| Error::validation(error.to_string()))?;
+            if build_cancellation.is_cancelled() {
+                return Err(Error::validation("Runtime preparation cancelled"));
+            }
+            if scope.is_object_backed() {
+                let token = payload.candidate_access_token.as_deref().ok_or_else(|| {
+                    Error::validation("Missing runtime preparation attempt token")
+                })?;
+                tokio::select! {
+                    biased;
+                    _ = build_cancellation.cancelled() => Err(Error::validation("Runtime preparation cancelled")),
+                    result = pack_transport.publish_prepared_runtime(install.id, token, &ready) => result,
+                }
+            } else {
+                RuntimePreparationRepository::finish(
+                    db_pool,
+                    install.id,
+                    worker_id,
+                    incarnation,
+                    &ready,
+                )
+                .await?;
+                Ok(())
+            }
+        };
         tokio::pin!(build);
         let observe_cancellation = async {
             loop {
@@ -2574,9 +2606,7 @@ async fn handle_pack_test(
                 Err(Error::validation("Runtime preparation timed out"))
             }
             result = &mut build => {
-                let ready = result.map_err(|error| Error::validation(error.to_string()))?;
-                RuntimePreparationRepository::finish(db_pool, install.id, worker_id, incarnation, &ready).await?;
-                return Ok(());
+                return result;
             }
         };
         build_cancellation.cancel();

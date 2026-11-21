@@ -16,6 +16,10 @@ mod source_header_races;
 #[path = "pack_registry_tests/source_auth.rs"]
 mod source_auth;
 
+#[cfg(target_os = "linux")]
+#[path = "pack_registry_tests/prepared_runtime_storage.rs"]
+mod prepared_runtime_storage;
+
 use attune_common::{
     auth::{
         hash_integration_token,

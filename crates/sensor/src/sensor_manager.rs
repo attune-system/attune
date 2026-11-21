@@ -1433,6 +1433,10 @@ impl SensorManager {
                 .ok_or_else(|| {
                     anyhow!("No ready installed runtime generation in this sensor manager's scope")
                 })?;
+                self.inner
+                    .pack_transport
+                    .sync_prepared_runtime(pack_revision.release_id, &ready)
+                    .await?;
                 recipe
                     .open_installed(&ready, runtime_root, environment)
                     .await

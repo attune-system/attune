@@ -3986,6 +3986,14 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/internal/pack-installs/{pack_install_id}/archive",
             get(download_pack_install_candidate_archive),
         )
+        .route(
+            "/internal/pack-installs/{pack_install_id}/prepared-runtime",
+            post(upload_prepared_runtime),
+        )
+        .route(
+            "/internal/pack-releases/{release_id}/prepared-runtimes/{directory}",
+            get(download_prepared_runtime),
+        )
 }
 
 /// Wrapper to avoid conflict with the `delete` import from axum::routing
@@ -4308,6 +4316,157 @@ pub(crate) async fn download_pack_install_candidate_archive(
         ),
     ];
     Ok((StatusCode::OK, headers, Body::from_stream(reader)))
+}
+
+async fn upload_prepared_runtime(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path(install_id): Path<i64>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<StatusCode, (StatusCode, String)> {
+    use attune_common::repositories::runtime_preparation::RuntimePreparationRepository;
+    use attune_common::runtime_lifecycle::{
+        InstalledPreparation, MAX_PREPARATION_ARCHIVE_BYTES, MAX_PREPARATION_RECEIPT_BYTES,
+    };
+    use futures::TryStreamExt;
+    use tokio_util::io::{ReaderStream, StreamReader};
+
+    let worker = pack_candidate_worker_id(&user)?;
+    let instance = scoped_metadata_value(&user, "worker_instance", "Worker")?
+        .parse()
+        .map_err(|_| {
+            (
+                StatusCode::FORBIDDEN,
+                "Worker token has an invalid instance scope".into(),
+            )
+        })?;
+    let missing = || {
+        (
+            StatusCode::NOT_FOUND,
+            "Runtime preparation attempt not found".into(),
+        )
+    };
+    if matches!(
+        state.config.storage,
+        attune_common::config::BlobStorageConfig::Filesystem { .. }
+    ) {
+        return Err(missing());
+    }
+    let incarnation =
+        RuntimePreparationRepository::builder_for_upload(&state.db, install_id, worker, instance)
+            .await
+            .map_err(map_pack_archive_repository_error)?
+            .ok_or_else(missing)?;
+    let install = PackInstallRepository::new(state.db.clone())
+        .find_by_id(install_id)
+        .await
+        .map_err(map_pack_archive_repository_error)?
+        .ok_or_else(missing)?;
+    authorize_pack_candidate_token(
+        &headers,
+        install
+            .candidate_access_token_hash
+            .as_deref()
+            .ok_or_else(missing)?,
+    )?;
+    let invalid = || {
+        (
+            StatusCode::BAD_REQUEST,
+            "Invalid runtime preparation upload".into(),
+        )
+    };
+    let size = headers
+        .get("x-attune-runtime-archive-size")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|size| *size > 0 && *size <= MAX_PREPARATION_ARCHIVE_BYTES)
+        .ok_or_else(invalid)?;
+    let digest = decode_hex_digest(
+        headers
+            .get("x-attune-sha256")
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(invalid)?,
+    )?;
+    let mut reader = StreamReader::new(body.into_data_stream().map_err(std::io::Error::other));
+    let length = reader.read_u32().await.map_err(|_| invalid())? as usize;
+    if length == 0 || length > MAX_PREPARATION_RECEIPT_BYTES {
+        return Err(invalid());
+    }
+    let mut receipt = vec![0; length];
+    reader
+        .read_exact(&mut receipt)
+        .await
+        .map_err(|_| invalid())?;
+    let mut prepared: InstalledPreparation =
+        serde_json::from_slice(&receipt).map_err(|_| invalid())?;
+    if !prepared.scope.is_object_backed() || prepared.archive().is_some() {
+        return Err(invalid());
+    }
+    let key = ObjectKey::new(format!(
+        "packs/prepared/{install_id}/{}.tar",
+        uuid::Uuid::new_v4()
+    ))
+    .map_err(map_pack_blob_error)?;
+    ObjectMaintenanceRepository::reserve_upload(&state.db, key.as_str(), "pack")
+        .await
+        .map_err(map_pack_archive_repository_error)?;
+    let stream = ReaderStream::new(reader.take(size + 1)).map_err(|_| {
+        BlobStoreError::Interrupted("Runtime preparation upload was interrupted".into())
+    });
+    let stored = state
+        .blob_store
+        .put(&key, Box::pin(stream), digest)
+        .await
+        .map_err(map_pack_blob_error)?;
+    if stored.size != size {
+        return Err(invalid());
+    }
+    prepared.set_archive(stored.into()).map_err(|_| invalid())?;
+    if !RuntimePreparationRepository::finish(&state.db, install_id, worker, incarnation, &prepared)
+        .await
+        .map_err(map_pack_archive_repository_error)?
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Runtime preparation attempt expired or was cancelled".into(),
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn download_prepared_runtime(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(user): RequireAuth,
+    Path((release, directory)): Path<(i64, uuid::Uuid)>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    use attune_common::repositories::runtime_preparation::RuntimePreparationRepository;
+
+    let worker = pack_candidate_worker_id(&user)?;
+    let prepared =
+        RuntimePreparationRepository::find_download(&state.db, worker, release, directory)
+            .await
+            .map_err(map_pack_archive_repository_error)?
+            .ok_or((
+                StatusCode::NOT_FOUND,
+                "Prepared runtime archive not found".into(),
+            ))?;
+    let archive = prepared
+        .archive()
+        .expect("download receipts carry an archive");
+    let key = ObjectKey::new(&archive.key).map_err(map_pack_blob_error)?;
+    let version = ProviderVersion::from_stored(&archive.version).map_err(map_pack_blob_error)?;
+    let digest = decode_hex_digest(&archive.sha256)?;
+    let body = state
+        .blob_store
+        .get_pinned(&key, &version, archive.size, digest, None)
+        .await
+        .map_err(map_pack_blob_error)?;
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_LENGTH, archive.size.to_string())],
+        Body::from_stream(body),
+    ))
 }
 
 /// Persist the complete candidate in configured blob storage before MQ dispatch.

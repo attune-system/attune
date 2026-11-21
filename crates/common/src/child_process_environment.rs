@@ -43,6 +43,7 @@ pub struct ChildProcessEnvironment {
     runtime_recipe_digests: BTreeSet<String>,
     workload_sandbox: crate::workload_sandbox::WorkloadSandbox,
     preparation_revision: Option<String>,
+    object_backed_preparation: bool,
     offline_preparation: bool,
 }
 
@@ -149,6 +150,7 @@ impl ChildProcessEnvironment {
             runtime_recipe_digests,
             workload_sandbox: Default::default(),
             preparation_revision,
+            object_backed_preparation: false,
             offline_preparation: false,
         })
     }
@@ -178,6 +180,16 @@ impl ChildProcessEnvironment {
         self.preparation_revision
             .as_deref()
             .filter(|_| self.uses_workload_sandbox())
+    }
+
+    pub fn with_preparation_storage(mut self, storage: &crate::config::BlobStorageConfig) -> Self {
+        self.object_backed_preparation =
+            !matches!(storage, crate::config::BlobStorageConfig::Filesystem { .. });
+        self
+    }
+
+    pub(crate) fn object_backed_preparation(&self) -> bool {
+        self.object_backed_preparation
     }
 
     pub(crate) fn for_install_preparation(&self) -> Self {

@@ -865,3 +865,134 @@ async fn bubblewrap_installed_generation_requires_local_seal_and_exact_identity(
         .await
         .is_err());
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires Linux Bubblewrap with unprivileged namespaces"]
+async fn object_preparation_restores_into_replacement_pod_storage() {
+    use attune_common::config::BlobStorageConfig;
+    use attune_common::runtime_lifecycle::{
+        PreparationScope, PreparationTarget, PreparationWorkload, PreparedRuntimeArchive,
+        RecipeCommand,
+    };
+    let (root, mut recipe) = fixture();
+    recipe.prepare_at_install = true;
+    recipe.prepare.push(RecipeCommand {
+        command: vec![
+            "/usr/bin/ln".into(),
+            "-s".into(),
+            "{source_file}".into(),
+            "{output_dir}/source-link".into(),
+        ],
+        cwd: None,
+        timeout_seconds: 5,
+        when_file_exists: None,
+    });
+    let environment = ChildProcessEnvironment::from_parent(
+        [
+            (
+                "ATTUNE_RUNTIME_RECIPE_DIGESTS".into(),
+                recipe.digest().unwrap().into(),
+            ),
+            (
+                "ATTUNE_RUNTIME_PREPARATION_REVISION".into(),
+                "pinned-image".into(),
+            ),
+        ],
+        &[],
+    )
+    .unwrap()
+    .with_workload_sandbox(WorkloadSandbox::Bubblewrap)
+    .with_preparation_storage(&BlobStorageConfig::S3 {
+        bucket: "example".into(),
+        region: "test".into(),
+        prefix: String::new(),
+        endpoint: None,
+        kms_key: None,
+    });
+    let pack = root.path().join("pack");
+    std::fs::create_dir_all(pack.join("actions")).unwrap();
+    executable(&pack.join("actions/run.nova"), "#!/bin/sh\nprintf ready\n");
+    let runtime_root = root.path().join("runtime");
+    let scope = PreparationScope::open(&runtime_root, &environment)
+        .unwrap()
+        .unwrap();
+    let mut receipt = recipe
+        .prepare_for_install(
+            &pack,
+            PreparationTarget {
+                kind: PreparationWorkload::Action,
+                reference: "fixture.run".into(),
+                source: "actions/run.nova".into(),
+                runtime_ref: "fixture.nova".into(),
+                runtime_names: vec!["nova".into()],
+                recipe_digest: recipe.digest().unwrap(),
+            },
+            &"a".repeat(64),
+            &scope,
+            &environment,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let (archive, size, sha256) = receipt.build_archive().await.unwrap();
+    receipt
+        .set_archive(PreparedRuntimeArchive {
+            key: "packs/prepared/1/fixture.tar".into(),
+            version: "v:fixture".into(),
+            size,
+            sha256,
+        })
+        .unwrap();
+    let generation = recipe
+        .open_installed(&receipt, &runtime_root, &environment)
+        .await
+        .unwrap();
+    let path = generation.generation.clone();
+    let link = std::fs::read_link(path.join("output/source-link")).unwrap();
+    assert!(link.is_absolute());
+    generation.cleanup().await.unwrap();
+    std::fs::remove_dir_all(&runtime_root).unwrap();
+    assert!(!receipt.is_local());
+    assert_eq!(
+        PreparationScope::open(&runtime_root, &environment).unwrap(),
+        Some(scope)
+    );
+
+    let corrupt = tempfile::NamedTempFile::new().unwrap();
+    std::fs::copy(archive.path(), corrupt.path()).unwrap();
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(corrupt.path())
+        .unwrap()
+        .write_all(b"incorrect contents")
+        .unwrap();
+    assert!(receipt.restore_archive(corrupt).await.is_err());
+    assert!(!receipt.is_local());
+    receipt.restore_archive(archive).await.unwrap();
+
+    let target = recipe
+        .open_installed(&receipt, &runtime_root, &environment)
+        .await
+        .unwrap();
+    assert_eq!(target.generation, path);
+    assert_eq!(
+        std::fs::read(path.join("output/source-link")).unwrap(),
+        b"#!/bin/sh\nprintf ready\n"
+    );
+    let mut command = std::process::Command::new(&target.command[0]);
+    environment.apply(&mut command);
+    command
+        .args(&target.command[1..])
+        .envs(&target.env)
+        .current_dir(&target.working_dir);
+    let output = target
+        .sandbox_invocation(command, &environment)
+        .unwrap()
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"ready");
+    target.cleanup().await.unwrap();
+}
