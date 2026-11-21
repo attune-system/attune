@@ -346,8 +346,12 @@ async fn action_put_rechecks_delegated_attempt_and_defaults_after_graph_wait() -
         )
         .await?;
         assert_eq!(
-            admitted.executable.action.default_execution_permission_set_refs,
-            [requested.r#ref.clone()]
+            admitted
+                .executable
+                .action
+                .default_execution_permission_set_refs
+                .as_slice(),
+            std::slice::from_ref(&requested.r#ref)
         );
         tx.commit().await?;
         Ok(())
