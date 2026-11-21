@@ -3,6 +3,13 @@
 import argparse,json,os,pathlib,shutil,subprocess,tempfile,uuid
 p=argparse.ArgumentParser();p.add_argument('--binary',required=True);a=p.parse_args()
 root=pathlib.Path(__file__).resolve().parents[1]
+optimized=(root/'docker/Dockerfile.optimized').read_text()
+compile_step, service_arg, select_step = optimized.partition('\nARG SERVICE=api\n')
+staged_admin = '/build/service-binaries/attune-rollout-admin'
+assert service_arg
+assert f'cp /build/target/release/attune-rollout-admin {staged_admin}' in compile_step
+assert f'cp {staged_admin} /build/rollout-tools/' in select_step
+assert '/build/target/' not in select_step
 for name,fragment in [('docker/Dockerfile.optimized','/build/rollout-tools/'),('docker/Dockerfile.runtime','dist/rollout-tools/'),('.github/workflows/publish.yml','cp "${service_output_dir}/attune-rollout-admin" "$bundle_root/bin/"')]:
  assert fragment in (root/name).read_text(),name
 for name in ['docker/Dockerfile.optimized','docker/Dockerfile.runtime']:
