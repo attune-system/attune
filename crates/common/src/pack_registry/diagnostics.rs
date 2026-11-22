@@ -250,46 +250,51 @@ pub fn read_manifest(root: &std::path::Path) -> crate::Result<serde_yaml_ng::Val
     Ok(value)
 }
 
-pub fn validate_metadata(root: &std::path::Path) -> crate::Result<Vec<PackDiagnostic>> {
-    let manifest = read_manifest(root)?;
-    if let Some(testing) = manifest.get("testing") {
-        let config: crate::test_executor::TestConfig =
-            decode_yaml_value("pack.yaml", "/testing", testing.clone())?;
-        config
-            .validate_policy()
-            .map_err(|error| located(error, "pack.yaml", "/testing"))?;
-        for (name, runner) in &config.runners {
-            let base = format!("/testing/runners{}", pointer(name));
-            if !matches!(
-                runner.r#type.as_str(),
-                "script" | "unittest" | "pytest" | "runtime"
-            ) {
-                return Err(metadata_error(
-                    "pack.yaml",
-                    &format!("{base}/type"),
-                    "Supported test runners are script, unittest, pytest, and runtime",
-                ));
-            }
-            if runner
-                .result_format
-                .as_deref()
-                .is_some_and(|format| format != "simple")
-            {
-                return Err(metadata_error(
-                    "pack.yaml",
-                    &format!("{base}/result_format"),
-                    "Only the simple test result format is supported",
-                ));
-            }
-            if crate::test_executor::confined_test_entrypoint(root, &runner.entry_point).is_err() {
-                return Err(metadata_error(
-                    "pack.yaml",
-                    &format!("{base}/entry_point"),
-                    "Test entrypoint must name an existing file within the pack",
-                ));
-            }
+pub(crate) fn validate_testing_metadata(
+    root: &std::path::Path,
+    testing: serde_yaml_ng::Value,
+) -> crate::Result<()> {
+    let config: crate::test_executor::TestConfig =
+        decode_yaml_value("pack.yaml", "/testing", testing)?;
+    config
+        .validate_policy()
+        .map_err(|error| located(error, "pack.yaml", "/testing"))?;
+    for (name, runner) in config.runners_by_name() {
+        let base = format!("/testing/runners{}", pointer(name));
+        if !matches!(
+            runner.r#type.as_str(),
+            "script" | "unittest" | "pytest" | "runtime"
+        ) {
+            return Err(metadata_error(
+                "pack.yaml",
+                &format!("{base}/type"),
+                "Supported test runners are script, unittest, pytest, and runtime",
+            ));
+        }
+        if runner
+            .result_format
+            .as_deref()
+            .is_some_and(|format| format != "simple")
+        {
+            return Err(metadata_error(
+                "pack.yaml",
+                &format!("{base}/result_format"),
+                "Only the simple test result format is supported",
+            ));
+        }
+        if crate::test_executor::confined_test_entrypoint(root, &runner.entry_point).is_err() {
+            return Err(metadata_error(
+                "pack.yaml",
+                &format!("{base}/entry_point"),
+                "Test entrypoint must name an existing file within the pack",
+            ));
         }
     }
+    Ok(())
+}
+
+pub fn validate_metadata(root: &std::path::Path) -> crate::Result<Vec<PackDiagnostic>> {
+    read_manifest(root)?;
     let report = crate::pack_check::check_pack(root);
     let errors: Vec<_> = report
         .diagnostics

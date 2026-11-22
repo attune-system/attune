@@ -32,6 +32,12 @@ pub struct TestConfig {
 }
 
 impl TestConfig {
+    pub(crate) fn runners_by_name(&self) -> Vec<(&String, &RunnerConfig)> {
+        let mut runners: Vec<_> = self.runners.iter().collect();
+        runners.sort_unstable_by_key(|(name, _)| *name);
+        runners
+    }
+
     pub fn required_recipe_digests(&self) -> Result<Vec<String>> {
         let mut digests: Vec<String> = self
             .runners
@@ -67,7 +73,7 @@ impl TestConfig {
             ));
         }
         let mut total_timeout = 60_u64;
-        for (name, runner) in &self.runners {
+        for (name, runner) in self.runners_by_name() {
             if let Some(recipe) = &runner.lifecycle {
                 if runner.r#type != "runtime" {
                     return Err(Error::validation(
