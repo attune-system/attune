@@ -730,7 +730,9 @@ async fn run_job(
             }
             return Ok(None);
         }
-        return Ok(Some(FinishPackJob::Prepared { receipt }));
+        return Ok(Some(FinishPackJob::Prepared {
+            receipt: Box::new(receipt),
+        }));
     }
 
     let metadata: serde_yaml_ng::Value =

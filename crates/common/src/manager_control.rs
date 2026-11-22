@@ -172,7 +172,7 @@ pub enum FinishPackJob {
         summary: crate::models::PackTestResult,
     },
     Prepared {
-        receipt: crate::runtime_lifecycle::InstalledPreparation,
+        receipt: Box<crate::runtime_lifecycle::InstalledPreparation>,
     },
     Failed,
 }
