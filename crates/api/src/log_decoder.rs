@@ -329,12 +329,14 @@ pub(crate) fn live_ciphertext(
                             ),
                         )));
                     }
-                    let key = state
-                        .config
-                        .security
-                        .encryption_key
-                        .as_deref()
-                        .ok_or_else(invalid)?;
+                    let key = attune_common::repositories::manager_log::ManagerLogRepository::key(
+                        &state.db,
+                        pin.version,
+                        state.config.security.encryption_key.as_deref(),
+                    )
+                    .await
+                    .map_err(|_| invalid())?
+                    .ok_or_else(invalid)?;
                     let proof = version
                         .meta
                         .as_ref()
@@ -344,7 +346,7 @@ pub(crate) fn live_ciphertext(
                     if proof.len() > attune_common::runtime_read_log::MAX_MANIFEST_BYTES {
                         return Err(invalid());
                     }
-                    let manifest = open_final_manifest(key, proof, pin.execution, pin.version)
+                    let manifest = open_final_manifest(&key, proof, pin.execution, pin.version)
                         .map_err(|_| invalid())?;
                     if manifest.ciphertext_bytes != offset
                         || version.size_bytes != i64::try_from(offset).ok()

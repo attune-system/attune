@@ -223,12 +223,13 @@ impl LogPin {
         let reader = crate::log_decoder::live_ciphertext(state.clone(), self.clone());
         use futures::StreamExt;
         let plaintext = if self.encrypted {
-            let key = state
-                .config
-                .security
-                .encryption_key
-                .clone()
-                .ok_or_else(denied)?;
+            let key = attune_common::repositories::manager_log::ManagerLogRepository::key(
+                &state.db,
+                self.version,
+                state.config.security.encryption_key.as_deref(),
+            )
+            .await?
+            .ok_or_else(denied)?;
             crate::log_decoder::verified_live_plaintext(reader, key, self.execution, self.version)
                 .boxed()
         } else {

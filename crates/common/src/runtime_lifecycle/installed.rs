@@ -48,6 +48,16 @@ impl PreparationScope {
         self.storage.is_nil()
     }
 
+    pub(crate) fn valid_for_report(&self, object_preparation: bool) -> bool {
+        self.is_object_backed() == object_preparation
+            && self.root.is_absolute()
+            && self.root.ends_with(STORAGE)
+            && !self.revision.is_empty()
+            && self.revision.len() <= 256
+            && !self.revision.chars().any(char::is_control)
+            && matches!(self.platform.as_str(), "linux/x86_64" | "linux/aarch64")
+    }
+
     fn local_storage_id(root: &Path) -> Result<Uuid> {
         let marker = root.join("storage-id");
         if !marker.try_exists()? {

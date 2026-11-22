@@ -358,6 +358,7 @@ impl Harness {
                     state.db.clone(),
                     state.broadcast_tx.clone(),
                     state.log_stream_wakeups.clone(),
+                    state.manager_work_wakeups.clone(),
                 );
                 listener.wait_until_ready().await?;
                 Some(listener)
@@ -1832,6 +1833,7 @@ async fn postgres_listener_retries_initial_failure_and_reports_readiness() -> Re
     let mut listener = postgres_listener::spawn_postgres_listener(
         pool.clone(),
         broadcast_tx,
+        attune_api::log_stream_wakeups::LogStreamWakeups::default(),
         attune_api::log_stream_wakeups::LogStreamWakeups::default(),
     );
 

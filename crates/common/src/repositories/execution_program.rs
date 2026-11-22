@@ -15,8 +15,20 @@ impl ExecutionProgramRepository {
         let selection = serde_json::to_value(selection)
             .map_err(|_| Error::validation("Invalid program metadata"))?;
         let mut transaction = pool.begin().await?;
+        Self::record_with(&mut transaction, execution, worker, release, selection).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn record_with(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        execution: i64,
+        worker: i64,
+        release: i64,
+        selection: serde_json::Value,
+    ) -> Result<()> {
         super::execution_runtime_admission::ExecutionAdmissionRepository::existing_authority(
-            &mut transaction,
+            transaction,
             execution,
         )
         .await?;
@@ -25,7 +37,7 @@ impl ExecutionProgramRepository {
              LEFT JOIN delegated_execution_attempt d ON d.execution=e.id AND d.worker=e.worker AND NOT d.closed AND d.producer_kind='worker' \
              LEFT JOIN runtime_authority_execution_fence f ON f.execution=e.id LEFT JOIN runtime_authority_admission a ON a.id=f.admission \
              WHERE e.id=$1 AND e.worker=$2 AND e.status='running' FOR SHARE OF e"
-        ).bind(execution).bind(worker).fetch_optional(&mut *transaction).await?.flatten();
+        ).bind(execution).bind(worker).fetch_optional(&mut **transaction).await?.flatten();
         let attempt = attempt.ok_or_else(|| {
             Error::PermissionDenied("Program launch attempt is unavailable".into())
         })?;
@@ -35,13 +47,12 @@ impl ExecutionProgramRepository {
              WHERE execution_program_selection.selection=EXCLUDED.selection AND execution_program_selection.worker=EXCLUDED.worker \
              AND execution_program_selection.release=EXCLUDED.release RETURNING id"
         ).bind(execution).bind(attempt).bind(worker).bind(release).bind(selection)
-            .fetch_optional(&mut *transaction).await?;
+            .fetch_optional(&mut **transaction).await?;
         if id.is_none() {
             return Err(Error::PermissionDenied(
                 "Program launch metadata changed within an attempt".into(),
             ));
         }
-        transaction.commit().await?;
         Ok(())
     }
 }

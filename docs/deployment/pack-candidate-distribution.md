@@ -10,8 +10,11 @@ releases.
 - All API replicas must share PostgreSQL and the same `storage` bucket and
   prefix. S3 requires bucket versioning; GCS is also supported. A filesystem
   backend is suitable only when its storage root is shared across replicas.
-- Configure workers with `ATTUNE_API_URL` pointing at this deployment and
-  worker-token authentication. Workers need no object-provider credentials.
+- Configure workers with `ATTUNE_API_URL` pointing at this deployment.
+  The API-only pack worker uses a scoped manager enrollment and job lease.
+  Direct-connected workers continue to use worker-token authentication.
+  Neither mode requires object-provider credentials on the worker.
+  See [API-only pack workers](api-only-managers.md#run-an-api-only-pack-worker).
 - Set `packs.transport: api` on workers without a shared installed-release
   volume. Shared-volume workers still download candidates through the API.
 

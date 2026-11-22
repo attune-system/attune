@@ -431,6 +431,7 @@ dependencies = [
  "attune-common",
  "attune-executor",
  "attune-notifier",
+ "attune-sensor",
  "attune-supervisor",
  "attune-worker",
  "axum",

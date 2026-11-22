@@ -19,6 +19,10 @@ struct Args {
     /// Log level (trace, debug, info, warn, error)
     #[arg(short, long)]
     log_level: Option<String>,
+
+    /// Run managed sensors using only the manager API.
+    #[arg(long, conflicts_with = "config")]
+    api_manager: bool,
 }
 
 fn main() -> Result<()> {
@@ -31,6 +35,13 @@ async fn run() -> Result<()> {
     attune_common::auth::install_crypto_provider();
 
     let args = Args::parse();
+    if args.api_manager {
+        return attune_sensor::manager_sensor::run_from_environment(
+            None,
+            args.log_level.as_deref(),
+        )
+        .await;
+    }
     set_config_path(args.config.as_deref());
 
     let config = Config::load()?;

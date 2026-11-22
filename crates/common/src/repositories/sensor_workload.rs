@@ -60,8 +60,17 @@ impl SensorWorkloadRepository {
         sensor_id: Id,
     ) -> Result<SensorWorkload> {
         let mut tx = pool.begin().await?;
-        Self::ensure_default_with_conn(&mut tx, sensor_id).await?;
-        let workload = sqlx::query_as::<_, SensorWorkload>(
+        let workload = Self::refresh_default_with_conn(&mut tx, sensor_id).await?;
+        tx.commit().await?;
+        Ok(workload)
+    }
+
+    pub(super) async fn refresh_default_with_conn(
+        conn: &mut PgConnection,
+        sensor_id: Id,
+    ) -> Result<SensorWorkload> {
+        Self::ensure_default_with_conn(conn, sensor_id).await?;
+        Ok(sqlx::query_as::<_, SensorWorkload>(
             "UPDATE sensor_workload AS workload SET \
                  pack_release = pr.id, pack_release_digest = pr.digest, \
                  executable_snapshot = jsonb_build_object( \
@@ -76,10 +85,8 @@ impl SensorWorkloadRepository {
         )
         .bind(sensor_id)
         .bind(DEFAULT_SENSOR_WORKLOAD_KEY)
-        .fetch_one(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(workload)
+        .fetch_one(conn)
+        .await?)
     }
 
     pub async fn ensure_default_for_sensor(pool: &PgPool, sensor_id: Id) -> Result<SensorWorkload> {
@@ -121,21 +128,7 @@ impl SensorWorkloadRepository {
     ) -> Result<AcquireSensorWorkloadOutcome> {
         validate_lease_seconds(input.lease_seconds)?;
         let workload = Self::ensure_default_with_conn(connection, input.sensor_id).await?;
-        sqlx::query(
-            "INSERT INTO sensor_workload_assignment (workload) VALUES ($1) \
-             ON CONFLICT (workload) DO NOTHING",
-        )
-        .bind(workload.id)
-        .execute(&mut *connection)
-        .await?;
-
-        let assignment = sqlx::query_as::<_, SensorWorkloadAssignment>(&format!(
-            "SELECT {ASSIGNMENT_SELECT_COLUMNS} FROM sensor_workload_assignment \
-             WHERE workload = $1 FOR UPDATE"
-        ))
-        .bind(workload.id)
-        .fetch_one(&mut *connection)
-        .await?;
+        let assignment = Self::lock_assignment(connection, workload.id).await?;
 
         let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
             .fetch_one(&mut *connection)
@@ -174,6 +167,27 @@ impl SensorWorkloadRepository {
         .fetch_one(&mut *connection)
         .await?;
         Ok(AcquireSensorWorkloadOutcome::Acquired(lease))
+    }
+
+    pub(super) async fn lock_assignment(
+        connection: &mut PgConnection,
+        workload: Id,
+    ) -> Result<SensorWorkloadAssignment> {
+        sqlx::query(
+            "INSERT INTO sensor_workload_assignment (workload) VALUES ($1) \
+             ON CONFLICT (workload) DO NOTHING",
+        )
+        .bind(workload)
+        .execute(&mut *connection)
+        .await?;
+
+        Ok(sqlx::query_as::<_, SensorWorkloadAssignment>(&format!(
+            "SELECT {ASSIGNMENT_SELECT_COLUMNS} FROM sensor_workload_assignment \
+             WHERE workload = $1 FOR UPDATE"
+        ))
+        .bind(workload)
+        .fetch_one(&mut *connection)
+        .await?)
     }
 
     pub async fn begin_process(
@@ -270,6 +284,13 @@ impl SensorWorkloadRepository {
     }
 
     pub async fn release(pool: &PgPool, fence: SensorWorkloadFence) -> Result<bool> {
+        Self::release_with_conn(pool, fence).await
+    }
+
+    pub(super) async fn release_with_conn<'e>(
+        connection: impl Executor<'e, Database = Postgres>,
+        fence: SensorWorkloadFence,
+    ) -> Result<bool> {
         let result = sqlx::query(
             "UPDATE sensor_workload_assignment \
              SET worker = NULL, worker_instance = NULL, lease_expires_at = NULL, \
@@ -281,7 +302,7 @@ impl SensorWorkloadRepository {
         .bind(fence.worker_id)
         .bind(fence.worker_instance)
         .bind(fence.generation)
-        .execute(pool)
+        .execute(connection)
         .await?;
         Ok(result.rows_affected() == 1)
     }
@@ -303,6 +324,12 @@ impl SensorWorkloadRepository {
         .fetch_one(&mut *tx)
         .await?;
         if current {
+            super::manager_sensor::ManagerSensorRepository::retain_owner(
+                &mut tx,
+                fence.workload_id,
+                fence.generation,
+            )
+            .await?;
             super::managed_sensor_metadata::ManagedSensorMetadataRepository::validate_generation(
                 &mut tx,
                 fence.workload_id,
@@ -348,6 +375,12 @@ impl SensorWorkloadRepository {
         .fetch_one(&mut *tx)
         .await?;
         if current {
+            super::manager_sensor::ManagerSensorRepository::retain_owner(
+                &mut tx,
+                fence.workload_id,
+                fence.generation,
+            )
+            .await?;
             super::managed_sensor_metadata::ManagedSensorMetadataRepository::validate_generation(
                 &mut tx,
                 fence.workload_id,
@@ -386,6 +419,12 @@ impl SensorWorkloadRepository {
         .await?
         .flatten();
         if release.is_some() {
+            super::manager_sensor::ManagerSensorRepository::retain_owner(
+                &mut tx,
+                fence.workload_id,
+                fence.generation,
+            )
+            .await?;
             super::managed_sensor_metadata::ManagedSensorMetadataRepository::validate_generation(
                 &mut tx,
                 fence.workload_id,
@@ -433,6 +472,12 @@ impl SensorWorkloadRepository {
         .fetch_optional(&mut **tx)
         .await?;
         if workload.is_some() {
+            super::manager_sensor::ManagerSensorRepository::retain_owner(
+                tx,
+                fence.workload_id,
+                fence.generation,
+            )
+            .await?;
             super::managed_sensor_metadata::ManagedSensorMetadataRepository::validate_generation(
                 tx,
                 fence.workload_id,
@@ -456,6 +501,31 @@ impl SensorWorkloadRepository {
         Ok(workload)
     }
 
+    pub async fn retained_deadline(
+        conn: &mut PgConnection,
+        fence: SensorWorkloadFence,
+    ) -> Result<DateTime<Utc>> {
+        let deadline: DateTime<Utc> = sqlx::query_scalar(
+            "SELECT lease_expires_at FROM sensor_workload_assignment
+             WHERE workload=$1 AND generation=$2 AND worker=$3 AND worker_instance=$4
+               AND lease_expires_at>clock_timestamp() FOR SHARE",
+        )
+        .bind(fence.workload_id)
+        .bind(fence.generation)
+        .bind(fence.worker_id)
+        .bind(fence.worker_instance)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(|| Error::PermissionDenied("Sensor lease unavailable".into()))?;
+        let session = super::manager_sensor::ManagerSensorRepository::retain_owner(
+            conn,
+            fence.workload_id,
+            fence.generation,
+        )
+        .await?;
+        Ok(session.map_or(deadline, |session| deadline.min(session)))
+    }
+
     /// Repeat after any target wait while retaining lock_current_fence_workload's
     /// assignment and generation protection. No lease deadline is historical authority.
     pub async fn recheck_locked_fence(
@@ -463,6 +533,12 @@ impl SensorWorkloadRepository {
         sensor_id: Id,
         fence: SensorWorkloadFence,
     ) -> Result<()> {
+        super::manager_sensor::ManagerSensorRepository::retain_owner(
+            tx,
+            fence.workload_id,
+            fence.generation,
+        )
+        .await?;
         super::managed_sensor_metadata::ManagedSensorMetadataRepository::validate_generation(
             tx,
             fence.workload_id,
@@ -529,7 +605,7 @@ impl SensorWorkloadRepository {
         .await?)
     }
 
-    async fn ensure_default_with_conn(
+    pub(super) async fn ensure_default_with_conn(
         conn: &mut PgConnection,
         sensor_id: Id,
     ) -> Result<SensorWorkload> {

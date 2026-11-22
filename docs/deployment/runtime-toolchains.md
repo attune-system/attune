@@ -38,6 +38,8 @@ Agents still report their bootstrap interpreter inventory, but no longer turn th
 inventory into an automatic name filter. After connecting, they can discover any
 registered, admitted recipe, including tools unknown to the agent binary. An
 explicit `ATTUNE_WORKER_RUNTIMES`/`ATTUNE_SENSOR_RUNTIMES` remains an operator filter.
+API-only pack workers fetch the runtime registry over HTTPS and publish local
+evidence against its current revision. See [runtime placement and pack jobs](api-only-managers.md#runtime-placement-and-pack-jobs).
 
 ## Recipe contract
 

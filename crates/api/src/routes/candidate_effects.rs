@@ -48,9 +48,14 @@ pub async fn apply(
     RequireAuth(context): RequireAuth<AuthenticatedCandidateContext>,
     Json(operation): Json<CandidateOperation>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let result = CandidateEffectRepository::apply_authenticated(&state.db, &context, operation)
-        .await
-        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let result = CandidateEffectRepository::apply_with_manager_grants(
+        &state.db,
+        &context,
+        operation,
+        &state.config.manager_enrollments,
+    )
+    .await
+    .map_err(|_| StatusCode::FORBIDDEN)?;
     Ok(Json(serde_json::json!({"data": result})))
 }
 

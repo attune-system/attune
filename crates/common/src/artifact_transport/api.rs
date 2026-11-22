@@ -57,6 +57,7 @@ pub struct ApiTransport {
     auth_token_source: AuthTokenSource,
     artifacts_dir: String,
     client: Client,
+    proxy_only_logs: bool,
 }
 
 impl ApiTransport {
@@ -111,7 +112,18 @@ impl ApiTransport {
             auth_token_source: AuthTokenSource::Static(auth_token.to_string()),
             artifacts_dir: artifacts_dir.to_string(),
             client,
+            proxy_only_logs: false,
         })
+    }
+
+    pub(crate) fn scoped(api_url: &str, client: Client, token: &str, local_dir: &str) -> Self {
+        Self {
+            base_url: api_url.to_owned(),
+            auth_token_source: AuthTokenSource::Static(token.to_owned()),
+            artifacts_dir: local_dir.to_owned(),
+            client,
+            proxy_only_logs: true,
+        }
     }
 
     pub fn new_with_worker_token_provider(
@@ -131,6 +143,7 @@ impl ApiTransport {
             auth_token_source: AuthTokenSource::WorkerProvider(token_provider),
             artifacts_dir: artifacts_dir.to_string(),
             client,
+            proxy_only_logs: false,
         })
     }
 
@@ -525,6 +538,11 @@ impl ArtifactFileTransport for ApiTransport {
         sequence: i64,
         content: &[u8],
     ) -> Result<()> {
+        if self.proxy_only_logs {
+            return self
+                .send_log_segment_through_api(artifact_version, sequence, content)
+                .await;
+        }
         let digest = Sha256::digest(content)
             .iter()
             .map(|byte| format!("{byte:02x}"))

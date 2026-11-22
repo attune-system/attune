@@ -3097,6 +3097,7 @@ mod tests {
             execution_id: 111,
             action_ref: "core.test".to_string(),
             worker_id: 222,
+            worker_instance: None,
             release_id: Some(333),
             release_digest: Some("a".repeat(64)),
             scheduled_attempt_updated_at: None,

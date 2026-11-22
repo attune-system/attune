@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use sqlx::{FromRow, PgConnection, PgPool};
+use sqlx::{FromRow, PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::manager_control::{ManagerEnrollment, SESSION_TTL_SECONDS};
@@ -103,12 +103,51 @@ impl ManagerSessionRepository {
         token_expiry: DateTime<Utc>,
         allow_closed: bool,
     ) -> Result<Option<ManagerSessionRecord>> {
+        Self::lock(
+            tx,
+            id,
+            instance,
+            Some(token_expiry),
+            allow_closed,
+            "FOR UPDATE",
+        )
+        .await
+    }
+
+    /// Concurrent work operations share an active session until their effect commits.
+    pub async fn lock_for_work(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        id: Id,
+        instance: Uuid,
+        token_expiry: DateTime<Utc>,
+    ) -> Result<Option<ManagerSessionRecord>> {
+        Self::lock(tx, id, instance, Some(token_expiry), false, "FOR SHARE").await
+    }
+
+    /// An already authorized streaming request retains the exact session ID
+    /// through I/O. The current session is still required at publication.
+    pub async fn lock_for_continuation(
+        tx: &mut Transaction<'_, Postgres>,
+        id: Id,
+        instance: Uuid,
+    ) -> Result<Option<ManagerSessionRecord>> {
+        Self::lock(tx, id, instance, None, false, "FOR SHARE").await
+    }
+
+    async fn lock(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        id: Id,
+        instance: Uuid,
+        token_expiry: Option<DateTime<Utc>>,
+        allow_closed: bool,
+        sql_lock: &'static str,
+    ) -> Result<Option<ManagerSessionRecord>> {
         Ok(sqlx::query_as(&format!(
             "WITH locked AS MATERIALIZED (
-                 SELECT {COLUMNS} FROM manager_session WHERE id = $1 AND instance = $2 FOR UPDATE
+                 SELECT {COLUMNS} FROM manager_session WHERE id = $1 AND instance = $2 {sql_lock}
              )
              SELECT {COLUMNS} FROM locked
-             WHERE (closed_at IS NULL OR $4) AND LEAST(expires_at, $3) > clock_timestamp()",
+             WHERE (closed_at IS NULL OR $4) AND LEAST(expires_at, $3::timestamptz) > clock_timestamp()",
         ))
         .bind(id)
         .bind(instance)

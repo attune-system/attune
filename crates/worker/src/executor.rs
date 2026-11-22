@@ -189,7 +189,7 @@ fn emit_runtime_log_truncation_events(execution_id: i64, result: &ExecutionResul
     }
 }
 
-fn record_runtime_log_capture(
+pub(crate) fn record_runtime_log_capture(
     result_data: &mut serde_json::Value,
     result: &ExecutionResult,
     allocation: Option<(bool, bool)>,
@@ -321,7 +321,7 @@ struct LogAllocationSettings {
     flush_interval_ms: u64,
 }
 
-fn inline_action_source(
+pub(crate) fn inline_action_source(
     entrypoint: &str,
     is_adhoc: bool,
     runtime_name: Option<&str>,
@@ -2601,7 +2601,7 @@ impl ActionExecutor {
         .await
     }
 
-    fn copy_reserved_queue_ack(
+    pub(crate) fn copy_reserved_queue_ack(
         result_data: &mut serde_json::Value,
         parsed_result: &serde_json::Value,
     ) {

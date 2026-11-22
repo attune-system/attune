@@ -83,6 +83,7 @@ impl Fixture {
             version: 9_000_000_001,
             stream: 9_000_000_002,
             attempt: Uuid::new_v4(),
+            segment_bytes: manager.segment_bytes,
             capture: capture.clone(),
             changed: changed.clone(),
             cancel: cancel.clone(),
@@ -93,7 +94,14 @@ impl Fixture {
         ));
         self.manager.tasks.spawn(async move {
             manager
-                .live(9_000_000_001, capture, changed, cancel, transport, slot)
+                .live(
+                    9_000_000_001,
+                    capture,
+                    changed,
+                    cancel,
+                    Some(transport),
+                    slot,
+                )
                 .await
         });
         writer

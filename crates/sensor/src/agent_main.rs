@@ -31,6 +31,10 @@ struct Args {
     /// Run runtime detection, print results, and exit
     #[arg(long)]
     detect_only: bool,
+
+    /// Run managed sensors using only the manager API.
+    #[arg(long, conflicts_with_all = ["config", "detect_only"])]
+    api_manager: bool,
 }
 
 fn main() -> Result<()> {
@@ -38,6 +42,11 @@ fn main() -> Result<()> {
     attune_common::auth::install_crypto_provider();
 
     let args = Args::parse();
+    if args.api_manager {
+        return tokio::runtime::Runtime::new()?.block_on(
+            attune_sensor::manager_sensor::run_from_environment(args.name, None),
+        );
+    }
 
     // Safe: no async runtime or worker threads are running yet.
     std::env::set_var("ATTUNE_SENSOR_AGENT_MODE", "true");

@@ -542,7 +542,9 @@ async fn run() -> Result<()> {
     let log_stream_wakeups = state.log_stream_wakeups.clone();
     let listener_db = database.pool().clone();
     let _postgres_listener =
-        postgres_listener::spawn_postgres_listener(listener_db, broadcast_tx, log_stream_wakeups);
+        postgres_listener::spawn_postgres_listener(
+            listener_db, broadcast_tx, log_stream_wakeups, state.manager_work_wakeups.clone(),
+        );
 
     info!("PostgreSQL notification listener started");
 
@@ -562,6 +564,13 @@ async fn run() -> Result<()> {
         .await;
     });
     info!("Inquiry callback delivery monitor started");
+
+    let manager_completion_monitor = tokio::spawn(
+        attune_api::manager_completion_publication::run(
+            state.clone(),
+            state.execution_log_streams.shutdown_token(),
+        ),
+    );
 
     // Create and start server
     let server = Server::new(state.clone());
@@ -586,6 +595,9 @@ async fn run() -> Result<()> {
     state.file_transfers.drain(file_shutdown_grace).await;
     if let Err(error) = callback_delivery_monitor.await {
         tracing::error!(%error, "Inquiry callback delivery monitor failed");
+    }
+    if let Err(error) = manager_completion_monitor.await {
+        tracing::error!(%error, "Manager completion delivery monitor failed");
     }
     // Also covers listener-bind/startup failure before Server's drain path.
     let cancellation_shutdown = state

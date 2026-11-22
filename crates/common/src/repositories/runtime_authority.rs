@@ -1860,6 +1860,13 @@ impl RuntimeAuthorityRepository {
                 "Execution credential references a stale attempt".into(),
             ));
         }
+        let manager_deadline =
+            super::manager_assignment::ManagerAssignmentRepository::retain_child_attempt(
+                connection,
+                credential.execution_id,
+                credential.attempt,
+            )
+            .await?;
         let approvals = validate_approvals(
             connection,
             &record.authority.owner,
@@ -1869,7 +1876,10 @@ impl RuntimeAuthorityRepository {
         tracing::debug!(stage = "approvals", "Runtime authority stage completed");
         let effect_fence = policy_fence
             .intersect(&dependency_fence)
-            .intersect(&approvals.fence);
+            .intersect(&approvals.fence)
+            .intersect(&ApprovalEffectFence {
+                earliest_expiry: manager_deadline,
+            });
         let standard_owners = if record
             .authority
             .selected_refs

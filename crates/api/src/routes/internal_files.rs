@@ -52,7 +52,10 @@ use crate::{
     http_range::{
         insert_range_headers, range_not_satisfiable, range_status, resolve_range, ResolvedRange,
     },
-    routes::artifacts::artifact_read_context_for_user,
+    routes::{
+        artifacts::artifact_read_context_for_user,
+        manager_pack_files::{self, PackTransferAuthorization},
+    },
     state::AppState,
 };
 
@@ -2663,14 +2666,16 @@ async fn encrypted_log_seal_proof(
             .and_then(|v| v.to_str().ok())
             .ok_or_else(denied)?
             .to_owned();
-        let key = state
-            .config
-            .security
-            .encryption_key
-            .as_deref()
-            .ok_or_else(denied)?;
+        let key = attune_common::repositories::manager_log::ManagerLogRepository::key(
+            &mut **tx,
+            version.id,
+            state.config.security.encryption_key.as_deref(),
+        )
+        .await
+        .map_err(map_transport_error)?
+        .ok_or_else(denied)?;
         let manifest =
-            attune_common::runtime_log_completion::FinalLogManifest::open(key, &authenticated)
+            attune_common::runtime_log_completion::FinalLogManifest::open(&key, &authenticated)
                 .map_err(map_transport_error)?;
         let stream_name = version
             .meta
@@ -2735,14 +2740,16 @@ async fn encrypted_log_seal_proof(
         .and_then(|value| value.to_str().ok())
         .ok_or_else(denied)?
         .to_owned();
-    let key = state
-        .config
-        .security
-        .encryption_key
-        .as_deref()
-        .ok_or_else(denied)?;
+    let key = attune_common::repositories::manager_log::ManagerLogRepository::key(
+        &mut **tx,
+        version.id,
+        state.config.security.encryption_key.as_deref(),
+    )
+    .await
+    .map_err(map_transport_error)?
+    .ok_or_else(denied)?;
     let manifest =
-        attune_common::runtime_log_completion::FinalLogManifest::open(key, &authenticated)
+        attune_common::runtime_log_completion::FinalLogManifest::open(&key, &authenticated)
             .map_err(map_transport_error)?;
     if manifest.execution != context.execution
         || manifest.version != version.id
@@ -2809,6 +2816,14 @@ async fn authorize_log_version(
 ) -> Result<attune_common::models::artifact_version::ArtifactVersion, (StatusCode, String)> {
     let log_credential =
         attune_common::log_delivery::credential(&user.claims).map_err(map_transport_error)?;
+    let capture_credential = attune_common::log_delivery::capture_credential(&user.claims)
+        .map_err(map_transport_error)?;
+    if capture_credential
+        .as_ref()
+        .is_some_and(|capture| capture.version != artifact_version)
+    {
+        return Err((StatusCode::FORBIDDEN, "Log capture version mismatch".into()));
+    }
     let workflow_credential = attune_common::log_delivery::workflow_credential(&user.claims)
         .map_err(map_transport_error)?;
     if workflow_credential
@@ -2853,7 +2868,7 @@ async fn authorize_log_version(
             "Log artifact version has no authorization path".to_string(),
         )
     })?;
-    if log_credential.is_none() && workflow_credential.is_none() {
+    if log_credential.is_none() && workflow_credential.is_none() && capture_credential.is_none() {
         authorize_file_transfer(state, user, file_path, FileOperation::Mutate).await?;
     }
     Ok(version)
@@ -4095,7 +4110,7 @@ pub(crate) async fn download_pack_archive(
 
 pub(crate) async fn download_pack_release_archive(
     State(state): State<Arc<AppState>>,
-    RequireAuth(user): RequireAuth,
+    RequireAuth(auth): RequireAuth<PackTransferAuthorization>,
     Path(release_id): Path<i64>,
     request_headers: HeaderMap,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
@@ -4105,17 +4120,40 @@ pub(crate) async fn download_pack_release_archive(
             "Invalid pack release ID".to_string(),
         ));
     }
+    let manager_digest = if let PackTransferAuthorization::Manager(manager) = &auth {
+        Some(
+            manager_pack_files::release(&state, manager, &request_headers, release_id, None)
+                .await
+                .map_err(map_api_error)?
+                .0,
+        )
+    } else {
+        None
+    };
     let release = PackReleaseRepository::find_by_id(&state.db, release_id)
         .await
         .map_err(map_pack_archive_repository_error)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Pack release not found".to_string()))?;
-    authorize_pack_release_archive(&state, &user, release.id).await?;
+    if let PackTransferAuthorization::Existing(user) = &auth {
+        authorize_pack_release_archive(&state, user, release.id).await?;
+    }
+    if manager_digest
+        .as_deref()
+        .is_some_and(|digest| digest != release.digest)
+    {
+        return Err(pack_archive_scope_forbidden());
+    }
     let size = pack_release_size(&release)?;
     let range = match resolve_range(&request_headers, size) {
         Ok(range) => range,
         Err(message) => return Ok(range_not_satisfiable(size, message)),
     };
     let tarball = read_pack_release_archive(&state, &release, range.bytes).await?;
+    if let PackTransferAuthorization::Manager(manager) = &auth {
+        manager_pack_files::release(&state, manager, &request_headers, release_id, None)
+            .await
+            .map_err(map_api_error)?;
+    }
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, "application/gzip".parse().unwrap());
     headers.insert(
@@ -4205,66 +4243,77 @@ fn map_pack_blob_error(error: BlobStoreError) -> (StatusCode, String) {
 )]
 pub(crate) async fn download_pack_install_candidate_archive(
     State(state): State<Arc<AppState>>,
-    RequireAuth(user): RequireAuth,
+    RequireAuth(auth): RequireAuth<PackTransferAuthorization>,
     Path(pack_install_id): Path<i64>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let worker_id = pack_candidate_worker_id(&user)?;
     if pack_install_id <= 0 {
         return Err((
             StatusCode::BAD_REQUEST,
             "Invalid pack install ID".to_string(),
         ));
     }
-    let install = PackInstallRepository::new(state.db.clone())
-        .find_by_id(pack_install_id)
-        .await
-        .map_err(|error| {
-            warn!(%error, pack_install_id, "Failed to load pack install candidate");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to load pack install candidate".to_string(),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                "Pack install candidate not found".to_string(),
-            )
-        })?;
-    if !matches!(install.status.as_str(), "pending" | "running") {
-        return Err((
-            StatusCode::NOT_FOUND,
-            "Pack install candidate not found".to_string(),
-        ));
-    }
-    if install.started_at
-        + chrono::Duration::seconds(
-            attune_common::repositories::pack_install::PACK_INSTALL_ACTIVE_TTL_SECS,
-        )
-        < chrono::Utc::now()
-    {
-        return Err((
-            StatusCode::NOT_FOUND,
-            "Pack install candidate not found".to_string(),
-        ));
-    }
-    if install.assigned_worker_id != Some(worker_id) {
-        return Err((
-            StatusCode::NOT_FOUND,
-            "Pack install candidate not found".to_string(),
-        ));
-    }
-    let expected_hash = install
-        .candidate_access_token_hash
-        .as_deref()
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                "Pack install candidate not found".to_string(),
-            )
-        })?;
-    authorize_pack_candidate_token(&headers, expected_hash)?;
+    let install = match &auth {
+        PackTransferAuthorization::Manager(manager) => {
+            manager_pack_files::candidate(&state, manager, &headers, pack_install_id)
+                .await
+                .map_err(map_api_error)?
+        }
+        PackTransferAuthorization::Existing(user) => {
+            let worker_id = pack_candidate_worker_id(user)?;
+            let install = PackInstallRepository::new(state.db.clone())
+                .find_by_id(pack_install_id)
+                .await
+                .map_err(|error| {
+                    warn!(%error, pack_install_id, "Failed to load pack install candidate");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to load pack install candidate".to_string(),
+                    )
+                })?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::NOT_FOUND,
+                        "Pack install candidate not found".to_string(),
+                    )
+                })?;
+            if !matches!(install.status.as_str(), "pending" | "running") {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    "Pack install candidate not found".to_string(),
+                ));
+            }
+            if install.started_at
+                + chrono::Duration::seconds(
+                    attune_common::repositories::pack_install::PACK_INSTALL_ACTIVE_TTL_SECS,
+                )
+                < chrono::Utc::now()
+            {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    "Pack install candidate not found".to_string(),
+                ));
+            }
+            if install.assigned_worker_id != Some(worker_id) {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    "Pack install candidate not found".to_string(),
+                ));
+            }
+            let expected_hash =
+                install
+                    .candidate_access_token_hash
+                    .as_deref()
+                    .ok_or_else(|| {
+                        (
+                            StatusCode::NOT_FOUND,
+                            "Pack install candidate not found".to_string(),
+                        )
+                    })?;
+            authorize_pack_candidate_token(&headers, expected_hash)?;
+            install
+        }
+    };
     validate_pack_archive_ref(&install.pack_ref).map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -4300,6 +4349,11 @@ pub(crate) async fn download_pack_install_candidate_archive(
         .get_pinned(&key, &version, size, digest, None)
         .await
         .map_err(map_pack_blob_error)?;
+    if let PackTransferAuthorization::Manager(manager) = &auth {
+        manager_pack_files::candidate(&state, manager, &headers, pack_install_id)
+            .await
+            .map_err(map_api_error)?;
+    }
     let headers = [
         (
             axum::http::header::CONTENT_TYPE,
@@ -4320,7 +4374,7 @@ pub(crate) async fn download_pack_install_candidate_archive(
 
 async fn upload_prepared_runtime(
     State(state): State<Arc<AppState>>,
-    RequireAuth(user): RequireAuth,
+    RequireAuth(auth): RequireAuth<PackTransferAuthorization>,
     Path(install_id): Path<i64>,
     headers: HeaderMap,
     body: Body,
@@ -4332,15 +4386,6 @@ async fn upload_prepared_runtime(
     use futures::TryStreamExt;
     use tokio_util::io::{ReaderStream, StreamReader};
 
-    let worker = pack_candidate_worker_id(&user)?;
-    let instance = scoped_metadata_value(&user, "worker_instance", "Worker")?
-        .parse()
-        .map_err(|_| {
-            (
-                StatusCode::FORBIDDEN,
-                "Worker token has an invalid instance scope".into(),
-            )
-        })?;
     let missing = || {
         (
             StatusCode::NOT_FOUND,
@@ -4353,23 +4398,45 @@ async fn upload_prepared_runtime(
     ) {
         return Err(missing());
     }
-    let incarnation =
-        RuntimePreparationRepository::builder_for_upload(&state.db, install_id, worker, instance)
+    let (legacy, manager_upload, prior) = match &auth {
+        PackTransferAuthorization::Manager(manager) => {
+            let (upload, prior) =
+                manager_pack_files::prepared_upload(&state, manager, &headers, install_id)
+                    .await
+                    .map_err(map_api_error)?;
+            (None, Some(upload), prior)
+        }
+        PackTransferAuthorization::Existing(user) => {
+            let worker = pack_candidate_worker_id(user)?;
+            let instance = scoped_metadata_value(user, "worker_instance", "Worker")?
+                .parse()
+                .map_err(|_| {
+                    (
+                        StatusCode::FORBIDDEN,
+                        "Worker token has an invalid instance scope".into(),
+                    )
+                })?;
+            let incarnation = RuntimePreparationRepository::builder_for_upload(
+                &state.db, install_id, worker, instance,
+            )
             .await
             .map_err(map_pack_archive_repository_error)?
             .ok_or_else(missing)?;
-    let install = PackInstallRepository::new(state.db.clone())
-        .find_by_id(install_id)
-        .await
-        .map_err(map_pack_archive_repository_error)?
-        .ok_or_else(missing)?;
-    authorize_pack_candidate_token(
-        &headers,
-        install
-            .candidate_access_token_hash
-            .as_deref()
-            .ok_or_else(missing)?,
-    )?;
+            let install = PackInstallRepository::new(state.db.clone())
+                .find_by_id(install_id)
+                .await
+                .map_err(map_pack_archive_repository_error)?
+                .ok_or_else(missing)?;
+            authorize_pack_candidate_token(
+                &headers,
+                install
+                    .candidate_access_token_hash
+                    .as_deref()
+                    .ok_or_else(missing)?,
+            )?;
+            (Some((worker, incarnation)), None, None)
+        }
+    };
     let invalid = || {
         (
             StatusCode::BAD_REQUEST,
@@ -4403,6 +4470,39 @@ async fn upload_prepared_runtime(
     if !prepared.scope.is_object_backed() || prepared.archive().is_some() {
         return Err(invalid());
     }
+    let finish_digest = format!(
+        "archive:{}:{size}:{}",
+        hex_digest(&Sha256::digest(&receipt).into()),
+        hex_digest(&digest)
+    );
+    if let Some(prior) = prior {
+        if prior != finish_digest {
+            return Err(pack_archive_scope_forbidden());
+        }
+        use tokio::io::AsyncReadExt;
+        let mut hasher = Sha256::new();
+        let mut limited = reader.take(size + 1);
+        let mut total = 0;
+        let mut chunk = [0; 16 * 1024];
+        loop {
+            let len = limited.read(&mut chunk).await.map_err(|_| invalid())?;
+            if len == 0 {
+                break;
+            }
+            hasher.update(&chunk[..len]);
+            total += len as u64;
+        }
+        if total != size || <[u8; 32]>::from(hasher.finalize()) != digest {
+            return Err(invalid());
+        }
+        if let Some(upload) = &manager_upload {
+            upload
+                .finish(&state, &prepared, &finish_digest)
+                .await
+                .map_err(map_api_error)?;
+        }
+        return Ok(StatusCode::NO_CONTENT);
+    }
     let key = ObjectKey::new(format!(
         "packs/prepared/{install_id}/{}.tar",
         uuid::Uuid::new_v4()
@@ -4423,34 +4523,61 @@ async fn upload_prepared_runtime(
         return Err(invalid());
     }
     prepared.set_archive(stored.into()).map_err(|_| invalid())?;
-    if !RuntimePreparationRepository::finish(&state.db, install_id, worker, incarnation, &prepared)
-        .await
-        .map_err(map_pack_archive_repository_error)?
-    {
-        return Err((
-            StatusCode::CONFLICT,
-            "Runtime preparation attempt expired or was cancelled".into(),
-        ));
+    match manager_upload {
+        Some(upload) => upload
+            .finish(&state, &prepared, &finish_digest)
+            .await
+            .map_err(map_api_error)?,
+        None => {
+            let (worker, incarnation) = legacy.expect("existing preparation scope");
+            if !RuntimePreparationRepository::finish(
+                &state.db,
+                install_id,
+                worker,
+                incarnation,
+                &prepared,
+            )
+            .await
+            .map_err(map_pack_archive_repository_error)?
+            {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "Runtime preparation attempt expired or was cancelled".into(),
+                ));
+            }
+        }
     }
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn download_prepared_runtime(
     State(state): State<Arc<AppState>>,
-    RequireAuth(user): RequireAuth,
+    RequireAuth(auth): RequireAuth<PackTransferAuthorization>,
     Path((release, directory)): Path<(i64, uuid::Uuid)>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     use attune_common::repositories::runtime_preparation::RuntimePreparationRepository;
 
-    let worker = pack_candidate_worker_id(&user)?;
-    let prepared =
-        RuntimePreparationRepository::find_download(&state.db, worker, release, directory)
-            .await
-            .map_err(map_pack_archive_repository_error)?
-            .ok_or((
-                StatusCode::NOT_FOUND,
-                "Prepared runtime archive not found".into(),
-            ))?;
+    let prepared = match &auth {
+        PackTransferAuthorization::Manager(manager) => {
+            manager_pack_files::release(&state, manager, &headers, release, Some(directory))
+                .await
+                .map_err(map_api_error)?
+                .1
+                .expect("prepared runtime authority includes a receipt")
+        }
+        PackTransferAuthorization::Existing(user) => {
+            let worker = pack_candidate_worker_id(user)?;
+
+            RuntimePreparationRepository::find_download(&state.db, worker, release, directory)
+                .await
+                .map_err(map_pack_archive_repository_error)?
+                .ok_or((
+                    StatusCode::NOT_FOUND,
+                    "Prepared runtime archive not found".into(),
+                ))?
+        }
+    };
     let archive = prepared
         .archive()
         .expect("download receipts carry an archive");
@@ -4462,6 +4589,11 @@ async fn download_prepared_runtime(
         .get_pinned(&key, &version, archive.size, digest, None)
         .await
         .map_err(map_pack_blob_error)?;
+    if let PackTransferAuthorization::Manager(manager) = &auth {
+        manager_pack_files::release(&state, manager, &headers, release, Some(directory))
+            .await
+            .map_err(map_api_error)?;
+    }
     Ok((
         StatusCode::OK,
         [(header::CONTENT_LENGTH, archive.size.to_string())],
@@ -4952,6 +5084,27 @@ async fn authorize_version_mutation_source(
     user: &AuthenticatedUser,
     version: &attune_common::models::artifact_version::ArtifactVersion,
 ) -> Result<crate::recorded_files::FileMutationProof, (StatusCode, String)> {
+    if let Some(credential) = attune_common::log_delivery::capture_credential(&user.claims)
+        .map_err(map_transport_error)?
+    {
+        let deadline =
+            attune_common::repositories::manager_log::ManagerLogRepository::require_capture(
+                tx,
+                version.id,
+                &credential,
+            )
+            .await
+            .map_err(map_transport_error)?;
+        return Ok(crate::recorded_files::FileMutationProof {
+            log_delivery: None,
+            workflow_log: None,
+            credential_deadline: user.claims.exp.min(deadline.timestamp()),
+            process: None,
+            process_delivery: None,
+            worker: None,
+            file_origin_budget: None,
+        });
+    }
     if let Some(credential) = attune_common::log_delivery::workflow_credential(&user.claims)
         .map_err(map_transport_error)?
     {
@@ -5097,10 +5250,60 @@ async fn authorize_version_mutation_source(
     } else {
         None
     };
+    let mut credential_deadline = user.claims.exp;
+    if let Some((execution, attempt)) = attune_common::repositories::delegated_execution::DelegatedExecutionRepository::validate_claims(
+        tx, &user.claims,
+    ).await.map_err(map_transport_error)? {
+        if let Some(end) = attune_common::repositories::manager_assignment::ManagerAssignmentRepository::retain_child_attempt(
+            tx, execution, attempt,
+        ).await.map_err(map_transport_error)? {
+            credential_deadline = credential_deadline.min(end.timestamp());
+        }
+    }
+    if user.claims.token_type == TokenType::Sensor {
+        use attune_common::repositories::sensor_schema::SensorSchemaRepository;
+        if let Some((binding_id, _)) =
+            SensorSchemaRepository::find_log_generation(&mut **tx, version.id)
+                .await
+                .map_err(map_transport_error)?
+        {
+            let deny = || {
+                (
+                    StatusCode::FORBIDDEN,
+                    "Sensor log generation unavailable".into(),
+                )
+            };
+            let fence = user.sensor_workload_fence().map_err(|_| deny())?;
+            let sensor = SensorWorkloadRepository::find_by_id(&mut **tx, fence.workload_id)
+                .await
+                .map_err(map_transport_error)?
+                .ok_or_else(deny)?
+                .sensor;
+            SensorWorkloadRepository::lock_current_fence_workload(tx, sensor, fence)
+                .await
+                .map_err(map_transport_error)?
+                .ok_or_else(deny)?;
+            let (current_id, _, _) =
+                SensorSchemaRepository::find(&mut **tx, fence.workload_id, fence.generation)
+                    .await
+                    .map_err(map_transport_error)?
+                    .ok_or_else(deny)?;
+            if binding_id != current_id {
+                return Err(deny());
+            }
+            SensorSchemaRepository::attach_current_log_deliveries(tx, version.id, binding_id)
+                .await
+                .map_err(map_transport_error)?;
+            let end = SensorWorkloadRepository::retained_deadline(tx, fence)
+                .await
+                .map_err(map_transport_error)?;
+            credential_deadline = credential_deadline.min(end.timestamp());
+        }
+    }
     let proof = crate::recorded_files::FileMutationProof {
         log_delivery,
         workflow_log: None,
-        credential_deadline: user.claims.exp,
+        credential_deadline,
         process,
         process_delivery,
         worker,
@@ -5153,6 +5356,28 @@ async fn check_delivery_bounds(
     stream: Option<i64>,
     operation: attune_common::repositories::worker_delivery::DeliveryOperation,
 ) -> Result<(), (StatusCode, String)> {
+    if attune_common::log_delivery::capture_credential(&user.claims)
+        .map_err(map_transport_error)?
+        .is_some()
+    {
+        // Keep live capture within the same bounded custody envelope.
+        let size = attune_common::runtime_read_log::maximum_encoded_bytes(
+            attune_common::manager_control::MAX_MANAGER_LOG_PLAINTEXT as u64,
+        )
+        .map_err(map_transport_error)?;
+        return match operation {
+            DeliveryOperation::Append { sequence, end }
+                if (0..16_384).contains(&sequence)
+                    && u64::try_from(end).is_ok_and(|end| end <= size) =>
+            {
+                Ok(())
+            }
+            _ => Err((
+                StatusCode::FORBIDDEN,
+                "Log capture exceeds its bounds".into(),
+            )),
+        };
+    }
     let Some(credential) =
         attune_common::worker_delivery::credential(&user.claims).map_err(map_transport_error)?
     else {

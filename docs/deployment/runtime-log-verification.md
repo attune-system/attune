@@ -28,6 +28,11 @@ and PostgreSQL database.
 
 ## Asynchronous worker log custody
 
+The [API-only manager configuration](api-only-managers.md#configure-the-manager-processes)
+uses object segments through the API. Each protected log version has a separate
+derived key. Manager log uploads use the API proxy, so managers need only the
+API network path and their own custody key.
+
 On Unix workers, delegated object logs use a persistent encrypted spool by
 default. After EOF and bounded capture, the worker synchronizes an immutable
 entry and registers its exact segment hashes and final proof before publishing

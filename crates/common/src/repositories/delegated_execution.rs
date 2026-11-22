@@ -389,7 +389,7 @@ impl DelegatedExecutionRepository {
     /// Resolve reserved access from persisted lineage, never bearer-supplied refs.
     /// A workflow child's additional scope belongs to its immediate containing
     /// workflow, not an arbitrary parent or a caller-selected ancestor.
-    async fn standard_scope(
+    pub async fn standard_scope(
         conn: &mut PgConnection,
         row: &crate::models::Execution,
     ) -> Result<(Vec<String>, Vec<String>)> {
@@ -487,10 +487,14 @@ impl DelegatedExecutionRepository {
         }
         let attempt: Uuid =
             serde_json::from_value(meta.get("delegated_attempt").cloned().ok_or_else(denied)?)?;
-        let open:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM delegated_execution_attempt WHERE execution=$1 AND attempt=$2 AND producer_kind='worker' AND worker=$3 AND NOT closed)").bind(execution).bind(attempt).bind(row.worker).fetch_one(conn).await?;
+        let open:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM delegated_execution_attempt WHERE execution=$1 AND attempt=$2 AND producer_kind='worker' AND worker=$3 AND NOT closed)").bind(execution).bind(attempt).bind(row.worker).fetch_one(&mut *conn).await?;
         if !open {
             return Err(denied());
         }
+        super::manager_assignment::ManagerAssignmentRepository::retain_child_attempt(
+            conn, execution, attempt,
+        )
+        .await?;
         Ok(Some((execution, attempt)))
     }
     /// Retain a bounded disclosure's source attempt through its final commit.
@@ -765,9 +769,18 @@ impl DelegatedExecutionRepository {
         execution: Id,
         worker: Id,
     ) -> Result<()> {
+        Self::require_worker_attempt(conn, execution, worker, &["running"]).await
+    }
+
+    pub(super) async fn require_worker_attempt(
+        conn: &mut PgConnection,
+        execution: Id,
+        worker: Id,
+        statuses: &[&str],
+    ) -> Result<()> {
         Box::pin(Self::validate(conn, execution)).await?;
-        let allowed:Option<Id>=sqlx::query_scalar("SELECT e.id FROM execution e JOIN delegated_execution_attempt a ON a.execution=e.id AND a.worker=e.worker WHERE e.id=$1 AND e.worker=$2 AND a.producer_kind='worker' AND e.status='running' AND NOT a.closed FOR SHARE OF e,a")
-            .bind(execution).bind(worker).fetch_optional(conn).await?;
+        let allowed:Option<Id>=sqlx::query_scalar("SELECT e.id FROM execution e JOIN delegated_execution_attempt a ON a.execution=e.id AND a.worker=e.worker WHERE e.id=$1 AND e.worker=$2 AND a.producer_kind='worker' AND e.status::text=ANY($3) AND NOT a.closed FOR SHARE OF e,a")
+            .bind(execution).bind(worker).bind(statuses).fetch_optional(conn).await?;
         if allowed.is_none() {
             return Err(denied());
         }

@@ -23,6 +23,99 @@ use std::collections::HashMap;
 use std::process::Command;
 use tracing::{debug, info, warn};
 
+mod version_probe;
+pub use version_probe::verify_registered_runtime_version;
+
+/// Probe the API's current definitions locally. The catalog cannot grant
+/// admission to run a recipe or choose which names the operator enabled.
+pub async fn probe_manager_catalog(
+    catalog: &crate::manager_control::ManagerRuntimeCatalog,
+    sequence: i64,
+    environment: &ChildProcessEnvironment,
+    runtime_root: &std::path::Path,
+    filter: Option<&[String]>,
+    pack_jobs_only: bool,
+) -> Result<crate::manager_control::ManagerRuntimeReport> {
+    use crate::{
+        manager_control::{ManagerRuntimeReport, RuntimeProbe},
+        runtime_lifecycle::PreparationScope,
+    };
+
+    let mut runtimes = std::collections::BTreeMap::new();
+    for runtime in &catalog.runtimes {
+        if filter.is_some_and(|filter| {
+            !runtime_aliases_match_filter(&runtime.aliases, filter)
+                && !runtime_aliases_match_filter(std::slice::from_ref(&runtime.name), filter)
+        }) {
+            continue;
+        }
+        let mut probe = RuntimeProbe {
+            default_available: false,
+            recipe_digest: None,
+            primary_version: None,
+            versions: Default::default(),
+        };
+        if runtime.execution_config.get("lifecycle").is_some() {
+            let Some(recipe) = runtime.parsed_execution_config().lifecycle else {
+                continue;
+            };
+            let Ok(digest) = recipe.require_admission(environment) else {
+                continue;
+            };
+            probe.recipe_digest = Some(digest);
+            if let Ok(tools) = recipe.discover(environment).await {
+                probe.primary_version = recipe
+                    .tools
+                    .iter()
+                    .find(|tool| tool.primary)
+                    .and_then(|tool| tools.get(&tool.name))
+                    .map(|tool| tool.version.clone());
+                probe.default_available = probe.primary_version.is_some();
+            }
+        } else {
+            probe.default_available =
+                RuntimeDetector::verify_definition(runtime, environment).await;
+        }
+        for version in catalog
+            .versions
+            .iter()
+            .filter(|version| version.runtime == runtime.id)
+        {
+            if crate::runtime_lifecycle::validate_version_mode(
+                &runtime.execution_config,
+                &version.execution_config,
+            )
+            .is_ok()
+                && verify_registered_runtime_version(version, environment).await
+            {
+                probe.versions.insert(version.id);
+            }
+        }
+        if probe.default_available || !probe.versions.is_empty() {
+            runtimes.insert(runtime.id, probe);
+        }
+    }
+    let preparation_scope = PreparationScope::open(
+        runtime_root,
+        &environment
+            .clone()
+            .with_object_preparation(catalog.object_preparation),
+    )
+    .map_err(|error| crate::Error::validation(error.to_string()))?;
+    Ok(ManagerRuntimeReport {
+        revision: catalog.revision,
+        sequence,
+        runtimes,
+        recipe_digests: environment
+            .runtime_recipe_digests()
+            .map(str::to_owned)
+            .collect(),
+        preparation_scope,
+        runtime_filter: filter.map(<[String]>::to_vec),
+        pack_jobs_only,
+    })
+}
+
 /// Check if a runtime's aliases overlap with a filter list.
 ///
 /// The filter list comes from `ATTUNE_WORKER_RUNTIMES` (e.g., `["python", "shell"]`).
@@ -194,12 +287,19 @@ impl RuntimeDetector {
 
     /// Verify if a runtime is available on this system
     pub async fn verify_runtime_available(&self, runtime: &Runtime) -> bool {
+        Self::verify_definition(runtime, &self.child_environment).await
+    }
+
+    pub async fn verify_definition(
+        runtime: &Runtime,
+        environment: &ChildProcessEnvironment,
+    ) -> bool {
         if runtime.execution_config.get("lifecycle").is_some() {
             return match serde_json::from_value::<crate::models::runtime::RuntimeExecutionConfig>(
                 runtime.execution_config.clone(),
             ) {
                 Ok(config) => match config.lifecycle {
-                    Some(recipe) => recipe.discover(&self.child_environment).await.is_ok(),
+                    Some(recipe) => recipe.discover(environment).await.is_ok(),
                     None => false,
                 },
                 Err(_) => false,
@@ -234,13 +334,7 @@ impl RuntimeDetector {
                     });
 
                     for cmd in sorted_commands {
-                        if Self::try_verification_command(
-                            &cmd,
-                            &runtime.name,
-                            &self.child_environment,
-                        )
-                        .await
-                        {
+                        if Self::try_verification_command(&cmd, &runtime.name, environment).await {
                             return true;
                         }
                     }
@@ -402,10 +496,18 @@ impl RuntimeDetector {
         let mut command = Command::new(binary);
         child_environment.apply(&mut command);
         command.args(&args);
-        let output = match child_environment
-            .sandbox_workload(command, &[])
-            .and_then(|mut command| command.output())
-        {
+        let output = async {
+            let command = child_environment.sandbox_workload(command, &[])?;
+            let mut command = tokio::process::Command::from(command);
+            command
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true);
+            tokio::time::timeout(std::time::Duration::from_secs(10), command.output())
+                .await
+                .map_err(std::io::Error::other)?
+        }
+        .await;
+        let output = match output {
             Ok(output) => output,
             Err(e) => {
                 if !optional {

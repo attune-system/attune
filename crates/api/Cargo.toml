@@ -98,6 +98,7 @@ jsonwebtoken = { workspace = true, features = ["rust_crypto"] }
 attune-executor = { path = "../executor" }
 serde_jcs = "=0.2.0"
 attune-worker = { path = "../worker" }
+attune-sensor = { path = "../sensor" }
 attune-notifier = { path = "../notifier" }
 tokio-tungstenite = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

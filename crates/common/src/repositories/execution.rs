@@ -1751,6 +1751,54 @@ impl ExecutionRepository {
             .map_err(Into::into)
     }
 
+    pub async fn find_legacy_reconciliation_candidates(
+        pool: &sqlx::PgPool,
+        status: ExecutionStatus,
+        stale_before: DateTime<Utc>,
+        limit: Option<i64>,
+    ) -> Result<Vec<Execution>> {
+        let sql = format!(
+            "SELECT {SELECT_COLUMNS} FROM execution
+             WHERE status = $1 AND updated < $2 AND NOT EXISTS (
+                 SELECT 1 FROM manager_execution_assignment a
+                 WHERE a.execution = execution.id AND a.closed_at IS NULL
+             ) ORDER BY updated, id LIMIT $3"
+        );
+        Ok(sqlx::query_as(&sql)
+            .bind(status)
+            .bind(stale_before)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?)
+    }
+
+    /// Legacy health checks may not settle API-managed attempts. Retain the
+    /// execution lock while deciding which recovery mechanism owns the row.
+    pub async fn reconcile_legacy_execution(
+        pool: &sqlx::PgPool,
+        id: Id,
+        expected_status: ExecutionStatus,
+        expected_updated: DateTime<Utc>,
+        input: UpdateExecutionInput,
+    ) -> Result<Option<Execution>> {
+        let mut tx = pool.begin().await?;
+        let current = Self::find_by_id_for_update(&mut tx, id).await?;
+        let result = if current.is_some_and(|execution| {
+            execution.status == expected_status && execution.updated == expected_updated
+        })
+            && !super::manager_assignment::ManagerAssignmentRepository::owns_remediation(
+                &mut tx, id,
+            )
+            .await?
+        {
+            Self::update_if_status(&mut *tx, id, expected_status, input).await?
+        } else {
+            None
+        };
+        tx.commit().await?;
+        Ok(result)
+    }
+
     pub async fn find_by_enforcement<'e, E>(
         executor: E,
         enforcement_id: Id,

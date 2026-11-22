@@ -20,6 +20,7 @@ pub mod inquiry_timeout;
 mod live_logs;
 mod log_decoder;
 pub mod log_stream_wakeups;
+pub mod manager_completion_publication;
 pub mod middleware;
 pub mod openapi;
 pub mod pack_release_upgrade;

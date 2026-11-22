@@ -1516,14 +1516,33 @@ async fn create_sensor_token_impl(
 
     let mut tx = state.db.begin().await?;
     SensorAdmissionRepository::lock_workload_checks(&mut tx).await?;
-    let authority = resolve_registered_sensor_authority(
+    let response = issue_sensor_token(
+        &state,
         &mut tx,
+        payload,
+        require_exact_request_scope,
+        workload_fence,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(ApiResponse::new(response)))
+}
+
+pub(crate) async fn issue_sensor_token(
+    state: &SharedState,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    payload: CreateSensorTokenRequest,
+    require_exact_request_scope: bool,
+    workload_fence: SensorWorkloadFence,
+) -> Result<SensorTokenResponse, ApiError> {
+    let authority = resolve_registered_sensor_authority(
+        tx,
         &payload,
         require_exact_request_scope,
         workload_fence,
     )
     .await?;
-    if !SensorWorkloadRepository::lock_current_fence(&mut tx, authority.sensor.id, workload_fence)
+    if !SensorWorkloadRepository::lock_current_fence(tx, authority.sensor.id, workload_fence)
         .await?
     {
         return Err(ApiError::Forbidden(
@@ -1543,12 +1562,12 @@ async fn create_sensor_token_impl(
         "cache_permission_set_refs": permission_set_refs.clone(),
     });
 
-    let identity = match IdentityRepository::find_by_login(&mut *tx, &sensor_login).await? {
+    let identity = match IdentityRepository::find_by_login(&mut **tx, &sensor_login).await? {
         Some(identity) => {
             ensure_identity_not_frozen_for_authentication(&identity)?;
             if identity.attributes != sensor_identity_attributes {
                 IdentityRepository::update(
-                    &mut *tx,
+                    &mut **tx,
                     identity.id,
                     UpdateIdentityInput {
                         attributes: Some(sensor_identity_attributes.clone()),
@@ -1568,7 +1587,7 @@ async fn create_sensor_token_impl(
                 password_hash: None, // Sensors don't use passwords
                 attributes: sensor_identity_attributes.clone(),
             };
-            IdentityRepository::create(&mut *tx, input).await?
+            IdentityRepository::create(&mut **tx, input).await?
         }
     };
 
@@ -1584,7 +1603,6 @@ async fn create_sensor_token_impl(
         &state.jwt_config,
         Some(ttl_seconds),
     )?;
-    tx.commit().await?;
 
     // Calculate expiration time
     let expires_at = chrono::Utc::now() + chrono::Duration::seconds(ttl_seconds);
@@ -1600,7 +1618,7 @@ async fn create_sensor_token_impl(
         workload_fence: Some(workload_fence),
     };
 
-    Ok(Json(ApiResponse::new(response)))
+    Ok(response)
 }
 
 fn ensure_identity_not_frozen_for_authentication(identity: &Identity) -> Result<(), ApiError> {

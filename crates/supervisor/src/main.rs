@@ -1527,10 +1527,11 @@ impl SupervisorService {
                 "worker": candidate.worker,
                 "corrected_at": Utc::now(),
             });
-            let updated = ExecutionRepository::update_if_status(
+            let updated = ExecutionRepository::reconcile_legacy_execution(
                 &self.inner.pool,
                 candidate.id,
                 expected_status,
+                candidate.updated,
                 UpdateExecutionInput {
                     status: Some(new_status),
                     result: Some(result.clone()),

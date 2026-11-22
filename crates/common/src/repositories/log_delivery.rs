@@ -8,7 +8,8 @@ use sqlx::{Executor, PgConnection, Postgres};
 use uuid::Uuid;
 
 const SELECT_COLUMNS:&str="id,execution,artifact_version,stream,worker,source_instance,delivery_instance,attempt,owner,custody,state,revision,segments,total_bytes,sha256,truncated,authenticated_manifest,finalize_by,failure,created,updated";
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrepareLogDelivery {
     pub execution: i64,
     pub version: i64,
@@ -61,10 +62,13 @@ impl PrepareLogDelivery {
 #[derive(Clone)]
 pub struct LogDeliveryFence {
     pub intent: LogDeliveryIntent,
+    pub(crate) session_deadline: Option<DateTime<Utc>>,
 }
 impl LogDeliveryFence {
     pub fn ensure_fresh(&self) -> Result<()> {
-        if self.intent.finalize_by <= Utc::now() {
+        if self.intent.finalize_by <= Utc::now()
+            || self.session_deadline.is_some_and(|end| end <= Utc::now())
+        {
             Err(denied())
         } else {
             Ok(())
@@ -349,7 +353,13 @@ impl LogDeliveryRepository {
         {
             return Err(denied());
         }
-        let fence = LogDeliveryFence { intent };
+        let session_deadline =
+            super::manager_log::ManagerLogRepository::retain_slot(conn, version, worker, instance)
+                .await?;
+        let fence = LogDeliveryFence {
+            intent,
+            session_deadline,
+        };
         fence.ensure_fresh_on(conn).await?;
         Ok(fence)
     }

@@ -1251,52 +1251,87 @@ impl ExecutionScheduler {
         ));
 
         // Use the handler pattern to consume messages
-        self.consumer
-            .consume_with_handler(
-                move |envelope: MessageEnvelope<ExecutionRequestedPayload>| {
-                    let pool = pool.clone();
-                    let publisher = publisher.clone();
-                    let policy_enforcer = policy_enforcer.clone();
-                    let counter = counter.clone();
-                    let artifacts_dir = artifacts_dir.clone();
-                    let encryption_key = encryption_key.clone();
-                    let recorded_identity = recorded_identity.clone();
-                    let metadata_caches = metadata_caches.clone();
-                    let workflow_log_transport = workflow_log_transport.clone();
+        let consume = self.consumer.consume_with_handler(
+            move |envelope: MessageEnvelope<ExecutionRequestedPayload>| {
+                let pool = pool.clone();
+                let publisher = publisher.clone();
+                let policy_enforcer = policy_enforcer.clone();
+                let counter = counter.clone();
+                let artifacts_dir = artifacts_dir.clone();
+                let encryption_key = encryption_key.clone();
+                let recorded_identity = recorded_identity.clone();
+                let metadata_caches = metadata_caches.clone();
+                let workflow_log_transport = workflow_log_transport.clone();
 
-                    // Keep native workflow scheduling state off the consumer's
-                    // stack, including when the broker has not delivered work.
-                    Box::pin(async move {
-                        if let Err(e) = Box::pin(Self::process_execution_requested(
-                            &pool,
-                            &publisher,
-                            &policy_enforcer,
-                            &counter,
-                            artifacts_dir.as_str(),
-                            encryption_key.as_deref(),
-                            &workflow_log_transport,
-                            workflow_log_segment_max_bytes,
-                            workflow_log_flush_interval_ms,
-                            &metadata_caches,
-                            recorded_identity.as_deref(),
-                            &envelope,
-                        ))
+                // Keep native workflow scheduling state off the consumer's
+                // stack, including when the broker has not delivered work.
+                Box::pin(async move {
+                    if let Err(e) = Box::pin(Self::process_execution_requested(
+                        &pool,
+                        &publisher,
+                        &policy_enforcer,
+                        &counter,
+                        artifacts_dir.as_str(),
+                        encryption_key.as_deref(),
+                        &workflow_log_transport,
+                        workflow_log_segment_max_bytes,
+                        workflow_log_flush_interval_ms,
+                        &metadata_caches,
+                        recorded_identity.as_deref(),
+                        &envelope,
+                    ))
+                    .await
+                    {
+                        error!("Error scheduling execution: {}", e);
+                        // Return error to trigger nack with requeue
+                        if let Some(mq_err) = Self::retryable_mq_error(&e) {
+                            return Err(mq_err);
+                        }
+                        return Err(format!("Failed to schedule execution: {}", e).into());
+                    }
+                    Ok(())
+                })
+            },
+        );
+        tokio::select! {
+            result = consume => Ok(result?),
+            () = self.recover_manager_assignments() => Ok(()),
+        }
+    }
+
+    async fn recover_manager_assignments(&self) {
+        use attune_common::repositories::manager_assignment::{
+            ManagerAssignmentRecovery, ManagerAssignmentRepository,
+        };
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            for _ in 0..32 {
+                match ManagerAssignmentRepository::recover_expired(&self.pool).await {
+                    Ok(Some(ManagerAssignmentRecovery::Reschedule(execution))) => {
+                        // The original policy slot belongs to this same execution.
+                        // A failed or interrupted publish leaves durable Requested
+                        // work for the supervisor's normal recovery.
+                        if let Err(error) = Self::republish_execution_requested(
+                            &self.pool,
+                            &self.publisher,
+                            execution,
+                        )
                         .await
                         {
-                            error!("Error scheduling execution: {}", e);
-                            // Return error to trigger nack with requeue
-                            if let Some(mq_err) = Self::retryable_mq_error(&e) {
-                                return Err(mq_err);
-                            }
-                            return Err(format!("Failed to schedule execution: {}", e).into());
+                            warn!(execution, %error, "Manager offer reschedule deferred");
                         }
-                        Ok(())
-                    })
-                },
-            )
-            .await?;
-
-        Ok(())
+                    }
+                    Ok(Some(ManagerAssignmentRecovery::Closed)) => {}
+                    Ok(None) => break,
+                    Err(error) => {
+                        warn!(%error, "Manager assignment recovery deferred");
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /// Process an execution requested message
@@ -1722,40 +1757,23 @@ impl ExecutionScheduler {
             worker: Some(worker.id),
             ..Default::default()
         };
-        let (assignment, recorded_worker_boot) = if recorded {
-            let result = Self::assign_recorded_worker(
-                pool,
-                execution_id,
-                &worker,
-                request_context.recorded_identity,
-                update,
-            )
-            .await;
-            match result {
-                Ok((execution, boot)) => (execution, Some(boot)),
-                Err(error) => {
-                    Self::release_acquired_policy_slot(
-                        policy_enforcer,
-                        pool,
-                        publisher,
-                        execution_id,
-                    )
+        let result = Self::assign_worker_for_dispatch(
+            pool,
+            execution_id,
+            &worker,
+            recorded,
+            request_context.recorded_identity,
+            update,
+        )
+        .await;
+        let (assignment, recorded_worker_boot, via_manager) = match result {
+            Ok(assignment) => assignment,
+            Err(error) => {
+                Self::release_acquired_policy_slot(policy_enforcer, pool, publisher, execution_id)
                     .await?;
-                    Self::revert_scheduling_claim(pool, execution_id).await?;
-                    return Err(MqError::Timeout(error.to_string()).into());
-                }
+                Self::revert_scheduling_claim(pool, execution_id).await?;
+                return Err(MqError::Timeout(error.to_string()).into());
             }
-        } else {
-            (
-                ExecutionRepository::update_if_status(
-                    pool,
-                    execution_id,
-                    ExecutionStatus::Scheduling,
-                    update,
-                )
-                .await?,
-                None,
-            )
         };
         let scheduled_execution = match assignment {
             Some(execution) => execution,
@@ -1770,36 +1788,38 @@ impl ExecutionScheduler {
             }
         };
 
-        // Publish message to worker-specific queue
-        if let Err(err) = Self::queue_to_worker(
-            publisher,
-            &execution_id,
-            &worker.id,
-            &request_context.envelope.payload.action_ref,
-            &execution_config,
-            scheduled_execution.updated,
-            recorded_worker_boot,
-            scheduled_execution.pack_release,
-            scheduled_execution.pack_release_digest.clone(),
-        )
-        .await
-        {
-            if let Err(revert_err) =
-                Self::revert_scheduled_execution(pool, execution_id, policy_enforcer, publisher)
-                    .await
+        // API-backed assignments are claimable as soon as placement commits.
+        if !via_manager {
+            if let Err(err) = Self::queue_to_worker(
+                publisher,
+                &execution_id,
+                &worker.id,
+                &request_context.envelope.payload.action_ref,
+                &execution_config,
+                scheduled_execution.updated,
+                recorded_worker_boot,
+                scheduled_execution.pack_release,
+                scheduled_execution.pack_release_digest.clone(),
+            )
+            .await
             {
-                warn!(
+                if let Err(revert_err) =
+                    Self::revert_scheduled_execution(pool, execution_id, policy_enforcer, publisher)
+                        .await
+                {
+                    warn!(
                     "Failed to revert execution {} back to Requested after worker publish error: {}",
                     execution_id, revert_err
                 );
-            }
-            if let Some(context) = Self::workflow_delay_context(&execution) {
-                warn!(
+                }
+                if let Some(context) = Self::workflow_delay_context(&execution) {
+                    warn!(
                     "Delayed {}: failed to publish the execution to a worker queue, the task will remain pending until retried: {}",
                     context, err
                 );
+                }
+                return Err(err);
             }
-            return Err(err);
         }
 
         info!(
@@ -10363,7 +10383,7 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
         } else {
             false
         };
-        let workers: Vec<_> = WorkerRepository::find_action_workers(pool)
+        let workers: Vec<_> = WorkerRepository::find_execution_workers(pool)
             .await?
             .into_iter()
             .filter(|worker| {
@@ -10552,29 +10572,46 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
             .ok()
     }
 
-    async fn assign_recorded_worker(
+    async fn assign_worker_for_dispatch(
         pool: &PgPool,
         execution: i64,
         worker: &attune_common::models::Worker,
+        recorded: bool,
         identity: Option<&RecordedConsumerIdentity>,
         update: UpdateExecutionInput,
-    ) -> Result<(Option<Execution>, uuid::Uuid)> {
-        let boot = Self::worker_boot(worker)
-            .ok_or_else(|| anyhow::anyhow!("Recorded worker registration is missing"))?;
-        let identity =
-            identity.ok_or_else(|| anyhow::anyhow!("Recorded executor identity is unavailable"))?;
+    ) -> Result<(Option<Execution>, Option<uuid::Uuid>, bool)> {
+        use attune_common::{
+            execution_authority::consumer_contract::ConsumerRole,
+            repositories::{
+                manager_assignment::ManagerAssignmentRepository,
+                manager_runtime::ManagerRuntimeRepository,
+            },
+        };
+
         let mut tx = pool.begin().await?;
-        let evidence = identity
-            .require_current(
-                &mut tx,
-                attune_common::execution_authority::consumer_contract::ConsumerRole::Executor,
-            )
-            .await?;
-        if !evidence.matches_worker(worker.id, boot, Utc::now()) {
+        if !ManagerRuntimeRepository::retain_placement(&mut tx, worker).await? {
             return Err(anyhow::anyhow!(
-                "Recorded worker registration is no longer current"
+                "Worker placement evidence changed during scheduling"
             ));
         }
+        let proof = if recorded {
+            let boot = Self::worker_boot(worker)
+                .ok_or_else(|| anyhow::anyhow!("Recorded worker registration is missing"))?;
+            let identity = identity
+                .ok_or_else(|| anyhow::anyhow!("Recorded executor identity is unavailable"))?;
+            let evidence = identity
+                .require_current(&mut tx, ConsumerRole::Executor)
+                .await?;
+            if !evidence.matches_worker(worker.id, boot, Utc::now()) {
+                return Err(anyhow::anyhow!(
+                    "Recorded worker registration is no longer current"
+                ));
+            }
+            Some((identity, boot))
+        } else {
+            None
+        };
+
         let assigned = ExecutionRepository::update_if_status(
             &mut *tx,
             execution,
@@ -10582,26 +10619,28 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
             update,
         )
         .await?;
-        if assigned.is_some() {
-            let current = identity
-                .require_current(
-                    &mut tx,
-                    attune_common::execution_authority::consumer_contract::ConsumerRole::Executor,
-                )
-                .await?;
-            let registration = WorkerRepository::find_by_id(&mut *tx, worker.id).await?;
-            if !current.matches_worker(worker.id, boot, Utc::now())
-                || registration.is_none_or(|current| {
-                    current.cordoned || Self::worker_boot(&current) != Some(boot)
-                })
-            {
-                return Err(anyhow::anyhow!(
-                    "Recorded worker registration is no longer current"
-                ));
+        let mut via_manager = false;
+        if let Some(execution) = &assigned {
+            if let Some((identity, boot)) = proof {
+                let current = identity
+                    .require_current(&mut tx, ConsumerRole::Executor)
+                    .await?;
+                let registration = WorkerRepository::find_by_id(&mut *tx, worker.id).await?;
+                if !current.matches_worker(worker.id, boot, Utc::now())
+                    || registration.is_none_or(|current| {
+                        current.cordoned || Self::worker_boot(&current) != Some(boot)
+                    })
+                {
+                    return Err(anyhow::anyhow!(
+                        "Recorded worker registration is no longer current"
+                    ));
+                }
             }
+            via_manager =
+                ManagerAssignmentRepository::offer_if_bound(&mut tx, execution, 30).await?;
         }
         tx.commit().await?;
-        Ok((assigned, boot))
+        Ok((assigned, proof.map(|(_, boot)| boot), via_manager))
     }
 
     /// Select an active, fresh worker that supports the runtimes required to
@@ -10616,8 +10655,9 @@ attune_common::repositories::execution_admission::ExecutionAdmissionRepository::
         required_recipe_digests: &[String],
         placement: WorkerPlacement,
         round_robin_counter: &AtomicUsize,
+        manager_only: bool,
     ) -> Result<attune_common::models::Worker> {
-        let workers = WorkerRepository::find_action_workers(pool).await?;
+        let workers = WorkerRepository::find_pack_workers(pool, manager_only).await?;
         if workers.is_empty() {
             return Err(anyhow::anyhow!("No action workers available"));
         }

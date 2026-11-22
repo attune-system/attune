@@ -14,7 +14,9 @@ use attune_common::{
         Publisher,
     },
     repositories::{
-        runtime_preparation::RuntimePreparationRepository, PackInstallRepository, WorkerRepository,
+        manager_pack_job::{ManagerPackJobRepository, PackDispatch},
+        runtime_preparation::RuntimePreparationRepository,
+        PackInstallRepository, WorkerRepository,
     },
     runtime_lifecycle::PREPARATION_TRIGGER,
     scheduling::{
@@ -54,6 +56,42 @@ impl PackTestProcessor {
     pub async fn start(&self) -> Result<()> {
         info!("Starting pack test processor");
 
+        tokio::select! {
+            result = self.consume_requests() => result,
+            () = self.recover_manager_jobs() => Ok(()),
+        }
+    }
+
+    async fn recover_manager_jobs(&self) {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            for _ in 0..32 {
+                match ManagerPackJobRepository::recover(&self.pool).await {
+                    Ok(Some(payload)) => {
+                        if let Err(error) = Self::dispatch_pack_test(
+                            &self.pool,
+                            &self.publisher,
+                            &self.round_robin_counter,
+                            &payload,
+                        )
+                        .await
+                        {
+                            warn!(%error, install=payload.pack_install_id, "Could not redispatch manager pack job");
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        warn!(%error, "Could not recover manager pack jobs");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn consume_requests(&self) -> Result<()> {
         let pool = self.pool.clone();
         let publisher = self.publisher.clone();
         let counter = self.round_robin_counter.clone();
@@ -127,9 +165,16 @@ impl PackTestProcessor {
             return Ok(());
         }
 
-        let worker = match Self::select_worker(pool, payload, counter).await {
+        let manager_only =
+            ManagerPackJobRepository::awaiting_recovery(pool, payload.pack_install_id)
+                .await
+                .map_err(|error| MqError::Pool(error.to_string()))?;
+        let worker = match Self::select_worker(pool, payload, counter, manager_only).await {
             Ok(worker) => worker,
             Err(e) => {
+                if manager_only {
+                    return Ok(());
+                }
                 warn!(
                     "No worker available for pack '{}' test run: {}",
                     payload.pack_ref, e
@@ -138,6 +183,19 @@ impl PackTestProcessor {
                 return Ok(());
             }
         };
+
+        match ManagerPackJobRepository::offer(pool, &worker, payload)
+            .await
+            .map_err(|error| MqError::Pool(error.to_string()))?
+        {
+            PackDispatch::Legacy => {}
+            PackDispatch::Offered | PackDispatch::AlreadyDispatched => return Ok(()),
+            PackDispatch::PlacementChanged => {
+                return ManagerPackJobRepository::retry_placement(pool, payload)
+                    .await
+                    .map_err(|error| MqError::Pool(error.to_string()))
+            }
+        }
 
         let candidate_token = payload
             .candidate_path
@@ -207,12 +265,13 @@ impl PackTestProcessor {
         pool: &PgPool,
         payload: &PackTestRequestedPayload,
         counter: &AtomicUsize,
+        manager_only: bool,
     ) -> Result<Worker> {
         if payload.trigger_reason == PREPARATION_TRIGGER {
             let job = RuntimePreparationRepository::dispatch_job(pool, payload.pack_install_id)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("Runtime preparation job is unavailable"))?;
-            let mut workers: Vec<_> = WorkerRepository::find_action_workers(pool)
+            let mut workers: Vec<_> = WorkerRepository::find_pack_workers(pool, manager_only)
                 .await?
                 .into_iter()
                 .filter(|worker| job.can_build(worker))
@@ -245,6 +304,7 @@ impl PackTestProcessor {
             &payload.required_recipe_digests,
             placement,
             counter,
+            manager_only,
         )
         .await
     }

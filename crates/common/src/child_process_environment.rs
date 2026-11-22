@@ -188,6 +188,11 @@ impl ChildProcessEnvironment {
         self
     }
 
+    pub fn with_object_preparation(mut self, object_backed: bool) -> Self {
+        self.object_backed_preparation = object_backed;
+        self
+    }
+
     pub(crate) fn object_backed_preparation(&self) -> bool {
         self.object_backed_preparation
     }

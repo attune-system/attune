@@ -6,7 +6,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 pub struct CandidateEffectRepository;
@@ -71,6 +71,15 @@ impl CandidateEffectRepository {
         operation: CandidateOperation,
     ) -> Result<Value> {
         Self::apply(pool, context.lease, &context.token, operation).await
+    }
+
+    pub async fn apply_with_manager_grants(
+        pool: &PgPool,
+        context: &AuthenticatedCandidateContext,
+        operation: CandidateOperation,
+        grants: &[crate::manager_control::ManagerEnrollmentGrant],
+    ) -> Result<Value> {
+        Self::apply_scoped(pool, context.lease, &context.token, operation, grants).await
     }
 
     /// Activation hook for an opt-in candidate test attempt. Call in the ordinary
@@ -162,6 +171,40 @@ impl CandidateEffectRepository {
         Ok(())
     }
 
+    pub async fn open_manager(
+        tx: &mut Transaction<'_, Postgres>,
+        install: i64,
+        worker: i64,
+        claim: Uuid,
+        lease: Uuid,
+        token: &str,
+        archive: &CandidateArchiveBinding<'_>,
+    ) -> Result<Uuid> {
+        let archive_hash = hash_integration_token(&claim.to_string());
+        let runtime_hash = hash_integration_token(token);
+        sqlx::query(
+            "INSERT INTO pack_candidate_context (lease, install_id, worker_id, archive_key, archive_version,
+                 archive_digest, archive_token_hash, runtime_token_hash, expires_at)
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8,
+                 LEAST(clock_timestamp() + INTERVAL '6 hours', p.started_at + INTERVAL '7 hours')
+             FROM pack_install p WHERE p.id=$2 AND p.status='running' AND p.assigned_worker_id=$3
+                AND p.candidate_object_key=$4 AND p.candidate_provider_version=$5
+                AND p.candidate_digest=$6 AND p.candidate_access_token_hash=$7
+             ON CONFLICT (install_id) DO NOTHING",
+        ).bind(lease).bind(install).bind(worker).bind(archive.key).bind(archive.provider_version)
+            .bind(archive.digest).bind(archive_hash).bind(&runtime_hash).execute(&mut **tx).await?;
+        sqlx::query_scalar(
+            "SELECT lease FROM pack_candidate_context WHERE install_id=$1 AND lease=$2
+             AND runtime_token_hash=$3 AND NOT revoked AND expires_at>clock_timestamp()",
+        )
+        .bind(install)
+        .bind(lease)
+        .bind(runtime_hash)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(denied)
+    }
+
     /// Authentication and effect admission share a transaction with the write. Credentials
     /// have no meaning to JWT consumers or to any production target resolver.
     pub async fn apply(
@@ -170,8 +213,34 @@ impl CandidateEffectRepository {
         token: &str,
         operation: CandidateOperation,
     ) -> Result<Value> {
+        Self::apply_scoped(pool, id, token, operation, &[]).await
+    }
+
+    async fn apply_scoped(
+        pool: &PgPool,
+        id: Uuid,
+        token: &str,
+        operation: CandidateOperation,
+        grants: &[crate::manager_control::ManagerEnrollmentGrant],
+    ) -> Result<Value> {
         let token_hash = hash_integration_token(token);
         let mut tx = pool.begin().await?;
+        // Lock the session before the install. Withdrawal and an effect then
+        // serialize, and retry can still replace the install claim atomically.
+        let manager: Option<(i64, String, String)> = sqlx::query_as(
+            "SELECT s.id,s.pool,s.enrollment_digest FROM pack_candidate_context c
+             JOIN manager_pack_job j ON j.install=c.install_id JOIN manager_session s ON s.id=j.manager_session
+             WHERE c.lease=$1 AND c.runtime_token_hash=$2 FOR SHARE OF s",
+        ).bind(id).bind(&token_hash).fetch_optional(&mut *tx).await?;
+        if manager.as_ref().is_some_and(|(_, pool, digest)| {
+            !grants.iter().any(|grant| {
+                grant.role == crate::models::WorkerRole::Action
+                    && &grant.pool == pool
+                    && &grant.secret_sha256 == digest
+            })
+        }) {
+            return Err(denied());
+        }
         let pack: Option<String> = sqlx::query_scalar("SELECT p.pack_ref FROM pack_install p JOIN pack_candidate_context c ON c.install_id = p.id WHERE c.lease = $1 AND c.runtime_token_hash = $2 AND NOT c.revoked AND c.expires_at > clock_timestamp() AND p.status = 'running' AND p.assigned_worker_id = c.worker_id AND p.candidate_object_key = c.archive_key AND p.candidate_provider_version = c.archive_version AND p.candidate_digest = c.archive_digest AND p.candidate_access_token_hash = c.archive_token_hash AND p.started_at > clock_timestamp() - INTERVAL '7 hours' FOR UPDATE OF p")
             .bind(id).bind(&token_hash).fetch_optional(&mut *tx).await?;
         let pack = pack.ok_or_else(denied)?;
@@ -207,6 +276,18 @@ impl CandidateEffectRepository {
                 Value::Array(events)
             }
         };
+        if let Some((session, _, _)) = manager {
+            let live: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pack_candidate_context c JOIN manager_pack_job j ON j.install=c.install_id
+                    JOIN manager_session s ON s.id=j.manager_session JOIN worker w ON w.id=j.worker
+                  WHERE c.lease=$1 AND s.id=$2 AND s.closed_at IS NULL
+                    AND s.instance=j.instance AND w.meta->>'registration_incarnation'=s.instance::text
+                    AND LEAST(s.expires_at,j.deadline,c.expires_at)>clock_timestamp())",
+            ).bind(id).bind(session).fetch_one(&mut *tx).await?;
+            if !live {
+                return Err(denied());
+            }
+        }
         tx.commit().await?;
         Ok(result)
     }

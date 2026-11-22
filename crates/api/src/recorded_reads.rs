@@ -629,16 +629,17 @@ pub(crate) async fn sealed_log_response(
     version: &ArtifactVersion,
 ) -> ApiResult<axum::response::Response> {
     use attune_common::runtime_read_log::open_final_manifest;
-    let key = state
-        .config
-        .security
-        .encryption_key
-        .as_deref()
-        .ok_or_else(denied)?;
+    let key = attune_common::repositories::manager_log::ManagerLogRepository::key(
+        &state.db,
+        version.id,
+        state.config.security.encryption_key.as_deref(),
+    )
+    .await?
+    .ok_or_else(denied)?;
     let encrypted = encrypted_manifest(version).ok_or_else(denied)?;
     let execution = version.execution.ok_or_else(denied)?;
     let manifest =
-        open_final_manifest(key, encrypted, execution, version.id).map_err(|_| denied())?;
+        open_final_manifest(&key, encrypted, execution, version.id).map_err(|_| denied())?;
     if version.body_state != Some(ArtifactBodyState::Ready)
         || version
             .meta
@@ -657,7 +658,7 @@ pub(crate) async fn sealed_log_response(
     }
     drop(connection);
     let reader = crate::log_decoder::sealed_ciphertext(state.clone(), version).await?;
-    let stream = crate::log_decoder::verified_plaintext(reader, key.to_owned(), manifest);
+    let stream = crate::log_decoder::verified_plaintext(reader, key, manifest);
     // A ciphertext range cannot establish complete-stream proof. Serve the full
     // plaintext with successful EOF gated on manifest verification, never an
     // early Content-Length/206 completion for an unchecked prefix.

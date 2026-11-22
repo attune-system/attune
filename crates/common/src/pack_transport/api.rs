@@ -14,11 +14,20 @@ use tracing::{debug, info};
 use super::{release_cache_path, PackFileTransport};
 use crate::auth::WorkerTokenProvider;
 use crate::error::{Error, Result};
+use crate::manager_control::{
+    ManagerSession, PackTransferScope, PACK_JOB_CLAIM_HEADER, PACK_JOB_HEADER,
+    SENSOR_GENERATION_HEADER, WORK_SCOPE_HEADER,
+};
 use crate::pack_registry::PackStorage;
 use crate::schema::RefValidator;
 
 const MAX_ARCHIVE_BYTES: u64 = crate::config::PackUploadConfig::DEFAULT_MAX_EXTRACTED_SIZE_BYTES;
 const RELEASE_READY_MARKER: &str = ".attune-release-ready";
+
+struct CandidateDownload<'a> {
+    access_token: Option<&'a str>,
+    digest: Option<&'a str>,
+}
 
 struct DownloadedArchive {
     path: PathBuf,
@@ -32,16 +41,18 @@ impl Drop for DownloadedArchive {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum AuthTokenSource {
     Static(String),
     WorkerProvider(Arc<WorkerTokenProvider>),
+    Manager(tokio::sync::watch::Receiver<Arc<ManagerSession>>),
 }
 
 impl AuthTokenSource {
     fn token(&self) -> Result<String> {
         match self {
             Self::Static(token) => Ok(token.clone()),
+            Self::Manager(session) => Ok(session.borrow().token.clone()),
             Self::WorkerProvider(provider) => provider
                 .token()
                 .map_err(|e| Error::Internal(format!("Failed to get worker auth token: {e}"))),
@@ -49,12 +60,13 @@ impl AuthTokenSource {
     }
 
     fn can_force_refresh(&self) -> bool {
-        matches!(self, Self::WorkerProvider(_))
+        matches!(self, Self::WorkerProvider(_) | Self::Manager(_))
     }
 
     fn force_refresh(&self) -> Result<String> {
         match self {
             Self::Static(token) => Ok(token.clone()),
+            Self::Manager(session) => Ok(session.borrow().token.clone()),
             Self::WorkerProvider(provider) => provider
                 .force_refresh()
                 .map_err(|e| Error::Internal(format!("Failed to refresh worker auth token: {e}"))),
@@ -63,13 +75,23 @@ impl AuthTokenSource {
 }
 
 /// HTTP-based pack transport that downloads pack archives from the API.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ApiPackTransport {
     api_url: String,
     auth_token_source: AuthTokenSource,
     packs_base_dir: String,
     candidate_base_dir: String,
     client: Client,
+    manager_scope: Option<PackTransferScope>,
+}
+
+impl std::fmt::Debug for ApiPackTransport {
+    fn fmt(&self, format: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        format
+            .debug_struct("ApiPackTransport")
+            .field("packs_base_dir", &self.packs_base_dir)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ApiPackTransport {
@@ -87,6 +109,7 @@ impl ApiPackTransport {
             packs_base_dir: packs_base_dir.to_string(),
             candidate_base_dir: packs_base_dir.to_string(),
             client,
+            manager_scope: None,
         })
     }
 
@@ -108,7 +131,46 @@ impl ApiPackTransport {
             packs_base_dir: packs_base_dir.to_string(),
             candidate_base_dir: packs_base_dir.to_string(),
             client,
+            manager_scope: None,
         })
+    }
+
+    pub(crate) fn for_manager(
+        api_url: &str,
+        client: Client,
+        session: tokio::sync::watch::Receiver<Arc<ManagerSession>>,
+        scope: PackTransferScope,
+        packs_base_dir: &str,
+    ) -> Self {
+        Self {
+            api_url: api_url.to_owned(),
+            client,
+            auth_token_source: AuthTokenSource::Manager(session),
+            packs_base_dir: packs_base_dir.to_owned(),
+            candidate_base_dir: packs_base_dir.to_owned(),
+            manager_scope: Some(scope),
+        }
+    }
+
+    fn scope_request(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let Some(scope) = self.manager_scope else {
+            return request;
+        };
+        let request = request.timeout(std::time::Duration::from_secs(300));
+        match scope {
+            PackTransferScope::PackJob { install, claim } => request
+                .header(PACK_JOB_HEADER, install.to_string())
+                .header(PACK_JOB_CLAIM_HEADER, claim.to_string()),
+            PackTransferScope::Action { assignment } => {
+                request.header(WORK_SCOPE_HEADER, assignment.to_string())
+            }
+            PackTransferScope::Sensor {
+                workload,
+                generation,
+            } => request
+                .header(WORK_SCOPE_HEADER, workload.to_string())
+                .header(SENSOR_GENERATION_HEADER, generation.to_string()),
+        }
     }
 
     /// Candidate inputs need writable storage even when installed releases are read-only.
@@ -136,15 +198,78 @@ impl ApiPackTransport {
         )
     }
 
+    pub async fn sync_claimed_candidate(
+        &self,
+        pack_ref: &str,
+        install: i64,
+        digest: &str,
+    ) -> Result<PathBuf> {
+        self.sync_candidate(pack_ref, install, None, Some(digest))
+            .await
+    }
+
+    async fn sync_candidate(
+        &self,
+        pack_ref: &str,
+        pack_install_id: i64,
+        candidate_access_token: Option<&str>,
+        digest: Option<&str>,
+    ) -> Result<PathBuf> {
+        RefValidator::validate_pack_ref(pack_ref)?;
+        if pack_install_id <= 0 {
+            return Err(Error::validation("Pack install ID must be positive"));
+        }
+        if candidate_access_token.is_none() && self.manager_scope.is_none() {
+            return Err(Error::validation(
+                "Pack install candidate access token is required",
+            ));
+        }
+        let archive = self
+            .download_archive(
+                &self.candidate_archive_url(pack_install_id),
+                &format!("candidate archive for pack install {pack_install_id}"),
+                Some(CandidateDownload {
+                    access_token: candidate_access_token,
+                    digest,
+                }),
+            )
+            .await?;
+        let attempt_dir = Path::new(&self.candidate_base_dir)
+            .join(".pack-test-attempts")
+            .join(pack_install_id.to_string())
+            .join("files");
+        let pack_dir = attempt_dir.join(pack_ref);
+        let candidate_base_dir = self.candidate_base_dir.clone();
+        let pack_ref = pack_ref.to_string();
+        let extraction_dir = attempt_dir.clone();
+        let extraction = tokio::task::spawn_blocking(move || {
+            let _ = std::fs::remove_dir_all(&extraction_dir);
+            let file = std::fs::File::open(&archive.path)?;
+            extract_pack_archive(file, &extraction_dir, &pack_ref)
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("Candidate pack extraction task panicked: {e}")))?;
+        if let Err(error) = extraction {
+            let _ = std::fs::remove_dir_all(&attempt_dir);
+            return Err(Error::Internal(format!(
+                "Failed to extract candidate pack: {error}"
+            )));
+        }
+        debug!(%candidate_base_dir, pack_install_id, "Candidate pack synced for testing");
+        Ok(pack_dir)
+    }
+
     async fn download_archive(
         &self,
         url: &str,
         subject: &str,
-        candidate_access_token: Option<&str>,
+        candidate: Option<CandidateDownload<'_>>,
     ) -> Result<DownloadedArchive> {
         let token = self.auth_token_source.token()?;
-        let request = self.client.get(url).bearer_auth(&token);
-        let request = if let Some(candidate_access_token) = candidate_access_token {
+        let request = self.scope_request(self.client.get(url).bearer_auth(&token));
+        let request = if let Some(candidate_access_token) =
+            candidate.as_ref().and_then(|source| source.access_token)
+        {
             request.header("x-attune-pack-candidate-token", candidate_access_token)
         } else {
             request
@@ -158,8 +283,10 @@ impl ApiPackTransport {
             && self.auth_token_source.can_force_refresh()
         {
             let refreshed_token = self.auth_token_source.force_refresh()?;
-            let request = self.client.get(url).bearer_auth(&refreshed_token);
-            let request = if let Some(candidate_access_token) = candidate_access_token {
+            let request = self.scope_request(self.client.get(url).bearer_auth(&refreshed_token));
+            let request = if let Some(candidate_access_token) =
+                candidate.as_ref().and_then(|source| source.access_token)
+            {
                 request.header("x-attune-pack-candidate-token", candidate_access_token)
             } else {
                 request
@@ -187,7 +314,7 @@ impl ApiPackTransport {
             )));
         }
 
-        let candidate_digest = if candidate_access_token.is_some() {
+        let candidate_digest = if candidate.is_some() {
             let digest = response
                 .headers()
                 .get("x-attune-pack-candidate-sha256")
@@ -201,12 +328,21 @@ impl ApiPackTransport {
                 .ok_or_else(|| {
                     Error::validation("Candidate archive is missing a valid SHA-256 digest")
                 })?;
+            if candidate
+                .as_ref()
+                .and_then(|source| source.digest)
+                .is_some_and(|expected| expected != digest)
+            {
+                return Err(Error::validation(
+                    "Candidate archive differs from the claimed digest",
+                ));
+            }
             Some(digest.to_string())
         } else {
             None
         };
 
-        let download_root = if candidate_access_token.is_some() {
+        let download_root = if candidate.is_some() {
             &self.candidate_base_dir
         } else {
             &self.packs_base_dir
@@ -336,43 +472,9 @@ impl PackFileTransport for ApiPackTransport {
         pack_ref: &str,
         pack_install_id: i64,
         candidate_access_token: Option<&str>,
-    ) -> Result<std::path::PathBuf> {
-        RefValidator::validate_pack_ref(pack_ref)?;
-        if pack_install_id <= 0 {
-            return Err(Error::validation("Pack install ID must be positive"));
-        }
-        let candidate_access_token = candidate_access_token
-            .ok_or_else(|| Error::validation("Pack install candidate access token is required"))?;
-        let archive = self
-            .download_archive(
-                &self.candidate_archive_url(pack_install_id),
-                &format!("candidate archive for pack install {pack_install_id}"),
-                Some(candidate_access_token),
-            )
-            .await?;
-        let attempt_dir = Path::new(&self.candidate_base_dir)
-            .join(".pack-test-attempts")
-            .join(pack_install_id.to_string())
-            .join("files");
-        let pack_dir = attempt_dir.join(pack_ref);
-        let candidate_base_dir = self.candidate_base_dir.clone();
-        let pack_ref = pack_ref.to_string();
-        let extraction_dir = attempt_dir.clone();
-        let extraction = tokio::task::spawn_blocking(move || {
-            let _ = std::fs::remove_dir_all(&extraction_dir);
-            let file = std::fs::File::open(&archive.path)?;
-            extract_pack_archive(file, &extraction_dir, &pack_ref)
-        })
-        .await
-        .map_err(|e| Error::Internal(format!("Candidate pack extraction task panicked: {e}")))?;
-        if let Err(error) = extraction {
-            let _ = std::fs::remove_dir_all(&attempt_dir);
-            return Err(Error::Internal(format!(
-                "Failed to extract candidate pack: {error}"
-            )));
-        }
-        debug!(%candidate_base_dir, pack_install_id, "Candidate pack synced for testing");
-        Ok(pack_dir)
+    ) -> Result<PathBuf> {
+        self.sync_candidate(pack_ref, pack_install_id, candidate_access_token, None)
+            .await
     }
 
     async fn publish_prepared_runtime(
@@ -408,24 +510,38 @@ impl PackFileTransport for ApiPackTransport {
             let prefix_bytes = bytes::Bytes::copy_from_slice(&prefix);
             let body = futures::stream::once(async move { Ok::<_, std::io::Error>(prefix_bytes) })
                 .chain(ReaderStream::new(file));
-            let response = self
-                .client
-                .post(&url)
-                .bearer_auth(&token)
-                .header("x-attune-pack-candidate-token", access_token)
+            let request = self.scope_request(self.client.post(&url).bearer_auth(&token));
+            let request = if self.manager_scope.is_none() {
+                request.header("x-attune-pack-candidate-token", access_token)
+            } else {
+                request
+            };
+            let response = request
                 .header("x-attune-runtime-archive-size", size)
                 .header("x-attune-sha256", &digest)
                 .header(reqwest::header::CONTENT_LENGTH, size + prefix.len() as u64)
                 .body(reqwest::Body::wrap_stream(body))
                 .send()
-                .await
-                .map_err(|error| Error::io(format!("Prepared runtime upload failed: {error}")))?;
+                .await;
+            let response = match response {
+                Ok(response) => response,
+                Err(_) if self.manager_scope.is_some() && !retry => {
+                    token = self.auth_token_source.force_refresh()?;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(Error::io(format!(
+                        "Prepared runtime upload failed: {error}"
+                    )))
+                }
+            };
             if response.status() == reqwest::StatusCode::NO_CONTENT {
                 return Ok(());
             }
-            if response.status() == reqwest::StatusCode::UNAUTHORIZED
-                && !retry
-                && self.auth_token_source.can_force_refresh()
+            if !retry
+                && ((response.status() == reqwest::StatusCode::UNAUTHORIZED
+                    && self.auth_token_source.can_force_refresh())
+                    || (response.status().is_server_error() && self.manager_scope.is_some()))
             {
                 token = self.auth_token_source.force_refresh()?;
                 continue;
@@ -458,7 +574,10 @@ impl PackFileTransport for ApiPackTransport {
             prepared.directory()
         );
         let token = self.auth_token_source.token()?;
-        let download = |token: String| self.client.get(&url).bearer_auth(token).send();
+        let download = |token: String| {
+            self.scope_request(self.client.get(&url).bearer_auth(token))
+                .send()
+        };
         let mut response = download(token)
             .await
             .map_err(|error| Error::io(format!("Prepared runtime download failed: {error}")))?;

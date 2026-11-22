@@ -4,6 +4,7 @@
 //! including event generation, rule matching, and template resolution.
 
 pub mod api_client;
+pub mod manager_sensor;
 pub mod rule_lifecycle_listener;
 pub mod sensor_log;
 pub mod sensor_manager;
