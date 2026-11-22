@@ -81,11 +81,11 @@ Use it when you want an MCP-capable agent or harness to interact with Attune thr
 ./target/debug/attune-mcp --api-url http://localhost:8080
 ./target/debug/attune-mcp --profile prod
 
-# Run as an HTTP service for containers or remote MCP clients
-./target/debug/attune-mcp --transport http --api-url http://localhost:8080 --http-host localhost:8090 --listen-addr 127.0.0.1:8090
+# Run a local HTTP service using the default loopback listener
+./target/debug/attune-mcp --transport http --api-url http://localhost:8080 --http-host 127.0.0.1:8090
 
-# Enable local pack checking over HTTP for explicitly mounted roots
-./target/debug/attune-mcp --transport http --api-url http://api:8080 --http-host localhost:8090 --packs-check-root /workspace/packs
+# In a container, bind on all interfaces and allow pack checks under a mounted root
+./target/debug/attune-mcp --transport http --api-url http://api:8080 --http-host localhost:8090 --listen-addr 0.0.0.0:8090 --packs-check-root /workspace/packs
 
 # Run with an execution-scoped token inside an Attune action/worker
 ATTUNE_API_URL=http://attune-api:8080 ATTUNE_API_TOKEN="$ATTUNE_API_TOKEN" ./target/debug/attune-mcp
@@ -114,18 +114,19 @@ Notes:
 - HTTP transport disables `packs_check` by default. Enable it with one or more `--packs-check-root PATH` options, or comma-separated `ATTUNE_MCP_PACKS_CHECK_ROOTS`. Requested paths and configured roots are canonicalized, and checks outside those roots are rejected. A container can therefore check only directories mounted beneath an allowlisted root.
 
 Container deployment surfaces:
-- Docker Compose includes an optional `mcp` profile-backed service on port `8090`.
-- The Helm chart includes an optional `mcp.enabled` deployment/service, disabled by default.
+- The MCP Docker image sets `ATTUNE_MCP_LISTEN_ADDR=0.0.0.0:8090`. The optional Docker Compose `mcp` profile sets the same container bind and publishes it on host loopback at `127.0.0.1:8090`.
+- The Helm chart includes an optional `mcp.enabled` Deployment and Service, disabled by default. The Deployment explicitly binds to `0.0.0.0` on the configured MCP Service port.
 
 #### HTTP caller authentication
 
-HTTP is opt-in; stdio remains the default. Every `POST /mcp` request, including
-initialization, tool listing and local pack checks, requires an Attune access
-bearer token in `Authorization: Bearer <token>`. The server validates it through
-`GET /auth/me` and uses the same token for API operations. API permissions and the
-MCP tool policy must both allow the operation. Invalid, expired, frozen or
-unavailable callers fail closed before dispatch. `/health` is an unauthenticated
-liveness endpoint with no identity or tool data.
+Standalone HTTP listens on `127.0.0.1:8090` by default. Use `--listen-addr` or
+`ATTUNE_MCP_LISTEN_ADDR` to override the bind address. Every `POST /mcp` request,
+including initialization, tool listing and local pack checks, requires an Attune
+access bearer token in `Authorization: Bearer <token>`. The server validates it
+through `GET /auth/me` and uses the same token for API operations. API permissions
+and the MCP tool policy must both allow the operation. Invalid, expired, frozen
+or unavailable callers fail closed before dispatch. `/health` is an
+unauthenticated liveness endpoint with no identity or tool data.
 
 HTTP requires an explicit `--api-url` / `ATTUNE_API_URL` HTTP(S) origin. It does
 not load profiles or the credential store. Startup token, refresh, login/password
@@ -141,20 +142,15 @@ trust is supported; configure the proxy to preserve an accepted Host. Browser
 Origins are denied unless exactly listed by `--http-origin` /
 `ATTUNE_MCP_HTTP_ORIGINS`. Missing Origin is allowed for non-browser clients;
 Origin and Host checks never substitute for bearer authentication. No permissive
-CORS is installed. Compose binds MCP to loopback, supplies local Host entries,
-and supplies no bootstrap credentials.
+CORS is installed. Compose supplies local Host entries and no bootstrap
+credentials.
 
 HTTP is request-scoped and retains no cache-refresh metadata across calls. Clients
 using an explicitly enabled refresh policy must supply seal metadata explicitly.
 The default read-only policy excludes mutations and execution file export.
 Existing filesystem root confinement still applies with any explicit policy.
 
-The separate `attune-charts` counterpart must keep `mcp.enabled: false`, remove
-bootstrap login/password injection, require per-request bearer authentication,
-configure exact Host/Origin allowlists, use TLS ingress and retain the read-only
-policy. Those chart changes are tracked with security finding s-4 / issue #132;
-they are not delivered by this repository PR. Do not enable an older MCP image
-with anonymous access or a shared bootstrap session.
+Use an MCP image that requires per-request bearer authentication with the chart.
 
 #### File-only execution disclosure through MCP
 
