@@ -236,10 +236,11 @@ async fn report_runtime(
         .runtime_catalog(session, None)
         .await?
         .context("runtime catalog missing")?;
+    // Protocol-only tests report the fixture runtime without requiring Bubblewrap.
     let report = attune_common::runtime_detection::probe_manager_catalog(
         &catalog,
         1,
-        &local_environment()?,
+        &ChildProcessEnvironment::default(),
         root,
         None,
         false,
