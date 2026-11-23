@@ -518,10 +518,6 @@ pub async fn receive_webhook(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    // Parse JSON payload
-    let payload: WebhookReceiverRequest = serde_json::from_slice(&body)
-        .map_err(|e| ApiError::BadRequest(format!("Invalid JSON payload: {}", e)))?;
-
     let payload_size_bytes = body.len() as i32;
 
     // Look up trigger by webhook key
@@ -799,6 +795,33 @@ pub async fn receive_webhook(
         }
     } else {
         None
+    };
+
+    // Admit the raw body before parsing it. Record malformed admitted requests
+    // so they count toward the same rate limit as well-formed requests.
+    let payload: WebhookReceiverRequest = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            let _ = log_webhook_event(
+                &state,
+                &trigger,
+                &webhook_key,
+                None,
+                source_ip.clone(),
+                user_agent.clone(),
+                payload_size_bytes,
+                400,
+                Some("Invalid JSON payload".to_string()),
+                start_time,
+                hmac_verified,
+                false,
+                ip_allowed,
+            )
+            .await;
+            return Err(ApiError::BadRequest(format!(
+                "Invalid JSON payload: {error}"
+            )));
+        }
     };
 
     // Build config with webhook context metadata
