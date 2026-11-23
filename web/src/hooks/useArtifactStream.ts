@@ -44,9 +44,7 @@ interface ArtifactNotification {
 interface ArtifactNotificationPayload {
   execution?: number;
   type?: string;
-  name?: string | null;
   progress_percent?: number | null;
-  progress_message?: string | null;
   progress_entries?: number | null;
   [key: string]: unknown;
 }
@@ -59,9 +57,8 @@ interface ArtifactNotificationPayload {
  * so that artifact lists and detail views update in real time.
  *
  * For progress-type artifacts, the notification payload includes a progress
- * summary (`progress_percent`, `progress_message`, `progress_entries`) extracted
- * by the database trigger so that the UI can update inline progress indicators
- * without a separate API call.
+ * summary (`progress_percent` and `progress_entries`) for fast progress updates.
+ * The artifact detail query retrieves its current name and message.
  *
  * @example
  * ```tsx
@@ -134,18 +131,12 @@ export function useArtifactStream(options: UseArtifactStreamOptions = {}) {
       // summary from the notification payload to provide instant feedback
       // before the invalidation refetch completes.
       if (payload?.type === "progress" && payload?.progress_percent != null) {
-        queryClient.setQueryData(
-          ["artifact_progress", artifactExecution],
-          (old: ArtifactProgressSummary | undefined) => ({
-            ...old,
-            artifactId: updatedArtifactId,
-            name: payload.name ?? null,
-            percent: payload.progress_percent as number,
-            message: payload.progress_message ?? null,
-            entries: payload.progress_entries ?? 0,
-            timestamp: notification.timestamp,
-          }),
-        );
+        queryClient.setQueryData(["artifact_progress", artifactExecution], {
+          artifactId: updatedArtifactId,
+          percent: payload.progress_percent as number,
+          entries: payload.progress_entries ?? 0,
+          timestamp: notification.timestamp,
+        } satisfies ArtifactProgressSummary);
       }
     },
     [artifactId, executionId, paused, queryClient, shouldRefresh],
@@ -168,9 +159,7 @@ export function useArtifactStream(options: UseArtifactStreamOptions = {}) {
  */
 export interface ArtifactProgressSummary {
   artifactId: number;
-  name: string | null;
   percent: number;
-  message: string | null;
   entries: number;
   timestamp: string;
 }

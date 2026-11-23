@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { BarChart3 } from "lucide-react";
 import {
+  useArtifact,
   useExecutionArtifacts,
   type ArtifactSummary,
 } from "@/hooks/useArtifacts";
@@ -22,8 +23,8 @@ interface ExecutionProgressBarProps {
  * 1. **Polling**: `useExecutionArtifacts` fetches the artifact list periodically
  *    so we can detect when a progress artifact first appears and read its initial state.
  * 2. **WebSocket**: `useArtifactStream` subscribes to real-time `artifact_updated`
- *    notifications, which include the latest `progress_percent` and `progress_message`
- *    extracted by the database trigger — providing instant updates between polls.
+ *    notifications, which include the latest `progress_percent` for updates
+ *    between polls. Progress messages come from the authenticated artifact API.
  *
  * The WebSocket-pushed summary takes precedence when available (it's newer), with
  * the polled data as a fallback for the initial render before any WS message arrives.
@@ -51,6 +52,14 @@ export default function ExecutionProgressBar({
     const artifacts = data?.items ?? [];
     return artifacts.find((a) => a.type === "progress") ?? null;
   }, [data]);
+  const { data: progressDetail } = useArtifact(
+    wsSummary?.artifactId ?? progressArtifact?.id,
+    isRunning,
+  );
+  const detail = progressDetail?.data;
+  const entry = Array.isArray(detail?.data) ? detail.data.at(-1) : undefined;
+  const latestEntry =
+    entry && typeof entry === "object" && !Array.isArray(entry) ? entry : null;
 
   // If there's no progress artifact at all, render nothing
   if (!progressArtifact && !wsSummary) {
@@ -59,9 +68,13 @@ export default function ExecutionProgressBar({
 
   // Prefer the WS-pushed summary (more current), fall back to indicating
   // that a progress artifact exists but we haven't received detail yet.
-  const percent = wsSummary?.percent ?? null;
-  const message = wsSummary?.message ?? null;
-  const name = wsSummary?.name ?? progressArtifact?.name ?? "Progress";
+  const detailPercent = latestEntry?.percent;
+  const percent =
+    wsSummary?.percent ??
+    (typeof detailPercent === "number" ? detailPercent : null);
+  const message =
+    typeof latestEntry?.message === "string" ? latestEntry.message : null;
+  const name = detail?.name ?? progressArtifact?.name ?? "Progress";
 
   // If we have a progress artifact but no percent yet (first poll, no WS yet),
   // show an indeterminate state

@@ -180,7 +180,6 @@ interface ExecutionCreatedPayload {
   action_id: number | null;
   action_ref: string;
   status: string;
-  trace_tag: string | null;
   enforcement: number | null;
   rule_ref: string | null;
   trigger_ref: string | null;
@@ -204,7 +203,6 @@ interface CompactExecutionPayload {
   id: number;
   status: string;
   old_status?: string;
-  trace_tag: string | null;
   auth_mode: "deferred";
 }
 ```
@@ -266,17 +264,16 @@ interface EventCreatedPayload {
   trigger: number | null;
   trigger_ref: string;
   source: number | null;
-  source_ref: string | null;
   rule: number | null;
   rule_ref: string | null;
-  trace_tag: string | null;
   has_payload: boolean;
   created: string;
   auth_mode: "full";
 }
 ```
 
-The notification never includes the event's payload. `has_payload` reports whether the PostgreSQL column is SQL null. Fetch the event through the API to read its payload.
+`has_payload` reports whether the event payload column is SQL null. Fetch
+the event through the API to read its payload, source reference, or trace tag.
 
 The compact form is:
 
@@ -287,7 +284,6 @@ interface CompactEventCreatedPayload {
   id: number;
   trigger_ref: string;
   rule_ref: string | null;
-  trace_tag: string | null;
   auth_mode: "deferred";
 }
 ```
@@ -308,7 +304,6 @@ interface EnforcementCreatedPayload {
   trigger_ref: string;
   event: number | null;
   status: string;
-  trace_tag: string | null;
   condition: string;
   created: string;
   resolved_at: string | null;
@@ -318,9 +313,10 @@ interface EnforcementCreatedPayload {
 
 `enforcement_status_changed` adds `old_status: string` to the full payload.
 
-The compact form keeps `entity_type`, `entity_id`, `id`, `rule`, `rule_ref`, `trigger_ref`, `event`, `status`, `trace_tag`, and `auth_mode: "deferred"`. It also keeps `old_status` for `enforcement_status_changed`.
-
-The trigger takes `trace_tag` from the first related execution that has one. If none exists, it uses the related event's trace tag. An enforcement creation notification usually arrives before its execution exists, so the event is normally the source.
+The compact form keeps `entity_type`, `entity_id`, `id`, `rule`, `rule_ref`,
+`trigger_ref`, `event`, `status`, and `auth_mode: "deferred"`. It also keeps
+`old_status` for `enforcement_status_changed`. Fetch an execution or
+enforcement through the API to read its trace tag.
 
 Sources: [current enforcement payload functions](../../migrations/20260902000002_related_notification_trace_tags.sql#L43-L159), [trigger attachments](../../migrations/20250101000004_trigger_sensor_event_rule.sql#L462-L500).
 
@@ -364,10 +360,8 @@ interface ArtifactCreatedPayload {
   type: string;
   visibility: string;
   classification: string;
-  name: string | null;
   scope: string;
   owner: string;
-  content_type: string | null;
   size_bytes: number | null;
   created: string;
   auth_mode: "full";
@@ -382,7 +376,6 @@ Its compact form keeps `entity_type`, `entity_id`, `id`, `ref`, `type`, `visibil
 interface ArtifactUpdatedPayload extends Omit<ArtifactCreatedPayload, "auth_mode"> {
   execution: number | null;
   progress_percent: number | null;
-  progress_message: string | null;
   progress_entries: number | null;
   updated: string;
   auth_mode: "full";
@@ -400,9 +393,16 @@ interface ArtifactVersionUpdatedPayload extends ArtifactUpdatedPayload {
 
 For the artifact-row producer, `execution` comes from the highest-numbered artifact version. For the version producer, it comes from that version. The outer `entity_id` and payload `id` always identify the parent artifact, not the artifact version.
 
-For progress artifacts backed by a JSON array, `progress_entries` is the array length. The percent and message come from the final array element. The three progress fields are null for other artifact types or data shapes.
+For progress artifacts backed by a JSON array, `progress_entries` is the
+array length. The percent comes from the final array element. Both fields
+are null for other artifact types or data shapes. Fetch the artifact through
+the API for its name, content type, and progress message.
 
-Compact artifact update payloads omit `classification`, `name`, `content_type`, `size_bytes`, `progress_message`, and timestamps. They retain the routing fields from compact creation payloads, plus `execution`, `progress_percent`, and `progress_entries`. Version-produced compact payloads also retain `artifact_version_id` and `version`.
+Compact artifact update payloads omit `classification`, `size_bytes`, and
+timestamps. They retain the routing fields from compact creation payloads,
+plus `execution`, `progress_percent`, and `progress_entries`.
+Version-produced compact payloads also retain `artifact_version_id` and
+`version`.
 
 An artifact version insert can produce two `artifact_updated` messages: one for the version and one caused by the retention trigger updating parent metadata. Use `artifact_version_id` to recognize the version-produced shape. Consumers should tolerate duplicate refresh signals.
 
@@ -422,7 +422,6 @@ interface WorkQueuePayload {
   ref: string;
   pack_ref: string | null;
   is_adhoc: boolean;
-  label: string;
   enabled: boolean;
   dispatch_action_ref: string;
   default_priority: number;
@@ -445,11 +444,8 @@ interface WorkQueueItemCreatedPayload {
   id: number;
   queue: number;
   queue_ref: string;
-  item_key: string | null;
   priority: number;
   status: string;
-  trace_tag: string | null;
-  enqueue_source: string;
   requested_by_identity: number | null;
   requested_by_execution: number | null;
   requested_by_enforcement: number | null;
@@ -465,9 +461,10 @@ interface WorkQueueItemCreatedPayload {
 
 `requested_by_identity` is provenance, not a notifier recipient. It does not populate the outer `user_id` and does not make a `user:<id>` filter match.
 
-These four streams have no compact fallback.
+Fetch queue details through the API for labels, item keys, trace tags, and
+enqueue sources. These four streams have no compact fallback.
 
-Sources: [work queue payload functions and trigger attachments](../../migrations/20250101000012_work_queues.sql#L284-L434), [current work queue item payload functions](../../migrations/20260902000002_related_notification_trace_tags.sql#L161-L226).
+Sources: [current notification payload functions](../../migrations/20261123000002_shared_operational_notifications.sql), [work queue trigger attachments](../../migrations/20250101000012_work_queues.sql#L284-L434).
 
 ## Rule lifecycle stream
 
@@ -482,21 +479,29 @@ interface RuleLifecycleChangedPayload {
   rule_id: number;
   rule_ref: string;
   trigger_ref: string;
-  trigger_params: unknown | null;
   timestamp: string;
-  auth_mode: "full";
+  auth_mode: "deferred";
 }
 ```
 
-The compact form omits `trigger_params` and sets `auth_mode` to `deferred`. The API service publishes this stream directly with `pg_notify`; it does not use a PostgreSQL trigger.
+The API publishes lifecycle changes as invalidation hints. Fetch current rule
+configuration through the authenticated API. Managed sensors use
+`GET /api/v1/rules?trigger_ref=<allowed_trigger_ref>&enabled=true` to reconcile
+their active rules.
 
 For regular access and execution tokens, the notifier refetches the rule before delivery. A `rule.deleted` message can therefore fail the delivery check after the row has been deleted. Sensor-token delivery checks the payload's `trigger_ref` against the token instead and does not require the rule row.
 
-Sources: [rule lifecycle publisher and payload builder](../../crates/api/src/routes/rule_lifecycle_notifier.rs#L11-L99), [current event type call sites](../../crates/api/src/routes/rules.rs), [sensor delivery authorization](../../crates/notifier/src/websocket_server.rs#L701-L717).
+Sources: [rule lifecycle publisher](../../crates/api/src/routes/rule_lifecycle_notifier.rs#L11-L60), [current event type call sites](../../crates/api/src/routes/rules.rs), [sensor delivery authorization](../../crates/notifier/src/websocket_server.rs#L888-L901).
 
 ## Compact payloads
 
-PostgreSQL limits a `NOTIFY` payload to 8,000 bytes. Execution, event, enforcement, artifact, and rule lifecycle publishers use a 7,000-byte threshold and replace oversized full payloads with compact payloads.
+The full envelope contains shared operational fields. Use the authenticated API
+for configuration, content, and caller-supplied trace and queue identifiers.
+
+PostgreSQL limits a `NOTIFY` payload to 8,000 bytes. Execution, event, enforcement,
+and artifact publishers use a 7,000-byte threshold and replace oversized full
+payloads with compact payloads. Rule lifecycle notifications always use the
+deferred envelope.
 
 Treat `payload.auth_mode === "deferred"` as an instruction to fetch the entity through the authenticated API. Do not assume that a field exists merely because it exists in the full type.
 
@@ -527,14 +532,13 @@ The notifier listens on `attune_notifications`, but no fixed trigger publishes a
 {
   "id": 1,
   "entity_type": "example",
-  "entity": "example-ref",
-  "activity": "updated"
+  "entity": "example-ref"
 }
 ```
 
 That payload lacks the required numeric `entity_id`. The notifier rejects it before WebSocket routing. Dynamic channel values outside the notifier's fixed channel list are not heard at all. Do not build a client subscription around `attune_notifications` until the publisher and parser contracts are aligned.
 
-Sources: [generic notification trigger](../../migrations/20250101000005_execution_and_operations.sql#L646-L671), [required common fields](../../crates/notifier/src/postgres_listener.rs#L171-L183), [listened channels](../../crates/notifier/src/postgres_listener.rs#L11-L30).
+Sources: [generic notification payload](../../migrations/20261123000002_shared_operational_notifications.sql), [required common fields](../../crates/notifier/src/postgres_listener.rs#L238-L254), [listened channels](../../crates/notifier/src/postgres_listener.rs#L11-L32).
 
 ## How to update this reference
 

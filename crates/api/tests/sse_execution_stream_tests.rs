@@ -148,13 +148,13 @@ async fn create_test_execution_with_notification_data(
 async fn receive_execution_notification(
     listener: &mut PgListener,
     channel: &str,
-    trace_tag: &str,
+    execution: i64,
 ) -> Result<Value> {
     timeout(Duration::from_secs(5), async {
         loop {
             let notification = listener.recv().await?;
             let payload: Value = serde_json::from_str(notification.payload())?;
-            if notification.channel() == channel && payload["trace_tag"] == trace_tag {
+            if notification.channel() == channel && payload["entity_id"] == execution {
                 return Ok(payload);
             }
         }
@@ -505,9 +505,9 @@ async fn test_postgresql_notify_trigger_fires() -> Result<()> {
     let execution =
         create_test_execution_with_trace_tag(&ctx.pool, action.id, Some(trace_tag.clone())).await?;
     let created_payload =
-        receive_execution_notification(&mut listener, "execution_created", &trace_tag).await?;
+        receive_execution_notification(&mut listener, "execution_created", execution.id).await?;
     assert_eq!(created_payload["entity_id"], execution.id);
-    assert_eq!(created_payload["trace_tag"], trace_tag.as_str());
+    assert!(created_payload.get("trace_tag").is_none());
     assert_eq!(created_payload["auth_mode"], "full");
 
     sqlx::query("UPDATE execution SET status = 'running' WHERE id = $1")
@@ -515,10 +515,10 @@ async fn test_postgresql_notify_trigger_fires() -> Result<()> {
         .execute(&ctx.pool)
         .await?;
     let updated_payload =
-        receive_execution_notification(&mut listener, "execution_status_changed", &trace_tag)
+        receive_execution_notification(&mut listener, "execution_status_changed", execution.id)
             .await?;
     assert_eq!(updated_payload["entity_id"], execution.id);
-    assert_eq!(updated_payload["trace_tag"], trace_tag.as_str());
+    assert!(updated_payload.get("trace_tag").is_none());
     assert_eq!(updated_payload["auth_mode"], "full");
 
     let compact_trace_tag = format!("sse-compact-{}", uuid::Uuid::new_v4().simple());
@@ -544,10 +544,10 @@ async fn test_postgresql_notify_trigger_fires() -> Result<()> {
     )
     .await?;
     let compact_created =
-        receive_execution_notification(&mut listener, "execution_created", &compact_trace_tag)
+        receive_execution_notification(&mut listener, "execution_created", compact_execution.id)
             .await?;
     assert_eq!(compact_created["entity_id"], compact_execution.id);
-    assert_eq!(compact_created["trace_tag"], compact_trace_tag.as_str());
+    assert!(compact_created.get("trace_tag").is_none());
     assert_eq!(compact_created["auth_mode"], "deferred");
 
     sqlx::query("UPDATE execution SET status = 'running' WHERE id = $1")
@@ -557,11 +557,11 @@ async fn test_postgresql_notify_trigger_fires() -> Result<()> {
     let compact_updated = receive_execution_notification(
         &mut listener,
         "execution_status_changed",
-        &compact_trace_tag,
+        compact_execution.id,
     )
     .await?;
     assert_eq!(compact_updated["entity_id"], compact_execution.id);
-    assert_eq!(compact_updated["trace_tag"], compact_trace_tag.as_str());
+    assert!(compact_updated.get("trace_tag").is_none());
     assert_eq!(compact_updated["auth_mode"], "deferred");
 
     Ok(())

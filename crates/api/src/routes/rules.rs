@@ -749,7 +749,6 @@ pub async fn create_rule(
         rule.id,
         &rule.r#ref,
         &rule.trigger_ref,
-        Some(&rule.trigger_params),
         rule.enabled,
     )
     .await
@@ -1463,7 +1462,6 @@ pub async fn update_rule(
             } else {
                 &rule.trigger_ref
             },
-            None,
             false,
         )
         .await
@@ -1482,7 +1480,6 @@ pub async fn update_rule(
             rule.id,
             &rule.r#ref,
             &rule.trigger_ref,
-            Some(&rule.trigger_params),
             true,
         )
         .await
@@ -1597,7 +1594,6 @@ pub async fn delete_rule(
         rule.id,
         &rule.r#ref,
         &rule.trigger_ref,
-        None,
         false,
     )
     .await
@@ -1693,7 +1689,6 @@ pub async fn enable_rule(
         rule.id,
         &rule.r#ref,
         &rule.trigger_ref,
-        Some(&rule.trigger_params),
         true,
     )
     .await
@@ -1784,7 +1779,6 @@ pub async fn disable_rule(
         rule.id,
         &rule.r#ref,
         &rule.trigger_ref,
-        None,
         false,
     )
     .await

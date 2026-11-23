@@ -26,7 +26,7 @@ async fn receive_payload(
 }
 
 #[tokio::test]
-async fn related_entity_notifications_include_trace_tags() {
+async fn related_entity_notifications_keep_routing_and_omit_business_identifiers() {
     let pool = helpers::create_test_pool().await.expect("test pool");
     let mut listener = PgListener::connect_with(&pool)
         .await
@@ -38,6 +38,8 @@ async fn related_entity_notifications_include_trace_tags() {
             "enforcement_status_changed",
             "work_queue_item_created",
             "work_queue_item_updated",
+            "artifact_created",
+            "artifact_updated",
         ])
         .await
         .expect("listen for notifications");
@@ -62,7 +64,7 @@ async fn related_entity_notifications_include_trace_tags() {
     let event_payload =
         receive_payload(&mut listener, "event_created", "trigger_ref", &trigger_ref).await;
     assert_eq!(event_payload["entity_id"], event_id);
-    assert_eq!(event_payload["trace_tag"], source_trace_tag);
+    assert!(event_payload.get("trace_tag").is_none());
 
     let rule_ref = format!("test.rule-{suffix}");
     let enforcement = sqlx::query(
@@ -83,7 +85,7 @@ async fn related_entity_notifications_include_trace_tags() {
     let enforcement_created =
         receive_payload(&mut listener, "enforcement_created", "rule_ref", &rule_ref).await;
     assert_eq!(enforcement_created["entity_id"], enforcement_id);
-    assert_eq!(enforcement_created["trace_tag"], source_trace_tag);
+    assert!(enforcement_created.get("trace_tag").is_none());
 
     let execution_trace_tag = format!("trace.execution.{suffix}");
     sqlx::query(
@@ -112,7 +114,7 @@ async fn related_entity_notifications_include_trace_tags() {
     )
     .await;
     assert_eq!(enforcement_updated["entity_id"], enforcement_id);
-    assert_eq!(enforcement_updated["trace_tag"], execution_trace_tag);
+    assert!(enforcement_updated.get("trace_tag").is_none());
 
     let queue_ref = format!("test.queue-{suffix}");
     let queue = sqlx::query(
@@ -131,8 +133,8 @@ async fn related_entity_notifications_include_trace_tags() {
     let queue_trace_tag = format!("trace.queue.{suffix}");
     let item = sqlx::query(
         r#"
-        INSERT INTO work_queue_item (queue, queue_ref, payload, trace_tag, enqueue_source)
-        VALUES ($1, $2, '{}'::jsonb, $3, 'test')
+        INSERT INTO work_queue_item (queue, queue_ref, payload, trace_tag, enqueue_source, item_key)
+        VALUES ($1, $2, '{}'::jsonb, $3, 'test', 'fixture-external-reference')
         RETURNING id
         "#,
     )
@@ -152,7 +154,8 @@ async fn related_entity_notifications_include_trace_tags() {
     )
     .await;
     assert_eq!(item_created["entity_id"], item_id);
-    assert_eq!(item_created["trace_tag"], queue_trace_tag);
+    assert!(item_created.get("trace_tag").is_none());
+    assert!(item_created.get("item_key").is_none());
 
     sqlx::query("UPDATE work_queue_item SET status = 'completed' WHERE id = $1")
         .bind(item_id)
@@ -167,7 +170,9 @@ async fn related_entity_notifications_include_trace_tags() {
     )
     .await;
     assert_eq!(item_updated["entity_id"], item_id);
-    assert_eq!(item_updated["trace_tag"], queue_trace_tag);
+    assert!(item_updated.get("trace_tag").is_none());
+    assert!(item_updated.get("item_key").is_none());
+    assert_eq!(item_updated["status"], "completed");
 
     let compact_trigger_ref = format!("test.compact-trigger-{suffix}");
     let compact_trace_tag = format!("trace.compact.{suffix}");
@@ -191,6 +196,31 @@ async fn related_entity_notifications_include_trace_tags() {
         &compact_trigger_ref,
     )
     .await;
-    assert_eq!(compact_event["auth_mode"], "deferred");
-    assert_eq!(compact_event["trace_tag"], compact_trace_tag);
+    assert_eq!(compact_event["auth_mode"], "full");
+    assert!(compact_event.get("trace_tag").is_none());
+    assert!(compact_event.get("source_ref").is_none());
+
+    let artifact_ref = format!("test.progress-{suffix}");
+    let artifact: i64 = sqlx::query_scalar(
+        "INSERT INTO artifact (ref, type, visibility, name)
+         VALUES ($1, 'progress', 'private', 'private fixture name') RETURNING id",
+    )
+    .bind(&artifact_ref)
+    .fetch_one(&pool)
+    .await
+    .expect("create private progress artifact");
+    let created = receive_payload(&mut listener, "artifact_created", "ref", &artifact_ref).await;
+    assert_eq!(created["entity_id"], artifact);
+    assert!(created.get("name").is_none());
+
+    sqlx::query("UPDATE artifact SET data = $2 WHERE id = $1")
+        .bind(artifact)
+        .bind(serde_json::json!([{"percent": 42, "message": "private fixture progress"}]))
+        .execute(&pool)
+        .await
+        .expect("update private progress artifact");
+    let updated = receive_payload(&mut listener, "artifact_updated", "ref", &artifact_ref).await;
+    assert_eq!(updated["progress_percent"], 42.0);
+    assert_eq!(updated["progress_entries"], 1);
+    assert!(updated.get("progress_message").is_none());
 }

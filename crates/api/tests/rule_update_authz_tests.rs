@@ -173,6 +173,8 @@ async fn rule_writes_store_key_templates_and_reject_literal_secret_parameters() 
     // Required defaults are validated without materializing them into the
     // authored selectors. Runtime admission owns their immutable resolved copy.
     let defaulted_ref = format!("{}.defaulted_rule", rule.pack_ref);
+    let mut listener = sqlx::postgres::PgListener::connect_with(&ctx.pool).await?;
+    listener.listen("rule_lifecycle_changed").await?;
     ctx.post(
         "/api/v1/rules",
         json!({"ref":defaulted_ref,"label":"Defaulted Rule","pack_ref":rule.pack_ref,
@@ -182,6 +184,15 @@ async fn rule_writes_store_key_templates_and_reject_literal_secret_parameters() 
     )
     .await?
     .assert_status(StatusCode::CREATED);
+    let notify = tokio::time::timeout(Duration::from_secs(5), listener.recv()).await??;
+    drop(listener);
+    let hint: Value = serde_json::from_str(notify.payload())?;
+    assert_eq!(hint["event_type"], "rule.created");
+    assert_eq!(hint["rule_ref"], defaulted_ref);
+    assert_eq!(hint["trigger_ref"], rule.trigger_ref);
+    assert_eq!(hint["auth_mode"], "deferred");
+    assert!(hint.get("trigger_params").is_none());
+    assert!(!notify.payload().contains("system.api_token"));
     let defaulted = RuleRepository::find_by_ref(&ctx.pool, &defaulted_ref)
         .await?
         .unwrap();
