@@ -1,8 +1,15 @@
 //! Lifecycle of the optional manager-only PostgreSQL connection.
 
-use std::{num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    io,
+    num::NonZeroU32,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
+use chrono::{DateTime, Utc};
 use ring::{
     digest, hmac, pbkdf2,
     rand::{SecureRandom, SystemRandom},
@@ -11,7 +18,7 @@ use sqlx::{
     postgres::{PgConnectOptions, PgSslMode},
     ConnectOptions, Connection, PgConnection,
 };
-use tokio::sync::watch;
+use tokio::{sync::watch, time::Instant};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -24,11 +31,56 @@ use crate::{
 
 const ROUNDS: NonZeroU32 = NonZeroU32::new(4096).unwrap();
 const RETRY: Duration = Duration::from_secs(2);
+const HEALTH_INTERVAL: Duration = Duration::from_secs(5);
+const READY_MAX_AGE: Duration = Duration::from_secs(15);
+const READY_FILE_ENV: &str = "ATTUNE_MANAGER_POSTGRES_READY_FILE";
+
+/// Kubernetes uses this local check without opening another database connection.
+pub fn check_database_ready() -> Result<()> {
+    let path = std::env::var_os(READY_FILE_ENV)
+        .map(PathBuf::from)
+        .ok_or_else(|| Error::configuration("Missing manager database readiness file"))?;
+    if recent_readiness(&path, SystemTime::now()) {
+        Ok(())
+    } else {
+        Err(Error::invalid_state(
+            "Restricted manager database is unavailable",
+        ))
+    }
+}
+
+fn recent_readiness(path: &Path, now: SystemTime) -> bool {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|updated| now.duration_since(updated).ok())
+        .is_some_and(|age| age <= READY_MAX_AGE)
+}
+
+fn clear_readiness(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+fn refresh_readiness(path: &Path) -> io::Result<()> {
+    let staging = path.with_extension("tmp");
+    std::fs::write(&staging, [])?;
+    std::fs::rename(staging, path)
+}
+
+struct ScopedConnection {
+    db: PgConnection,
+    expires_at: DateTime<Utc>,
+    rotate_at: Instant,
+}
 
 pub struct ManagerDatabaseConfig {
     pod_token: PathBuf,
     database: PgConnectOptions,
     role: WorkerRole,
+    readiness: Option<PathBuf>,
 }
 
 impl ManagerDatabaseConfig {
@@ -57,7 +109,13 @@ impl ManagerDatabaseConfig {
             ));
         }
 
+        let readiness = std::env::var_os(READY_FILE_ENV).map(PathBuf::from);
+        if let Some(path) = &readiness {
+            clear_readiness(path)
+                .map_err(|_| Error::configuration("Could not clear manager database readiness"))?;
+        }
         Ok(Some(Self {
+            readiness,
             pod_token: location.into(),
             database: database
                 .options([
@@ -75,28 +133,51 @@ impl ManagerDatabaseConfig {
         sessions: watch::Receiver<Arc<ManagerSession>>,
         stop: CancellationToken,
     ) {
-        let mut active: Option<PgConnection> = None;
+        let mut active: Option<ScopedConnection> = None;
+        let mut health = tokio::time::interval(HEALTH_INTERVAL);
+        health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut generation = 1;
         while !stop.is_cancelled() {
-            let operation = self.obtain(&api, &sessions, generation);
-            let result = tokio::select! {
-                biased;
-                _ = stop.cancelled() => break,
-                result = operation => result,
+            // Keep checking the old connection while the next credential is
+            // being verified, issued, and used to open its replacement.
+            let rotate_at = active.as_ref().map(|connection| connection.rotate_at);
+            let next_generation = generation;
+            let operation = async {
+                if let Some(rotate_at) = rotate_at {
+                    tokio::time::sleep_until(rotate_at).await;
+                }
+                self.obtain(&api, &sessions, next_generation).await
             };
+            tokio::pin!(operation);
+            let result = loop {
+                tokio::select! {
+                    biased;
+                    _ = stop.cancelled() => break None,
+                    result = &mut operation => break Some(result),
+                    _ = health.tick(), if active.is_some() => {
+                        let session = sessions.borrow().clone();
+                        let connection = active.as_mut().expect("health branch requires a connection");
+                        let healthy = connection.expires_at > Utc::now()
+                            && tokio::time::timeout(
+                                HEALTH_INTERVAL,
+                                self.inspect(&mut connection.db, &session),
+                            ).await.is_ok_and(|result| result.unwrap_or(false));
+                        self.set_ready(healthy);
+                    }
+                }
+            };
+            let Some(result) = result else { break };
             match result {
-                Ok((connection, rotate_in)) => {
+                Ok(connection) => {
+                    self.set_ready(connection.expires_at > Utc::now());
                     if let Some(old) = active.replace(connection) {
-                        let _ = old.close().await;
+                        let _ = old.db.close().await;
                     }
                     tracing::info!(
                         generation,
                         "Restricted manager database credential connected"
                     );
                     generation += 1;
-                    if wait(&stop, rotate_in).await {
-                        break;
-                    }
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -106,8 +187,9 @@ impl ManagerDatabaseConfig {
                 }
             }
         }
+        self.set_ready(false);
         if let Some(connection) = active {
-            let _ = connection.close().await;
+            let _ = connection.db.close().await;
         }
     }
 
@@ -116,7 +198,7 @@ impl ManagerDatabaseConfig {
         api: &ManagerControlClient,
         sessions: &watch::Receiver<Arc<ManagerSession>>,
         generation: i64,
-    ) -> Result<(PgConnection, Duration)> {
+    ) -> Result<ScopedConnection> {
         let random = SystemRandom::new();
         let mut password = [0_u8; 32];
         let mut salt = [0_u8; 16];
@@ -167,7 +249,11 @@ impl ManagerDatabaseConfig {
                                 let delay = Duration::from_secs(
                                     u64::try_from(lease.rotate_after_seconds).unwrap_or(2),
                                 );
-                                return Ok((db, delay));
+                                return Ok(ScopedConnection {
+                                    db,
+                                    expires_at: lease.expires_at,
+                                    rotate_at: Instant::now() + delay,
+                                });
                             }
                             let _ = db.close().await;
                         }
@@ -175,6 +261,19 @@ impl ManagerDatabaseConfig {
                 }
             }
             tokio::time::sleep(RETRY).await;
+        }
+    }
+
+    fn set_ready(&self, ready: bool) {
+        if let Some(path) = &self.readiness {
+            let result = if ready {
+                refresh_readiness(path)
+            } else {
+                clear_readiness(path)
+            };
+            if result.is_err() {
+                tracing::warn!("Could not update restricted manager database readiness");
+            }
         }
     }
 
@@ -186,13 +285,6 @@ impl ManagerDatabaseConfig {
             session.id,
         )
         .await
-    }
-}
-
-async fn wait(stop: &CancellationToken, delay: Duration) -> bool {
-    tokio::select! {
-        _ = stop.cancelled() => true,
-        _ = tokio::time::sleep(delay) => false,
     }
 }
 
@@ -243,6 +335,21 @@ pub fn valid_scram_verifier(verifier: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_requires_a_recent_health_check() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ready");
+        assert!(!recent_readiness(&path, SystemTime::now()));
+        refresh_readiness(&path).unwrap();
+        assert!(recent_readiness(&path, SystemTime::now()));
+        assert!(!recent_readiness(
+            &path,
+            SystemTime::now() + READY_MAX_AGE + Duration::from_secs(1),
+        ));
+        clear_readiness(&path).unwrap();
+        assert!(!recent_readiness(&path, SystemTime::now()));
+    }
 
     #[test]
     fn scram_verifier_matches_postgres_format() {

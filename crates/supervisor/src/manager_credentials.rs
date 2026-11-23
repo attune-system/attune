@@ -120,13 +120,20 @@ async fn reconcile_pods(pool: &PgPool, config: &ManagerKubernetesDatabaseConfig)
         });
     }
     while let Some(result) = checks.join_next().await {
-        match result? {
-            Ok((pod, false)) => {
-                ManagerDatabaseLoginRepository::invalidate_pod(pool, pod.session_id, pod.pod_uid)
-                    .await?
+        match result {
+            Ok(Ok((pod, false))) => {
+                if ManagerDatabaseLoginRepository::invalidate_pod(pool, pod.session_id, pod.pod_uid)
+                    .await
+                    .is_err()
+                {
+                    warn!(
+                        session = pod.session_id,
+                        "Manager Pod invalidation failed; will retry"
+                    );
+                }
             }
-            Ok(_) => {}
-            Err(_) => warn!("Manager Pod identity check unavailable; will retry"),
+            Ok(Ok(_)) => {}
+            _ => warn!("Manager Pod identity check unavailable; will retry"),
         }
     }
     Ok(())

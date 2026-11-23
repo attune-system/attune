@@ -71,6 +71,10 @@ struct Args {
     /// Run actions, pack tests, and runtime preparation over the manager API.
     #[arg(long, conflicts_with_all = ["config", "api_pack_jobs", "detect_only"])]
     api_manager: bool,
+
+    /// Check the local restricted PostgreSQL readiness signal and exit.
+    #[arg(long)]
+    check_database_ready: bool,
 }
 
 fn main() -> Result<()> {
@@ -79,6 +83,9 @@ fn main() -> Result<()> {
     attune_common::auth::install_crypto_provider();
 
     let args = Args::parse();
+    if args.check_database_ready {
+        return attune_common::manager_db_client::check_database_ready().map_err(Into::into);
+    }
     if args.api_pack_jobs || args.api_manager {
         return tokio::runtime::Runtime::new()?.block_on(
             attune_worker::manager_pack_worker::run_from_environment(args.name, args.api_manager),

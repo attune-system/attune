@@ -103,10 +103,10 @@ CREATE ROLE retirement_owner NOLOGIN CREATEROLE;
 CREATE ROLE retirement_caller LOGIN;
 INSERT INTO manager_session (role, pool, name, instance, enrollment_digest, expires_at)
 VALUES
- ('action','build','managed-live','00000000-0000-0000-0000-000000000006',
-        repeat('a',64),clock_timestamp()+interval '5 minutes'),
  ('sensor','observe','managed-sensor','00000000-0000-0000-0000-000000000007',
-        repeat('b',64),clock_timestamp()+interval '5 minutes');
+        repeat('b',64),clock_timestamp()+interval '5 minutes'),
+ ('action','build','managed-live','00000000-0000-0000-0000-000000000006',
+        repeat('a',64),clock_timestamp()+interval '5 minutes');
 SQL
 admin -v app_schema=attune -v retirement_owner=retirement_owner -v retirement_caller=retirement_caller \
     -v login_prefix=fixture_mgr -v action_group=action_ops -v sensor_group=sensor_ops \
@@ -155,13 +155,16 @@ FROM manager_session WHERE name IN ('managed-live', 'managed-sensor');
 SQL
 
 admin </dev/null -c 'GRANT SELECT (name) ON manager_session TO sensor_ops'
-if query retirement_caller 'SELECT install_requested_manager_db_logins(32)' >/dev/null 2>&1; then
-    printf 'FAIL automated issuance accepted a wider sensor group grant\n' >&2
-    exit 1
-fi
-admin </dev/null -c 'REVOKE SELECT (name) ON manager_session FROM sensor_ops'
-printf 'PASS automated issuance rejects wider effective sensor grants\n'
-check retirement_caller 'SELECT install_requested_manager_db_logins(32)' 2 'restricted caller issues both manager roles'
+check retirement_caller 'SELECT install_requested_manager_db_logins(32)' 1 'action issues after the earlier sensor grant check fails'
+check attune "SELECT count(*) FROM manager_db_credential c JOIN manager_session s ON c.manager_session=s.id
+    WHERE s.name='managed-sensor' AND c.principal IS NULL AND c.install_retry_after > clock_timestamp()" 1 'failed issuance rolls back and schedules a retry'
+check retirement_caller 'SELECT install_requested_manager_db_logins(32)' 0 'failed issuance waits for its retry'
+admin <<'SQL'
+REVOKE SELECT (name) ON manager_session FROM sensor_ops;
+UPDATE manager_db_credential c SET install_retry_after='-infinity'
+FROM manager_session s WHERE c.manager_session=s.id AND s.name='managed-sensor';
+SQL
+check retirement_caller 'SELECT install_requested_manager_db_logins(32)' 1 'sensor issues after its retry and grant correction'
 check retirement_caller 'SELECT install_requested_manager_db_logins(32)' 0 'install retry has no side effect'
 managed=$(query attune "SELECT login_name FROM manager_db_credential c JOIN manager_session s ON c.manager_session=s.id WHERE s.name='managed-live'")
 sensor=$(query attune "SELECT login_name FROM manager_db_credential c JOIN manager_session s ON c.manager_session=s.id WHERE s.name='managed-sensor'")
@@ -227,14 +230,26 @@ SQL
 # locks, as an ordinary caller transaction does.
 admin -v login="$managed" <<'SQL'
 UPDATE manager_db_credential SET credential_expires_at = clock_timestamp() WHERE login_name = :'login';
+-- Seed an earlier inconsistent entry without granting the provisioner any
+-- rights over this manually managed fixture role.
+INSERT INTO manager_db_credential
+    (manager_session, pod_uid, request_id, requested_generation, installed_generation,
+     proof_expires_at, principal, login_name, credential_expires_at)
+SELECT id, instance, instance, 1, 1, clock_timestamp(), 'action_b'::regrole, 'action_b', clock_timestamp()
+FROM manager_session WHERE name='worker-b';
 SQL
-check retirement_caller 'SELECT disable_retired_manager_db_logins(32)' 1 'retirement fences login while binding lock is held'
+check retirement_caller 'SELECT disable_retired_manager_db_logins(32)' 1 'retirement fences the healthy login after another login fails'
+check attune "SELECT count(*) FROM manager_db_credential WHERE login_name='action_b'
+    AND retired_at IS NULL AND disable_retry_after > clock_timestamp()" 1 'failed retirement schedules a retry without marking the login retired'
+admin </dev/null -c "UPDATE manager_db_credential SET retired_at=clock_timestamp() WHERE login_name='action_b'"
 if authenticate "$second" "$managed" 'SELECT 1' >/dev/null 2>&1; then
     printf 'FAIL retired role still permits connections\n' >&2
     exit 1
 fi
 check retirement_caller 'SELECT drain_retired_manager_db_connections(32)' 0 'signal delivery awaits drain confirmation'
 wait_for_activity 2
+check attune "SELECT count(*) FROM manager_db_credential WHERE login_name='action_b'
+    AND drained_at IS NULL AND drain_retry_after > clock_timestamp()" 1 'failed drain schedules a retry while the peer connection closes'
 for _ in {1..80}; do
     if [[ "$(query retirement_caller 'SELECT drain_retired_manager_db_connections(32)')" == 1 ]]; then
         break

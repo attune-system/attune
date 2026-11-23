@@ -23,6 +23,9 @@ CREATE TABLE manager_db_credential (
     credential_expires_at TIMESTAMPTZ,
     retired_at TIMESTAMPTZ,
     drained_at TIMESTAMPTZ,
+    install_retry_after TIMESTAMPTZ NOT NULL DEFAULT '-infinity',
+    disable_retry_after TIMESTAMPTZ NOT NULL DEFAULT '-infinity',
+    drain_retry_after TIMESTAMPTZ NOT NULL DEFAULT '-infinity',
     CHECK (installed_generation BETWEEN 0 AND requested_generation),
     CHECK ((principal IS NULL) = (login_name IS NULL))
 );
@@ -81,68 +84,82 @@ BEGIN
         SELECT * FROM manager_db_credential
         WHERE drained_at IS NULL AND retired_at IS NULL AND NOT pod_invalidated AND pending_verifier IS NOT NULL
           AND proof_expires_at > statement_timestamp()
-        ORDER BY manager_session
+          AND install_retry_after <= statement_timestamp()
+        ORDER BY install_retry_after, manager_session
         LIMIT greatest(0, least(batch_size, 32))
         FOR UPDATE SKIP LOCKED
     LOOP
-        -- The API locks its session before recording a request. Skip this
-        -- operation if an API update or a manager-held transaction owns it.
-        SELECT id, instance, role INTO scope FROM manager_session
-        WHERE id = request.manager_session AND closed_at IS NULL
-          AND expires_at > clock_timestamp()
-        FOR SHARE SKIP LOCKED;
-        IF NOT FOUND THEN
-            CONTINUE;
-        END IF;
-        deadline := request.proof_expires_at;
-        IF deadline <= clock_timestamp() THEN
-            CONTINUE;
-        END IF;
-        IF request.pending_verifier !~ '^SCRAM-SHA-256\$4096:[A-Za-z0-9+/]{22}==\$[A-Za-z0-9+/]{43}=:[A-Za-z0-9+/]{43}=$' THEN
-            RAISE EXCEPTION 'Invalid manager SCRAM verifier';
-        END IF;
-
-        role_name := (profile.login_prefix || '_' || scope.id)::NAME;
-        capability := CASE scope.role
-            WHEN 'action' THEN profile.action_group
-            WHEN 'sensor' THEN profile.sensor_group
-        END;
-        IF request.principal IS NULL THEN
-            EXECUTE format('CREATE ROLE %I NOLOGIN CONNECTION LIMIT 2', role_name);
-            EXECUTE format('GRANT %I TO %I WITH INHERIT TRUE, SET FALSE, ADMIN FALSE',
-                           capability, role_name);
-            SELECT oid INTO STRICT login_oid FROM pg_roles WHERE rolname = role_name;
-            INSERT INTO manager_db_principal (principal, login_name, manager_session, instance)
-            VALUES (login_oid, role_name, scope.id, scope.instance);
-        ELSE
-            login_oid := request.principal;
-            IF NOT EXISTS (
-                SELECT 1 FROM pg_roles r
-                JOIN pg_auth_members m ON m.roleid = r.oid
-                WHERE r.oid = login_oid AND r.rolname = role_name AND r.rolcanlogin
-                  AND NOT (r.rolsuper OR r.rolcreaterole OR r.rolcreatedb
-                           OR r.rolreplication OR r.rolbypassrls)
-                  AND m.member = current_user::regrole AND m.admin_option
-                  AND pg_has_role(r.oid, 'USAGE')
-            ) THEN
-                RAISE EXCEPTION 'Unexpected manager SQL role state';
-            END IF;
-        END IF;
-        IF NOT coalesce(valid_manager_db_role_privileges(login_oid, scope.role), false) THEN
-            RAISE EXCEPTION 'Invalid effective privileges for scoped manager login';
-        END IF;
+        -- Leave time to commit completed rows before the supervisor's
+        -- statement deadline. Each login rolls back through its own savepoint.
+        EXIT WHEN clock_timestamp() >= statement_timestamp() + interval '3 seconds';
         BEGIN
-            EXECUTE format('ALTER ROLE %I LOGIN PASSWORD %L VALID UNTIL %L',
-                           role_name, request.pending_verifier, deadline);
+            -- The API locks its session before recording a request. Skip this
+            -- operation if an API update or a manager-held transaction owns it.
+            SELECT id, instance, role INTO scope FROM manager_session
+            WHERE id = request.manager_session AND closed_at IS NULL
+              AND expires_at > clock_timestamp()
+            FOR SHARE SKIP LOCKED;
+            IF NOT FOUND THEN
+                UPDATE manager_db_credential SET install_retry_after = clock_timestamp() + interval '2 seconds'
+                WHERE manager_session = request.manager_session;
+                CONTINUE;
+            END IF;
+            deadline := request.proof_expires_at;
+            IF deadline <= clock_timestamp() THEN
+                CONTINUE;
+            END IF;
+            IF request.pending_verifier !~ '^SCRAM-SHA-256\$4096:[A-Za-z0-9+/]{22}==\$[A-Za-z0-9+/]{43}=:[A-Za-z0-9+/]{43}=$' THEN
+                RAISE EXCEPTION 'Invalid manager SCRAM verifier';
+            END IF;
+
+            role_name := (profile.login_prefix || '_' || scope.id)::NAME;
+            capability := CASE scope.role
+                WHEN 'action' THEN profile.action_group
+                WHEN 'sensor' THEN profile.sensor_group
+            END;
+            IF request.principal IS NULL THEN
+                EXECUTE format('CREATE ROLE %I NOLOGIN CONNECTION LIMIT 2', role_name);
+                EXECUTE format('GRANT %I TO %I WITH INHERIT TRUE, SET FALSE, ADMIN FALSE',
+                               capability, role_name);
+                SELECT oid INTO STRICT login_oid FROM pg_roles WHERE rolname = role_name;
+                INSERT INTO manager_db_principal (principal, login_name, manager_session, instance)
+                VALUES (login_oid, role_name, scope.id, scope.instance);
+            ELSE
+                login_oid := request.principal;
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_roles r
+                    JOIN pg_auth_members m ON m.roleid = r.oid
+                    WHERE r.oid = login_oid AND r.rolname = role_name AND r.rolcanlogin
+                      AND NOT (r.rolsuper OR r.rolcreaterole OR r.rolcreatedb
+                               OR r.rolreplication OR r.rolbypassrls)
+                      AND m.member = current_user::regrole AND m.admin_option
+                      AND pg_has_role(r.oid, 'USAGE')
+                ) THEN
+                    RAISE EXCEPTION 'Unexpected manager SQL role state';
+                END IF;
+            END IF;
+            IF NOT coalesce(valid_manager_db_role_privileges(login_oid, scope.role), false) THEN
+                RAISE EXCEPTION 'Invalid effective privileges for scoped manager login';
+            END IF;
+            BEGIN
+                EXECUTE format('ALTER ROLE %I LOGIN PASSWORD %L VALID UNTIL %L',
+                               role_name, request.pending_verifier, deadline);
+            EXCEPTION WHEN OTHERS THEN
+                -- Discard the dynamic statement context containing the verifier.
+                RAISE EXCEPTION 'Unable to install manager password (SQLSTATE %)', SQLSTATE;
+            END;
+            UPDATE manager_db_credential SET principal = login_oid, login_name = role_name,
+                installed_generation = request.requested_generation,
+                credential_expires_at = deadline, pending_verifier = NULL,
+                install_retry_after = '-infinity'
+            WHERE manager_session = request.manager_session;
+            installed_count := installed_count + 1;
         EXCEPTION WHEN OTHERS THEN
-            -- Discard the dynamic statement context containing the verifier.
-            RAISE EXCEPTION 'Unable to install manager password (SQLSTATE %)', SQLSTATE;
+            UPDATE manager_db_credential SET install_retry_after = clock_timestamp() + interval '15 seconds'
+            WHERE manager_session = request.manager_session;
+            RAISE WARNING 'Manager database install failed for session % (SQLSTATE %); will retry',
+                request.manager_session, SQLSTATE;
         END;
-        UPDATE manager_db_credential SET principal = login_oid, login_name = role_name,
-            installed_generation = request.requested_generation,
-            credential_expires_at = deadline, pending_verifier = NULL
-        WHERE manager_session = request.manager_session;
-        installed_count := installed_count + 1;
     END LOOP;
     RETURN installed_count;
 END
@@ -160,30 +177,41 @@ BEGIN
         SELECT c.manager_session, c.principal, c.login_name
         FROM manager_db_credential c JOIN manager_session s ON s.id = c.manager_session
         WHERE c.drained_at IS NULL AND c.retired_at IS NULL
+          AND c.disable_retry_after <= statement_timestamp()
           AND (c.pod_invalidated OR s.closed_at IS NOT NULL OR s.expires_at <= statement_timestamp()
                OR c.credential_expires_at <= statement_timestamp())
-        ORDER BY c.manager_session
+        ORDER BY c.disable_retry_after, c.manager_session
         LIMIT greatest(0, least(batch_size, 32))
         FOR UPDATE OF c SKIP LOCKED
     LOOP
-        IF EXISTS (SELECT 1 FROM pg_roles WHERE oid = binding.principal) THEN
-            IF NOT EXISTS (
-                SELECT 1 FROM pg_roles r
-                JOIN pg_auth_members m ON m.roleid = r.oid
-                WHERE r.oid = binding.principal AND r.rolname = binding.login_name
-                  AND NOT (r.rolsuper OR r.rolcreaterole OR r.rolcreatedb
-                           OR r.rolreplication OR r.rolbypassrls)
-                  AND m.member = current_user::regrole AND m.admin_option
-                  AND pg_has_role(r.oid, 'USAGE')
-            ) THEN
-                RAISE EXCEPTION 'Managed manager login no longer has expected ownership';
+        -- Leave time to commit completed rows before the supervisor's
+        -- statement deadline. Each login rolls back through its own savepoint.
+        EXIT WHEN clock_timestamp() >= statement_timestamp() + interval '3 seconds';
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE oid = binding.principal) THEN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_roles r
+                    JOIN pg_auth_members m ON m.roleid = r.oid
+                    WHERE r.oid = binding.principal AND r.rolname = binding.login_name
+                      AND NOT (r.rolsuper OR r.rolcreaterole OR r.rolcreatedb
+                               OR r.rolreplication OR r.rolbypassrls)
+                      AND m.member = current_user::regrole AND m.admin_option
+                      AND pg_has_role(r.oid, 'USAGE')
+                ) THEN
+                    RAISE EXCEPTION 'Managed manager login no longer has expected ownership';
+                END IF;
+                EXECUTE format('ALTER ROLE %I NOLOGIN PASSWORD NULL', binding.login_name);
             END IF;
-            EXECUTE format('ALTER ROLE %I NOLOGIN PASSWORD NULL', binding.login_name);
-        END IF;
-        UPDATE manager_db_credential SET retired_at = clock_timestamp(),
-            pending_verifier = NULL
-        WHERE manager_session = binding.manager_session;
-        retired_count := retired_count + 1;
+            UPDATE manager_db_credential SET retired_at = clock_timestamp(),
+                pending_verifier = NULL
+            WHERE manager_session = binding.manager_session;
+            retired_count := retired_count + 1;
+        EXCEPTION WHEN OTHERS THEN
+            UPDATE manager_db_credential SET disable_retry_after = clock_timestamp() + interval '15 seconds'
+            WHERE manager_session = binding.manager_session;
+            RAISE WARNING 'Manager database disable failed for session % (SQLSTATE %); will retry',
+                binding.manager_session, SQLSTATE;
+        END;
     END LOOP;
     -- Clear verifier material from abandoned requests, including those which
     -- never reached issuance. Preserve their generation for an exact retry.
@@ -212,50 +240,64 @@ BEGIN
         SELECT manager_session, principal, login_name, retired_at
         FROM manager_db_credential
         WHERE retired_at IS NOT NULL AND drained_at IS NULL
-        ORDER BY manager_session
+          AND drain_retry_after <= statement_timestamp()
+        ORDER BY drain_retry_after, manager_session
         LIMIT greatest(0, least(batch_size, 32))
         FOR UPDATE SKIP LOCKED
     LOOP
-        IF EXISTS (SELECT 1 FROM pg_roles WHERE oid = binding.principal) AND NOT EXISTS (
-            SELECT 1 FROM pg_roles r
-            JOIN pg_auth_members m ON m.roleid = r.oid
-            WHERE r.oid = binding.principal AND r.rolname = binding.login_name
-              AND NOT (r.rolcanlogin OR r.rolsuper OR r.rolcreaterole OR r.rolcreatedb
-                       OR r.rolreplication OR r.rolbypassrls)
-              AND m.member = current_user::regrole AND m.admin_option
-                  AND pg_has_role(r.oid, 'USAGE')
-        ) THEN
-            RAISE EXCEPTION 'Managed manager login no longer has expected retirement state';
-        END IF;
-        PERFORM pg_stat_clear_snapshot();
-        IF EXISTS (SELECT 1 FROM pg_stat_activity WHERE usesysid = binding.principal
-                   AND backend_type = 'client backend') THEN
-            FOR connection_pid IN
-                SELECT pid FROM pg_stat_activity WHERE usesysid = binding.principal
-                  AND backend_type = 'client backend'
-                ORDER BY pid LIMIT 32
-            LOOP
-                PERFORM pg_terminate_backend(connection_pid);
-            END LOOP;
-        ELSIF binding.principal IS NULL OR
-              binding.retired_at + current_setting('authentication_timeout')::interval
-              <= clock_timestamp() THEN
-            -- A caller can hold this row lock until its backend exits.
-            UPDATE manager_db_principal SET revoked_at = coalesce(revoked_at, clock_timestamp())
-            WHERE principal = binding.principal;
-            IF EXISTS (SELECT 1 FROM pg_roles WHERE oid = binding.principal) THEN
-                BEGIN
-                    EXECUTE format('DROP ROLE %I', binding.login_name);
-                EXCEPTION WHEN dependent_objects_still_exist THEN
-                    -- A catalog dependency must not delay any connection drain.
-                    -- The already-disabled role can be cleaned up by a DBA.
-                    RAISE WARNING 'Disabled manager login % still owns objects', binding.login_name;
-                END;
+        -- Leave time to commit completed rows before the supervisor's
+        -- statement deadline. Each login rolls back through its own savepoint.
+        EXIT WHEN clock_timestamp() >= statement_timestamp() + interval '3 seconds';
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE oid = binding.principal) AND NOT EXISTS (
+                SELECT 1 FROM pg_roles r
+                JOIN pg_auth_members m ON m.roleid = r.oid
+                WHERE r.oid = binding.principal AND r.rolname = binding.login_name
+                  AND NOT (r.rolcanlogin OR r.rolsuper OR r.rolcreaterole OR r.rolcreatedb
+                           OR r.rolreplication OR r.rolbypassrls)
+                  AND m.member = current_user::regrole AND m.admin_option
+                      AND pg_has_role(r.oid, 'USAGE')
+            ) THEN
+                RAISE EXCEPTION 'Managed manager login no longer has expected retirement state';
             END IF;
-            UPDATE manager_db_credential SET drained_at = clock_timestamp()
+            PERFORM pg_stat_clear_snapshot();
+            IF EXISTS (SELECT 1 FROM pg_stat_activity WHERE usesysid = binding.principal
+                       AND backend_type = 'client backend') THEN
+                FOR connection_pid IN
+                    SELECT pid FROM pg_stat_activity WHERE usesysid = binding.principal
+                      AND backend_type = 'client backend'
+                    ORDER BY pid LIMIT 32
+                LOOP
+                    PERFORM pg_terminate_backend(connection_pid);
+                END LOOP;
+            ELSIF binding.principal IS NULL OR
+                  binding.retired_at + current_setting('authentication_timeout')::interval
+                  <= clock_timestamp() THEN
+                -- A caller can hold this row lock until its backend exits.
+                UPDATE manager_db_principal SET revoked_at = coalesce(revoked_at, clock_timestamp())
+                WHERE principal = binding.principal;
+                IF EXISTS (SELECT 1 FROM pg_roles WHERE oid = binding.principal) THEN
+                    BEGIN
+                        EXECUTE format('DROP ROLE %I', binding.login_name);
+                    EXCEPTION WHEN dependent_objects_still_exist THEN
+                        -- A catalog dependency must not delay any connection drain.
+                        -- The already-disabled role can be cleaned up by a DBA.
+                        RAISE WARNING 'Disabled manager login % still owns objects', binding.login_name;
+                    END;
+                END IF;
+                UPDATE manager_db_credential SET drained_at = clock_timestamp()
+                WHERE manager_session = binding.manager_session;
+                drained_count := drained_count + 1;
+                CONTINUE;
+            END IF;
+            UPDATE manager_db_credential SET drain_retry_after = clock_timestamp() + interval '2 seconds'
             WHERE manager_session = binding.manager_session;
-            drained_count := drained_count + 1;
-        END IF;
+        EXCEPTION WHEN OTHERS THEN
+            UPDATE manager_db_credential SET drain_retry_after = clock_timestamp() + interval '15 seconds'
+            WHERE manager_session = binding.manager_session;
+            RAISE WARNING 'Manager database drain failed for session % (SQLSTATE %); will retry',
+                binding.manager_session, SQLSTATE;
+        END;
     END LOOP;
     RETURN drained_count;
 END

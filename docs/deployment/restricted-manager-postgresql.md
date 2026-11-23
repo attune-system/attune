@@ -104,7 +104,12 @@ the scoped API. The supervisor installs the verifier and drops it from the
 request row. A manager establishes and checks its scoped connection over
 verified TLS, then keeps the prior connection until the next generation is
 usable. Generation changes preserve the per-process login and never carry
-forward to a replacement process.
+forward to a replacement process. When configured with
+`ATTUNE_MANAGER_POSTGRES_READY_FILE`, the manager refreshes a private
+readiness marker after confirmed session inspection. Both agent binaries
+support `--check-database-ready`. The Helm probe allows 15 seconds of marker
+age and opens no extra PostgreSQL connection. An unavailable database
+connection makes the Pod unready while the API workload loop can continue.
 
 The supervisor checks bound Pod identities in bounded batches. A confirmed
 missing or replaced Pod, withdrawal, or credential expiry retires the login.
@@ -113,7 +118,10 @@ The login fence commits independently of manager-held binding locks.
 Subsequent passes terminate existing connections, wait out in-flight
 authentication, and remove the disabled role. A role with remaining catalog
 dependencies stays disabled for DBA cleanup, and draining continues. The
-binding and credential metadata retain the retirement record.
+binding and credential metadata retain the retirement record. Each SQL
+reconciliation phase rolls back a failed login independently and delays its
+retry by 15 seconds. Other due logins continue in the same pass. A lost
+database connection or an interrupted SQL statement is retried as a phase.
 
 Provide a verified PostgreSQL TLS endpoint and a dedicated pool Secret per
 role. Put manager credentials outside workload paths and egress only to the
