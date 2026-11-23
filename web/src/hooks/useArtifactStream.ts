@@ -43,9 +43,6 @@ interface ArtifactNotification {
 /** The raw payload from the PostgreSQL trigger for artifact notifications */
 interface ArtifactNotificationPayload {
   execution?: number;
-  type?: string;
-  progress_percent?: number | null;
-  progress_entries?: number | null;
   [key: string]: unknown;
 }
 
@@ -56,9 +53,7 @@ interface ArtifactNotificationPayload {
  * PostgreSQL LISTEN/NOTIFY system, and invalidates relevant React Query caches
  * so that artifact lists and detail views update in real time.
  *
- * For progress-type artifacts, the notification payload includes a progress
- * summary (`progress_percent` and `progress_entries`) for fast progress updates.
- * The artifact detail query retrieves its current name and message.
+ * Notifications serve as invalidations. Artifact data comes from the API.
  *
  * @example
  * ```tsx
@@ -126,18 +121,6 @@ export function useArtifactStream(options: UseArtifactStreamOptions = {}) {
           shouldRefresh,
         );
       }
-
-      // For progress artifacts, also update cached data directly with the
-      // summary from the notification payload to provide instant feedback
-      // before the invalidation refetch completes.
-      if (payload?.type === "progress" && payload?.progress_percent != null) {
-        queryClient.setQueryData(["artifact_progress", artifactExecution], {
-          artifactId: updatedArtifactId,
-          percent: payload.progress_percent as number,
-          entries: payload.progress_entries ?? 0,
-          timestamp: notification.timestamp,
-        } satisfies ArtifactProgressSummary);
-      }
     },
     [artifactId, executionId, paused, queryClient, shouldRefresh],
   );
@@ -151,40 +134,4 @@ export function useArtifactStream(options: UseArtifactStreamOptions = {}) {
   return {
     isConnected: connected,
   };
-}
-
-/**
- * Lightweight progress summary extracted from artifact WebSocket notifications.
- * Available immediately via the `artifact_progress` query key without an API call.
- */
-export interface ArtifactProgressSummary {
-  artifactId: number;
-  percent: number;
-  entries: number;
-  timestamp: string;
-}
-
-/**
- * Hook to read the latest progress summary pushed by WebSocket notifications.
- *
- * This does NOT make any API calls — it only reads from the React Query cache
- * which is populated by `useArtifactStream`. Returns `null` if no progress
- * notification has been received yet for the given execution.
- *
- * For the initial load (before any WebSocket message arrives), the component
- * should fall back to the polling-based `useExecutionArtifacts` data.
- */
-export function useArtifactProgress(
-  executionId: number | undefined,
-): ArtifactProgressSummary | null {
-  const queryClient = useQueryClient();
-
-  if (!executionId) return null;
-
-  const data = queryClient.getQueryData<ArtifactProgressSummary>([
-    "artifact_progress",
-    executionId,
-  ]);
-
-  return data ?? null;
 }

@@ -153,6 +153,14 @@ INSERT INTO manager_db_credential
 SELECT id, instance, instance, 1, clock_timestamp() + interval '2 minutes', :'verifier'
 FROM manager_session WHERE name IN ('managed-live', 'managed-sensor');
 SQL
+
+admin </dev/null -c 'GRANT SELECT (name) ON manager_session TO sensor_ops'
+if query retirement_caller 'SELECT install_requested_manager_db_logins(32)' >/dev/null 2>&1; then
+    printf 'FAIL automated issuance accepted a wider sensor group grant\n' >&2
+    exit 1
+fi
+admin </dev/null -c 'REVOKE SELECT (name) ON manager_session FROM sensor_ops'
+printf 'PASS automated issuance rejects wider effective sensor grants\n'
 check retirement_caller 'SELECT install_requested_manager_db_logins(32)' 2 'restricted caller issues both manager roles'
 check retirement_caller 'SELECT install_requested_manager_db_logins(32)' 0 'install retry has no side effect'
 managed=$(query attune "SELECT login_name FROM manager_db_credential c JOIN manager_session s ON c.manager_session=s.id WHERE s.name='managed-live'")
@@ -167,18 +175,23 @@ printf 'PASS issued SCRAM credentials authenticate scoped action and sensor logi
 check "$managed" "SELECT has_function_privilege('install_requested_manager_db_logins(integer)','EXECUTE')
     OR has_function_privilege('disable_retired_manager_db_logins(integer)','EXECUTE')
     OR has_table_privilege('manager_db_credential','SELECT,UPDATE')" f 'manager lacks provisioning authority'
+check "$sensor" "SELECT has_function_privilege('manager_db_action_session(uuid,boolean)','EXECUTE')
+    OR has_function_privilege('install_requested_manager_db_logins(integer)','EXECUTE')
+    OR has_table_privilege('manager_db_credential','SELECT,UPDATE')" f 'sensor lacks action and provisioning authority'
 admin -v verifier="$(verifier "$second")" <<'SQL'
 UPDATE manager_db_credential c SET requested_generation = 2, pending_verifier = :'verifier',
     request_id = gen_random_uuid(), proof_expires_at=clock_timestamp()+interval '2 minutes'
-FROM manager_session s WHERE c.manager_session=s.id AND s.name='managed-live';
+FROM manager_session s WHERE c.manager_session=s.id AND s.name IN ('managed-live', 'managed-sensor');
 SQL
-check retirement_caller 'SELECT install_requested_manager_db_logins(32)' 1 'rotation installs one new generation'
-if authenticate "$first" "$managed" 'SELECT 1' >/dev/null 2>&1; then
-    printf 'FAIL rotated password still authenticates\n' >&2
-    exit 1
-fi
-test "$(authenticate "$second" "$managed" 'SELECT 1')" = 1
-printf 'PASS only the new password authenticates\n'
+check retirement_caller 'SELECT install_requested_manager_db_logins(32)' 2 'rotation installs a new generation for both roles'
+for login in "$managed" "$sensor"; do
+    if authenticate "$first" "$login" 'SELECT 1' >/dev/null 2>&1; then
+        printf 'FAIL rotated password still authenticates for %s\n' "$login" >&2
+        exit 1
+    fi
+    test "$(authenticate "$second" "$login" 'SELECT 1')" = 1
+done
+printf 'PASS only the new password authenticates for action and sensor logins\n'
 
 wait_for_activity() {
     local expected=$1
@@ -196,12 +209,20 @@ db env PGAPPNAME=manager-retirement-fixture psql -X -U "$managed" -d attune_test
     -c "BEGIN; SELECT * FROM manager_db_action_session('00000000-0000-0000-0000-000000000006'); SELECT pg_sleep(90)" \
     </dev/null >/dev/null 2>&1 &
 fixture_client_pids+=("$!")
-for login in action_a "$sensor"; do
-    db env PGAPPNAME=manager-retirement-fixture psql -X -U "$login" -d attune_test \
-        -c 'SELECT pg_sleep(90)' </dev/null >/dev/null 2>&1 &
-    fixture_client_pids+=("$!")
-done
+db env PGAPPNAME=manager-retirement-fixture psql -X -U "$sensor" -d attune_test \
+    -c "BEGIN; SELECT * FROM manager_db_sensor_session('00000000-0000-0000-0000-000000000007'); SELECT pg_sleep(90)" \
+    </dev/null >/dev/null 2>&1 &
+fixture_client_pids+=("$!")
+db env PGAPPNAME=manager-retirement-fixture psql -X -U action_a -d attune_test \
+    -c 'SELECT pg_sleep(90)' </dev/null >/dev/null 2>&1 &
+fixture_client_pids+=("$!")
 wait_for_activity 3
+# Leave a durable dependency on the action role in the disposable fixture.
+# It must not prevent confirmation of this or any subsequent drain.
+admin -v login="$managed" <<'SQL'
+CREATE TABLE attune.manager_retirement_dependency (id BIGINT);
+ALTER TABLE attune.manager_retirement_dependency OWNER TO :"login";
+SQL
 # Expire the login ledger while the action connection holds binding and session
 # locks, as an ordinary caller transaction does.
 admin -v login="$managed" <<'SQL'
@@ -222,6 +243,8 @@ for _ in {1..80}; do
 done
 check attune "SELECT count(*) FROM manager_db_credential WHERE login_name = '$managed'
     AND retired_at IS NOT NULL AND drained_at IS NOT NULL" 1 'reconciler confirms old connection is gone'
+check attune "SELECT count(*) FROM pg_roles WHERE rolname = '$managed' AND NOT rolcanlogin" \
+    1 'role with a catalog dependency stays disabled after drain'
 check retirement_caller 'SELECT disable_retired_manager_db_logins(32) + drain_retired_manager_db_connections(32)' 0 'retirement retry is idempotent'
 check attune "SELECT count(*) FROM pg_roles WHERE rolname IN ('action_a', '$sensor') AND rolcanlogin" 2 'unmanaged and live managed logins remain enabled'
 check retirement_caller 'SELECT count(*) FROM claim_manager_db_pod_checks(16)' 1 'only the live manager is due for a Kubernetes check'
@@ -231,3 +254,18 @@ query retirement_caller "SELECT invalidate_manager_db_pod($sensor_id, gen_random
 check retirement_caller 'SELECT disable_retired_manager_db_logins(32)' 0 'a stale Pod identity cannot retire the live SQL login'
 query retirement_caller "SELECT invalidate_manager_db_pod($sensor_id, '00000000-0000-0000-0000-000000000007')" >/dev/null
 check retirement_caller 'SELECT disable_retired_manager_db_logins(32)' 1 'confirmed Pod invalidation retires the exact login'
+
+if authenticate "$second" "$sensor" 'SELECT 1' >/dev/null 2>&1; then
+    printf 'FAIL retired sensor still permits connections\n' >&2
+    exit 1
+fi
+check retirement_caller 'SELECT drain_retired_manager_db_connections(32)' 0 'sensor drain awaits connection exit'
+wait_for_activity 1
+for _ in {1..80}; do
+    if [[ "$(query retirement_caller 'SELECT drain_retired_manager_db_connections(32)')" == 1 ]]; then
+        break
+    fi
+    sleep 0.1
+done
+check attune "SELECT count(*) FROM manager_db_credential WHERE login_name = '$sensor'
+    AND retired_at IS NOT NULL AND drained_at IS NOT NULL" 1 'sensor connection is drained despite its held binding lock'

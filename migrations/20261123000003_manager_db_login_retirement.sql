@@ -32,6 +32,35 @@ REVOKE ALL ON manager_db_provisioning, manager_db_credential FROM PUBLIC;
 CREATE INDEX manager_db_credential_active ON manager_db_credential (manager_session)
     WHERE drained_at IS NULL;
 
+
+-- Apply the same effective grant checks to manual and managed logins.
+CREATE FUNCTION valid_manager_db_role_privileges(principal_oid OID, requested_role worker_role_enum)
+RETURNS BOOLEAN
+LANGUAGE sql STABLE STRICT
+AS $body$
+    SELECT NOT has_schema_privilege(principal_oid, catalog.relnamespace, 'CREATE')
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_class relation
+            WHERE relation.relnamespace = catalog.relnamespace
+                AND CASE
+                    WHEN relation.relkind = 'S' THEN
+                        has_sequence_privilege(principal_oid, relation.oid, 'USAGE, SELECT, UPDATE')
+                    WHEN relation.relkind IN ('r', 'p', 'v', 'm', 'f') THEN
+                        has_any_column_privilege(principal_oid, relation.oid, 'SELECT, INSERT, UPDATE, REFERENCES')
+                        OR has_table_privilege(principal_oid, relation.oid, 'DELETE, TRUNCATE, TRIGGER')
+                    ELSE FALSE
+                END
+        )
+        AND has_function_privilege(principal_oid, 'manager_db_action_session(uuid,boolean)', 'EXECUTE')
+            = (requested_role = 'action')
+        AND has_function_privilege(principal_oid, 'manager_db_sensor_session(uuid,boolean)', 'EXECUTE')
+            = (requested_role = 'sensor')
+        AND NOT has_function_privilege(
+            principal_oid, 'inspect_manager_db_session(worker_role_enum,uuid,boolean)', 'EXECUTE')
+    FROM pg_class catalog
+    WHERE catalog.oid = 'manager_db_principal'::regclass
+$body$;
+
 CREATE FUNCTION install_requested_manager_db_logins(batch_size INTEGER)
 RETURNS INTEGER
 LANGUAGE plpgsql VOLATILE STRICT SECURITY DEFINER
@@ -98,6 +127,9 @@ BEGIN
             ) THEN
                 RAISE EXCEPTION 'Unexpected manager SQL role state';
             END IF;
+        END IF;
+        IF NOT coalesce(valid_manager_db_role_privileges(login_oid, scope.role), false) THEN
+            RAISE EXCEPTION 'Invalid effective privileges for scoped manager login';
         END IF;
         BEGIN
             EXECUTE format('ALTER ROLE %I LOGIN PASSWORD %L VALID UNTIL %L',
@@ -212,7 +244,13 @@ BEGIN
             UPDATE manager_db_principal SET revoked_at = coalesce(revoked_at, clock_timestamp())
             WHERE principal = binding.principal;
             IF EXISTS (SELECT 1 FROM pg_roles WHERE oid = binding.principal) THEN
-                EXECUTE format('DROP ROLE %I', binding.login_name);
+                BEGIN
+                    EXECUTE format('DROP ROLE %I', binding.login_name);
+                EXCEPTION WHEN dependent_objects_still_exist THEN
+                    -- A catalog dependency must not delay any connection drain.
+                    -- The already-disabled role can be cleaned up by a DBA.
+                    RAISE WARNING 'Disabled manager login % still owns objects', binding.login_name;
+                END;
             END IF;
             UPDATE manager_db_credential SET drained_at = clock_timestamp()
             WHERE manager_session = binding.manager_session;
@@ -252,7 +290,8 @@ AS $body$
     WHERE manager_session = session_id AND pod_uid = expected_pod AND retired_at IS NULL
 $body$;
 
-REVOKE ALL ON FUNCTION claim_manager_db_pod_checks(INTEGER), invalidate_manager_db_pod(BIGINT, UUID),
+REVOKE ALL ON FUNCTION valid_manager_db_role_privileges(OID, worker_role_enum),
+    claim_manager_db_pod_checks(INTEGER), invalidate_manager_db_pod(BIGINT, UUID),
     install_requested_manager_db_logins(INTEGER),
     disable_retired_manager_db_logins(INTEGER), drain_retired_manager_db_connections(INTEGER) FROM PUBLIC;
 
@@ -261,6 +300,7 @@ DECLARE
     signature TEXT;
 BEGIN
     FOREACH signature IN ARRAY ARRAY[
+        'valid_manager_db_role_privileges(oid,worker_role_enum)',
         'claim_manager_db_pod_checks(integer)',
         'invalidate_manager_db_pod(bigint,uuid)',
         'install_requested_manager_db_logins(integer)',

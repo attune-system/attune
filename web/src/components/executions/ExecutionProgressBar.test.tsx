@@ -5,11 +5,12 @@ import ExecutionProgressBar from "./ExecutionProgressBar";
 
 vi.mock("@/hooks/useArtifactStream", () => ({
   useArtifactStream: vi.fn(),
-  useArtifactProgress: () => ({ artifactId: 7, percent: 60, entries: 2 }),
 }));
 
 vi.mock("@/hooks/useArtifacts", () => ({
-  useExecutionArtifacts: () => ({ data: { items: [] } }),
+  useExecutionArtifacts: () => ({
+    data: { items: [{ id: 7, type: "progress" }] },
+  }),
   useArtifact: vi.fn(() => ({
     data: {
       data: {
@@ -21,11 +22,11 @@ vi.mock("@/hooks/useArtifacts", () => ({
 }));
 
 describe("ExecutionProgressBar", () => {
-  it("combines numeric notification progress with authorized artifact details", () => {
+  it("renders progress from the execution-scoped artifact API", () => {
     render(<ExecutionProgressBar executionId={12} isRunning />);
 
     expect(useArtifact).toHaveBeenCalledWith(7, true);
-    expect(screen.getByText("60%")).toBeInTheDocument();
+    expect(screen.getByText("30%")).toBeInTheDocument();
     expect(screen.getByText("Private artifact name")).toBeInTheDocument();
     expect(
       screen.getByText("Latest authorized progress message"),

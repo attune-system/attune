@@ -54,6 +54,7 @@ GRANT :"action_group", :"sensor_group" TO :"retirement_owner"
 GRANT CONNECT ON DATABASE :"database" TO :"action_group", :"sensor_group", :"retirement_caller";
 GRANT USAGE ON SCHEMA :"app_schema" TO :"retirement_owner", :"retirement_caller", :"api_role";
 GRANT SELECT ON manager_db_provisioning TO :"retirement_owner";
+GRANT EXECUTE ON FUNCTION valid_manager_db_role_privileges(OID, worker_role_enum) TO :"retirement_owner";
 GRANT SELECT, UPDATE ON manager_db_credential TO :"retirement_owner";
 GRANT SELECT, INSERT, UPDATE ON manager_db_credential TO :"api_role";
 GRANT INSERT (principal, login_name, manager_session, instance),

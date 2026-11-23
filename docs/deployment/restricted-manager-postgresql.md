@@ -111,8 +111,9 @@ missing or replaced Pod, withdrawal, or credential expiry retires the login.
 An unavailable Kubernetes API leaves the credential on its existing lease.
 The login fence commits independently of manager-held binding locks.
 Subsequent passes terminate existing connections, wait out in-flight
-authentication, and remove the disabled role. The binding and credential
-metadata retain the retirement record.
+authentication, and remove the disabled role. A role with remaining catalog
+dependencies stays disabled for DBA cleanup, and draining continues. The
+binding and credential metadata retain the retirement record.
 
 Provide a verified PostgreSQL TLS endpoint and a dedicated pool Secret per
 role. Put manager credentials outside workload paths and egress only to the
