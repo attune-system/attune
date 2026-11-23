@@ -297,12 +297,16 @@ async fn run_basic_binary_check(binary: &str, child_environment: &ChildProcessEn
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(unix)]
     use std::io::Write;
+    #[cfg(unix)]
     use std::sync::{Arc, Mutex};
 
+    #[cfg(unix)]
     #[derive(Clone, Default)]
     struct TestLogWriter(Arc<Mutex<Vec<u8>>>);
 
+    #[cfg(unix)]
     impl Write for TestLogWriter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             self.0
@@ -317,6 +321,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestLogWriter {
         type Writer = Self;
 
