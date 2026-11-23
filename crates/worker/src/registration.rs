@@ -737,6 +737,7 @@ mod tests {
             executor: None,
             agent: None,
             manager_enrollments: Vec::new(),
+            manager_kubernetes_database: None,
             pack_upload: attune_common::config::PackUploadConfig::default(),
             artifacts: attune_common::config::ArtifactsConfig::default(),
             storage: attune_common::config::BlobStorageConfig::default(),

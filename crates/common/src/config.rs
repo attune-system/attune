@@ -1707,6 +1707,11 @@ pub struct SupervisorMaintenanceConfig {
     #[serde(default = "default_true")]
     pub corrective_actions_enabled: bool,
 
+    /// Optional file containing the dedicated PostgreSQL URL for manager
+    /// credential reconciliation. Absent by default.
+    #[serde(default)]
+    pub manager_database_credentials_file: Option<std::path::PathBuf>,
+
     /// Alert when non-terminal executions are older than this many seconds.
     #[serde(default = "default_stuck_execution_seconds")]
     pub stuck_execution_seconds: u64,
@@ -1769,6 +1774,7 @@ impl Default for SupervisorMaintenanceConfig {
             storage_rollback_snapshot_seconds: default_storage_rollback_snapshot_seconds(),
             monitoring_enabled: true,
             corrective_actions_enabled: true,
+            manager_database_credentials_file: None,
             stuck_execution_seconds: default_stuck_execution_seconds(),
             execution_remediation_seconds: default_execution_remediation_seconds(),
             execution_remediation_batch_size: default_execution_remediation_batch_size(),
@@ -2095,6 +2101,21 @@ impl Default for ExecutorConfig {
     }
 }
 
+/// Allowed Pod identities for Kubernetes-backed manager database credentials.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagerKubernetesDatabaseConfig {
+    pub namespace: String,
+    pub audience: String,
+    pub pools: Vec<ManagerKubernetesPool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagerKubernetesPool {
+    pub role: crate::models::WorkerRole,
+    pub pool: String,
+    pub service_account: String,
+}
+
 /// Main application configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -2181,6 +2202,10 @@ pub struct Config {
     /// API-side enrollment grants for action and sensor manager pools.
     #[serde(default)]
     pub manager_enrollments: Vec<crate::manager_control::ManagerEnrollmentGrant>,
+
+    /// Enable Kubernetes identity verification for these manager pools.
+    #[serde(default)]
+    pub manager_kubernetes_database: Option<ManagerKubernetesDatabaseConfig>,
 
     /// Pack upload safety limits (optional; sensible defaults are used when absent).
     #[serde(default)]
@@ -2564,6 +2589,26 @@ impl Config {
     /// Validate configuration
     pub fn validate(&self) -> crate::Result<()> {
         self.branding.validate()?;
+        if let Some(kubernetes) = &self.manager_kubernetes_database {
+            use crate::manager_control::valid_manager_name;
+            if !valid_manager_name(&kubernetes.namespace)
+                || kubernetes.audience.is_empty()
+                || kubernetes.audience.len() > 255
+                || kubernetes.pools.is_empty()
+                || kubernetes.pools.iter().enumerate().any(|(index, pool)| {
+                    !valid_manager_name(&pool.pool)
+                        || !valid_manager_name(&pool.service_account)
+                        || kubernetes.pools.iter().skip(index + 1).any(|other| {
+                            (pool.role == other.role && pool.pool == other.pool)
+                                || pool.service_account == other.service_account
+                        })
+                })
+            {
+                return Err(crate::Error::configuration(
+                    "Invalid Kubernetes manager database pool configuration",
+                ));
+            }
+        }
         crate::manager_control::ManagerEnrollmentGrant::validate_all(&self.manager_enrollments)?;
         if !self.manager_enrollments.is_empty()
             && !self
@@ -3081,6 +3126,7 @@ mod tests {
             executor: None,
             agent: None,
             manager_enrollments: Vec::new(),
+            manager_kubernetes_database: None,
             pack_upload: PackUploadConfig::default(),
             retention: RetentionConfig::default(),
             maintenance: SupervisorMaintenanceConfig::default(),
@@ -3638,6 +3684,7 @@ mod tests {
             executor: None,
             agent: None,
             manager_enrollments: Vec::new(),
+            manager_kubernetes_database: None,
             pack_upload: PackUploadConfig::default(),
             retention: RetentionConfig::default(),
             maintenance: SupervisorMaintenanceConfig::default(),
@@ -3703,6 +3750,7 @@ mod tests {
             executor: None,
             agent: None,
             manager_enrollments: Vec::new(),
+            manager_kubernetes_database: None,
             pack_upload: PackUploadConfig::default(),
             retention: RetentionConfig::default(),
             maintenance: SupervisorMaintenanceConfig::default(),

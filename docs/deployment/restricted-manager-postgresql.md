@@ -81,48 +81,50 @@ that need those privileges or a trusted commit boundary.
 
 ## Kubernetes provisioning
 
-Use a post-migration Job for shared database setup and a control-plane
-reconciler for process credentials. Enable manager database access only when
-the runtime supports the per-instance binding flow. The SQL in this change
-supports DBA provisioning and verification. Manager processes still use the
-Attune API for work.
+Enable this profile through the matching first-party chart. Use a release
+that includes the restricted manager migration and the API notification
+payload changes on all replicas. The chart creates dedicated StatefulSets
+for configured action and sensor pools. An action pool keeps its encrypted
+log spool in a per-slot RWO claim. Both roles use writable local pack,
+runtime, and artifact directories and keep execution and artifact transfer on
+the Attune API.
 
-1. Run the Job after migrations succeed and the API rollout uses the shared
-   notification contract. Ensure the operation owner and separate action and
-   sensor groups exist as dedicated `NOLOGIN` roles. Use installation-specific
-   role names because PostgreSQL roles are cluster-wide. Run
-   `deployment/worker-db-roles/provision.sql` with the schema and those role
-   names. Make retries check existing roles and grants before continuing. Keep
-   the Job's database administration credential scoped to the Job.
-   [Kubernetes Jobs](https://kubernetes.io/docs/concepts/workloads/controllers/job/)
-   · [PostgreSQL roles](https://www.postgresql.org/docs/16/sql-createrole.html)
-2. Reconcile one restricted `LOGIN` per trusted manager incarnation. Derive
-   the pool and stable slot from the controller-owned workload. Verify the
-   manager's live API enrollment and its exact process UUID before applying
-   `deployment/worker-db-roles/bind.sql`. Track the Pod UID together with
-   that process UUID because a container can restart within the same Pod.
-   Grant the appropriate action or sensor group with inheritance enabled
-   and role switching and administration disabled.
-   [Kubernetes Pod lifecycle](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/)
-   · [PostgreSQL membership grants](https://www.postgresql.org/docs/16/sql-grant.html)
-3. Deliver the login as a read-only credential file scoped to the manager
-   container, using a short-lived SCRAM secret over verified TLS or a
-   PostgreSQL client certificate mapped to the login. Keep the file outside
-   workload mounts. Give Kubernetes Secret access to the provisioning
-   identity and use encryption at rest if credentials are stored as Secrets.
-   Limit network egress to the API and the database endpoint needed by the
-   restricted profile.
-   [Kubernetes Secret security](https://kubernetes.io/docs/concepts/security/secrets-good-practices/)
-   · [PostgreSQL client certificates](https://www.postgresql.org/docs/16/auth-cert.html)
-4. On replacement or withdrawal, revoke the old database binding and
-   prevent new connections with its login. Close any remaining sessions and
-   retire the credential when safe. Keep the retired binding as evidence
-   against reuse. Provision a new login and binding for the replacement.
-   [PostgreSQL role changes](https://www.postgresql.org/docs/16/sql-alterrole.html)
+The post-migration Job installs the installation-specific groups, the database
+functions, and a dedicated supervisor login. The Job's database administrator
+credential is scoped to its Pod. The supervisor uses its own TLS-verified
+connection with permission to execute the provisioning functions.
 
-The reconciler needs an authenticated way to obtain the enrolled instance
-and hand the resulting credential to that same process. That handoff and
-manager connection support are chart and application integration work.
+Each manager presents its regular Attune session bearer and a projected
+Pod-bound token. The API asks Kubernetes to verify the expected audience and
+ServiceAccount, checks the live Pod UID and owning StatefulSet, then records a
+request for that exact enrolled instance. Restrict Pod and ServiceAccount
+management in the manager namespace to trusted deployment operators. The
+manager generates the SCRAM password in memory and sends a verifier through
+the scoped API. The supervisor installs the verifier and drops it from the
+request row. A manager establishes and checks its scoped connection over
+verified TLS, then keeps the prior connection until the next generation is
+usable. Generation changes preserve the per-process login and never carry
+forward to a replacement process.
+
+The supervisor checks bound Pod identities in bounded batches. A confirmed
+missing or replaced Pod, withdrawal, or credential expiry retires the login.
+An unavailable Kubernetes API leaves the credential on its existing lease.
+The login fence commits independently of manager-held binding locks.
+Subsequent passes terminate existing connections, wait out in-flight
+authentication, and remove the disabled role. The binding and credential
+metadata retain the retirement record.
+
+Provide a verified PostgreSQL TLS endpoint and a dedicated pool Secret per
+role. Put manager credentials outside workload paths and egress only to the
+Attune API, the PostgreSQL endpoint, and the destinations required by the
+workloads. The chart's inventory, labels, and taints are operator-controlled.
+Use the matching chart release documentation for the Job and Secret settings.
+
+Test both an action pool and a sensor pool first. To roll back, scale the
+restricted pools to zero while the supervisor task remains enabled. Observe
+retirement, then remove the configuration and provisioning grants. An
+administrator can retire managed logins through the guarded SQL operations
+during a supervisor outage.
 
 ## Verification
 

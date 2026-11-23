@@ -43,6 +43,9 @@ type SessionReader = watch::Receiver<Arc<ManagerSession>>;
 pub async fn run_from_environment(name: Option<String>, actions: bool) -> Result<()> {
     attune_common::observability::init_tracing(None, None)?;
     let env = |key: &'static str| std::env::var(key).with_context(|| format!("Missing {key}"));
+    let database = attune_common::manager_db_client::ManagerDatabaseConfig::from_environment(
+        WorkerRole::Action,
+    )?;
     let api = ManagerControlClient::new(&env("ATTUNE_API_URL")?, false)?;
     let credential_path = env("ATTUNE_MANAGER_ENROLLMENT_FILE")?;
     let enrollment = ManagerEnrollment {
@@ -99,7 +102,8 @@ pub async fn run_from_environment(name: Option<String>, actions: bool) -> Result
         signals.cancel();
         Ok::<_, std::io::Error>(())
     });
-    let result = run_manager(api, session, local, actions, stop.clone()).await;
+    let result =
+        run_manager_with_database(api, session, local, actions, stop.clone(), database).await;
     signal_task.abort();
     let _ = signal_task.await;
     result
@@ -121,6 +125,17 @@ pub async fn run_manager(
     actions: Option<ActionManagerConfig>,
     stop: CancellationToken,
 ) -> Result<()> {
+    run_manager_with_database(api, session, local, actions, stop, None).await
+}
+
+async fn run_manager_with_database(
+    api: ManagerControlClient,
+    session: ManagerSession,
+    local: PackJobWorkerConfig,
+    actions: Option<ActionManagerConfig>,
+    stop: CancellationToken,
+    database: Option<attune_common::manager_db_client::ManagerDatabaseConfig>,
+) -> Result<()> {
     if let Some(actions) = &actions {
         if !(1..=32).contains(&actions.concurrency) {
             return Err(anyhow!(
@@ -140,6 +155,9 @@ pub async fn run_manager(
     let tasks = TaskTracker::new();
     let renew_stop = CancellationToken::new();
     let failed_session = CancellationToken::new();
+    if let Some(database) = database {
+        tasks.spawn(database.run(api.clone(), session.clone(), renew_stop.clone()));
+    }
     tasks.spawn(renew_session(
         api.clone(),
         sessions,

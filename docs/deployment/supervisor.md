@@ -454,6 +454,23 @@ not destroy the only authoritative copy. Cache payloads are plaintext `JSONB`
 and therefore contribute to PostgreSQL data files, WAL, replicas, and backups;
 deployment encryption and backup controls apply to them.
 
+## Manager database credentials
+
+The optional credential task uses an independent database connection. Set
+`maintenance.manager_database_credentials_file` to a mounted file containing
+the provisioning caller's PostgreSQL URL with `sslmode=verify-full`. Leave it
+absent to disable the task. The task reconciles credential requests, confirms
+Pod identity, and retires logins independently of the retention cycle.
+
+The task operates through the guarded SQL installed by
+`deployment/worker-db-roles/provision-retirement.sql`. It uses namespaced Pod
+reads to invalidate deleted and superseded managers. The API owns the
+TokenReview permission and admits requests for configured manager pools.
+PostgreSQL authorizes the exact request generation, enforces login expiry,
+and fences retirement before closing connections. Follow the
+[restricted manager deployment contract](restricted-manager-postgresql.md)
+for chart wiring and rollback.
+
 ## Configuration
 
 ### Runtime retention configuration

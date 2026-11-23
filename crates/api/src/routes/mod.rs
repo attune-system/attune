@@ -23,6 +23,7 @@ pub mod internal_files;
 pub mod keys;
 mod lifecycle_authorization;
 mod manager_actions;
+mod manager_database;
 mod manager_logs;
 mod manager_pack_files;
 mod manager_sensors;

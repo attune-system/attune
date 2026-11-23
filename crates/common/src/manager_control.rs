@@ -348,6 +348,24 @@ pub struct WorkCompletion {
     pub status: ExecutionStatus,
 }
 
+/// Client-generated SCRAM verifier paired with fresh workload identity proof.
+#[derive(Deserialize, Serialize)]
+pub struct ManagerDatabaseCredentialRequest {
+    pub request: Uuid,
+    pub generation: i64,
+    pub verifier: String,
+    pub pod_token: String,
+}
+
+#[derive(Deserialize, Serialize, sqlx::FromRow)]
+pub struct ManagerDatabaseCredential {
+    pub request: Uuid,
+    pub generation: i64,
+    pub username: String,
+    pub expires_at: DateTime<Utc>,
+    pub rotate_after_seconds: i64,
+}
+
 /// A pooled manager transport. Credentials are passed per request and never
 /// forwarded across redirects or through an environment-selected HTTP proxy.
 #[derive(Clone)]
@@ -450,6 +468,36 @@ impl ManagerControlClient {
         )
         .await?;
         Ok(())
+    }
+
+    pub async fn request_database_credential(
+        &self,
+        session: &ManagerSession,
+        request: &ManagerDatabaseCredentialRequest,
+    ) -> Result<()> {
+        checked_response(
+            self.client
+                .post(format!("{}/database-credential", self.base_url))
+                .bearer_auth(&session.token)
+                .json(request),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn database_credential(
+        &self,
+        session: &ManagerSession,
+    ) -> Result<Option<ManagerDatabaseCredential>> {
+        checked_response(
+            self.client
+                .get(format!("{}/database-credential", self.base_url))
+                .bearer_auth(&session.token),
+        )
+        .await?
+        .json()
+        .await
+        .map_err(|_| invalid_response())
     }
 
     pub async fn wait_work(&self, session: &ManagerSession) -> Result<Option<WorkOffer>> {

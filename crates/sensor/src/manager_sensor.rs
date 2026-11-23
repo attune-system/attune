@@ -52,6 +52,9 @@ pub struct SensorManagerConfig {
 pub async fn run_from_environment(name: Option<String>, log_level: Option<&str>) -> Result<()> {
     attune_common::observability::init_tracing(log_level, None)?;
     let env = |key: &'static str| std::env::var(key).with_context(|| format!("Missing {key}"));
+    let database = attune_common::manager_db_client::ManagerDatabaseConfig::from_environment(
+        WorkerRole::Sensor,
+    )?;
     let api = ManagerControlClient::new(&env("ATTUNE_API_URL")?, false)?;
     let environment = ChildProcessEnvironment::capture_for_service(&[], true).await?;
     if !environment.uses_workload_sandbox() {
@@ -92,7 +95,7 @@ pub async fn run_from_environment(name: Option<String>, log_level: Option<&str>)
         signals.cancel();
         Ok::<_, std::io::Error>(())
     });
-    let result = run(api, session, local, stop).await;
+    let result = run_with_database(api, session, local, stop, database).await;
     signal_task.abort();
     let _ = signal_task.await;
     result
@@ -104,6 +107,16 @@ pub async fn run(
     local: SensorManagerConfig,
     stop: CancellationToken,
 ) -> Result<()> {
+    run_with_database(api, session, local, stop, None).await
+}
+
+async fn run_with_database(
+    api: ManagerControlClient,
+    session: ManagerSession,
+    local: SensorManagerConfig,
+    stop: CancellationToken,
+    database: Option<attune_common::manager_db_client::ManagerDatabaseConfig>,
+) -> Result<()> {
     if !local.environment.uses_workload_sandbox() {
         return Err(anyhow!("API-only sensor managers require Bubblewrap"));
     }
@@ -113,9 +126,14 @@ pub async fn run(
     let local = Arc::new(local);
     let (sessions, session) = watch::channel(Arc::new(session));
     let renewal = tokio::spawn(renew_session(api.clone(), sessions, stop.clone()));
+    let database = database
+        .map(|database| tokio::spawn(database.run(api.clone(), session.clone(), stop.clone())));
     let result = reconcile(&api, &session, local, &stop).await;
     stop.cancel();
     renewal.await?;
+    if let Some(database) = database {
+        database.await?;
+    }
     let current = session.borrow().clone();
     if let Err(error) = api.withdraw(&current).await {
         warn!(%error, "Sensor manager withdrawal failed");
