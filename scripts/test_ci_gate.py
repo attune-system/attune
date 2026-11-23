@@ -20,16 +20,17 @@ ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
 
 
-def expression_value(expression, event, flags, inputs):
+def expression_value(expression, event, flags, inputs, context=None):
     """Interpret the workflow's boolean/string expressions without executing code."""
     expression = expression.strip().removeprefix("${{").removesuffix("}}").strip()
     values = {"github.event_name": event}
     values.update({f"needs.changes.outputs.{key}": value for key, value in flags.items()})
+    values.update(context or {})
     for _, key in JOBS.values():
         if key:
             values[f"inputs.{key}"] = inputs.get(key, False)
     expression = re.sub(
-        r"(?:github\.event_name|needs\.changes\.outputs\.\w+|inputs\.\w+)",
+        r"(?:github\.[\w.]+|env\.\w+|needs\.changes\.outputs\.\w+|inputs\.\w+)",
         lambda match: repr(values[match[0]]), expression,
     ).replace("&&", " and ").replace("||", " or ")
 
@@ -54,6 +55,15 @@ def expression_value(expression, event, flags, inputs):
         raise AssertionError(f"Unsupported workflow expression: {expression}")
 
     return resolve(ast.parse(" ".join(expression.split()), mode="eval").body)
+
+
+def changed_path_flags(*paths):
+    completed = subprocess.run(
+        ["bash", str(ROOT / "scripts/ci-changed-paths.sh")],
+        input="\n".join(paths) + "\n", capture_output=True, text=True,
+        check=True, timeout=10,
+    )
+    return dict(line.split("=", 1) for line in completed.stdout.splitlines())
 
 
 def results(event="pull_request", flags=None, inputs=None):
@@ -82,12 +92,7 @@ class CiGateTests(unittest.TestCase):
              web_runtime | rust_infrastructure),
         ):
             with self.subTest(paths=paths):
-                completed = subprocess.run(
-                    ["bash", str(ROOT / "scripts/ci-changed-paths.sh")],
-                    input="\n".join(paths) + "\n", capture_output=True, text=True,
-                    check=True, timeout=10,
-                )
-                flags = dict(line.split("=", 1) for line in completed.stdout.splitlines())
+                flags = changed_path_flags(*paths)
                 self.assertEqual(flags, {key: str(key in enabled).lower() for key in PATH_FLAGS})
                 needs = results(flags=flags)
                 self.assertEqual(evaluate(needs, "pull_request", {}), ([], []))
@@ -95,6 +100,42 @@ class CiGateTests(unittest.TestCase):
                                  "success" if "web_image" in enabled else "skipped")
                 self.assertEqual(needs["rust-test"]["result"],
                                  "success" if "rust" in enabled else "skipped")
+
+    def test_cargo_deny_input_paths(self):
+        for path in ("Cargo.toml", "Cargo.lock", "crates/api/Cargo.toml",
+                     "crates/core-actions/Cargo.lock", "tests/sqlx-session/Cargo.toml",
+                     "vendor/sqlx-core-0.8.6/Cargo.toml", "deny.toml", ".cargo/config",
+                     ".cargo/config.toml"):
+            with self.subTest(path=path):
+                flags = changed_path_flags(path)
+                self.assertEqual(flags["cargo_deny_inputs"], "true")
+                self.assertEqual(results(flags=flags)["rust-audit"]["result"], "success")
+        for path in ("crates/api/src/lib.rs", "docs/Cargo.toml.md", "web/package-lock.json"):
+            with self.subTest(path=path):
+                self.assertEqual(changed_path_flags(path)["cargo_deny_inputs"], "false")
+
+    def test_cargo_deny_failures_are_advisory_for_prs_without_input_changes(self):
+        job = WORKFLOW["jobs"]["rust-audit"]
+        policy = job["env"]["CARGO_DENY_ADVISORY"]
+        steps = {step["id"]: step for step in job["steps"] if "id" in step}
+        for event, ref, head, merge_base, changed, advisory in (
+            ("pull_request", "refs/pull/1/merge", "feature", "", "false", True),
+            ("pull_request", "refs/pull/1/merge", "feature", "", "true", False),
+            ("pull_request", "refs/pull/1/merge", "feature", "", "", False),
+            ("pull_request", "refs/pull/1/merge", "main", "", "false", False),
+            ("push", "refs/heads/main", "", "", "false", False),
+            ("merge_group", "refs/heads/gh-readonly-queue/main/pr-1", "",
+             "refs/heads/main", "false", False),
+        ):
+            with self.subTest(event=event, ref=ref, head=head, changed=changed):
+                flags = {"cargo_deny_inputs": changed}
+                context = {"github.ref": ref, "github.head_ref": head,
+                           "github.event.merge_group.base_ref": merge_base}
+                self.assertEqual(expression_value(policy, event, flags, {}, context), advisory)
+                context["env.CARGO_DENY_ADVISORY"] = str(advisory).lower()
+                for step in ("deny-workspace", "deny-core-actions", "deny-timer"):
+                    self.assertEqual(expression_value(steps[step]["continue-on-error"],
+                                                      event, flags, {}, context), advisory)
 
     def test_every_path_combination_matches_the_real_push_and_pr_conditions(self):
         for event in ("pull_request", "push"):

@@ -88,9 +88,10 @@ agent can distinguish saved progress from merge readiness.
 The `CI` workflow reports `CI Gate` on push and pull-request runs. It waits for
 every job, requires path detection to succeed, and rejects failed blocking jobs,
 cancelled jobs, missing results, and unexpected skips. Path-filtered jobs may skip
-when their owning change flag is false. Existing web/security advisory failures
-remain warnings; a green gate does not mean their findings were resolved or
-override step-level advisory policy such as Cargo Deny on feature branches.
+when their owning change flag is false. Web and security advisory failures remain
+warnings. Cargo Deny steps also report warnings on PRs that leave Cargo manifests,
+lockfiles, Cargo configuration, and `deny.toml` unchanged. Cargo Deny failures
+block PRs that change those inputs and block runs on `main`.
 
 Manual runs report `CI Gate (manual)` because their input flags can disable
 checks. They must not satisfy a required `CI Gate` check. The manual release

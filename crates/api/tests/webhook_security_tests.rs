@@ -1120,6 +1120,70 @@ async fn test_webhook_malformed_json() {
 }
 
 #[tokio::test]
+async fn test_webhook_checks_admission_before_parsing_json() {
+    let ctx = setup_test_context().await;
+    let pack_id = create_test_pack(&ctx.pool, "webhook_admission").await;
+    let trigger_id = create_test_trigger(
+        &ctx.pool,
+        pack_id,
+        "webhook_admission",
+        "webhook_admission.trigger",
+    )
+    .await;
+    let webhook_info = TriggerRepository::enable_webhook(&ctx.pool, trigger_id)
+        .await
+        .unwrap();
+    let secret = uuid::Uuid::new_v4().to_string();
+    TriggerRepository::update_webhook_config(
+        &ctx.pool,
+        trigger_id,
+        json!({
+            "hmac": {"enabled": true, "secret": secret, "algorithm": "sha256"},
+            "rate_limit": {"enabled": true, "requests": 2, "window_seconds": 60}
+        }),
+    )
+    .await
+    .unwrap();
+
+    let malformed = "{";
+    let signature = generate_hmac_signature(malformed.as_bytes(), &secret, "sha256");
+    let webhook_key = webhook_info.webhook_key.as_str();
+    for (key, signature, expected) in [
+        ("unknown", None, StatusCode::NOT_FOUND),
+        (webhook_key, None, StatusCode::UNAUTHORIZED),
+        (
+            webhook_key,
+            Some(signature.as_str()),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            webhook_key,
+            Some(signature.as_str()),
+            StatusCode::TOO_MANY_REQUESTS,
+        ),
+    ] {
+        let mut request = Request::builder()
+            .extension(axum::extract::ConnectInfo(
+                "192.0.2.100:12345".parse::<std::net::SocketAddr>().unwrap(),
+            ))
+            .method("POST")
+            .uri(format!("/api/v1/webhooks/{key}"))
+            .header("content-type", "application/json");
+        if let Some(signature) = signature {
+            request = request.header("x-webhook-signature", signature);
+        }
+        let response = ctx
+            .app
+            .clone()
+            .oneshot(request.body(Body::from(malformed)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    ctx.cleanup().await.unwrap();
+}
+
+#[tokio::test]
 async fn test_webhook_empty_payload() {
     let ctx = setup_test_context().await;
     let app = ctx.app.clone();

@@ -3,6 +3,7 @@ set -euo pipefail
 
 # Read git diff --name-only output from stdin.
 rust=false
+cargo_deny_inputs=false
 web=false
 web_image=false
 release=false
@@ -15,6 +16,11 @@ while IFS= read -r path; do
       web_image=true
       continue ;;
     .dockerignore) web_image=true ;;
+  esac
+  case "$path" in
+    Cargo.toml|*/Cargo.toml|Cargo.lock|*/Cargo.lock|deny.toml|.cargo/config|.cargo/config.toml)
+      rust=true
+      cargo_deny_inputs=true ;;
   esac
   case "$path" in
     crates/*|migrations/*|*.rs|Cargo.toml|Cargo.lock|Makefile|.cargo/*|.github/workflows/ci.yml|scripts/*|docker/*|docker-compose*.yaml|docker-compose*.yml|config.*|packs/*|tests/fixtures/*)
@@ -32,4 +38,5 @@ while IFS= read -r path; do
       smoke=true ;;
   esac
 done
-printf 'rust=%s\nweb=%s\nweb_image=%s\nrelease=%s\nsmoke=%s\n' "$rust" "$web" "$web_image" "$release" "$smoke"
+printf 'rust=%s\ncargo_deny_inputs=%s\nweb=%s\nweb_image=%s\nrelease=%s\nsmoke=%s\n' \
+  "$rust" "$cargo_deny_inputs" "$web" "$web_image" "$release" "$smoke"
