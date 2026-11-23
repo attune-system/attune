@@ -21,7 +21,7 @@ JOBS = {
     "release-checks": ("release", None),
 }
 ADVISORY = {"web-advisory", "security-advisory"}
-PATH_FLAGS = {"rust", "web", "web_image", "release", "smoke"}
+PATH_FLAGS = {"rust", "cargo_deny_inputs", "web", "web_image", "release", "smoke"}
 
 
 def evaluate(needs, event, inputs):

@@ -70,6 +70,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
+      cargo_deny_inputs: ${{ steps.filter.outputs.cargo_deny_inputs }}
       web: ${{ steps.filter.outputs.web }}
       web_image: ${{ steps.filter.outputs.web_image }}
       release: ${{ steps.filter.outputs.release }}
@@ -92,16 +93,16 @@ jobs:
             base="${{ github.event.before }}"
             head="${{ github.sha }}"
             if [ "$base" = "0000000000000000000000000000000000000000" ]; then
-              printf 'rust=true\nweb=true\nweb_image=true\nrelease=true\nsmoke=true\n' >> "$GITHUB_OUTPUT"
+              printf 'rust=true\ncargo_deny_inputs=true\nweb=true\nweb_image=true\nrelease=true\nsmoke=true\n' >> "$GITHUB_OUTPUT"
               exit 0
             fi
           else
             # workflow_dispatch: path detection not applicable; jobs check their own input flags
-            printf 'rust=false\nweb=false\nweb_image=false\nrelease=false\nsmoke=false\n' >> "$GITHUB_OUTPUT"
+            printf 'rust=false\ncargo_deny_inputs=false\nweb=false\nweb_image=false\nrelease=false\nsmoke=false\n' >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          git diff --name-only "$base" "$head" | bash scripts/ci-changed-paths.sh | tee -a "$GITHUB_OUTPUT"
+          git diff --no-renames --name-only "$base" "$head" | bash scripts/ci-changed-paths.sh | tee -a "$GITHUB_OUTPUT"
 
   rust-fmt:
     name: Rustfmt
@@ -454,6 +455,12 @@ jobs:
     if: |
       (github.event_name == 'workflow_dispatch' && inputs.run_rust_audit) ||
       (github.event_name != 'workflow_dispatch' && needs.changes.outputs.rust == 'true')
+    env:
+      # PRs use a synthetic merge ref. Enforce on main and on PRs changing Cargo Deny inputs.
+      CARGO_DENY_ADVISORY: >-
+        ${{ github.ref != 'refs/heads/main' && github.head_ref != 'main' &&
+            github.event.merge_group.base_ref != 'refs/heads/main' &&
+            (github.event_name != 'pull_request' || needs.changes.outputs.cargo_deny_inputs == 'false') }}
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -490,32 +497,30 @@ jobs:
         run: |
           command -v cargo-deny   &> /dev/null || cargo binstall --no-confirm --locked cargo-deny
 
-      # PRs use a synthetic merge ref, so check the source branch as well.
-      # Main and its merge queue remain blocking; feature branches get warnings.
       - name: Cargo Deny (workspace)
         id: deny-workspace
-        continue-on-error: ${{ github.ref != 'refs/heads/main' && github.head_ref != 'main' && github.event.merge_group.base_ref != 'refs/heads/main' }}
+        continue-on-error: ${{ env.CARGO_DENY_ADVISORY == 'true' }}
         run: cargo deny --locked check
 
       - name: Cargo Deny (core actions)
         id: deny-core-actions
         if: ${{ !cancelled() }}
-        continue-on-error: ${{ github.ref != 'refs/heads/main' && github.head_ref != 'main' && github.event.merge_group.base_ref != 'refs/heads/main' }}
+        continue-on-error: ${{ env.CARGO_DENY_ADVISORY == 'true' }}
         # Both cached 0.19 and 0.20 read deny.toml from this repository-root cwd.
         run: cargo deny --manifest-path crates/core-actions/Cargo.toml --locked check
 
       - name: Cargo Deny (timer)
         id: deny-timer
         if: ${{ !cancelled() }}
-        continue-on-error: ${{ github.ref != 'refs/heads/main' && github.head_ref != 'main' && github.event.merge_group.base_ref != 'refs/heads/main' }}
+        continue-on-error: ${{ env.CARGO_DENY_ADVISORY == 'true' }}
         run: cargo deny --manifest-path crates/core-timer-sensor/Cargo.toml --config deny.toml --locked check
 
       - name: Report non-blocking Cargo Deny failures
-        if: ${{ !cancelled() && github.ref != 'refs/heads/main' && github.head_ref != 'main' && github.event.merge_group.base_ref != 'refs/heads/main' && (steps.deny-workspace.outcome == 'failure' || steps.deny-timer.outcome == 'failure' || steps.deny-core-actions.outcome == 'failure') }}
+        if: ${{ !cancelled() && env.CARGO_DENY_ADVISORY == 'true' && (steps.deny-workspace.outcome == 'failure' || steps.deny-timer.outcome == 'failure' || steps.deny-core-actions.outcome == 'failure') }}
         run: |
-          echo "::warning::Cargo Deny failed. Findings are non-blocking on this branch, but must be resolved before main passes. See the Cargo Deny step logs."
+          echo "::warning::Cargo Deny failed in advisory mode. See the Cargo Deny step logs for findings."
           echo "### Cargo Deny warning" >> "$GITHUB_STEP_SUMMARY"
-          echo "Dependency policy checks failed. This branch is non-blocking; main remains enforced. See the Cargo Deny step logs for findings." >> "$GITHUB_STEP_SUMMARY"
+          echo "Dependency policy checks failed in advisory mode. See the Cargo Deny step logs for findings. Main enforces Cargo Deny." >> "$GITHUB_STEP_SUMMARY"
 
   web-blocking:
     name: Web Blocking Checks
