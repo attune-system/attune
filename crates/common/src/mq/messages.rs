@@ -692,6 +692,12 @@ pub struct PackTestRequestedPayload {
     /// Exact operator-admitted recipes needed by explicit lifecycle test runners.
     #[serde(default)]
     pub required_recipe_digests: Vec<String>,
+    #[serde(default)]
+    pub candidate_api_effects: bool,
+    #[serde(default)]
+    pub test_min_pass_rate: Option<f64>,
+    #[serde(default)]
+    pub test_allows_failure: bool,
     /// Mandatory pack-level placement constraints selected by the executor.
     #[serde(default = "default_json_object")]
     pub worker_selector: serde_json::Value,

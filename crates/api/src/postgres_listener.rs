@@ -4,6 +4,8 @@ use sqlx::postgres::{PgListener, PgPool};
 use tokio::sync::{broadcast, watch};
 use tracing::{debug, error, info, warn};
 
+use attune_common::repositories::manager_assignment::MANAGER_WORK_WAKEUP;
+
 use crate::log_stream_wakeups::LogStreamWakeups;
 
 const LOG_STREAM_CHANNEL: &str = "log_stream_changed";
@@ -26,6 +28,7 @@ const NOTIFICATION_CHANNELS: &[&str] = &[
     "work_queue_item_created",
     "work_queue_item_updated",
     LOG_STREAM_CHANNEL,
+    MANAGER_WORK_WAKEUP,
 ];
 
 #[derive(Debug, serde::Deserialize, PartialEq, Eq)]
@@ -58,6 +61,15 @@ impl PostgresListener {
     pub fn abort(self) {
         self.task.abort();
     }
+
+    pub async fn shutdown(self) {
+        self.task.abort();
+        if let Err(error) = self.task.await {
+            if !error.is_cancelled() {
+                error!(%error, "PostgreSQL notification listener failed while stopping");
+            }
+        }
+    }
 }
 
 /// Start the resilient notification listener without blocking API startup.
@@ -65,6 +77,7 @@ pub fn spawn_postgres_listener(
     db: PgPool,
     broadcast_tx: broadcast::Sender<String>,
     log_stream_wakeups: LogStreamWakeups,
+    manager_work_wakeups: LogStreamWakeups,
 ) -> PostgresListener {
     info!("Starting PostgreSQL notification listener for SSE broadcasting");
     let (ready_tx, ready) = watch::channel(false);
@@ -72,6 +85,7 @@ pub fn spawn_postgres_listener(
         db,
         broadcast_tx,
         log_stream_wakeups,
+        manager_work_wakeups,
         ready_tx,
     ));
     PostgresListener { task, ready }
@@ -81,6 +95,7 @@ async fn run_postgres_listener(
     db: PgPool,
     broadcast_tx: broadcast::Sender<String>,
     log_stream_wakeups: LogStreamWakeups,
+    manager_work_wakeups: LogStreamWakeups,
     ready: watch::Sender<bool>,
 ) {
     loop {
@@ -93,6 +108,7 @@ async fn run_postgres_listener(
             }
         };
         let readers = log_stream_wakeups.wake_all();
+        manager_work_wakeups.wake_all();
         ready.send_replace(true);
         info!(readers, "PostgreSQL notification listener connected");
 
@@ -104,6 +120,7 @@ async fn run_postgres_listener(
                         notification.payload(),
                         &broadcast_tx,
                         &log_stream_wakeups,
+                        &manager_work_wakeups,
                     );
                 }
                 Err(error) => {
@@ -130,12 +147,19 @@ fn route_notification(
     payload: &str,
     broadcast_tx: &broadcast::Sender<String>,
     log_stream_wakeups: &LogStreamWakeups,
+    manager_work_wakeups: &LogStreamWakeups,
 ) {
     debug!(
         channel,
         payload_len = payload.len(),
         "Received PostgreSQL notification"
     );
+    if channel == MANAGER_WORK_WAKEUP {
+        if let Ok(session) = payload.parse::<i64>() {
+            manager_work_wakeups.wake(session);
+        }
+        return;
+    }
     if channel == LOG_STREAM_CHANNEL {
         match serde_json::from_str::<LogStreamChange>(payload) {
             Ok(change) => {
@@ -184,6 +208,7 @@ mod tests {
             r#"{"stream_id":42,"artifact_version_id":9,"total_bytes":128,"sealed":false}"#,
             &broadcast_tx,
             &wakeups,
+            &LogStreamWakeups::default(),
         );
 
         assert!(subscription.wait(tokio::time::Duration::from_secs(1)).await);
@@ -195,7 +220,13 @@ mod tests {
         let (broadcast_tx, _) = broadcast::channel(1);
         let wakeups = LogStreamWakeups::default();
         let mut subscription = wakeups.subscribe(42);
-        route_notification(LOG_STREAM_CHANNEL, "not-json", &broadcast_tx, &wakeups);
+        route_notification(
+            LOG_STREAM_CHANNEL,
+            "not-json",
+            &broadcast_tx,
+            &wakeups,
+            &LogStreamWakeups::default(),
+        );
 
         let wait = tokio::spawn(async move {
             subscription

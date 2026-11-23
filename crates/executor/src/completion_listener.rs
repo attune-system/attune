@@ -22,6 +22,9 @@ use attune_common::{
     },
     repositories::{
         execution::{ExecutionRepository, UpdateExecutionInput},
+        manager_assignment::{
+            ManagerAssignmentRepository, ManagerCompletionReceipt, MANAGER_COMPLETION_SOURCE,
+        },
         work_queue::{
             UpdateWorkQueueDispatchInput, UpdateWorkQueueItemInput, WorkQueueDispatchRepository,
             WorkQueueItemRepository, WorkQueueItemSearchFilters, WorkQueueRepository,
@@ -152,7 +155,32 @@ impl CompletionListener {
                     let workflow_log_transport = workflow_log_transport.clone();
 
                     async move {
-                        if let Err(e) = Box::pin(Self::process_execution_completed(
+                        let receipt = if envelope.headers.source_service.as_deref()
+                            == Some(MANAGER_COMPLETION_SOURCE)
+                        {
+                            match ManagerAssignmentRepository::begin_completion_processing(
+                                &pool,
+                                envelope.message_id,
+                                &envelope.payload,
+                            )
+                            .await
+                            {
+                                Ok(ManagerCompletionReceipt::Process(receipt)) => Some(receipt),
+                                Ok(
+                                    ManagerCompletionReceipt::AlreadyProcessed
+                                    | ManagerCompletionReceipt::Busy,
+                                ) => return Ok(()),
+                                Err(attune_common::Error::PermissionDenied(_)) => {
+                                    return Err(MqError::InvalidMessage(
+                                        "Manager completion does not match its outbox event".into(),
+                                    ));
+                                }
+                                Err(error) => return Err(MqError::Pool(error.to_string())),
+                            }
+                        } else {
+                            None
+                        };
+                        let result = Box::pin(Self::process_execution_completed(
                             &pool,
                             &publisher,
                             &queue_manager,
@@ -165,8 +193,20 @@ impl CompletionListener {
                             &metadata_caches,
                             &envelope,
                         ))
-                        .await
-                        {
+                        .await;
+                        if let Some(receipt) = receipt {
+                            receipt
+                                .release(result.is_ok())
+                                .await
+                                .map_err(|error| MqError::Pool(error.to_string()))?;
+                            if let Err(error) = result {
+                                // The API retries the durable event until the executor
+                                // records its receipt. Avoid hot broker requeue here.
+                                warn!(%error, "Manager completion deferred");
+                            }
+                            return Ok(());
+                        }
+                        if let Err(e) = result {
                             error!("Error processing execution completion: {}", e);
                             // Return error to trigger nack with requeue
                             if let Some(mq_err) = Self::retryable_mq_error(&e) {
@@ -301,6 +341,11 @@ impl CompletionListener {
                         );
                         if let Some(mq_err) = Self::retryable_mq_error(&e) {
                             return Err(mq_err.into());
+                        }
+                        if envelope.headers.source_service.as_deref()
+                            == Some(MANAGER_COMPLETION_SOURCE)
+                        {
+                            return Err(e);
                         }
                         // Non-retryable workflow advancement errors are logged but
                         // do not fail the entire completion processing path.

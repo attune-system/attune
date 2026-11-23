@@ -44,6 +44,7 @@ pub struct AppState {
     pub broadcast_tx: broadcast::Sender<String>,
     /// Local wakeups for readers interested in a specific execution log stream.
     pub log_stream_wakeups: LogStreamWakeups,
+    pub manager_work_wakeups: LogStreamWakeups,
     /// Admission control, shutdown signaling, and metrics for execution log SSE streams.
     pub execution_log_streams: ExecutionLogStreams,
     /// Audit event emitter (non-blocking; no-op if not configured)
@@ -177,6 +178,7 @@ impl AppState {
             publisher: Arc::new(RwLock::new(None)),
             broadcast_tx,
             log_stream_wakeups: LogStreamWakeups::default(),
+            manager_work_wakeups: LogStreamWakeups::default(),
             execution_log_streams,
             audit_emitter,
             blob_store,

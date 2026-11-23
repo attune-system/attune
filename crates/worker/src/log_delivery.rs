@@ -3,6 +3,7 @@ use crate::log_delivery_spool::{LogDeliverySpool, SpoolDelivery, SpoolSegment};
 use attune_common::{
     artifact_transport::ArtifactFileTransport,
     auth::jwt::JwtConfig,
+    manager_control::{ActionLog, LogResume, ManagerControlClient, ManagerSession},
     repositories::{
         delegated_execution::DelegatedExecutionRepository,
         file_evidence_retention::FileEvidenceRetentionRepository,
@@ -24,14 +25,24 @@ use uuid::Uuid;
 #[path = "log_delivery_tests.rs"]
 mod tests;
 
+enum DeliveryAuthority {
+    Local {
+        pool: sqlx::PgPool,
+        jwt: JwtConfig,
+        api: String,
+        client: reqwest::Client,
+    },
+    Remote {
+        api: ManagerControlClient,
+        session: tokio::sync::watch::Receiver<Arc<ManagerSession>>,
+    },
+}
+
 pub struct LogDeliveryManager {
-    pool: sqlx::PgPool,
+    authority: DeliveryAuthority,
     spool: LogDeliverySpool,
     worker: i64,
     instance: Uuid,
-    jwt: JwtConfig,
-    api: String,
-    client: reqwest::Client,
     tasks: TaskTracker,
     slots: Arc<Semaphore>,
     stop: CancellationToken,
@@ -53,6 +64,7 @@ pub struct SpoolingLogWriter {
     version: i64,
     stream: i64,
     attempt: Uuid,
+    segment_bytes: usize,
     capture: Arc<Mutex<Capture>>,
     changed: Arc<Notify>,
     cancel: CancellationToken,
@@ -88,6 +100,67 @@ impl LogDeliveryManager {
         max_payload: u64,
         segment_bytes: usize,
     ) -> Result<Arc<Self>> {
+        let authority = DeliveryAuthority::Local {
+            pool,
+            jwt,
+            api: api.trim_end_matches('/').to_owned(),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .map_err(|_| Error::execution("Log delivery HTTP client unavailable"))?,
+        };
+        Self::open_with_authority(
+            authority,
+            root,
+            key,
+            worker,
+            instance,
+            config,
+            max_payload,
+            segment_bytes,
+        )
+        .await
+    }
+
+    pub async fn open_remote(
+        api: ManagerControlClient,
+        session: tokio::sync::watch::Receiver<Arc<ManagerSession>>,
+        root: std::path::PathBuf,
+        key: String,
+        worker: i64,
+    ) -> Result<Arc<Self>> {
+        let instance = session.borrow().instance;
+        let config = attune_common::config::LogDeliveryConfig::default();
+        let segment_bytes = attune_common::config::ArtifactsConfig::default()
+            .log_segment_writer_config()
+            .max_segment_bytes;
+        let max_payload = attune_common::runtime_read_log::maximum_encoded_bytes(
+            attune_common::manager_control::MAX_MANAGER_LOG_PLAINTEXT as u64,
+        )?;
+        Self::open_with_authority(
+            DeliveryAuthority::Remote { api, session },
+            root,
+            key,
+            worker,
+            instance,
+            config,
+            max_payload,
+            segment_bytes,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn open_with_authority(
+        authority: DeliveryAuthority,
+        root: std::path::PathBuf,
+        key: String,
+        worker: i64,
+        instance: Uuid,
+        config: attune_common::config::LogDeliveryConfig,
+        max_payload: u64,
+        segment_bytes: usize,
+    ) -> Result<Arc<Self>> {
         let entry_bytes = max_payload
             .checked_mul(4)
             .and_then(|v| v.checked_add(64 * 1024))
@@ -102,16 +175,10 @@ impl LogDeliveryManager {
         )
         .await?;
         let result = Arc::new(Self {
-            pool,
+            authority,
             spool,
             worker,
             instance,
-            jwt,
-            api: api.trim_end_matches('/').to_owned(),
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .map_err(|_| Error::execution("Log delivery HTTP client unavailable"))?,
             tasks: TaskTracker::new(),
             slots: Arc::new(Semaphore::new(config.max_finalizers)),
             stop: CancellationToken::new(),
@@ -127,18 +194,66 @@ impl LogDeliveryManager {
         version: i64,
         transport: Arc<dyn ArtifactFileTransport>,
     ) -> Result<SpoolingLogWriter> {
-        let slot = self
-            .slots
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Error::execution("Log delivery concurrency budget exhausted"))?;
-        let mut conn = self.pool.acquire().await?;
+        let DeliveryAuthority::Local { pool, .. } = &self.authority else {
+            return Err(Error::invalid_state("Local log custody unavailable"));
+        };
+        let mut conn = pool.acquire().await?;
         let attempt = DelegatedExecutionRepository::current_attempt(&mut conn, execution).await?;
         let stream = LogStreamRepository::find_by_artifact_version_with_conn(&mut conn, version)
             .await?
             .ok_or_else(|| Error::invalid_state("Log stream unavailable"))?
             .id;
         drop(conn);
+        self.start_writer(
+            execution,
+            version,
+            stream,
+            attempt,
+            self.segment_bytes,
+            Some(transport),
+        )
+    }
+
+    pub fn manager_writer(
+        self: &Arc<Self>,
+        execution: i64,
+        log: &ActionLog,
+        transport: Option<Arc<dyn ArtifactFileTransport>>,
+    ) -> Result<SpoolingLogWriter> {
+        if log.worker != self.worker
+            || !matches!(self.authority, DeliveryAuthority::Remote { .. })
+            || log.segment_bytes == 0
+            || attune_common::runtime_read_log::maximum_encoded_bytes(log.max_plaintext as u64)?
+                > self.max_payload
+        {
+            return Err(Error::invalid_state(
+                "Log capture exceeds this manager's scope or budget",
+            ));
+        }
+        self.start_writer(
+            execution,
+            log.version,
+            log.stream,
+            log.attempt,
+            log.segment_bytes,
+            transport,
+        )
+    }
+
+    fn start_writer(
+        self: &Arc<Self>,
+        execution: i64,
+        version: i64,
+        stream: i64,
+        attempt: Uuid,
+        segment_bytes: usize,
+        transport: Option<Arc<dyn ArtifactFileTransport>>,
+    ) -> Result<SpoolingLogWriter> {
+        let slot = self
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::execution("Log delivery concurrency budget exhausted"))?;
         let capture = Arc::new(Mutex::new(Capture {
             segments: Vec::new(),
             bytes: 0,
@@ -153,6 +268,7 @@ impl LogDeliveryManager {
             version,
             stream,
             attempt,
+            segment_bytes,
             capture: capture.clone(),
             changed: changed.clone(),
             cancel: cancel.clone(),
@@ -171,11 +287,11 @@ impl LogDeliveryManager {
         capture: Arc<Mutex<Capture>>,
         changed: Arc<Notify>,
         cancel: CancellationToken,
-        transport: Arc<dyn ArtifactFileTransport>,
+        transport: Option<Arc<dyn ArtifactFileTransport>>,
         _slot: OwnedSemaphorePermit,
     ) {
         let mut next = 0usize;
-        let mut live_failed = false;
+        let mut live_failed = transport.is_none();
         loop {
             // Register the notification before examining the state to avoid lost EOF.
             let notified = changed.notified();
@@ -194,7 +310,7 @@ impl LogDeliveryManager {
                 self.deliver(entry).await;
                 return;
             }
-            if let Some(segment) = segment {
+            if let (Some(segment), Some(transport)) = (segment, &transport) {
                 let request = tokio::time::timeout(
                     Duration::from_secs(2),
                     transport.commit_log_segment(version, segment.sequence, &segment.bytes),
@@ -211,32 +327,32 @@ impl LogDeliveryManager {
     }
     async fn recover(self: &Arc<Self>) -> Result<()> {
         let versions = self.spool.versions().await?;
-        let pending = LogDeliveryRepository::pending_for_worker(
-            &mut *self.pool.acquire().await?,
-            self.worker,
-        )
-        .await?;
-        for intent in pending {
-            let valid = if versions.contains(&intent.artifact_version) {
-                self.spool
-                    .load(intent.artifact_version)
-                    .await
-                    .ok()
-                    .is_some_and(|e| e.custody == intent.custody && e.attempt == intent.attempt)
-            } else {
-                false
-            };
-            if !valid {
-                let mut tx = self.pool.begin().await?;
-                LogDeliveryRepository::mark_incomplete(
-                    &mut tx,
-                    intent.artifact_version,
-                    self.worker,
-                    intent.custody,
-                    "custody_lost",
-                )
-                .await?;
-                tx.commit().await?;
+        if let DeliveryAuthority::Local { pool, .. } = &self.authority {
+            let pending =
+                LogDeliveryRepository::pending_for_worker(&mut *pool.acquire().await?, self.worker)
+                    .await?;
+            for intent in pending {
+                let valid = if versions.contains(&intent.artifact_version) {
+                    self.spool
+                        .load(intent.artifact_version)
+                        .await
+                        .ok()
+                        .is_some_and(|e| e.custody == intent.custody && e.attempt == intent.attempt)
+                } else {
+                    false
+                };
+                if !valid {
+                    let mut tx = pool.begin().await?;
+                    LogDeliveryRepository::mark_incomplete(
+                        &mut tx,
+                        intent.artifact_version,
+                        self.worker,
+                        intent.custody,
+                        "custody_lost",
+                    )
+                    .await?;
+                    tx.commit().await?;
+                }
             }
         }
         for version in versions {
@@ -284,12 +400,23 @@ impl LogDeliveryManager {
         }
     }
     async fn deliver_inner(&self, entry: &SpoolDelivery) -> Result<()> {
+        let (pool, jwt, api, client) = match &self.authority {
+            DeliveryAuthority::Remote { api, session } => {
+                return self.deliver_remote(entry, api, session).await
+            }
+            DeliveryAuthority::Local {
+                pool,
+                jwt,
+                api,
+                client,
+            } => (pool, jwt, api, client),
+        };
         let mut backoff = Duration::from_millis(100);
         loop {
             if self.stop.is_cancelled() {
                 return Ok(());
             }
-            let mut tx = self.pool.begin().await?;
+            let mut tx = pool.begin().await?;
             let intent = LogDeliveryRepository::find(&mut *tx, entry.version).await?;
             let Some(intent) = intent else {
                 let absent = LogDeliveryRepository::custody_absent(&mut tx, entry.version).await?;
@@ -358,15 +485,14 @@ impl LogDeliveryManager {
             } else {
                 intent
             };
-            let token = attune_common::log_delivery::mint(&intent, &self.jwt)?;
+            let token = attune_common::log_delivery::mint(&intent, jwt)?;
             tx.commit().await?;
             let upload = async {
                 for segment in &entry.segments {
-                    let response = self
-                        .client
+                    let response = client
                         .put(format!(
                             "{}/api/v1/internal/logs/{}/segments/{}",
-                            self.api, entry.version, segment.sequence
+                            api, entry.version, segment.sequence
                         ))
                         .bearer_auth(&token)
                         .body(segment.bytes.clone())
@@ -380,11 +506,10 @@ impl LogDeliveryManager {
                         )));
                     }
                 }
-                let mut request = self
-                    .client
+                let mut request = client
                     .post(format!(
                         "{}/api/v1/internal/logs/{}/seal?truncated={}",
-                        self.api, entry.version, entry.truncated
+                        api, entry.version, entry.truncated
                     ))
                     .bearer_auth(&token);
                 if let Some(manifest) = &entry.authenticated_manifest {
@@ -410,6 +535,54 @@ impl LogDeliveryManager {
             backoff = (backoff * 2).min(Duration::from_secs(2));
         }
     }
+    async fn deliver_remote(
+        &self,
+        entry: &SpoolDelivery,
+        api: &ManagerControlClient,
+        sessions: &tokio::sync::watch::Receiver<Arc<ManagerSession>>,
+    ) -> Result<()> {
+        let current = sessions.borrow().clone();
+        match api
+            .resume_log(&current, entry.version, entry.custody)
+            .await?
+        {
+            LogResume::Closed => self.spool.remove(entry.version, entry.custody).await,
+            LogResume::Waiting => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                Err(Error::RetryableTransport(
+                    "Log custody is awaiting completion".into(),
+                ))
+            }
+            LogResume::Upload { token } => {
+                let transport = api.artifact_transport(&token, "");
+                for segment in &entry.segments {
+                    transport
+                        .commit_log_segment(entry.version, segment.sequence, &segment.bytes)
+                        .await?;
+                }
+                transport
+                    .seal_log_stream_with_manifest(
+                        entry.version,
+                        entry.truncated,
+                        entry.authenticated_manifest.as_deref().ok_or_else(|| {
+                            Error::invalid_state("Managed logs require an authenticated manifest")
+                        })?,
+                    )
+                    .await?;
+                // Keep the spool until the API acknowledges verified Ready.
+                let current = sessions.borrow().clone();
+                if matches!(
+                    api.resume_log(&current, entry.version, entry.custody)
+                        .await?,
+                    LogResume::Closed
+                ) {
+                    self.spool.remove(entry.version, entry.custody).await?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     pub async fn drain(&self) {
         self.tasks.close();
         if tokio::time::timeout(Duration::from_secs(65), self.tasks.wait())
@@ -436,7 +609,7 @@ impl SpoolingLogWriter {
             .checked_add(bytes.len() as u64)
             .filter(|n| *n <= self.manager.max_payload)
             .ok_or_else(|| std::io::Error::other("Log custody payload budget exhausted"))?;
-        for chunk in bytes.chunks(self.manager.segment_bytes) {
+        for chunk in bytes.chunks(self.segment_bytes) {
             let sequence = capture.segments.len() as i64;
             if sequence >= 16_384 {
                 return Err(std::io::Error::other(
@@ -512,29 +685,43 @@ impl SpoolingLogWriter {
         // Bound settlement independently of the upload deadline. SQLx owns a
         // cancelled transaction; reconciliation fences its eventual rollback
         // or COMMIT before treating missing custody as deletion evidence.
+        let input = PrepareLogDelivery {
+            execution: entry.execution,
+            version: entry.version,
+            stream: entry.stream,
+            worker: entry.worker,
+            instance: entry.source_instance,
+            custody: entry.custody,
+            segments: descriptors,
+            total_bytes: total,
+            sha256: hex(&digest.finalize()),
+            truncated: entry.truncated,
+            authenticated_manifest: entry.authenticated_manifest.clone(),
+            finalize_by: entry.finalize_by,
+        };
         let preparation = async {
-            let mut tx = self.manager.pool.begin().await?;
-            FileEvidenceRetentionRepository::lock_capture(&mut tx).await?;
-            LogDeliveryRepository::prepare(
-                &mut tx,
-                PrepareLogDelivery {
-                    execution: entry.execution,
-                    version: entry.version,
-                    stream: entry.stream,
-                    worker: entry.worker,
-                    instance: entry.source_instance,
-                    custody: entry.custody,
-                    segments: descriptors,
-                    total_bytes: total,
-                    sha256: hex(&digest.finalize()),
-                    truncated: entry.truncated,
-                    authenticated_manifest: entry.authenticated_manifest.clone(),
-                    finalize_by: entry.finalize_by,
-                },
-            )
-            .await?;
-            tx.commit().await?;
-            Ok(())
+            match &self.manager.authority {
+                DeliveryAuthority::Local { pool, .. } => {
+                    let mut tx = pool.begin().await?;
+                    FileEvidenceRetentionRepository::lock_capture(&mut tx).await?;
+                    LogDeliveryRepository::prepare(&mut tx, input).await?;
+                    tx.commit().await?;
+                    Ok(())
+                }
+                DeliveryAuthority::Remote { api, session } => {
+                    let current = session.borrow().clone();
+                    let result = api
+                        .prepare_action_log(&current, entry.version, &input)
+                        .await;
+                    if matches!(result, Err(Error::RetryableTransport(_))) {
+                        let current = session.borrow().clone();
+                        api.prepare_action_log(&current, entry.version, &input)
+                            .await
+                    } else {
+                        result
+                    }
+                }
+            }
         };
         tokio::time::timeout(Duration::from_secs(10), preparation)
             .await

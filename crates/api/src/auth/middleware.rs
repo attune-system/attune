@@ -249,6 +249,18 @@ impl axum::extract::FromRequestParts<crate::state::SharedState> for RequireAuth<
             extract_claims(&parts.headers, &state.jwt_config)?
         };
 
+        if claims.scope.as_deref() == Some(attune_common::log_delivery::CAPTURE_LOG_SCOPE) {
+            attune_common::log_delivery::capture_credential(&claims)
+                .map_err(|_| AuthError::InvalidToken)?;
+            if parts.method != axum::http::Method::PUT
+                || parts
+                    .extensions
+                    .get::<crate::recorded_files::LogDeliveryConsumer>()
+                    .is_none()
+            {
+                return Err(AuthError::Unauthorized);
+            }
+        }
         if claims.scope.as_deref() == Some("log_delivery") {
             attune_common::log_delivery::credential(&claims)
                 .map_err(|_| AuthError::InvalidToken)?;
@@ -309,9 +321,12 @@ impl axum::extract::FromRequestParts<crate::state::SharedState> for RequireAuth<
                 }
                 _ => SensorWorkloadRepository::is_current_fence(&state.db, fence).await,
             }
-            .map_err(|error| {
-                tracing::error!(%error, "Failed to validate sensor workload fence");
-                AuthError::Internal
+            .map_err(|error| match error {
+                attune_common::Error::PermissionDenied(_) => AuthError::InvalidToken,
+                error => {
+                    tracing::error!(%error, "Failed to validate sensor workload fence");
+                    AuthError::Internal
+                }
             })?;
             if !current {
                 return Err(AuthError::InvalidToken);

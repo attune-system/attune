@@ -180,6 +180,15 @@ impl PackInstallRepository {
         worker_id: Id,
         candidate_access_token_hash: Option<&str>,
     ) -> Result<Option<PackInstall>> {
+        Self::claim_worker_with(&self.pool, id, worker_id, candidate_access_token_hash).await
+    }
+
+    pub async fn claim_worker_with<'e>(
+        connection: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+        id: Id,
+        worker_id: Id,
+        candidate_access_token_hash: Option<&str>,
+    ) -> Result<Option<PackInstall>> {
         let sql = format!(
             "UPDATE pack_install \
              SET status = $2, assigned_worker_id = $3, candidate_access_token_hash = $4, \
@@ -192,7 +201,7 @@ impl PackInstallRepository {
             .bind(PackInstallStatus::Running.as_str())
             .bind(worker_id)
             .bind(candidate_access_token_hash)
-            .fetch_optional(&self.pool)
+            .fetch_optional(connection)
             .await?)
     }
 
@@ -279,6 +288,25 @@ impl PackInstallRepository {
         test_result: Option<serde_json::Value>,
         error_message: Option<String>,
     ) -> Result<Option<PackInstall>> {
+        Self::finish_running_with(
+            &self.pool,
+            id,
+            status,
+            test_execution_id,
+            test_result,
+            error_message,
+        )
+        .await
+    }
+
+    pub async fn finish_running_with<'e>(
+        connection: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+        id: Id,
+        status: PackInstallStatus,
+        test_execution_id: Option<Id>,
+        test_result: Option<serde_json::Value>,
+        error_message: Option<String>,
+    ) -> Result<Option<PackInstall>> {
         let sql = format!(
             "UPDATE pack_install \
              SET status = $2, \
@@ -297,7 +325,7 @@ impl PackInstallRepository {
             .bind(test_execution_id)
             .bind(test_result)
             .bind(error_message)
-            .fetch_optional(&self.pool)
+            .fetch_optional(connection)
             .await?)
     }
 

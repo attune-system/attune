@@ -230,3 +230,53 @@ mod workflow_credential_tests {
         assert!(workflow_credential(&claims).unwrap().is_none());
     }
 }
+
+pub const CAPTURE_LOG_SCOPE: &str = "manager_log_capture";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureCredential {
+    pub version: i64,
+    pub worker: i64,
+    pub session: i64,
+    pub instance: Uuid,
+}
+
+pub fn capture_credential(claims: &Claims) -> Result<Option<CaptureCredential>> {
+    if claims.scope.as_deref() != Some(CAPTURE_LOG_SCOPE) {
+        return Ok(None);
+    }
+    let denied = || Error::PermissionDenied("Invalid manager log capture credential".into());
+    let credential: CaptureCredential =
+        serde_json::from_value(claims.metadata.clone().ok_or_else(denied)?)
+            .map_err(|_| denied())?;
+    if claims.token_type != TokenType::Worker
+        || claims.sub != credential.worker.to_string()
+        || credential.session <= 0
+        || credential.version <= 0
+        || credential.worker <= 0
+        || credential.instance.is_nil()
+    {
+        return Err(denied());
+    }
+    Ok(Some(credential))
+}
+
+pub fn mint_capture(credential: CaptureCredential, config: &JwtConfig) -> Result<String> {
+    let now = chrono::Utc::now().timestamp();
+    let claims = Claims {
+        sub: credential.worker.to_string(),
+        login: "manager-log-capture".into(),
+        iat: now,
+        exp: now + 900,
+        token_type: TokenType::Worker,
+        scope: Some(CAPTURE_LOG_SCOPE.into()),
+        metadata: Some(serde_json::to_value(credential)?),
+    };
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(config.secret.as_bytes()),
+    )
+    .map_err(|_| Error::PermissionDenied("Unable to sign log capture credential".into()))
+}

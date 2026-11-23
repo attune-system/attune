@@ -7,7 +7,7 @@ use crate::models::{
     runtime::*,
     Id, JsonDict,
 };
-use crate::Result;
+use crate::{Error, Result};
 use sqlx::{Executor, Postgres, QueryBuilder};
 
 use super::{
@@ -527,7 +527,7 @@ pub struct UpdateWorkerInput {
     pub port: Option<i32>,
 }
 
-const WORKER_SELECT_COLUMNS: &str =
+pub(crate) const WORKER_SELECT_COLUMNS: &str =
     "id, name, worker_type, worker_role, runtime, host, port, status, \
      capabilities, meta, last_heartbeat, cordoned, cordon_reason, cordoned_by, cordoned_at, \
      created, updated";
@@ -762,17 +762,19 @@ impl WorkerRepository {
         role: crate::models::WorkerRole,
         incarnation: uuid::Uuid,
     ) -> Result<Worker> {
-        Ok(sqlx::query_as::<_, Worker>(&format!(
+        sqlx::query_as::<_, Worker>(&format!(
             "INSERT INTO worker (name, worker_type, worker_role, runtime, host, port, status, capabilities, meta, last_heartbeat) \
              VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, jsonb_build_object('registration_incarnation', $8::text), NOW()) \
              ON CONFLICT (name) DO UPDATE SET status = 'active', last_heartbeat = NOW(), \
              host = EXCLUDED.host, port = EXCLUDED.port, capabilities = EXCLUDED.capabilities, \
              meta = COALESCE(worker.meta, '{{}}'::jsonb) || EXCLUDED.meta, updated = NOW() \
+             WHERE worker.worker_role = EXCLUDED.worker_role \
              RETURNING {WORKER_SELECT_COLUMNS}"
         ))
         .bind(input.name).bind(input.worker_type).bind(role).bind(input.runtime)
         .bind(input.host).bind(input.port).bind(input.capabilities).bind(incarnation.to_string())
-        .fetch_one(executor).await?)
+        .fetch_optional(executor).await?
+        .ok_or_else(|| Error::PermissionDenied("Worker name belongs to another role".into()))
     }
 
     pub async fn deregister_incarnation(
@@ -924,15 +926,46 @@ impl WorkerRepository {
     where
         E: Executor<'e, Database = Postgres> + 'e,
     {
-        let workers = sqlx::query_as::<_, Worker>(
-            &format!(
-                "SELECT {WORKER_SELECT_COLUMNS} FROM worker WHERE worker_role = 'action' ORDER BY name ASC"
-            ),
-        )
+        let workers = sqlx::query_as::<_, Worker>(&format!(
+            "SELECT {WORKER_SELECT_COLUMNS} FROM worker WHERE worker_role = 'action'
+                 AND manager_runtime_is_current(id) ORDER BY name ASC"
+        ))
         .fetch_all(executor)
         .await?;
 
         Ok(workers)
+    }
+
+    /// Existing worker placement owns eligibility and compatibility. Filtering
+    /// out stale manager transports here avoids picking a draining registration.
+    pub async fn find_execution_workers(pool: &sqlx::PgPool) -> Result<Vec<Worker>> {
+        Self::find_pack_or_execution_workers(pool, false, false).await
+    }
+
+    pub async fn find_pack_workers<'e>(
+        executor: impl Executor<'e, Database = Postgres>,
+        manager_only: bool,
+    ) -> Result<Vec<Worker>> {
+        Self::find_pack_or_execution_workers(executor, true, manager_only).await
+    }
+
+    async fn find_pack_or_execution_workers<'e>(
+        executor: impl Executor<'e, Database = Postgres>,
+        pack_jobs: bool,
+        manager_only: bool,
+    ) -> Result<Vec<Worker>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT {WORKER_SELECT_COLUMNS} FROM worker w WHERE worker_role = 'action'
+             AND manager_runtime_is_current(w.id)
+             AND ($1 OR w.capabilities->'pack_jobs_only' IS DISTINCT FROM 'true'::jsonb)
+             AND (NOT $2 OR EXISTS (SELECT 1 FROM manager_action_worker m WHERE m.worker=w.id))
+             AND NOT EXISTS (
+                 SELECT 1 FROM manager_action_worker m JOIN manager_session s ON s.id = m.manager_session
+                 WHERE m.worker = w.id AND (m.draining OR s.closed_at IS NOT NULL
+                   OR s.expires_at <= clock_timestamp()
+                   OR w.meta->>'registration_incarnation' IS DISTINCT FROM s.instance::text)
+             ) ORDER BY name ASC"
+        )).bind(pack_jobs).bind(manager_only).fetch_all(executor).await?)
     }
 
     /// Find workers that can run managed sensors (role = 'sensor').
@@ -941,8 +974,11 @@ impl WorkerRepository {
         E: Executor<'e, Database = Postgres> + 'e,
     {
         let workers = sqlx::query_as::<_, Worker>(&format!(
-            "SELECT {WORKER_SELECT_COLUMNS} FROM worker \
-             WHERE worker_role = 'sensor' ORDER BY name ASC"
+                "SELECT {WORKER_SELECT_COLUMNS} FROM worker w
+                 WHERE worker_role = 'sensor' AND manager_runtime_is_current(w.id)
+                 AND NOT EXISTS (SELECT 1 FROM manager_runtime_report r JOIN manager_session s ON s.id=r.manager_session
+                    WHERE r.worker=w.id AND w.meta->>'registration_incarnation' IS DISTINCT FROM s.instance::text)
+                 ORDER BY name ASC"
         ))
         .fetch_all(executor)
         .await?;

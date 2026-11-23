@@ -26,7 +26,7 @@ use attune_common::mq::{
     PackTestRequestedPayload, Publisher, PublisherConfig, RuntimeChangedPayload,
 };
 use attune_common::repositories::{
-    execution::{ExecutionRepository, ExecutionTransition},
+    execution::{ExecutionRepository, ExecutionTransition, WorkerExecutionAssignment},
     recorded_consumer_observations::RecordedConsumerIdentity,
     worker_delivery::WorkerDeliveryRepository,
     FindById, FindByRef, PackInstallRepository, PackRepository, PackTestRepository,
@@ -48,7 +48,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::artifacts::ArtifactManager;
 use crate::env_setup;
-use crate::executor::{ActionExecutor, RecordedWorkerAssignment};
+use crate::executor::ActionExecutor;
 use crate::heartbeat::HeartbeatManager;
 use crate::registration::WorkerRegistration;
 use crate::runtime::local::LocalRuntime;
@@ -94,6 +94,8 @@ pub struct ExecutionScheduledPayload {
     #[serde(default)]
     pub scheduled_attempt_updated_at: Option<chrono::DateTime<Utc>>,
     #[serde(default)]
+    pub worker_instance: Option<uuid::Uuid>,
+    #[serde(default)]
     pub recorded_worker_boot: Option<uuid::Uuid>,
 }
 
@@ -101,22 +103,24 @@ impl ExecutionScheduledPayload {
     fn recorded_assignment(
         &self,
         local_registration: (i64, uuid::Uuid),
-    ) -> Result<Option<RecordedWorkerAssignment>> {
-        let Some(boot) = self.recorded_worker_boot else {
+    ) -> Result<Option<WorkerExecutionAssignment>> {
+        let Some(instance) = self.recorded_worker_boot else {
             return Ok(None);
         };
-        if (self.worker_id, boot) != local_registration {
+        if (self.worker_id, instance) != local_registration {
             return Err(Error::PermissionDenied(
                 "Recorded delivery targets another worker registration".into(),
             ));
         }
-        let updated_at = self.scheduled_attempt_updated_at.ok_or_else(|| {
+        let scheduled_at = self.scheduled_attempt_updated_at.ok_or_else(|| {
             Error::PermissionDenied("Recorded delivery is missing its scheduling attempt".into())
         })?;
-        Ok(Some(RecordedWorkerAssignment {
-            worker_id: self.worker_id,
-            boot,
-            updated_at,
+        Ok(Some(WorkerExecutionAssignment {
+            instance,
+            scheduled_at,
+            pack_release: self.release_id,
+            pack_release_digest: self.release_digest.clone(),
+            recorded: true,
         }))
     }
 }
@@ -1806,7 +1810,7 @@ impl WorkerService {
     ) -> Result<()> {
         let received_at = std::time::Instant::now();
         let execution_id = envelope.payload.execution_id;
-        let recorded_assignment = envelope.payload.recorded_assignment(local_registration)?;
+        let assignment = envelope.payload.recorded_assignment(local_registration)?;
 
         info!(
             "Processing execution.scheduled for execution: {}",
@@ -1872,7 +1876,7 @@ impl WorkerService {
             "Worker lifecycle phase"
         );
         let started = executor
-            .start_execution(execution_id, recorded_assignment)
+            .start_execution(execution_id, assignment.as_ref())
             .await?;
         if let Err(error) = Self::publish_persisted_status_update(&publisher, &started).await {
             error!("Failed to publish running status: {}", error);
@@ -3093,6 +3097,7 @@ mod tests {
             execution_id: 111,
             action_ref: "core.test".to_string(),
             worker_id: 222,
+            worker_instance: None,
             release_id: Some(333),
             release_digest: Some("a".repeat(64)),
             scheduled_attempt_updated_at: None,
@@ -3111,9 +3116,9 @@ mod tests {
         let scheduled_at = Utc::now();
         payload.scheduled_attempt_updated_at = Some(scheduled_at);
         let accepted = payload.recorded_assignment(local).unwrap().unwrap();
-        assert_eq!(accepted.worker_id, 222);
-        assert_eq!(accepted.boot, boot);
-        assert_eq!(accepted.updated_at, scheduled_at);
+        assert!(accepted.recorded);
+        assert_eq!(accepted.instance, boot);
+        assert_eq!(accepted.scheduled_at, scheduled_at);
         assert!(payload.recorded_assignment((223, boot)).is_err());
         assert!(payload
             .recorded_assignment((222, uuid::Uuid::new_v4()))

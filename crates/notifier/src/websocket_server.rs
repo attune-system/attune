@@ -175,7 +175,7 @@ struct AppState {
 }
 
 struct VerifiedWsToken {
-    delegated_claims: Option<attune_common::auth::Claims>,
+    workload_claims: Option<attune_common::auth::Claims>,
     recorded: Option<RecordedConnection>,
     identity_id: i64,
     token_type: TokenType,
@@ -190,7 +190,7 @@ struct VerifiedWsToken {
 /// decisions can be memoized once per distinct snapshot per notification.
 #[derive(Clone)]
 pub(crate) struct WebSocketAuthContext {
-    pub(crate) delegated_claims: Option<attune_common::auth::Claims>,
+    pub(crate) workload_claims: Option<attune_common::auth::Claims>,
     pub(crate) recorded: Option<RecordedConnection>,
     pub(crate) identity_id: i64,
     pub(crate) token_type: TokenType,
@@ -215,7 +215,7 @@ impl WebSocketAuthContext {
         use std::hash::{Hash, Hasher};
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        if let Some(claims) = &self.delegated_claims {
+        if let Some(claims) = &self.workload_claims {
             serde_json::to_string(claims).ok().hash(&mut hasher);
         }
         self.identity_id.hash(&mut hasher);
@@ -265,7 +265,7 @@ impl WebSocketAuthContext {
         grants: Vec<Grant>,
     ) -> Self {
         Self {
-            delegated_claims: None,
+            workload_claims: None,
             recorded: None,
             identity_id,
             token_type,
@@ -377,9 +377,15 @@ fn verify_ws_token(
         Vec::new()
     };
 
+    let sensor_workload = claims.token_type == TokenType::Sensor
+        && claims
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.get("workload_fence").is_some());
     Ok(VerifiedWsToken {
-        delegated_claims: (claims.token_type == TokenType::Execution && recorded.is_none())
-            .then(|| claims.clone()),
+        workload_claims: (sensor_workload
+            || (claims.token_type == TokenType::Execution && recorded.is_none()))
+        .then(|| claims.clone()),
         recorded,
         identity_id,
         token_type: claims.token_type,
@@ -1410,10 +1416,14 @@ async fn websocket_handler(
             }
         }
     };
-    if !delegated_source_is_live(&state.db_pool, &verified_token.delegated_claims).await {
+    if !workload_source_is_live(&state.db_pool, &verified_token.workload_claims).await {
+        let error = match verified_token.token_type {
+            TokenType::Sensor => "sensor_generation_unavailable",
+            _ => "delegated_authority_unavailable",
+        };
         return (
             StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error":"delegated_authority_unavailable"})),
+            Json(serde_json::json!({"error":error})),
         )
             .into_response();
     }
@@ -1456,7 +1466,7 @@ async fn websocket_handler(
     };
 
     let auth = WebSocketAuthContext {
-        delegated_claims: verified_token.delegated_claims,
+        workload_claims: verified_token.workload_claims,
         recorded: verified_token.recorded,
         identity_id: verified_token.identity_id,
         token_type: verified_token.token_type,
@@ -1598,7 +1608,7 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, auth: WebSock
             _ = exp_interval.tick() => {
                 let now = chrono::Utc::now().timestamp();
                 if is_token_expired(auth.token_exp, now)
-                    || !delegated_source_is_live(&state.db_pool, &auth.delegated_claims).await
+                    || !workload_source_is_live(&state.db_pool, &auth.workload_claims).await
                     || match &auth.recorded {
                         Some(recorded) => !recorded.is_live(&state.db_pool).await,
                         None => false,
@@ -1654,13 +1664,25 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, auth: WebSock
     info!("WebSocket connection closed: {}", client_id);
 }
 
-async fn delegated_source_is_live(
+async fn workload_source_is_live(
     pool: &PgPool,
     claims: &Option<attune_common::auth::Claims>,
 ) -> bool {
     let Some(claims) = claims else {
         return true;
     };
+    if claims.token_type == TokenType::Sensor {
+        let (Ok(fence), Ok(sensor), Ok(pack)) = (
+            claims.sensor_workload_fence(),
+            claims.sensor_ref(),
+            claims.sensor_pack_ref(),
+        ) else {
+            return false;
+        };
+        return attune_common::repositories::SensorWorkloadRepository::is_current_fence_for_sensor_scope(
+            pool, fence, sensor, pack,
+        ).await.unwrap_or(false);
+    }
     match pool.acquire().await {
         Ok(mut connection) => attune_common::repositories::delegated_execution::DelegatedExecutionRepository::validate_claims(&mut connection, claims).await.is_ok(),
         Err(_) => false,
@@ -1707,7 +1729,7 @@ async fn send_checked_frame(
             .await;
         return false;
     }
-    if !delegated_source_is_live(pool, &auth.delegated_claims).await {
+    if !workload_source_is_live(pool, &auth.workload_claims).await {
         return false;
     }
     if let Some(recorded) = &auth.recorded {
@@ -2766,7 +2788,7 @@ mod tests {
         let manager = SubscriberManager::new();
 
         let sensor_auth = Arc::new(WebSocketAuthContext {
-            delegated_claims: None,
+            workload_claims: None,
             recorded: None,
             identity_id: 99,
             token_type: TokenType::Sensor,

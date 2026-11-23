@@ -327,12 +327,18 @@ pub(super) async fn seal(
         if prepared.selected.published() {
             return Ok(StatusCode::OK);
         }
-        let verified = verify(
-            state.blob_store.as_ref(),
-            prepared,
-            state.config.security.encryption_key.as_deref(),
-        )
-        .await?;
+        let key = if matches!(prepared.history.proof(), ProofBinding::Encrypted { .. }) {
+            attune_common::repositories::manager_log::ManagerLogRepository::key(
+                &state.db,
+                version.id,
+                state.config.security.encryption_key.as_deref(),
+            )
+            .await
+            .map_err(map_transport_error)?
+        } else {
+            None
+        };
+        let verified = verify(state.blob_store.as_ref(), prepared, key.as_deref()).await?;
         match bounded(finish(&state, &user, &version, &headers, &verified)).await {
             Err((StatusCode::SERVICE_UNAVAILABLE, _)) => {
                 bounded(finish(&state, &user, &version, &headers, &verified)).await?

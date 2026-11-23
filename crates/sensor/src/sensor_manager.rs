@@ -80,7 +80,7 @@ const SENSOR_RECONCILIATION_RETRY_BASE_DELAY: Duration = Duration::from_millis(2
 const STDERR_EXCERPT_MAX_BYTES: u64 = 16 * 1024;
 const STDERR_EXCERPT_MAX_LINES: usize = 80;
 
-async fn deliver_sensor_bootstrap(
+pub(crate) async fn deliver_sensor_bootstrap(
     child: &mut Child,
     bootstrap: &[u8],
     deadline: Duration,
@@ -110,7 +110,7 @@ fn existing_command_env(cmd: &Command, key: &str) -> Option<String> {
     })
 }
 
-fn build_recipe_sensor_command(
+pub(crate) fn build_recipe_sensor_command(
     target: &attune_common::runtime_lifecycle::PreparedTarget,
     environment: &ChildProcessEnvironment,
 ) -> Command {
@@ -123,7 +123,7 @@ fn build_recipe_sensor_command(
     command
 }
 
-fn build_sensor_command(
+pub(crate) fn build_sensor_command(
     sensor_script: &str,
     is_native: bool,
     exec_config: &RuntimeExecutionConfig,
@@ -145,7 +145,7 @@ fn build_sensor_command(
     (program, command)
 }
 
-fn sandbox_sensor_command(
+pub(crate) fn sandbox_sensor_command(
     command: Command,
     environment: &ChildProcessEnvironment,
     pack_dir: &std::path::Path,
@@ -188,7 +188,7 @@ fn build_sensor_setup_command(
         .map(Command::from)
 }
 
-fn apply_runtime_env_vars(
+pub(crate) fn apply_runtime_env_vars(
     cmd: &mut Command,
     exec_config: &RuntimeExecutionConfig,
     pack_dir: &std::path::Path,
@@ -213,7 +213,7 @@ fn apply_runtime_env_vars(
     }
 }
 
-fn apply_notifier_env(cmd: &mut Command, notifier_ws_url: &str, allow_insecure: bool) {
+pub(crate) fn apply_notifier_env(cmd: &mut Command, notifier_ws_url: &str, allow_insecure: bool) {
     cmd.env("ATTUNE_NOTIFIER_WS_URL", notifier_ws_url).env(
         "ATTUNE_ALLOW_INSECURE_NOTIFIER_WS",
         allow_insecure.to_string(),
@@ -282,7 +282,7 @@ fn collect_sensor_token_permission_set_refs(
     Ok(refs)
 }
 
-fn configure_sensor_process(cmd: &mut Command) -> io::Result<()> {
+pub(crate) fn configure_sensor_process(cmd: &mut Command) -> io::Result<()> {
     #[cfg(unix)]
     {
         // Run each sensor in its own process group so shutdown can terminate
@@ -304,17 +304,17 @@ fn configure_sensor_process(cmd: &mut Command) -> io::Result<()> {
     Ok(())
 }
 
-struct StartupProcessGuard {
+pub(crate) struct StartupProcessGuard {
     pid: Option<u32>,
     armed: bool,
 }
 
 impl StartupProcessGuard {
-    fn new(pid: Option<u32>) -> Self {
+    pub(crate) fn new(pid: Option<u32>) -> Self {
         Self { pid, armed: true }
     }
 
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }
 }
@@ -412,7 +412,7 @@ fn kill_signal() -> i32 {
     libc::SIGKILL
 }
 
-fn sensor_restart_backoff_delay(failure_count: i32) -> Duration {
+pub(crate) fn sensor_restart_backoff_delay(failure_count: i32) -> Duration {
     let exponent = failure_count.max(1).saturating_sub(1).min(10) as u32;
     let multiplier = 2_u64.saturating_pow(exponent);
     let secs = SENSOR_RESTART_BASE_DELAY
@@ -448,13 +448,16 @@ where
     unreachable!("bounded reconciliation loop always returns")
 }
 
-fn parse_sensor_token_expiry(expires_at: &str) -> Result<DateTime<Utc>> {
+pub(crate) fn parse_sensor_token_expiry(expires_at: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(expires_at)
         .map(|expires_at| expires_at.with_timezone(&Utc))
         .map_err(|e| anyhow!("Invalid sensor token expiration '{}': {}", expires_at, e))
 }
 
-fn sensor_token_rotation_delay(now: DateTime<Utc>, expires_at: DateTime<Utc>) -> Duration {
+pub(crate) fn sensor_token_rotation_delay(
+    now: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+) -> Duration {
     let remaining = expires_at.signed_duration_since(now);
     if remaining <= chrono::Duration::zero() {
         return Duration::ZERO;
@@ -606,7 +609,7 @@ fn format_stderr_excerpt(bytes: &[u8], truncated: bool) -> Option<String> {
     }
 }
 
-async fn terminate_sensor_child(child: &mut Child, sensor_label: &str) {
+pub(crate) async fn terminate_sensor_child(child: &mut Child, sensor_label: &str) {
     let Some(pid) = child.id() else {
         if let Err(e) = child.start_kill() {
             error!("Failed to kill sensor process {}: {}", sensor_label, e);
@@ -933,8 +936,8 @@ impl SensorManager {
         Ok(enabled_sensors)
     }
 
-    async fn ensure_runtime_environment(
-        &self,
+    pub(crate) async fn ensure_runtime_environment(
+        child_environment: &ChildProcessEnvironment,
         exec_config: &RuntimeExecutionConfig,
         pack_dir: &std::path::Path,
         env_dir: &std::path::Path,
@@ -966,7 +969,7 @@ impl SensorManager {
                 exec_config,
                 pack_dir,
                 &temporary,
-                &self.inner.child_environment,
+                child_environment,
             )
             .await?;
             if let Some(interpreter_template) = exec_config
@@ -1493,9 +1496,14 @@ impl SensorManager {
             .map(|target| target.generation.clone())
             .unwrap_or_else(|| cache_key.path(std::path::Path::new(&self.inner.runtime_envs_dir)));
         if prepared_target.is_none() {
-            if let Err(e) = self
-                .ensure_runtime_environment(&exec_config, &pack_dir, &env_dir, &cache_key)
-                .await
+            if let Err(e) = Self::ensure_runtime_environment(
+                &self.inner.child_environment,
+                &exec_config,
+                &pack_dir,
+                &env_dir,
+                &cache_key,
+            )
+            .await
             {
                 if self.inner.child_environment.uses_workload_sandbox() {
                     return Err(e.context("Failed to prepare sandboxed sensor environment"));

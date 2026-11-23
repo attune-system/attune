@@ -13,6 +13,9 @@ pub mod heartbeat;
 pub mod log_delivery;
 #[cfg(unix)]
 pub mod log_delivery_spool;
+#[cfg(unix)]
+pub mod manager_action;
+pub mod manager_pack_worker;
 pub mod recorded_credentials;
 pub mod registration;
 pub mod runtime;

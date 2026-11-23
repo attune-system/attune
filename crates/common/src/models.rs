@@ -1775,6 +1775,34 @@ pub mod event {
 pub mod execution {
     use super::*;
 
+    #[derive(Debug, Clone, FromRow)]
+    pub struct ManagerExecutionAssignment {
+        pub id: Id,
+        pub execution: Id,
+        pub worker: Id,
+        pub manager_session: Id,
+        pub instance: uuid::Uuid,
+        pub scheduled_at: DateTime<Utc>,
+        pub pack_release: Id,
+        pub pack_release_digest: String,
+        pub deadline: DateTime<Utc>,
+        pub claim_request: Option<uuid::Uuid>,
+        pub closed_at: Option<DateTime<Utc>>,
+        pub finish_digest: Option<String>,
+        pub final_status: Option<ExecutionStatus>,
+    }
+
+    #[derive(Debug, Clone, FromRow)]
+    pub struct ManagerExecutionCompletion {
+        pub assignment: Id,
+        pub message_id: uuid::Uuid,
+        pub execution: Id,
+        pub action: Id,
+        pub action_ref: String,
+        pub status: ExecutionStatus,
+        pub completed_at: DateTime<Utc>,
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct PackReleasePin {
         pub id: Id,

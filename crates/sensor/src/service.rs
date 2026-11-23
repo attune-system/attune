@@ -245,7 +245,8 @@ impl SensorService {
             .map(|sensor| sensor.allow_insecure_notifier_ws)
             .unwrap_or(false);
         let sensor_worker_registration = SensorWorkerRegistration::new(db.clone(), &config)
-            .with_child_environment(child_environment.clone());
+            .with_child_environment(child_environment.clone())
+            .with_incarnation(worker_token_provider.instance_id());
         let worker_name = sensor_worker_registration.worker_name().to_string();
 
         let sensor_manager = Arc::new(SensorManager::new(

@@ -13,10 +13,13 @@ use tokio::process::ChildStdout;
 use tracing::{info, warn};
 
 use attune_common::artifact_transport::ArtifactFileTransport;
+use attune_common::manager_control::{LogChannel, ManagerControlClient, ManagerSession, OpenLog};
 use attune_common::models::enums::{ArtifactClassification, RetentionPolicyType};
+use attune_common::models::SensorWorkloadFence;
 use attune_common::repositories::artifact::{classify_artifact, ArtifactVersionRepository};
 use attune_common::repositories::log_stream::LogStreamRepository;
 use attune_common::runtime_log_mirror::{RuntimeLogMirror, RuntimeLogSource, RuntimeLogStream};
+use tokio::sync::watch;
 
 /// Configuration for sensor log rotation.
 #[derive(Debug, Clone)]
@@ -92,10 +95,18 @@ pub struct SensorLogArtifacts {
     pub stderr: SensorLogArtifactTarget,
 }
 
-#[derive(Debug, Clone)]
-struct SensorLogVersioning {
-    pool: sqlx::PgPool,
-    target: SensorLogArtifactTarget,
+enum SensorLogVersioning {
+    Local {
+        pool: sqlx::PgPool,
+        target: SensorLogArtifactTarget,
+    },
+    Manager {
+        api: ManagerControlClient,
+        session: watch::Receiver<Arc<ManagerSession>>,
+        fence: SensorWorkloadFence,
+        channel: LogChannel,
+        request: uuid::Uuid,
+    },
 }
 
 impl RotatingLogWriter {
@@ -112,7 +123,32 @@ impl RotatingLogWriter {
             transport,
             current_size: 0,
             config,
-            versioning: SensorLogVersioning { pool, target },
+            versioning: SensorLogVersioning::Local { pool, target },
+            writer: None,
+            active_version: None,
+        }
+    }
+
+    pub(crate) fn new_managed(
+        api: ManagerControlClient,
+        session: watch::Receiver<Arc<ManagerSession>>,
+        token: &str,
+        fence: SensorWorkloadFence,
+        channel: LogChannel,
+    ) -> Self {
+        let transport = Arc::new(api.artifact_transport(token, ""));
+        Self {
+            relative_path: String::new(),
+            transport,
+            current_size: 0,
+            config: SensorLogConfig::default(),
+            versioning: SensorLogVersioning::Manager {
+                api,
+                session,
+                fence,
+                channel,
+                request: uuid::Uuid::new_v4(),
+            },
             writer: None,
             active_version: None,
         }
@@ -150,10 +186,12 @@ impl RotatingLogWriter {
             } else {
                 bytes.len()
             };
-            if let (Some(generation), Some(version)) =
-                (self.config.generation_binding_id, self.active_version)
-            {
-                let mut connection = self.versioning.pool.acquire().await?;
+            if let (SensorLogVersioning::Local { pool, .. }, Some(generation), Some(version)) = (
+                &self.versioning,
+                self.config.generation_binding_id,
+                self.active_version,
+            ) {
+                let mut connection = pool.acquire().await?;
                 attune_common::repositories::sensor_schema::SensorSchemaRepository::attach_current_log_deliveries(
                     &mut connection, version, generation).await?;
             }
@@ -180,17 +218,60 @@ impl RotatingLogWriter {
     }
 
     async fn allocate_new_version_file(&mut self) -> anyhow::Result<()> {
-        let versioning = &self.versioning;
-        let mut tx = versioning.pool.begin().await?;
+        let (pool, target) = match &mut self.versioning {
+            SensorLogVersioning::Manager {
+                api,
+                session,
+                fence,
+                channel,
+                request,
+            } => {
+                let current = session.borrow().clone();
+                let log = api
+                    .open_sensor_log(
+                        &current,
+                        *fence,
+                        &OpenLog {
+                            channel: *channel,
+                            request: *request,
+                        },
+                    )
+                    .await?;
+                // Keep the same request if returning the successful allocation
+                // fails before the local writer is constructed.
+                self.config.max_bytes = log.rotation_bytes;
+                self.config.max_files = if log.rotates { 1 } else { 0 };
+                let cfg = attune_common::log_stream::SegmentedLogConfig {
+                    initial_segment_bytes: self
+                        .config
+                        .segment_writer
+                        .initial_segment_bytes
+                        .min(log.segment_bytes),
+                    max_segment_bytes: log.segment_bytes,
+                    ..self.config.segment_writer
+                };
+                self.writer = Some(attune_common::log_stream::SegmentedLogWriter::new(
+                    self.transport.clone(),
+                    log.version,
+                    cfg,
+                )?);
+                self.active_version = Some(log.version);
+                self.current_size = 0;
+                *request = uuid::Uuid::new_v4();
+                return Ok(());
+            }
+            SensorLogVersioning::Local { pool, target } => (pool, target),
+        };
+        let mut tx = pool.begin().await?;
         let version = ArtifactVersionRepository::create_file_backed_with_conn(
             &mut tx,
-            versioning.target.artifact_id,
-            &versioning.target.artifact_ref,
+            target.artifact_id,
+            &target.artifact_ref,
             "text/plain".to_string(),
             None,
             Some(serde_json::json!({
-                "sensor_ref": versioning.target.sensor_ref,
-                "stream": versioning.target.stream,
+                "sensor_ref": target.sensor_ref,
+                "stream": target.stream,
             })),
             Some("sensor".to_string()),
         )
@@ -203,11 +284,11 @@ impl RotatingLogWriter {
         }
         tx.commit().await?;
         info!(
-            artifact_id = versioning.target.artifact_id,
-            artifact_ref = %versioning.target.artifact_ref,
+            artifact_id = target.artifact_id,
+            artifact_ref = %target.artifact_ref,
             version_id = version.id,
-            sensor_ref = %versioning.target.sensor_ref,
-            stream = %versioning.target.stream,
+            sensor_ref = %target.sensor_ref,
+            stream = %target.stream,
             "Allocated sensor runtime log artifact version"
         );
 
@@ -216,7 +297,7 @@ impl RotatingLogWriter {
             .ok_or_else(|| anyhow::anyhow!("Allocated sensor log version has no file_path"))?;
 
         LogStreamRepository::create(
-            &versioning.pool,
+            &*pool,
             version.id,
             self.config.segment_writer.max_segment_bytes as u64,
             self.config.segment_writer.flush_interval_ms,

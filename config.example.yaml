@@ -39,6 +39,17 @@ database:
   # PostgreSQL schema name (defaults to "attune" if not specified)
   schema: "attune"
 
+# API-side enrollment for API-only attune-worker and attune-sensor pools.
+# Store the SHA-256 digest of a separate random 64-hex-character enrollment
+# credential per role and pool. Mount the raw secret only in that manager pool.
+# See docs/deployment/api-only-managers.md for HTTPS, sandbox, and spool settings.
+manager_enrollments: []
+# Example entry:
+#   - role: action
+#     pool: linux-actions
+#     secret_sha256: <lowercase sha256 hex>
+#     labels: {zone: local}
+
 # Message queue configuration (optional, for async processing)
 message_queue:
   url: amqp://guest:guest@localhost:5672/%2f

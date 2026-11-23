@@ -10,19 +10,22 @@ use attune_common::agent_runtime_detection::{detect_runtimes, DetectedRuntime};
 use attune_common::child_process_environment::ChildProcessEnvironment;
 use attune_common::config::Config;
 use attune_common::error::Result;
-use attune_common::models::{RuntimeVersion, Worker, WorkerRole, WorkerStatus, WorkerType};
-use attune_common::repositories::{List, RuntimeRepository, RuntimeVersionRepository};
+use attune_common::models::{RuntimeVersion, WorkerRole, WorkerType};
+use attune_common::repositories::{
+    runtime::{CreateWorkerInput, WorkerRepository},
+    List, RuntimeRepository, RuntimeVersionRepository,
+};
 use attune_common::runtime_detection::{normalize_runtime_name, RuntimeDetector};
 use attune_common::scheduling::{
     validate_label_map, validate_taints, WORKER_LABELS_CAPABILITY_KEY, WORKER_TAINTS_CAPABILITY_KEY,
 };
-use chrono::Utc;
 use serde_json::json;
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::process::Command;
 use tracing::{debug, info};
+use uuid::Uuid;
 
 /// Capability key under which detected runtime versions are stored.
 ///
@@ -39,12 +42,18 @@ pub struct SensorWorkerRegistration {
     child_environment: ChildProcessEnvironment,
     pool: PgPool,
     worker_id: Option<i64>,
+    incarnation: Uuid,
     worker_name: String,
     host: Option<String>,
     capabilities: HashMap<String, serde_json::Value>,
 }
 
 impl SensorWorkerRegistration {
+    pub(crate) fn with_incarnation(mut self, incarnation: Uuid) -> Self {
+        self.incarnation = incarnation;
+        self
+    }
+
     pub fn with_child_environment(mut self, environment: ChildProcessEnvironment) -> Self {
         self.child_environment = environment;
         self
@@ -266,6 +275,7 @@ impl SensorWorkerRegistration {
             child_environment: Default::default(),
             pool,
             worker_id: None,
+            incarnation: Uuid::new_v4(),
             worker_name,
             host,
             capabilities,
@@ -279,65 +289,23 @@ impl SensorWorkerRegistration {
 
         info!("Registering sensor worker: {}", self.worker_name);
 
-        // Check if sensor worker with this name already exists
-        let existing = sqlx::query_as::<_, Worker>(
-            "SELECT * FROM worker WHERE name = $1 AND worker_role = 'sensor' ORDER BY created DESC LIMIT 1",
+        let worker = WorkerRepository::register_incarnation(
+            &self.pool,
+            CreateWorkerInput {
+                name: self.worker_name.clone(),
+                worker_type: WorkerType::Local,
+                runtime: None,
+                host: self.host.clone(),
+                port: None,
+                status: None,
+                capabilities: Some(serde_json::to_value(&self.capabilities)?),
+                meta: None,
+            },
+            WorkerRole::Sensor,
+            self.incarnation,
         )
-        .bind(&self.worker_name)
-        .fetch_optional(&self.pool)
         .await?;
-
-        let worker_id = if let Some(existing_worker) = existing {
-            info!(
-                "Sensor worker '{}' already exists (ID: {}), updating status",
-                self.worker_name, existing_worker.id
-            );
-
-            // Update existing sensor worker to active status with new heartbeat
-            sqlx::query(
-                r#"
-                UPDATE worker
-                SET status = $1,
-                    capabilities = $2,
-                    last_heartbeat = $3,
-                    updated = $4,
-                    host = $5
-                WHERE id = $6
-                "#,
-            )
-            .bind(WorkerStatus::Active)
-            .bind(serde_json::to_value(&self.capabilities)?)
-            .bind(Utc::now())
-            .bind(Utc::now())
-            .bind(&self.host)
-            .bind(existing_worker.id)
-            .execute(&self.pool)
-            .await?;
-
-            existing_worker.id
-        } else {
-            // Insert new sensor worker
-            let row = sqlx::query(
-                r#"
-                INSERT INTO worker (name, worker_type, worker_role, host, status, capabilities, last_heartbeat)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                RETURNING id
-                "#,
-            )
-            .bind(&self.worker_name)
-            .bind(WorkerType::Local) // Sensor workers are always local
-            .bind(WorkerRole::Sensor)
-            .bind(&self.host)
-            .bind(WorkerStatus::Active)
-            .bind(serde_json::to_value(&self.capabilities)?)
-            .bind(Utc::now())
-            .fetch_one(&self.pool)
-            .await?;
-
-            let worker_id: i64 = row.get("id");
-            info!("Sensor worker registered with ID: {}", worker_id);
-            worker_id
-        };
+        let worker_id = worker.id;
 
         self.worker_id = Some(worker_id);
         Ok(worker_id)
@@ -346,21 +314,8 @@ impl SensorWorkerRegistration {
     /// Send heartbeat to update last_heartbeat timestamp
     pub async fn heartbeat(&self) -> Result<()> {
         if let Some(worker_id) = self.worker_id {
-            sqlx::query(
-                r#"
-                UPDATE worker
-                SET last_heartbeat = $1,
-                    status = $2,
-                    updated = $3
-                WHERE id = $4
-                "#,
-            )
-            .bind(Utc::now())
-            .bind(WorkerStatus::Active)
-            .bind(Utc::now())
-            .bind(worker_id)
-            .execute(&self.pool)
-            .await?;
+            WorkerRepository::heartbeat_incarnation(&self.pool, worker_id, self.incarnation)
+                .await?;
 
             debug!("Sensor worker heartbeat sent");
         }
@@ -373,19 +328,8 @@ impl SensorWorkerRegistration {
         if let Some(worker_id) = self.worker_id {
             info!("Deregistering sensor worker: {}", self.worker_name);
 
-            sqlx::query(
-                r#"
-                UPDATE worker
-                SET status = $1,
-                    updated = $2
-                WHERE id = $3
-                "#,
-            )
-            .bind(WorkerStatus::Inactive)
-            .bind(Utc::now())
-            .bind(worker_id)
-            .execute(&self.pool)
-            .await?;
+            WorkerRepository::deregister_incarnation(&self.pool, worker_id, self.incarnation)
+                .await?;
 
             info!("Sensor worker deregistered");
         }
@@ -415,18 +359,12 @@ impl SensorWorkerRegistration {
     /// Update sensor worker capabilities in the database
     pub async fn update_capabilities(&self) -> Result<()> {
         if let Some(worker_id) = self.worker_id {
-            sqlx::query(
-                r#"
-                UPDATE worker
-                SET capabilities = $1,
-                    updated = $2
-                WHERE id = $3
-                "#,
+            WorkerRepository::update_incarnation_capabilities(
+                &self.pool,
+                worker_id,
+                self.incarnation,
+                serde_json::to_value(&self.capabilities)?,
             )
-            .bind(serde_json::to_value(&self.capabilities)?)
-            .bind(Utc::now())
-            .bind(worker_id)
-            .execute(&self.pool)
             .await?;
 
             info!("Sensor worker capabilities updated");
@@ -890,9 +828,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_sensor_worker_registration() {
+        use attune_common::{models::WorkerStatus, repositories::FindById};
+
         let _lock = AGENT_ENV_LOCK.lock().await;
-        let (config, pool, _database) = isolated_test_context().await;
-        let mut registration = SensorWorkerRegistration::new(pool, &config);
+        let (config, pool, database) = isolated_test_context().await;
+        let mut registration = SensorWorkerRegistration::new(pool.clone(), &config);
 
         // Test registration
         let worker_id = registration.register(&config).await.unwrap();
@@ -902,8 +842,30 @@ mod tests {
         // Test heartbeat
         registration.heartbeat().await.unwrap();
 
-        // Test deregistration
+        // Updates from a replaced process leave the new registration intact.
+        let mut replacement = SensorWorkerRegistration::new(pool.clone(), &config);
+        replacement.add_capability("replacement".into(), json!(true));
+        assert_eq!(replacement.register(&config).await.unwrap(), worker_id);
+        let current = WorkerRepository::get_by_id(&pool, worker_id).await.unwrap();
+        registration.heartbeat().await.unwrap();
+        registration.update_capabilities().await.unwrap();
         registration.deregister().await.unwrap();
+        let observed = WorkerRepository::get_by_id(&pool, worker_id).await.unwrap();
+        assert_eq!(observed.updated, current.updated);
+        assert_eq!(observed.last_heartbeat, current.last_heartbeat);
+        assert_eq!(observed.status, Some(WorkerStatus::Active));
+        assert_eq!(observed.capabilities.unwrap()["replacement"], json!(true));
+        replacement.deregister().await.unwrap();
+        assert_eq!(
+            WorkerRepository::get_by_id(&pool, worker_id)
+                .await
+                .unwrap()
+                .status,
+            Some(WorkerStatus::Inactive)
+        );
+        drop(registration);
+        drop(replacement);
+        database.cleanup().await.unwrap();
     }
 
     #[tokio::test]

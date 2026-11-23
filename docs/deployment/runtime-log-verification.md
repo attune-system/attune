@@ -28,6 +28,11 @@ and PostgreSQL database.
 
 ## Asynchronous worker log custody
 
+The [API-only manager configuration](api-only-managers.md#configure-the-manager-processes)
+uses object segments through the API. Each protected log version has a separate
+derived key. Manager log uploads use the API proxy, so managers need only the
+API network path and their own custody key.
+
 On Unix workers, delegated object logs use a persistent encrypted spool by
 default. After EOF and bounded capture, the worker synchronizes an immutable
 entry and registers its exact segment hashes and final proof before publishing
@@ -44,6 +49,8 @@ worker:
     # Optional private persistent worker-local directory. Default:
     # runtime_envs_dir/.log-delivery/<database-worker-id>
     spool_dir: /var/lib/attune/log-spool
+    # Optional dedicated key retained with this spool.
+    spool_key_file: /run/secrets/attune-worker-spool
     max_spool_bytes: 1073741824
     max_finalizers: 64
 ```
@@ -57,6 +64,12 @@ resource use. If custody cannot be accepted, capture is marked incomplete and
 the classified action outcome can still settle. This local spool is not the log
 artifact backend: `artifacts.transport: api` and the configured object store
 continue to own delivery and published logs.
+
+To provision a dedicated local custody key, set `worker.log_delivery.spool_key_file`
+to a manager-only file containing 64 hexadecimal characters generated from 32
+random bytes. Keep the file available to the same worker on restart and outside
+pack, runtime, and artifact mounts. Existing spools use the key with which their
+entries were written. Drain pending deliveries before changing the configured key.
 
 A restarted worker claims only matching custody under its original attempt and
 active source authority. The new process instance fences old delivery tokens.

@@ -39,7 +39,10 @@ pub fn classify_confirmation(
     confirmation: Confirmation,
 ) -> MqResult<PublishConfirmation> {
     match confirmation {
-        Confirmation::Ack(_) => Ok(PublishConfirmation::Acknowledged),
+        Confirmation::Ack(None) => Ok(PublishConfirmation::Acknowledged),
+        Confirmation::Ack(Some(_)) => Err(MqError::Publish(
+            "Broker returned the message because it could not be routed".into(),
+        )),
         Confirmation::Nack(_) => Err(MqError::Publish(
             "Broker negatively acknowledged publication".into(),
         )),
@@ -155,6 +158,7 @@ impl Publisher {
         envelope: &MessageEnvelope<T>,
         exchange: &str,
         routing_key: &str,
+        mandatory: bool,
     ) -> MqResult<()>
     where
         T: Clone + serde::Serialize + for<'de> serde::Deserialize<'de>,
@@ -180,7 +184,10 @@ impl Publisher {
             .basic_publish(
                 exchange.into(),
                 routing_key.into(),
-                BasicPublishOptions::default(),
+                BasicPublishOptions {
+                    mandatory,
+                    ..Default::default()
+                },
                 &payload,
                 properties,
             )
@@ -219,6 +226,26 @@ impl Publisher {
             .await
     }
 
+    /// Durable outbox delivery requires both routing and a broker confirmation.
+    /// An unroutable message stays pending even if RabbitMQ acknowledges it.
+    pub async fn publish_required_envelope<T>(&self, envelope: &MessageEnvelope<T>) -> MqResult<()>
+    where
+        T: Clone + serde::Serialize + for<'de> serde::Deserialize<'de>,
+    {
+        if !self.config.confirm_publish {
+            return Err(MqError::Publish(
+                "Required publication needs confirms".into(),
+            ));
+        }
+        self.publish_envelope_with_policy(
+            envelope,
+            &envelope.message_type.exchange(),
+            &envelope.message_type.routing_key(),
+            true,
+        )
+        .await
+    }
+
     /// Publish a message envelope with explicit exchange and routing key
     pub async fn publish_envelope_with_routing<T>(
         &self,
@@ -229,8 +256,22 @@ impl Publisher {
     where
         T: Clone + serde::Serialize + for<'de> serde::Deserialize<'de>,
     {
+        self.publish_envelope_with_policy(envelope, exchange, routing_key, false)
+            .await
+    }
+
+    async fn publish_envelope_with_policy<T>(
+        &self,
+        envelope: &MessageEnvelope<T>,
+        exchange: &str,
+        routing_key: &str,
+        mandatory: bool,
+    ) -> MqResult<()>
+    where
+        T: Clone + serde::Serialize + for<'de> serde::Deserialize<'de>,
+    {
         match self
-            .publish_envelope_once(envelope, exchange, routing_key)
+            .publish_envelope_once(envelope, exchange, routing_key, mandatory)
             .await
         {
             Ok(()) => Ok(()),
@@ -245,7 +286,7 @@ impl Publisher {
                 );
 
                 self.reset_channel().await?;
-                self.publish_envelope_once(envelope, exchange, routing_key)
+                self.publish_envelope_once(envelope, exchange, routing_key, mandatory)
                     .await
             }
         }

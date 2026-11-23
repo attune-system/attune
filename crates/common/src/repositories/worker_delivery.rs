@@ -194,6 +194,28 @@ impl WorkerDeliveryRepository {
         result: serde_json::Value,
         key: &str,
     ) -> Result<super::execution::ExecutionTransition> {
+        let effect = Self::require_result_context(tx, context).await?;
+        let terminal = Self::complete_classified_result(
+            tx,
+            context.execution,
+            context.worker,
+            status,
+            result,
+            key,
+        )
+        .await?;
+        effect.ensure_fresh_on(tx).await?;
+        Ok(terminal)
+    }
+
+    pub(super) async fn complete_classified_result(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        execution: i64,
+        worker: i64,
+        status: crate::models::ExecutionStatus,
+        result: serde_json::Value,
+        key: &str,
+    ) -> Result<super::execution::ExecutionTransition> {
         use super::{
             execution::ExecutionRepository,
             execution_key_read::ExecutionKeyReadRepository,
@@ -207,8 +229,6 @@ impl WorkerDeliveryRepository {
                 prepare_secret_values, ENTITY_EXECUTION_CONFIG, ENTITY_EXECUTION_RESULT,
             },
         };
-        let execution = context.execution;
-        let effect = Self::require_result_context(tx, context).await?;
         let binding = SchemaContractRepository::find(tx, BindingOwner::Execution, execution)
             .await?
             .ok_or_else(denied)?;
@@ -254,16 +274,14 @@ impl WorkerDeliveryRepository {
             &channels,
         )
         .await?;
-        let terminal = ExecutionRepository::transition_worker(
+        ExecutionRepository::transition_worker(
             &mut **tx,
             execution,
-            Some(context.worker),
+            Some(worker),
             status,
             Some(classified.public_result),
         )
-        .await?;
-        effect.ensure_fresh_on(tx).await?;
-        Ok(terminal)
+        .await
     }
 
     async fn require_active_context(
@@ -569,9 +587,14 @@ impl WorkerDeliveryRepository {
         {
             return Err(denied());
         }
+        let deadline = super::manager_log::ManagerLogRepository::retain_slot(
+            connection, version, worker, instance,
+        )
+        .await?
+        .map_or(context.deadline, |session| context.deadline.min(session));
         let effect = DeliveryEffectFence {
             context: context.id,
-            deadline: context.deadline,
+            deadline,
             approval,
         };
         effect.ensure_fresh_on(connection).await?;

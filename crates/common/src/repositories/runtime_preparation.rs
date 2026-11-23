@@ -93,7 +93,7 @@ impl RuntimePreparationRepository {
                 "The release exceeds the install-time preparation target limit",
             ));
         }
-        let builders = WorkerRepository::find_action_workers(&mut *connection).await?;
+        let builders = WorkerRepository::find_pack_workers(&mut *connection, false).await?;
         let mut jobs = Vec::with_capacity(snapshots.len());
         let pack_placement = WorkerPlacement {
             selector: pack.worker_selector_labels(),
@@ -208,11 +208,14 @@ impl RuntimePreparationRepository {
         Ok(())
     }
 
-    pub async fn dispatch_job(pool: &PgPool, install: Id) -> Result<Option<PreparationJob>> {
+    pub async fn dispatch_job<'e>(
+        connection: impl Executor<'e, Database = Postgres>,
+        install: Id,
+    ) -> Result<Option<PreparationJob>> {
         let job: Option<sqlx::types::Json<PreparationJob>> = sqlx::query_scalar(
             "SELECT a.job FROM pack_runtime_preparation_attempt a JOIN pack_install parent ON a.activation = parent.id
              WHERE a.install = $1 AND a.expires_at > clock_timestamp() AND parent.status = 'activating'",
-        ).bind(install).fetch_optional(pool).await?;
+        ).bind(install).fetch_optional(connection).await?;
         Ok(job.map(|job| job.0))
     }
 
@@ -223,21 +226,23 @@ impl RuntimePreparationRepository {
         incarnation: uuid::Uuid,
         scope: &PreparationScope,
     ) -> Result<Option<PreparationAttempt>> {
-        let Some(job) = Self::dispatch_job(pool, install).await? else {
+        let mut tx = pool.begin().await?;
+        let attempt = Self::begin_with(&mut tx, install, worker, incarnation, scope).await?;
+        tx.commit().await?;
+        Ok(attempt)
+    }
+
+    pub async fn begin_with(
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        install: Id,
+        worker: Id,
+        incarnation: uuid::Uuid,
+        scope: &PreparationScope,
+    ) -> Result<Option<PreparationAttempt>> {
+        let Some(job) = Self::dispatch_job(&mut **tx, install).await? else {
             return Ok(None);
         };
-        let mut tx = pool.begin().await?;
-        // Freeze placement and scope for the claim without depending on
-        // unrelated changes to the worker's advertised capabilities.
-        let exists: Option<Id> =
-            sqlx::query_scalar("SELECT id FROM worker WHERE id = $1 FOR SHARE")
-                .bind(worker)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if exists.is_none() {
-            return Ok(None);
-        }
-        let Some(builder) = WorkerRepository::find_by_id(&mut *tx, worker).await? else {
+        let Some(builder) = WorkerRepository::find_registration_for_share(tx, worker).await? else {
             return Ok(None);
         };
         if !job.can_build(&builder)
@@ -260,9 +265,8 @@ impl RuntimePreparationRepository {
         .bind(incarnation)
         .bind(PREPARATION_TRIGGER)
         .bind(sqlx::types::Json(scope))
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?;
-        tx.commit().await?;
         Ok(attempt)
     }
 
@@ -293,6 +297,20 @@ impl RuntimePreparationRepository {
         prepared: &InstalledPreparation,
     ) -> Result<bool> {
         let mut tx = pool.begin().await?;
+        let finished = Self::finish_with(&mut tx, install, worker, incarnation, prepared).await?;
+        if finished {
+            tx.commit().await?;
+        }
+        Ok(finished)
+    }
+
+    pub async fn finish_with(
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        install: Id,
+        worker: Id,
+        incarnation: uuid::Uuid,
+        prepared: &InstalledPreparation,
+    ) -> Result<bool> {
         let owner: Option<Id> = sqlx::query_scalar(
             "SELECT w.id FROM pack_runtime_preparation_attempt a
              JOIN pack_install parent ON parent.id = a.activation
@@ -304,13 +322,12 @@ impl RuntimePreparationRepository {
         .bind(install)
         .bind(worker)
         .bind(incarnation)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?;
         if owner.is_none() {
             return Ok(false);
         }
-        let Some(attempt) = PackInstallRepository::find_by_id_for_update(&mut tx, install).await?
-        else {
+        let Some(attempt) = PackInstallRepository::find_by_id_for_update(tx, install).await? else {
             return Ok(false);
         };
         if attempt.status != "running" || attempt.assigned_worker_id != Some(worker) {
@@ -322,7 +339,7 @@ impl RuntimePreparationRepository {
         )
         .bind(install)
         .bind(incarnation)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?;
         let Some(claim) = claim else {
             return Ok(false);
@@ -345,7 +362,7 @@ impl RuntimePreparationRepository {
         .bind(incarnation)
         .bind(sqlx::types::Json(prepared))
         .bind(sqlx::types::Json(&prepared.scope))
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?
         .rows_affected();
         if affected != 1 {
@@ -353,7 +370,7 @@ impl RuntimePreparationRepository {
         }
         if let Some(archive) = prepared.archive() {
             super::ObjectMaintenanceRepository::record_uploaded(
-                &mut *tx,
+                &mut **tx,
                 &archive.key,
                 &archive.version,
                 i64::try_from(archive.size)
@@ -366,9 +383,8 @@ impl RuntimePreparationRepository {
              updated_at = clock_timestamp() WHERE id = $1",
         )
         .bind(install)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-        tx.commit().await?;
         Ok(true)
     }
 
@@ -518,6 +534,15 @@ impl RuntimePreparationRepository {
         let Some(worker) = WorkerRepository::find_by_id(pool, worker).await? else {
             return Ok(None);
         };
+        Self::find_download_with(pool, &worker, release, directory).await
+    }
+
+    pub async fn find_download_with<'e>(
+        connection: impl Executor<'e, Database = Postgres>,
+        worker: &Worker,
+        release: Id,
+        directory: uuid::Uuid,
+    ) -> Result<Option<InstalledPreparation>> {
         let ready: Option<sqlx::types::Json<InstalledPreparation>> = sqlx::query_scalar(
             "SELECT p.prepared FROM pack_release_runtime_preparation p
              JOIN pack_release r ON r.id = p.release
@@ -527,10 +552,10 @@ impl RuntimePreparationRepository {
         )
         .bind(release)
         .bind(directory.to_string())
-        .fetch_optional(pool)
+        .fetch_optional(connection)
         .await?;
         Ok(ready.map(|ready| ready.0).filter(|ready| {
-            ready.archive().is_some() && can_consume(&worker, std::slice::from_ref(ready))
+            ready.archive().is_some() && can_consume(worker, std::slice::from_ref(ready))
         }))
     }
 }

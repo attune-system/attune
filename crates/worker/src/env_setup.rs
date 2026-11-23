@@ -477,13 +477,29 @@ pub async fn prepare_python_candidate_test_runtime(
     let runtime = RuntimeRepository::find_by_ref(db_pool, "core.python")
         .await?
         .ok_or_else(|| attune_common::error::Error::not_found("runtime", "ref", "core.python"))?;
+    let attempt_root = runtime_envs_dir
+        .join(".pack-test-attempts")
+        .join(attempt_id.to_string());
+    prepare_python_for_pack_test(
+        &runtime,
+        pack_dir,
+        runtime_envs_dir,
+        &attempt_root,
+        child_environment,
+    )
+    .await
+}
+
+pub(crate) async fn prepare_python_for_pack_test(
+    runtime: &Runtime,
+    pack_dir: &Path,
+    runtime_envs_dir: &Path,
+    attempt_root: &Path,
+    child_environment: &ChildProcessEnvironment,
+) -> attune_common::error::Result<PathBuf> {
     let runtime_name = normalize_runtime_name(&runtime.name);
     let exec_config = runtime.parsed_execution_config();
-    let env_dir = runtime_envs_dir
-        .join(".pack-test-attempts")
-        .join(attempt_id.to_string())
-        .join("envs")
-        .join(&runtime_name);
+    let env_dir = attempt_root.join("envs").join(&runtime_name);
     let process_runtime = ProcessRuntime::new(
         runtime_name,
         exec_config.clone(),

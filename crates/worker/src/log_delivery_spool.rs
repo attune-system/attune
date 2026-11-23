@@ -112,6 +112,42 @@ fn sync_directory(path: &Path) -> Result<()> {
         .map_err(io)
 }
 
+/// Read one installer-provisioned, worker-scoped key. Bound the read and keep
+/// key bytes and filesystem errors out of startup diagnostics.
+#[cfg(unix)]
+pub async fn load_spool_key(path: &Path) -> Result<String> {
+    use tokio::io::AsyncReadExt;
+
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .await
+        .map_err(|_| Error::configuration("Cannot open the worker spool key file"))?;
+    if !file
+        .metadata()
+        .await
+        .map_err(|_| Error::configuration("Cannot inspect the worker spool key file"))?
+        .is_file()
+    {
+        return Err(Error::configuration(
+            "The worker spool key must be a regular file",
+        ));
+    }
+    let mut contents = String::new();
+    file.take(66)
+        .read_to_string(&mut contents)
+        .await
+        .map_err(|_| Error::configuration("Cannot read the worker spool key file"))?;
+    let key = contents.strip_suffix('\n').unwrap_or(&contents);
+    if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::configuration(
+            "The worker spool key must contain 64 hexadecimal characters",
+        ));
+    }
+    Ok(key.to_owned())
+}
+
 impl LogDeliverySpool {
     /// Open one worker's private persistent root. The caller supplies a directory
     /// dedicated to this spool, never a pack-controlled or shared scratch root.
@@ -394,6 +430,28 @@ mod tests {
         LogDeliverySpool::open(root.to_owned(), 4, KEY, 8192, 4096, 1024)
             .await
             .unwrap()
+    }
+    #[tokio::test]
+    async fn dedicated_key_file_preserves_custody_across_restarts() {
+        let root = tempfile::tempdir().unwrap();
+        let key_path = root.path().join("key");
+        let spool_root = root.path().join("custody");
+        let key = "12".repeat(32);
+        fs::write(&key_path, format!("{key}\n")).unwrap();
+        let loaded = load_spool_key(&key_path).await.unwrap();
+        let spool = LogDeliverySpool::open(spool_root.clone(), 4, &loaded, 8192, 4096, 1024)
+            .await
+            .unwrap();
+        let entry = delivery(2);
+        spool.save(entry.clone()).await.unwrap();
+        drop(spool);
+        let loaded = load_spool_key(&key_path).await.unwrap();
+        let reopened = LogDeliverySpool::open(spool_root, 4, &loaded, 8192, 4096, 1024)
+            .await
+            .unwrap();
+        assert!(reopened.load(2).await.unwrap() == entry);
+        fs::write(&key_path, "f".repeat(66)).unwrap();
+        assert!(load_spool_key(&key_path).await.is_err());
     }
     #[tokio::test]
     async fn encrypted_entry_survives_reopen_and_requires_exact_custody_for_removal() {

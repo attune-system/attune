@@ -13,9 +13,7 @@ use attune_common::{
     models::{enums::ExecutionStatus, Execution, Worker, WorkerStatus},
     mq::{ExecutionCompletedPayload, MessageEnvelope, MessageType, Publisher},
     repositories::{
-        execution::{UpdateExecutionInput, SELECT_COLUMNS as EXECUTION_COLUMNS},
-        runtime::WorkerRepository,
-        ExecutionRepository, FindById,
+        execution::UpdateExecutionInput, runtime::WorkerRepository, ExecutionRepository, FindById,
     },
     system_alert::{emit_core_alert, SystemAlert},
 };
@@ -108,16 +106,13 @@ impl ExecutionTimeoutMonitor {
         );
 
         // Find executions stuck in SCHEDULED status
-        let sql = format!(
-            "SELECT {EXECUTION_COLUMNS} FROM execution \
-             WHERE status = $1 AND updated < $2 \
-             ORDER BY updated ASC LIMIT 100"
-        );
-        let stale_executions = sqlx::query_as::<_, Execution>(&sql)
-            .bind(ExecutionStatus::Scheduled)
-            .bind(cutoff)
-            .fetch_all(&self.pool)
-            .await?;
+        let stale_executions = ExecutionRepository::find_legacy_reconciliation_candidates(
+            &self.pool,
+            ExecutionStatus::Scheduled,
+            cutoff,
+            Some(100),
+        )
+        .await?;
 
         if stale_executions.is_empty() {
             debug!("No stale scheduled executions found");
@@ -180,11 +175,11 @@ impl ExecutionTimeoutMonitor {
             "original_status": "scheduled"
         });
 
-        let updated = ExecutionRepository::update_if_status_and_updated_before(
+        let updated = ExecutionRepository::reconcile_legacy_execution(
             &self.pool,
             execution_id,
             ExecutionStatus::Scheduled,
-            self.calculate_cutoff_time(),
+            execution.updated,
             UpdateExecutionInput {
                 status: Some(ExecutionStatus::Failed),
                 result: Some(result.clone()),
@@ -241,8 +236,13 @@ impl ExecutionTimeoutMonitor {
     }
 
     async fn reconcile_running_executions_on_dead_workers(&self) -> Result<()> {
-        let running_executions =
-            ExecutionRepository::find_by_status(&self.pool, ExecutionStatus::Running).await?;
+        let running_executions = ExecutionRepository::find_legacy_reconciliation_candidates(
+            &self.pool,
+            ExecutionStatus::Running,
+            Utc::now(),
+            None,
+        )
+        .await?;
 
         for execution in running_executions
             .into_iter()
@@ -316,10 +316,11 @@ impl ExecutionTimeoutMonitor {
             "reconciled_at": now,
         });
 
-        let updated = ExecutionRepository::update_if_status(
+        let updated = ExecutionRepository::reconcile_legacy_execution(
             &self.pool,
             execution.id,
             ExecutionStatus::Running,
+            execution.updated,
             UpdateExecutionInput {
                 status: Some(ExecutionStatus::Abandoned),
                 result: Some(result.clone()),

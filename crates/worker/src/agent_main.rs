@@ -63,6 +63,14 @@ struct Args {
     /// Run runtime detection, print results, and exit without starting the worker
     #[arg(long)]
     detect_only: bool,
+
+    /// Run pack tests and runtime preparation using only the manager API.
+    #[arg(long, conflicts_with_all = ["config", "detect_only"])]
+    api_pack_jobs: bool,
+
+    /// Run actions, pack tests, and runtime preparation over the manager API.
+    #[arg(long, conflicts_with_all = ["config", "api_pack_jobs", "detect_only"])]
+    api_manager: bool,
 }
 
 fn main() -> Result<()> {
@@ -71,6 +79,11 @@ fn main() -> Result<()> {
     attune_common::auth::install_crypto_provider();
 
     let args = Args::parse();
+    if args.api_pack_jobs || args.api_manager {
+        return tokio::runtime::Runtime::new()?.block_on(
+            attune_worker::manager_pack_worker::run_from_environment(args.name, args.api_manager),
+        );
+    }
 
     // Safe: no async runtime or worker threads are running yet.
     std::env::set_var("ATTUNE_AGENT_MODE", "true");

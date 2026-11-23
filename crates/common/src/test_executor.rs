@@ -110,6 +110,18 @@ impl TestConfig {
     }
 
     pub fn accepts_result(&self, result: &PackTestResult) -> bool {
+        Self::accepts_result_with_policy(
+            result,
+            self.min_pass_rate,
+            matches!(self.on_failure.as_deref(), Some("warn" | "ignore")),
+        )
+    }
+
+    pub fn accepts_result_with_policy(
+        result: &PackTestResult,
+        min_pass_rate: Option<f64>,
+        allows_failure: bool,
+    ) -> bool {
         let has_execution_error = result.test_suites.iter().any(|suite| {
             suite
                 .test_cases
@@ -118,8 +130,8 @@ impl TestConfig {
         });
         let meets_pass_rate = result.total_tests > 0
             && !has_execution_error
-            && result.pass_rate >= self.min_pass_rate.unwrap_or(1.0);
-        meets_pass_rate || matches!(self.on_failure.as_deref(), Some("warn" | "ignore"))
+            && result.pass_rate >= min_pass_rate.unwrap_or(1.0);
+        meets_pass_rate || allows_failure
     }
 }
 

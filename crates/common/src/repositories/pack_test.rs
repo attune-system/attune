@@ -25,6 +25,16 @@ impl PackTestRepository {
         trigger_reason: &str,
         result: &PackTestResult,
     ) -> Result<PackTestExecution> {
+        Self::create_with(&self.pool, pack_id, pack_version, trigger_reason, result).await
+    }
+
+    pub async fn create_with<'e>(
+        connection: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+        pack_id: Id,
+        pack_version: &str,
+        trigger_reason: &str,
+        result: &PackTestResult,
+    ) -> Result<PackTestExecution> {
         let result_json = serde_json::to_value(result)?;
 
         let record = sqlx::query_as::<_, PackTestExecution>(
@@ -34,7 +44,8 @@ impl PackTestRepository {
                 total_tests, passed, failed, skipped, pass_rate, duration_ms, result
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            RETURNING *
+            RETURNING id, pack_id, pack_version, execution_time, trigger_reason, total_tests,
+                      passed, failed, skipped, pass_rate, duration_ms, result, created
             "#,
         )
         .bind(pack_id)
@@ -48,7 +59,7 @@ impl PackTestRepository {
         .bind(result.pass_rate)
         .bind(result.duration_ms)
         .bind(result_json)
-        .fetch_one(&self.pool)
+        .fetch_one(connection)
         .await?;
 
         Ok(record)

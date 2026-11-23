@@ -20,6 +20,14 @@ struct Args {
     /// Worker name (overrides config)
     #[arg(short, long)]
     name: Option<String>,
+
+    /// Run pack tests and runtime preparation using only the manager API.
+    #[arg(long, conflicts_with = "config")]
+    api_pack_jobs: bool,
+
+    /// Run actions, pack tests, and runtime preparation over the manager API.
+    #[arg(long, conflicts_with_all = ["config", "api_pack_jobs"])]
+    api_manager: bool,
 }
 
 fn main() -> Result<()> {
@@ -33,6 +41,13 @@ async fn run() -> Result<()> {
     attune_common::auth::install_crypto_provider();
 
     let args = Args::parse();
+    if args.api_pack_jobs || args.api_manager {
+        return attune_worker::manager_pack_worker::run_from_environment(
+            args.name,
+            args.api_manager,
+        )
+        .await;
+    }
 
     // Load configuration
     if let Some(ref config_path) = args.config {

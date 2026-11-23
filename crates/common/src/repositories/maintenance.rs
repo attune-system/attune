@@ -595,7 +595,10 @@ impl MaintenanceRepository {
              FROM execution e
              LEFT JOIN worker w ON w.id = e.worker
              LEFT JOIN execution_reschedule_state rs ON rs.execution_id = e.id
-             WHERE (
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM manager_execution_assignment a
+                 WHERE a.execution = e.id AND a.closed_at IS NULL
+             ) AND ((
                    e.status IN ('scheduling', 'scheduled', 'canceling')
                    AND e.updated < $1
                  )
@@ -617,7 +620,7 @@ impl MaintenanceRepository {
                         OR w.last_heartbeat IS NULL
                         OR w.last_heartbeat < $1
                     )
-                )
+                ))
              ORDER BY e.updated ASC, e.id ASC
              LIMIT $2",
         )

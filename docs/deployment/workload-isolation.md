@@ -74,16 +74,17 @@ ATTUNE_TEST_RUN_ID=bwrap-recipe cargo test -p attune-common --test runtime_lifec
 ## Mantis findings s-2 and s-23
 
 The process and filesystem boundary limits a pack workload's access to
-manager credentials, sibling processes and published files. Workers and sensor
-managers still hold their control-plane credentials. Moving those credentials
-out of the managers requires a separately designed, attempt-scoped control
-protocol that preserves recorded authority, secret origins and log custody.
-Control-plane network policy can restrict direct database reachability after
-workers and sensor managers switch to that protocol.
+manager credentials, sibling processes and published files. The action and
+sensor `--api-manager` modes connect to the Attune API with credentials
+scoped to their role, pool and process slot. The action pool handles tests and
+preparation using the same boundary. Use the
+[API-only manager rollout](api-only-managers.md#first-party-chart-and-installer-cutover)
+to validate attempt and generation authority, secret origins, and log custody
+before cutting off direct control-plane access.
 
 For eligible recipes, install-time preparation publishes a release-pinned
 generation before activation. The worker or sensor manager opens it read-only
 with private scratch for each invocation. See the
 [install-time preparation requirements](runtime-toolchains.md#install-time-preparation)
 for storage placement and toolchain compatibility. Findings s-2 and s-23 remain
-open pending the remaining remediation and target-pool validation.
+open until the separate chart and installer cutover passes validation on target pools.

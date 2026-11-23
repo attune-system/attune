@@ -1269,6 +1269,10 @@ impl SensorSchemaRepository {
                 "Sensor input generation binding mismatch",
             ));
         }
+        super::manager_sensor::ManagerSensorRepository::retain_owner(
+            connection, workload, generation,
+        )
+        .await?;
         super::managed_sensor_metadata::ManagedSensorMetadataRepository::validate_generation(
             connection, workload, generation,
         )
