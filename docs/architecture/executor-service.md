@@ -391,7 +391,8 @@ cargo run
 
 ### Graceful Shutdown
 
-On SIGTERM or SIGINT, the executor stops admitting completions, withdraws
+SIGTERM and SIGINT also cancel startup, including a broker reconnect.
+On shutdown, the executor stops admitting completions, withdraws
 recorded readiness, and gives active completion handlers up to ten seconds with
 the broker and database available. It then stops the remaining processors,
 gives the workflow log dispatcher up to ten seconds, and closes the broker and

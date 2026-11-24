@@ -34,6 +34,12 @@ pub const MANAGER_COMPLETION_WAKEUP: &str = "manager_completion_available";
 pub const MANAGER_COMPLETION_SOURCE: &str = "manager-assignment";
 
 #[derive(Clone, Copy)]
+pub enum CompletionPublishKind {
+    Initial,
+    Replay,
+}
+
+#[derive(Clone, Copy)]
 pub struct ManagerAssignmentScope {
     pub session: Id,
     pub instance: Uuid,
@@ -903,17 +909,25 @@ impl ManagerAssignmentRepository {
     pub async fn claim_completion(
         pool: &PgPool,
         claim: Uuid,
+        kind: CompletionPublishKind,
     ) -> Result<Option<ManagerExecutionCompletion>> {
+        // An unresolved claim may already have reached the broker. Treat its
+        // next attempt like a confirmed publication awaiting a receipt.
+        let eligibility = match kind {
+            CompletionPublishKind::Initial => "published_at IS NULL AND claim IS NULL",
+            CompletionPublishKind::Replay => "(published_at IS NOT NULL OR claim IS NOT NULL)",
+        };
         Ok(sqlx::query_as(
-            "WITH next AS (
+            &format!("WITH next AS (
                  SELECT assignment FROM manager_execution_completion
-                 WHERE processed_at IS NULL AND available_at <= clock_timestamp()
+                 WHERE processed_at IS NULL AND available_at <= statement_timestamp()
+                 AND {eligibility}
                  ORDER BY available_at, assignment LIMIT 1 FOR UPDATE SKIP LOCKED
              )
              UPDATE manager_execution_completion o
              SET claim = $1, available_at = clock_timestamp() + make_interval(secs => $2::integer)
              FROM next WHERE o.assignment = next.assignment
-             RETURNING o.assignment, o.message_id, o.execution, o.action, o.action_ref, o.status, o.completed_at",
+             RETURNING o.assignment, o.message_id, o.execution, o.action, o.action_ref, o.status, o.completed_at"),
         )
         .bind(claim)
         .bind(PUBLISH_LEASE_SECONDS)

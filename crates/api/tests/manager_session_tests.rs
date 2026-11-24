@@ -240,8 +240,8 @@ mod work {
             executable_snapshot::ExecutableSnapshotRepository,
             execution::{CreateExecutionInput, ExecutionRepository, UpdateExecutionInput},
             manager_assignment::{
-                ManagerAssignmentRecovery, ManagerAssignmentRepository as Assignments,
-                ManagerCompletionReceipt,
+                CompletionPublishKind, ManagerAssignmentRecovery,
+                ManagerAssignmentRepository as Assignments, ManagerCompletionReceipt,
             },
             pack_release::{CreatePackReleaseInput, PackReleaseRepository},
             runtime::{CreateWorkerInput, WorkerRepository},
@@ -675,6 +675,135 @@ mod work {
         }
     }
 
+    async fn exercise_replay_budget(
+        pool: &PgPool,
+        config: &Config,
+        publisher: &Arc<Publisher>,
+        queue: &str,
+        example_assignment: Id,
+    ) -> Result<()> {
+        use std::time::Duration;
+        use tokio::time::{self, Instant};
+
+        // Model a broker with a bound queue but no consumers. Seed durable
+        // rows as if their confirmed deliveries had expired without receipts.
+        let replay_ids: Vec<Id> = sqlx::query_scalar(
+            "WITH assignments AS (
+                 INSERT INTO manager_execution_assignment
+                   (execution,worker,manager_session,instance,scheduled_at,pack_release,
+                    pack_release_digest,deadline,closed_at)
+                 SELECT execution,worker,manager_session,instance,scheduled_at,pack_release,
+                        pack_release_digest,deadline,closed_at
+                 FROM manager_execution_assignment CROSS JOIN generate_series(1,33)
+                 WHERE id=$1 RETURNING id
+             )
+             INSERT INTO manager_execution_completion
+               (assignment,message_id,execution,action,action_ref,status,completed_at,
+                published_at,available_at)
+             SELECT a.id,gen_random_uuid(),o.execution,o.action,o.action_ref,o.status,
+                    o.completed_at,clock_timestamp()-interval '1 hour',
+                    clock_timestamp()-interval '1 hour'
+             FROM assignments a CROSS JOIN manager_execution_completion o
+             WHERE o.assignment=$1 RETURNING assignment",
+        )
+        .bind(example_assignment)
+        .fetch_all(pool)
+        .await?;
+
+        let state = Arc::new(AppState::new(pool.clone(), config.clone()));
+        state.set_publisher(publisher.clone()).await;
+        let mut listener = attune_api::postgres_listener::spawn_postgres_listener(
+            pool.clone(),
+            state.broadcast_tx.clone(),
+            state.log_stream_wakeups.clone(),
+            state.manager_work_wakeups.clone(),
+            state.manager_completion_wakeup.clone(),
+        );
+        let stop = CancellationToken::new();
+        let mut task = None;
+        let result = time::timeout(Duration::from_secs(20), async {
+            time::timeout(Duration::from_secs(5), listener.wait_until_ready()).await??;
+            task = Some(tokio::spawn(
+                attune_api::manager_completion_publication::run(
+                    state,
+                    stop.clone(),
+                    time::interval_at(Instant::now(), Duration::from_secs(60)),
+                ),
+            ));
+            let channel = publisher.channel().await;
+            let mut deliveries = channel
+                .basic_consume(
+                    queue.into(),
+                    "replay-budget".into(),
+                    Default::default(),
+                    Default::default(),
+                )
+                .await?;
+            use futures::StreamExt;
+            for _ in 0..32 {
+                let delivery = deliveries
+                    .next()
+                    .await
+                    .ok_or_else(|| anyhow::anyhow!("Missing replay"))??;
+                delivery.acker.ack(Default::default()).await?;
+            }
+            // Commit a fresh completion hint before the next replay tick.
+            let fresh = Uuid::new_v4();
+            let mut tx = pool.begin().await?;
+            let fresh_assignment: Id = sqlx::query_scalar(
+                "WITH assignment AS (
+                     INSERT INTO manager_execution_assignment
+                       (execution,worker,manager_session,instance,scheduled_at,pack_release,
+                        pack_release_digest,deadline,closed_at)
+                     SELECT execution,worker,manager_session,instance,scheduled_at,pack_release,
+                            pack_release_digest,deadline,closed_at
+                     FROM manager_execution_assignment WHERE id=$1 RETURNING id
+                 )
+                 INSERT INTO manager_execution_completion
+                   (assignment,message_id,execution,action,action_ref,status,completed_at)
+                 SELECT a.id,$2,o.execution,o.action,o.action_ref,o.status,o.completed_at
+                 FROM assignment a CROSS JOIN manager_execution_completion o
+                 WHERE o.assignment=$1 RETURNING assignment",
+            )
+            .bind(example_assignment)
+            .bind(fresh)
+            .fetch_one(&mut *tx)
+            .await?;
+            sqlx::query("SELECT pg_notify($1, '')")
+                .bind(attune_common::repositories::manager_assignment::MANAGER_COMPLETION_WAKEUP)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            let delivery = deliveries
+                .next()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("Missing first publication"))??;
+            let message = MessageEnvelope::<ExecutionCompletedPayload>::from_bytes(&delivery.data)?;
+            anyhow::ensure!(
+                message.message_id == fresh,
+                "Replay exceeded its budget or delayed a new completion"
+            );
+            delivery.acker.ack(Default::default()).await?;
+            channel
+                .basic_cancel("replay-budget".into(), Default::default())
+                .await?;
+            let mut fixture_ids = replay_ids;
+            fixture_ids.push(fresh_assignment);
+            sqlx::query("DELETE FROM manager_execution_assignment WHERE id=ANY($1)")
+                .bind(fixture_ids)
+                .execute(pool)
+                .await?;
+            Ok(())
+        })
+        .await;
+        stop.cancel();
+        if let Some(task) = task {
+            time::timeout(Duration::from_secs(5), task).await??;
+        }
+        listener.shutdown().await;
+        result?
+    }
+
     #[tokio::test]
     #[ignore = "requires an exclusively owned disposable RabbitMQ vhost"]
     async fn completion_survives_broker_return_and_reuses_one_event_id() -> Result<()> {
@@ -760,20 +889,24 @@ mod work {
         let broker = Connection::connect(&broker_url).await?;
         let mq = attune_common::mq::MessageQueueConfig::default();
         broker.setup_common_infrastructure(&mq).await?;
-        let publisher = Publisher::new(
-            &broker,
-            PublisherConfig {
-                confirm_publish: true,
-                timeout_secs: 5,
-                exchange: mq.rabbitmq.exchanges.executions.name.clone(),
-            },
-        )
-        .await?;
-        assert!(publish_one(pool, &publisher)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("could not be routed"));
+        let publisher = Arc::new(
+            Publisher::new(
+                &broker,
+                PublisherConfig {
+                    confirm_publish: true,
+                    timeout_secs: 5,
+                    exchange: mq.rabbitmq.exchanges.executions.name.clone(),
+                },
+            )
+            .await?,
+        );
+        assert!(
+            publish_one(pool, &publisher, CompletionPublishKind::Initial)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("could not be routed")
+        );
         let pending: bool = sqlx::query_scalar(
             "SELECT published_at IS NULL FROM manager_execution_completion WHERE assignment = $1",
         )
@@ -784,7 +917,7 @@ mod work {
         sqlx::query("UPDATE manager_execution_completion SET available_at = clock_timestamp() WHERE assignment = $1")
             .bind(assignment).execute(pool).await?;
         broker.setup_executor_infrastructure(&mq).await?;
-        assert!(publish_one(pool, &publisher).await?);
+        assert!(publish_one(pool, &publisher, CompletionPublishKind::Replay).await?);
 
         let channel = publisher.channel().await;
         let queue = &mq.rabbitmq.queues.execution_completed.name;
@@ -810,9 +943,9 @@ mod work {
         first.delivery.acker.ack(Default::default()).await?;
 
         // Simulate durable state after a publisher disappeared before recording its broker ack.
-        sqlx::query("UPDATE manager_execution_completion SET published_at = NULL, available_at = clock_timestamp() WHERE assignment = $1")
+        sqlx::query("UPDATE manager_execution_completion SET published_at = NULL, claim = gen_random_uuid(), available_at = clock_timestamp() WHERE assignment = $1")
             .bind(assignment).execute(pool).await?;
-        assert!(publish_one(pool, &publisher).await?);
+        assert!(publish_one(pool, &publisher, CompletionPublishKind::Replay).await?);
         let second = channel
             .basic_get(queue.as_str().into(), Default::default())
             .await?
@@ -833,7 +966,9 @@ mod work {
             ManagerCompletionReceipt::AlreadyProcessed
         ));
         second.delivery.acker.ack(Default::default()).await?;
-        assert!(!publish_one(pool, &publisher).await?);
+        assert!(!publish_one(pool, &publisher, CompletionPublishKind::Replay).await?);
+
+        exercise_replay_budget(pool, &config, &publisher, queue, assignment).await?;
 
         // Exercise the normal executor consumer, placement, and completion paths.
         config.database.url = db.database_url().into();
@@ -842,7 +977,6 @@ mod work {
         config.packs_base_dir = scratch.path().join("packs").display().to_string();
         config.runtime_envs_dir = scratch.path().join("runtimes").display().to_string();
         let key = config.security.encryption_key.clone().unwrap();
-        let publisher = std::sync::Arc::new(publisher);
         let executor = attune_executor::service::ExecutorService::new(config.clone()).await?;
         let executor_task = tokio::spawn({
             let executor = executor.clone();

@@ -89,6 +89,34 @@ impl CompletionListener {
         })
     }
 
+    fn retryable_manager_error(error: &anyhow::Error) -> Option<MqError> {
+        if let Some(error) = Self::retryable_mq_error(error) {
+            return Some(error);
+        }
+        let database_error = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<sqlx::Error>())?;
+        let transient = match database_error {
+            sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut | sqlx::Error::WorkerCrashed => true,
+            sqlx::Error::Database(error) => error.code().is_some_and(|code| {
+                code.starts_with("08")
+                    || matches!(
+                        code.as_ref(),
+                        "40001"
+                            | "40P01"
+                            | "55P03"
+                            | "57014"
+                            | "57P01"
+                            | "57P02"
+                            | "57P03"
+                            | "53300"
+                    )
+            }),
+            _ => false,
+        };
+        transient.then(|| MqError::Pool(database_error.to_string()))
+    }
+
     /// Create a new completion listener
     #[allow(clippy::too_many_arguments)] // Explicit service dependencies keep listener ownership clear.
     pub(crate) fn new(
@@ -140,6 +168,7 @@ impl CompletionListener {
                 .min(requested_parallelism.get()),
         )
         .unwrap_or(NonZeroUsize::MIN);
+        let keyed = parallelism > NonZeroUsize::MIN;
         info!(
             completion_concurrency = parallelism.get(),
             "Starting completion listener"
@@ -178,10 +207,11 @@ impl CompletionListener {
                     .await
                     {
                         Ok(ManagerCompletionReceipt::Process(receipt)) => Some(receipt),
-                        Ok(
-                            ManagerCompletionReceipt::AlreadyProcessed
-                            | ManagerCompletionReceipt::Busy,
-                        ) => return Ok(()),
+                        Ok(ManagerCompletionReceipt::AlreadyProcessed) => return Ok(()),
+                        Ok(ManagerCompletionReceipt::Busy) if keyed => {
+                            return Err(MqError::Pool("Manager completion receipt is busy".into()));
+                        }
+                        Ok(ManagerCompletionReceipt::Busy) => return Ok(()),
                         Err(attune_common::Error::PermissionDenied(_)) => {
                             return Err(MqError::InvalidMessage(
                                 "Manager completion does not match its outbox event".into(),
@@ -212,6 +242,11 @@ impl CompletionListener {
                         .await
                         .map_err(|error| MqError::Pool(error.to_string()))?;
                     if let Err(error) = result {
+                        if keyed {
+                            if let Some(error) = Self::retryable_manager_error(&error) {
+                                return Err(error);
+                            }
+                        }
                         // The API retries the durable event until the executor
                         // records its receipt. Avoid hot broker requeue here.
                         warn!(%error, "Manager completion deferred");
@@ -230,7 +265,7 @@ impl CompletionListener {
             }
         };
 
-        if parallelism == NonZeroUsize::MIN {
+        if !keyed {
             self.consumer.consume_with_handler(handle).await?;
         } else {
             let pool = self.pool.clone();

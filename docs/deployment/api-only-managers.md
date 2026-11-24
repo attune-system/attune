@@ -121,7 +121,10 @@ ATTUNE_TEST_RUN_ID=manager-outbox cargo test -p attune-api \
 
 The test also starts the executor service, places an admitted execution through
 the ordinary request queue, and waits for the executor to record its completion
-receipt.
+receipt. Committed outbox rows wake the publisher through PostgreSQL. The
+one-second reconciliation scan recovers missed notifications and allows up to
+32 replays per API process per tick. An expired claim may already have reached
+the broker, so its next attempt uses the replay budget too.
 
 ## Launch and handover prototype results
 

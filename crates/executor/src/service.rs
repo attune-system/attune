@@ -8,7 +8,7 @@
 //! - Orchestrates workflows (parent-child executions)
 //! - Handles human-in-the-loop inquiries
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use attune_common::{
     artifact_transport::{ApiTransport, ArtifactFileTransport},
     auth::{jwt::JwtConfig, WorkerTokenProvider},
@@ -48,6 +48,14 @@ use attune_common::{
 
 const COMPLETION_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const WORKFLOW_LOG_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const RESOURCE_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+struct PreparedProcessors {
+    subscriptions: Option<Vec<SubscriptionObservation>>,
+    completion_consumer: Arc<Consumer>,
+    completion_listener: CompletionListener,
+    workflow_log_dispatcher: WorkflowLogDispatcher,
+}
 
 /// Main executor service that orchestrates execution processing
 #[derive(Clone)]
@@ -276,14 +284,12 @@ impl ExecutorService {
         format!("{}.{}", self.inner.consumer_tag_prefix, name)
     }
 
-    /// Start the executor service
-    pub async fn start(&self) -> Result<()> {
-        info!("Starting Executor Service");
-        let recorded_identity = RecordedConsumerIdentity::from_environment()?.map(Arc::new);
+    async fn prepare_processors(
+        &self,
+        recorded_identity: Option<Arc<RecordedConsumerIdentity>>,
+        tasks: &mut JoinSet<Result<()>>,
+    ) -> Result<PreparedProcessors> {
         let mut recorded_subscriptions = recorded_identity.as_ref().map(|_| Vec::new());
-
-        // Spawn message consumers
-        let mut tasks = JoinSet::<Result<()>>::new();
         let api_url = std::env::var("ATTUNE_API_URL").unwrap_or_else(|_| {
             format!(
                 "http://{}:{}",
@@ -373,14 +379,6 @@ impl ExecutorService {
             self.inner.config.artifacts.flush_interval_ms,
         )
         .with_workflow_log_transport(workflow_log_transport.clone());
-        let completion_concurrency = self
-            .inner
-            .config
-            .executor
-            .as_ref()
-            .and_then(|config| config.completion_concurrency)
-            .unwrap_or(NonZeroUsize::MIN);
-
         // Start enforcement processor with its own consumer
         info!("Starting enforcement processor...");
         let enforcements_queue = self
@@ -654,6 +652,53 @@ impl ExecutorService {
             self.inner.config.artifacts.flush_interval_ms,
         )
         .with_recorded_transport(workflow_log_api, jwt_config);
+        Ok(PreparedProcessors {
+            subscriptions: recorded_subscriptions,
+            completion_consumer,
+            completion_listener,
+            workflow_log_dispatcher,
+        })
+    }
+
+    /// Start the executor service
+    pub async fn start(&self) -> Result<()> {
+        info!("Starting Executor Service");
+        let recorded_identity = RecordedConsumerIdentity::from_environment()?.map(Arc::new);
+        let mut tasks = JoinSet::new();
+        let mut shutdown = self.inner.shutdown_requested.subscribe();
+        let prepared = tokio::select! {
+            biased;
+            _ = shutdown.wait_for(|requested| *requested) => Ok(None),
+            result = self.prepare_processors(recorded_identity.clone(), &mut tasks) => result.map(Some),
+        };
+        let PreparedProcessors {
+            subscriptions: recorded_subscriptions,
+            completion_consumer,
+            completion_listener,
+            workflow_log_dispatcher,
+        } = match prepared {
+            Ok(Some(prepared)) => prepared,
+            result => {
+                tasks.shutdown().await;
+                let cleanup = self.close_resources().await;
+                if let Err(error) = result {
+                    if let Err(cleanup_error) = cleanup {
+                        warn!(%cleanup_error, "Failed to close executor resources after startup error");
+                    }
+                    return Err(error);
+                }
+                return cleanup;
+            }
+        };
+
+        let completion_concurrency = self
+            .inner
+            .config
+            .executor
+            .as_ref()
+            .and_then(|config| config.completion_concurrency)
+            .unwrap_or(NonZeroUsize::MIN);
+
         let (workflow_log_stop, workflow_log_shutdown) = tokio::sync::broadcast::channel(1);
         let mut workflow_log_handle =
             tokio::spawn(async move { workflow_log_dispatcher.start(workflow_log_shutdown).await });
@@ -668,7 +713,6 @@ impl ExecutorService {
         info!("All processors are listening for messages...");
 
         // Wait for shutdown signal
-        let mut shutdown = self.inner.shutdown_requested.subscribe();
         let mut observations = Box::pin(self.observe_recorded_executor(
             recorded_identity.as_deref(),
             recorded_subscriptions.as_deref().unwrap_or_default(),
@@ -757,14 +801,21 @@ impl ExecutorService {
                 }
             }
         }
-        let broker_closed = self.inner.mq_connection.close().await;
-        self.inner.pool.close().await;
+        let cleanup = self.close_resources().await;
 
         if let Some(error) = service_failure {
             return Err(error);
         }
-        broker_closed?;
-        Ok(())
+        cleanup
+    }
+
+    async fn close_resources(&self) -> Result<()> {
+        let (broker, ()) = tokio::time::timeout(RESOURCE_SHUTDOWN_TIMEOUT, async {
+            tokio::join!(self.inner.mq_connection.close(), self.inner.pool.close())
+        })
+        .await
+        .context("Executor resource shutdown timed out")?;
+        broker.map_err(Into::into)
     }
 
     fn observe_subscription(
@@ -1074,7 +1125,6 @@ impl ExecutorService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Context;
     use attune_common::test_database::TestDatabase;
     use lapin::options::{ExchangeDeleteOptions, QueueDeleteOptions};
     use std::{collections::HashSet, time::Duration};
@@ -1082,6 +1132,8 @@ mod tests {
     use uuid::Uuid;
 
     const TEST_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
+
+    include!("service/completion_tests.rs");
 
     struct TestMqTopology {
         config: MessageQueueConfig,
