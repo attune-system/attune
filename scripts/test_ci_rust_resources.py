@@ -153,16 +153,18 @@ class CiRustResourceTests(unittest.TestCase):
             for name, kind, package in targets:
                 is_test = kind != "bin"
                 binary = root / ("target/debug/deps" if is_test else "target/debug") / name
-                binary.write_text('#!/bin/sh\n'
-                                  'test "$PWD" = "$CARGO_MANIFEST_DIR" || exit 1\n'
-                                  'test "$1" = "--test-threads=4" || exit 1\n'
-                                  f'echo "ran {name}"\n')
+                fixture = (
+                    '#!/usr/bin/env python3\n'
+                    'import os, sys\n'
+                    'assert os.getcwd() == os.environ["CARGO_MANIFEST_DIR"]\n'
+                    'assert sys.argv[1:] == ["--test-threads=4"]\n'
+                )
                 if name == "credential_storage_tests":
-                    with binary.open("a") as fixture:
-                        fixture.write(
-                            'test -x "$(printenv CARGO_BIN_EXE_attune)" || exit 1\n'
-                            'test -x "$(printenv CARGO_BIN_EXE_attune-mcp)" || exit 1\n'
-                        )
+                    fixture += (
+                        'assert os.access(os.environ["CARGO_BIN_EXE_attune"], os.X_OK)\n'
+                        'assert os.access(os.environ["CARGO_BIN_EXE_attune-mcp"], os.X_OK)\n'
+                    )
+                binary.write_text(fixture + f'print("ran {name}")\n')
                 binary.chmod(0o755)
                 crate = root / "crates" / package
                 crate.mkdir(parents=True, exist_ok=True)
