@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 PROFILE_ENV = {
     "CARGO_PROFILE_DEV_DEBUG": "0",
     "CARGO_PROFILE_TEST_DEBUG": "0",
+    "CARGO_PROFILE_TEST_LTO": "off",
     "CARGO_PROFILE_DEV_STRIP": "debuginfo",
     "CARGO_PROFILE_TEST_STRIP": "debuginfo",
     "CARGO_BUILD_JOBS": "2",
@@ -58,6 +59,7 @@ def resource_plan(workflow, manifest):
             "manifest_debug": defaults["debug"],
             "ci_debug": environment.get(f"CARGO_PROFILE_{profile.upper()}_DEBUG", defaults["debug"]),
             "ci_strip": environment.get(f"CARGO_PROFILE_{profile.upper()}_STRIP", "none"),
+            "ci_lto": environment.get(f"CARGO_PROFILE_{profile.upper()}_LTO", defaults.get("lto", False)),
         }
     caches = [step["with"] for step in build["steps"] + job["steps"] if step.get("uses", "").startswith("actions/cache@")]
     commands = {step["name"]: step["run"] for step in job["steps"] if step.get("name") in TEST_COMMANDS}
