@@ -19,9 +19,15 @@ PROFILE_ENV = {
 }
 TEST_COMMANDS = {
     "Tests": "scripts/run-ci-rust-tests.sh",
-    "Standalone timer sensor tests": "cargo test --manifest-path crates/core-timer-sensor/Cargo.toml --locked -- --test-threads=4",
     "Executor broker integration test": "cargo test -p attune-executor --lib service::tests::test_service_creation -- --ignored --exact --nocapture --test-threads=4",
     "S3 storage correctness tests": "make test-runtime-log-correctness",
+}
+NATIVE_TEST_COMMANDS = {
+    "Standalone core action tests": "cargo test --manifest-path crates/core-actions/Cargo.toml --locked -- --test-threads=4",
+    "Native HTTP action loopback HTTP and TLS tests": "python3 scripts/test_native_http_action.py",
+    "Static native HTTP action loopback HTTP and TLS tests": "python3 scripts/test_native_http_action.py",
+    "Native core archive smoke test": "cargo run -p attune-worker --example core_native_archive",
+    "Standalone timer sensor tests": "cargo test --manifest-path crates/core-timer-sensor/Cargo.toml --locked -- --test-threads=4",
 }
 
 
@@ -44,8 +50,7 @@ def resource_plan(workflow, manifest):
             "ci_strip": environment.get(f"CARGO_PROFILE_{profile.upper()}_STRIP", "none"),
         }
     caches = [step["with"] for step in job["steps"] if step.get("uses", "").startswith("actions/cache@")]
-    commands = {step["name"]: step["run"] for step in job["steps"] if step.get("name") in (
-        "Tests", "Standalone timer sensor tests", "Executor broker integration test", "S3 storage correctness tests")}
+    commands = {step["name"]: step["run"] for step in job["steps"] if step.get("name") in TEST_COMMANDS}
     return {
         "mode": "DRY_RUN_NO_CARGO_NO_INFRASTRUCTURE",
         "profiles": profiles,
@@ -79,7 +84,7 @@ def validate_policy(workflow, manifest):
     if int(plan["libtest_threads"]) < 4:
         raise AssertionError("Database tests require at least four threads")
     if plan["test_commands"] != TEST_COMMANDS:
-        raise AssertionError("Keep all workspace, standalone, broker and S3 test commands unchanged")
+        raise AssertionError("Keep all workspace, broker and S3 test commands unchanged")
     if any(key.startswith("CARGO_PROFILE_RELEASE_") or key.endswith("_OPT_LEVEL") for key in environment):
         raise AssertionError("Disk policy must not change release or optimization behavior")
     return plan
@@ -88,6 +93,31 @@ def validate_policy(workflow, manifest):
 class CiRustResourceTests(unittest.TestCase):
     def test_ci_test_job_uses_lean_scoped_profiles_and_no_stale_build_cache(self):
         validate_policy(*inputs())
+
+    def test_native_core_coverage_runs_in_a_parallel_job(self):
+        workflow, _manifest = inputs()
+        native_job = workflow["jobs"]["native-core-test"]
+        self.assertEqual(native_job["needs"], "changes")
+        self.assertNotIn("services", native_job)
+        commands = {step["name"]: step["run"] for step in native_job["steps"]
+                    if step.get("name") in NATIVE_TEST_COMMANDS}
+        self.assertEqual(commands, NATIVE_TEST_COMMANDS)
+        builds = next(step["run"] for step in native_job["steps"]
+                      if step.get("name") == "Build static core action fixtures")
+        for arch in ("x86_64", "aarch64"):
+            self.assertIn(f"--target {arch}-unknown-linux-musl --bins", builds)
+
+    def test_database_migration_reuses_the_precompiled_api(self):
+        workflow, _manifest = inputs()
+        steps = {step["name"]: step for step in workflow["jobs"]["rust-test"]["steps"]}
+        self.assertEqual(steps["Compile workspace test executables"]["run"],
+                         "cargo test --workspace --all-features --no-run --timings")
+        self.assertIn("target/debug/attune-api --config config.test.yaml --migrate",
+                      steps["Initialize test database"]["run"])
+        self.assertLess(list(steps).index("Compile workspace test executables"),
+                        list(steps).index("Initialize test database"))
+        self.assertLess(list(steps).index("Initialize test database"),
+                        list(steps).index("S3 storage correctness tests"))
 
     def test_missing_debug_override_is_rejected(self):
         workflow, manifest = inputs()

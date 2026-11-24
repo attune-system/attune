@@ -105,6 +105,19 @@ does not enable branch rules or add merge-queue support.
 The gate covers this workflow's jobs, not checks from separate workflows such as
 Windows CLI, CLI credentials, or pack-format golden vectors.
 
+### Measuring Rust CI performance
+
+`Tests` compiles the all-features workspace before running migrations with the
+resulting API binary. The job uploads a Cargo build timings report and records
+disk usage. The `Native core tests` job runs the standalone action, archive,
+and timer checks in parallel with `Tests`.
+
+Compare the compile, test, and native job durations for cold and warm runs of
+the same revision. The compiler-cache post step reports hits, misses, and cache
+errors. Set the repository Actions variable `CI_RUST_SCCACHE` to `false` for an
+uncached control with the same test selection and build layout. Compare the
+elapsed time to the gate as well as total runner time across the jobs.
+
 ### Common checks
 
 ```bash
