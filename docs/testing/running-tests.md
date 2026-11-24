@@ -107,11 +107,12 @@ Windows CLI, CLI credentials, or pack-format golden vectors.
 
 ### Measuring Rust CI performance
 
-`Tests` compiles the all-features workspace before running migrations with the
-resulting API binary. S3 correctness checks also run the two executables from
-that build directly. The job uploads a Cargo build timings report and records
-disk usage. The `Native core tests` job runs the standalone action, archive,
-and timer checks in parallel with `Tests`.
+`Build Rust tests` compiles the all-features workspace, uploads the Cargo timings
+report and an archive of executables, and runs doctests with Cargo. Two
+`Tests` shards then download that archive and run disjoint sets of whole test
+executables, each with its own database and broker. They report per-executable
+wall times. Shard 1 also runs the explicit ignored S3 and broker checks.
+`Native core tests` runs independently.
 
 Compare the compile, test, and native job durations for cold and warm runs of
 the same revision. The compiler-cache post step reports hits, misses, and cache

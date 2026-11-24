@@ -20,8 +20,11 @@ PROFILE_ENV = {
     "CARGO_BUILD_JOBS": "2",
 }
 TEST_COMMANDS = {
-    "Tests": "scripts/run-ci-rust-tests.sh",
-    "Executor broker integration test": "cargo test -p attune-executor --lib service::tests::test_service_creation -- --ignored --exact --nocapture --test-threads=4",
+    "Tests": 'scripts/run-ci-rust-tests.sh "${{ matrix.shard }}"',
+    "Executor broker integration test": (
+        '"${ATTUNE_BROKER_TEST_BIN:?Missing precompiled executor tests}" '
+        "service::tests::test_service_creation --ignored --exact --nocapture --test-threads=4"
+    ),
     "S3 storage correctness tests": (
         ': "${ATTUNE_S3_COMMON_TEST_BIN:?Missing precompiled common tests}"\n'
         ': "${ATTUNE_S3_REPLICA_TEST_BIN:?Missing precompiled replica tests}"\n'
@@ -45,7 +48,8 @@ def inputs():
 
 def resource_plan(workflow, manifest):
     job = workflow["jobs"]["rust-test"]
-    environment = dict(workflow.get("env", {}), **job["env"])
+    build = workflow["jobs"]["rust-test-build"]
+    environment = dict(workflow.get("env", {}), **build["env"])
     profiles = {}
     for profile in ("dev", "test"):
         defaults = manifest["profile"][profile]
@@ -55,14 +59,14 @@ def resource_plan(workflow, manifest):
             "ci_debug": environment.get(f"CARGO_PROFILE_{profile.upper()}_DEBUG", defaults["debug"]),
             "ci_strip": environment.get(f"CARGO_PROFILE_{profile.upper()}_STRIP", "none"),
         }
-    caches = [step["with"] for step in job["steps"] if step.get("uses", "").startswith("actions/cache@")]
+    caches = [step["with"] for step in build["steps"] + job["steps"] if step.get("uses", "").startswith("actions/cache@")]
     commands = {step["name"]: step["run"] for step in job["steps"] if step.get("name") in TEST_COMMANDS}
     return {
         "mode": "DRY_RUN_NO_CARGO_NO_INFRASTRUCTURE",
         "profiles": profiles,
         "incremental": str(environment["CARGO_INCREMENTAL"]),
         "build_jobs": str(environment.get("CARGO_BUILD_JOBS", "cargo-default")),
-        "libtest_threads": str(environment["ATTUNE_RUST_TEST_THREADS"]),
+        "libtest_threads": str(job["env"]["ATTUNE_RUST_TEST_THREADS"]),
         "cache_paths": [entry["path"].splitlines() for entry in caches],
         "cache_restore_prefixes": [entry.get("restore-keys", "").splitlines() for entry in caches],
         "test_commands": commands,
@@ -74,7 +78,7 @@ def resource_plan(workflow, manifest):
 
 def validate_policy(workflow, manifest):
     plan = resource_plan(workflow, manifest)
-    environment = workflow["jobs"]["rust-test"]["env"]
+    environment = workflow["jobs"]["rust-test-build"]["env"]
     for name, expected in PROFILE_ENV.items():
         if str(environment.get(name)) != expected:
             raise AssertionError(f"Tests job must set {name}={expected}")
@@ -113,52 +117,71 @@ class CiRustResourceTests(unittest.TestCase):
         for arch in ("x86_64", "aarch64"):
             self.assertIn(f"--target {arch}-unknown-linux-musl --bins", builds)
 
-    def test_database_migration_reuses_the_precompiled_api(self):
+    def test_shards_require_the_build_and_keep_special_coverage(self):
         workflow, _manifest = inputs()
-        steps = {step["name"]: step for step in workflow["jobs"]["rust-test"]["steps"]}
+        build = workflow["jobs"]["rust-test-build"]
+        shard = workflow["jobs"]["rust-test"]
+        self.assertIn("rust-test-build", shard["needs"])
+        self.assertEqual(shard["strategy"]["matrix"]["shard"], [1, 2])
+        steps = {step["name"]: step for step in build["steps"] + shard["steps"]}
         self.assertIn("cargo test --workspace --all-features --no-run --timings",
                       steps["Compile workspace test executables"]["run"])
+        self.assertEqual(steps["Workspace doctests"]["run"],
+                         "cargo test --workspace --all-features --doc -- --test-threads=4")
         self.assertIn("target/debug/attune-api --config config.test.yaml --migrate",
                       steps["Initialize test database"]["run"])
-        self.assertLess(list(steps).index("Compile workspace test executables"),
-                        list(steps).index("Initialize test database"))
-        self.assertLess(list(steps).index("Initialize test database"),
-                        list(steps).index("S3 storage correctness tests"))
+        for name in ("S3 storage correctness tests", "Executor broker integration test"):
+            self.assertEqual(steps[name]["if"], "matrix.shard == 1")
 
-    def test_s3_correctness_reuses_cargo_test_artifacts(self):
+    def test_artifact_manifest_runs_each_test_executable_once(self):
         with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "target/debug/deps").mkdir(parents=True)
             targets = (
-                ("attune_common", "lib", "ATTUNE_S3_COMMON_TEST_BIN", "crates/common"),
-                ("runtime_log_replica_tests", "test", "ATTUNE_S3_REPLICA_TEST_BIN", "crates/api"),
+                ("attune_common", "lib", "common"),
+                ("runtime_log_replica_tests", "test", "api"),
+                ("attune_executor", "lib", "executor"),
+                ("test_database_lifecycle_helper", "test", "common"),
+                ("attune-api", "bin", "api"),
             )
-            artifacts = []
-            assignments = {}
-            for name, kind, variable, _package in targets:
-                binary = Path(directory) / name
-                binary.touch()
-                artifacts.append(json.dumps({
+            messages = []
+            for name, kind, package in targets:
+                is_test = kind != "bin"
+                binary = root / ("target/debug/deps" if is_test else "target/debug") / name
+                binary.write_text('#!/bin/sh\n'
+                                  'test "$PWD" = "$CARGO_MANIFEST_DIR" || exit 1\n'
+                                  'test "$1" = "--test-threads=4" || exit 1\n'
+                                  f'echo "ran {name}"\n')
+                binary.chmod(0o755)
+                crate = root / "crates" / package
+                crate.mkdir(parents=True, exist_ok=True)
+                messages.append(json.dumps({
                     "reason": "compiler-artifact",
-                    "profile": {"test": True},
+                    "profile": {"test": is_test and name != "test_database_lifecycle_helper"},
                     "target": {"name": name, "kind": [kind]},
+                    "manifest_path": str(crate / "Cargo.toml"),
                     "executable": str(binary),
                 }))
-                assignments[variable] = str(binary)
-            selector = [sys.executable, "scripts/select-ci-s3-test-binaries.py"]
-            selected = subprocess.run(selector, cwd=ROOT, text=True, capture_output=True,
-                                      check=True, input="\n".join(artifacts))
-            self.assertEqual(dict(line.split("=", 1) for line in selected.stdout.splitlines()),
-                             assignments)
-            missing = subprocess.run(selector, cwd=ROOT, text=True, capture_output=True,
-                                     input=artifacts[0])
-            self.assertNotEqual(missing.returncode, 0)
+            helper = [sys.executable, str(ROOT / "scripts/ci-rust-test-artifacts.py")]
+            paths = subprocess.run([*helper, "pack"], cwd=root, text=True,
+                                   capture_output=True, check=True, input="\n".join(messages))
+            self.assertIn("target/debug/attune-api", paths.stdout.splitlines())
+            executions = []
+            for shard in (1, 2):
+                output = subprocess.check_output([*helper, "run", str(shard), "4"],
+                                                 cwd=root, text=True)
+                executions.extend(line for line in output.splitlines() if line.startswith("ran "))
+            self.assertCountEqual(executions, [f"ran {name}" for name, kind, _ in targets if kind != "bin"])
+            exported = subprocess.check_output([*helper, "env"], cwd=root, text=True)
+            assignments = dict(line.split("=", 1) for line in exported.splitlines())
+            self.assertEqual(set(assignments),
+                             {"ATTUNE_S3_COMMON_TEST_BIN", "ATTUNE_S3_REPLICA_TEST_BIN", "ATTUNE_BROKER_TEST_BIN"})
             command = subprocess.check_output(
                 ["make", "-n", "test-runtime-log-correctness",
                  *(f"{name}={value}" for name, value in assignments.items())],
                 cwd=ROOT, text=True,
             )
             self.assertNotIn("cargo test", command)
-            for _name, _kind, variable, package in targets:
-                self.assertIn(f'env -C {package} "{assignments[variable]}"', command)
             self.assertIn("--ignored --exact --test-threads=4", command)
             self.assertIn("--skip bounded_runtime_log_load_report --skip volume_transport_child_holds_lock", command)
 
@@ -166,11 +189,11 @@ class CiRustResourceTests(unittest.TestCase):
         workflow, manifest = inputs()
         for name in PROFILE_ENV:
             with self.subTest(variable=name):
-                original = workflow["jobs"]["rust-test"]["env"].pop(name, None)
+                original = workflow["jobs"]["rust-test-build"]["env"].pop(name, None)
                 with self.assertRaises(AssertionError):
                     validate_policy(workflow, manifest)
                 if original is not None:
-                    workflow["jobs"]["rust-test"]["env"][name] = original
+                    workflow["jobs"]["rust-test-build"]["env"][name] = original
 
     def test_restoring_target_or_clippy_cache_is_rejected(self):
         workflow, manifest = inputs()
@@ -187,7 +210,8 @@ class CiRustResourceTests(unittest.TestCase):
 
     def test_before_and_after_disk_telemetry_is_not_cleanup_or_a_passing_capacity_claim(self):
         workflow, manifest = inputs()
-        steps = {step.get("name"): step for step in workflow["jobs"]["rust-test"]["steps"]}
+        steps = {step.get("name"): step for job in ("rust-test-build", "rust-test")
+                 for step in workflow["jobs"][job]["steps"]}
         for name in ("Record disk usage before Rust compilation", "Record disk usage after Rust tests"):
             command = steps[name]["run"]
             self.assertIn("df -h .", command)

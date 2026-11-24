@@ -10,6 +10,7 @@ import sys
 JOBS = {
     "rust-fmt": ("rust", "run_rust_fmt"),
     "rust-clippy": ("rust", "run_rust_clippy"),
+    "rust-test-build": ("rust", "run_rust_test"),
     "rust-test": ("rust", "run_rust_test"),
     "native-core-test": ("rust", "run_rust_test"),
     "e2e-smoke": ("smoke", "run_e2e_smoke"),

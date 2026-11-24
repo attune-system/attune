@@ -18,4 +18,7 @@ export DATABASE_URL="$database_url"
 export ATTUNE__DATABASE__URL="$database_url"
 
 cd "$ROOT"
+if [[ $# -ne 0 ]]; then
+  exec python3 scripts/ci-rust-test-artifacts.py run "$@" "$threads"
+fi
 cargo test --workspace --all-features -- --test-threads="$threads"
