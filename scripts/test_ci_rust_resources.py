@@ -143,6 +143,9 @@ class CiRustResourceTests(unittest.TestCase):
                 ("attune_executor", "lib", "executor"),
                 ("test_database_lifecycle_helper", "test", "common"),
                 ("attune-api", "bin", "api"),
+                ("attune", "bin", "cli"),
+                ("attune-mcp", "bin", "cli"),
+                ("credential_storage_tests", "test", "cli"),
             )
             messages = []
             for name, kind, package in targets:
@@ -152,6 +155,12 @@ class CiRustResourceTests(unittest.TestCase):
                                   'test "$PWD" = "$CARGO_MANIFEST_DIR" || exit 1\n'
                                   'test "$1" = "--test-threads=4" || exit 1\n'
                                   f'echo "ran {name}"\n')
+                if name == "credential_storage_tests":
+                    with binary.open("a") as fixture:
+                        fixture.write(
+                            'test -x "$(printenv CARGO_BIN_EXE_attune)" || exit 1\n'
+                            'test -x "$(printenv CARGO_BIN_EXE_attune-mcp)" || exit 1\n'
+                        )
                 binary.chmod(0o755)
                 crate = root / "crates" / package
                 crate.mkdir(parents=True, exist_ok=True)

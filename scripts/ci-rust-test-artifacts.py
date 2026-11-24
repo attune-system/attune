@@ -21,15 +21,18 @@ def pack(messages):
     root = Path.cwd()
     files = {MANIFEST}
     tests = {}
+    binaries = {}
     for message in map(json.loads, messages):
         if message["reason"] != "compiler-artifact" or not message["executable"]:
             continue
         path = Path(message["executable"]).relative_to(root)
         target = message["target"]
+        package = str(Path(message["manifest_path"]).parent.relative_to(root))
         if message["profile"]["test"] or "test" in target["kind"]:
-            package = Path(message["manifest_path"]).parent.relative_to(root)
-            tests[path] = (str(package), target["name"], target["kind"][0], str(path))
-        elif "bin" not in target["kind"]:
+            tests[path] = (package, target["name"], target["kind"][0], str(path))
+        elif "bin" in target["kind"]:
+            binaries.setdefault(package, {})[target["name"]] = str(path)
+        else:
             continue
         files.add(path)
 
@@ -37,7 +40,7 @@ def pack(messages):
     if len(entries) < 2 or Path("target/debug/attune-api") not in files:
         sys.exit("Workspace build did not emit the expected test and API binaries")
     special_test_paths(entries)
-    MANIFEST.write_text(json.dumps({"root": str(root), "tests": entries}))
+    MANIFEST.write_text(json.dumps({"root": str(root), "tests": entries, "binaries": binaries}))
     for path in sorted(files):
         if not path.is_file() or path.is_symlink():
             sys.exit(f"Expected a regular Cargo artifact at {path}")
@@ -57,7 +60,7 @@ def special_test_paths(entries):
     return paths
 
 
-def run_shard(root, entries, shard, threads):
+def run_shard(root, entries, binaries, shard, threads):
     selected = entries[shard - 1::2]
     if not selected:
         sys.exit(f"No executables assigned to shard {shard}")
@@ -65,6 +68,8 @@ def run_shard(root, entries, shard, threads):
     for package, _name, _kind, path in selected:
         cwd = root / package
         env = dict(os.environ, CARGO_MANIFEST_DIR=str(cwd))
+        env.update({f"CARGO_BIN_EXE_{name}": str(root / binary)
+                    for name, binary in binaries.get(package, {}).items()})
         print(f"::group::Running {package}/{Path(path).name}", flush=True)
         start = time.monotonic()
         status = subprocess.run([root / path, f"--test-threads={threads}"], cwd=cwd, env=env).returncode
@@ -95,7 +100,7 @@ def main():
         for variable, path in special_test_paths(manifest["tests"]).items():
             print(f"{variable}={root / path}")
     else:
-        run_shard(root, manifest["tests"], args.shard, args.threads)
+        run_shard(root, manifest["tests"], manifest["binaries"], args.shard, args.threads)
 
 
 if __name__ == "__main__":
