@@ -108,7 +108,8 @@ Windows CLI, CLI credentials, or pack-format golden vectors.
 ### Measuring Rust CI performance
 
 `Tests` compiles the all-features workspace before running migrations with the
-resulting API binary. The job uploads a Cargo build timings report and records
+resulting API binary. S3 correctness checks also run the two executables from
+that build directly. The job uploads a Cargo build timings report and records
 disk usage. The `Native core tests` job runs the standalone action, archive,
 and timer checks in parallel with `Tests`.
 

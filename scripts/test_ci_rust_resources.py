@@ -1,6 +1,8 @@
 """Check CI test disk policy; --dry-run reports the plan without invoking Cargo."""
 
 import json
+import subprocess
+import tempfile
 import sys
 import tomllib
 import unittest
@@ -20,7 +22,11 @@ PROFILE_ENV = {
 TEST_COMMANDS = {
     "Tests": "scripts/run-ci-rust-tests.sh",
     "Executor broker integration test": "cargo test -p attune-executor --lib service::tests::test_service_creation -- --ignored --exact --nocapture --test-threads=4",
-    "S3 storage correctness tests": "make test-runtime-log-correctness",
+    "S3 storage correctness tests": (
+        ': "${ATTUNE_S3_COMMON_TEST_BIN:?Missing precompiled common tests}"\n'
+        ': "${ATTUNE_S3_REPLICA_TEST_BIN:?Missing precompiled replica tests}"\n'
+        "make test-runtime-log-correctness\n"
+    ),
 }
 NATIVE_TEST_COMMANDS = {
     "Standalone core action tests": "cargo test --manifest-path crates/core-actions/Cargo.toml --locked -- --test-threads=4",
@@ -110,14 +116,51 @@ class CiRustResourceTests(unittest.TestCase):
     def test_database_migration_reuses_the_precompiled_api(self):
         workflow, _manifest = inputs()
         steps = {step["name"]: step for step in workflow["jobs"]["rust-test"]["steps"]}
-        self.assertEqual(steps["Compile workspace test executables"]["run"],
-                         "cargo test --workspace --all-features --no-run --timings")
+        self.assertIn("cargo test --workspace --all-features --no-run --timings",
+                      steps["Compile workspace test executables"]["run"])
         self.assertIn("target/debug/attune-api --config config.test.yaml --migrate",
                       steps["Initialize test database"]["run"])
         self.assertLess(list(steps).index("Compile workspace test executables"),
                         list(steps).index("Initialize test database"))
         self.assertLess(list(steps).index("Initialize test database"),
                         list(steps).index("S3 storage correctness tests"))
+
+    def test_s3_correctness_reuses_cargo_test_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            targets = (
+                ("attune_common", "lib", "ATTUNE_S3_COMMON_TEST_BIN", "crates/common"),
+                ("runtime_log_replica_tests", "test", "ATTUNE_S3_REPLICA_TEST_BIN", "crates/api"),
+            )
+            artifacts = []
+            assignments = {}
+            for name, kind, variable, _package in targets:
+                binary = Path(directory) / name
+                binary.touch()
+                artifacts.append(json.dumps({
+                    "reason": "compiler-artifact",
+                    "profile": {"test": True},
+                    "target": {"name": name, "kind": [kind]},
+                    "executable": str(binary),
+                }))
+                assignments[variable] = str(binary)
+            selector = [sys.executable, "scripts/select-ci-s3-test-binaries.py"]
+            selected = subprocess.run(selector, cwd=ROOT, text=True, capture_output=True,
+                                      check=True, input="\n".join(artifacts))
+            self.assertEqual(dict(line.split("=", 1) for line in selected.stdout.splitlines()),
+                             assignments)
+            missing = subprocess.run(selector, cwd=ROOT, text=True, capture_output=True,
+                                     input=artifacts[0])
+            self.assertNotEqual(missing.returncode, 0)
+            command = subprocess.check_output(
+                ["make", "-n", "test-runtime-log-correctness",
+                 *(f"{name}={value}" for name, value in assignments.items())],
+                cwd=ROOT, text=True,
+            )
+            self.assertNotIn("cargo test", command)
+            for _name, _kind, variable, package in targets:
+                self.assertIn(f'env -C {package} "{assignments[variable]}"', command)
+            self.assertIn("--ignored --exact --test-threads=4", command)
+            self.assertIn("--skip bounded_runtime_log_load_report --skip volume_transport_child_holds_lock", command)
 
     def test_missing_debug_override_is_rejected(self):
         workflow, manifest = inputs()

@@ -320,7 +320,11 @@ jobs:
           done
 
       - name: Compile workspace test executables
-        run: cargo test --workspace --all-features --no-run --timings
+        run: |
+          cargo test --workspace --all-features --no-run --timings \
+            --message-format=json-render-diagnostics > "$RUNNER_TEMP/workspace-test-build.jsonl"
+          python3 scripts/select-ci-s3-test-binaries.py \
+            < "$RUNNER_TEMP/workspace-test-build.jsonl" >> "$GITHUB_ENV"
 
       - name: Upload Cargo build timings
         if: always()
@@ -377,7 +381,10 @@ jobs:
         run: bash scripts/ci-test-db-safety.sh baseline
 
       - name: S3 storage correctness tests
-        run: make test-runtime-log-correctness
+        run: |
+          : "${ATTUNE_S3_COMMON_TEST_BIN:?Missing precompiled common tests}"
+          : "${ATTUNE_S3_REPLICA_TEST_BIN:?Missing precompiled replica tests}"
+          make test-runtime-log-correctness
 
       - name: Tests
         env:
