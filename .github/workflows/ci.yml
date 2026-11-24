@@ -306,9 +306,11 @@ jobs:
       - name: Enable Rust compiler cache
         if: steps.rust_cache.outcome == 'success'
         run: |
-          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1" >> "$GITHUB_ENV"
-          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          {
+            echo "SCCACHE_GHA_ENABLED=true"
+            echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1"
+            echo "RUSTC_WRAPPER=sccache"
+          } >> "$GITHUB_ENV"
 
       - name: Record disk usage before Rust compilation
         run: |
