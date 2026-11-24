@@ -355,6 +355,7 @@ jobs:
 
       - name: Tests
         env:
+          ATTUNE_CI_BROKER_TEST_ARTIFACTS: ${{ runner.temp }}/completion-test-artifacts.jsonl
           ATTUNE_TEST_S3_ENDPOINT: http://127.0.0.1:59000
           ATTUNE_TEST_S3_BUCKET: attune-runtime-log-tests
           ATTUNE_TEST_S3_PREFIX: runtime-log-tests/attune-runtime-log-ci-${{ github.run_id }}-${{ github.run_attempt }}
@@ -399,6 +400,7 @@ jobs:
 
       - name: Completion broker integration tests
         env:
+          ATTUNE_CI_BROKER_TEST_ARTIFACTS: ${{ runner.temp }}/completion-test-artifacts.jsonl
           RABBITMQ_CONTAINER_ID: ${{ job.services.rabbitmq.id }}
           COMPLETION_VHOST: completion-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
@@ -406,7 +408,7 @@ jobs:
           docker exec "$RABBITMQ_CONTAINER_ID" rabbitmqctl set_permissions -p "$COMPLETION_VHOST" attune '.*' '.*' '.*'
           export ATTUNE_TEST_RABBITMQ_URL="$ATTUNE__MESSAGE_QUEUE__URL"
           export ATTUNE_MANAGER_TEST_AMQP_URL="amqp://attune:attune@localhost:5672/$COMPLETION_VHOST"
-          bash scripts/run-ci-completion-broker-tests.sh
+          python3 scripts/run-ci-completion-broker-tests.py run "$ATTUNE_CI_BROKER_TEST_ARTIFACTS"
 
       - name: Stop runtime-log test storage
         if: always()
