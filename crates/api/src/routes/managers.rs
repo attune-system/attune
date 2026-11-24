@@ -60,6 +60,12 @@ pub(crate) fn routes() -> Router<SharedState> {
         .route("/internal/managers/enroll", post(enroll))
         .route("/internal/managers/session", post(renew).delete(withdraw))
         .route(
+            "/internal/managers/database-credential",
+            get(super::manager_database::current)
+                .post(super::manager_database::request)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
             "/internal/managers/runtime",
             get(runtime_catalog).post(report_runtime),
         )

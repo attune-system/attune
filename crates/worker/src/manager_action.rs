@@ -90,7 +90,7 @@ pub async fn execute(
     let entry_point = launch.action.entrypoint.clone().unwrap_or_default();
     let code_path = if launch.action.launch.is_none() && !launch.action.is_adhoc {
         let source = pack.join("actions").join(&entry_point);
-        source.is_file().then_some(source)
+        (source.is_file() || (runtime_name == "native" && source.is_dir())).then_some(source)
     } else {
         None
     };

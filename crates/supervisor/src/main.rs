@@ -4,6 +4,7 @@
 
 mod cache_retention;
 mod leader_session;
+mod manager_credentials;
 mod native_maintenance;
 mod object_retention;
 mod storage_migration;
@@ -19,7 +20,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use attune_common::{
     artifact_transport::{ArtifactFileTransport, VolumeTransport},
     audit::{event_type, AuditCategory, AuditEventBuilder, AuditOutcome, AuditRepository},
@@ -2017,6 +2018,16 @@ async fn main() -> Result<()> {
     }
 
     let service = SupervisorService::new(config).await?;
+
+    let credentials_task = manager_credentials::connect(&service.inner.config)
+        .await?
+        .map(|pool| {
+            tokio::spawn(manager_credentials::run(
+                pool,
+                service.inner.config.manager_kubernetes_database.clone(),
+                service.inner.shutdown_tx.subscribe(),
+            ))
+        });
     let service_for_shutdown = service.clone();
 
     tokio::spawn(async move {
@@ -2034,7 +2045,13 @@ async fn main() -> Result<()> {
         }
     });
 
-    if let Err(err) = service.start().await {
+    let result = service.start().await;
+    if let Some(task) = credentials_task {
+        service.shutdown().await?;
+        task.await
+            .context("Join manager database credential reconciler")?;
+    }
+    if let Err(err) = result {
         error!("Supervisor service error: {}", err);
         return Err(err);
     }

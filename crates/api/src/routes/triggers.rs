@@ -175,11 +175,6 @@ async fn publish_rule_lifecycle_messages(
             row.id,
             &row.r#ref,
             &row.trigger_ref,
-            if enabled {
-                Some(&row.trigger_params)
-            } else {
-                None
-            },
             enabled,
         )
         .await

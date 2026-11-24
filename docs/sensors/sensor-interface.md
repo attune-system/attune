@@ -133,7 +133,7 @@ Sensors interact with the following API endpoints:
 
 | Method | Endpoint | Purpose | Auth |
 |--------|----------|---------|------|
-| GET | `/rules?trigger_type={ref}` | Fetch active rules for this sensor's triggers | Required |
+| GET | `/rules?trigger_ref={ref}&enabled=true` | Fetch active rules for this sensor's triggers | Required |
 | GET | `/triggers/{ref}` | Fetch trigger metadata | Required |
 | POST | `/events` | Create new event | Required |
 | POST | `/auth/refresh` | Refresh token before expiration | Required |
@@ -141,7 +141,9 @@ Sensors interact with the following API endpoints:
 
 ## Rule Lifecycle Stream (Managed Sensors)
 
-Managed sensor processes consume lifecycle deltas through `attune-notifier` over WebSocket.
+Managed sensor processes receive rule change hints through `attune-notifier`
+over WebSocket. Fetch the current trigger parameters through the authenticated
+rules API.
 
 ### Subscription model
 
@@ -156,15 +158,15 @@ Lifecycle payloads are delivered inside notifier `notification` envelopes. The `
 
 ```json
 {
-  "event_type": "rule.created | rule.enabled | rule.disabled | rule.deleted",
+  "entity_type": "rule_lifecycle",
+  "entity_id": 123,
+  "event_type": "rule.enabled",
   "rule_id": 123,
   "rule_ref": "core.timer_rule",
-  "trigger_ref": "core.timer",
-  "trigger_params": {
-    "interval_seconds": 5
-  },
+  "trigger_ref": "core.intervaltimer",
   "active": true,
-  "timestamp": "2025-01-27T12:34:56Z"
+  "timestamp": "2025-01-27T12:34:56Z",
+  "auth_mode": "deferred"
 }
 ```
 
@@ -174,8 +176,8 @@ Sensors MUST:
 
 1. **Validate** messages against expected schema
 2. **Filter** messages to only process rules for their trigger refs (based on token's `metadata.trigger_types`)
-3. **Handle Duplicates** idempotently (same rule_id + event_type)
-4. **Reconnect** with backoff on socket disconnect
+3. **Reconcile** active rules from the API when a hint arrives, handling duplicate hints idempotently
+4. **Reconnect** with backoff on socket disconnect, and reconcile active rules after reconnecting
 5. **Enforce Trigger Type Restrictions**: Only emit events for trigger refs declared in the sensor token metadata
 
 ## Event Emission

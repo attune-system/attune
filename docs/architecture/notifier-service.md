@@ -40,7 +40,7 @@ Source: [WebSocket routing and authentication](../../crates/notifier/src/websock
 
 The service provides best-effort live delivery. It does not persist WebSocket messages, acknowledge notifications, or replay messages after a disconnect. PostgreSQL also does not retain `NOTIFY` messages for disconnected listeners.
 
-Clients should reconnect, restore their subscriptions, and fetch current state through the API. Payloads with `auth_mode: "deferred"` are compact forms of messages that exceeded the publisher's safe payload threshold. Clients must fetch the entity to recover omitted fields.
+Clients should reconnect, restore their subscriptions, and fetch current state through the API. Publishers can use `auth_mode: "deferred"` when a message exceeds the safe payload threshold. Rule lifecycle messages always use this form and signal clients to fetch current rules through the authenticated API.
 
 The notifier's in-process broadcast channel has a capacity of 1,000 messages. If its receiver lags, Tokio drops messages and the service logs the number dropped.
 

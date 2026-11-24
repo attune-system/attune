@@ -86,6 +86,7 @@ pub mod managed_component_readmission;
 pub mod managed_executable;
 pub mod managed_sensor_metadata;
 pub mod manager_assignment;
+pub mod manager_db_login;
 pub mod manager_log;
 pub mod manager_pack_job;
 pub mod manager_runtime;
