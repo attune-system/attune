@@ -6,7 +6,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use tokio::sync::{broadcast, Mutex, OnceCell, OwnedMutexGuard, RwLock};
+use tokio::sync::{broadcast, Mutex, Notify, OnceCell, OwnedMutexGuard, RwLock};
 
 use crate::execution_log_streams::ExecutionLogStreams;
 use crate::log_stream_wakeups::LogStreamWakeups;
@@ -45,6 +45,8 @@ pub struct AppState {
     /// Local wakeups for readers interested in a specific execution log stream.
     pub log_stream_wakeups: LogStreamWakeups,
     pub manager_work_wakeups: LogStreamWakeups,
+    /// Wake the durable manager completion publisher after a PostgreSQL commit.
+    pub manager_completion_wakeup: Arc<Notify>,
     /// Admission control, shutdown signaling, and metrics for execution log SSE streams.
     pub execution_log_streams: ExecutionLogStreams,
     /// Audit event emitter (non-blocking; no-op if not configured)
@@ -179,6 +181,7 @@ impl AppState {
             broadcast_tx,
             log_stream_wakeups: LogStreamWakeups::default(),
             manager_work_wakeups: LogStreamWakeups::default(),
+            manager_completion_wakeup: Arc::new(Notify::new()),
             execution_log_streams,
             audit_emitter,
             blob_store,

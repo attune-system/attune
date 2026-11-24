@@ -560,6 +560,23 @@ impl ExecutionRepository {
             .await
             .map_err(Into::into)
     }
+
+    /// Use the recorded workflow owner to order child completions. Dispatches
+    /// and execution wait targets can affect other workflows, so they give
+    /// the consumer no key and run in delivery order with no other handlers.
+    pub async fn completion_workflow_key(pool: &PgPool, id: Id) -> Result<Option<Id>> {
+        let key = sqlx::query_scalar::<_, Option<Id>>(
+            "SELECT (e.workflow_task->>'workflow_execution')::bigint
+             FROM execution e
+             WHERE e.id = $1 AND e.workflow_task IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM workflow_task_wait w WHERE w.target_execution = e.id)
+             AND NOT EXISTS (SELECT 1 FROM work_queue_dispatch d WHERE d.execution = e.id)",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(key.flatten())
+    }
 }
 
 impl Repository for ExecutionRepository {

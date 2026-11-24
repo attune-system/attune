@@ -470,6 +470,7 @@ mod work {
             state.broadcast_tx.clone(),
             state.log_stream_wakeups.clone(),
             state.manager_work_wakeups.clone(),
+            state.manager_completion_wakeup.clone(),
         );
         tokio::time::timeout(
             std::time::Duration::from_secs(4),
@@ -568,7 +569,13 @@ mod work {
             assert_eq!(lease().await?.error_for_status()?.json::<Value>().await?["state"], "cancel");
             expire(pool, running_assignment).await?;
             assert_eq!(finish(&second, running_assignment, &manager, &protected).await?.status(), StatusCode::FORBIDDEN);
+            let mut recovery_notifications = sqlx::postgres::PgListener::connect_with(pool).await?;
+            recovery_notifications
+                .listen_all([attune_common::repositories::manager_assignment::MANAGER_COMPLETION_WAKEUP])
+                .await?;
             assert!(matches!(Assignments::recover_expired(pool).await?, Some(ManagerAssignmentRecovery::Closed)));
+            tokio::time::timeout(std::time::Duration::from_secs(5), recovery_notifications.recv()).await??;
+            drop(recovery_notifications);
             assert_eq!(ExecutionRepository::get_by_id(pool, running.id).await?.status, ExecutionStatus::Cancelled);
 
             expire(pool, unclaimed_assignment).await?;
@@ -629,8 +636,39 @@ mod work {
             instance: session.instance,
             bearer_expires_at: session.expires_at,
         };
+        use attune_common::repositories::manager_assignment::MANAGER_COMPLETION_WAKEUP;
+        let mut listener = sqlx::postgres::PgListener::connect_with(pool).await?;
+        listener.listen_all([MANAGER_COMPLETION_WAKEUP]).await?;
         let mut tx = pool.begin().await?;
         Assignments::claim(&mut tx, scope, assignment, Uuid::new_v4()).await?;
+        tx.commit().await?;
+
+        let mut tx = pool.begin().await?;
+        Assignments::finish(
+            &mut tx,
+            scope,
+            assignment,
+            "test-fingerprint",
+            ExecutionStatus::Completed,
+            json!({"succeeded":true}),
+            config.security.encryption_key.as_deref().unwrap(),
+        )
+        .await?;
+        tx.rollback().await?;
+        // A committed marker on the same channel distinguishes a suppressed
+        // rollback notification without relying on a timeout for its absence.
+        sqlx::query("SELECT pg_notify($1, 'rollback-marker')")
+            .bind(MANAGER_COMPLETION_WAKEUP)
+            .execute(pool)
+            .await?;
+        let receive = std::time::Duration::from_secs(5);
+        assert_eq!(
+            tokio::time::timeout(receive, listener.recv())
+                .await??
+                .payload(),
+            "rollback-marker"
+        );
+        let mut tx = pool.begin().await?;
         Assignments::finish(
             &mut tx,
             scope,
@@ -642,6 +680,13 @@ mod work {
         )
         .await?;
         tx.commit().await?;
+        assert_eq!(
+            tokio::time::timeout(receive, listener.recv())
+                .await??
+                .payload(),
+            ""
+        );
+        drop(listener);
 
         let broker_url = std::env::var("ATTUNE_MANAGER_TEST_AMQP_URL")?;
         let broker = Connection::connect(&broker_url).await?;
@@ -732,6 +777,17 @@ mod work {
         config.packs_base_dir = scratch.path().join("packs").display().to_string();
         config.runtime_envs_dir = scratch.path().join("runtimes").display().to_string();
         let key = config.security.encryption_key.clone().unwrap();
+        let publisher = std::sync::Arc::new(publisher);
+        // This state has no PostgreSQL listener. The running publisher must
+        // still reconcile committed work using its periodic fallback.
+        let fallback_state = std::sync::Arc::new(AppState::new(pool.clone(), config.clone()));
+        fallback_state.set_publisher(publisher.clone()).await;
+        let publication_stop = CancellationToken::new();
+        let _publication_guard = publication_stop.clone().drop_guard();
+        let publication_task = tokio::spawn(attune_api::manager_completion_publication::run(
+            fallback_state,
+            publication_stop.clone(),
+        ));
         let executor = attune_executor::service::ExecutorService::new(config).await?;
         let executor_task = tokio::spawn({
             let executor = executor.clone();
@@ -761,7 +817,6 @@ mod work {
             Assignments::finish(&mut tx, scope, offer.id, "service-fingerprint", ExecutionStatus::Completed,
                 json!({"succeeded":true}), &key).await?;
             tx.commit().await?;
-            assert!(publish_one(pool, &publisher).await?);
             tokio::time::timeout(std::time::Duration::from_secs(15), async {
                 loop {
                     let processed: bool = sqlx::query_scalar("SELECT processed_at IS NOT NULL FROM manager_execution_completion WHERE assignment = $1")
@@ -772,6 +827,8 @@ mod work {
             }).await??;
             Ok(())
         }.await;
+        publication_stop.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(15), publication_task).await??;
         executor.stop().await?;
         tokio::time::timeout(std::time::Duration::from_secs(15), executor_task).await???;
         drop(publisher);

@@ -35,8 +35,10 @@ use attune_common::{
 };
 use serde_json::{json, Value as JsonValue};
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
-use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
+use std::{
+    num::NonZeroUsize,
+    sync::{atomic::AtomicUsize, Arc},
+};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -46,6 +48,7 @@ use crate::{
 };
 
 type QueueAckValidation = std::result::Result<WorkQueueAck, (&'static str, String)>;
+const MAX_CONCURRENT_COMPLETIONS: usize = 4;
 
 /// Completion listener that handles execution completion messages
 pub struct CompletionListener {
@@ -127,8 +130,20 @@ impl CompletionListener {
     }
 
     /// Start processing execution completed messages
-    pub async fn start(&self) -> Result<()> {
-        info!("Starting completion listener");
+    pub async fn start(&self, requested_parallelism: NonZeroUsize) -> Result<()> {
+        // A manager receipt holds one session while the handler works on
+        // another. Reserve pool capacity for routing and the other consumers.
+        let pool_budget = self.pool.options().get_max_connections().saturating_sub(2) / 2;
+        let parallelism = NonZeroUsize::new(
+            (pool_budget as usize)
+                .min(MAX_CONCURRENT_COMPLETIONS)
+                .min(requested_parallelism.get()),
+        )
+        .unwrap_or(NonZeroUsize::MIN);
+        info!(
+            completion_concurrency = parallelism.get(),
+            "Starting completion listener"
+        );
 
         let pool = self.pool.clone();
         let publisher = self.publisher.clone();
@@ -141,86 +156,100 @@ impl CompletionListener {
         let workflow_log_segment_max_bytes = self.workflow_log_segment_max_bytes;
         let workflow_log_flush_interval_ms = self.workflow_log_flush_interval_ms;
 
-        // Use the handler pattern to consume messages
-        self.consumer
-            .consume_with_handler(
-                move |envelope: MessageEnvelope<ExecutionCompletedPayload>| {
-                    let pool = pool.clone();
-                    let publisher = publisher.clone();
-                    let queue_manager = queue_manager.clone();
-                    let round_robin_counter = round_robin_counter.clone();
-                    let artifacts_dir = artifacts_dir.clone();
-                    let encryption_key = encryption_key.clone();
-                    let metadata_caches = metadata_caches.clone();
-                    let workflow_log_transport = workflow_log_transport.clone();
+        let handle = move |envelope: MessageEnvelope<ExecutionCompletedPayload>| {
+            let pool = pool.clone();
+            let publisher = publisher.clone();
+            let queue_manager = queue_manager.clone();
+            let round_robin_counter = round_robin_counter.clone();
+            let artifacts_dir = artifacts_dir.clone();
+            let encryption_key = encryption_key.clone();
+            let metadata_caches = metadata_caches.clone();
+            let workflow_log_transport = workflow_log_transport.clone();
 
-                    async move {
-                        let receipt = if envelope.headers.source_service.as_deref()
-                            == Some(MANAGER_COMPLETION_SOURCE)
-                        {
-                            match ManagerAssignmentRepository::begin_completion_processing(
-                                &pool,
-                                envelope.message_id,
-                                &envelope.payload,
-                            )
-                            .await
-                            {
-                                Ok(ManagerCompletionReceipt::Process(receipt)) => Some(receipt),
-                                Ok(
-                                    ManagerCompletionReceipt::AlreadyProcessed
-                                    | ManagerCompletionReceipt::Busy,
-                                ) => return Ok(()),
-                                Err(attune_common::Error::PermissionDenied(_)) => {
-                                    return Err(MqError::InvalidMessage(
-                                        "Manager completion does not match its outbox event".into(),
-                                    ));
-                                }
-                                Err(error) => return Err(MqError::Pool(error.to_string())),
-                            }
-                        } else {
-                            None
-                        };
-                        let result = Box::pin(Self::process_execution_completed(
-                            &pool,
-                            &publisher,
-                            &queue_manager,
-                            &round_robin_counter,
-                            artifacts_dir.as_str(),
-                            &workflow_log_transport,
-                            workflow_log_segment_max_bytes,
-                            workflow_log_flush_interval_ms,
-                            encryption_key.as_deref(),
-                            &metadata_caches,
-                            &envelope,
-                        ))
-                        .await;
-                        if let Some(receipt) = receipt {
-                            receipt
-                                .release(result.is_ok())
-                                .await
-                                .map_err(|error| MqError::Pool(error.to_string()))?;
-                            if let Err(error) = result {
-                                // The API retries the durable event until the executor
-                                // records its receipt. Avoid hot broker requeue here.
-                                warn!(%error, "Manager completion deferred");
-                            }
-                            return Ok(());
+            async move {
+                let receipt = if envelope.headers.source_service.as_deref()
+                    == Some(MANAGER_COMPLETION_SOURCE)
+                {
+                    match ManagerAssignmentRepository::begin_completion_processing(
+                        &pool,
+                        envelope.message_id,
+                        &envelope.payload,
+                    )
+                    .await
+                    {
+                        Ok(ManagerCompletionReceipt::Process(receipt)) => Some(receipt),
+                        Ok(
+                            ManagerCompletionReceipt::AlreadyProcessed
+                            | ManagerCompletionReceipt::Busy,
+                        ) => return Ok(()),
+                        Err(attune_common::Error::PermissionDenied(_)) => {
+                            return Err(MqError::InvalidMessage(
+                                "Manager completion does not match its outbox event".into(),
+                            ));
                         }
-                        if let Err(e) = result {
-                            error!("Error processing execution completion: {}", e);
-                            // Return error to trigger nack with requeue
-                            if let Some(mq_err) = Self::retryable_mq_error(&e) {
-                                return Err(mq_err);
-                            }
-                            return Err(
-                                format!("Failed to process execution completion: {}", e).into()
-                            );
-                        }
-                        Ok(())
+                        Err(error) => return Err(MqError::Pool(error.to_string())),
                     }
-                },
-            )
-            .await?;
+                } else {
+                    None
+                };
+                let result = Box::pin(Self::process_execution_completed(
+                    &pool,
+                    &publisher,
+                    &queue_manager,
+                    &round_robin_counter,
+                    artifacts_dir.as_str(),
+                    &workflow_log_transport,
+                    workflow_log_segment_max_bytes,
+                    workflow_log_flush_interval_ms,
+                    encryption_key.as_deref(),
+                    &metadata_caches,
+                    &envelope,
+                ))
+                .await;
+                if let Some(receipt) = receipt {
+                    receipt
+                        .release(result.is_ok())
+                        .await
+                        .map_err(|error| MqError::Pool(error.to_string()))?;
+                    if let Err(error) = result {
+                        // The API retries the durable event until the executor
+                        // records its receipt. Avoid hot broker requeue here.
+                        warn!(%error, "Manager completion deferred");
+                    }
+                    return Ok(());
+                }
+                if let Err(e) = result {
+                    error!("Error processing execution completion: {}", e);
+                    // Return error to trigger nack with requeue
+                    if let Some(mq_err) = Self::retryable_mq_error(&e) {
+                        return Err(mq_err);
+                    }
+                    return Err(format!("Failed to process execution completion: {}", e).into());
+                }
+                Ok(())
+            }
+        };
+
+        if parallelism == NonZeroUsize::MIN {
+            self.consumer.consume_with_handler(handle).await?;
+        } else {
+            let pool = self.pool.clone();
+            self.consumer
+                .consume_with_keyed_handler(
+                    parallelism,
+                    move |envelope: &MessageEnvelope<ExecutionCompletedPayload>| {
+                        let pool = pool.clone();
+                        let execution = envelope.payload.execution_id;
+                        async move {
+                            ExecutionRepository::completion_workflow_key(&pool, execution)
+                                .await
+                                .map_err(|error| MqError::Pool(error.to_string()))
+                        }
+                    },
+                    handle,
+                )
+                .await?;
+        }
 
         Ok(())
     }
@@ -408,12 +437,14 @@ impl CompletionListener {
                 }
             }
 
-            // Get queue statistics for logging
-            if let Some(stats) = queue_manager.get_queue_stats(action_id).await {
-                debug!(
-                    "Queue stats for action {}: {} active, {} queued, {} total completed",
-                    action_id, stats.active_count, stats.queue_length, stats.total_completed
-                );
+            // Get queue statistics for logging only when they will be used.
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                if let Some(stats) = queue_manager.get_queue_stats(action_id).await {
+                    debug!(
+                        "Queue stats for action {}: {} active, {} queued, {} total completed",
+                        action_id, stats.active_count, stats.queue_length, stats.total_completed
+                    );
+                }
             }
 
             info!(

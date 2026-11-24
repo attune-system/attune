@@ -544,6 +544,7 @@ async fn run() -> Result<()> {
     let _postgres_listener =
         postgres_listener::spawn_postgres_listener(
             listener_db, broadcast_tx, log_stream_wakeups, state.manager_work_wakeups.clone(),
+            state.manager_completion_wakeup.clone(),
         );
 
     info!("PostgreSQL notification listener started");

@@ -87,8 +87,11 @@ against the same assignment.
 
 An expired unclaimed offer returns to executor scheduling with its original
 request attribution. An expired claimed attempt settles as abandoned, or
-cancelled if cancellation is already pending. The API republishes completion
-with its stable event ID until the executor records a durable receipt. The
+cancelled if cancellation is already pending. Committing a completion wakes
+the API publisher through PostgreSQL LISTEN/NOTIFY. The publisher drains ready
+records and checks once per second as a fallback for missed notifications and
+retry eligibility. The API republishes completion with its stable event ID until
+the executor records a durable receipt. The
 executor serializes concurrent deliveries. A crash during processing can replay
 the event through the existing completion and workflow repository fences.
 

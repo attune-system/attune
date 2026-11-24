@@ -12378,7 +12378,8 @@ true,
     ) {
         use attune_common::repositories::execution_admission::ExecutionAdmissionRepository as Admission;
         use attune_common::repositories::identity::{
-            CreatePermissionAssignmentInput, PermissionAssignmentRepository,
+            CreatePermissionAssignmentInput, IdentityRepository, PermissionAssignmentRepository,
+            UpdateIdentityInput,
         };
         let fixture = WorkflowDelegationFixture::create()
             .await
@@ -12532,6 +12533,33 @@ true,
                 .is_adhoc
         );
         assert_eq!(messages.len(), 1);
+        let mut publication = pool.begin().await.unwrap();
+        PreparedWorkflowInputPublications::prepare(&mut publication, &messages, None)
+            .await
+            .expect("reopen the delegated child under its live owner")
+            .ensure_fresh_on(&mut publication)
+            .await
+            .unwrap();
+        publication.rollback().await.unwrap();
+
+        let mut revoked = pool.begin().await.unwrap();
+        IdentityRepository::update(
+            &mut *revoked,
+            fixture.identity_id,
+            UpdateIdentityInput {
+                frozen: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            PreparedWorkflowInputPublications::prepare(&mut revoked, &messages, None)
+                .await
+                .is_err(),
+            "a retained delegated child must still check its live owner"
+        );
+        revoked.rollback().await.unwrap();
         let mut selection = pool.begin().await.unwrap();
         let running_child = ExecutionRepository::update(
             &mut *selection,

@@ -30,6 +30,7 @@ const ASSIGNMENT_COLUMNS: &str = "id, execution, worker, manager_session, instan
 const LEASE_SECONDS: i32 = 30;
 const PUBLISH_LEASE_SECONDS: i32 = 45;
 pub const MANAGER_WORK_WAKEUP: &str = "manager_work_available";
+pub const MANAGER_COMPLETION_WAKEUP: &str = "manager_completion_available";
 pub const MANAGER_COMPLETION_SOURCE: &str = "manager-assignment";
 
 #[derive(Clone, Copy)]
@@ -724,9 +725,13 @@ impl ManagerAssignmentRepository {
             })
             .ok_or_else(denied)?;
         sqlx::query(
-            "INSERT INTO manager_execution_completion
-                (assignment, message_id, execution, action, action_ref, status, completed_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "WITH queued AS (
+                 INSERT INTO manager_execution_completion
+                     (assignment, message_id, execution, action, action_ref, status, completed_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 RETURNING 1
+             )
+             SELECT pg_notify($8, '') FROM queued",
         )
         .bind(assignment)
         .bind(Uuid::new_v4())
@@ -735,6 +740,7 @@ impl ManagerAssignmentRepository {
         .bind(&execution.action_ref)
         .bind(execution.status)
         .bind(execution.updated)
+        .bind(MANAGER_COMPLETION_WAKEUP)
         .execute(&mut **tx)
         .await?;
         Ok(())

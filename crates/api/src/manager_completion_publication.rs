@@ -57,17 +57,21 @@ fn completion_envelope(
 pub async fn run(state: SharedState, shutdown: CancellationToken) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Pace failed attempts even when new commits continue to arrive.
+    let mut retry_on_tick = false;
     loop {
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => break,
+            _ = state.manager_completion_wakeup.notified(), if !retry_on_tick => {}
             _ = interval.tick() => {}
         }
         let Some(publisher) = state.get_publisher().await else {
             continue;
         };
 
-        for _ in 0..32 {
+        retry_on_tick = false;
+        loop {
             let published = tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => return,
@@ -78,6 +82,7 @@ pub async fn run(state: SharedState, shutdown: CancellationToken) {
                 Ok(false) => break,
                 Err(error) => {
                     tracing::warn!(%error, "Manager completion publication deferred");
+                    retry_on_tick = true;
                     break;
                 }
             }

@@ -254,6 +254,20 @@ ATTUNE__DATABASE__URL=postgresql://prod-db/attune
 ATTUNE__MESSAGE_QUEUE__URL=amqp://prod-mq
 ```
 
+Completion processing defaults to one handler per executor. Set
+`executor.completion_concurrency` or `ATTUNE__EXECUTOR__COMPLETION_CONCURRENCY`
+to a positive integer to overlap independent workflow completions. The executor
+caps the setting at four and budgets two database connections per handler plus
+two for routing and other consumers. A small pool uses a single handler.
+Deliveries for a workflow stay in order within each consumer. A transient
+classification failure drains earlier work before processing that delivery on
+its own. Durable receipts and workflow locks coordinate processing across
+replicas.
+
+Measure broker backlog, completion latency, and database lock waits together.
+Concurrent handlers can spend the broker time they save waiting for shared
+cache admission in PostgreSQL.
+
 ## Error Handling
 
 ### Error Types
@@ -375,12 +389,11 @@ cargo run
 
 ### Graceful Shutdown
 
-The service supports graceful shutdown via SIGTERM/SIGINT:
-1. Stop accepting new messages
-2. Finish processing in-flight messages
-3. Close message queue connections
-4. Close database connections
-5. Exit cleanly
+On SIGTERM or SIGINT, the executor stops admitting completions and gives
+active completion handlers up to ten seconds with the broker and database
+available. It then stops the remaining processors, lets the workflow log
+dispatcher shut down, and closes the broker and database connections. RabbitMQ
+can redeliver work whose acknowledgement was interrupted.
 
 ## Testing
 

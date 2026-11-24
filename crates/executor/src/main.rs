@@ -89,7 +89,7 @@ async fn main() -> Result<()> {
     // Set up graceful shutdown handler
     let service_clone = service.clone();
     tokio::spawn(async move {
-        if let Err(e) = tokio::signal::ctrl_c().await {
+        if let Err(e) = shutdown_signal().await {
             error!("Failed to listen for shutdown signal: {}", e);
         } else {
             info!("Shutdown signal received");
@@ -109,6 +109,20 @@ async fn main() -> Result<()> {
     info!("Executor Service has shut down gracefully");
 
     Ok(())
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> std::io::Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        _ = terminate.recv() => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
 }
 
 /// Return connection metadata that is safe to include in logs.
