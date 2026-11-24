@@ -365,7 +365,7 @@ async fn two_prepared_source_holders_never_deadlock_on_the_requested_target_upgr
     a.rollback().await.unwrap();
     assert!(matches!(
         busy,
-        Ok(Err(attune_common::Error::InvalidState(_)))
+        Ok(Err(attune_common::Error::ExecutionContention(_)))
     ));
     pb.lock_target(&mut b).await.unwrap();
     pb.publish_bounded(&mut b, async { Ok(()) }).await.unwrap();

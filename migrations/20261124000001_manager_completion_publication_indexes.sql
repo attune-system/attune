@@ -7,3 +7,5 @@ CREATE INDEX manager_execution_completion_initial_ready
 CREATE INDEX manager_execution_completion_replay_ready
     ON manager_execution_completion (available_at, assignment)
     WHERE processed_at IS NULL AND (published_at IS NOT NULL OR claim IS NOT NULL);
+
+DROP INDEX manager_execution_completion_ready;

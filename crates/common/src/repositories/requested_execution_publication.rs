@@ -334,7 +334,7 @@ fn lock_error(error: sqlx::Error) -> Error {
         .as_deref()
         == Some("55P03")
     {
-        Error::InvalidState(
+        Error::ExecutionContention(
             "Requested publication target is busy; retry without changing its authority".into(),
         )
     } else {
