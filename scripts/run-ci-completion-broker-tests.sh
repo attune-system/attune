@@ -19,4 +19,5 @@ run_broker_test -p attune-common --lib mq::consumer::tests::keyed_consumer_order
 run_broker_test -p attune-executor --lib service::tests::test_service_drains_completion_before_closing_resources
 run_broker_test -p attune-executor --lib service::tests::test_service_can_stop_while_reconnecting_during_startup
 run_broker_test -p attune-executor --lib service::tests::test_manager_completion_retry_holds_key_in_real_listener
+run_broker_test -p attune-executor --lib service::tests::test_worker_completion_retry_holds_key_in_real_listener
 run_broker_test -p attune-api --test manager_session_tests work::completion_survives_broker_return_and_reuses_one_event_id

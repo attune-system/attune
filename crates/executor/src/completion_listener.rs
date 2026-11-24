@@ -76,11 +76,8 @@ struct QueueDispatchCompletionFailure {
 }
 
 impl CompletionListener {
-    fn retryable_mq_error(error: &anyhow::Error) -> Option<MqError> {
-        let mq_error = error
-            .chain()
-            .find_map(|cause| cause.downcast_ref::<MqError>())?;
-        Some(match mq_error {
+    fn retryable_mq_error(error: &MqError) -> Option<MqError> {
+        Some(match error {
             MqError::Connection(msg) => MqError::Connection(msg.clone()),
             MqError::Channel(msg) => MqError::Channel(msg.clone()),
             MqError::Publish(msg) => MqError::Publish(msg.clone()),
@@ -91,9 +88,16 @@ impl CompletionListener {
         })
     }
 
-    fn retryable_manager_error(error: &anyhow::Error) -> Option<MqError> {
-        if let Some(error) = Self::retryable_mq_error(error) {
+    fn retryable_completion_error(error: &anyhow::Error, keyed: bool) -> Option<MqError> {
+        if let Some(error) = error.chain().find_map(|cause| {
+            cause
+                .downcast_ref::<MqError>()
+                .and_then(Self::retryable_mq_error)
+        }) {
             return Some(error);
+        }
+        if !keyed {
+            return None;
         }
         if let Some(error) =
             error
@@ -104,6 +108,9 @@ impl CompletionListener {
                     }
                     Some(attune_common::Error::ExecutionContention(message)) => {
                         Some(MqError::Pool(message.clone()))
+                    }
+                    Some(attune_common::Error::MessageQueue(error)) => {
+                        Self::retryable_mq_error(error)
                     }
                     _ => None,
                 })
@@ -250,6 +257,7 @@ impl CompletionListener {
                     workflow_log_flush_interval_ms,
                     encryption_key.as_deref(),
                     &metadata_caches,
+                    keyed,
                     &envelope,
                 ))
                 .await;
@@ -260,7 +268,7 @@ impl CompletionListener {
                         .map_err(|error| MqError::Pool(error.to_string()))?;
                     if let Err(error) = result {
                         if keyed {
-                            if let Some(error) = Self::retryable_manager_error(&error) {
+                            if let Some(error) = Self::retryable_completion_error(&error, keyed) {
                                 return Err(error);
                             }
                         }
@@ -272,8 +280,7 @@ impl CompletionListener {
                 }
                 if let Err(e) = result {
                     error!("Error processing execution completion: {}", e);
-                    // Return error to trigger nack with requeue
-                    if let Some(mq_err) = Self::retryable_mq_error(&e) {
+                    if let Some(mq_err) = Self::retryable_completion_error(&e, keyed) {
                         return Err(mq_err);
                     }
                     return Err(format!("Failed to process execution completion: {}", e).into());
@@ -321,6 +328,7 @@ impl CompletionListener {
         workflow_log_flush_interval_ms: u64,
         encryption_key: Option<&'a str>,
         metadata_caches: &'a SchedulerMetadataCaches,
+        keyed: bool,
         envelope: &'a MessageEnvelope<ExecutionCompletedPayload>,
     ) -> futures::future::BoxFuture<'a, Result<()>> {
         Box::pin(async move {
@@ -394,11 +402,8 @@ impl CompletionListener {
                                 "Failed to schedule workflow retry for execution {}: {}",
                                 execution_id, e
                             );
-                            if let Some(mq_err) = Self::retryable_mq_error(&e) {
-                                return Err(mq_err.into());
-                            }
                             // A refused/contended retry must not become ordinary
-                            // workflow advancement. Requeue the completion instead.
+                            // workflow advancement. Let the listener handle the error.
                             return Err(e);
                         }
                     }
@@ -420,7 +425,7 @@ impl CompletionListener {
                             "Failed to advance workflow for execution {}: {}",
                             execution_id, e
                         );
-                        if let Some(mq_err) = Self::retryable_mq_error(&e) {
+                        if let Some(mq_err) = Self::retryable_completion_error(&e, keyed) {
                             return Err(mq_err.into());
                         }
                         if envelope.headers.source_service.as_deref()
@@ -1341,26 +1346,26 @@ mod tests {
     }
 
     #[test]
-    fn manager_completion_retries_contended_and_unconfirmed_workflow_retries() {
+    fn keyed_completion_retries_contended_and_unconfirmed_workflow_retries() {
         use attune_common::Error;
 
         let contention = Error::ExecutionContention("workflow 1".into());
         assert!(matches!(
-            CompletionListener::retryable_manager_error(&contention.into()),
+            CompletionListener::retryable_completion_error(&contention.into(), true),
             Some(MqError::Pool(_))
         ));
         let publication = Error::MessageQueue(Box::new(MqError::Publish("fixture".into())));
         assert!(matches!(
-            CompletionListener::retryable_manager_error(&publication.into()),
+            CompletionListener::retryable_completion_error(&publication.into(), true),
             Some(MqError::Publish(_))
         ));
         let timeout = Error::Timeout("fixture unknown confirmation".into());
         assert!(matches!(
-            CompletionListener::retryable_manager_error(&timeout.into()),
+            CompletionListener::retryable_completion_error(&timeout.into(), true),
             Some(MqError::Timeout(_))
         ));
         let forbidden = Error::PermissionDenied("fixture invalid grant".into());
-        assert!(CompletionListener::retryable_manager_error(&forbidden.into()).is_none());
+        assert!(CompletionListener::retryable_completion_error(&forbidden.into(), true).is_none());
     }
 
     #[test]

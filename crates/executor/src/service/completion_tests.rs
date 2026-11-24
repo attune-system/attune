@@ -1,3 +1,5 @@
+use attune_common::repositories::manager_assignment::MANAGER_COMPLETION_SOURCE;
+
 fn completion_test_config(
     database: &TestDatabase,
     scratch: &tempfile::TempDir,
@@ -98,8 +100,17 @@ async fn test_service_can_stop_while_reconnecting_during_startup() -> Result<()>
 #[tokio::test]
 #[ignore = "requires a disposable database and RabbitMQ vhost"]
 async fn test_manager_completion_retry_holds_key_in_real_listener() -> Result<()> {
+    completion_retry_holds_key_in_real_listener(MANAGER_COMPLETION_SOURCE).await
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable database and RabbitMQ vhost"]
+async fn test_worker_completion_retry_holds_key_in_real_listener() -> Result<()> {
+    completion_retry_holds_key_in_real_listener("worker").await
+}
+
+async fn completion_retry_holds_key_in_real_listener(first_source: &str) -> Result<()> {
     use attune_common::mq::{ExecutionCompletedPayload, MessageType};
-    use attune_common::repositories::manager_assignment::MANAGER_COMPLETION_SOURCE;
 
     let mut config = Config::load_from_file(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -177,10 +188,11 @@ async fn test_manager_completion_retry_holds_key_in_real_listener() -> Result<()
             ).bind(parent).bind(serde_json::json!({"workflow_execution":workflow,"task_name":name,
                 "retry_count":0,"max_retries":0,"timed_out":false}))
                 .bind(session).bind(instance).bind(message).fetch_one(pool).await?;
+            let source = if name == "first" { first_source } else { MANAGER_COMPLETION_SOURCE };
             let mut envelope = MessageEnvelope::new(MessageType::ExecutionCompleted, ExecutionCompletedPayload {
                 execution_id: execution, action_id: 1, action_ref: "completion_test.action".into(),
                 status: "Cancelled".into(), result: None, completed_at,
-            }).with_source(MANAGER_COMPLETION_SOURCE);
+            }).with_source(source);
             envelope.message_id = message;
             channel.basic_publish("".into(),queue.as_str().into(),Default::default(),&envelope.to_bytes()?,Default::default()).await?.await?;
             events.push(message);
@@ -220,9 +232,17 @@ async fn test_manager_completion_retry_holds_key_in_real_listener() -> Result<()
         anyhow::ensure!(!premature, "a same-workflow successor passed the failed completion");
 
         sqlx::query("UPDATE completion_test_gate SET enabled=false").execute(pool).await?;
-        let first = processed(events[0]).await?;
         let sibling = processed(events[1]).await?;
-        anyhow::ensure!(first <= sibling, "the sibling's receipt committed before the failed delivery retried");
+        // The terminal workflow is sealed by the first successful delivery.
+        // Its committed append proves the worker was retried before the sibling.
+        let first_logged: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM workflow_log_outbox WHERE workflow_execution=$1
+             AND kind='append' AND position('Task ''first''' in convert_from(payload,'UTF8')) > 0)",
+        ).bind(workflows[0].0).fetch_one(pool).await?;
+        anyhow::ensure!(first_logged, "the sibling sealed the workflow before the first completion retried");
+        if first_source == MANAGER_COMPLETION_SOURCE {
+            anyhow::ensure!(processed(events[0]).await? <= sibling, "the sibling's receipt committed first");
+        }
         consumer.request_stop();
         tasks.join_next().await.context("missing completion listener")???;
         Ok::<_, anyhow::Error>(())
