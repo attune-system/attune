@@ -190,8 +190,9 @@ impl Consumer {
     }
 
     /// Process different keys concurrently while preserving broker delivery
-    /// order within each key on this consumer. An unkeyed delivery is a
-    /// barrier. Classification runs in delivery order before taking a slot.
+    /// order within each key on this consumer session. An unkeyed delivery is
+    /// a barrier. Retriable failures keep their delivery and slot until settled
+    /// or the session ends. Classification runs in delivery order.
     /// Manual acknowledgement and nonzero prefetch bound the entire window.
     pub async fn consume_with_keyed_handler<T, K, C, Classification, F, Fut>(
         &self,
@@ -204,7 +205,7 @@ impl Consumer {
         K: Copy + Eq + Hash + Send + 'static,
         C: FnMut(&MessageEnvelope<T>) -> Classification + Send + 'static,
         Classification: Future<Output = MqResult<Option<K>>> + Send + 'static,
-        F: FnMut(MessageEnvelope<T>) -> Fut + Send + 'static,
+        F: Fn(MessageEnvelope<T>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = MqResult<()>> + Send + 'static,
     {
         if self.config.auto_ack || usize::from(self.config.prefetch_count) < parallelism.get() {
@@ -393,14 +394,14 @@ impl Consumer {
         channel: &Channel,
         parallelism: NonZeroUsize,
         classify: &mut C,
-        handler: &mut F,
+        handler: &F,
     ) -> MqResult<()>
     where
         T: Clone + serde::Serialize + for<'de> serde::Deserialize<'de> + Send + 'static,
         K: Copy + Eq + Hash + Send,
         C: FnMut(&MessageEnvelope<T>) -> Classification + Send,
         Classification: Future<Output = MqResult<Option<K>>> + Send,
-        F: FnMut(MessageEnvelope<T>) -> Fut + Send,
+        F: Fn(MessageEnvelope<T>) -> Fut + Sync,
         Fut: Future<Output = MqResult<()>> + Send,
     {
         let consumer = self.start_on(channel).await?;
@@ -456,6 +457,8 @@ impl Consumer {
         let window = usize::from(self.config.prefetch_count);
         let mut pending = VecDeque::<KeyedDelivery<K, T>>::new();
         let mut active = HashSet::new();
+        let session_ended = self.stopped.child_token();
+        let stop_retries = &session_ended;
         let mut in_flight = FuturesUnordered::new();
         let mut ticker = tokio::time::interval(SUBSCRIPTION_POLL_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -465,6 +468,9 @@ impl Consumer {
             if self.stopped.is_cancelled() {
                 break Ok(());
             }
+            if !channel.status().connected() {
+                break Err(MqError::Channel("Consumer channel disconnected".into()));
+            }
 
             while in_flight.len() < parallelism.get() {
                 let Some(index) = next_ready_delivery(&pending, &active) else {
@@ -472,10 +478,8 @@ impl Consumer {
                 };
                 let (key, (tag, envelope)) = pending.remove(index).expect("ready delivery exists");
                 active.insert(key);
-                let message_id = envelope.message_id;
-                let processing = handler(envelope);
                 in_flight.push(async move {
-                    self.settle_delivery(channel, tag, message_id, processing.await)
+                    self.process_keyed_delivery(channel, tag, envelope, handler, stop_retries)
                         .await?;
                     Ok::<_, MqError>(key)
                 });
@@ -501,11 +505,7 @@ impl Consumer {
                     }
                 }
                 _ = ticker.tick() => {
-                    // The prefetch window can be full of handlers blocked on DB
-                    // or broker I/O. Detect loss even while intake is paused.
-                    if !channel.status().connected() {
-                        break Err(MqError::Channel("Consumer channel disconnected".into()));
-                    }
+                    // Return to the channel check even when intake is paused.
                     if let Some(observed) = &observed {
                         if pending.is_empty()
                             && in_flight.is_empty()
@@ -521,12 +521,57 @@ impl Consumer {
         // Broker recovery stops intake first. Finishing admitted handlers gives
         // them the chance to complete side effects and cleanup, as in the
         // serial consumer. Any failed acknowledgement can still replay.
+        session_ended.cancel();
         drop(deliveries);
         drop(pending);
         while let Some(finished) = in_flight.next().await {
             result = result.and(finished.map(|_| ()));
         }
         result
+    }
+
+    async fn process_keyed_delivery<T, F, Fut>(
+        &self,
+        channel: &Channel,
+        tag: u64,
+        envelope: MessageEnvelope<T>,
+        handler: &F,
+        session_ended: &CancellationToken,
+    ) -> MqResult<()>
+    where
+        T: Clone,
+        F: Fn(MessageEnvelope<T>) -> Fut,
+        Fut: Future<Output = MqResult<()>>,
+    {
+        let mut backoff = Duration::from_millis(250);
+        loop {
+            if session_ended.is_cancelled() {
+                return Ok(());
+            }
+            if !channel.status().connected() {
+                return Err(MqError::Channel("Consumer channel disconnected".into()));
+            }
+            let result = handler(envelope.clone()).await;
+            match result {
+                Err(error) if error.is_retriable() => {
+                    // RabbitMQ cannot place a NACKed message ahead of newer
+                    // deliveries already in our prefetch window. Keep this
+                    // delivery unacknowledged and retain its key during retry.
+                    warn!(message_id = %envelope.message_id, %error, "Retrying keyed delivery");
+                    tokio::select! {
+                        biased;
+                        _ = session_ended.cancelled() => return Ok(()),
+                        _ = tokio::time::sleep(jittered_recovery_delay(backoff)) => {}
+                    }
+                    backoff = next_recovery_backoff(backoff);
+                }
+                result => {
+                    return self
+                        .settle_delivery(channel, tag, envelope.message_id, result)
+                        .await
+                }
+            }
+        }
     }
 
     fn observe_session(&self, channel: &Channel) -> Option<ObservedSession<'_>> {
@@ -778,7 +823,7 @@ mod tests {
             .unwrap();
         let mut tasks = tokio::task::JoinSet::new();
         let result = AssertUnwindSafe(async {
-            for item in 1..=5 {
+            for item in (1..=5).chain([12]) {
                 publish(&channel, &queue, item).await;
             }
             let (consumer, observation) = Consumer::new(
@@ -801,16 +846,21 @@ mod tests {
             let release_fault = Arc::new(Notify::new());
             let classify_started = Arc::new(Notify::new());
             let release_classification = Arc::new(Notify::new());
+            let successor_classified = Arc::new(Notify::new());
+            let release_retry = Arc::new(Notify::new());
             let release_shutdown = Arc::new(Notify::new());
             tasks.spawn({
-                let mut first_fault_delivery = true;
-                let mut first_retry_delivery = true;
+                let first_fault_delivery = AtomicBool::new(true);
+                let first_retry_delivery = AtomicBool::new(true);
+                let mut first_fault_classification = true;
                 let consumer = consumer.clone();
                 let release_first = release_first.clone();
                 let release_barrier = release_barrier.clone();
                 let release_fault = release_fault.clone();
                 let classify_started = classify_started.clone();
                 let release_classification = release_classification.clone();
+                let successor_classified = successor_classified.clone();
+                let release_retry = release_retry.clone();
                 let release_shutdown = release_shutdown.clone();
                 async move {
                     consumer
@@ -818,9 +868,16 @@ mod tests {
                             NonZeroUsize::new(2).unwrap(),
                             move |message: &MessageEnvelope<u8>| {
                                 let item = message.payload;
+                                let wait_for_disconnect =
+                                    item == 7 && std::mem::take(&mut first_fault_classification);
                                 let classify_started = classify_started.clone();
                                 let release_classification = release_classification.clone();
+                                let successor_classified = successor_classified.clone();
                                 async move {
+                                    if wait_for_disconnect {
+                                        classify_started.notify_one();
+                                        release_classification.notified().await;
+                                    }
                                     if item == 8 {
                                         classify_started.notify_one();
                                         release_classification.notified().await;
@@ -828,10 +885,13 @@ mod tests {
                                             "test classification failure".into(),
                                         ));
                                     }
+                                    if item == 12 {
+                                        successor_classified.notify_one();
+                                    }
                                     Ok(match item {
                                         1 | 2 => Some(1),
                                         4 => None,
-                                        6 | 7 => Some(6),
+                                        5 | 12 => Some(5),
                                         9 => Some(8),
                                         other => Some(other),
                                     })
@@ -839,17 +899,20 @@ mod tests {
                             },
                             move |message| {
                                 let item = message.payload;
-                                let interrupted =
-                                    item == 6 && std::mem::take(&mut first_fault_delivery);
-                                let retry = item == 5 && std::mem::take(&mut first_retry_delivery);
+                                let interrupted = item == 6
+                                    && first_fault_delivery.swap(false, Ordering::Relaxed);
+                                let retry = item == 5
+                                    && first_retry_delivery.swap(false, Ordering::Relaxed);
                                 let started = started.clone();
                                 let release_first = release_first.clone();
                                 let release_barrier = release_barrier.clone();
                                 let release_fault = release_fault.clone();
+                                let release_retry = release_retry.clone();
                                 let release_shutdown = release_shutdown.clone();
                                 async move {
                                     started.send(item).unwrap();
                                     if retry {
+                                        release_retry.notified().await;
                                         return Err(MqError::Pool("test retry".into()));
                                     }
                                     match item {
@@ -881,24 +944,30 @@ mod tests {
                 );
                 release_barrier.notify_one();
                 assert_eq!(starts.recv().await, Some(5));
+                successor_classified.notified().await;
+                release_retry.notify_one();
                 assert_eq!(starts.recv().await, Some(5));
+                assert_eq!(starts.recv().await, Some(12));
 
                 publish(&channel, &queue, 6).await;
                 assert_eq!(starts.recv().await, Some(6));
+                publish(&channel, &queue, 7).await;
+                classify_started.notified().await;
                 consumer
                     .channel()
                     .close(200, "Test session loss".into())
                     .await
                     .unwrap();
+                release_classification.notify_one();
                 assert!(
                     tokio::time::timeout(Duration::from_millis(150), starts.recv())
                         .await
                         .is_err()
                 );
                 release_fault.notify_one();
-                assert_eq!(starts.recv().await, Some(6));
-                publish(&channel, &queue, 7).await;
-                assert_eq!(starts.recv().await, Some(7));
+                let mut redelivered = [starts.recv().await, starts.recv().await];
+                redelivered.sort_unstable();
+                assert_eq!(redelivered, [Some(6), Some(7)]);
 
                 publish(&channel, &queue, 8).await;
                 classify_started.notified().await;

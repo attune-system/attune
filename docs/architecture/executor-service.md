@@ -259,10 +259,12 @@ Completion processing defaults to one handler per executor. Set
 to a positive integer to overlap independent workflow completions. The executor
 caps the setting at four and budgets two database connections per handler plus
 two for routing and other consumers. A small pool uses a single handler.
-Deliveries for a workflow stay in order within each consumer. A transient
-classification failure drains earlier work before processing that delivery on
-its own. Durable receipts and workflow locks coordinate processing across
-replicas.
+Each consumer session keeps deliveries for a root workflow and its nested
+workflows in order. Retriable handler errors keep their slot and retry the
+unacknowledged delivery in place. Deliveries that can affect other workflows,
+or that encounter a transient classification error, drain earlier work and run
+on their own. Durable receipts and workflow locks coordinate processing across
+replicas and after broker redelivery.
 
 Measure broker backlog, completion latency, and database lock waits together.
 Concurrent handlers can spend the broker time they save waiting for shared
@@ -389,10 +391,11 @@ cargo run
 
 ### Graceful Shutdown
 
-On SIGTERM or SIGINT, the executor stops admitting completions and gives
-active completion handlers up to ten seconds with the broker and database
-available. It then stops the remaining processors, lets the workflow log
-dispatcher shut down, and closes the broker and database connections. RabbitMQ
+On SIGTERM or SIGINT, the executor stops admitting completions, withdraws
+recorded readiness, and gives active completion handlers up to ten seconds with
+the broker and database available. It then stops the remaining processors,
+gives the workflow log dispatcher up to ten seconds, and closes the broker and
+database connections. Compose allows 45 seconds for this sequence. RabbitMQ
 can redeliver work whose acknowledgement was interrupted.
 
 ## Testing

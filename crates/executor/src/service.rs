@@ -720,7 +720,15 @@ impl ExecutorService {
         }
 
         completion_consumer.request_stop();
-        match tokio::time::timeout(COMPLETION_SHUTDOWN_TIMEOUT, completion_task.join_next()).await {
+        let ((), completion_drain) = tokio::join!(
+            async {
+                if let Some(identity) = &recorded_identity {
+                    self.publish_recorded_executor(identity, false).await;
+                }
+            },
+            tokio::time::timeout(COMPLETION_SHUTDOWN_TIMEOUT, completion_task.join_next()),
+        );
+        match completion_drain {
             Ok(Some(Ok(Err(error)))) => {
                 error!(%error, "Completion listener failed during shutdown")
             }
@@ -748,9 +756,6 @@ impl ExecutorService {
                     let _ = workflow_log_handle.await;
                 }
             }
-        }
-        if let Some(identity) = &recorded_identity {
-            self.publish_recorded_executor(identity, false).await;
         }
         let broker_closed = self.inner.mq_connection.close().await;
         self.inner.pool.close().await;

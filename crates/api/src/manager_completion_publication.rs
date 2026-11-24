@@ -54,8 +54,11 @@ fn completion_envelope(
     envelope
 }
 
-pub async fn run(state: SharedState, shutdown: CancellationToken) {
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
+pub async fn run(
+    state: SharedState,
+    shutdown: CancellationToken,
+    mut interval: tokio::time::Interval,
+) {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Pace failed attempts even when new commits continue to arrive.
     let mut retry_on_tick = false;

@@ -570,6 +570,7 @@ async fn run() -> Result<()> {
         attune_api::manager_completion_publication::run(
             state.clone(),
             state.execution_log_streams.shutdown_token(),
+            tokio::time::interval(std::time::Duration::from_secs(1)),
         ),
     );
 

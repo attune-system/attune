@@ -20,7 +20,13 @@ PROFILE_ENV = {
 TEST_COMMANDS = {
     "Tests": "scripts/run-ci-rust-tests.sh",
     "Standalone timer sensor tests": "cargo test --manifest-path crates/core-timer-sensor/Cargo.toml --locked -- --test-threads=4",
-    "Executor broker integration test": "cargo test -p attune-executor --lib service::tests::test_service_creation -- --ignored --exact --nocapture --test-threads=4",
+    "Completion broker integration tests": (
+        "docker exec \"$RABBITMQ_CONTAINER_ID\" rabbitmqctl add_vhost \"$COMPLETION_VHOST\"\n"
+        "docker exec \"$RABBITMQ_CONTAINER_ID\" rabbitmqctl set_permissions -p \"$COMPLETION_VHOST\" attune '.*' '.*' '.*'\n"
+        "export ATTUNE_TEST_RABBITMQ_URL=\"$ATTUNE__MESSAGE_QUEUE__URL\"\n"
+        "export ATTUNE_MANAGER_TEST_AMQP_URL=\"amqp://attune:attune@localhost:5672/$COMPLETION_VHOST\"\n"
+        "bash scripts/run-ci-completion-broker-tests.sh\n"
+    ),
     "S3 storage correctness tests": "make test-runtime-log-correctness",
 }
 
@@ -44,8 +50,7 @@ def resource_plan(workflow, manifest):
             "ci_strip": environment.get(f"CARGO_PROFILE_{profile.upper()}_STRIP", "none"),
         }
     caches = [step["with"] for step in job["steps"] if step.get("uses", "").startswith("actions/cache@")]
-    commands = {step["name"]: step["run"] for step in job["steps"] if step.get("name") in (
-        "Tests", "Standalone timer sensor tests", "Executor broker integration test", "S3 storage correctness tests")}
+    commands = {step["name"]: step["run"] for step in job["steps"] if step.get("name") in TEST_COMMANDS}
     return {
         "mode": "DRY_RUN_NO_CARGO_NO_INFRASTRUCTURE",
         "profiles": profiles,

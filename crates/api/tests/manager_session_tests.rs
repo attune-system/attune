@@ -607,6 +607,74 @@ mod work {
         result
     }
 
+    async fn finish_and_wait_for_receipt(
+        pool: &PgPool,
+        publisher: &Publisher,
+        scope: attune_common::repositories::manager_assignment::ManagerAssignmentScope,
+        action: Id,
+        owner: Id,
+        worker: Id,
+        key: &str,
+    ) -> Result<()> {
+        use std::time::Duration;
+
+        let mut tx = pool.begin().await?;
+        let requested = request_execution(&mut tx, action, owner, &[]).await?;
+        tx.commit().await?;
+        publisher
+            .publish_envelope(&MessageEnvelope::new(
+                MessageType::ExecutionRequested,
+                ExecutionRequestedPayload {
+                    execution_id: requested.id,
+                    action_id: requested.action,
+                    action_ref: requested.action_ref,
+                    parent_id: requested.parent,
+                    enforcement_id: requested.enforcement,
+                    config: requested.config,
+                    release_id: requested.pack_release,
+                    release_digest: requested.pack_release_digest,
+                },
+            ))
+            .await?;
+
+        let offer = loop {
+            let mut tx = pool.begin().await?;
+            let offer = Assignments::next_offer(&mut tx, scope).await?;
+            tx.commit().await?;
+            if let Some(offer) = offer {
+                break offer;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        anyhow::ensure!(offer.execution == requested.id && offer.worker == worker);
+        let mut tx = pool.begin().await?;
+        Assignments::claim(&mut tx, scope, offer.id, Uuid::new_v4()).await?;
+        Assignments::finish(
+            &mut tx,
+            scope,
+            offer.id,
+            "service-fingerprint",
+            ExecutionStatus::Completed,
+            json!({"succeeded": true}),
+            key,
+        )
+        .await?;
+        tx.commit().await?;
+
+        loop {
+            let processed: bool = sqlx::query_scalar(
+                "SELECT processed_at IS NOT NULL FROM manager_execution_completion WHERE assignment = $1",
+            )
+            .bind(offer.id)
+            .fetch_one(pool)
+            .await?;
+            if processed {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires an exclusively owned disposable RabbitMQ vhost"]
     async fn completion_survives_broker_return_and_reuses_one_event_id() -> Result<()> {
@@ -768,9 +836,6 @@ mod work {
         assert!(!publish_one(pool, &publisher).await?);
 
         // Exercise the normal executor consumer, placement, and completion paths.
-        let mut tx = pool.begin().await?;
-        let requested = request_execution(&mut tx, action, owner, &[]).await?;
-        tx.commit().await?;
         config.database.url = db.database_url().into();
         config.message_queue.as_mut().unwrap().url = broker_url;
         config.artifacts_dir = scratch.path().join("artifacts").display().to_string();
@@ -778,57 +843,73 @@ mod work {
         config.runtime_envs_dir = scratch.path().join("runtimes").display().to_string();
         let key = config.security.encryption_key.clone().unwrap();
         let publisher = std::sync::Arc::new(publisher);
-        // This state has no PostgreSQL listener. The running publisher must
-        // still reconcile committed work using its periodic fallback.
-        let fallback_state = std::sync::Arc::new(AppState::new(pool.clone(), config.clone()));
-        fallback_state.set_publisher(publisher.clone()).await;
-        let publication_stop = CancellationToken::new();
-        let _publication_guard = publication_stop.clone().drop_guard();
-        let publication_task = tokio::spawn(attune_api::manager_completion_publication::run(
-            fallback_state,
-            publication_stop.clone(),
-        ));
-        let executor = attune_executor::service::ExecutorService::new(config).await?;
+        let executor = attune_executor::service::ExecutorService::new(config.clone()).await?;
         let executor_task = tokio::spawn({
             let executor = executor.clone();
             async move { executor.start().await }
         });
         let execution_path: Result<()> = async {
-            let envelope = MessageEnvelope::new(MessageType::ExecutionRequested, ExecutionRequestedPayload {
-                execution_id: requested.id, action_id: requested.action,
-                action_ref: requested.action_ref, parent_id: requested.parent,
-                enforcement_id: requested.enforcement, config: requested.config,
-                release_id: requested.pack_release, release_digest: requested.pack_release_digest,
-            });
-            publisher.publish_envelope(&envelope).await?;
-            let offer = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-                loop {
-                    let mut tx = pool.begin().await?;
-                    let offer = Assignments::next_offer(&mut tx, scope).await?;
-                    tx.commit().await?;
-                    if let Some(offer) = offer { return Ok::<_, anyhow::Error>(offer); }
-                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            for use_notification in [true, false] {
+                let state = Arc::new(AppState::new(pool.clone(), config.clone()));
+                state.set_publisher(publisher.clone()).await;
+                let mut listener = use_notification.then(|| {
+                    attune_api::postgres_listener::spawn_postgres_listener(
+                        pool.clone(),
+                        state.broadcast_tx.clone(),
+                        state.log_stream_wakeups.clone(),
+                        state.manager_work_wakeups.clone(),
+                        state.manager_completion_wakeup.clone(),
+                    )
+                });
+                let publication_result: Result<()> = async {
+                    use std::time::Duration;
+                    use tokio::time::{self, Instant};
+
+                    let first_tick = if let Some(listener) = listener.as_mut() {
+                        time::timeout(Duration::from_secs(5), listener.wait_until_ready())
+                            .await??;
+                        // Drop the initial reconciliation hint so only a real
+                        // committed completion can wake the publisher here.
+                        time::timeout(
+                            Duration::from_secs(5),
+                            state.manager_completion_wakeup.notified(),
+                        )
+                        .await?;
+                        // The assertion deadline expires before any fallback tick.
+                        Instant::now() + Duration::from_secs(60)
+                    } else {
+                        // Without a listener the publisher must use its fallback.
+                        Instant::now()
+                    };
+                    let publication_stop = CancellationToken::new();
+                    let _publication_guard = publication_stop.clone().drop_guard();
+                    let publication_task =
+                        tokio::spawn(attune_api::manager_completion_publication::run(
+                            state,
+                            publication_stop.clone(),
+                            time::interval_at(first_tick, Duration::from_secs(1)),
+                        ));
+                    let work_result = time::timeout(
+                        Duration::from_secs(20),
+                        finish_and_wait_for_receipt(
+                            pool, &publisher, scope, action, owner, worker, &key,
+                        ),
+                    )
+                    .await;
+                    publication_stop.cancel();
+                    time::timeout(Duration::from_secs(5), publication_task).await??;
+                    work_result??;
+                    Ok(())
                 }
-            }).await??;
-            assert_eq!(offer.execution, requested.id);
-            assert_eq!(offer.worker, worker);
-            let mut tx = pool.begin().await?;
-            Assignments::claim(&mut tx, scope, offer.id, Uuid::new_v4()).await?;
-            Assignments::finish(&mut tx, scope, offer.id, "service-fingerprint", ExecutionStatus::Completed,
-                json!({"succeeded":true}), &key).await?;
-            tx.commit().await?;
-            tokio::time::timeout(std::time::Duration::from_secs(15), async {
-                loop {
-                    let processed: bool = sqlx::query_scalar("SELECT processed_at IS NOT NULL FROM manager_execution_completion WHERE assignment = $1")
-                        .bind(offer.id).fetch_one(pool).await?;
-                    if processed { return Ok::<_, sqlx::Error>(()); }
-                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                .await;
+                if let Some(listener) = listener {
+                    listener.shutdown().await;
                 }
-            }).await??;
+                publication_result?;
+            }
             Ok(())
-        }.await;
-        publication_stop.cancel();
-        tokio::time::timeout(std::time::Duration::from_secs(15), publication_task).await??;
+        }
+        .await;
         executor.stop().await?;
         tokio::time::timeout(std::time::Duration::from_secs(15), executor_task).await???;
         drop(publisher);
