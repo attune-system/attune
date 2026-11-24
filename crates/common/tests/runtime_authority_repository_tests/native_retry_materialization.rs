@@ -396,8 +396,11 @@ async fn retry_target_advisory_contention_never_waits_behind_its_source_share_fe
     blocker.commit().await.unwrap();
     fixture.db.cleanup().await.unwrap();
     assert!(
-        matches!(result, Ok(Err(_))),
-        "target advisory lock waited behind retained source owner locks"
+        matches!(
+            result,
+            Ok(Err(attune_common::Error::ExecutionContention(_)))
+        ),
+        "retry must report workflow contention without waiting behind retained source owner locks"
     );
 }
 

@@ -79,6 +79,29 @@ async fn first_workflow_attempt_recovery_preserves_current_task_and_pause_guards
 #[tokio::test]
 async fn workflow_retry_republication_delegates_existing_continuation_and_receipt_guards() {
     let (db, retry) = super::native_retry_materialization::requested_retry_fixture().await;
+    let mut rejected = db.begin().await.unwrap();
+    let publication = Requested::prepare(
+        &mut rejected,
+        &retry,
+        "native-retry-test-owned-encryption-key",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    publication.lock_target(&mut rejected).await.unwrap();
+    let failure = publication
+        .publish_bounded(&mut rejected, async {
+            Err(attune_common::mq::MqError::Publish(
+                "fixture unavailable".into(),
+            ))
+        })
+        .await;
+    assert!(
+        matches!(failure, Err(attune_common::Error::MessageQueue(error))
+        if matches!(*error, attune_common::mq::MqError::Publish(_)))
+    );
+    rejected.rollback().await.unwrap();
+
     let mut tx = db.begin().await.unwrap();
     let prepared = Requested::prepare(&mut tx, &retry, "native-retry-test-owned-encryption-key")
         .await

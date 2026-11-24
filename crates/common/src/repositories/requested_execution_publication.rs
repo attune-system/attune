@@ -318,8 +318,8 @@ where
     F: std::future::Future<Output = crate::mq::MqResult<()>>,
 {
     tokio::time::timeout(std::time::Duration::from_secs(5), publish).await
-        .map_err(|_| Error::Timeout("Requested publication acknowledgement is unknown; retain the existing row for recovery".into()))??;
-    Ok(())
+        .map_err(|_| Error::Timeout("Requested publication acknowledgement is unknown; retain the existing row for recovery".into()))?
+        .map_err(|error| Error::MessageQueue(Box::new(error)))
 }
 
 async fn transaction(conn: &mut PgConnection) -> Result<String> {

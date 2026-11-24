@@ -77,7 +77,9 @@ struct QueueDispatchCompletionFailure {
 
 impl CompletionListener {
     fn retryable_mq_error(error: &anyhow::Error) -> Option<MqError> {
-        let mq_error = error.downcast_ref::<MqError>()?;
+        let mq_error = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<MqError>())?;
         Some(match mq_error {
             MqError::Connection(msg) => MqError::Connection(msg.clone()),
             MqError::Channel(msg) => MqError::Channel(msg.clone()),
@@ -91,6 +93,21 @@ impl CompletionListener {
 
     fn retryable_manager_error(error: &anyhow::Error) -> Option<MqError> {
         if let Some(error) = Self::retryable_mq_error(error) {
+            return Some(error);
+        }
+        if let Some(error) =
+            error
+                .chain()
+                .find_map(|cause| match cause.downcast_ref::<attune_common::Error>() {
+                    Some(attune_common::Error::Timeout(message)) => {
+                        Some(MqError::Timeout(message.clone()))
+                    }
+                    Some(attune_common::Error::ExecutionContention(message)) => {
+                        Some(MqError::Pool(message.clone()))
+                    }
+                    _ => None,
+                })
+        {
             return Some(error);
         }
         let database_error = error
@@ -1321,6 +1338,29 @@ mod tests {
         })
         .await
         .expect("queue state did not converge before the deadline");
+    }
+
+    #[test]
+    fn manager_completion_retries_contended_and_unconfirmed_workflow_retries() {
+        use attune_common::Error;
+
+        let contention = Error::ExecutionContention("workflow 1".into());
+        assert!(matches!(
+            CompletionListener::retryable_manager_error(&contention.into()),
+            Some(MqError::Pool(_))
+        ));
+        let publication = Error::MessageQueue(Box::new(MqError::Publish("fixture".into())));
+        assert!(matches!(
+            CompletionListener::retryable_manager_error(&publication.into()),
+            Some(MqError::Publish(_))
+        ));
+        let timeout = Error::Timeout("fixture unknown confirmation".into());
+        assert!(matches!(
+            CompletionListener::retryable_manager_error(&timeout.into()),
+            Some(MqError::Timeout(_))
+        ));
+        let forbidden = Error::PermissionDenied("fixture invalid grant".into());
+        assert!(CompletionListener::retryable_manager_error(&forbidden.into()).is_none());
     }
 
     #[test]
