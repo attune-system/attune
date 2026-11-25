@@ -255,14 +255,14 @@ impl Connection {
         let mut conn_guard = self.connection.write().await;
         if let Some(conn) = conn_guard.take() {
             let status = conn.status();
-            if status.closing() || status.closed() {
-                info!("Connection already closing or closed");
+            if status.closing() || status.closed() || status.errored() {
+                info!("Connection already closing or disconnected");
                 return Ok(());
             }
 
             match conn.close(200, "Normal shutdown".into()).await {
                 Ok(()) => info!("Connection closed"),
-                Err(e) if is_expected_shutdown_error(&e) => {
+                Err(e) if status.errored() || is_expected_shutdown_error(&e) => {
                     info!("Connection was already shutting down");
                 }
                 Err(e) => {

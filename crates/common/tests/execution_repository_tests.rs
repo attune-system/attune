@@ -16,6 +16,122 @@ use attune_common::{
 use helpers::*;
 use serde_json::json;
 
+#[tokio::test]
+async fn completion_keys_group_nested_and_outer_tasks_by_workflow_root() -> attune_common::Result<()>
+{
+    use attune_common::{
+        models::Id,
+        repositories::{
+            execution_admission::ExecutionAdmissionRepository,
+            workflow::{
+                CreateWorkflowDefinitionInput, CreateWorkflowExecutionInput,
+                WorkflowDefinitionRepository, WorkflowExecutionRepository,
+            },
+        },
+    };
+
+    let pool = create_test_pool().await?;
+    let pack = PackFixture::new_unique("completion_keys")
+        .create(&pool)
+        .await?;
+    let action = ActionFixture::new_unique(pack.id, &pack.r#ref, "task")
+        .create(&pool)
+        .await?;
+    let definition = WorkflowDefinitionRepository::create(
+        &pool,
+        CreateWorkflowDefinitionInput {
+            r#ref: format!("{}.workflow", pack.r#ref),
+            pack: pack.id,
+            pack_ref: pack.r#ref,
+            label: "Completion keys".into(),
+            description: None,
+            version: "1.0.0".into(),
+            param_schema: None,
+            out_schema: None,
+            definition: json!({}),
+            tags: Vec::new(),
+        },
+    )
+    .await?;
+    let create_execution = |parent: Option<(Id, Id)>, task_name: &str| {
+        ExecutionRepository::create(
+            &pool,
+            CreateExecutionInput {
+                action: Some(action.id),
+                action_ref: action.r#ref.clone(),
+                parent: parent.map(|(execution, _)| execution),
+                workflow_task: parent.map(|(_, workflow)| {
+                    serde_json::from_value(json!({
+                        "workflow_execution": workflow,
+                        "task_name": task_name,
+                        "retry_count": 0,
+                        "max_retries": 0,
+                        "timed_out": false,
+                    }))
+                    .unwrap()
+                }),
+                status: ExecutionStatus::Running,
+                ..Default::default()
+            },
+        )
+    };
+    let create_workflow = |execution| {
+        WorkflowExecutionRepository::create(
+            &pool,
+            CreateWorkflowExecutionInput {
+                execution,
+                workflow_def: definition.id,
+                task_graph: json!({}),
+                variables: json!({}),
+                status: ExecutionStatus::Running,
+            },
+        )
+    };
+    let outer = create_execution(None, "outer").await?;
+    let root = create_workflow(outer.id).await?;
+    let parent = Some((outer.id, root.id));
+    let sibling = create_execution(parent, "sibling").await?;
+    let nested = create_execution(parent, "nested").await?;
+    let nested_workflow = create_workflow(nested.id).await?;
+    let leaf = create_execution(Some((nested.id, nested_workflow.id)), "leaf").await?;
+    let other = create_execution(None, "independent").await?;
+    // The standard create path writes JSON null. Both representations of
+    // absent workflow task metadata must terminate the ancestry walk.
+    sqlx::query("UPDATE execution SET workflow_task = NULL WHERE id = $1")
+        .bind(other.id)
+        .execute(pool.pool())
+        .await?;
+    let other_root = create_workflow(other.id).await?;
+    let other_leaf = create_execution(Some((other.id, other_root.id)), "leaf").await?;
+
+    for related in [sibling.id, nested.id, leaf.id] {
+        assert_eq!(
+            ExecutionRepository::completion_workflow_key(&pool, related).await?,
+            Some(root.id)
+        );
+    }
+    assert_eq!(
+        ExecutionRepository::completion_workflow_key(&pool, other_leaf.id).await?,
+        Some(other_root.id)
+    );
+    assert_eq!(
+        ExecutionRepository::completion_workflow_key(&pool, outer.id).await?,
+        None
+    );
+
+    // Releasing an active policy slot can dispatch across workflows.
+    assert!(
+        ExecutionAdmissionRepository::try_acquire(&pool, action.id, leaf.id, 2, None)
+            .await?
+            .acquired
+    );
+    assert_eq!(
+        ExecutionRepository::completion_workflow_key(&pool, leaf.id).await?,
+        None
+    );
+    pool.cleanup().await
+}
+
 // ============================================================================
 // CREATE Tests
 // ============================================================================

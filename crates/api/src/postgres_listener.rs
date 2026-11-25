@@ -1,10 +1,13 @@
 //! PostgreSQL LISTEN/NOTIFY listener for SSE broadcasting
 
 use sqlx::postgres::{PgListener, PgPool};
-use tokio::sync::{broadcast, watch};
+use std::sync::Arc;
+use tokio::sync::{broadcast, watch, Notify};
 use tracing::{debug, error, info, warn};
 
-use attune_common::repositories::manager_assignment::MANAGER_WORK_WAKEUP;
+use attune_common::repositories::manager_assignment::{
+    MANAGER_COMPLETION_WAKEUP, MANAGER_WORK_WAKEUP,
+};
 
 use crate::log_stream_wakeups::LogStreamWakeups;
 
@@ -29,6 +32,7 @@ const NOTIFICATION_CHANNELS: &[&str] = &[
     "work_queue_item_updated",
     LOG_STREAM_CHANNEL,
     MANAGER_WORK_WAKEUP,
+    MANAGER_COMPLETION_WAKEUP,
 ];
 
 #[derive(Debug, serde::Deserialize, PartialEq, Eq)]
@@ -78,6 +82,7 @@ pub fn spawn_postgres_listener(
     broadcast_tx: broadcast::Sender<String>,
     log_stream_wakeups: LogStreamWakeups,
     manager_work_wakeups: LogStreamWakeups,
+    manager_completion_wakeup: Arc<Notify>,
 ) -> PostgresListener {
     info!("Starting PostgreSQL notification listener for SSE broadcasting");
     let (ready_tx, ready) = watch::channel(false);
@@ -86,6 +91,7 @@ pub fn spawn_postgres_listener(
         broadcast_tx,
         log_stream_wakeups,
         manager_work_wakeups,
+        manager_completion_wakeup,
         ready_tx,
     ));
     PostgresListener { task, ready }
@@ -96,6 +102,7 @@ async fn run_postgres_listener(
     broadcast_tx: broadcast::Sender<String>,
     log_stream_wakeups: LogStreamWakeups,
     manager_work_wakeups: LogStreamWakeups,
+    manager_completion_wakeup: Arc<Notify>,
     ready: watch::Sender<bool>,
 ) {
     loop {
@@ -109,6 +116,7 @@ async fn run_postgres_listener(
         };
         let readers = log_stream_wakeups.wake_all();
         manager_work_wakeups.wake_all();
+        manager_completion_wakeup.notify_one();
         ready.send_replace(true);
         info!(readers, "PostgreSQL notification listener connected");
 
@@ -121,6 +129,7 @@ async fn run_postgres_listener(
                         &broadcast_tx,
                         &log_stream_wakeups,
                         &manager_work_wakeups,
+                        &manager_completion_wakeup,
                     );
                 }
                 Err(error) => {
@@ -148,12 +157,17 @@ fn route_notification(
     broadcast_tx: &broadcast::Sender<String>,
     log_stream_wakeups: &LogStreamWakeups,
     manager_work_wakeups: &LogStreamWakeups,
+    manager_completion_wakeup: &Notify,
 ) {
     debug!(
         channel,
         payload_len = payload.len(),
         "Received PostgreSQL notification"
     );
+    if channel == MANAGER_COMPLETION_WAKEUP {
+        manager_completion_wakeup.notify_one();
+        return;
+    }
     if channel == MANAGER_WORK_WAKEUP {
         if let Ok(session) = payload.parse::<i64>() {
             manager_work_wakeups.wake(session);
@@ -209,10 +223,31 @@ mod tests {
             &broadcast_tx,
             &wakeups,
             &LogStreamWakeups::default(),
+            &Notify::new(),
         );
 
         assert!(subscription.wait(tokio::time::Duration::from_secs(1)).await);
         assert!(broadcast_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retains_completion_wakeup_for_the_publisher() {
+        let (broadcast_tx, mut receiver) = broadcast::channel(1);
+        let wakeup = Notify::new();
+
+        route_notification(
+            MANAGER_COMPLETION_WAKEUP,
+            "",
+            &broadcast_tx,
+            &LogStreamWakeups::default(),
+            &LogStreamWakeups::default(),
+            &wakeup,
+        );
+
+        tokio::time::timeout(tokio::time::Duration::ZERO, wakeup.notified())
+            .await
+            .unwrap();
+        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test(start_paused = true)]
@@ -226,6 +261,7 @@ mod tests {
             &broadcast_tx,
             &wakeups,
             &LogStreamWakeups::default(),
+            &Notify::new(),
         );
 
         let wait = tokio::spawn(async move {

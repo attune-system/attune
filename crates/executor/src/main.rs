@@ -81,27 +81,36 @@ async fn main() -> Result<()> {
         info!("Message Queue: {}", mask_connection_url(&mq_config.url));
     }
 
-    // Create executor service
-    let service = ExecutorService::new(config).await?;
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    let service = tokio::select! {
+        biased;
+        signal = &mut shutdown => {
+            signal?;
+            info!("Shutdown signal received during executor initialization");
+            return Ok(());
+        }
+        service = ExecutorService::new(config) => service?,
+    };
 
     info!("Executor Service initialized successfully");
 
-    // Set up graceful shutdown handler
-    let service_clone = service.clone();
-    tokio::spawn(async move {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            error!("Failed to listen for shutdown signal: {}", e);
-        } else {
-            info!("Shutdown signal received");
-            if let Err(e) = service_clone.stop().await {
-                error!("Error during shutdown: {}", e);
-            }
-        }
-    });
-
-    // Start the service
     info!("Starting Executor Service components...");
-    if let Err(e) = service.start().await {
+    let mut running = Box::pin(service.start());
+    let result = tokio::select! {
+        biased;
+        signal = &mut shutdown => {
+            if signal.is_ok() {
+                info!("Shutdown signal received");
+            }
+            service.stop().await?;
+            let result = running.await;
+            signal?;
+            result
+        }
+        result = &mut running => result,
+    };
+    if let Err(e) = result {
         error!("Executor Service error: {}", e);
         return Err(e);
     }
@@ -109,6 +118,20 @@ async fn main() -> Result<()> {
     info!("Executor Service has shut down gracefully");
 
     Ok(())
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> std::io::Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        _ = terminate.recv() => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
 }
 
 /// Return connection metadata that is safe to include in logs.

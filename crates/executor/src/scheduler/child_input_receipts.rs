@@ -8,7 +8,7 @@ use attune_common::repositories::{
     execution_runtime_admission::ExistingExecutionAuthority,
     inherited_input::ReceiptContext,
     native_input_origin::{NativeInputClosure, NativeInputOriginRepository},
-    runtime_authority::ApprovalEffectFence,
+    runtime_authority::{ApprovalEffectFence, RuntimeOwner},
 };
 
 pub(super) struct PreparedExecutionInputs {
@@ -80,8 +80,13 @@ impl TransactionInputReceipts {
         );
         // Ownership and an absent admission cannot select authority. In
         // particular, a lost/revoked recorded admission must never borrow IAM.
-        let authority = Admission::existing_authority(conn, execution.id).await?;
+        let authority = Admission::selected_authority(conn, execution.id).await?;
         let (receipts, acceptance, source) = if authority == ExistingExecutionAuthority::Recorded {
+            Box::pin(Admission::require(
+                conn,
+                RuntimeOwner::Execution(execution.id),
+            ))
+            .await?;
             let key = encryption_key.ok_or_else(|| {
                 attune_common::Error::PermissionDenied(
                     "Accepted workflow input encryption is unavailable".into(),
@@ -116,14 +121,15 @@ impl TransactionInputReceipts {
             attune_common::Error::PermissionDenied("Workflow input parent is unavailable".into())
         })?;
         anyhow::ensure!(
-            Admission::existing_authority(conn, parent_id).await?
+            Admission::selected_authority(conn, parent_id).await?
                 == ExistingExecutionAuthority::Delegated,
             attune_common::Error::PermissionDenied(
                 "Delegated workflow input requires a delegated parent".into()
             )
         );
-        // This retains the active owner, immutable executable/schema, open
-        // parent producer and selected-grant ceiling, including `standard`.
+        // Validate both selections here. The live owner, immutable executable
+        // and schema, open parent, and grant ceiling remain fenced for this
+        // transaction.
         DelegatedExecutionRepository::validate_child(conn, parent_id, execution.id).await?;
         if let Some(task) = &execution.workflow_task {
             let workflow =

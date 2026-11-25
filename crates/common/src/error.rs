@@ -176,6 +176,14 @@ pub enum Error {
     #[error("Execution error: {0}")]
     Execution(String),
 
+    /// A conflicting operation owns the execution or workflow lock.
+    #[error("Execution is busy: {0}")]
+    ExecutionContention(String),
+
+    /// A broker failure whose cause must survive the repository boundary.
+    #[error("Message queue error: {0}")]
+    MessageQueue(#[source] Box<MqError>),
+
     /// Schema validation errors
     #[error("Schema validation error: {0}")]
     SchemaValidation(String),

@@ -145,6 +145,7 @@ jobs:
           python3 -m pip install --disable-pip-version-check 'PyYAML==6.0.3'
           python3 scripts/test_optional_cli_release.py
           bash -n docker/run-migrations.sh scripts/build-linux-packages.sh scripts/sign-arch-packages.sh scripts/verify-arch-package-signatures.sh scripts/test-arch-package-signatures.sh scripts/upload-release-asset.sh scripts/test-upload-release-asset.sh scripts/verify-release-assets.sh scripts/test-verify-release-assets.sh scripts/check-db-test-threads.sh scripts/database-test-ignore-policy.sh scripts/run-ci-rust-tests.sh scripts/run-integration-tests.sh scripts/run-rust-integration-tests.sh scripts/cleanup-test-schemas.sh scripts/ci-test-db-safety.sh scripts/test-test-isolation-guards.sh
+          python3 scripts/run-ci-completion-broker-tests.py --help >/dev/null
           bash scripts/test-test-isolation-guards.sh
           bash scripts/test-arch-package-signatures.sh
           bash scripts/test-upload-release-asset.sh
@@ -354,6 +355,7 @@ jobs:
 
       - name: Tests
         env:
+          ATTUNE_CI_BROKER_TEST_ARTIFACTS: ${{ runner.temp }}/completion-test-artifacts.jsonl
           ATTUNE_TEST_S3_ENDPOINT: http://127.0.0.1:59000
           ATTUNE_TEST_S3_BUCKET: attune-runtime-log-tests
           ATTUNE_TEST_S3_PREFIX: runtime-log-tests/attune-runtime-log-ci-${{ github.run_id }}-${{ github.run_attempt }}
@@ -396,10 +398,17 @@ jobs:
           cargo test --manifest-path crates/core-timer-sensor/Cargo.toml --locked
           -- --test-threads=4
 
-      - name: Executor broker integration test
-        run: >-
-          cargo test -p attune-executor --lib service::tests::test_service_creation
-          -- --ignored --exact --nocapture --test-threads=4
+      - name: Completion broker integration tests
+        env:
+          ATTUNE_CI_BROKER_TEST_ARTIFACTS: ${{ runner.temp }}/completion-test-artifacts.jsonl
+          RABBITMQ_CONTAINER_ID: ${{ job.services.rabbitmq.id }}
+          COMPLETION_VHOST: completion-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          docker exec "$RABBITMQ_CONTAINER_ID" rabbitmqctl add_vhost "$COMPLETION_VHOST"
+          docker exec "$RABBITMQ_CONTAINER_ID" rabbitmqctl set_permissions -p "$COMPLETION_VHOST" attune '.*' '.*' '.*'
+          export ATTUNE_TEST_RABBITMQ_URL="$ATTUNE__MESSAGE_QUEUE__URL"
+          export ATTUNE_MANAGER_TEST_AMQP_URL="amqp://attune:attune@localhost:5672/$COMPLETION_VHOST"
+          python3 scripts/run-ci-completion-broker-tests.py run "$ATTUNE_CI_BROKER_TEST_ARTIFACTS"
 
       - name: Stop runtime-log test storage
         if: always()

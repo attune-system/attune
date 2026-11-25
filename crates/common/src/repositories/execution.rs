@@ -560,6 +560,36 @@ impl ExecutionRepository {
             .await
             .map_err(Into::into)
     }
+
+    /// Order child completions by the root workflow. Finishing a nested
+    /// workflow changes the status of its execution in the parent workflow.
+    /// Wait targets, dispatches, and policy slot releases can affect other
+    /// workflows, so those deliveries run alone.
+    pub async fn completion_workflow_key(pool: &PgPool, id: Id) -> Result<Option<Id>> {
+        let key = sqlx::query_scalar::<_, Id>(
+            "WITH RECURSIVE ancestry(id) AS (
+                 SELECT (e.workflow_task->>'workflow_execution')::bigint
+                 FROM execution e
+                 WHERE e.id = $1 AND e.workflow_task->>'workflow_execution' IS NOT NULL
+                 AND NOT EXISTS (SELECT 1 FROM workflow_task_wait w WHERE w.target_execution = e.id)
+                 AND NOT EXISTS (SELECT 1 FROM work_queue_dispatch d WHERE d.execution = e.id)
+                 AND NOT EXISTS (SELECT 1 FROM execution_admission_entry a
+                                 WHERE a.execution_id = e.id AND a.status = 'active')
+                 UNION
+                 SELECT (owner.workflow_task->>'workflow_execution')::bigint
+                 FROM ancestry a JOIN workflow_execution w ON w.id = a.id
+                 JOIN execution owner ON owner.id = w.execution
+                 WHERE owner.workflow_task->>'workflow_execution' IS NOT NULL
+             )
+             SELECT a.id FROM ancestry a JOIN workflow_execution w ON w.id = a.id
+             JOIN execution owner ON owner.id = w.execution
+             WHERE owner.workflow_task IS NULL OR owner.workflow_task = 'null'::jsonb",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(key)
+    }
 }
 
 impl Repository for ExecutionRepository {
