@@ -242,7 +242,7 @@ jobs:
       CARGO_PROFILE_TEST_LTO: "off"
       CARGO_PROFILE_DEV_STRIP: debuginfo
       CARGO_PROFILE_TEST_STRIP: debuginfo
-      CARGO_BUILD_JOBS: "2"
+      CARGO_BUILD_JOBS: "4"
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -325,6 +325,15 @@ jobs:
 
       - name: Workspace doctests
         run: cargo test --workspace --all-features --doc -- --test-threads=4
+
+      - name: Record Rust build resource usage
+        if: always()
+        run: |
+          df -h . "$RUNNER_TEMP"
+          free -h
+          if [ -r /sys/fs/cgroup/memory.peak ]; then
+            awk '{print "Runner cgroup peak memory (bytes):", $1}' /sys/fs/cgroup/memory.peak
+          fi
 
   rust-test:
     name: Tests (shard ${{ matrix.shard }})

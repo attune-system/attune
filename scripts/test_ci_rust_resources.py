@@ -21,7 +21,7 @@ PROFILE_ENV = {
     "CARGO_PROFILE_TEST_LTO": "off",
     "CARGO_PROFILE_DEV_STRIP": "debuginfo",
     "CARGO_PROFILE_TEST_STRIP": "debuginfo",
-    "CARGO_BUILD_JOBS": "2",
+    "CARGO_BUILD_JOBS": "4",
 }
 TEST_COMMANDS = {
     "Tests": 'scripts/run-ci-rust-tests.sh "${{ matrix.shard }}"',
