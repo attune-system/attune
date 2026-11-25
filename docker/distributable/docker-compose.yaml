@@ -224,6 +224,7 @@ services:
     <<: *attune-service-logging
     image: ${ATTUNE_IMAGE_REGISTRY:-ghcr.io/attune-system}/attune/executor:${ATTUNE_IMAGE_TAG:-latest}
     container_name: attune-executor
+    stop_grace_period: 45s
     environment:
       RUST_LOG: info
       ATTUNE_CONFIG: /opt/attune/config/config.yaml

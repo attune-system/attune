@@ -8,7 +8,7 @@
 //! - Orchestrates workflows (parent-child executions)
 //! - Handles human-in-the-loop inquiries
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use attune_common::{
     artifact_transport::{ApiTransport, ArtifactFileTransport},
     auth::{jwt::JwtConfig, WorkerTokenProvider},
@@ -20,8 +20,8 @@ use attune_common::{
     system_alert::{emit_core_alert, SystemAlert},
 };
 use sqlx::PgPool;
-use std::sync::Arc;
-use tokio::task::JoinHandle;
+use std::{num::NonZeroUsize, sync::Arc};
+use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
 use crate::completion_listener::CompletionListener;
@@ -46,7 +46,16 @@ use attune_common::{
     },
 };
 
+const COMPLETION_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const WORKFLOW_LOG_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const RESOURCE_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+struct PreparedProcessors {
+    subscriptions: Option<Vec<SubscriptionObservation>>,
+    completion_consumer: Arc<Consumer>,
+    completion_listener: CompletionListener,
+    workflow_log_dispatcher: WorkflowLogDispatcher,
+}
 
 /// Main executor service that orchestrates execution processing
 #[derive(Clone)]
@@ -90,7 +99,7 @@ struct ExecutorServiceInner {
     scheduler_metadata_caches: Arc<SchedulerMetadataCaches>,
 
     /// Service shutdown signal
-    shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    shutdown_requested: tokio::sync::watch::Sender<bool>,
 }
 
 impl ExecutorService {
@@ -234,8 +243,8 @@ impl ExecutorService {
             enforcements_queue, execution_requests_queue, execution_status_queue
         );
 
-        // Create shutdown channel
-        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        // Retain the stop request even if startup is still in progress.
+        let (shutdown_requested, _) = tokio::sync::watch::channel(false);
 
         // Initialize queue manager with default configuration and database pool
         let queue_config = QueueConfig::default();
@@ -261,7 +270,7 @@ impl ExecutorService {
             policy_enforcer,
             queue_manager,
             scheduler_metadata_caches: Arc::new(SchedulerMetadataCaches::new()),
-            shutdown_tx,
+            shutdown_requested,
             mq_config: Arc::new(mq_config),
             consumer_tag_prefix,
         };
@@ -275,14 +284,12 @@ impl ExecutorService {
         format!("{}.{}", self.inner.consumer_tag_prefix, name)
     }
 
-    /// Start the executor service
-    pub async fn start(&self) -> Result<()> {
-        info!("Starting Executor Service");
-        let recorded_identity = RecordedConsumerIdentity::from_environment()?.map(Arc::new);
+    async fn prepare_processors(
+        &self,
+        recorded_identity: Option<Arc<RecordedConsumerIdentity>>,
+        tasks: &mut JoinSet<Result<()>>,
+    ) -> Result<PreparedProcessors> {
         let mut recorded_subscriptions = recorded_identity.as_ref().map(|_| Vec::new());
-
-        // Spawn message consumers
-        let mut handles: Vec<JoinHandle<Result<()>>> = Vec::new();
         let api_url = std::env::var("ATTUNE_API_URL").unwrap_or_else(|_| {
             format!(
                 "http://{}:{}",
@@ -335,7 +342,7 @@ impl ExecutorService {
             Self::observe_subscription(event_consumer, &mut recorded_subscriptions),
             self.inner.config.security.encryption_key.clone(),
         );
-        handles.push(tokio::spawn(async move { event_processor.start().await }));
+        tasks.spawn(async move { event_processor.start().await });
 
         // Start completion listener with its own consumer
         info!("Starting completion listener...");
@@ -358,9 +365,11 @@ impl ExecutorService {
             },
         )
         .await?;
+        let completion_consumer =
+            Self::observe_subscription(completion_consumer, &mut recorded_subscriptions);
         let completion_listener = CompletionListener::new(
             self.inner.pool.clone(),
-            Self::observe_subscription(completion_consumer, &mut recorded_subscriptions),
+            completion_consumer.clone(),
             self.inner.publisher.clone(),
             self.inner.queue_manager.clone(),
             self.inner.config.artifacts_dir.clone(),
@@ -370,10 +379,6 @@ impl ExecutorService {
             self.inner.config.artifacts.flush_interval_ms,
         )
         .with_workflow_log_transport(workflow_log_transport.clone());
-        handles.push(tokio::spawn(
-            async move { completion_listener.start().await },
-        ));
-
         // Start enforcement processor with its own consumer
         info!("Starting enforcement processor...");
         let enforcements_queue = self
@@ -403,9 +408,7 @@ impl ExecutorService {
             self.inner.queue_manager.clone(),
             self.inner.config.security.encryption_key.clone(),
         );
-        handles.push(tokio::spawn(
-            async move { enforcement_processor.start().await },
-        ));
+        tasks.spawn(async move { enforcement_processor.start().await });
 
         // Start execution scheduler with its own consumer
         info!("Starting execution scheduler...");
@@ -441,7 +444,7 @@ impl ExecutorService {
         )
         .with_workflow_log_transport(workflow_log_transport.clone())
         .with_recorded_identity(recorded_identity.clone());
-        handles.push(tokio::spawn(async move { scheduler.start().await }));
+        tasks.spawn(async move { scheduler.start().await });
 
         // Start execution manager with its own consumer
         info!("Starting execution manager...");
@@ -470,7 +473,7 @@ impl ExecutorService {
             Self::observe_subscription(manager_consumer, &mut recorded_subscriptions),
             self.inner.config.security.encryption_key.clone(),
         );
-        handles.push(tokio::spawn(async move { execution_manager.start().await }));
+        tasks.spawn(async move { execution_manager.start().await });
 
         // Start inquiry handler with its own consumer
         info!("Starting inquiry handler...");
@@ -499,7 +502,7 @@ impl ExecutorService {
             Self::observe_subscription(inquiry_consumer, &mut recorded_subscriptions),
             self.inner.config.security.encryption_key.clone(),
         );
-        handles.push(tokio::spawn(async move { inquiry_handler.start().await }));
+        tasks.spawn(async move { inquiry_handler.start().await });
 
         // Start pack test processor with its own consumer
         info!("Starting pack test processor...");
@@ -520,16 +523,14 @@ impl ExecutorService {
             self.inner.publisher.clone(),
             Arc::new(pack_tests_consumer),
         );
-        handles.push(tokio::spawn(
-            async move { pack_test_processor.start().await },
-        ));
+        tasks.spawn(async move { pack_test_processor.start().await });
 
         // Start inquiry timeout checker
         info!("Starting inquiry timeout checker...");
         let timeout_pool = self.inner.pool.clone();
         let timeout_publisher = self.inner.publisher.clone();
         let timeout_encryption_key = self.inner.config.security.encryption_key.clone();
-        handles.push(tokio::spawn(async move {
+        tasks.spawn(async move {
             InquiryHandler::timeout_check_loop(
                 timeout_pool,
                 timeout_publisher,
@@ -538,7 +539,7 @@ impl ExecutorService {
             )
             .await;
             Ok(())
-        }));
+        });
 
         // Start metadata invalidation consumer (per-instance ephemeral queue)
         info!("Starting metadata invalidation consumer...");
@@ -550,7 +551,7 @@ impl ExecutorService {
             .expect("message queue configuration was validated during initialization")
             .url
             .clone();
-        handles.push(tokio::spawn(Self::run_metadata_invalidation_consumer(
+        tasks.spawn(Self::run_metadata_invalidation_consumer(
             metadata_mq_url,
             self.inner
                 .mq_config
@@ -561,16 +562,16 @@ impl ExecutorService {
                 .clone(),
             self.consumer_tag("metadata.invalidation"),
             self.inner.scheduler_metadata_caches.clone(),
-        )));
+        ));
 
         // Start worker heartbeat monitor
         info!("Starting worker heartbeat monitor...");
         let worker_pool = self.inner.pool.clone();
         let worker_publisher = self.inner.publisher.clone();
-        handles.push(tokio::spawn(async move {
+        tasks.spawn(async move {
             Self::worker_heartbeat_monitor_loop(worker_pool, worker_publisher, 60).await;
             Ok(())
-        }));
+        });
 
         // Start execution timeout monitor
         info!("Starting execution timeout monitor...");
@@ -604,7 +605,7 @@ impl ExecutorService {
             self.inner.publisher.clone(),
             timeout_config,
         ));
-        handles.push(tokio::spawn(async move { timeout_monitor.start().await }));
+        tasks.spawn(async move { timeout_monitor.start().await });
 
         // Start work queue dispatcher
         info!("Starting work queue dispatcher...");
@@ -614,7 +615,7 @@ impl ExecutorService {
             self.inner.config.security.encryption_key.clone(),
             recorded_identity.clone(),
         );
-        handles.push(tokio::spawn(async move { queue_dispatcher.start().await }));
+        tasks.spawn(async move { queue_dispatcher.start().await });
 
         // Start dead letter handler (if DLQ is enabled)
         if self.inner.mq_config.rabbitmq.dead_letter.enabled {
@@ -633,12 +634,12 @@ impl ExecutorService {
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to create DLQ handler: {}", e))?,
             );
-            handles.push(tokio::spawn(async move {
+            tasks.spawn(async move {
                 dlq_handler
                     .start()
                     .await
                     .map_err(|e| anyhow::anyhow!("DLQ handler error: {}", e))
-            }));
+            });
         } else {
             info!("Dead letter queue is disabled, skipping DLQ handler");
         }
@@ -651,46 +652,106 @@ impl ExecutorService {
             self.inner.config.artifacts.flush_interval_ms,
         )
         .with_recorded_transport(workflow_log_api, jwt_config);
-        let workflow_log_shutdown = self.inner.shutdown_tx.subscribe();
+        Ok(PreparedProcessors {
+            subscriptions: recorded_subscriptions,
+            completion_consumer,
+            completion_listener,
+            workflow_log_dispatcher,
+        })
+    }
+
+    /// Start the executor service
+    pub async fn start(&self) -> Result<()> {
+        info!("Starting Executor Service");
+        let recorded_identity = RecordedConsumerIdentity::from_environment()?.map(Arc::new);
+        let mut tasks = JoinSet::new();
+        let mut shutdown = self.inner.shutdown_requested.subscribe();
+        let prepared = tokio::select! {
+            biased;
+            _ = shutdown.wait_for(|requested| *requested) => Ok(None),
+            result = self.prepare_processors(recorded_identity.clone(), &mut tasks) => result.map(Some),
+        };
+        let PreparedProcessors {
+            subscriptions: recorded_subscriptions,
+            completion_consumer,
+            completion_listener,
+            workflow_log_dispatcher,
+        } = match prepared {
+            Ok(Some(prepared)) => prepared,
+            result => {
+                tasks.shutdown().await;
+                let cleanup = self.close_resources().await;
+                if let Err(error) = result {
+                    if let Err(cleanup_error) = cleanup {
+                        warn!(%cleanup_error, "Failed to close executor resources after startup error");
+                    }
+                    return Err(error);
+                }
+                return cleanup;
+            }
+        };
+
+        let completion_concurrency = self
+            .inner
+            .config
+            .executor
+            .as_ref()
+            .and_then(|config| config.completion_concurrency)
+            .unwrap_or(NonZeroUsize::MIN);
+
+        let (workflow_log_stop, workflow_log_shutdown) = tokio::sync::broadcast::channel(1);
         let mut workflow_log_handle =
             tokio::spawn(async move { workflow_log_dispatcher.start(workflow_log_shutdown).await });
+        let mut completion_task = JoinSet::new();
+        if *self.inner.shutdown_requested.borrow() {
+            completion_consumer.request_stop();
+        }
+        completion_task
+            .spawn(async move { completion_listener.start(completion_concurrency).await });
 
         info!("Executor Service started successfully");
         info!("All processors are listening for messages...");
 
         // Wait for shutdown signal
-        let mut shutdown_rx = self.inner.shutdown_tx.subscribe();
         let mut observations = Box::pin(self.observe_recorded_executor(
             recorded_identity.as_deref(),
             recorded_subscriptions.as_deref().unwrap_or_default(),
         ));
-        let mut dispatcher_failure = None;
+        let mut service_failure = None;
         let dispatcher_finished = tokio::select! {
-            _ = shutdown_rx.recv() => {
+            _ = shutdown.wait_for(|requested| *requested) => {
                 info!("Shutdown signal received");
                 false
             }
             () = observations.as_mut() => unreachable!("recorded observation loop returned"),
-            result = Self::wait_for_tasks(handles) => {
+            result = Self::wait_for_tasks(&mut tasks) => {
                 match result {
                     Ok(_) => info!("All tasks completed"),
                     Err(e) => error!("Task error: {}", e),
                 }
                 false
             }
+            result = completion_task.join_next() => {
+                service_failure = Some(match result {
+                    Some(Ok(Err(error))) => error,
+                    Some(Err(error)) => anyhow!("Completion listener task failed: {error}"),
+                    _ => anyhow!("Completion listener stopped unexpectedly"),
+                });
+                false
+            }
             result = &mut workflow_log_handle => {
                 match result {
                     Ok(Ok(())) => {
                         warn!("Workflow log dispatcher stopped unexpectedly");
-                        dispatcher_failure = Some(anyhow!("workflow log dispatcher stopped unexpectedly"));
+                        service_failure = Some(anyhow!("workflow log dispatcher stopped unexpectedly"));
                     }
                     Ok(Err(error)) => {
                         error!("Workflow log dispatcher stopped with error: {error}");
-                        dispatcher_failure = Some(error);
+                        service_failure = Some(error);
                     }
                     Err(error) => {
                         error!("Workflow log dispatcher task panicked: {error}");
-                        dispatcher_failure = Some(anyhow!("workflow log dispatcher task panicked: {error}"));
+                        service_failure = Some(anyhow!("workflow log dispatcher task panicked: {error}"));
                     }
                 }
                 true
@@ -698,22 +759,34 @@ impl ExecutorService {
         };
         drop(observations);
 
-        if dispatcher_finished {
-            let shutdown_was_requested = matches!(
-                shutdown_rx.try_recv(),
-                Ok(())
-                    | Err(tokio::sync::broadcast::error::TryRecvError::Closed)
-                    | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
-            );
-            if shutdown_was_requested {
-                dispatcher_failure = None;
-            }
+        if *shutdown.borrow() {
+            service_failure = None;
         }
 
-        let _ = self.inner.shutdown_tx.send(());
-        if let Some(identity) = &recorded_identity {
-            self.publish_recorded_executor(identity, false).await;
+        completion_consumer.request_stop();
+        let ((), completion_drain) = tokio::join!(
+            async {
+                if let Some(identity) = &recorded_identity {
+                    self.publish_recorded_executor(identity, false).await;
+                }
+            },
+            tokio::time::timeout(COMPLETION_SHUTDOWN_TIMEOUT, completion_task.join_next()),
+        );
+        match completion_drain {
+            Ok(Some(Ok(Err(error)))) => {
+                error!(%error, "Completion listener failed during shutdown")
+            }
+            Ok(Some(Err(error))) => {
+                error!(%error, "Completion listener task failed during shutdown")
+            }
+            Ok(_) => {}
+            Err(_) => {
+                warn!("Completion listener did not drain before the shutdown deadline");
+                completion_task.shutdown().await;
+            }
         }
+        tasks.shutdown().await;
+        let _ = workflow_log_stop.send(());
         if !dispatcher_finished {
             match tokio::time::timeout(WORKFLOW_LOG_SHUTDOWN_TIMEOUT, &mut workflow_log_handle)
                 .await
@@ -728,12 +801,21 @@ impl ExecutorService {
                 }
             }
         }
-        self.inner.pool.close().await;
+        let cleanup = self.close_resources().await;
 
-        if let Some(error) = dispatcher_failure {
+        if let Some(error) = service_failure {
             return Err(error);
         }
-        Ok(())
+        cleanup
+    }
+
+    async fn close_resources(&self) -> Result<()> {
+        let (broker, ()) = tokio::time::timeout(RESOURCE_SHUTDOWN_TIMEOUT, async {
+            tokio::join!(self.inner.mq_connection.close(), self.inner.pool.close())
+        })
+        .await
+        .context("Executor resource shutdown timed out")?;
+        broker.map_err(Into::into)
     }
 
     fn observe_subscription(
@@ -804,18 +886,11 @@ impl ExecutorService {
         }
     }
 
-    /// Stop the executor service
+    /// Request shutdown. The running service drains and closes its resources
+    /// before `start` returns.
     pub async fn stop(&self) -> Result<()> {
         info!("Stopping Executor Service");
-
-        // Send shutdown signal
-        let _ = self.inner.shutdown_tx.send(());
-
-        // Close message queue connection (will close publisher and consumer)
-        self.inner.mq_connection.close().await?;
-
-        info!("Executor Service stopped");
-
+        self.inner.shutdown_requested.send_replace(true);
         Ok(())
     }
 
@@ -1019,9 +1094,9 @@ impl ExecutorService {
     }
 
     /// Wait for all tasks to complete
-    async fn wait_for_tasks(handles: Vec<JoinHandle<Result<()>>>) -> Result<()> {
-        for handle in handles {
-            if let Err(e) = handle.await {
+    async fn wait_for_tasks(tasks: &mut JoinSet<Result<()>>) -> Result<()> {
+        while let Some(result) = tasks.join_next().await {
+            if let Err(e) = result {
                 error!("Task panicked: {}", e);
             }
         }
@@ -1050,7 +1125,6 @@ impl ExecutorService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Context;
     use attune_common::test_database::TestDatabase;
     use lapin::options::{ExchangeDeleteOptions, QueueDeleteOptions};
     use std::{collections::HashSet, time::Duration};
@@ -1058,6 +1132,8 @@ mod tests {
     use uuid::Uuid;
 
     const TEST_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
+
+    include!("service/completion_tests.rs");
 
     struct TestMqTopology {
         config: MessageQueueConfig,
@@ -1193,9 +1269,20 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a disposable database and RabbitMQ vhost"]
-    async fn test_service_creation() -> Result<()> {
+    async fn test_service_drains_completion_before_closing_resources() -> Result<()> {
         let config_path = format!("{}/../../config.test.yaml", env!("CARGO_MANIFEST_DIR"));
         let mut config = Config::load_from_file(&config_path).expect("Failed to load test config");
+        let mq_url =
+            std::env::var("ATTUNE_TEST_RABBITMQ_URL").context("owned RabbitMQ fixture URL")?;
+        config
+            .message_queue
+            .as_mut()
+            .context("test message queue config")?
+            .url = mq_url.clone();
+        let work = tempfile::tempdir()?;
+        config.artifacts_dir = work.path().join("artifacts").display().to_string();
+        config.packs_base_dir = work.path().join("packs").display().to_string();
+        config.runtime_envs_dir = work.path().join("runtimes").display().to_string();
         let database = timeout(
             TEST_OPERATION_TIMEOUT,
             TestDatabase::create(&config.database),
@@ -1205,17 +1292,13 @@ mod tests {
         .with_cleanup_on_drop();
         config.database.url = database.database_url().to_string();
         config.database.schema = Some(database.schema().to_string());
-        let mq_url = config
-            .message_queue
-            .as_ref()
-            .context("test message queue config")?
-            .url
-            .clone();
         let topology = TestMqTopology::new(&Uuid::new_v4().simple().to_string());
         let cleanup_connection = timeout(TEST_OPERATION_TIMEOUT, Connection::connect(&mq_url))
             .await
             .context("connect cleanup client before timeout")??;
 
+        let mut tasks = JoinSet::new();
+        let mut service_connection = None;
         let service_result: Result<()> = async {
             let service = timeout(
                 TEST_OPERATION_TIMEOUT,
@@ -1227,13 +1310,96 @@ mod tests {
             )
             .await
             .context("create executor service before timeout")??;
+            service_connection = Some(service.inner.mq_connection.clone());
+            let queue = &topology.config.rabbitmq.queues.execution_completed.name;
+            let channel = cleanup_connection.create_channel().await?;
+            tasks.spawn({
+                let service = service.clone();
+                async move { service.start().await }
+            });
+            timeout(TEST_OPERATION_TIMEOUT, async {
+                loop {
+                    let declared = channel.queue_declare(queue.as_str().into(),
+                        lapin::options::QueueDeclareOptions {
+                            passive: true,
+                            durable: true,
+                            ..Default::default()
+                        },
+                        lapin::types::FieldTable::default()).await?;
+                    if declared.consumer_count() == 1 {
+                        return Ok::<_, lapin::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }).await.context("wait for the completion subscription")??;
 
-            timeout(TEST_OPERATION_TIMEOUT, service.stop())
+            let mut blocker = database.pool().begin().await?;
+            sqlx::query("LOCK TABLE execution_resource_admission IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *blocker).await?;
+            let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *blocker).await?;
+            let envelope = MessageEnvelope::new(
+                attune_common::mq::MessageType::ExecutionCompleted,
+                attune_common::mq::ExecutionCompletedPayload {
+                    execution_id: i64::MAX,
+                    action_id: i64::MAX,
+                    action_ref: "test.shutdown".into(),
+                    status: "Completed".into(),
+                    result: None,
+                    completed_at: chrono::Utc::now(),
+                },
+            );
+            channel
+                .basic_publish(
+                    "".into(),
+                    queue.as_str().into(),
+                    Default::default(),
+                    &envelope.to_bytes()?,
+                    Default::default(),
+                )
+                .await?
+                .await?;
+            timeout(TEST_OPERATION_TIMEOUT, async {
+                loop {
+                    let blocked: bool = sqlx::query_scalar(
+                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                         WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid))
+                         AND query LIKE '%SELECT EXISTS (SELECT 1 FROM execution_resource_admission%')",
+                    ).bind(blocker_pid).fetch_one(database.pool()).await?;
+                    if blocked {
+                        return Ok::<_, sqlx::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }).await.context("wait for a completion handler to reach the database gate")??;
+            service.stop().await?;
+            anyhow::ensure!(
+                timeout(Duration::from_millis(150), tasks.join_next()).await.is_err(),
+                "the service must wait for its blocked completion"
+            );
+            anyhow::ensure!(
+                service.inner.mq_connection.is_healthy().await && !service.pool().is_closed(),
+                "the active completion needs both connections during shutdown"
+            );
+            blocker.rollback().await?;
+            timeout(TEST_OPERATION_TIMEOUT, tasks.join_next())
                 .await
-                .context("stop executor service before timeout")??;
+                .context("drain executor service before timeout")?
+                .context("missing executor task")???;
+            anyhow::ensure!(
+                channel.basic_get(queue.as_str().into(), Default::default()).await?.is_none(),
+                "the active completion was requeued instead of acknowledged"
+            );
+            anyhow::ensure!(service.pool().is_closed(), "executor pool was left open");
             Ok(())
         }
         .await;
+        tasks.shutdown().await;
+        let service_close_result = if let Some(connection) = service_connection {
+            connection.close().await
+        } else {
+            Ok(())
+        };
 
         let topology_cleanup_result = timeout(
             TEST_OPERATION_TIMEOUT,
@@ -1252,6 +1418,7 @@ mod tests {
             .and_then(|result| result.map_err(Into::into));
 
         service_result?;
+        service_close_result?;
         topology_cleanup_result?;
         connection_close_result?;
         database_cleanup_result?;

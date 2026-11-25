@@ -329,6 +329,7 @@ impl From<attune_common::error::Error> for ApiError {
             attune_common::error::Error::SchemaValidation(msg) => ApiError::BadRequest(msg),
             attune_common::error::Error::Database(err) => ApiError::from(err),
             attune_common::error::Error::InvalidState(msg) => ApiError::BadRequest(msg),
+            attune_common::error::Error::ExecutionContention(msg) => ApiError::Conflict(msg),
             attune_common::error::Error::PackDeletionBlocked(msg) => ApiError::Conflict(msg),
             // A pinned cache snapshot vanished/expired; the caller should
             // restart the scan against the current active generation.
@@ -361,6 +362,9 @@ impl From<attune_common::error::Error> for ApiError {
             | attune_common::error::Error::Worker(msg)
             | attune_common::error::Error::Execution(msg)
             | attune_common::error::Error::Internal(msg) => ApiError::InternalServerError(msg),
+            attune_common::error::Error::MessageQueue(err) => {
+                ApiError::InternalServerError(format!("Message queue error: {err}"))
+            }
             attune_common::error::Error::Other(err) => {
                 ApiError::InternalServerError(format!("{}", err))
             }

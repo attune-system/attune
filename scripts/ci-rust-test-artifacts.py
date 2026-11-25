@@ -13,8 +13,44 @@ MANIFEST = Path("target/ci-test-executables.json")
 SPECIAL_TESTS = {
     ("attune_common", "lib"): "ATTUNE_S3_COMMON_TEST_BIN",
     ("runtime_log_replica_tests", "test"): "ATTUNE_S3_REPLICA_TEST_BIN",
-    ("attune_executor", "lib"): "ATTUNE_BROKER_TEST_BIN",
 }
+
+# Executable wall times from CI run 45508077350. Use stable Cargo target names
+# because rustc changes executable hashes between builds.
+TEST_DURATIONS = {
+    "crates/api/artifact_read_performance_tests": 152.0,
+    "crates/api/attune_api": 21.2,
+    "crates/api/bootstrap_deployment_transaction_tests": 31.0,
+    "crates/api/execution_log_stream_admission_api_tests": 11.7,
+    "crates/api/pack_registry_tests": 27.4,
+    "crates/api/recorded_execution_events_tests": 800.7,
+    "crates/cli/test_auth": 17.0,
+    "crates/common/attune_common": 32.8,
+    "crates/common/cache_large_generation_integrity_tests": 205.5,
+    "crates/common/execution_admission_tests": 50.7,
+    "crates/common/file_evidence_retention_tests": 17.4,
+    "crates/common/recorded_rollout_tests": 77.4,
+    "crates/common/runtime_authority_repository_tests": 599.5,
+    "crates/common/storage_maintenance_repository_tests": 12.2,
+    "crates/executor/attune_executor": 80.4,
+    "crates/notifier/attune_notifier": 14.6,
+    "crates/supervisor/attune_supervisor": 32.7,
+}
+DEFAULT_TEST_DURATION = 2.0
+
+
+def partition(entries):
+    def duration(entry):
+        package, name, _kind, _path = entry
+        return TEST_DURATIONS.get(f"{package}/{name.replace('-', '_')}", DEFAULT_TEST_DURATION)
+
+    shards = [[], []]
+    totals = [0.0, 0.0]
+    for entry in sorted(entries, key=lambda entry: (-duration(entry), entry)):
+        index = min(range(len(shards)), key=lambda index: totals[index])
+        shards[index].append(entry)
+        totals[index] += duration(entry)
+    return [sorted(shard) for shard in shards]
 
 
 def pack(messages):
@@ -61,7 +97,7 @@ def special_test_paths(entries):
 
 
 def run_shard(root, entries, binaries, shard, threads):
-    selected = entries[shard - 1::2]
+    selected = partition(entries)[shard - 1]
     if not selected:
         sys.exit(f"No executables assigned to shard {shard}")
 

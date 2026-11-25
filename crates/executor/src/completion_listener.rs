@@ -35,8 +35,10 @@ use attune_common::{
 };
 use serde_json::{json, Value as JsonValue};
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
-use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
+use std::{
+    num::NonZeroUsize,
+    sync::{atomic::AtomicUsize, Arc},
+};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -46,6 +48,7 @@ use crate::{
 };
 
 type QueueAckValidation = std::result::Result<WorkQueueAck, (&'static str, String)>;
+const MAX_CONCURRENT_COMPLETIONS: usize = 4;
 
 /// Completion listener that handles execution completion messages
 pub struct CompletionListener {
@@ -73,9 +76,8 @@ struct QueueDispatchCompletionFailure {
 }
 
 impl CompletionListener {
-    fn retryable_mq_error(error: &anyhow::Error) -> Option<MqError> {
-        let mq_error = error.downcast_ref::<MqError>()?;
-        Some(match mq_error {
+    fn retryable_mq_error(error: &MqError) -> Option<MqError> {
+        Some(match error {
             MqError::Connection(msg) => MqError::Connection(msg.clone()),
             MqError::Channel(msg) => MqError::Channel(msg.clone()),
             MqError::Publish(msg) => MqError::Publish(msg.clone()),
@@ -84,6 +86,59 @@ impl CompletionListener {
             MqError::Lapin(err) => MqError::Connection(err.to_string()),
             _ => return None,
         })
+    }
+
+    fn retryable_completion_error(error: &anyhow::Error, keyed: bool) -> Option<MqError> {
+        if let Some(error) = error.chain().find_map(|cause| {
+            cause
+                .downcast_ref::<MqError>()
+                .and_then(Self::retryable_mq_error)
+        }) {
+            return Some(error);
+        }
+        if !keyed {
+            return None;
+        }
+        if let Some(error) =
+            error
+                .chain()
+                .find_map(|cause| match cause.downcast_ref::<attune_common::Error>() {
+                    Some(attune_common::Error::Timeout(message)) => {
+                        Some(MqError::Timeout(message.clone()))
+                    }
+                    Some(attune_common::Error::ExecutionContention(message)) => {
+                        Some(MqError::Pool(message.clone()))
+                    }
+                    Some(attune_common::Error::MessageQueue(error)) => {
+                        Self::retryable_mq_error(error)
+                    }
+                    _ => None,
+                })
+        {
+            return Some(error);
+        }
+        let database_error = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<sqlx::Error>())?;
+        let transient = match database_error {
+            sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut | sqlx::Error::WorkerCrashed => true,
+            sqlx::Error::Database(error) => error.code().is_some_and(|code| {
+                code.starts_with("08")
+                    || matches!(
+                        code.as_ref(),
+                        "40001"
+                            | "40P01"
+                            | "55P03"
+                            | "57014"
+                            | "57P01"
+                            | "57P02"
+                            | "57P03"
+                            | "53300"
+                    )
+            }),
+            _ => false,
+        };
+        transient.then(|| MqError::Pool(database_error.to_string()))
     }
 
     /// Create a new completion listener
@@ -127,8 +182,21 @@ impl CompletionListener {
     }
 
     /// Start processing execution completed messages
-    pub async fn start(&self) -> Result<()> {
-        info!("Starting completion listener");
+    pub async fn start(&self, requested_parallelism: NonZeroUsize) -> Result<()> {
+        // A manager receipt holds one session while the handler works on
+        // another. Reserve pool capacity for routing and the other consumers.
+        let pool_budget = self.pool.options().get_max_connections().saturating_sub(2) / 2;
+        let parallelism = NonZeroUsize::new(
+            (pool_budget as usize)
+                .min(MAX_CONCURRENT_COMPLETIONS)
+                .min(requested_parallelism.get()),
+        )
+        .unwrap_or(NonZeroUsize::MIN);
+        let keyed = parallelism > NonZeroUsize::MIN;
+        info!(
+            completion_concurrency = parallelism.get(),
+            "Starting completion listener"
+        );
 
         let pool = self.pool.clone();
         let publisher = self.publisher.clone();
@@ -141,86 +209,106 @@ impl CompletionListener {
         let workflow_log_segment_max_bytes = self.workflow_log_segment_max_bytes;
         let workflow_log_flush_interval_ms = self.workflow_log_flush_interval_ms;
 
-        // Use the handler pattern to consume messages
-        self.consumer
-            .consume_with_handler(
-                move |envelope: MessageEnvelope<ExecutionCompletedPayload>| {
-                    let pool = pool.clone();
-                    let publisher = publisher.clone();
-                    let queue_manager = queue_manager.clone();
-                    let round_robin_counter = round_robin_counter.clone();
-                    let artifacts_dir = artifacts_dir.clone();
-                    let encryption_key = encryption_key.clone();
-                    let metadata_caches = metadata_caches.clone();
-                    let workflow_log_transport = workflow_log_transport.clone();
+        let handle = move |envelope: MessageEnvelope<ExecutionCompletedPayload>| {
+            let pool = pool.clone();
+            let publisher = publisher.clone();
+            let queue_manager = queue_manager.clone();
+            let round_robin_counter = round_robin_counter.clone();
+            let artifacts_dir = artifacts_dir.clone();
+            let encryption_key = encryption_key.clone();
+            let metadata_caches = metadata_caches.clone();
+            let workflow_log_transport = workflow_log_transport.clone();
 
-                    async move {
-                        let receipt = if envelope.headers.source_service.as_deref()
-                            == Some(MANAGER_COMPLETION_SOURCE)
-                        {
-                            match ManagerAssignmentRepository::begin_completion_processing(
-                                &pool,
-                                envelope.message_id,
-                                &envelope.payload,
-                            )
-                            .await
-                            {
-                                Ok(ManagerCompletionReceipt::Process(receipt)) => Some(receipt),
-                                Ok(
-                                    ManagerCompletionReceipt::AlreadyProcessed
-                                    | ManagerCompletionReceipt::Busy,
-                                ) => return Ok(()),
-                                Err(attune_common::Error::PermissionDenied(_)) => {
-                                    return Err(MqError::InvalidMessage(
-                                        "Manager completion does not match its outbox event".into(),
-                                    ));
-                                }
-                                Err(error) => return Err(MqError::Pool(error.to_string())),
-                            }
-                        } else {
-                            None
-                        };
-                        let result = Box::pin(Self::process_execution_completed(
-                            &pool,
-                            &publisher,
-                            &queue_manager,
-                            &round_robin_counter,
-                            artifacts_dir.as_str(),
-                            &workflow_log_transport,
-                            workflow_log_segment_max_bytes,
-                            workflow_log_flush_interval_ms,
-                            encryption_key.as_deref(),
-                            &metadata_caches,
-                            &envelope,
-                        ))
-                        .await;
-                        if let Some(receipt) = receipt {
-                            receipt
-                                .release(result.is_ok())
-                                .await
-                                .map_err(|error| MqError::Pool(error.to_string()))?;
-                            if let Err(error) = result {
-                                // The API retries the durable event until the executor
-                                // records its receipt. Avoid hot broker requeue here.
-                                warn!(%error, "Manager completion deferred");
-                            }
-                            return Ok(());
+            async move {
+                let receipt = if envelope.headers.source_service.as_deref()
+                    == Some(MANAGER_COMPLETION_SOURCE)
+                {
+                    match ManagerAssignmentRepository::begin_completion_processing(
+                        &pool,
+                        envelope.message_id,
+                        &envelope.payload,
+                    )
+                    .await
+                    {
+                        Ok(ManagerCompletionReceipt::Process(receipt)) => Some(receipt),
+                        Ok(ManagerCompletionReceipt::AlreadyProcessed) => return Ok(()),
+                        Ok(ManagerCompletionReceipt::Busy) if keyed => {
+                            return Err(MqError::Pool("Manager completion receipt is busy".into()));
                         }
-                        if let Err(e) = result {
-                            error!("Error processing execution completion: {}", e);
-                            // Return error to trigger nack with requeue
-                            if let Some(mq_err) = Self::retryable_mq_error(&e) {
-                                return Err(mq_err);
-                            }
-                            return Err(
-                                format!("Failed to process execution completion: {}", e).into()
-                            );
+                        Ok(ManagerCompletionReceipt::Busy) => return Ok(()),
+                        Err(attune_common::Error::PermissionDenied(_)) => {
+                            return Err(MqError::InvalidMessage(
+                                "Manager completion does not match its outbox event".into(),
+                            ));
                         }
-                        Ok(())
+                        Err(error) => return Err(MqError::Pool(error.to_string())),
                     }
-                },
-            )
-            .await?;
+                } else {
+                    None
+                };
+                let result = Box::pin(Self::process_execution_completed(
+                    &pool,
+                    &publisher,
+                    &queue_manager,
+                    &round_robin_counter,
+                    artifacts_dir.as_str(),
+                    &workflow_log_transport,
+                    workflow_log_segment_max_bytes,
+                    workflow_log_flush_interval_ms,
+                    encryption_key.as_deref(),
+                    &metadata_caches,
+                    keyed,
+                    &envelope,
+                ))
+                .await;
+                if let Some(receipt) = receipt {
+                    receipt
+                        .release(result.is_ok())
+                        .await
+                        .map_err(|error| MqError::Pool(error.to_string()))?;
+                    if let Err(error) = result {
+                        if keyed {
+                            if let Some(error) = Self::retryable_completion_error(&error, keyed) {
+                                return Err(error);
+                            }
+                        }
+                        // The API retries the durable event until the executor
+                        // records its receipt. Avoid hot broker requeue here.
+                        warn!(%error, "Manager completion deferred");
+                    }
+                    return Ok(());
+                }
+                if let Err(e) = result {
+                    error!("Error processing execution completion: {}", e);
+                    if let Some(mq_err) = Self::retryable_completion_error(&e, keyed) {
+                        return Err(mq_err);
+                    }
+                    return Err(format!("Failed to process execution completion: {}", e).into());
+                }
+                Ok(())
+            }
+        };
+
+        if !keyed {
+            self.consumer.consume_with_handler(handle).await?;
+        } else {
+            let pool = self.pool.clone();
+            self.consumer
+                .consume_with_keyed_handler(
+                    parallelism,
+                    move |envelope: &MessageEnvelope<ExecutionCompletedPayload>| {
+                        let pool = pool.clone();
+                        let execution = envelope.payload.execution_id;
+                        async move {
+                            ExecutionRepository::completion_workflow_key(&pool, execution)
+                                .await
+                                .map_err(|error| MqError::Pool(error.to_string()))
+                        }
+                    },
+                    handle,
+                )
+                .await?;
+        }
 
         Ok(())
     }
@@ -240,6 +328,7 @@ impl CompletionListener {
         workflow_log_flush_interval_ms: u64,
         encryption_key: Option<&'a str>,
         metadata_caches: &'a SchedulerMetadataCaches,
+        keyed: bool,
         envelope: &'a MessageEnvelope<ExecutionCompletedPayload>,
     ) -> futures::future::BoxFuture<'a, Result<()>> {
         Box::pin(async move {
@@ -313,11 +402,8 @@ impl CompletionListener {
                                 "Failed to schedule workflow retry for execution {}: {}",
                                 execution_id, e
                             );
-                            if let Some(mq_err) = Self::retryable_mq_error(&e) {
-                                return Err(mq_err.into());
-                            }
                             // A refused/contended retry must not become ordinary
-                            // workflow advancement. Requeue the completion instead.
+                            // workflow advancement. Let the listener handle the error.
                             return Err(e);
                         }
                     }
@@ -339,7 +425,7 @@ impl CompletionListener {
                             "Failed to advance workflow for execution {}: {}",
                             execution_id, e
                         );
-                        if let Some(mq_err) = Self::retryable_mq_error(&e) {
+                        if let Some(mq_err) = Self::retryable_completion_error(&e, keyed) {
                             return Err(mq_err.into());
                         }
                         if envelope.headers.source_service.as_deref()
@@ -408,12 +494,14 @@ impl CompletionListener {
                 }
             }
 
-            // Get queue statistics for logging
-            if let Some(stats) = queue_manager.get_queue_stats(action_id).await {
-                debug!(
-                    "Queue stats for action {}: {} active, {} queued, {} total completed",
-                    action_id, stats.active_count, stats.queue_length, stats.total_completed
-                );
+            // Get queue statistics for logging only when they will be used.
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                if let Some(stats) = queue_manager.get_queue_stats(action_id).await {
+                    debug!(
+                        "Queue stats for action {}: {} active, {} queued, {} total completed",
+                        action_id, stats.active_count, stats.queue_length, stats.total_completed
+                    );
+                }
             }
 
             info!(
@@ -1255,6 +1343,29 @@ mod tests {
         })
         .await
         .expect("queue state did not converge before the deadline");
+    }
+
+    #[test]
+    fn keyed_completion_retries_contended_and_unconfirmed_workflow_retries() {
+        use attune_common::Error;
+
+        let contention = Error::ExecutionContention("workflow 1".into());
+        assert!(matches!(
+            CompletionListener::retryable_completion_error(&contention.into(), true),
+            Some(MqError::Pool(_))
+        ));
+        let publication = Error::MessageQueue(Box::new(MqError::Publish("fixture".into())));
+        assert!(matches!(
+            CompletionListener::retryable_completion_error(&publication.into(), true),
+            Some(MqError::Publish(_))
+        ));
+        let timeout = Error::Timeout("fixture unknown confirmation".into());
+        assert!(matches!(
+            CompletionListener::retryable_completion_error(&timeout.into(), true),
+            Some(MqError::Timeout(_))
+        ));
+        let forbidden = Error::PermissionDenied("fixture invalid grant".into());
+        assert!(CompletionListener::retryable_completion_error(&forbidden.into(), true).is_none());
     }
 
     #[test]

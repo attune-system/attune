@@ -359,6 +359,7 @@ impl Harness {
                     state.broadcast_tx.clone(),
                     state.log_stream_wakeups.clone(),
                     state.manager_work_wakeups.clone(),
+                    state.manager_completion_wakeup.clone(),
                 );
                 listener.wait_until_ready().await?;
                 Some(listener)
@@ -1835,6 +1836,7 @@ async fn postgres_listener_retries_initial_failure_and_reports_readiness() -> Re
         broadcast_tx,
         attune_api::log_stream_wakeups::LogStreamWakeups::default(),
         attune_api::log_stream_wakeups::LogStreamWakeups::default(),
+        Arc::new(tokio::sync::Notify::new()),
     );
 
     failed_attempt.notified().await;

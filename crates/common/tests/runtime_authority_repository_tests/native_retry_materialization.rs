@@ -26,7 +26,7 @@ const KEY: &str = "native-retry-test-owned-encryption-key";
 
 async fn rejected_broker_confirmation_rolls_back_retry_mark(confirmation: lapin::Confirmation) {
     use attune_common::{
-        mq::publisher::classify_confirmation,
+        mq::{publisher::classify_confirmation, MqError},
         repositories::maintenance::MaintenanceRepository as Maintenance,
     };
     use lapin::Confirmation;
@@ -58,8 +58,11 @@ async fn rejected_broker_confirmation_rolls_back_retry_mark(confirmation: lapin:
             classify_confirmation(true, confirmation).map(|_| ())
         })
         .await;
-    assert!(matches!(result, Err(attune_common::Error::Internal(_))));
     tx.rollback().await.unwrap();
+    assert!(matches!(
+        result,
+        Err(attune_common::Error::MessageQueue(error)) if matches!(*error, MqError::Publish(_))
+    ));
     let marks: i64 =
         sqlx::query_scalar("SELECT count(*) FROM execution_reschedule_state WHERE execution_id=$1")
             .bind(retry.id)
@@ -396,8 +399,11 @@ async fn retry_target_advisory_contention_never_waits_behind_its_source_share_fe
     blocker.commit().await.unwrap();
     fixture.db.cleanup().await.unwrap();
     assert!(
-        matches!(result, Ok(Err(_))),
-        "target advisory lock waited behind retained source owner locks"
+        matches!(
+            result,
+            Ok(Err(attune_common::Error::ExecutionContention(_)))
+        ),
+        "retry must report workflow contention without waiting behind retained source owner locks"
     );
 }
 

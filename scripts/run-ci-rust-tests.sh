@@ -21,4 +21,10 @@ cd "$ROOT"
 if [[ $# -ne 0 ]]; then
   exec python3 scripts/ci-rust-test-artifacts.py run "$@" "$threads"
 fi
+if [[ -n "${ATTUNE_CI_BROKER_TEST_ARTIFACTS:-}" ]]; then
+  # Record executables from this build so the broker tests need no Cargo rebuilds.
+  cargo test --workspace --all-features --message-format=json-render-diagnostics -- --test-threads="$threads" |
+    python3 -u scripts/run-ci-completion-broker-tests.py record "$ATTUNE_CI_BROKER_TEST_ARTIFACTS"
+  exit 0
+fi
 cargo test --workspace --all-features -- --test-threads="$threads"

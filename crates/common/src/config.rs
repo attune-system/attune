@@ -38,7 +38,7 @@
 
 use config as config_crate;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{num::NonZeroUsize, path::PathBuf};
 use utoipa::ToSchema;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2078,6 +2078,11 @@ fn default_cache_alert_limit_per_cycle() -> i64 {
 /// Executor service configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutorConfig {
+    /// Requested concurrent completion handlers per executor. Defaults to one.
+    /// The executor also limits this by its database pool and a ceiling of four.
+    #[serde(default)]
+    pub completion_concurrency: Option<NonZeroUsize>,
+
     /// How long an execution can remain in SCHEDULED status before timing out (seconds)
     #[serde(default)]
     pub scheduled_timeout: Option<u64>,
@@ -2094,6 +2099,7 @@ pub struct ExecutorConfig {
 impl Default for ExecutorConfig {
     fn default() -> Self {
         Self {
+            completion_concurrency: None,
             scheduled_timeout: Some(300),     // 5 minutes
             timeout_check_interval: Some(60), // 1 minute
             enable_timeout_monitor: Some(true),

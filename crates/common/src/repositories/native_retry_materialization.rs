@@ -700,7 +700,7 @@ async fn lock_workflow(conn: &mut PgConnection, workflow: Id) -> Result<()> {
         .fetch_one(conn)
         .await?;
     if !acquired {
-        return Err(denied());
+        return Err(Error::ExecutionContention(format!("workflow {workflow}")));
     }
     Ok(())
 }

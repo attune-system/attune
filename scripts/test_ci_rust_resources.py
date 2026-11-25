@@ -1,9 +1,12 @@
 """Check CI test disk policy; --dry-run reports the plan without invoking Cargo."""
 
+import contextlib
+import io
 import json
+import runpy
 import subprocess
-import tempfile
 import sys
+import tempfile
 import tomllib
 import unittest
 from pathlib import Path
@@ -22,9 +25,12 @@ PROFILE_ENV = {
 }
 TEST_COMMANDS = {
     "Tests": 'scripts/run-ci-rust-tests.sh "${{ matrix.shard }}"',
-    "Executor broker integration test": (
-        '"${ATTUNE_BROKER_TEST_BIN:?Missing precompiled executor tests}" '
-        "service::tests::test_service_creation --ignored --exact --nocapture --test-threads=4"
+    "Completion broker integration tests": (
+        "docker exec \"$RABBITMQ_CONTAINER_ID\" rabbitmqctl add_vhost \"$COMPLETION_VHOST\"\n"
+        "docker exec \"$RABBITMQ_CONTAINER_ID\" rabbitmqctl set_permissions -p \"$COMPLETION_VHOST\" attune '.*' '.*' '.*'\n"
+        "export ATTUNE_TEST_RABBITMQ_URL=\"$ATTUNE__MESSAGE_QUEUE__URL\"\n"
+        "export ATTUNE_MANAGER_TEST_AMQP_URL=\"amqp://attune:attune@localhost:5672/$COMPLETION_VHOST\"\n"
+        'python3 scripts/run-ci-completion-broker-tests.py run "$ATTUNE_CI_BROKER_TEST_ARTIFACTS"\n'
     ),
     "S3 storage correctness tests": (
         ': "${ATTUNE_S3_COMMON_TEST_BIN:?Missing precompiled common tests}"\n'
@@ -72,7 +78,10 @@ def resource_plan(workflow, manifest):
         "cache_paths": [entry["path"].splitlines() for entry in caches],
         "cache_restore_prefixes": [entry.get("restore-keys", "").splitlines() for entry in caches],
         "test_commands": commands,
-        "workspace_runner": (ROOT / "scripts/run-ci-rust-tests.sh").read_text().splitlines()[-1],
+        "workspace_runner": [
+            line.strip() for line in (ROOT / "scripts/run-ci-rust-tests.sh").read_text().splitlines()
+            if line.strip().startswith("cargo test ")
+        ],
         "release_profile_unchanged": manifest["profile"]["release"],
         "disk_capacity_verdict": "UNMEASURED: require the full remote suite and before/after disk telemetry",
     }
@@ -91,7 +100,10 @@ def validate_policy(workflow, manifest):
     allowed_paths = {"~/.cargo/registry/index", "~/.cargo/registry/cache", "~/.cargo/git/db"}
     if any(path not in allowed_paths for paths in plan["cache_paths"] for path in paths):
         raise AssertionError("Tests must not restore stale target/test/Clippy build outputs")
-    if plan["workspace_runner"] != 'cargo test --workspace --all-features -- --test-threads="$threads"':
+    if plan["workspace_runner"] != [
+        'cargo test --workspace --all-features --message-format=json-render-diagnostics -- --test-threads="$threads" |',
+        'cargo test --workspace --all-features -- --test-threads="$threads"',
+    ]:
         raise AssertionError("Preserve complete all-features workspace test coverage")
     if int(plan["libtest_threads"]) < 4:
         raise AssertionError("Database tests require at least four threads")
@@ -132,8 +144,20 @@ class CiRustResourceTests(unittest.TestCase):
                          "cargo test --workspace --all-features --doc -- --test-threads=4")
         self.assertIn("target/debug/attune-api --config config.test.yaml --migrate",
                       steps["Initialize test database"]["run"])
-        for name in ("S3 storage correctness tests", "Executor broker integration test"):
-            self.assertEqual(steps[name]["if"], "matrix.shard == 1")
+        self.assertEqual(steps["S3 storage correctness tests"]["if"], "matrix.shard == 1")
+        self.assertEqual(steps["Completion broker integration tests"]["if"], "matrix.shard == 2")
+
+    def test_shards_separate_the_two_longest_suites(self):
+        partition = runpy.run_path(str(ROOT / "scripts/ci-rust-test-artifacts.py"))["partition"]
+        recorded_events = ("crates/api", "recorded_execution_events_tests", "test", "events")
+        runtime_authority = ("crates/common", "runtime_authority_repository_tests", "test", "authority")
+        unmeasured = ("crates/api", "new_suite", "test", "new")
+        entries = [recorded_events, runtime_authority, unmeasured]
+        shards = partition(entries)
+        self.assertEqual(shards, partition(reversed(entries)))
+        self.assertCountEqual(shards[0] + shards[1], entries)
+        self.assertIn(recorded_events, shards[0])
+        self.assertIn(runtime_authority, shards[1])
 
     def test_artifact_manifest_runs_each_test_executable_once(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -188,7 +212,7 @@ class CiRustResourceTests(unittest.TestCase):
             exported = subprocess.check_output([*helper, "env"], cwd=root, text=True)
             assignments = dict(line.split("=", 1) for line in exported.splitlines())
             self.assertEqual(set(assignments),
-                             {"ATTUNE_S3_COMMON_TEST_BIN", "ATTUNE_S3_REPLICA_TEST_BIN", "ATTUNE_BROKER_TEST_BIN"})
+                             {"ATTUNE_S3_COMMON_TEST_BIN", "ATTUNE_S3_REPLICA_TEST_BIN"})
             command = subprocess.check_output(
                 ["make", "-n", "test-runtime-log-correctness",
                  *(f"{name}={value}" for name, value in assignments.items())],
@@ -220,6 +244,48 @@ class CiRustResourceTests(unittest.TestCase):
         workflow, _manifest = inputs()
         step = next(step for step in workflow["jobs"]["release-checks"]["steps"] if step.get("name") == "Validate release scripts")
         self.assertIn("python3 scripts/test_ci_rust_resources.py", step["run"])
+
+    def test_broker_lane_uses_artifacts_from_workspace_tests(self):
+        workflow, _manifest = inputs()
+        steps = {step.get("name"): step for step in workflow["jobs"]["rust-test"]["steps"]}
+        manifest_path = steps["Completion broker integration tests"]["env"]["ATTUNE_CI_BROKER_TEST_ARTIFACTS"]
+        self.assertEqual(manifest_path, "target/completion-test-artifacts.jsonl")
+        build = next(step["run"] for step in workflow["jobs"]["rust-test-build"]["steps"]
+                     if step.get("name") == "Compile workspace test executables")
+        self.assertIn(f"run-ci-completion-broker-tests.py record {manifest_path}", build)
+        self.assertIn(f"echo {manifest_path}", build)
+
+        broker = runpy.run_path(str(ROOT / "scripts/run-ci-completion-broker-tests.py"))
+        package = ROOT / "crates/executor"
+
+        def artifact(kind, executable, is_test):
+            return json.dumps({
+                "reason": "compiler-artifact",
+                "manifest_path": str(package / "Cargo.toml"),
+                "target": {"kind": [kind], "name": "attune_executor"},
+                "profile": {"test": is_test},
+                "executable": executable,
+            }) + "\n"
+
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "executables.jsonl"
+            with contextlib.redirect_stdout(io.StringIO()) as log:
+                broker["record_artifacts"](manifest, [
+                    artifact("lib", "/executor-library", False),
+                    artifact("bin", "/executor-binary-test", True),
+                    artifact("lib", "/executor-library-test", True),
+                    '{"reason":"build-finished","success":true}\n',
+                    "test result: ok. 1 passed;\n",
+                ])
+            self.assertEqual(log.getvalue(), "test result: ok. 1 passed;\n")
+            entries = [json.loads(line) for line in manifest.read_text().splitlines()]
+            self.assertEqual(len(entries), 2)
+            self.assertEqual(
+                broker["find_executable"](entries, package, "lib", "attune_executor"),
+                "/executor-library-test",
+            )
+            with self.assertRaises(SystemExit):
+                broker["find_executable"](entries[:1], package, "lib", "attune_executor")
 
     def test_before_and_after_disk_telemetry_is_not_cleanup_or_a_passing_capacity_claim(self):
         workflow, manifest = inputs()
